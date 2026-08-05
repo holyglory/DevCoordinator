@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "artifact_type": "test-fixture-snapshot",
+  "source": "production-console-design-audit",
+  "fixture_id": "devops-console-performance-stacked-selected-design-v1:1487x1058",
+  "generator": "OpenAI image generation selected-design fixture",
+  "artifact_kind": "selected-product-design-reference",
+  "repository_path": "apps/DevOpsConsole/Artifacts/Design/performance-stacked-selected-reference.png",
+  "sha256": "a769f4e9b6e7ec75223e239428ec3b4290125570069a5e591d6a701e8487b515",
+  "bytes": 1571902,
+  "width": 1487,
+  "height": 1058,
+  "color_mode": "RGB",
+  "origin": {
+    "kind": "openai-image-generation-result",
+    "session_id": "019f624f-69d2-7893-929b-d8f18000e1e8",
+    "generation_event": "exec-d0a6437f-69c9-4809-8a0e-0db1f7a44b85",
+    "completed_at": "2026-08-02T19:06:49.750Z",
+    "original_locator": "local Codex generated-image cache",
+    "input_sha256": [
+      "e38f96e291d4fa5fbc6ea1e28dd6fede24c11ac5951881bb66d47ef424242ce3",
+      "5171a091e23c712a9e72d6c6b92743abe28cf7e51fac4b39bdcb43b6581c5b81",
+      "7ec1c4aaa0db3c88a64d1223c3ccee265e548335352703316a493fcb2ba59f21"
+    ]
+  },
+  "selection": {
+    "option": 1,
+    "selected_at": "2026-08-03",
+    "request": "The first option looks great, go ahead"
+  },
+  "verification": {
+    "original_file_sha256_match": true,
+    "copied_file_sha256_match": true
+  }
+}

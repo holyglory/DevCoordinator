@@ -692,6 +692,8 @@ class LifecyclePersistence(Protocol):
         *,
         actor: str,
         reason: str,
+        provenance: str = "operator_attach",
+        allow_existing: bool = False,
     ) -> AttachResult:
         ...
 

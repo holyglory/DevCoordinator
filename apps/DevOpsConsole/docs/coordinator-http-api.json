@@ -6,20 +6,19 @@
     "health": "GET /healthz is anonymous and returns service/version only",
     "body_limit_bytes": 65536,
     "content_type": "application/json",
-    "readiness": "api serve prints one JSON line with the actual bound port and token_file; --port 0 is supported"
+    "readiness": "api serve prints one JSON line with the actual bound port; --port 0 is supported"
   },
   "authentication": {
-    "protected_routes": "/v1/*",
-    "header": "Authorization: Bearer <contents of token file>",
-    "default_token_file": "<coordinator-home>/api-token",
-    "override": "CODEX_AGENT_COORDINATOR_TOKEN_FILE or api serve --token-file",
-    "file_policy": "regular non-symlink file, mode 0600, bounded size, minimum token length 32",
-    "browser_policy": "the Console reads the token server-side; it must never enter browser JavaScript, URLs, logs, screenshots, or Git"
+    "internal_api": "no application credential; this transport is trusted local infrastructure",
+    "bind_policy": "the API binds only to exact loopback and rejects non-loopback Host or Origin values",
+    "browser_policy": "browser JavaScript never calls this internal port directly; the public Console session and project upstream credentials remain separate boundaries"
   },
   "endpoints": {
     "GET": [
       "/healthz",
+      "/v1/ready",
       "/v1/inventory",
+      "/v1/inventory/source",
       "/v1/inventory/no-docker",
       "/v1/state",
       "/v1/ports",
@@ -28,7 +27,16 @@
       "/v1/archives",
       "/v1/events",
       "/v1/tests",
-      "/v1/test-repositories"
+      "/v1/test-fleet",
+      "/v1/test-repositories",
+      "/v1/test-repositories/:repo_id/setup",
+      "/v1/test-runs?repo_id=:repo_id",
+      "/v1/test-runs/:run_id",
+      "/v1/test-runs/:run_id/summary",
+      "/v1/test-runs/:run_id/failures",
+      "/v1/test-runs/:run_id/artifacts",
+      "/v1/test-runs/:run_id/cases",
+      "/v1/test-events?repo_id=:repo_id"
     ],
     "POST": [
       "/v1/ports/lease",
@@ -58,6 +66,10 @@
       "/v1/lifecycle/plan",
       "/v1/lifecycle/apply",
       "/v1/lifecycle/restore",
+      "/v1/test-plan",
+      "/v1/test-runs",
+      "/v1/test-runs/:run_id/cancel",
+      "/v1/test-runs/:run_id/retry",
       "/v1/observe"
     ]
   },
@@ -120,19 +132,30 @@
       "unassigned_resources",
       "lifecycle_violations",
       "observations",
-      "control_bindings"
-      ,"test_statistics"
+      "control_bindings",
+      "test_statistics",
+      "agent_browsers"
     ],
     "compatibility_projection": "v1_compatibility",
     "compatibility_policy": "legacy Console rows are nested under v1_compatibility; non-colliding legacy aliases may also appear at top level, but top-level leases and port_assignments always retain normalized lease_id/assignment_id and repo_id identities",
     "no_docker": "GET /v1/inventory/no-docker returns the authenticated committed normalized snapshot without a Docker CLI/daemon probe; when the systemd readiness client supplies exactly one project, name, and port query target, only compatibility rows that can affect that registration graph receive bounded current process, listener, and health observation on an in-memory copy; the route excludes unrelated services, process-usage sampling, and backup discovery and never persists derived lifecycle or lease changes",
     "project_usage": "rows include stable usage_key plus authoritative server_ids and exact container_resource_ids; container_names remain legacy display data and are not ownership keys",
+    "agent_browsers": "an optional schema-1, path-free sidecar projection reports measured non-project headless/automation browser sessions, last observed resource work, bounded cleanup history, and idle-reaper policy. Project/container browser trees are excluded to avoid double accounting; omission leaves their bytes honestly in System / unclassified and never invalidates repository inventory",
     "docker_ownership": "Compose labels and verified coordinator sidecars are mutation authority; name similarity is read-only evidence",
     "project_reports": "ok=false must be treated as failure even when HTTP status is 200; inspect partial, preflight_failed, classification, actions, and action_errors"
   },
   "test_contract": {
-    "repositories": "GET /v1/test-repositories returns the protected profile's enabled repository IDs, canonical roots, and display names without building inventory or observing the host",
-    "read": "GET /v1/tests requires one enrolled repo_id or canonical repository root plus optional days (1-3650) and limit (1-500)",
+    "repositories": "GET /v1/test-repositories returns every current protected-profile repository ID and display name joined to testd's retained ready, missing, or invalid setup projection; the response never scans user worktrees and never exposes canonical paths, manifest text, argv, environment values, or fixture secrets",
+    "setup": "GET /v1/test-repositories/:repo_id/setup executes the bounded repository-UID setup projection and returns only ready, missing, or invalid plus sanitized graph, policy, fixture, network, isolation, and input-coverage facts; it never returns argv, environment values, absolute repository paths, or manifest text",
+    "read": "GET /v1/tests requires one enrolled repo_id plus optional days (1-3650) and limit (1-500), and serves summary, comparison, daily and hourly data from testd-owned materialized TestDB rollups rather than legacy authority test tables",
+    "fleet": "GET /v1/test-fleet accepts hours (1-168, default 24) and returns one bounded projection from testd-owned materialized TestDB rollups, scoped to the caller's exact current repository enrollments and keyed only by immutable repo_id: sparse repository-by-hour exact test seconds, capacity, health, efficiency, queue wait, freshness and actionable repository attention. Test assertion/error failures and infrastructure/setup failures have separate state, count, rate and detail fields. Repository state_scope is selected_window: it describes observations in the requested window and does not claim a historical failure remains unresolved. The read never accesses legacy authority test records or returns paths, commands, logs, or case identities",
+    "plan": "POST /v1/test-plan accepts repo_id, intent, one caller-generated canonical operation_id UUID, one exact schema-1 source selector, and an optional bounded requested_targets list for manual intent only. Original and temporary selectors carry an immutable repository ID plus protected-profile generation; temporary canonical paths are resolved only from the installed broker profile and re-authorized by the broker. The returned plan preserves operation_id so retries are durably idempotent. Target names must come from the sanitized enrolled-repository setup catalog; dependency closure, manifest, argv, resources and policy remain derived inside the authenticated test plane",
+    "submit": "POST /v1/test-runs accepts repo_id, plan_id and operation_id plus the trusted API's bounded diagnostic actor; the canonical UUID is the durable idempotency key, the broker derives authorization from the protected OS peer, and the plan must resolve to the same immutable repository before mutation",
+    "history": "GET /v1/test-runs requires repo_id and accepts one opaque after cursor, one state filter, and limit 1-200; results are repository-scoped and do not expose another repository's run existence",
+    "run_reads": "GET /v1/test-runs/:run_id and /summary return bounded run status and the <=8 KiB agent summary. /failures, /artifacts and /cases use cursor pagination with a maximum page of 50 and are reauthorized against the run's immutable repository before any result is disclosed",
+    "events": "GET /v1/test-events requires repo_id and accepts a non-negative numeric event cursor plus limit 1-500; events are repository-scoped and polling never clears retained Console content",
+    "control": "POST /v1/test-runs/:run_id/cancel accepts reason and operation_id. POST /retry accepts failed_only and operation_id. Every mutation is idempotent, reauthorizes the actual run repository, and does not trust the run ID as an ownership claim",
+    "google_authorization": "The public Console maps immutable repository grants tests:read, tests:run and tests:operate to these internal operations. Repository-scoped run routes verify the returned repository identity before disclosure; release intent remains owner-only",
     "hourly": "the read returns seven complete UTC days of hourly buckets; exact case intervals are split at hour boundaries and parallel intervals add, so test_seconds may exceed 3600 in one wall-clock hour; failure_count is attributed to the case start hour",
     "comparison": "comparison_summary and previous_daily cover the immediately preceding equal period, while dynamics reports suite-level current_seconds, previous_seconds, change_percent, failures, and last_run",
     "ownership": "the service-owned broker database stores repository-attributed sessions, group runs, and exact individual case timings; clients never receive a database handle",
@@ -148,8 +171,8 @@
     "retention": "archive stops and fences the exact resource while retaining declared data/history; permanent removal is available only for an archived row that advertises removable=true; worktree removal is shown only as an advertised removable child of an archived project"
   },
   "errors": {
-    "401": "missing or incorrect bearer credential",
     "400": "invalid request, ownership mismatch, capability failure, or refused mutation",
+    "403": "a non-loopback Origin is rejected by the trusted local boundary",
     "413": "request body exceeds 64 KiB",
     "409": "fresh lifecycle evidence blocks the action, the archived capability is unavailable, or an apply/restore result is incomplete",
     "415": "POST content type is not application/json",

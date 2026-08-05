@@ -1,0 +1,153 @@
+{
+  "acceptance": [
+    {
+      "argv": [
+        "{release}/bin/devcoordinator-codex-test-access-verify",
+        "--root-repo",
+        "{repo}",
+        "--exercise-runner",
+        "--execution-timeout-seconds",
+        "{acceptance_execution_timeout_seconds}",
+        "--launch-timeout-seconds",
+        "{acceptance_launch_timeout_seconds}",
+        "--wait-timeout-seconds",
+        "{acceptance_wait_timeout_seconds}"
+      ],
+      "blocking": true,
+      "name": "codex-test-access"
+    },
+    {
+      "argv": [
+        "/usr/bin/python3",
+        "scripts/check_availability_topology.py",
+        "--json"
+      ],
+      "blocking": false,
+      "name": "availability-topology"
+    },
+    {
+      "argv": [
+        "/usr/bin/python3",
+        "skills/codex-dev-coordinator/scripts/dev_coordinator.py",
+        "inventory",
+        "--project",
+        "{repo}",
+        "--compact-json"
+      ],
+      "blocking": false,
+      "name": "coordinator-inventory"
+    },
+    {
+      "argv": [
+        "/usr/bin/python3",
+        "skills/codex-dev-coordinator/scripts/dev_coordinator.py",
+        "test",
+        "manifest",
+        "validate",
+        "--root-repo",
+        "{repo}"
+      ],
+      "blocking": false,
+      "name": "test-manifest"
+    },
+    {
+      "argv": [
+        "{release}/bin/devcoordinator-production-console-acceptance-batch",
+        "--release",
+        "{release}",
+        "--output-dir",
+        "{run_root}/browser"
+      ],
+      "blocking": false,
+      "name": "production-console-playwright"
+    },
+    {
+      "argv": [
+        "{release}/bin/devcoordinator-first-use-acceptance",
+        "--client",
+        "{release}/bin/devcoordinator",
+        "--project",
+        "/home/holyglory/DesignDocEngine",
+        "--caller-user",
+        "holygloryTT",
+        "--cwd",
+        "prototype",
+        "--auto-port"
+      ],
+      "blocking": true,
+      "name": "first-use-development-server"
+    },
+    {
+      "argv": [
+        "{release}/bin/devcoordinator-browser-accounting",
+        "status",
+        "--state",
+        "/var/lib/devcoordinator/browser-lifecycle.json",
+        "--json"
+      ],
+      "blocking": true,
+      "name": "headless-browser-accounting"
+    }
+  ],
+  "kind": "devcoordinator-software-delivery-plan",
+  "same_schema": {
+    "apply": [
+      {
+        "argv": [
+          "{release}/bin/devcoordinator-same-schema-switch",
+          "apply",
+          "--release",
+          "{release}",
+          "--transaction-root",
+          "{transaction_root}"
+        ],
+        "blocking": true,
+        "name": "switch-release"
+      }
+    ],
+    "health": [
+      {
+        "argv": [
+          "{release}/bin/devcoordinator-same-schema-switch",
+          "verify",
+          "--release",
+          "{release}",
+          "--transaction-root",
+          "{transaction_root}"
+        ],
+        "blocking": true,
+        "name": "control-plane-health"
+      }
+    ],
+    "prepare": [
+      {
+        "argv": [
+          "{release}/bin/devcoordinator-same-schema-switch",
+          "prepare",
+          "--release",
+          "{release}",
+          "--transaction-root",
+          "{transaction_root}"
+        ],
+        "blocking": true,
+        "name": "prepare-release-switch"
+      }
+    ],
+    "rollback": [
+      {
+        "argv": [
+          "{release}/bin/devcoordinator-same-schema-switch",
+          "rollback",
+          "--release",
+          "{release}",
+          "--transaction-root",
+          "{transaction_root}"
+        ],
+        "blocking": true,
+        "name": "restore-previous-release"
+      }
+    ]
+  },
+  "schema_version": 1,
+  "source_checks": []
+}

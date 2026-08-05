@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import replace
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -9,7 +10,6 @@ from unittest import mock
 
 from devcoordinator.broker_profile import (
     BrokerClientProfile,
-    BrokerProfileError,
     BrokerRepositoryProfile,
     BrokerServiceProfile,
 )
@@ -37,8 +37,9 @@ from devcoordinator.repository_lifecycle import (
     RunningState,
     StartupPolicyRef,
 )
+from devcoordinator.schema import establish_repository_owner_authority
 from devcoordinator.sqlite_lifecycle import SQLiteLifecyclePersistence
-from devcoordinator.store import AccountStore, utc_timestamp
+from devcoordinator.store import AccountStore, deterministic_id, utc_timestamp
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -125,6 +126,7 @@ class LifecycleApplyObservationTests(unittest.TestCase):
         self.repo_a = self._repository("repo-a")
         self.repo_b = self._repository("repo-b")
         self.request_repo = self._repository("request-repo")
+        self._enroll_repositories(self.repo_a, self.repo_b, self.request_repo)
         self.adapter = RecordingAdapter()
 
     def tearDown(self) -> None:
@@ -135,6 +137,56 @@ class LifecycleApplyObservationTests(unittest.TestCase):
         value.mkdir()
         (value / ".git").mkdir()
         return value.resolve()
+
+    def _enroll_repositories(self, *repositories: Path) -> None:
+        with AccountStore.open_default(self.home) as store:
+            host_id = store.ensure_local_host()
+            timestamp = utc_timestamp()
+            with store.immediate_transaction() as connection:
+                for repository in repositories:
+                    repo_id = deterministic_id(
+                        "test-lifecycle-repository", host_id, str(repository)
+                    )
+                    connection.execute(
+                        """
+                        INSERT INTO repositories(
+                            repo_id, host_id, canonical_root, display_name,
+                            state, generation, created_at, updated_at
+                        ) VALUES (?, ?, ?, ?, 'active', 0, ?, ?)
+                        """,
+                        (
+                            repo_id,
+                            host_id,
+                            str(repository),
+                            repository.name,
+                            timestamp,
+                            timestamp,
+                        ),
+                    )
+                    connection.execute(
+                        """
+                        INSERT INTO repository_installations(
+                            repo_id, status, startup_fenced, generation,
+                            reason, actor, updated_at
+                        ) VALUES (?, 'installed', 0, 0, ?, 'test', ?)
+                        """,
+                        (
+                            repo_id,
+                            "explicit lifecycle CLI test enrollment",
+                            timestamp,
+                        ),
+                    )
+                    establish_repository_owner_authority(
+                        connection,
+                        repository_id=repo_id,
+                        owner_uid=os.geteuid(),
+                        repository_generation=0,
+                        operation_id=f"fixture-enroll-{repo_id}",
+                        actor="test",
+                        reason="explicit lifecycle CLI test enrollment",
+                        timestamp=timestamp,
+                        evidence={"source": "test_fixture"},
+                    )
 
     @staticmethod
     def _container(full_id: str, *, project: Path | None = None) -> dict[str, object]:
@@ -1104,21 +1156,33 @@ class LifecycleApplyObservationTests(unittest.TestCase):
         self.assertIn("Refresh authoritative inventory", payload["action_required"])
         self.assertIn("newly generated lifecycle plan", payload["action_required"])
 
-    def test_expired_broker_profile_cannot_list_removed_repositories(self) -> None:
+    def test_profile_expiry_is_informational_for_local_removed_repository_reads(
+        self,
+    ) -> None:
         repository = BrokerRepositoryProfile(
             canonical_root=str(self.repo_a),
             repo_id="repo-expired",
             generation=1,
+            owner_uid=1000,
             server_ids={},
             container_ids={},
             compose_definition_id=None,
+            compose_container_ids=frozenset(),
+            compose_run_once_services={},
+            ephemeral_templates={},
+            ephemeral_image_prefetch_template_ids=frozenset(),
+            ephemeral_secret_policies={},
+            account_id="account-expired",
+            enabled=True,
+            issued_at=utc_timestamp(),
+            valid_until_epoch=1,
         )
         profile = BrokerClientProfile(
             service=BrokerServiceProfile(
                 socket_path=self.root / "broker.sock",
                 service_uid=0,
                 socket_gid=0,
-                socket_mode=0o660,
+                socket_mode=0o666,
                 database_generation="generation-expired",
             ),
             client_uid=0,
@@ -1130,13 +1194,30 @@ class LifecycleApplyObservationTests(unittest.TestCase):
         args = _parser().parse_args(["repository", "list-removed"])
         with mock.patch(
             "devcoordinator.lifecycle_cli.load_broker_profile", return_value=profile
-        ), self.assertRaisesRegex(BrokerProfileError, "expired"):
-            handle_lifecycle_cli(
+        ), mock.patch.object(
+            BrokerClientProfile,
+            "call",
+            return_value=(
+                "removed-read-operation",
+                {
+                    "repositories": [
+                        {
+                            "repo_id": "repo-expired",
+                            "display_name": "Expired metadata only",
+                            "disabled_at": "2026-07-18T00:00:00Z",
+                        }
+                    ]
+                },
+            ),
+        ) as broker_call:
+            result = handle_lifecycle_cli(
                 args,
                 coordinator_home=self.home,
                 canonical_project=lambda value: str(Path(value).resolve()),
                 bootstrap_legacy_import=lambda _store: {},
             )
+        self.assertEqual([row["repo_id"] for row in result], ["repo-expired"])
+        broker_call.assert_called_once()
 
 
 if __name__ == "__main__":

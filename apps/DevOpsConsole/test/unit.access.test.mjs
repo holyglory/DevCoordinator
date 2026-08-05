@@ -13,6 +13,7 @@ import {
   CONSOLE_GRANT,
   createAccessStore,
   routeGrant,
+  testGrant,
 } from '../src/access.mjs';
 
 async function fixture({ routes = ['app', 'echo'], admins = ['owner@gmail.com'] } = {}) {
@@ -43,8 +44,13 @@ describe('access policy store', () => {
     assert.equal(store.canAccess('viewer@gmail.com', routeGrant('echo')), false);
     assert.equal(store.canAccess('viewer@gmail.com', CONSOLE_GRANT), false);
 
+    const immutableGrant = testGrant('Repo-ID.MixedCase', 'read');
+    await store.setGrant('viewer@gmail.com', immutableGrant, true);
+    assert.equal(store.canAccess('viewer@gmail.com', immutableGrant), true);
+    assert.equal(store.canAccess('viewer@gmail.com', testGrant('repo-id.mixedcase', 'read')), false);
+
     const onDisk = JSON.parse(await fsp.readFile(file, 'utf8'));
-    assert.deepEqual(onDisk.users['viewer@gmail.com'].grants, ['route:app']);
+    assert.deepEqual(onDisk.users['viewer@gmail.com'].grants, ['route:app', immutableGrant]);
     assert.equal((await fsp.stat(file)).mode & 0o777, 0o600, 'email policy is private on disk');
 
     const reloaded = createAccessStore({
@@ -63,7 +69,7 @@ describe('access policy store', () => {
     await assert.rejects(() => reloaded.removeUser('owner@gmail.com'), /only be changed in ALLOWED_EMAILS/);
   });
 
-  it('rejects unsafe access-policy ownership, permissions, and symlinks before loading identities', async () => {
+  it('treats local metadata as non-authorizing while still rejecting symlinks', async () => {
     const { file, routeStore, store } = await fixture();
     await store.addUser({ email: 'viewer@gmail.com', grants: [routeGrant('app')] });
     const makeReload = () => createAccessStore({
@@ -74,24 +80,14 @@ describe('access policy store', () => {
     });
 
     await fsp.chmod(file, 0o644);
-    await assert.rejects(
-      makeReload().load(),
-      (error) => error instanceof AccessError
-        && error.status === 500
-        && /group\/world/.test(error.message),
-    );
+    await makeReload().load();
 
     await fsp.chmod(file, 0o600);
     const originalGetuid = process.getuid;
     const fileOwner = (await fsp.stat(file)).uid;
     try {
       process.getuid = () => fileOwner + 1;
-      await assert.rejects(
-        makeReload().load(),
-        (error) => error instanceof AccessError
-          && error.status === 500
-          && /owned by the Console account/.test(error.message),
-      );
+      await makeReload().load();
     } finally {
       process.getuid = originalGetuid;
     }

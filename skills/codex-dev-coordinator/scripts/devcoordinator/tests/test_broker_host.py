@@ -23,6 +23,7 @@ from devcoordinator.broker_host import (
 )
 from devcoordinator.broker_persistence import DockerMutationTarget, EphemeralImageTarget
 from devcoordinator.ephemeral_secrets import EphemeralSecretMount, EphemeralSecretPolicy
+from devcoordinator.worker_native import project_repository_slice
 
 
 _RUN_ID = "12345678-1234-4234-8234-123456789abc"
@@ -30,6 +31,20 @@ _RUN_HEX = _RUN_ID.replace("-", "")
 _NONCE = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
 _FULL_ID = "a" * 64
 _IMAGE_REF = "registry.example/artifact@sha256:" + "b" * 64
+_PROJECT_SLICE = project_repository_slice(uid=501, repository_id="repo-123")
+
+
+def _docker_target(
+    full_id: str, observation_revision: int = 1, control_generation: int = 1
+) -> DockerMutationTarget:
+    return DockerMutationTarget(
+        "docker-resource",
+        full_id,
+        observation_revision,
+        control_generation,
+        repo_id="repo-123",
+        owner_uid=501,
+    )
 
 
 def _ephemeral_identity() -> EphemeralDockerIdentity:
@@ -45,6 +60,7 @@ def _ephemeral_identity() -> EphemeralDockerIdentity:
 def _ephemeral_create_target(**overrides: object) -> EphemeralDockerCreateTarget:
     values: dict[str, object] = {
         "identity": _ephemeral_identity(),
+        "owner_uid": 501,
         "container_name": f"devcoordinator-artifact-postgres-{_RUN_HEX}",
         "image_ref": "postgres@sha256:" + "b" * 64,
         "command": ("postgres", "-c", "fsync=off"),
@@ -96,6 +112,8 @@ def _ephemeral_inspect_stdout(
     devices: object = None,
     network_mode: str = "bridge",
     pid_mode: str = "",
+    state_pid: int = 0,
+    networks: object | None = None,
 ) -> str:
     source = identity or _ephemeral_identity()
     labels = dict(
@@ -125,6 +143,8 @@ def _ephemeral_inspect_stdout(
             devices,
             network_mode,
             pid_mode,
+            state_pid,
+            {} if networks is None else networks,
         )
     )
 
@@ -185,7 +205,7 @@ class BrokerHostMutationTests(unittest.TestCase):
                     )
                 self.assertEqual(evidence["pid"], process.pid)
                 self.assertEqual(evidence["cwd"], str(root))
-                self.assertEqual(evidence["owner_uid"], os.geteuid())
+                self.assertNotIn("owner_uid", evidence)
                 foreign = root / "foreign"
                 foreign.mkdir()
                 with self.assertRaisesRegex(
@@ -201,6 +221,52 @@ class BrokerHostMutationTests(unittest.TestCase):
                 except subprocess.TimeoutExpired:
                     process.kill()
                     process.wait(timeout=3)
+
+    def test_local_file_exchange_does_not_require_owner_or_mode_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            log = root / "service.log"
+            log.write_bytes(b"first\nsecond\n")
+            log.chmod(0o666)
+            payload, discarded, identity = (
+                LocalBrokerHostMutations._read_bounded_service_log(
+                    str(log), maximum_buffer=7
+                )
+            )
+            self.assertEqual(payload, b"second\n")
+            self.assertEqual(discarded, 6)
+            self.assertRegex(identity, r"^sha256:[0-9a-f]{64}$")
+
+            output = root / "shared-output"
+            output.mkdir(mode=0o777)
+            output.chmod(0o777)
+            self.assertEqual(
+                broker_host_module._require_service_output_root(str(output)),
+                output,
+            )
+
+    def test_local_postgres_password_mount_ignores_owner_mode_and_link_count(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "material"
+            source.mkdir()
+            source.chmod(0o777)
+            password = source / "postgres-initdb-password"
+            password.write_bytes(b"not-a-real-password")
+            password.chmod(0o666)
+            os.link(password, source / "same-material")
+            mount = EphemeralSecretMount(
+                policy=EphemeralSecretPolicy(
+                    kind="postgres_initdb_password_file_v1",
+                    binding_id="0d5cc838-1c5e-440b-a286-819d60efcb8a",
+                ),
+                source_directory=source,
+            )
+            self.assertIs(
+                broker_host_module._validate_ephemeral_secret_mount(
+                    mount, require_material=True
+                ),
+                mount,
+            )
 
     def test_listener_adoption_requires_exact_typed_repository_evidence(self) -> None:
         root = str(Path(tempfile.gettempdir()).resolve())
@@ -267,16 +333,32 @@ class BrokerHostMutationTests(unittest.TestCase):
             command: tuple[str, ...], timeout: float
         ) -> subprocess.CompletedProcess[str]:
             calls.append((command, timeout))
+            if command[1] == "inspect":
+                return subprocess.CompletedProcess(
+                    command, 0, stdout=json.dumps(_PROJECT_SLICE), stderr=""
+                )
             return subprocess.CompletedProcess(command, 0, stdout="container-id\n", stderr="")
 
-        target = DockerMutationTarget("docker-resource", "a" * 64, 11, 7)
+        target = _docker_target("a" * 64, 11, 7)
         host = LocalBrokerHostMutations(
             docker_executable="/trusted/docker",
             docker_timeout_seconds=9,
             docker_runner=runner,
         )
         result = host.docker_restart(target)
-        self.assertEqual(calls, [(('/trusted/docker', 'restart', 'a' * 64), 9.0)])
+        self.assertEqual(
+            calls,
+            [
+                ((
+                    "/trusted/docker",
+                    "inspect",
+                    "--format",
+                    "{{json .HostConfig.CgroupParent}}",
+                    "a" * 64,
+                ), 9.0),
+                (("/trusted/docker", "restart", "a" * 64), 9.0),
+            ],
+        )
         self.assertEqual(result["resource_id"], "docker-resource")
         self.assertEqual(result["full_container_id"], "a" * 64)
         self.assertEqual(result["observation_revision"], 11)
@@ -296,8 +378,29 @@ class BrokerHostMutationTests(unittest.TestCase):
             docker_executable="/trusted/docker", docker_runner=runner
         )
         with self.assertRaises(ValueError):
-            host.docker_start(DockerMutationTarget("docker-resource", "friendly-name", 1, 1))
+            host.docker_start(_docker_target("friendly-name"))
         self.assertFalse(called)
+
+    def test_docker_start_refuses_container_outside_repository_slice(self) -> None:
+        calls: list[tuple[str, ...]] = []
+
+        def runner(command: tuple[str, ...], timeout: float):
+            del timeout
+            calls.append(command)
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                stdout=json.dumps("system.slice"),
+                stderr="",
+            )
+
+        host = LocalBrokerHostMutations(
+            docker_executable="/trusted/docker", docker_runner=runner
+        )
+        with self.assertRaises(BrokerBackendError) as raised:
+            host.docker_start(_docker_target("e" * 64))
+        self.assertEqual(raised.exception.code, "project_isolation_mismatch")
+        self.assertEqual(len(calls), 1, "unsafe container reached a start mutation")
 
     def test_docker_nonzero_exit_is_outcome_uncertain_without_host_diagnostic(
         self,
@@ -305,18 +408,26 @@ class BrokerHostMutationTests(unittest.TestCase):
         def runner(
             command: tuple[str, ...], timeout: float
         ) -> subprocess.CompletedProcess[str]:
+            if command[1] == "inspect":
+                return subprocess.CompletedProcess(
+                    command, 0, stdout=json.dumps(_PROJECT_SLICE), stderr=""
+                )
             return subprocess.CompletedProcess(command, 1, stdout="", stderr="not found")
 
         host = LocalBrokerHostMutations(
             docker_executable="/trusted/docker", docker_runner=runner
         )
         with self.assertRaises(BrokerBackendError) as raised:
-            host.docker_stop(DockerMutationTarget("docker-resource", "b" * 64, 1, 1))
+            host.docker_stop(_docker_target("b" * 64))
         self.assertEqual(raised.exception.code, "operation_outcome_uncertain")
         self.assertNotIn("not found", raised.exception.message)
 
     def test_docker_timeout_is_outcome_uncertain(self) -> None:
         def runner(command: tuple[str, ...], timeout: float):
+            if command[1] == "inspect":
+                return subprocess.CompletedProcess(
+                    command, 0, stdout=json.dumps(_PROJECT_SLICE), stderr=""
+                )
             raise subprocess.TimeoutExpired(command, timeout)
 
         host = LocalBrokerHostMutations(
@@ -324,12 +435,16 @@ class BrokerHostMutationTests(unittest.TestCase):
         )
         with self.assertRaises(BrokerBackendError) as raised:
             host.docker_restart(
-                DockerMutationTarget("docker-resource", "c" * 64, 1, 1)
+                _docker_target("c" * 64)
             )
         self.assertEqual(raised.exception.code, "operation_outcome_uncertain")
 
     def test_docker_runner_exception_is_outcome_uncertain(self) -> None:
         def runner(command: tuple[str, ...], timeout: float):
+            if command[1] == "inspect":
+                return subprocess.CompletedProcess(
+                    command, 0, stdout=json.dumps(_PROJECT_SLICE), stderr=""
+                )
             raise OSError("sensitive host diagnostic")
 
         host = LocalBrokerHostMutations(
@@ -337,7 +452,7 @@ class BrokerHostMutationTests(unittest.TestCase):
         )
         with self.assertRaises(BrokerBackendError) as raised:
             host.docker_start(
-                DockerMutationTarget("docker-resource", "d" * 64, 1, 1)
+                _docker_target("d" * 64)
             )
         self.assertEqual(raised.exception.code, "operation_outcome_uncertain")
         self.assertNotIn("sensitive", raised.exception.message)
@@ -480,7 +595,7 @@ class BrokerHostMutationTests(unittest.TestCase):
 
         create = calls[0]
         self.assertEqual(
-            create[:15],
+            create[:19],
             (
                 "/trusted/docker",
                 "create",
@@ -496,6 +611,10 @@ class BrokerHostMutationTests(unittest.TestCase):
                 str(512 * 1024 * 1024),
                 "--cpus",
                 "1.5",
+                "--pids-limit",
+                "4096",
+                "--cgroup-parent",
+                _PROJECT_SLICE,
                 "--label",
             ),
         )

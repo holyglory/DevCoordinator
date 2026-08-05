@@ -12,6 +12,7 @@ from .worker_control import WorkerController
 
 
 WorkerRevoker = Callable[[str, str, str], Optional[Mapping[str, Any]]]
+WorkerExecutionUIDResolver = Callable[[str, str], int]
 
 
 def unregister_workers_for_plan(
@@ -20,7 +21,8 @@ def unregister_workers_for_plan(
     plan: Any,
     actor: str,
     coordinator_script: Path,
-    execution_uid: int,
+    execution_uid: int | None = None,
+    execution_uid_for_worker: WorkerExecutionUIDResolver | None = None,
     revoke: Optional[WorkerRevoker] = None,
 ) -> dict[str, Any]:
     """Revoke and unregister every exact worker named by one validated plan."""
@@ -109,10 +111,19 @@ def unregister_workers_for_plan(
                     }
                 )
             continue
+        worker_execution_uid = (
+            execution_uid_for_worker(worker_id, repo_id)
+            if execution_uid_for_worker is not None
+            else execution_uid
+        )
+        if type(worker_execution_uid) is not int or worker_execution_uid < 0:
+            raise RuntimeError(
+                "validated worker removal target has no execution identity"
+            )
         result = WorkerController(
             store,
             coordinator_script=coordinator_script,
-            execution_uid=execution_uid,
+            execution_uid=worker_execution_uid,
         ).unregister(
             worker_id=worker_id,
             canonical_repository=str(row["canonical_root"]),

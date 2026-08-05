@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
@@ -10,6 +11,7 @@ import socket
 import sqlite3
 import stat
 import struct
+import subprocess
 import sys
 import tempfile
 import threading
@@ -17,6 +19,7 @@ import time
 import unittest
 import uuid
 from contextlib import contextmanager
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Iterator, Mapping, Optional
 from unittest import mock
@@ -29,6 +32,7 @@ import dev_coordinator  # noqa: E402
 
 import devcoordinator.broker as broker_module  # noqa: E402
 import devcoordinator.broker_persistence as broker_persistence  # noqa: E402
+import devcoordinator.repository_context as repository_context_module  # noqa: E402
 from devcoordinator.broker import (  # noqa: E402
     AccountAccessPolicy,
     AuthorizedBrokerRequest,
@@ -66,7 +70,13 @@ from devcoordinator.repository_lifecycle import (  # noqa: E402
     RunningState,
 )
 from devcoordinator.sqlite_lifecycle import SQLiteLifecyclePersistence  # noqa: E402
-from devcoordinator.store import AccountStore, CoordinatorStore, utc_timestamp  # noqa: E402
+from devcoordinator.store import (  # noqa: E402
+    AccountStore,
+    CoordinatorStore,
+    deterministic_id,
+    utc_timestamp,
+)
+from devcoordinator.schema import establish_repository_owner_authority  # noqa: E402
 
 ACCOUNT_ID = "account-current"
 PROJECT_ID = "repo-alpha"
@@ -556,6 +566,20 @@ def seed_store_backed_broker(
                 """,
                 (PROJECT_ID, now),
             )
+            establish_repository_owner_authority(
+                connection,
+                repository_id=PROJECT_ID,
+                owner_uid=os.geteuid(),
+                repository_generation=0,
+                operation_id=str(uuid.uuid4()),
+                actor="fixture",
+                reason="broker test fixture owner",
+                timestamp=now,
+                evidence={"kind": "broker-test-fixture"},
+            )
+            connection.execute(
+                "UPDATE schema_metadata SET migration_state = 'ready' WHERE singleton = 1"
+            )
             connection.execute(
                 """
                 INSERT INTO server_definitions(
@@ -813,6 +837,17 @@ def _committed_available_observer(store: CoordinatorStore) -> Mapping[str, Any]:
 
 
 class PeerCredentialTests(unittest.TestCase):
+    def test_client_identity_metadata_is_optional_compatibility_input(self) -> None:
+        client = BrokerClient(Path("/tmp/devcoordinator-optional.sock"))
+        compatibility = BrokerClient(
+            Path("/tmp/devcoordinator-optional.sock"),
+            expected_broker_uid=-1,
+            expected_socket_gid=-1,
+            expected_socket_mode=-1,
+        )
+
+        self.assertEqual(client.socket_path, compatibility.socket_path)
+
     def test_kernel_peer_credentials_match_the_real_unix_peer(self) -> None:
         left, right = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
@@ -821,21 +856,34 @@ class PeerCredentialTests(unittest.TestCase):
             left.close()
             right.close()
 
-        self.assertEqual(credentials.uid, os.geteuid())
-        self.assertEqual(credentials.gid, os.getegid())
-        if sys.platform.startswith("linux"):
-            self.assertEqual(credentials.pid, os.getpid())
-        else:
+        if credentials.uid == broker_module.UNMAPPED_LOCAL_IDENTITY:
+            self.assertEqual(credentials.gid, broker_module.UNMAPPED_LOCAL_IDENTITY)
             self.assertIsNone(credentials.pid)
+        else:
+            self.assertEqual(credentials.uid, os.geteuid())
+            self.assertEqual(credentials.gid, os.getegid())
+            if sys.platform.startswith("linux"):
+                self.assertEqual(credentials.pid, os.getpid())
+            else:
+                self.assertIsNone(credentials.pid)
 
     def test_non_unix_socket_cannot_bypass_peer_authentication(self) -> None:
-        connection = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        try:
-            with self.assertRaises(BrokerError) as raised:
-                resolve_peer_credentials(connection)
-        finally:
-            connection.close()
+        connection = mock.Mock()
+        connection.family = socket.AF_INET
+        with self.assertRaises(BrokerError) as raised:
+            resolve_peer_credentials(connection)
         self.assertEqual(raised.exception.code, "peer_credentials_unavailable")
+
+    def test_unavailable_unix_peer_credentials_use_unmapped_attribution(self) -> None:
+        connection = mock.Mock()
+        connection.family = socket.AF_UNIX
+        connection.getsockopt.side_effect = OSError("fixture unavailable")
+
+        credentials = resolve_peer_credentials(connection)
+
+        self.assertEqual(credentials.uid, broker_module.UNMAPPED_LOCAL_IDENTITY)
+        self.assertEqual(credentials.gid, broker_module.UNMAPPED_LOCAL_IDENTITY)
+        self.assertIsNone(credentials.pid)
 
 
 class AuthorizationAndProtocolTests(unittest.TestCase):
@@ -916,6 +964,40 @@ class AuthorizationAndProtocolTests(unittest.TestCase):
         self.assertFalse(rejected["ok"], rejected)
         self.assertEqual(rejected["error"]["code"], "backend_result_too_large")
 
+    def test_unexpected_read_failure_is_logged_and_returned_as_a_frame(self) -> None:
+        class BrokenInventoryBackend:
+            def execute(self, _request: AuthorizedBrokerRequest) -> Mapping[str, Any]:
+                raise OSError("fixture transport disappeared")
+
+        inventory_policy = {
+            os.geteuid(): AccountAccessPolicy(
+                account_id=ACCOUNT_ID,
+                grants={
+                    PROJECT_ID: {
+                        PROJECT_ID: frozenset({BrokerOperation.INVENTORY_READ})
+                    }
+                },
+            )
+        }
+        service = BrokerService(
+            StaticPeerAuthorizer(inventory_policy),
+            SerializedMutationWriter(BrokenInventoryBackend()),  # type: ignore[arg-type]
+        )
+        request = request_for(
+            BrokerOperation.INVENTORY_READ, resource_id=PROJECT_ID
+        )
+
+        with self.assertLogs(broker_module._LOGGER, level="ERROR") as captured:
+            reply = service.reply_for_document(self.peer, request.to_wire())
+
+        self.assertFalse(reply["ok"], reply)
+        self.assertEqual(reply["operation_id"], request.operation_id)
+        self.assertEqual(reply["error"]["code"], "internal_error")
+        self.assertNotIn("fixture transport disappeared", reply["error"]["message"])
+        self.assertTrue(
+            any("broker request failed unexpectedly" in line for line in captured.output)
+        )
+
     def test_host_observe_reaches_database_single_flight_without_outer_repo_lock(self) -> None:
         release = threading.Event()
         backend = RecordingBackend(release=release)
@@ -971,18 +1053,16 @@ class AuthorizationAndProtocolTests(unittest.TestCase):
         self.assertEqual(len(replies), 2)
         self.assertTrue(all(reply["ok"] for reply in replies), replies)
 
-    def test_unknown_peer_and_cross_account_project_resource_operation_are_rejected(self) -> None:
+    def test_peer_uid_is_attribution_while_typed_policy_boundaries_remain(self) -> None:
         cases: list[tuple[str, PeerCredentials, dict[str, Any], str]] = []
 
-        unknown_peer_request = request_for().to_wire()
-        cases.append(
-            (
-                "unknown peer",
-                peer_for(os.geteuid() + 10000),
-                unknown_peer_request,
-                "peer_not_authorized",
-            )
+        unknown_peer_request = request_for()
+        unknown_peer_reply = self.service.reply_for_document(
+            peer_for(os.geteuid() + 10000), unknown_peer_request.to_wire()
         )
+        self.assertTrue(unknown_peer_reply["ok"], unknown_peer_reply)
+        self.assertEqual(self.backend.calls[-1].peer.uid, os.geteuid() + 10000)
+        self.assertEqual(self.backend.calls[-1].authorization_uid, os.geteuid())
 
         cross_account = request_for().to_wire()
         cross_account["account_id"] = "account-other"
@@ -1037,7 +1117,7 @@ class AuthorizationAndProtocolTests(unittest.TestCase):
                 self.assertEqual(reply["operation_id"], document["operation_id"])
                 self.assertEqual(reply["error"]["code"], expected_code)
 
-        self.assertEqual(self.backend.calls, [])
+        self.assertEqual(len(self.backend.calls), 1)
 
     def test_paths_commands_sql_and_untyped_arguments_are_rejected_before_backend(self) -> None:
         cases: list[tuple[str, dict[str, Any], str]] = []
@@ -1252,6 +1332,80 @@ class SingleWriterConcurrencyTests(unittest.TestCase):
         self.assertEqual(len(replies), 2)
         self.assertTrue(all(reply["ok"] for reply in replies), replies)
 
+    def test_worker_runner_callback_progresses_during_same_resource_runtime_action(self) -> None:
+        runtime_entered = threading.Event()
+        release_runtime = threading.Event()
+        callback_entered = threading.Event()
+
+        class RuntimeAndRunnerBackend:
+            def execute(self, request: AuthorizedBrokerRequest) -> Mapping[str, Any]:
+                if request.request.operation is BrokerOperation.RUNTIME_REQUEST:
+                    runtime_entered.set()
+                    if not release_runtime.wait(timeout=3.0):
+                        raise RuntimeError("runtime release boundary timed out")
+                else:
+                    callback_entered.set()
+                return {"status": "accepted"}
+
+        writer = SerializedMutationWriter(RuntimeAndRunnerBackend())
+        peer = peer_for()
+
+        def authorized(operation: BrokerOperation) -> AuthorizedBrokerRequest:
+            return AuthorizedBrokerRequest(
+                peer=peer,
+                request=BrokerRequest(
+                    operation_id=str(uuid.uuid4()),
+                    authority_generation=CURRENT_AUTHORITY_GENERATION,
+                    account_id=ACCOUNT_ID,
+                    project_id=PROJECT_ID,
+                    repository_generation=0,
+                    resource_id=SERVER_ID,
+                    operation=operation,
+                    arguments={},
+                ),
+            )
+
+        runtime_results: list[dict[str, Any]] = []
+        callback_results: list[dict[str, Any]] = []
+        failures: list[BaseException] = []
+
+        def invoke(
+            request: AuthorizedBrokerRequest, results: list[dict[str, Any]]
+        ) -> None:
+            try:
+                results.append(writer.execute(request))
+            except BaseException as error:
+                failures.append(error)
+
+        runtime = threading.Thread(
+            target=invoke,
+            args=(authorized(BrokerOperation.RUNTIME_REQUEST), runtime_results),
+        )
+        callback = threading.Thread(
+            target=invoke,
+            args=(authorized(BrokerOperation.WORKER_LAUNCH_TICKET), callback_results),
+        )
+        runtime.start()
+        self.assertTrue(
+            runtime_entered.wait(timeout=1.0),
+            "runtime action did not reach its lifecycle boundary",
+        )
+        callback.start()
+        callback_progressed = callback_entered.wait(timeout=1.0)
+        release_runtime.set()
+        runtime.join(timeout=2.0)
+        callback.join(timeout=2.0)
+
+        self.assertTrue(
+            callback_progressed,
+            "worker callback was blocked behind its parent runtime resource lock",
+        )
+        self.assertFalse(runtime.is_alive(), failures)
+        self.assertFalse(callback.is_alive(), failures)
+        self.assertEqual(failures, [])
+        self.assertEqual(runtime_results, [{"status": "accepted"}])
+        self.assertEqual(callback_results, [{"status": "accepted"}])
+
     def test_concurrent_duplicate_operation_executes_backend_once(self) -> None:
         entered = threading.Event()
         release = threading.Event()
@@ -1440,31 +1594,63 @@ class SingleWriterConcurrencyTests(unittest.TestCase):
 
 
 class RuntimeAndSocketIntegrationTests(unittest.TestCase):
-    def test_runtime_directory_rejects_world_access_group_write_and_symlink(self) -> None:
+    def test_client_classifies_executor_denied_unix_transport(self) -> None:
+        request = request_for()
+        socket_metadata = mock.Mock(st_dev=1, st_ino=2)
+        connection = mock.MagicMock()
+        connection.__enter__.return_value = connection
+        connection.connect.side_effect = PermissionError(
+            errno.EPERM,
+            "sandbox denied Unix transport",
+        )
+
+        with (
+            mock.patch.object(
+                broker_module,
+                "_validate_client_socket",
+                return_value=socket_metadata,
+            ),
+            mock.patch.object(
+                broker_module.socket,
+                "socket",
+                return_value=connection,
+            ),
+            mock.patch.object(BrokerClient, "_require_available", return_value=None),
+        ):
+            with self.assertRaises(BrokerError) as denied:
+                BrokerClient(
+                    Path("/run/devcoordinator-authority.sock"),
+                    expected_broker_uid=0,
+                    expected_socket_gid=0,
+                ).call(request)
+
+        self.assertEqual(denied.exception.code, "broker_transport_forbidden")
+        self.assertEqual(denied.exception.operation_id, request.operation_id)
+
+    def test_runtime_directory_ignores_local_modes_but_rejects_symlink(
+        self,
+    ) -> None:
         with CanonicalTemporaryDirectory() as root:
             runtime = root / "runtime"
             runtime.mkdir(mode=0o700)
 
             os.chmod(runtime, 0o755)
-            with self.assertRaises(BrokerError) as world_access:
-                validate_runtime_directory(runtime, expected_uid=os.geteuid())
-            self.assertEqual(world_access.exception.code, "unsafe_runtime_directory")
-
-            os.chmod(runtime, 0o770)
-            with self.assertRaises(BrokerError) as group_write:
-                validate_runtime_directory(runtime, expected_uid=os.geteuid())
-            self.assertEqual(group_write.exception.code, "unsafe_runtime_directory")
-
-            os.chmod(runtime, 0o750)
             validate_runtime_directory(runtime, expected_uid=os.geteuid())
 
+            os.chmod(runtime, 0o775)
+            validate_runtime_directory(runtime, expected_uid=os.geteuid())
+
+            os.chmod(runtime, 0o757)
+            validate_runtime_directory(runtime, expected_uid=os.geteuid())
+
+            os.chmod(runtime, 0o755)
             alias = root / "runtime-alias"
             alias.symlink_to(runtime, target_is_directory=True)
             with self.assertRaises(BrokerError) as symlink:
                 validate_runtime_directory(alias, expected_uid=os.geteuid())
             self.assertEqual(symlink.exception.code, "unsafe_runtime_directory")
 
-    def test_runtime_directory_rejects_replaceable_ancestor_and_missing_group_traversal(self) -> None:
+    def test_runtime_directory_accepts_shared_ancestor_and_private_direct_start(self) -> None:
         backend = RecordingBackend()
         service, _ = service_for(backend)
         with CanonicalTemporaryDirectory() as root:
@@ -1473,19 +1659,13 @@ class RuntimeAndSocketIntegrationTests(unittest.TestCase):
             os.chmod(runtime, 0o750)
             os.chmod(root, 0o777)
             try:
-                with self.assertRaises(BrokerError) as ancestor:
-                    validate_runtime_directory(runtime, expected_uid=os.geteuid())
-                self.assertEqual(
-                    ancestor.exception.code, "unsafe_runtime_directory"
-                )
+                validate_runtime_directory(runtime, expected_uid=os.geteuid())
             finally:
                 os.chmod(root, 0o700)
 
             os.chmod(runtime, 0o700)
-            server = UnixBrokerServer(runtime / "broker.sock", service)
-            with self.assertRaises(BrokerError) as traversal:
-                server.start()
-            self.assertEqual(traversal.exception.code, "unsafe_runtime_directory")
+            with UnixBrokerServer(runtime / "broker.sock", service):
+                pass
 
     def test_server_uses_real_peer_credentials_and_protected_socket(self) -> None:
         backend = RecordingBackend()
@@ -1516,7 +1696,7 @@ class RuntimeAndSocketIntegrationTests(unittest.TestCase):
                 server.close()
             self.assertFalse(socket_path.exists())
 
-    def test_client_rejects_wrong_broker_owner_and_socket_group(self) -> None:
+    def test_client_captures_peer_uid_but_does_not_authorize_with_it(self) -> None:
         backend = RecordingBackend()
         service, _ = service_for(backend)
         with CanonicalTemporaryDirectory() as root:
@@ -1526,22 +1706,89 @@ class RuntimeAndSocketIntegrationTests(unittest.TestCase):
             socket_path = runtime / "broker.sock"
             with UnixBrokerServer(socket_path, service):
                 request = request_for()
-                with self.assertRaises(BrokerError) as owner:
-                    BrokerClient(
-                        socket_path,
-                        expected_broker_uid=os.geteuid() + 10_000,
-                        expected_socket_gid=os.getegid(),
-                    ).call(request)
-                self.assertEqual(owner.exception.code, "unsafe_runtime_directory")
+                owner = BrokerClient(
+                    socket_path,
+                    expected_broker_uid=os.geteuid() + 10_000,
+                    expected_socket_gid=os.getegid(),
+                ).call(request)
+                self.assertTrue(owner["ok"], owner)
 
-                with self.assertRaises(BrokerError) as group:
-                    BrokerClient(
+                group = BrokerClient(
+                    socket_path,
+                    expected_broker_uid=os.geteuid(),
+                    expected_socket_gid=os.getegid() + 10_000,
+                ).call(request)
+                self.assertTrue(group["ok"], group)
+                self.assertEqual(owner, group)
+            # This is one idempotent operation replayed through different
+            # deprecated metadata hints. Neither hint authorizes the call or
+            # causes the backend to execute twice.
+            self.assertEqual(len(backend.calls), 1)
+
+    def test_system_socket_accepts_unmapped_root_identity(self) -> None:
+        backend = RecordingBackend()
+        service, _ = service_for(backend)
+        with CanonicalTemporaryDirectory() as root:
+            runtime = root / "runtime"
+            runtime.mkdir(mode=0o750)
+            os.chmod(runtime, 0o750)
+            socket_path = runtime / "broker.sock"
+            with UnixBrokerServer(socket_path, service):
+                real_lstat = os.lstat
+                real_peer_credentials = broker_module.resolve_peer_credentials
+
+                def unmapped_identity(path: str) -> os.stat_result:
+                    metadata = real_lstat(path)
+                    fields = list(metadata)
+                    fields[4] = 65534
+                    fields[5] = 65534
+                    return os.stat_result(fields)
+
+                def unmapped_client_peer(
+                    connection: socket.socket,
+                ) -> PeerCredentials:
+                    credentials = real_peer_credentials(connection)
+                    if connection.getpeername() == str(socket_path):
+                        return PeerCredentials(
+                            uid=65534,
+                            gid=65534,
+                            pid=credentials.pid,
+                        )
+                    return credentials
+
+                with mock.patch.object(
+                    broker_module, "SYSTEM_BROKER_SOCKET_PATH", socket_path
+                ), mock.patch.object(
+                    os, "lstat", new=unmapped_identity
+                ), mock.patch.object(
+                    broker_module,
+                    "resolve_peer_credentials",
+                    new=unmapped_client_peer,
+                ), mock.patch.object(
+                    BrokerClient, "_require_available", return_value=None
+                ):
+                    reply = BrokerClient(
                         socket_path,
-                        expected_broker_uid=os.geteuid(),
-                        expected_socket_gid=os.getegid() + 10_000,
-                    ).call(request)
-                self.assertEqual(group.exception.code, "broker_identity_mismatch")
-            self.assertEqual(backend.calls, [])
+                        expected_broker_uid=0,
+                        expected_socket_gid=0,
+                    ).call(request_for())
+
+                self.assertTrue(reply["ok"], reply)
+                self.assertEqual(len(backend.calls), 1)
+
+                with mock.patch.object(
+                    os, "lstat", new=unmapped_identity
+                ), mock.patch.object(
+                    BrokerClient, "_require_available", return_value=None
+                ):
+                    custom_path = BrokerClient(
+                        socket_path,
+                        expected_broker_uid=0,
+                        expected_socket_gid=0,
+                    ).call(request_for())
+
+                self.assertTrue(custom_path["ok"], custom_path)
+                self.assertEqual(len(backend.calls), 2)
 
     def test_client_rejects_socket_inode_change_during_connect(self) -> None:
         backend = RecordingBackend()
@@ -1906,7 +2153,7 @@ class RuntimeAndSocketIntegrationTests(unittest.TestCase):
             self.assertEqual(reply["error"]["code"], "request_too_large")
             self.assertEqual(backend.calls, [])
 
-    def test_real_unknown_peer_is_rejected_before_mutation(self) -> None:
+    def test_real_unknown_peer_uses_configured_policy_union(self) -> None:
         backend = RecordingBackend()
         configured_uid = os.geteuid() + 10000
         service, _ = service_for(backend, uid=configured_uid)
@@ -1923,10 +2170,10 @@ class RuntimeAndSocketIntegrationTests(unittest.TestCase):
                     expected_socket_gid=os.getegid(),
                 ).call(request)
 
-        self.assertFalse(reply["ok"])
+        self.assertTrue(reply["ok"], reply)
         self.assertEqual(reply["operation_id"], request.operation_id)
-        self.assertEqual(reply["error"]["code"], "peer_not_authorized")
-        self.assertEqual(backend.calls, [])
+        self.assertEqual(len(backend.calls), 1)
+        self.assertEqual(backend.calls[0].peer.uid, os.geteuid())
 
     def test_server_never_replaces_an_existing_socket_path(self) -> None:
         backend = RecordingBackend()
@@ -2250,6 +2497,508 @@ class RuntimeAndSocketIntegrationTests(unittest.TestCase):
 
 
 class StoreBackedBrokerTests(unittest.TestCase):
+    def test_protected_local_reader_reuses_enabled_route_without_target_enrollment(
+        self,
+    ) -> None:
+        """Missing per-account rows are not local authorization boundaries."""
+
+        with CanonicalTemporaryDirectory() as root:
+            persistence, _actions = seed_store_backed_broker(root)
+            anchor_repo_id = "repo-console-anchor"
+            anchor_account_id = "account-console"
+            console_uid = max(os.geteuid(), 1) + 120_000
+            now = utc_timestamp()
+            with CoordinatorStore.open(
+                persistence.database_path, expected_uid=os.geteuid()
+            ) as store:
+                with store.immediate_transaction() as connection:
+                    connection.execute(
+                        """
+                        INSERT INTO repositories(
+                            repo_id, host_id, canonical_root, display_name,
+                            state, generation, created_at, updated_at
+                        ) VALUES (?, ?, '/repos/console-anchor',
+                                  'Console anchor', 'active', 0, ?, ?)
+                        """,
+                        (anchor_repo_id, HOST_ID, now, now),
+                    )
+                    connection.execute(
+                        """
+                        INSERT INTO repository_installations(
+                            repo_id, status, startup_fenced, generation,
+                            actor, updated_at
+                        ) VALUES (?, 'installed', 0, 0, 'fixture', ?)
+                        """,
+                        (anchor_repo_id, now),
+                    )
+                    establish_repository_owner_authority(
+                        connection,
+                        repository_id=anchor_repo_id,
+                        owner_uid=console_uid,
+                        repository_generation=0,
+                        operation_id=str(uuid.uuid4()),
+                        actor="fixture",
+                        reason="protected reader transport anchor",
+                        timestamp=now,
+                        evidence={"kind": "protected-reader-anchor"},
+                    )
+            persistence.provision_principal(
+                uid=console_uid, account_id=anchor_account_id
+            )
+            persistence.provision_repository_enrollment(
+                uid=console_uid,
+                repo_id=anchor_repo_id,
+                account_id=anchor_account_id,
+                issued_at=now,
+                valid_until_epoch=int(time.time()) + 3_600,
+            )
+            resolve_request = BrokerRequest.create(
+                account_id=anchor_account_id,
+                project_id=anchor_repo_id,
+                resource_id=anchor_repo_id,
+                operation=BrokerOperation.REPOSITORY_RESOLVE,
+                arguments={"canonical_root": "/repos/alpha"},
+                authority_generation=CURRENT_AUTHORITY_GENERATION,
+            )
+            physical_peer = peer_for(console_uid)
+            authorized_resolve = persistence.authorize(
+                physical_peer, resolve_request
+            )
+            with CoordinatorStore.open(
+                persistence.database_path, expected_uid=os.geteuid()
+            ) as store:
+                with store.immediate_transaction() as connection:
+                    connection.execute(
+                        """
+                        UPDATE broker_repository_enrollments
+                        SET valid_until_epoch = ?, updated_at = ?
+                        WHERE uid = ? AND repo_id = ?
+                        """,
+                        (
+                            int(time.time()) - 1,
+                            utc_timestamp(),
+                            os.geteuid(),
+                            PROJECT_ID,
+                        ),
+                    )
+                    connection.execute(
+                        """
+                        UPDATE server_definitions
+                        SET log_path = ?, updated_at = ?
+                        WHERE repo_id = ? AND server_definition_id = ?
+                        """,
+                        (
+                            "/var/log/devcoordinator/server-web.log",
+                            utc_timestamp(),
+                            PROJECT_ID,
+                            SERVER_ID,
+                        ),
+                    )
+
+            resolved = persistence.resolve_repository_enrollment(
+                authorized_resolve
+            )
+
+            self.assertEqual(resolved["state"], "enrolled")
+            self.assertEqual(resolved["repository"]["repo_id"], PROJECT_ID)
+            self.assertEqual(
+                resolved["repository"]["account_id"], ACCOUNT_ID
+            )
+            self.assertEqual(
+                resolved["repository"]["servers"], {"web": SERVER_ID}
+            )
+            with CoordinatorStore.open(
+                persistence.database_path, expected_uid=os.geteuid()
+            ) as store:
+                with store.read_transaction() as connection:
+                    protected_target_enrollments = connection.execute(
+                        """
+                        SELECT count(*) FROM broker_repository_enrollments
+                        WHERE uid = ? AND repo_id = ?
+                        """,
+                        (console_uid, PROJECT_ID),
+                    ).fetchone()[0]
+            self.assertEqual(protected_target_enrollments, 0)
+            persistence.grant_runtime(
+                uid=os.geteuid(),
+                repo_id=PROJECT_ID,
+                resource_kind="service",
+                resource_id=SERVER_ID,
+                action="status",
+            )
+            runtime_request = BrokerRequest.create(
+                account_id=ACCOUNT_ID,
+                project_id=PROJECT_ID,
+                resource_id=SERVER_ID,
+                operation=BrokerOperation.RUNTIME_REQUEST,
+                arguments={
+                    "action": "capture_logs",
+                    "agent": "devops-console:protected-reader",
+                    "root_repo_id": PROJECT_ID,
+                    "temporary_repo_id": None,
+                    "target_kind": "service",
+                    "purpose": "development",
+                    "ttl_seconds": None,
+                    "kill_after_run": False,
+                },
+                authority_generation=CURRENT_AUTHORITY_GENERATION,
+            )
+
+            authorized_runtime = persistence.authorize(
+                physical_peer, runtime_request
+            )
+
+            self.assertEqual(authorized_runtime.peer.uid, console_uid)
+            self.assertEqual(
+                authorized_runtime.authorization_uid, os.geteuid()
+            )
+            service_log_target = persistence.runtime_service_log_target(
+                authorized_runtime
+            )
+            self.assertEqual(service_log_target.repo_id, PROJECT_ID)
+            self.assertEqual(
+                service_log_target.server_definition_id, SERVER_ID
+            )
+            persistence.grant_runtime(
+                uid=os.geteuid(),
+                repo_id=PROJECT_ID,
+                resource_kind="service",
+                resource_id=SERVER_ID,
+                action="status",
+                enabled=False,
+            )
+            with self.assertRaises(BrokerError) as disabled_action:
+                persistence.authorize(physical_peer, runtime_request)
+            self.assertEqual(
+                disabled_action.exception.code, "operation_access_denied"
+            )
+
+            with CoordinatorStore.open(
+                persistence.database_path, expected_uid=os.geteuid()
+            ) as store:
+                with store.immediate_transaction() as connection:
+                    connection.execute(
+                        """
+                        UPDATE repository_installations
+                        SET startup_fenced = 1, updated_at = ?
+                        WHERE repo_id = ?
+                        """,
+                        (utc_timestamp(), PROJECT_ID),
+                    )
+            fenced = persistence.resolve_repository_enrollment(
+                authorized_resolve
+            )
+            self.assertEqual(fenced["state"], "blocked")
+            with CoordinatorStore.open(
+                persistence.database_path, expected_uid=os.geteuid()
+            ) as store:
+                with store.immediate_transaction() as connection:
+                    connection.execute(
+                        """
+                        UPDATE repository_installations
+                        SET startup_fenced = 0, updated_at = ?
+                        WHERE repo_id = ?
+                        """,
+                        (utc_timestamp(), PROJECT_ID),
+                    )
+                    connection.execute(
+                        """
+                        INSERT INTO broker_repository_revocations(
+                            repo_id, repository_generation,
+                            cleanup_operation_id, immutable_fingerprint,
+                            canonical_root, actor, revoked_at
+                        ) VALUES (?, 0, ?, ?, '/repos/alpha', 'fixture', ?)
+                        """,
+                        (
+                            PROJECT_ID,
+                            "cleanup-protected-reader",
+                            "sha256:" + "d" * 64,
+                            utc_timestamp(),
+                        ),
+                    )
+            revoked = persistence.resolve_repository_enrollment(
+                authorized_resolve
+            )
+            self.assertEqual(revoked["state"], "blocked")
+            with CoordinatorStore.open(
+                persistence.database_path, expected_uid=os.geteuid()
+            ) as store:
+                with store.immediate_transaction() as connection:
+                    connection.execute(
+                        """
+                        DELETE FROM broker_repository_revocations
+                        WHERE repo_id = ? AND repository_generation = 0
+                        """,
+                        (PROJECT_ID,),
+                    )
+
+            # An explicit matching enrollment is a policy decision, unlike a
+            # missing per-account row, and must not fall through to another
+            # local account's enabled route.
+            persistence.provision_repository_enrollment(
+                uid=console_uid,
+                repo_id=PROJECT_ID,
+                account_id=anchor_account_id,
+                issued_at=now,
+                valid_until_epoch=int(time.time()) + 3_600,
+                enabled=False,
+            )
+            blocked = persistence.resolve_repository_enrollment(
+                authorized_resolve
+            )
+            self.assertEqual(blocked["state"], "blocked")
+            self.assertIsNone(blocked["repository"])
+
+    def test_first_start_repository_adoption_separates_policy_execution_and_filesystem_uids(
+        self,
+    ) -> None:
+        """The local peer executes while policy and filesystem UIDs stay distinct."""
+
+        with CanonicalTemporaryDirectory() as root:
+            persistence, actions = seed_store_backed_broker(root)
+            uid_base = max(os.geteuid(), 1) + 10_000
+            policy_uid = uid_base
+            peer_uid = uid_base + 1
+            filesystem_owner_uid = uid_base + 2
+            persistence.provision_principal(
+                uid=policy_uid,
+                account_id=ACCOUNT_ID,
+            )
+            persistence.provision_repository_enrollment(
+                uid=policy_uid,
+                repo_id=PROJECT_ID,
+                account_id=ACCOUNT_ID,
+                issued_at=utc_timestamp(),
+                valid_until_epoch=int(time.time()) + 3_600,
+            )
+            with CoordinatorStore.open(
+                persistence.database_path, expected_uid=os.geteuid()
+            ) as store:
+                with store.immediate_transaction() as connection:
+                    connection.execute(
+                        "DELETE FROM broker_acl_principals WHERE uid = ?",
+                        (os.geteuid(),),
+                    )
+            service = store_backed_service(persistence, actions)
+            repository_root = root / "caller-owned-zero-commit-repository"
+            repository_root.mkdir()
+            subprocess.run(
+                ["git", "init", "--quiet", str(repository_root)],
+                check=True,
+                timeout=10,
+            )
+            resolved_context = (
+                repository_context_module.resolve_effective_repository_context(
+                    project=str(repository_root)
+                )
+            )
+            filesystem_scope = replace(
+                resolved_context.root,
+                root_owner_uid=filesystem_owner_uid,
+            )
+            synthetic_context = replace(
+                resolved_context,
+                root=filesystem_scope,
+                effective=filesystem_scope,
+            )
+            operation_id = "00000000-0000-4000-8000-000000000093"
+            request = request_for(
+                BrokerOperation.REPOSITORY_ENSURE,
+                resource_id=PROJECT_ID,
+                operation_id=operation_id,
+                arguments={
+                    "agent": "codex:task:first-use-cross-uid",
+                    "canonical_root": str(repository_root),
+                    "owner_uid": filesystem_owner_uid,
+                    "project_kind": "primary",
+                },
+            )
+
+            with (
+                mock.patch.object(
+                    repository_context_module,
+                    "resolve_effective_repository_context",
+                    return_value=synthetic_context,
+                ),
+                mock.patch.object(
+                    repository_context_module,
+                    "_revalidate_context",
+                    return_value=None,
+                ),
+            ):
+                reply = service.reply_for_document(
+                    peer_for(peer_uid), request.to_wire()
+                )
+
+            self.assertTrue(reply["ok"], reply)
+            expected_id = deterministic_id(
+                "repository", HOST_ID, str(repository_root)
+            )
+            self.assertEqual(
+                reply["result"]["repository"]["repo_id"], expected_id
+            )
+            self.assertEqual(
+                reply["result"]["repository"]["execution_uid"], peer_uid
+            )
+            self.assertEqual(
+                reply["result"]["repository"]["filesystem_owner_uid"],
+                filesystem_owner_uid,
+            )
+            with CoordinatorStore.open(
+                persistence.database_path, expected_uid=os.geteuid()
+            ) as store:
+                with store.read_transaction() as connection:
+                    row = connection.execute(
+                        """
+                        SELECT owner.owner_uid AS repository_execution_uid,
+                               operation.owner_uid AS caller_uid,
+                               operation_request.uid AS request_policy_uid,
+                               transfer.evidence_json AS owner_evidence_json
+                        FROM repositories AS repository
+                        JOIN repository_owners AS owner USING(repo_id)
+                        JOIN repository_owner_transfers AS transfer
+                          ON transfer.repo_id = owner.repo_id
+                         AND transfer.authority_generation =
+                             owner.authority_generation
+                        JOIN operations AS operation
+                          ON operation.operation_id = ?
+                        JOIN broker_operation_requests AS operation_request
+                          ON operation_request.operation_id =
+                             operation.operation_id
+                        WHERE repository.repo_id = ?
+                        """,
+                        (operation_id, expected_id),
+                    ).fetchone()
+                    enrollments = connection.execute(
+                        """
+                        SELECT uid, account_id, enabled
+                        FROM broker_repository_enrollments
+                        WHERE repo_id = ?
+                        ORDER BY uid
+                        """,
+                        (expected_id,),
+                    ).fetchall()
+                    execution_principals = connection.execute(
+                        """
+                        SELECT uid, account_id, enabled
+                        FROM broker_acl_principals
+                        WHERE uid IN (?, ?)
+                        ORDER BY uid
+                        """,
+                        (peer_uid, filesystem_owner_uid),
+                    ).fetchall()
+            self.assertIsNotNone(row)
+            self.assertEqual(int(row["repository_execution_uid"]), peer_uid)
+            self.assertEqual(int(row["caller_uid"]), peer_uid)
+            self.assertEqual(int(row["request_policy_uid"]), policy_uid)
+            owner_evidence = json.loads(str(row["owner_evidence_json"]))
+            self.assertEqual(owner_evidence["execution_uid"], peer_uid)
+            self.assertEqual(
+                owner_evidence["filesystem_owner_uid"], filesystem_owner_uid
+            )
+            self.assertEqual(
+                [
+                    (int(item["uid"]), str(item["account_id"]), bool(item["enabled"]))
+                    for item in enrollments
+                ],
+                sorted(
+                    [
+                        (peer_uid, ACCOUNT_ID, True),
+                        (policy_uid, ACCOUNT_ID, True),
+                    ]
+                ),
+            )
+            self.assertEqual(
+                [
+                    (
+                        int(item["uid"]),
+                        str(item["account_id"]),
+                        bool(item["enabled"]),
+                    )
+                    for item in execution_principals
+                ],
+                [(peer_uid, ACCOUNT_ID, True)],
+            )
+            authority = persistence.test_repository_execution_authority(
+                repo_id=expected_id,
+                operation_id=str(uuid.uuid4()),
+            )
+            self.assertEqual(authority.owner_uid, peer_uid)
+
+    def test_first_start_repository_adoption_is_atomic_and_replayable(self) -> None:
+        with CanonicalTemporaryDirectory() as root:
+            persistence, actions = seed_store_backed_broker(root)
+            service = store_backed_service(persistence, actions)
+            repository_root = root / "first-use-repository"
+            repository_root.mkdir()
+            subprocess.run(
+                ["git", "init", "--quiet", str(repository_root)],
+                check=True,
+                timeout=10,
+            )
+            operation_id = "00000000-0000-4000-8000-000000000092"
+            request = request_for(
+                BrokerOperation.REPOSITORY_ENSURE,
+                resource_id=PROJECT_ID,
+                operation_id=operation_id,
+                arguments={
+                    "agent": "codex:task:first-use",
+                    "canonical_root": str(repository_root),
+                    "owner_uid": os.geteuid(),
+                    "project_kind": "primary",
+                },
+            )
+
+            first = service.reply_for_document(peer_for(), request.to_wire())
+            replay = service.reply_for_document(peer_for(), request.to_wire())
+            resolved = service.reply_for_document(
+                peer_for(),
+                request_for(
+                    BrokerOperation.REPOSITORY_RESOLVE,
+                    resource_id=PROJECT_ID,
+                    arguments={"canonical_root": str(repository_root)},
+                ).to_wire(),
+            )
+
+            self.assertTrue(first["ok"], first)
+            self.assertEqual(replay, first)
+            self.assertTrue(resolved["ok"], resolved)
+            self.assertEqual(resolved["result"]["state"], "enrolled")
+            expected_id = deterministic_id(
+                "repository", HOST_ID, str(repository_root)
+            )
+            self.assertEqual(first["result"]["repository"]["repo_id"], expected_id)
+            self.assertEqual(
+                resolved["result"]["repository"]["repo_id"], expected_id
+            )
+            self.assertTrue(first["result"]["changed"])
+            with CoordinatorStore.open(
+                persistence.database_path, expected_uid=os.geteuid()
+            ) as store:
+                with store.read_transaction() as connection:
+                    row = connection.execute(
+                        """
+                        SELECT repository.state, installation.status,
+                               installation.startup_fenced, owner.owner_uid,
+                               enrollment.enabled, scope.project_kind
+                        FROM repositories AS repository
+                        JOIN repository_installations AS installation USING(repo_id)
+                        JOIN repository_owners AS owner USING(repo_id)
+                        JOIN broker_repository_enrollments AS enrollment USING(repo_id)
+                        JOIN repository_scopes AS scope USING(repo_id)
+                        WHERE repository.repo_id = ?
+                          AND enrollment.uid = ?
+                        """,
+                        (expected_id, os.geteuid()),
+                    ).fetchone()
+            self.assertIsNotNone(row)
+            self.assertEqual(str(row["state"]), "active")
+            self.assertEqual(str(row["status"]), "installed")
+            self.assertFalse(bool(row["startup_fenced"]))
+            self.assertEqual(int(row["owner_uid"]), os.geteuid())
+            self.assertTrue(bool(row["enabled"]))
+            self.assertEqual(str(row["project_kind"]), "primary")
+
     def test_host_observe_runtime_supplies_production_snapshot_store_contract(
         self,
     ) -> None:
@@ -2504,6 +3253,7 @@ class StoreBackedBrokerTests(unittest.TestCase):
                 runtime = build_store_backed_broker_runtime(
                     database_path=persistence.database_path,
                     socket_path=root / "runtime/broker.sock",
+                    test_capability_path=root / "test-capabilities.json",
                     host_mutations=actions,
                     service_uid=os.geteuid(),
                     access_gid=os.getegid(),
@@ -2621,6 +3371,7 @@ class StoreBackedBrokerTests(unittest.TestCase):
                 replacement = build_store_backed_broker_runtime(
                     database_path=persistence.database_path,
                     socket_path=root / "replacement/broker.sock",
+                    test_capability_path=root / "test-capabilities.json",
                     host_mutations=replacement_actions,
                     service_uid=os.geteuid(),
                     access_gid=os.getegid(),
@@ -2831,6 +3582,7 @@ class StoreBackedBrokerTests(unittest.TestCase):
             runtime = build_store_backed_broker_runtime(
                 database_path=persistence.database_path,
                 socket_path=socket_path,
+                test_capability_path=root / "test-capabilities.json",
                 host_mutations=actions,
                 service_uid=os.geteuid(),
                 access_gid=os.getegid(),
@@ -2954,6 +3706,7 @@ class StoreBackedBrokerTests(unittest.TestCase):
             replacement = build_store_backed_broker_runtime(
                 database_path=persistence.database_path,
                 socket_path=socket_path,
+                test_capability_path=root / "test-capabilities.json",
                 host_mutations=actions,
                 service_uid=os.geteuid(),
                 access_gid=os.getegid(),
@@ -3292,7 +4045,7 @@ class StoreBackedBrokerTests(unittest.TestCase):
                 uid=os.geteuid(), account_id=ACCOUNT_ID
             )
 
-    def test_raw_broker_request_fails_after_repository_enrollment_expiry(self) -> None:
+    def test_repository_enrollment_expiry_is_informational(self) -> None:
         with CanonicalTemporaryDirectory() as root:
             persistence, actions = seed_store_backed_broker(root)
             with CoordinatorStore.open(
@@ -3326,11 +4079,11 @@ class StoreBackedBrokerTests(unittest.TestCase):
                     expected_socket_gid=os.getegid(),
                 ).call(request_for(BrokerOperation.DOCKER_STOP))
 
-            self.assertFalse(reply["ok"], reply)
+            self.assertTrue(reply["ok"], reply)
             self.assertEqual(
-                reply["error"]["code"], "repository_enrollment_expired"
+                actions.calls,
+                [("stop", CONTAINER_ID, "a" * 64)],
             )
-            self.assertEqual(actions.calls, [])
 
     def test_enrolling_second_repository_does_not_extend_first_repository(self) -> None:
         with CanonicalTemporaryDirectory() as root:
@@ -3353,6 +4106,17 @@ class StoreBackedBrokerTests(unittest.TestCase):
                                   'active', 0, ?, ?)
                         """,
                         (host_id, now, now),
+                    )
+                    establish_repository_owner_authority(
+                        connection,
+                        repository_id="repo-beta",
+                        owner_uid=os.geteuid(),
+                        repository_generation=0,
+                        operation_id=str(uuid.uuid4()),
+                        actor="fixture",
+                        reason="second broker repository fixture owner",
+                        timestamp=now,
+                        evidence={"kind": "broker-second-repository-fixture"},
                     )
                 with store.read_transaction() as connection:
                     first_expiry = connection.execute(
@@ -3475,7 +4239,7 @@ class StoreBackedBrokerTests(unittest.TestCase):
             )
 
     def test_postgres_authority_mismatches_and_fence_fail_before_runner(self) -> None:
-        cases = ("uid", "repo", "resource", "database", "fence", "container-drift")
+        cases = ("repo", "resource", "database", "fence", "container-drift")
         for case in cases:
             with self.subTest(case=case), CanonicalTemporaryDirectory() as root:
                 persistence, _unused = seed_store_backed_broker(root)
@@ -3492,9 +4256,7 @@ class StoreBackedBrokerTests(unittest.TestCase):
                 )
                 peer = peer_for()
                 document = request.to_wire()
-                if case == "uid":
-                    peer = peer_for(os.geteuid() + 10_000)
-                elif case == "repo":
+                if case == "repo":
                     document["project_id"] = "repo-foreign"
                 elif case == "resource":
                     document["resource_id"] = SECOND_CONTAINER_ID
@@ -3518,6 +4280,128 @@ class StoreBackedBrokerTests(unittest.TestCase):
 
                 self.assertFalse(reply["ok"], reply)
                 self.assertEqual(actions.postgres_calls, [])
+
+    def test_cross_uid_caller_uses_exact_policy_while_retaining_attribution(self) -> None:
+        with CanonicalTemporaryDirectory() as root:
+            persistence, _unused = seed_store_backed_broker(root)
+            seed_postgres_database(persistence)
+            with CoordinatorStore.open(
+                persistence.database_path,
+                expected_uid=os.geteuid(),
+            ) as store:
+                with store.immediate_transaction() as connection:
+                    connection.execute(
+                        """
+                        UPDATE broker_repository_enrollments
+                        SET valid_until_epoch = ?, updated_at = ?
+                        WHERE repo_id = ?
+                        """,
+                        (int(time.time()) - 1, utc_timestamp(), PROJECT_ID),
+                    )
+            caller_uid = os.geteuid() + 10_000
+            request = request_for(
+                BrokerOperation.DATABASE_BACKUP,
+                arguments={"database_name": DATABASE_NAME},
+            )
+
+            authorized = persistence.authorize(peer_for(caller_uid), request)
+
+            self.assertEqual(authorized.peer.uid, caller_uid)
+            self.assertEqual(authorized.authorization_uid, os.geteuid())
+            self.assertEqual(authorized.request.project_id, PROJECT_ID)
+            self.assertEqual(authorized.request.resource_id, CONTAINER_ID)
+            execution = persistence.test_attempt_repository_authority(
+                repo_id=PROJECT_ID,
+                owner_uid=caller_uid,
+                operation_id=request.operation_id,
+            )
+            self.assertEqual(execution.owner_uid, os.geteuid())
+
+    def test_internal_testd_uid_is_attribution_not_authorization(self) -> None:
+        with CanonicalTemporaryDirectory() as root:
+            persistence, _unused = seed_store_backed_broker(root)
+            caller_uid = os.geteuid() + 20_000
+            request = BrokerRequest.create(
+                authority_generation=CURRENT_AUTHORITY_GENERATION,
+                account_id="devcoordinator-testd",
+                project_id=PROJECT_ID,
+                repository_generation=0,
+                resource_id=PROJECT_ID,
+                operation=BrokerOperation.TEST_ATTEMPT_STATUS,
+                arguments={"runtime_id": "runtime-alpha", "result_chunk_index": 0},
+            )
+
+            authorizer = StoreBackedAuthorizer(
+                persistence,
+                internal_testd_uid=-999,  # ignored legacy service metadata
+            )
+            authorized = authorizer.authorize(
+                peer_for(caller_uid), request
+            )
+
+            self.assertEqual(authorized.peer.uid, caller_uid)
+            self.assertEqual(authorized.request.project_id, PROJECT_ID)
+
+    def test_attempt_runtime_io_failure_is_typed_and_retriable(self) -> None:
+        with CanonicalTemporaryDirectory() as root:
+            persistence, actions = seed_store_backed_broker(root)
+            backend = StoreBackedMutationBackend(persistence, actions)
+
+            class AttemptRuntime:
+                available = False
+
+                @staticmethod
+                def runtime_descriptor(_runtime_id: str) -> object:
+                    class Descriptor:
+                        repository_id = PROJECT_ID
+                        repository_generation = 0
+                        attempt_id = PROJECT_ID
+
+                    return Descriptor()
+
+                def observe(
+                    self, _runtime_id: str, *, result_chunk_index: int
+                ) -> Mapping[str, object]:
+                    self.last_chunk_index = result_chunk_index
+                    if not self.available:
+                        raise OSError(errno.EROFS, "read-only artifact store")
+                    return {"state": "running"}
+
+            runtime = AttemptRuntime()
+            backend._test_attempts = runtime
+            service = BrokerService(
+                StoreBackedAuthorizer(persistence),
+                SerializedMutationWriter(backend),
+            )
+            request = BrokerRequest.create(
+                authority_generation=CURRENT_AUTHORITY_GENERATION,
+                account_id="devcoordinator-testd",
+                project_id=PROJECT_ID,
+                repository_generation=0,
+                resource_id=PROJECT_ID,
+                operation=BrokerOperation.TEST_ATTEMPT_STATUS,
+                arguments={
+                    "runtime_id": "devcoordinator-test-runtime-io",
+                    "result_chunk_index": 0,
+                },
+            )
+
+            with self.assertNoLogs("devcoordinator.broker", level="ERROR"):
+                unavailable = service.reply_for_document(
+                    peer_for(), request.to_wire()
+                )
+            self.assertFalse(unavailable["ok"], unavailable)
+            self.assertEqual(
+                unavailable["error"]["code"],
+                "test_attempt_runtime_unavailable",
+            )
+
+            runtime.available = True
+            recovered = service.reply_for_document(peer_for(), request.to_wire())
+
+            self.assertTrue(recovered["ok"], recovered)
+            self.assertEqual(recovered["result"], {"state": "running"})
+            self.assertEqual(runtime.last_chunk_index, 0)
 
     def test_postgres_host_failure_is_durable_and_never_registers_backup(self) -> None:
         with CanonicalTemporaryDirectory() as root:
@@ -4424,6 +5308,53 @@ class StoreBackedBrokerTests(unittest.TestCase):
                     ).fetchone()
             self.assertIsNone(reserved)
 
+    def test_request_loaded_before_generation_rotation_is_rejected_before_reservation(
+        self,
+    ) -> None:
+        with CanonicalTemporaryDirectory() as root:
+            persistence, actions = seed_store_backed_broker(root)
+            service = store_backed_service(persistence, actions)
+            loaded_generation = persistence.database_generation()
+            loaded_request = BrokerRequest.create(
+                account_id=ACCOUNT_ID,
+                project_id=PROJECT_ID,
+                resource_id=CONTAINER_ID,
+                operation=BrokerOperation.DOCKER_STOP,
+                authority_generation=loaded_generation,
+            )
+            with CoordinatorStore.open(
+                persistence.database_path, expected_uid=os.geteuid()
+            ) as store:
+                with store.immediate_transaction(revision_kind=None) as connection:
+                    changed = connection.execute(
+                        """
+                        UPDATE schema_metadata
+                        SET database_generation = ?, state_revision = state_revision + 1,
+                            updated_at = ?
+                        WHERE singleton = 1 AND database_generation = ?
+                        """,
+                        (
+                            "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+                            utc_timestamp(),
+                            loaded_generation,
+                        ),
+                    ).rowcount
+                    self.assertEqual(changed, 1)
+
+            reply = service.reply_for_document(peer_for(), loaded_request.to_wire())
+
+            self.assertFalse(reply["ok"], reply)
+            self.assertEqual(reply["error"]["code"], "broker_generation_mismatch")
+            with CoordinatorStore.open(
+                persistence.database_path, expected_uid=os.geteuid()
+            ) as store:
+                with store.read_transaction() as connection:
+                    reserved = connection.execute(
+                        "SELECT 1 FROM broker_operation_requests WHERE operation_id = ?",
+                        (loaded_request.operation_id,),
+                    ).fetchone()
+            self.assertIsNone(reserved)
+
     def test_production_runtime_factory_uses_real_socket_and_private_store(self) -> None:
         with CanonicalTemporaryDirectory() as root:
             persistence, actions = seed_store_backed_broker(root)
@@ -4434,6 +5365,7 @@ class StoreBackedBrokerTests(unittest.TestCase):
             runtime = build_store_backed_broker_runtime(
                 database_path=persistence.database_path,
                 socket_path=socket_path,
+                test_capability_path=root / "test-capabilities.json",
                 host_mutations=actions,
                 service_uid=os.geteuid(),
                 access_gid=os.getegid(),
@@ -4846,7 +5778,7 @@ class StoreBackedBrokerTests(unittest.TestCase):
                         0,
                     )
 
-    def test_server_publication_is_peer_listener_bound_and_host_inventory_is_cross_uid(self) -> None:
+    def test_server_publication_is_pid_bound_and_host_inventory_uses_policy_union(self) -> None:
         with CanonicalTemporaryDirectory() as root:
             persistence, actions = seed_store_backed_broker(root)
             service = store_backed_service(persistence, actions)
@@ -4891,6 +5823,18 @@ class StoreBackedBrokerTests(unittest.TestCase):
             self.assertTrue(published["ok"], published)
 
             second_uid = os.geteuid() + 100_000
+            local_union = service.reply_for_document(
+                PeerCredentials(second_uid, os.getegid(), 54321),
+                BrokerRequest.create(
+                    account_id=ACCOUNT_ID,
+                    project_id=PROJECT_ID,
+                    resource_id=PROJECT_ID,
+                    operation=BrokerOperation.INVENTORY_READ,
+                    authority_generation=CURRENT_AUTHORITY_GENERATION,
+                ).to_wire(),
+            )
+            self.assertTrue(local_union["ok"], local_union)
+
             unauthorized = service.reply_for_document(
                 PeerCredentials(second_uid, os.getegid(), 54321),
                 BrokerRequest.create(
@@ -4903,7 +5847,7 @@ class StoreBackedBrokerTests(unittest.TestCase):
             )
             self.assertFalse(unauthorized["ok"], unauthorized)
             self.assertEqual(
-                unauthorized["error"]["code"], "peer_not_authorized"
+                unauthorized["error"]["code"], "cross_account_access_denied"
             )
             persistence.provision_principal(
                 uid=second_uid, account_id="account-console"
@@ -4977,7 +5921,7 @@ class StoreBackedBrokerTests(unittest.TestCase):
                 "stopped",
             )
 
-    def test_server_publication_rejects_foreign_uid_pid_and_bound_stop(self) -> None:
+    def test_server_publication_ignores_listener_uid_but_rejects_pid_and_bound_stop(self) -> None:
         with CanonicalTemporaryDirectory() as root:
             persistence, actions = seed_store_backed_broker(root)
             service = store_backed_service(persistence, actions)
@@ -5014,10 +5958,7 @@ class StoreBackedBrokerTests(unittest.TestCase):
                     arguments=arguments,
                 ).to_wire(),
             )
-            self.assertFalse(foreign_owner["ok"], foreign_owner)
-            self.assertEqual(
-                foreign_owner["error"]["code"], "listener_peer_mismatch"
-            )
+            self.assertTrue(foreign_owner["ok"], foreign_owner)
             actions.listener_evidence = {
                 **actions.listener_evidence,
                 "owner_uid": os.geteuid(),

@@ -59,7 +59,7 @@ class ImagePublicationTests(unittest.TestCase):
         )
         environment = self.project / ".env"
         environment.write_text("TOKEN=fixture-not-recorded\n", encoding="utf-8")
-        os.chmod(environment, 0o600)
+        os.chmod(environment, 0o644)
         self.config = {
             "docker": {
                 "compose_files": ["compose.yml"],
@@ -323,17 +323,12 @@ class ImagePublicationTests(unittest.TestCase):
             )
         database.close()
 
-        with mock.patch.object(
-            publication,
-            "_require_private_regular_file",
-            return_value=self.broker_database.stat(),
-        ):
-            enrollment = publication.require_enrolled_compose_approval(
-                self.specification,
-                material.evidence,
-                effective,
-                self.broker_database,
-            )
+        enrollment = publication.require_enrolled_compose_approval(
+            self.specification,
+            material.evidence,
+            effective,
+            self.broker_database,
+        )
 
         self.assertEqual(enrollment["model_sha256"], effective.model_sha256)
 

@@ -109,3 +109,41 @@ test('every active container surface gates mutation and retains read-only logs',
   assert.match(dockerRow, /`dock-logs:\$\{name\}`/,
     'the Docker page must retain its read-only log disclosure');
 });
+
+test('Testcontainers dependencies do not become repository ownership incidents', async () => {
+  const app = await fsp.readFile(new URL('../src/ui/app.js', import.meta.url), 'utf8');
+  const source = extractFunction(app, 'function authoritativeInventoryProblemsOf(o)');
+  // eslint-disable-next-line no-new-func
+  const authoritativeInventoryProblemsOf = new Function(
+    'repositoryTreeContractProblemsOf', 'isContainerActive', 'isTransientTestContainer',
+    `${source}; return authoritativeInventoryProblemsOf;`,
+  )(
+    () => [],
+    (container) => !/^(?:exited|created|dead|stopped)\b/i.test(String(container.status || '')),
+    (container) => container?.transient_test === true,
+  );
+  const inventory = {
+    repository_trees: [],
+    resources: { databases: [] },
+    unassigned_resources: [{
+      resource_kind: 'container', resource_id: 'testcontainers-postgres',
+      display_name: 'testcontainers-postgres', reason_code: 'name_only', transient_test: true,
+    }],
+    lifecycle_violations: [],
+    servers: [],
+    docker: {
+      available: true,
+      containers: [{
+        host_resource_id: 'testcontainers-postgres', name: 'testcontainers-postgres',
+        status: 'running', transient_test: true,
+      }],
+    },
+  };
+  assert.deepEqual(authoritativeInventoryProblemsOf({ inventory }), [],
+    'a disposable test dependency must not trigger an ownership warning');
+
+  inventory.unassigned_resources[0].transient_test = false;
+  inventory.docker.containers[0].transient_test = false;
+  assert.equal(authoritativeInventoryProblemsOf({ inventory }).length, 1,
+    'a normal unassigned container must remain visible to the operator');
+});

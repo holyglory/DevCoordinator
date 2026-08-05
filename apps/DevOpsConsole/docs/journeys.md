@@ -64,6 +64,7 @@ Prioritized: top rows are the most frequent and most important.
 | J10 Archive, restore, or permanently remove a host resource | Owner | Monthly | 2 | High | Active/Archived filter on Projects, Servers, or Docker | Exact resource is durably fenced, restored without starting, or removed only from a reviewed archived plan |
 | J11 Request and decide exact Google access | Requester / owner | Monthly+ | 2 | High | Protected-host denial / Incoming invites | One exact host-derived request is approved or denied; replacement routes cannot inherit it |
 | J12 Register a Telegram bot and authorize project notifications | Console operator / bot owner | Monthly setup, continuous delivery | 3 | High | Telegram page / private bot chat | Exact projects and approved chats receive durable server/Docker lifecycle, failure, and crash events |
+| J13 Triage an agent-reported Coordinator bug | Console operator / owner | During infrastructure failures | 2 | High | Open Coordinator bugs page | Reproduction is actionable while Coordinator is down; an owner closes the fixed report everywhere |
 
 ## Journey Detail
 
@@ -473,9 +474,11 @@ Prioritized: top rows are the most frequent and most important.
 - Route/screen sequence: compact tree of repo headers, collapsed by default;
   each header shows name, n of m running, project CPU/mem numbers +
   sparkline, and Start/Restart/Stop for the whole project. Expanding one repo
-  discloses its losslessly paged, kind-tagged server / database / container
-  members with status, CPU/mem + sparkline, per-item Start/Stop/Restart and
-  hide controls.
+  discloses its losslessly paged server / worker / database / container
+  members. A compact, visually distinct kind icon precedes each member name;
+  its accessible name states the kind and a short hint appears only on hover,
+  keyboard focus, or tap. Rows also show status, CPU/mem + sparkline,
+  per-item Start/Stop/Restart and hide controls.
 - Primary decisions: act on one item or the whole repo; hide an idle item or
   project; drill into Servers/Docker pages for logs and details.
 - Required information per step: grouping must be the coordinator's own
@@ -498,14 +501,20 @@ Prioritized: top rows are the most frequent and most important.
   content; sampling notes stay passive.
 - Failure/recovery: hide/unhide failures show the banner with Retry; prefs
   unreachable at boot degrades to session-only hiding.
-- Device/context constraints: tree indents collapse on phones; project
-  actions wrap under the header; no horizontal scroll at 390px. Only the
+- Device/context constraints: tree indents collapse on phones; project and
+  member actions stay snapped to the same fixed Start / Restart / Stop /
+  visibility tracks at 1135, 763, 390 and 320px; absent optional controls keep
+  inert layout slots, and no row, section, or document scrolls horizontally.
+  Only the
   active hash page keeps a dynamic body mounted; Servers, Docker and an
   expanded project's members render at most 75 resource rows at once so
   ordinary page work remains bounded even with retained host-wide history.
 - Accessibility expectations: hide/unhide buttons carry explicit labels
   ("Hide X until it runs again"); collapse chevrons are buttons with
-  aria-expanded; kind tags are text, not color-only.
+  aria-expanded. Resource-kind icons have distinct shapes and explicit
+  accessible names, never rely on color, and expose one viewport-bounded
+  tooltip on hover/focus/tap. Escape and outside activation dismiss a pinned
+  hint without moving the row or changing the action-column geometry.
 - Acceptance criteria: a repo with a declared runtime starts fully from the
   project Start button and, after expansion, every member is reachable and
   shows running with live CPU/mem; pagination never loses or duplicates a
@@ -731,6 +740,61 @@ Prioritized: top rows are the most frequent and most important.
     pending/recent authorization, remove confirm, desktop, and 390px states are
     usable and never reveal a token.
 
+### J13 — Triage an agent-reported Coordinator bug
+
+- Users: every authenticated Console operator may read and export; configured
+  owners may import or close reports.
+- Goal: understand and reproduce a Coordinator, broker, API, testd, or skill
+  failure without depending on the failing control path or blocking unrelated
+  coding work.
+- Sequence: `#/bugs` → open actionable collection first → select a report →
+  inspect expected and actual behavior, ordered steps, exact structured
+  arguments, safe correlation/release/instance facts, and occurrence timing →
+  fix and verify outside this page → configured owner chooses **Close** and
+  confirms the named report.
+- Transfer: **Export** opens the complete portable JSON in a selectable large
+  field with **Copy to Clipboard**. Clipboard denial leaves the complete field
+  selected for manual copy. **Import** opens a large paste dialog, validates
+  the whole bundle before one write, and reports imported versus already
+  present counts. Imported cards say **Imported from SERVER**; local cards say
+  **This server · SERVER**. Re-export preserves the original remote identity.
+- Independence: the page calls only the Console-local open-bug API. Coordinator
+  inventory, authority, broker, API, or testd may all be unavailable without
+  blanking, disabling, or globally bannering this collection. A failed registry
+  refresh leaves retained rows, open disclosures, focus and scroll in place and
+  reports the failure inline.
+- Local fallback: when an agent continued with a direct local check, the report
+  shows its status, summary, local structured command and the explicit label
+  **Advisory local check only — this is not governed Coordinator evidence.** It
+  helps development continue but cannot be mistaken for harness evidence.
+- Synchronization: one bounded file means open. Closing physically removes the
+  report and any same-fingerprint duplicate, so another Console instance sees
+  the same result on refresh. There is no Closed tab, archive, history row or
+  tombstone.
+- Empty/loading/error/permission states: an empty registry says there are no
+  open bugs and hides the nav count. A cold read error stays inside the page.
+  Readers never see Close; owners see one exact destructive action.
+- Accessibility/device constraints: expected/actual and every reproduction
+  argument remain selectable and wrap safely; ordered steps retain order;
+  disclosure and Close are keyboard accessible; 320px through desktop have no
+  horizontal document scroll.
+- Acceptance criteria:
+  - A populated collection is readable while `/api/overview` fails, with no
+    overview banner or invented empty state.
+  - Refresh failure after a successful read retains all rows and explains that
+    they are retained. A later success updates the same disclosure without
+    losing focus or scroll.
+  - Zero open reports hides the Bugs badge. An owner close removes the row
+    immediately and remains idempotent across two Console instances.
+  - Export includes every open local and imported report without private server
+    paths or secrets. Repeated or concurrent import is idempotent, a malformed
+    member creates no partial records, and a matching local report stays
+    distinct from its remote-origin counterpart.
+  - Export/import dialogs restore focus, remain usable with keyboard and touch,
+    and never introduce horizontal document scrolling at 320px.
+  - Malformed/oversized files are isolated; valid reports still render and no
+    obvious secret or private server path reaches the browser.
+
 ## Journey Decision Model
 
 | Surface | Primary user goal | Primary decision | Required facts | Warning/flag conditions | Frequent actions | Secondary/rare actions | Unresolved assumptions |
@@ -745,6 +809,7 @@ Prioritized: top rows are the most frequent and most important.
 | Access page | Grant exact private destinations | Which user gets which host | Google email; real host + target; owner/public state; Console privilege consequence | User removal revokes live sessions; owners immutable | Add user; toggle a host grant | Remove user | Ownership transfer remains environment-only |
 | Protected-host denial / Incoming invites | Request and decide exact access | Is this verified account entitled to this exact current destination? | Verified email; server-derived host/title/target; request/status/time | Console-control consequence; stale instance; denial cooldown/rate limit | Request invite; Approve/Deny | Review recent decisions | Only configured owners decide |
 | Telegram page | Deliver project events to approved chats | Which owned bot, exact projects, and private-chat users? | Redacted bot identity/owner/status; current repo names/paths backed by exact `repo_id`; queue/status/error | Existing webhook takeover; vanished assignment; destructive bot removal; delivery error | Register; assign project; approve/deny `/start` | Remove bot; inspect recent decisions | Bot owner isolation; configured-owner override |
+| Open Coordinator bugs | Reproduce and clear current control-plane failures | Is this still open and what exact evidence reproduces it? | Expected/actual, ordered steps, structured argv, safe correlations/release/instance, occurrences; advisory fallback classification | Registry refresh failure stays local; Close physically removes the open report | Expand evidence; Refresh | Owner-only Close | No closed history by design |
 | Projects/Servers/Docker lifecycle views | Clean durable host state safely | Archive, restore, purge, or leave intact | Human target, active/archive state, exact effects/retained/deleted/blockers, capability flags | Blockers; partial/needs-attention result; exact purge phrase mismatch | Archive; inspect archived; restore | Permanent remove; advertised worktree remove | None |
 | Servers/Docker usage cells | Spot a hog in place | Is this row's load normal? | Live CPU % + memory numbers; sparkline shape | Sampling failure note | Click for history charts | — | CPU normalized to observed peak, numbers absolute |
 | Performance page | Find resource hogs with history | Which entity/project to act on | Per-entity CPU/mem charts (current, peak, window); per-project bars | Sampler error note; stale (not running) cards dimmed | Read; navigate to the row to act | Cross-reference project bars | History is in-process, resets with console |
@@ -786,6 +851,9 @@ Prioritized: top rows are the most frequent and most important.
 | J12 | Project assignment | Current name/path backed by exact `repo_id` | critical-on-change | Prevents name/path heuristics from sending another project's events | Every current coordinator project | Labelled checkbox on the exact bot card |
 | J12 | Bot authorization queue | Telegram user identity, private `/start` time and decision status | critical-always-per-bot | Prevents operational event disclosure before explicit approval | Pending first; recent decisions on demand | Inline row with Approve/Deny and text badge |
 | J12 | Register-bot dialog | Optional label, secret token, explicit webhook takeover | critical-on-invocation | Establishes bot identity without leaking or silently disrupting an existing integration | Token entry; takeover only after conflict | Focused password input; conditional labelled checkbox |
+| J13 | Open bug row | Component, summary, occurrences and last seen | critical-always | Identifies the current actionable failure without opening details | Every open report | Collection row heading |
+| J13 | Reproduction disclosure | Expected/actual, ordered steps, structured argv, correlations, release and instance | critical-on-investigation | Makes the failure reproducible without raw logs or context poisoning | On demand per report | Keyboard-accessible disclosure |
+| J13 | Local fallback | Status, summary and structured argv labelled advisory/non-governed | conditional | Shows how work continued without implying Coordinator evidence | Only when reported | Inside the report disclosure |
 | J10 | Active/Archived filter | Authoritative counts and selected lifecycle state | critical-always-for-owner | Prevents Hide from being mistaken for durable archive | Projects, Servers, Docker | Inline; unknown counts omitted |
 | J10 | Lifecycle plan dialog | Effects, retained, deleted, blockers, reason | critical-on-invocation | Operator must understand the exact host mutation | Archive/purge | Focused modal; server wording preserved |
 | J10 | Purge phrase field | Exact coordinator-issued confirmation phrase | critical-destructive | Prevents generic or stale permanent removal | Removable archived row only | Inline labelled input; apply disabled until exact match |
@@ -821,6 +889,7 @@ Binding affordance rules, made concrete for this app:
 | Access | J9 | Browser evidence: owner-only nav, owners + invitees, exact grant toggles, add dialog at 1440×900 and 390×844 | loading, owner-only/zero invitees, populated, long domains, add open, invalid email, save failure | none | Configured ownership is intentionally not transferable in UI |
 | Incoming invites | J11 | Denied-page Request invite round trip plus owner-only queue screenshots at 1440×900 and 390×844; prove exact host/email and post-decision grant | anonymous redirect, verified denial, pending, duplicate, empty, approved/denied/stale history, conflict/rate/save error | none | Request target is wholly server-derived |
 | Telegram | J12 | Owned/admin bot isolation, register dialog, exact project assignment, private `/start` queue decision, and redacted network/UI evidence at 1440×900 and 390×844 | loading, empty, populated, long projects, webhook conflict/takeover, no projects, pending/recent queue, poll/delivery error, remove confirm | none | Real tokens are excluded from browser fixtures; fake Bot API proves the contract |
+| Open Coordinator bugs | J13 | Populated evidence disclosure and owner Close at desktop and 320px; overview-down independence; retained rows after refresh error | loading, empty, populated, malformed-file isolation, retained-error, reader, owner, close race | none | One file means open; no Closed view or tombstone |
 | Nav | All | Screenshots: desktop tabs with counts + active state; mobile drawer open/closed | drawer open/closed, active page marked, counts hidden when unknown | none | None |
 | Global | All | Deterministic browser verification at 1440px and 390px per page: no horizontal document scroll, no clipped text, visible scrollbar inventory (expected: document vertical + log boxes + popover when open); the ten labels above each marked pass with evidence | error banner, 401 reload, reduced-motion, focus-visible pass | none | None |
 
@@ -831,12 +900,12 @@ is supported and every relevance tier keeps its documented access path
 
 ## Screen Requirements
 
-Nine hash-routed pages behind one sticky header (summary bar + nav; the
+Eleven hash-routed pages behind one sticky header (summary bar + nav; the
 header is identical on every page):
 
 | Screen area | Journey | Critical info | Primary actions | Secondary actions | Rare details | Device/context constraints |
 | --- | --- | --- | --- | --- | --- | --- |
-| Projects page (`#/projects`, default) | J8, J7 | Collapsed-by-default repo tree: per-node running counts and project CPU/mem; expanding one repo shows losslessly paged members with item CPU/mem, kind tags and subdomain chip on web-serving containers | Whole-project start/stop/restart; per-item start/stop/restart; hide idle; assign/edit container subdomain. Every row (project header, server, container) renders the SAME three color-coded slots — Start (green) / Restart (blue) / Stop (red), inapplicable ones disabled, never hidden — so buttons align into columns | Expand/collapse one node; page members; reveal hidden; unhide | Repo path (title); pin markers | Tree stacks on phone; actions wrap; at most 75 members mounted |
+| Projects page (`#/projects`, default) | J8, J7 | Collapsed-by-default repo tree: per-node running counts and project CPU/mem; expanding one repo shows losslessly paged members with item CPU/mem, a distinct accessible kind icon, and a subdomain chip on web-serving containers. Kind text is available on hover, focus, or tap rather than occupying every row | Whole-project start/stop/restart; per-item start/stop/restart; hide idle; assign/edit container subdomain. Every row (project header, server, worker, container, database) renders the SAME fixed Start (green) / Restart (blue) / Stop (red) / optional-visibility tracks; inapplicable and absent controls retain inert slots so controls align | Expand/collapse one node; page members; reveal hidden; unhide | Repo path (title); pin markers; viewport-bounded kind hint | Tree compacts without horizontal scrolling from 320px upward; action tracks remain aligned at 1135, 763, 390 and 320px; at most 75 members mounted |
 | Sticky header (single row) | J1 | Brand; needs-attention badge (only when something is wrong); account button | Open badge popover (facts, instructions, actions per problem) | Sign out via account popover | Coordinator error text; cert dates; renew command | ONE row on every viewport; domain label hidden <480px; sticky top |
 | Section nav | All | Page names, live counts, active page | Switch page | Hamburger open/close (≤1023px) | — | Tabs inline in the header row ≥1024px; drawer with ≥40px targets below |
 | Servers page (`#/servers`, default) | J2, J3, J7 | Every nonempty repo/resource-group header, collapsed by default, with running count and project CPU/mem; opening one shows its losslessly paged health badge, name, port, subdomain and CPU/mem rows; Docker-hosted web servers remain first-class rows | Expand one project then a server; restart; refresh logs; assign/edit subdomain (containers too, with an explicitly HTTP-labelled port picker when several are published); open history charts | Collapse/switch project; Stop; start (stopped containers); page through the open project's servers | pid/cmd/cwd/health detail; container image/ports detail | Full-width accessible project targets; compact two-line headers at 390px; from 480–719px each server uses three compact identity/facts/actions bands without redundant labels, below 480px four bounded bands; log box height-capped; at most 75 server rows mounted |
@@ -847,6 +916,7 @@ header is identical on every page):
 | Access page (`#/access`, owners only) | J9 | Real owner/invited-user collection first; exact Console/domain grants; real hosts/targets; owner and public state | Add user in focused dialog; change grant immediately | Remove user with live-revocation confirm | Configured-owner recovery note | Cards and grant list single-column on phone; dialog viewport-bounded |
 | Incoming invites page (`#/invites`, owners only) | J11 | Pending verified requests first: email, exact server-derived host/title/target, request time, status; recent resolved/stale history disclosed below | Approve or Deny exact request; Refresh | Review recent decisions | Resolver identity and immutable instance remain private | Queue cards stack; actions remain distinct and reachable on phone |
 | Telegram page (`#/telegram`, every Console-authorized account) | J12 | Caller-owned bots first (all bots for configured owners); bot identity/owner/status/error, exact project choices, pending `/start` queue; token never shown | Register bot in focused dialog; assign projects; Approve/Deny Telegram user | Remove bot with destructive confirm; review recent decisions | Exact `repo_id` stays transport identity while current name/path explain it | Bot cards and project/queue controls single-column at 390px; dialog viewport-bounded |
+| Open Coordinator bugs (`#/bugs`) | J13 | Open collection first; component/summary/occurrences; expected/actual, ordered steps, structured argv, release/instance and advisory fallback on disclosure | Refresh; expand evidence | Owner-only Close with exact confirmation | Fingerprint stays transport identity, not normal content | Independent of overview; retained refresh error; no document overflow from 320px upward |
 
 ## QA And Acceptance
 

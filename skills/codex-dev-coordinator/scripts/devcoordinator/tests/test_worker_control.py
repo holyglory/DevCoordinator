@@ -42,8 +42,12 @@ class FakeNativeManager:
             exit_status=None,
         )
 
-    def start(self, *, worker_id: str, uid: int, gid: int) -> NativeWorkerState:
+    def start(
+        self, *, worker_id: str, uid: int, gid: int, repository_id: str
+    ) -> NativeWorkerState:
         del uid, gid
+        if not repository_id:
+            raise AssertionError("worker start omitted repository isolation identity")
         self.start_calls += 1
         if self.fail_next_starts:
             self.fail_next_starts -= 1
@@ -295,6 +299,79 @@ class WorkerControllerTests(unittest.TestCase):
                 (self.worker_id,),
             )
         with self.assertRaisesRegex(WorkerControlError, "worker-role"):
+            self._start(keep_alive=True)
+
+    def test_stopped_observation_with_stale_pid_allows_supervised_restart(self) -> None:
+        timestamp = utc_timestamp()
+        with self.store.immediate_transaction() as connection:
+            connection.execute(
+                """
+                INSERT INTO server_observations(
+                    server_definition_id, source_resource_id, lifecycle, pid,
+                    process_start_time, process_fingerprint, listener_host,
+                    listener_port, listener_observable, health_classification,
+                    health_ok, stopped_at, stopped_reason, sampled_at,
+                    observation_fingerprint
+                ) VALUES (?, NULL, 'stopped', 45555, 'old-start', 'old-process',
+                          '127.0.0.1', 3003, 1, 'stopped', 0, ?,
+                          'process is confirmed stopped', ?, 'stale-observation')
+                """,
+                (self.worker_id, timestamp, timestamp),
+            )
+
+        restarted = self.controller.restart(
+            worker_id=self.worker_id,
+            canonical_repository=str(self.project),
+            name="queue-worker",
+            actor="test-agent",
+            keep_alive=True,
+            timeout_seconds=0.1,
+        )
+
+        self.assertTrue(restarted["ok"])
+        self.assertEqual(restarted["status"], "running")
+        self.assertEqual(self.manager.start_calls, 1)
+
+    def test_active_unmanaged_observation_requires_exact_server_stop(self) -> None:
+        timestamp = utc_timestamp()
+        with self.store.immediate_transaction() as connection:
+            connection.execute(
+                """
+                INSERT INTO server_observations(
+                    server_definition_id, source_resource_id, lifecycle, pid,
+                    process_start_time, process_fingerprint, listener_host,
+                    listener_port, listener_observable, health_classification,
+                    health_ok, stopped_at, stopped_reason, sampled_at,
+                    observation_fingerprint
+                ) VALUES (?, NULL, 'running', 45555, 'active-start', 'active-process',
+                          '127.0.0.1', 3003, 1, 'healthy', 1, NULL, NULL, ?,
+                          'active-observation')
+                """,
+                (self.worker_id, timestamp),
+            )
+
+        with self.assertRaisesRegex(WorkerControlError, "exact service"):
+            self._start(keep_alive=True)
+
+    def test_unknown_observation_with_pid_fails_closed_before_start(self) -> None:
+        timestamp = utc_timestamp()
+        with self.store.immediate_transaction() as connection:
+            connection.execute(
+                """
+                INSERT INTO server_observations(
+                    server_definition_id, source_resource_id, lifecycle, pid,
+                    process_start_time, process_fingerprint, listener_host,
+                    listener_port, listener_observable, health_classification,
+                    health_ok, stopped_at, stopped_reason, sampled_at,
+                    observation_fingerprint
+                ) VALUES (?, NULL, 'unknown', 45555, 'unknown-start',
+                          'unknown-process', '127.0.0.1', 3003, 0, 'unknown', 0,
+                          NULL, NULL, ?, 'unknown-observation')
+                """,
+                (self.worker_id, timestamp),
+            )
+
+        with self.assertRaisesRegex(WorkerControlError, "exact service"):
             self._start(keep_alive=True)
 
     def test_unregister_commits_stopped_state_and_removes_native_registration(self) -> None:

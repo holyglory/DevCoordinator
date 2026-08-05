@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import stat
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -29,7 +30,7 @@ from devcoordinator.runtime_sessions import (
     link_runtime_resource,
     mark_runtime_session_started,
 )
-from devcoordinator.schema import SCHEMA_VERSION, invariant_violations
+from devcoordinator.schema import invariant_violations
 from devcoordinator.store import AccountStore, deterministic_id, utc_timestamp
 
 
@@ -142,7 +143,7 @@ class RepositoryContextTests(unittest.TestCase):
         self.assertRegex(context.root.git_identity_fingerprint, r"^sha256:[0-9a-f]{64}$")
         self.assertRegex(
             context.root.identity_fingerprint,
-            r"^repository-scope-v1:sha256:[0-9a-f]{64}$",
+            r"^repository-scope-v2:sha256:[0-9a-f]{64}$",
         )
         with self.assertRaisesRegex(RepositoryContextError, "primary Git worktree"):
             resolve_repository_context(root_repo=str(linked), temporary_repo=None)
@@ -180,7 +181,7 @@ class RepositoryContextTests(unittest.TestCase):
                 root_repo=str(self.repository), temporary_repo=str(first)
             )
 
-    def test_symlink_and_replaceable_ancestor_are_rejected(self) -> None:
+    def test_symlink_is_rejected_but_shared_writable_ancestor_is_allowed(self) -> None:
         alias = self.test_root / "repository-alias"
         alias.symlink_to(self.repository, target_is_directory=True)
         with self.assertRaisesRegex(RepositoryContextError, "symbolic-link"):
@@ -191,8 +192,10 @@ class RepositoryContextTests(unittest.TestCase):
         unsafe = unsafe_parent / "unsafe-repository"
         self._initialize_repository(unsafe)
         unsafe_parent.chmod(0o777)
-        with self.assertRaisesRegex(RepositoryContextError, "replaceable"):
-            resolve_repository_context(root_repo=str(unsafe), temporary_repo=None)
+        shared = resolve_repository_context(
+            root_repo=str(unsafe), temporary_repo=None
+        )
+        self.assertEqual(shared.root.canonical_root, str(unsafe))
 
     def test_ambient_repository_redirection_and_local_config_include_are_rejected(self) -> None:
         with mock.patch.dict(
@@ -605,7 +608,7 @@ class RepositoryContextTests(unittest.TestCase):
             )
             self.assertEqual(store.connection.total_changes, changes_before)
 
-    def test_schema_v7_adds_nullable_filesystem_identity_columns(self) -> None:
+    def test_schema_v7_requires_explicit_offline_migration_without_writes(self) -> None:
         home = self.test_root / "coordinator-schema-v7"
         with AccountStore.open_default(home, effective_uid=os.geteuid()) as store:
             with store.immediate_transaction(
@@ -616,22 +619,26 @@ class RepositoryContextTests(unittest.TestCase):
                 connection.execute(
                     "UPDATE schema_metadata SET schema_version = 7 WHERE singleton = 1"
                 )
-        with AccountStore.open_default(home, effective_uid=os.geteuid()) as store:
-            with store.read_transaction() as connection:
-                columns = {
-                    str(row[1])
-                    for row in connection.execute(
-                        "PRAGMA table_info(repository_scopes)"
-                    )
-                }
-                version = int(
-                    connection.execute(
-                        "SELECT schema_version FROM schema_metadata WHERE singleton = 1"
-                    ).fetchone()[0]
-                )
-        self.assertIn("root_device", columns)
-        self.assertIn("root_inode", columns)
-        self.assertEqual(version, SCHEMA_VERSION)
+        database = home / "coordinator.sqlite3"
+        before = database.read_bytes()
+        with self.assertRaisesRegex(
+            RuntimeError, "unsupported coordinator database schema 7"
+        ):
+            AccountStore.open_default(home, effective_uid=os.geteuid())
+        self.assertEqual(database.read_bytes(), before)
+        with sqlite3.connect(database) as connection:
+            columns = {
+                str(row[1])
+                for row in connection.execute("PRAGMA table_info(repository_scopes)")
+            }
+            version = int(
+                connection.execute(
+                    "SELECT schema_version FROM schema_metadata WHERE singleton = 1"
+                ).fetchone()[0]
+            )
+        self.assertNotIn("root_device", columns)
+        self.assertNotIn("root_inode", columns)
+        self.assertEqual(version, 7)
 
     def test_unicode_path_legacy_digest_matches_pre_version_algorithm(self) -> None:
         repository = self.test_root / "репозиторій"
@@ -648,11 +655,14 @@ class RepositoryContextTests(unittest.TestCase):
         }
         material = {
             "canonical_root": str(repository),
-            "root": root_identity.material(),
-            "git_dir": {"path": admin.git_dir, **admin.git_dir_identity.material()},
+            "root": root_identity.legacy_material(),
+            "git_dir": {
+                "path": admin.git_dir,
+                **admin.git_dir_identity.legacy_material(),
+            },
             "git_common_dir": {
                 "path": admin.git_common_dir,
-                **admin.git_common_dir_identity.material(),
+                **admin.git_common_dir_identity.legacy_material(),
             },
             "git_marker_kind": admin.marker_kind,
             "git_marker_fingerprint": admin.marker_digest,
@@ -737,9 +747,7 @@ class RepositoryContextTests(unittest.TestCase):
         context = resolve_repository_context(
             root_repo=str(self.repository), temporary_repo=None
         )
-        error = repository_context_module._filesystem_acl.FilesystemACLTrustError(
-            "unrelated repository has a different writer"
-        )
+        error = RepositoryContextError("unrelated repository was replaced")
 
         with mock.patch.object(
             repository_context_module,
@@ -778,7 +786,58 @@ class RepositoryContextTests(unittest.TestCase):
                     self.repository, "worktree", "list", "--porcelain", "-z"
                 )
 
-    def test_trusted_git_rejects_non_root_writable_or_set_id_binary(self) -> None:
+    def test_git_command_admits_only_the_exact_canonical_worktree(self) -> None:
+        command = repository_context_module._git_command(
+            self.repository, "rev-parse", "--show-toplevel"
+        )
+
+        self.assertIn(f"safe.directory={self.repository}", command)
+        self.assertEqual(command[command.index("-C") + 1], str(self.repository))
+        self.assertNotIn("--global", command)
+        self.assertNotIn("safe.directory=*", command)
+        self.assertFalse(
+            any(
+                argument.startswith("safe.directory=") and argument.endswith("/*")
+                for argument in command
+            )
+        )
+
+        alias = self.test_root / "repository-alias"
+        alias.symlink_to(self.repository, target_is_directory=True)
+        with self.assertRaisesRegex(
+            RepositoryContextError, "symbolic-link|canonical non-symlink"
+        ):
+            repository_context_module._git_command(
+                alias, "rev-parse", "--show-toplevel"
+            )
+
+    def test_git_inspection_handles_different_owner_without_global_config(self) -> None:
+        environment = repository_context_module._git_environment()
+        forced_home = self.test_root / "different-owner-home"
+        forced_home.mkdir(mode=0o700)
+        environment.update(
+            {
+                "GIT_TEST_ASSUME_DIFFERENT_OWNER": "1",
+                "HOME": str(forced_home),
+            }
+        )
+
+        with mock.patch.object(
+            repository_context_module,
+            "_git_environment",
+            return_value=environment,
+        ):
+            raw = repository_context_module._git(
+                self.repository, "rev-parse", "--show-toplevel"
+            )
+
+        self.assertEqual(
+            raw.decode("utf-8", errors="surrogateescape").strip(),
+            str(self.repository),
+        )
+        self.assertFalse((forced_home / ".gitconfig").exists())
+
+    def test_trusted_git_accepts_any_executable_regular_system_candidate(self) -> None:
         real_metadata = Path(GIT).lstat()
         unsafe_modes = (
             real_metadata.st_mode | stat.S_IWGRP,
@@ -787,14 +846,14 @@ class RepositoryContextTests(unittest.TestCase):
         )
         for unsafe_mode in unsafe_modes:
             with self.subTest(mode=oct(unsafe_mode)):
-                unsafe = SimpleNamespace(st_mode=unsafe_mode, st_uid=0)
+                unsafe = SimpleNamespace(st_mode=unsafe_mode, st_uid=99_999)
                 with mock.patch.object(Path, "lstat", return_value=unsafe), mock.patch.object(
                     os, "access", return_value=True
                 ):
-                    with self.assertRaisesRegex(
-                        RepositoryContextError, "non-set-id"
-                    ):
-                        repository_context_module._trusted_git_executable()
+                    self.assertEqual(
+                        repository_context_module._trusted_git_executable(),
+                        "/usr/bin/git",
+                    )
 
     def test_nul_is_normalized_and_non_utf8_repository_path_is_supported(self) -> None:
         with self.assertRaisesRegex(RepositoryContextError, "NUL"):
@@ -821,7 +880,7 @@ class RepositoryContextTests(unittest.TestCase):
         )
         self.assertRegex(
             context.root.identity_fingerprint,
-            r"^repository-scope-v1:sha256:[0-9a-f]{64}$",
+            r"^repository-scope-v2:sha256:[0-9a-f]{64}$",
         )
 
     def test_final_reproof_detects_replacement_during_worktree_enumeration(self) -> None:

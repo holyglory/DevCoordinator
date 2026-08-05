@@ -1,0 +1,16 @@
+[Unit]
+Description=DevCoordinator test-plane broker socket
+Before=devcoordinator-authority.service devcoordinator-testd.service
+
+[Socket]
+ListenStream=/run/devcoordinator-testd/testd.sock
+Service=devcoordinator-testd.service
+FileDescriptorName=testd
+Accept=no
+SocketMode=0666
+SocketUser=root
+DirectoryMode=0755
+RemoveOnStop=no
+
+[Install]
+WantedBy=sockets.target

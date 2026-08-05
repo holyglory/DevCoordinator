@@ -9,7 +9,10 @@ import socket
 import tempfile
 import time
 import unittest
+from unittest import mock
 import uuid
+
+import devcoordinator.maintenance as maintenance_module
 
 from devcoordinator.broker import (
     BrokerClient,
@@ -19,6 +22,7 @@ from devcoordinator.broker import (
 )
 from devcoordinator.maintenance import (
     CONTROL_PLANE_MAINTENANCE_SCOPE,
+    MAINTENANCE_MARKER_MODE,
     MaintenanceMarkerError,
     PUBLIC_MAINTENANCE_MESSAGE,
     activate_maintenance,
@@ -45,7 +49,12 @@ class MaintenanceTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
-    def _write(self, document: dict[str, object], *, mode: int = 0o640) -> Path:
+    def _write(
+        self,
+        document: dict[str, object],
+        *,
+        mode: int = MAINTENANCE_MARKER_MODE,
+    ) -> Path:
         marker = self.maintenance_runtime / "maintenance.json"
         marker.write_text(json.dumps(document) + "\n", encoding="utf-8")
         marker.chmod(mode)
@@ -100,6 +109,39 @@ class MaintenanceTests(unittest.TestCase):
             )
         )
 
+    def test_marker_identity_mapping_does_not_affect_clients(self) -> None:
+        document = self._document()
+        marker = self._write(document)
+        real_lstat = Path.lstat
+
+        def unmapped_root(path: Path) -> os.stat_result:
+            metadata = real_lstat(path)
+            if path in {self.maintenance_runtime, marker}:
+                fields = list(metadata)
+                fields[4] = 65534
+                fields[5] = 65534
+                return os.stat_result(fields)
+            return metadata
+
+        with mock.patch.object(
+            maintenance_module, "MAINTENANCE_ROOT", self.maintenance_runtime
+        ), mock.patch.object(Path, "lstat", new=unmapped_root):
+            state = load_maintenance_state(
+                expected_uid=0,
+                maintenance_root=self.maintenance_runtime,
+            )
+
+        self.assertIsNotNone(state)
+        self.assertEqual(state.deployment_id, document["deployment_id"])
+
+        with mock.patch.object(Path, "lstat", new=unmapped_root):
+            custom = load_maintenance_state(
+                expected_uid=0,
+                maintenance_root=self.maintenance_runtime,
+            )
+        self.assertIsNotNone(custom)
+        self.assertEqual(custom.deployment_id, document["deployment_id"])
+
     def test_trusted_marker_blocks_before_socket_access_with_retry(self) -> None:
         marker = self._write({
             **self._document(),
@@ -114,6 +156,42 @@ class MaintenanceTests(unittest.TestCase):
         self.assertEqual(caught.exception.message, PUBLIC_MAINTENANCE_MESSAGE)
         self.assertNotIn("GlobalFinance", caught.exception.message)
         self.assertTrue(marker.exists())
+
+    def test_marker_gid_is_independent_of_socket_access_gid(self) -> None:
+        marker = self._write(self._document())
+        unrelated_socket_gid = marker.stat().st_gid + 1
+        client = BrokerClient(
+            self.socket,
+            expected_broker_uid=self.uid,
+            expected_socket_gid=unrelated_socket_gid,
+            maintenance_root=self.maintenance_runtime,
+        )
+
+        self.assertNotEqual(marker.stat().st_gid, unrelated_socket_gid)
+        with self.assertRaises(BrokerError) as caught:
+            client.call(self._request(BrokerOperation.INVENTORY_READ))
+
+        self.assertEqual(caught.exception.code, "maintenance_in_progress")
+
+    def test_marker_owner_is_not_a_local_authorization_gate(self) -> None:
+        marker = self._write(self._document())
+        real_lstat = Path.lstat
+
+        def foreign_marker_owner(path: Path) -> os.stat_result:
+            metadata = real_lstat(path)
+            if path == marker:
+                fields = list(metadata)
+                fields[4] = self.uid + 1
+                return os.stat_result(fields)
+            return metadata
+
+        with mock.patch.object(Path, "lstat", new=foreign_marker_owner):
+            with self.assertRaises(BrokerError) as caught:
+                self._client().call(
+                    self._request(BrokerOperation.INVENTORY_READ)
+                )
+
+        self.assertEqual(caught.exception.code, "maintenance_in_progress")
 
     def test_activation_is_reserved_for_fixed_control_plane_scope_and_copy(self) -> None:
         document = self._document()
@@ -139,11 +217,18 @@ class MaintenanceTests(unittest.TestCase):
             )
         self.assertFalse((self.maintenance_runtime / "maintenance.json").exists())
 
-    def test_untrusted_or_malformed_marker_fails_closed(self) -> None:
+    def test_marker_mode_is_ignored_but_malformed_content_fails_closed(self) -> None:
+        self._write(self._document(), mode=0o666)
+        with self.assertRaises(BrokerError) as active:
+            self._client().call(self._request(BrokerOperation.INVENTORY_READ))
+        self.assertEqual(active.exception.code, "maintenance_in_progress")
+
         cases = (
-            (self._document(), 0o660),
-            ({**self._document(), "retry_after_seconds": True}, 0o640),
-            ({**self._document(), "extra": "field"}, 0o640),
+            (
+                {**self._document(), "retry_after_seconds": True},
+                MAINTENANCE_MARKER_MODE,
+            ),
+            ({**self._document(), "extra": "field"}, MAINTENANCE_MARKER_MODE),
         )
         for document, mode in cases:
             with self.subTest(document=document, mode=oct(mode)):
@@ -198,6 +283,11 @@ class MaintenanceTests(unittest.TestCase):
             "maintenance_root": self.maintenance_runtime,
         }
         first = activate_maintenance(**arguments)
+        self.assertEqual(
+            (self.maintenance_runtime / "maintenance.json").stat().st_mode
+            & 0o777,
+            MAINTENANCE_MARKER_MODE,
+        )
         second = activate_maintenance(**arguments)
         self.assertEqual(first, second)
         with self.assertRaisesRegex(

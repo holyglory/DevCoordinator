@@ -8,7 +8,6 @@ import tempfile
 import time
 import unittest
 
-from devcoordinator.schema import SCHEMA_VERSION
 from devcoordinator.store import AccountStore, deterministic_id, utc_timestamp
 from devcoordinator.worker_supervision import (
     WorkerCircuitOpen,
@@ -832,7 +831,7 @@ class WorkerSupervisionTests(unittest.TestCase):
         )
         self.assertEqual(result["desired_state"], "running")
 
-    def test_previous_schema_additively_migrates_worker_tables(self) -> None:
+    def test_previous_schema_requires_explicit_offline_migration_without_writes(self) -> None:
         self.store.close()
         database = self.home / "coordinator.sqlite3"
         connection = sqlite3.connect(database)
@@ -848,12 +847,18 @@ class WorkerSupervisionTests(unittest.TestCase):
             connection.commit()
         finally:
             connection.close()
-        self.store = AccountStore.open_default(
-            self.home, effective_uid=os.geteuid()
-        )
-        self.service = WorkerSupervision(self.store, clock=self.clock)
-        self.assertEqual(self.store.metadata.schema_version, SCHEMA_VERSION)
-        with self.store.read_transaction() as current:
+        before = database.read_bytes()
+        with self.assertRaisesRegex(
+            RuntimeError, "unsupported coordinator database schema 9"
+        ):
+            AccountStore.open_default(self.home, effective_uid=os.geteuid())
+        self.assertEqual(database.read_bytes(), before)
+        with sqlite3.connect(database) as current:
+            version = int(
+                current.execute(
+                    "SELECT schema_version FROM schema_metadata WHERE singleton = 1"
+                ).fetchone()[0]
+            )
             tables = {
                 str(row[0])
                 for row in current.execute(
@@ -863,15 +868,8 @@ class WorkerSupervisionTests(unittest.TestCase):
                     """
                 )
             }
-        self.assertEqual(
-            tables,
-            {
-                "worker_policies",
-                "worker_attempts",
-                "worker_supervisor_states",
-                "worker_exit_decisions",
-            },
-        )
+        self.assertEqual(version, 9)
+        self.assertEqual(tables, set())
 
     def test_optimized_mode_has_no_assert_dependent_worker_guards(self) -> None:
         source = Path(

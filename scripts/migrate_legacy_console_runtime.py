@@ -74,7 +74,6 @@ PATH_VALUES = {
     "STATE_DIR": lambda state, coordinator, root: str(state),
     "ACME_WEBROOT": lambda state, coordinator, root: str(state / "acme"),
     "CODEX_AGENT_COORDINATOR_HOME": lambda state, coordinator, root: str(coordinator),
-    "COORDINATOR_TOKEN_FILE": lambda state, coordinator, root: str(coordinator / "api-token"),
     "DEVCOORDINATOR_ROOT": lambda state, coordinator, root: str(root),
     "COORDINATOR_SCRIPT": lambda state, coordinator, root: str(
         root / "skills/codex-dev-coordinator/scripts/dev_coordinator.py"
@@ -82,6 +81,7 @@ PATH_VALUES = {
     "COORDINATOR_AUTOSTART": lambda state, coordinator, root: "0",
     "COORDINATOR_URL": lambda state, coordinator, root: "http://127.0.0.1:29876",
 }
+REMOVED_VALUES = {"COORDINATOR_TOKEN_FILE"}
 ASSIGNMENT = re.compile(r"^(?P<prefix>\s*(?:export\s+)?)(?P<key>[A-Z][A-Z0-9_]*)(?P<separator>\s*=\s*).*$")
 
 
@@ -317,6 +317,8 @@ def migrated_environment(
             ending = "\r\n" if ending else "\r"
         match = ASSIGNMENT.match(body)
         key = match.group("key") if match else None
+        if key in REMOVED_VALUES:
+            continue
         if key in replacements:
             output.append(
                 f"{match.group('prefix')}{key}{match.group('separator')}{replacements[key]}{ending}"

@@ -3,13 +3,21 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 import json
 import re
 import sqlite3
-from typing import Iterable
+from typing import Iterable, Mapping
+
+from .repository_execution_scope import (
+    RepositoryExecutionScopeError,
+    repository_execution_scope,
+    validate_repository_execution_scope,
+)
 
 
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 13
+PRE_OWNER_AUTHORITY_SCHEMA_VERSION = 12
 MINIMUM_MIGRATABLE_SCHEMA_VERSION = 1
 
 
@@ -69,6 +77,54 @@ CREATE TABLE IF NOT EXISTS repositories (
     updated_at TEXT NOT NULL,
     UNIQUE(host_id, canonical_root)
 );
+
+-- Repository execution ownership is explicit authority.  It intentionally
+-- lives outside ``repositories`` so legacy repository records cannot acquire
+-- an execution UID from a column default, caller identity, or a filesystem
+-- guess.  A ready authority store must contain exactly one row for every
+-- repository; consumers fail closed when it is absent or generation-stale.
+CREATE TABLE IF NOT EXISTS repository_owners (
+    repo_id TEXT PRIMARY KEY REFERENCES repositories(repo_id) ON DELETE CASCADE,
+    owner_uid INTEGER NOT NULL CHECK(owner_uid > 0),
+    repository_generation INTEGER NOT NULL CHECK(repository_generation >= 0),
+    authority_generation INTEGER NOT NULL CHECK(authority_generation >= 1),
+    evidence_sha256 TEXT NOT NULL,
+    operation_id TEXT NOT NULL,
+    established_by TEXT NOT NULL,
+    established_at TEXT NOT NULL
+);
+
+-- Every initial owner assignment and later transfer is retained.  Transfer
+-- rows are immutable: correction is a new generation-fenced transfer, never
+-- an UPDATE or DELETE that could rewrite execution authority history.
+CREATE TABLE IF NOT EXISTS repository_owner_transfers (
+    transfer_id TEXT PRIMARY KEY,
+    repo_id TEXT NOT NULL REFERENCES repositories(repo_id) ON DELETE RESTRICT,
+    prior_owner_uid INTEGER CHECK(prior_owner_uid IS NULL OR prior_owner_uid > 0),
+    owner_uid INTEGER NOT NULL CHECK(owner_uid > 0),
+    repository_generation INTEGER NOT NULL CHECK(repository_generation >= 0),
+    authority_generation INTEGER NOT NULL CHECK(authority_generation >= 1),
+    evidence_sha256 TEXT NOT NULL,
+    evidence_json TEXT NOT NULL,
+    operation_id TEXT NOT NULL,
+    actor TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    transferred_at TEXT NOT NULL,
+    UNIQUE(repo_id, authority_generation),
+    UNIQUE(operation_id, repo_id)
+);
+
+CREATE TRIGGER IF NOT EXISTS repository_owner_transfers_no_update
+BEFORE UPDATE ON repository_owner_transfers
+BEGIN
+    SELECT RAISE(ABORT, 'repository owner transfer history is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS repository_owner_transfers_no_delete
+BEFORE DELETE ON repository_owner_transfers
+BEGIN
+    SELECT RAISE(ABORT, 'repository owner transfer history is immutable');
+END;
 
 CREATE TABLE IF NOT EXISTS repository_aliases (
     alias_id TEXT PRIMARY KEY,
@@ -1438,10 +1494,528 @@ CREATE INDEX IF NOT EXISTS unassigned_by_status ON unassigned_resources(status, 
 """
 
 
+# The offline v12 -> v13 authority migration executes only this additive DDL
+# after validating an operator-sealed, exact owner map.  Keep it independent
+# from ``initialize_schema``: service startup must never invent repository
+# execution ownership or partially advance this authority boundary.
+REPOSITORY_OWNER_AUTHORITY_DDL = r"""
+CREATE TABLE repository_owners (
+    repo_id TEXT PRIMARY KEY REFERENCES repositories(repo_id) ON DELETE CASCADE,
+    owner_uid INTEGER NOT NULL CHECK(owner_uid > 0),
+    repository_generation INTEGER NOT NULL CHECK(repository_generation >= 0),
+    authority_generation INTEGER NOT NULL CHECK(authority_generation >= 1),
+    evidence_sha256 TEXT NOT NULL,
+    operation_id TEXT NOT NULL,
+    established_by TEXT NOT NULL,
+    established_at TEXT NOT NULL
+);
+
+CREATE TABLE repository_owner_transfers (
+    transfer_id TEXT PRIMARY KEY,
+    repo_id TEXT NOT NULL REFERENCES repositories(repo_id) ON DELETE RESTRICT,
+    prior_owner_uid INTEGER CHECK(prior_owner_uid IS NULL OR prior_owner_uid > 0),
+    owner_uid INTEGER NOT NULL CHECK(owner_uid > 0),
+    repository_generation INTEGER NOT NULL CHECK(repository_generation >= 0),
+    authority_generation INTEGER NOT NULL CHECK(authority_generation >= 1),
+    evidence_sha256 TEXT NOT NULL,
+    evidence_json TEXT NOT NULL,
+    operation_id TEXT NOT NULL,
+    actor TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    transferred_at TEXT NOT NULL,
+    UNIQUE(repo_id, authority_generation),
+    UNIQUE(operation_id, repo_id)
+);
+
+CREATE TRIGGER repository_owner_transfers_no_update
+BEFORE UPDATE ON repository_owner_transfers
+BEGIN
+    SELECT RAISE(ABORT, 'repository owner transfer history is immutable');
+END;
+
+CREATE TRIGGER repository_owner_transfers_no_delete
+BEFORE DELETE ON repository_owner_transfers
+BEGIN
+    SELECT RAISE(ABORT, 'repository owner transfer history is immutable');
+END;
+"""
+
+
 @dataclass(frozen=True)
 class InvariantViolation:
     code: str
     detail: str
+
+
+def _execute_ddl(connection: sqlite3.Connection, ddl: str) -> None:
+    statement = ""
+    for line in ddl.splitlines(keepends=True):
+        statement += line
+        if sqlite3.complete_statement(statement):
+            sql = statement.strip()
+            statement = ""
+            if sql:
+                connection.execute(sql)
+    if statement.strip():
+        raise RuntimeError("coordinator schema contains an incomplete SQL statement")
+
+
+def migrate_repository_owner_authority_v13(
+    connection: sqlite3.Connection,
+    *,
+    assignments: Iterable[dict[str, object]],
+    execution_scope: Mapping[str, object],
+    target_database_generation: str,
+    operation_id: str,
+    actor: str,
+    evidence_sha256: str,
+    timestamp: str,
+) -> None:
+    """Apply one exact, operator-sealed v12 -> v13 owner authority map.
+
+    This primitive intentionally accepts no path or caller UID from which an
+    owner could be inferred.  The caller must hold an offline transaction and
+    supply exactly one generation-bound assignment for every executable
+    repository.  A retained repository may be omitted only when the sealed
+    execution-scope partition proves an exact terminal project cleanup.
+    SQLite makes the schema change, initial owner rows, immutable ledger,
+    database-generation rotation, and schema-version advance atomic; a crash
+    therefore leaves either complete v12 or complete v13 authority.  Rotating
+    the generation fences every request or profile loaded before this parser
+    and authority change.
+    """
+
+    if not connection.in_transaction:
+        raise RuntimeError("repository owner authority migration requires a transaction")
+    if not isinstance(operation_id, str) or not operation_id.strip():
+        raise ValueError("repository owner migration operation_id is required")
+    if not isinstance(actor, str) or not actor.strip():
+        raise ValueError("repository owner migration actor is required")
+    if not isinstance(timestamp, str) or not timestamp.strip():
+        raise ValueError("repository owner migration timestamp is required")
+    if (
+        not isinstance(target_database_generation, str)
+        or target_database_generation != target_database_generation.strip()
+        or not target_database_generation
+        or len(target_database_generation) > 256
+        or any(ord(character) < 0x20 for character in target_database_generation)
+    ):
+        raise ValueError("repository owner migration target database generation is invalid")
+    if not isinstance(evidence_sha256, str) or not _SHA256_FINGERPRINT.fullmatch(
+        evidence_sha256
+    ):
+        raise ValueError("repository owner map evidence_sha256 is invalid")
+
+    metadata = connection.execute(
+        """
+        SELECT schema_version, migration_state, database_generation
+        FROM schema_metadata WHERE singleton = 1
+        """
+    ).fetchone()
+    if metadata is None or int(metadata[0]) != PRE_OWNER_AUTHORITY_SCHEMA_VERSION:
+        actual = None if metadata is None else metadata[0]
+        raise RuntimeError(
+            "repository owner authority migration requires exact schema "
+            f"{PRE_OWNER_AUTHORITY_SCHEMA_VERSION}; found {actual}"
+        )
+    if str(metadata[1]) != "ready":
+        raise RuntimeError(
+            "repository owner authority migration requires migration_state=ready"
+        )
+    source_database_generation = str(metadata[2])
+    if target_database_generation == source_database_generation:
+        raise RuntimeError(
+            "repository owner authority migration must rotate database generation"
+        )
+    for table in ("repository_owners", "repository_owner_transfers"):
+        if connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (table,)
+        ).fetchone() is not None:
+            raise RuntimeError(
+                "repository owner authority migration found partial v13 state; "
+                "restore the sealed v12 database before retrying"
+            )
+
+    try:
+        validated_scope = validate_repository_execution_scope(
+            connection, execution_scope
+        )
+    except RepositoryExecutionScopeError as error:
+        raise RuntimeError(
+            f"repository owner execution scope is invalid: {error}"
+        ) from error
+    if (
+        validated_scope["authority_schema_version"]
+        != PRE_OWNER_AUTHORITY_SCHEMA_VERSION
+        or validated_scope["database_generation"] != source_database_generation
+        or validated_scope["migration_state"] != "ready"
+    ):
+        raise RuntimeError(
+            "repository owner execution scope is bound to another authority"
+        )
+
+    normalized: list[dict[str, object]] = []
+    seen: set[str] = set()
+    for raw in assignments:
+        if not isinstance(raw, dict) or set(raw) != {
+            "repository_id",
+            "canonical_root",
+            "repository_generation",
+            "owner_uid",
+        }:
+            raise ValueError("repository owner assignment fields are invalid")
+        repository_id = raw["repository_id"]
+        canonical_root = raw["canonical_root"]
+        generation = raw["repository_generation"]
+        owner_uid = raw["owner_uid"]
+        if not isinstance(repository_id, str) or not repository_id or repository_id in seen:
+            raise ValueError("repository owner assignment repository_id is invalid")
+        if not isinstance(canonical_root, str) or not canonical_root.startswith("/"):
+            raise ValueError("repository owner assignment canonical_root is invalid")
+        if isinstance(generation, bool) or not isinstance(generation, int) or generation < 0:
+            raise ValueError("repository owner assignment generation is invalid")
+        if isinstance(owner_uid, bool) or not isinstance(owner_uid, int) or owner_uid <= 0:
+            raise ValueError("repository owner assignment owner_uid is invalid")
+        seen.add(repository_id)
+        normalized.append(
+            {
+                "repository_id": repository_id,
+                "canonical_root": canonical_root,
+                "repository_generation": generation,
+                "owner_uid": owner_uid,
+            }
+        )
+    normalized.sort(key=lambda item: str(item["repository_id"]))
+
+    actual = [
+        {
+            "repository_id": str(item["repository_id"]),
+            "canonical_root": str(item["canonical_root"]),
+            "repository_generation": int(item["repository_generation"]),
+        }
+        for item in validated_scope["executable_repositories"]
+    ]
+    proposed = [
+        {
+            "repository_id": str(item["repository_id"]),
+            "canonical_root": str(item["canonical_root"]),
+            "repository_generation": int(item["repository_generation"]),
+        }
+        for item in normalized
+    ]
+    if proposed != actual:
+        raise RuntimeError(
+            "repository owner map does not cover every executable repository exactly once"
+        )
+
+    _execute_ddl(connection, REPOSITORY_OWNER_AUTHORITY_DDL)
+    for item in normalized:
+        repository_id = str(item["repository_id"])
+        owner_uid = int(item["owner_uid"])
+        generation = int(item["repository_generation"])
+        entry_evidence = json.dumps(
+            {
+                "kind": "devcoordinator-repository-owner-initial-assignment",
+                "owner_map_sha256": evidence_sha256,
+                **item,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+        transfer_id = "repository-owner-initial-" + hashlib.sha256(
+            f"{operation_id}\0{repository_id}".encode("utf-8")
+        ).hexdigest()
+        connection.execute(
+            """
+            INSERT INTO repository_owners(
+                repo_id, owner_uid, repository_generation,
+                authority_generation, evidence_sha256, operation_id,
+                established_by, established_at
+            ) VALUES (?, ?, ?, 1, ?, ?, ?, ?)
+            """,
+            (
+                repository_id,
+                owner_uid,
+                generation,
+                evidence_sha256,
+                operation_id,
+                actor,
+                timestamp,
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO repository_owner_transfers(
+                transfer_id, repo_id, prior_owner_uid, owner_uid,
+                repository_generation, authority_generation,
+                evidence_sha256, evidence_json, operation_id, actor,
+                reason, transferred_at
+            ) VALUES (?, ?, NULL, ?, ?, 1, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                transfer_id,
+                repository_id,
+                owner_uid,
+                generation,
+                evidence_sha256,
+                entry_evidence,
+                operation_id,
+                actor,
+                "sealed v12 to v13 repository owner authority migration",
+                timestamp,
+            ),
+        )
+    changed = connection.execute(
+        """
+        UPDATE schema_metadata
+        SET schema_version = ?, database_generation = ?,
+            state_revision = state_revision + 1, updated_at = ?
+        WHERE singleton = 1 AND schema_version = ? AND migration_state = 'ready'
+          AND database_generation = ?
+        """,
+        (
+            SCHEMA_VERSION,
+            target_database_generation,
+            timestamp,
+            PRE_OWNER_AUTHORITY_SCHEMA_VERSION,
+            source_database_generation,
+        ),
+    ).rowcount
+    if changed != 1:
+        raise RuntimeError("repository owner authority schema fence changed")
+    try:
+        committed_scope = repository_execution_scope(connection)
+    except RepositoryExecutionScopeError as error:
+        raise RuntimeError(
+            f"repository owner committed execution scope is invalid: {error}"
+        ) from error
+    partition_fields = (
+        "repository_count",
+        "executable_repository_count",
+        "excluded_terminal_repository_count",
+        "repository_universe_sha256",
+        "executable_repositories_sha256",
+        "excluded_terminal_repositories_sha256",
+        "executable_repositories",
+        "excluded_terminal_repositories",
+    )
+    if (
+        committed_scope["authority_schema_version"] != SCHEMA_VERSION
+        or committed_scope["database_generation"] != target_database_generation
+        or committed_scope["state_revision"]
+        != int(validated_scope["state_revision"]) + 1
+        or committed_scope["migration_state"] != "ready"
+        or any(
+            committed_scope[field] != validated_scope[field]
+            for field in partition_fields
+        )
+    ):
+        raise RuntimeError(
+            "repository owner execution scope changed during schema migration"
+        )
+
+
+def establish_repository_owner_authority(
+    connection: sqlite3.Connection,
+    *,
+    repository_id: str,
+    owner_uid: int,
+    repository_generation: int,
+    operation_id: str,
+    actor: str,
+    reason: str,
+    timestamp: str,
+    evidence: dict[str, object],
+) -> None:
+    """Establish the first explicit owner for a newly inserted repository."""
+
+    if not connection.in_transaction:
+        raise RuntimeError("repository owner establishment requires a transaction")
+    if isinstance(owner_uid, bool) or not isinstance(owner_uid, int) or owner_uid <= 0:
+        raise ValueError("repository owner UID must be a positive integer")
+    if (
+        isinstance(repository_generation, bool)
+        or not isinstance(repository_generation, int)
+        or repository_generation < 0
+    ):
+        raise ValueError("repository generation must be a non-negative integer")
+    for label, value in (
+        ("repository id", repository_id),
+        ("operation id", operation_id),
+        ("actor", actor),
+        ("reason", reason),
+        ("timestamp", timestamp),
+    ):
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"{label} is required")
+    row = connection.execute(
+        "SELECT generation FROM repositories WHERE repo_id = ?", (repository_id,)
+    ).fetchone()
+    if row is None or int(row[0]) != repository_generation:
+        raise RuntimeError("repository owner establishment generation fence changed")
+    if connection.execute(
+        "SELECT 1 FROM repository_owners WHERE repo_id = ?", (repository_id,)
+    ).fetchone() is not None:
+        raise RuntimeError("repository already has explicit owner authority")
+    try:
+        evidence_json = json.dumps(
+            evidence,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+    except (TypeError, ValueError, UnicodeError, RecursionError) as error:
+        raise ValueError("repository owner evidence must be canonical JSON") from error
+    evidence_sha256 = "sha256:" + hashlib.sha256(
+        evidence_json.encode("utf-8")
+    ).hexdigest()
+    transfer_id = "repository-owner-initial-" + hashlib.sha256(
+        f"{operation_id}\0{repository_id}".encode("utf-8")
+    ).hexdigest()
+    connection.execute(
+        """
+        INSERT INTO repository_owners(
+            repo_id, owner_uid, repository_generation, authority_generation,
+            evidence_sha256, operation_id, established_by, established_at
+        ) VALUES (?, ?, ?, 1, ?, ?, ?, ?)
+        """,
+        (
+            repository_id,
+            owner_uid,
+            repository_generation,
+            evidence_sha256,
+            operation_id,
+            actor,
+            timestamp,
+        ),
+    )
+    connection.execute(
+        """
+        INSERT INTO repository_owner_transfers(
+            transfer_id, repo_id, prior_owner_uid, owner_uid,
+            repository_generation, authority_generation, evidence_sha256,
+            evidence_json, operation_id, actor, reason, transferred_at
+        ) VALUES (?, ?, NULL, ?, ?, 1, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            transfer_id,
+            repository_id,
+            owner_uid,
+            repository_generation,
+            evidence_sha256,
+            evidence_json,
+            operation_id,
+            actor,
+            reason,
+            timestamp,
+        ),
+    )
+
+
+def advance_repository_owner_generation(
+    connection: sqlite3.Connection,
+    *,
+    repository_id: str,
+    owner_uid: int,
+    prior_repository_generation: int,
+    repository_generation: int,
+    operation_id: str,
+    actor: str,
+    reason: str,
+    timestamp: str,
+    evidence: dict[str, object],
+) -> None:
+    """Fence unchanged owner authority to an explicitly advanced repo generation."""
+
+    if not connection.in_transaction:
+        raise RuntimeError("repository owner generation advance requires a transaction")
+    if repository_generation != prior_repository_generation + 1:
+        raise ValueError("repository owner generation must advance by exactly one")
+    current = connection.execute(
+        """
+        SELECT owner_uid, repository_generation, authority_generation
+        FROM repository_owners WHERE repo_id = ?
+        """,
+        (repository_id,),
+    ).fetchone()
+    repository = connection.execute(
+        "SELECT generation FROM repositories WHERE repo_id = ?", (repository_id,)
+    ).fetchone()
+    if (
+        current is None
+        or repository is None
+        or int(current[0]) != owner_uid
+        or int(current[1]) != prior_repository_generation
+        or int(repository[0]) != repository_generation
+    ):
+        raise RuntimeError("repository owner generation fence changed")
+    authority_generation = int(current[2]) + 1
+    try:
+        evidence_json = json.dumps(
+            evidence,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+    except (TypeError, ValueError, UnicodeError, RecursionError) as error:
+        raise ValueError("repository owner generation evidence must be canonical JSON") from error
+    evidence_sha256 = "sha256:" + hashlib.sha256(
+        evidence_json.encode("utf-8")
+    ).hexdigest()
+    transfer_id = "repository-owner-generation-" + hashlib.sha256(
+        f"{operation_id}\0{repository_id}\0{authority_generation}".encode("utf-8")
+    ).hexdigest()
+    changed = connection.execute(
+        """
+        UPDATE repository_owners
+        SET repository_generation = ?, authority_generation = ?,
+            evidence_sha256 = ?, operation_id = ?, established_by = ?,
+            established_at = ?
+        WHERE repo_id = ? AND owner_uid = ?
+          AND repository_generation = ? AND authority_generation = ?
+        """,
+        (
+            repository_generation,
+            authority_generation,
+            evidence_sha256,
+            operation_id,
+            actor,
+            timestamp,
+            repository_id,
+            owner_uid,
+            prior_repository_generation,
+            authority_generation - 1,
+        ),
+    ).rowcount
+    if changed != 1:
+        raise RuntimeError("repository owner generation authority changed")
+    connection.execute(
+        """
+        INSERT INTO repository_owner_transfers(
+            transfer_id, repo_id, prior_owner_uid, owner_uid,
+            repository_generation, authority_generation, evidence_sha256,
+            evidence_json, operation_id, actor, reason, transferred_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            transfer_id,
+            repository_id,
+            owner_uid,
+            owner_uid,
+            repository_generation,
+            authority_generation,
+            evidence_sha256,
+            evidence_json,
+            operation_id,
+            actor,
+            reason,
+            timestamp,
+        ),
+    )
 
 
 def _upgrade_sha256_fingerprints_to_v4(connection: sqlite3.Connection) -> None:
@@ -1917,32 +2491,30 @@ def initialize_schema(
     database_generation: str,
     timestamp: str,
 ) -> None:
-    """Create or atomically upgrade the normalized coordinator schema."""
+    """Create a fresh v13 store or validate one already at exact v13.
 
-    statement = ""
-    for line in DDL.splitlines(keepends=True):
-        statement += line
-        if sqlite3.complete_statement(statement):
-            sql = statement.strip()
-            statement = ""
-            if sql:
-                connection.execute(sql)
-    if statement.strip():
-        raise RuntimeError("coordinator schema contains an incomplete SQL statement")
-    # Existing stores predate the insertion-order journal. Backfill once in a
-    # deterministic order; the trigger assigns every later event atomically in
-    # its originating transaction. AUTOINCREMENT prevents cursor reuse after
-    # deletions, logical import, or VACUUM.
-    connection.execute(
-        """
-        INSERT OR IGNORE INTO event_journal_sequences(event_id)
-        SELECT event_id FROM events ORDER BY occurred_at, event_id
-        """
-    )
-    row = connection.execute(
-        "SELECT schema_version FROM schema_metadata WHERE singleton = 1"
-    ).fetchone()
-    if row is None:
+    Existing stores are deliberately never upgraded here.  In particular,
+    v12 has no repository execution-owner authority and must pass through the
+    separately sealed offline owner-map transaction.  This check runs before
+    any v13 DDL, so an ordinary service open of v12 is byte/logically no-write.
+    """
+
+    tables = {
+        str(row[0])
+        for row in connection.execute(
+            """
+            SELECT name FROM sqlite_master
+            WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+            """
+        )
+    }
+    if "schema_metadata" not in tables:
+        if tables:
+            raise RuntimeError(
+                "coordinator database has tables but no schema metadata; "
+                "explicit recovery is required"
+            )
+        _execute_ddl(connection, DDL)
         connection.execute(
             """
             INSERT INTO schema_metadata(
@@ -1951,37 +2523,29 @@ def initialize_schema(
             """,
             (SCHEMA_VERSION, database_generation, timestamp, timestamp),
         )
-    elif MINIMUM_MIGRATABLE_SCHEMA_VERSION <= int(row[0]) < SCHEMA_VERSION:
-        # Versions 2 and 3 add only additive ledgers. Version 4 additionally
-        # tags exact legacy membership/policy digests. Versions 5 through 11
-        # were developed on two compatible feature lines: broker-owned
-        # ephemeral/test journals and repository-family/runtime/worker state.
-        # Their migrations are deliberately idempotent and all run below so a
-        # database from either line reaches the merged v12 contract without
-        # guessing which same-numbered historical line produced it.
-        # The caller owns one BEGIN IMMEDIATE transaction around this entire
-        # function, so a malformed leftover rolls back both DDL and every
-        # successfully converted fingerprint.
-        previous = int(row[0])
-        _upgrade_sha256_fingerprints_to_v4(connection)
-        _upgrade_ephemeral_runs_to_v6(connection)
-        _upgrade_ephemeral_secret_policy_to_v7(connection)
-        _upgrade_ephemeral_renewal_journal_to_v8(connection)
-        _backfill_repository_families_to_v5(connection, timestamp=timestamp)
-        _upgrade_runtime_session_columns_to_v6(connection)
-        _upgrade_runtime_cleanup_owner_columns_to_v7(connection)
-        _upgrade_repository_scope_filesystem_identity_to_v8(connection)
-        _upgrade_cleanup_tombstones_to_v11(connection)
-        connection.execute(
-            """
-            UPDATE schema_metadata SET schema_version = ?, updated_at = ?
-            WHERE singleton = 1 AND schema_version = ?
-            """,
-            (SCHEMA_VERSION, timestamp, previous),
-        )
-    elif int(row[0]) != SCHEMA_VERSION:
+        return
+
+    row = connection.execute(
+        "SELECT schema_version FROM schema_metadata WHERE singleton = 1"
+    ).fetchone()
+    if row is None:
+        raise RuntimeError("coordinator schema metadata singleton is missing")
+    version = int(row[0])
+    if version == PRE_OWNER_AUTHORITY_SCHEMA_VERSION:
         raise RuntimeError(
-            f"unsupported coordinator database schema {row[0]}; expected {SCHEMA_VERSION}"
+            "coordinator schema 12 requires the sealed offline repository-owner "
+            "authority migration; service startup will not infer owners"
+        )
+    if version != SCHEMA_VERSION:
+        raise RuntimeError(
+            f"unsupported coordinator database schema {version}; expected {SCHEMA_VERSION}"
+        )
+    required = {"repository_owners", "repository_owner_transfers"}
+    missing = sorted(required - tables)
+    if missing:
+        raise RuntimeError(
+            "coordinator schema 13 repository-owner authority is incomplete: "
+            + ", ".join(missing)
         )
 
 
@@ -1989,6 +2553,7 @@ def invariant_violations(
     connection: sqlite3.Connection,
     *,
     include_foreign_keys: bool = True,
+    include_owner_authority: bool = True,
 ) -> list[InvariantViolation]:
     """Return human-readable violations not expressible as local constraints.
 
@@ -1996,6 +2561,9 @@ def invariant_violations(
     ``foreign_key_check`` is therefore a maintenance verifier for pre-existing
     corruption, not a per-mutation safety primitive; callers on short write
     paths can omit it while still evaluating the semantic consistency checks.
+    The explicit owner-authority switch exists only for the sealed schema-12
+    recovery verifier, whose database predates those schema-13 tables but must
+    still run every invariant defined by its own authority generation.
     """
 
     violations: list[InvariantViolation] = []
@@ -2008,7 +2576,75 @@ def invariant_violations(
                 )
             )
 
+    if include_owner_authority:
+        metadata = connection.execute(
+            """
+            SELECT schema_version, migration_state
+            FROM schema_metadata WHERE singleton = 1
+            """
+        ).fetchone()
+        if (
+            metadata is not None
+            and int(metadata[0]) == SCHEMA_VERSION
+            and str(metadata[1]) == "ready"
+        ):
+            try:
+                execution_scope = repository_execution_scope(connection)
+            except (RepositoryExecutionScopeError, sqlite3.DatabaseError) as error:
+                violations.append(
+                    InvariantViolation(
+                        "ready_repository_execution_scope_invalid",
+                        "ready authority repository execution scope is invalid: "
+                        f"{error}",
+                    )
+                )
+            else:
+                executable_ids = {
+                    str(item["repository_id"])
+                    for item in execution_scope["executable_repositories"]
+                }
+                owner_ids = {
+                    str(row[0])
+                    for row in connection.execute(
+                        "SELECT repo_id FROM repository_owners"
+                    )
+                }
+                for repository_id in sorted(executable_ids - owner_ids):
+                    violations.append(
+                        InvariantViolation(
+                            "ready_repository_missing_owner_authority",
+                            "ready executable repository has no explicit "
+                            f"execution owner: {repository_id}",
+                        )
+                    )
+
     checks: Iterable[tuple[str, str, str]] = (
+        (
+            "repository_owner_generation_stale",
+            """
+            SELECT r.repo_id
+            FROM repositories r
+            JOIN repository_owners owner USING(repo_id)
+            WHERE owner.repository_generation != r.generation
+            """,
+            "repository owner authority is fenced to another repository generation",
+        ),
+        (
+            "repository_owner_ledger_mismatch",
+            """
+            SELECT owner.repo_id
+            FROM repository_owners owner
+            LEFT JOIN repository_owner_transfers transfer
+              ON transfer.repo_id = owner.repo_id
+             AND transfer.authority_generation = owner.authority_generation
+            WHERE transfer.transfer_id IS NULL
+               OR transfer.owner_uid != owner.owner_uid
+               OR transfer.repository_generation != owner.repository_generation
+               OR transfer.evidence_sha256 != owner.evidence_sha256
+               OR transfer.operation_id != owner.operation_id
+            """,
+            "repository owner authority does not match its immutable ledger head",
+        ),
         (
             "installed_missing_repository",
             """
@@ -2324,7 +2960,15 @@ def invariant_violations(
             "worker crash event belongs to a different repository",
         ),
     )
+    owner_authority_codes = frozenset(
+        {
+            "repository_owner_generation_stale",
+            "repository_owner_ledger_mismatch",
+        }
+    )
     for code, sql, prefix in checks:
+        if not include_owner_authority and code in owner_authority_codes:
+            continue
         for row in connection.execute(sql):
             violations.append(InvariantViolation(code, f"{prefix}: {row[0]}"))
     return violations

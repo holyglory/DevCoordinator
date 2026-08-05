@@ -1,0 +1,44 @@
+[Unit]
+Description=DevCoordinator bounded Telegram notification worker
+After=network-online.target devcoordinator-api.socket
+Wants=network-online.target devcoordinator-api.socket
+ConditionPathExists=/var/lib/devcoordinator-notifications/telegram-control.json
+
+[Service]
+Type=exec
+User=devcoordinator-notifications
+Group=devcoordinator-notifications
+Slice=devcoordinator-background.slice
+UMask=0077
+Environment=DEVCOORDINATOR_ROLE=notifications
+Environment=COORDINATOR_URL=http://127.0.0.1:29876
+Environment=DEVCOORDINATOR_NOTIFICATION_STATE=/var/lib/devcoordinator-notifications/telegram-control.json
+Environment=DEVCOORDINATOR_NOTIFICATION_SOCKET=/run/devcoordinator-notifications/notifications.sock
+EnvironmentFile=/etc/devcoordinator/notifications.env
+ExecStartPre=/opt/devcoordinator/releases/RELEASE_DIGEST/bin/devcoordinator-notifications --check
+ExecStart=/opt/devcoordinator/releases/RELEASE_DIGEST/bin/devcoordinator-notifications
+Restart=always
+RestartSec=3
+TimeoutStopSec=30s
+KillMode=control-group
+StateDirectory=devcoordinator-notifications
+StateDirectoryMode=0700
+RuntimeDirectory=devcoordinator-notifications
+RuntimeDirectoryMode=0755
+RuntimeDirectoryPreserve=restart
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=devcoordinator-notifications
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=/var/lib/devcoordinator-notifications /run/devcoordinator-notifications
+
+[Install]
+WantedBy=multi-user.target

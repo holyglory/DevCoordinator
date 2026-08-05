@@ -8,6 +8,7 @@ rule to :func:`validate_runtime_request`.
 from __future__ import annotations
 
 import argparse
+import uuid
 from dataclasses import dataclass
 from typing import Any, Iterable
 
@@ -100,6 +101,13 @@ def add_runtime_cli_arguments(parser: argparse.ArgumentParser) -> None:
     request_input.add_argument("--request-json", help="inline strict JSON request")
     request_input.add_argument(
         "--request-file", help="absolute path to a strict JSON request file"
+    )
+    parser.add_argument(
+        "--operation-id",
+        help=(
+            "canonical operation UUID to reuse for an exact broker replay; "
+            "one is generated before dispatch when omitted"
+        ),
     )
 
     parser.add_argument("--agent", help="requesting agent or session identity")
@@ -200,6 +208,33 @@ def _explicit_boolean(raw: Any, *, field: str) -> bool:
     if raw == "false":
         return False
     raise RuntimeRequestError(f"{field} must be exactly true or false")
+
+
+def canonical_runtime_operation_id(raw: Any) -> str:
+    """Validate outer transport identity without adding it to the request schema."""
+
+    if not isinstance(raw, str):
+        raise RuntimeRequestError("operation_id must be a canonical UUID")
+    try:
+        canonical = str(uuid.UUID(raw))
+    except (ValueError, AttributeError, TypeError):
+        raise RuntimeRequestError(
+            "operation_id must be a canonical UUID"
+        ) from None
+    if canonical != raw:
+        raise RuntimeRequestError("operation_id must be a canonical UUID")
+    return canonical
+
+
+def runtime_cli_operation_id(namespace: argparse.Namespace) -> str:
+    """Return and retain the one operation UUID owned by this CLI invocation."""
+
+    raw = getattr(namespace, "operation_id", None)
+    if raw is None:
+        raw = str(uuid.uuid4())
+    operation_id = canonical_runtime_operation_id(raw)
+    namespace.operation_id = operation_id
+    return operation_id
 
 
 def _explicit_integer(raw: Any, *, field: str) -> int:

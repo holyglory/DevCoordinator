@@ -35,7 +35,6 @@ from urllib.parse import parse_qs, urlencode, urlparse
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "scripts"
 DEAD_PID = 2_147_483_647
-FIXTURE_CREDENTIAL = "cutover-cli-contract-" + "a" * 40
 
 
 def require(condition: bool, message: str) -> None:
@@ -142,29 +141,33 @@ class CoordinatorFixtureHandler(http.server.BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler contract
         server = self.server
-        token = getattr(server, "fixture_token")
         inventory = getattr(server, "fixture_inventory")
-        authorization = self.headers.get("Authorization")
+        host = self.headers.get("Host", "").partition(":")[0]
+        if host not in {"127.0.0.1", "localhost", "::1", "[::1]"}:
+            self._reply(400, {"error": "invalid Host header"})
+            return
+        origin = self.headers.get("Origin")
+        if origin:
+            parsed_origin = urlparse(origin)
+            origin_port = parsed_origin.port or (443 if parsed_origin.scheme == "https" else 80)
+            if (
+                parsed_origin.scheme not in {"http", "https"}
+                or parsed_origin.hostname not in {"127.0.0.1", "localhost", "::1"}
+                or origin_port != int(server.server_address[1])
+            ):
+                self._reply(403, {"error": "cross-origin requests are forbidden"})
+                return
         if self.path == "/healthz":
             self._reply(200, {"ok": True})
             return
         if self.path == "/v1/ready":
-            if authorization != f"Bearer {token}":
-                self._reply(401, {"error": "unauthorized"})
-                return
             self._reply(200, {"ok": True})
             return
         if self.path == "/v1/inventory":
-            if authorization != f"Bearer {token}":
-                self._reply(401, {"error": "unauthorized"})
-                return
             self._reply(200, inventory)
             return
         parsed = urlparse(self.path)
         if parsed.path == "/v1/inventory/no-docker":
-            if authorization != f"Bearer {token}":
-                self._reply(401, {"error": "unauthorized"})
-                return
             expected_query = getattr(server, "fixture_registration_query", None)
             if expected_query is not None:
                 try:
@@ -207,7 +210,6 @@ def coordinator_fixture(
     registration_query: dict[str, str] | None = None,
 ) -> Iterator[FastThreadingServer]:
     server = FastThreadingServer(("127.0.0.1", 0), CoordinatorFixtureHandler)
-    server.fixture_token = FIXTURE_CREDENTIAL  # type: ignore[attr-defined]
     server.fixture_inventory = inventory  # type: ignore[attr-defined]
     server.fixture_registration_query = registration_query  # type: ignore[attr-defined]
     worker = threading.Thread(target=server.serve_forever, daemon=True)
@@ -223,8 +225,6 @@ def coordinator_fixture(
 def fixture_request_status(
     server: FastThreadingServer,
     target: str,
-    *,
-    authenticated: bool = True,
 ) -> int:
     connection = http.client.HTTPConnection(
         "127.0.0.1",
@@ -232,15 +232,7 @@ def fixture_request_status(
         timeout=5,
     )
     try:
-        connection.request(
-            "GET",
-            target,
-            headers=(
-                {"Authorization": f"Bearer {FIXTURE_CREDENTIAL}"}
-                if authenticated
-                else {}
-            ),
-        )
+        connection.request("GET", target)
         response = connection.getresponse()
         response.read()
         return response.status
@@ -281,14 +273,13 @@ def test_scoped_inventory_fixture() -> None:
             fixture_request_status(
                 server,
                 "/healthz?unexpected=1",
-                authenticated=False,
             )
             == 404,
             "coordinator fixture weakened the exact health-probe path contract",
         )
         require(
             fixture_request_status(server, "/v1/inventory?unexpected=1") == 404,
-            "coordinator fixture weakened the exact authenticated inventory path contract",
+            "coordinator fixture weakened the exact trusted-loopback inventory path contract",
         )
 
 
@@ -320,8 +311,6 @@ def test_production_layout(root: Path) -> None:
     state = private_directory(case / "external" / "state")
     acme = private_directory(state / "acme")
     coordinator = private_directory(case / "external" / "coordinator")
-    token = private_file(coordinator / "api-token", FIXTURE_CREDENTIAL + "\n")
-
     completed = run_helper(
         "check_production_layout.py",
         [
@@ -337,14 +326,9 @@ def test_production_layout(root: Path) -> None:
             str(acme),
             "--coordinator-home",
             str(coordinator),
-            "--token-file",
-            str(token),
-            "--require-token",
-            "--wait-token-seconds",
-            "10",
         ],
     )
-    require_success(completed, "token-required production layout CLI")
+    require_success(completed, "trusted-loopback production layout CLI")
     require(
         completed.stdout.strip() == "production layout preflight ok",
         "production layout CLI did not reach its successful post-parse contract",
@@ -480,23 +464,20 @@ class socket:
     )
 
 
-def test_auth_inventory_capture(root: Path) -> None:
+def test_loopback_inventory_capture(root: Path) -> None:
     case = private_directory(root / "auth-boundary")
-    token = private_file(case / "api-token", FIXTURE_CREDENTIAL + "\n")
     evidence = case / "post-cutover-inventory.json"
     inventory = {
         "port_assignments": [],
         "servers": [],
         "leases": [],
-        "fixture": "authenticated-cutover-inventory",
+        "fixture": "trusted-loopback-cutover-inventory",
     }
     with coordinator_fixture(inventory) as server:
         port = int(server.server_address[1])
         completed = run_helper(
             "check_coordinator_auth_boundary.py",
             [
-                "--token-file",
-                str(token),
                 "--host",
                 "127.0.0.1",
                 "--port",
@@ -505,16 +486,17 @@ def test_auth_inventory_capture(root: Path) -> None:
                 str(evidence),
             ],
         )
-    require_success(completed, "authenticated inventory capture CLI")
+    require_success(completed, "trusted-loopback inventory capture CLI")
     report = json.loads(completed.stdout)
     require(
         report.get("statuses")
         == {
-            "anonymous_health": 200,
-            "anonymous_ready": 401,
-            "authenticated_ready": 200,
+            "local_health": 200,
+            "local_ready": 200,
+            "foreign_host_ready": 400,
+            "foreign_origin_ready": 403,
         },
-        "auth boundary did not prove the exact three-response contract",
+        "loopback boundary did not prove the exact four-response contract",
     )
     require(json.loads(evidence.read_text(encoding="utf-8")) == inventory, "inventory evidence differs from API")
     require(stat.S_IMODE(evidence.stat().st_mode) == 0o600, "inventory evidence is not private")
@@ -669,7 +651,6 @@ while True:
     environment_file = private_file(
         case / "console.env", "SESSION_SECRET=${SESSION_SECRET}\n"
     )
-    token_file = private_file(case / "api-token", FIXTURE_CREDENTIAL + "\n")
     ready_file = case / "listener.ready"
     console_port = unused_loopback_port()
     child_environment = os.environ.copy()
@@ -730,8 +711,6 @@ while True:
                     "devops-console.service",
                     "--main-pid",
                     str(child.pid),
-                    "--token-file",
-                    str(token_file),
                     "--project",
                     str(project),
                     "--name",
@@ -933,7 +912,7 @@ def main() -> int:
         test_state_only_migration(root)
         evidence = test_captured_process_termination(root)
         test_stopped_boundary(root, evidence)
-        test_auth_inventory_capture(root)
+        test_loopback_inventory_capture(root)
         test_console_registration_cli(root)
         test_loaded_unit_evidence(root)
         mode = "optimized" if sys.flags.optimize > 0 else "normal"

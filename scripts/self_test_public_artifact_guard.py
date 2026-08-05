@@ -133,6 +133,10 @@ def main() -> int:
         )
         write(tmp / "docs" / "dollar-secret.env", f"DEPLOY_TOKEN={dollar_bearing_secret}\n")
 
+        sealed_fixture = tmp / "scripts" / "self_test_schema12_legacy_broker_bridge.py"
+        sealed_fixture_bytes = (ROOT / sealed_fixture.relative_to(tmp)).read_bytes()
+        write(sealed_fixture, sealed_fixture_bytes)
+
         write(external_target, "safe external content must not bypass repository boundaries\n")
         write(tmp / "docs" / "internal-target.md", "safe internal linked content\n")
         (tmp / "docs" / "external-link.md").symlink_to(external_target)
@@ -178,6 +182,10 @@ def main() -> int:
             check(rule in rules, f"must-catch class was not detected: {rule}")
         check(not any(item["path"] == "docs/safe.md" for item in report["findings"]), "portable placeholder documentation must not be flagged")
         check(not any(item["path"] == "artifacts/safe.png" for item in report["findings"]), "clean PNG with valid fixture provenance must not be flagged")
+        check(
+            not any(item["path"] == "scripts/self_test_schema12_legacy_broker_bridge.py" for item in report["findings"]),
+            "the exact reviewed immutable fixture must use its sealed path-and-digest allowance",
+        )
         check(any(item["path"] == "docs/dollar-secret.env" and item["rule"] == "text-secret" for item in report["findings"]), "a bare dollar inside a literal secret must not become a placeholder bypass")
         check(any(item["path"] == "docs/untracked-private.md" for item in report["findings"]), "non-ignored untracked text must be scanned")
         check(any(item["path"] == "artifacts/untracked-missing-provenance.png" for item in report["findings"]), "non-ignored untracked PNGs must be scanned")
@@ -217,6 +225,13 @@ def main() -> int:
         (tmp / "docs" / "internal-link.md").unlink()
         clean_report = run_guard(tmp, expect=0)
         check(clean_report["ok"] is True and not clean_report["findings"], "intentional portable artifacts should pass cleanly")
+
+        write(sealed_fixture, sealed_fixture_bytes + b"\n# seal drift\n")
+        drift_report = run_guard(tmp, expect=1)
+        check(
+            any(item["path"] == "scripts/self_test_schema12_legacy_broker_bridge.py" for item in drift_report["findings"]),
+            "any immutable-fixture byte drift must revoke the allowance",
+        )
 
         print("public artifact guard self-test ok")
         return 0

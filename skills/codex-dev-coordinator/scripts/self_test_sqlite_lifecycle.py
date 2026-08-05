@@ -24,6 +24,7 @@ from devcoordinator.repository_lifecycle import (  # noqa: E402
     ResourceObservation,
     RunningState,
 )
+from devcoordinator.schema import establish_repository_owner_authority  # noqa: E402
 from devcoordinator.sqlite_lifecycle import SQLiteLifecyclePersistence  # noqa: E402
 from devcoordinator.store import AccountStore, CoordinatorStore, utc_timestamp  # noqa: E402
 
@@ -33,6 +34,7 @@ SOURCE_ID = "source-test"
 REPO_ID = "repo-test"
 CONTAINER_ID = "a" * 64
 DOCKER_RESOURCE_ID = "docker-repo"
+TEST_OWNER_UID = 1000
 
 
 class SimulatedCrash(BaseException):
@@ -210,6 +212,22 @@ def seed_base(connection: Any) -> None:
         ) VALUES (?, ?, ?, ?, 'active', 0, ?, ?)
         """,
         (REPO_ID, HOST_ID, "/repo/test", "test", now, now),
+    )
+    establish_repository_owner_authority(
+        connection,
+        repository_id=REPO_ID,
+        owner_uid=TEST_OWNER_UID,
+        repository_generation=0,
+        operation_id="fixture-lifecycle-owner",
+        actor="seed",
+        reason="explicit lifecycle fixture enrollment",
+        timestamp=now,
+        evidence={
+            "kind": "sqlite-lifecycle-owner-fixture",
+            "repository_id": REPO_ID,
+            "repository_generation": 0,
+            "owner_uid": TEST_OWNER_UID,
+        },
     )
     connection.execute(
         """

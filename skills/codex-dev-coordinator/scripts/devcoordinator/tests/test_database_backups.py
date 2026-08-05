@@ -245,15 +245,17 @@ class DatabaseBackupRegistryTests(unittest.TestCase):
         with AccountStore.open(self.database, expected_uid=os.geteuid()) as store:
             self.assertEqual(store.inventory_v2()["database_backups"], [])
 
-    def test_symlink_and_foreign_readable_evidence_are_rejected(self) -> None:
+    def test_symlink_is_rejected_but_readable_metadata_is_accepted(self) -> None:
         alias = self.root / "artifact-alias.dump"
         alias.symlink_to(self.artifact)
         with self.assertRaises(PermissionError):
             inspect_database_backup(alias, self.manifest_path)
 
         os.chmod(self.artifact, 0o644)
-        with self.assertRaisesRegex(PermissionError, "0600"):
-            inspect_database_backup(self.artifact, self.manifest_path)
+        self.assertEqual(
+            inspect_database_backup(self.artifact, self.manifest_path)["artifact_path"],
+            str(self.artifact),
+        )
 
     def test_claimed_strong_verification_requires_real_strong_evidence(self) -> None:
         checksum = hashlib.sha256(self.artifact.read_bytes()).hexdigest()
@@ -289,12 +291,12 @@ class DatabaseBackupRegistryTests(unittest.TestCase):
         self.assertTrue(replaced)
 
     @unittest.skipUnless(os.geteuid() == 0, "ownership mutation requires root")
-    def test_wrong_owner_is_rejected_before_read(self) -> None:
+    def test_owner_is_attribution_not_backup_authorization(self) -> None:
         os.chown(self.artifact, 1, -1)
-        with self.assertRaisesRegex(PermissionError, "owned by uid"):
-            inspect_database_backup(
-                self.artifact, self.manifest_path, expected_uid=0
-            )
+        descriptor = inspect_database_backup(
+            self.artifact, self.manifest_path, expected_uid=0
+        )
+        self.assertEqual(descriptor["artifact_path"], str(self.artifact))
 
     def test_restore_ledger_rejects_an_unproved_success_mapping(self) -> None:
         descriptor = inspect_database_backup(self.artifact, self.manifest_path)

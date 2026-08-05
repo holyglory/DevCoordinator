@@ -1,7 +1,7 @@
 interface:
   display_name: "Codex Dev Coordinator"
-  short_description: "Coordinate ports, dev servers, and Docker."
-  default_prompt: "Use $codex-dev-coordinator to lease a port and start this repo's dev server safely."
+  short_description: "Coordinate runtimes, tests, and failure reports."
+  default_prompt: "Use $codex-dev-coordinator for attributed runtime work or governed tests. On a Coordinator tool or infrastructure failure, first file a structured devcoordinator-bug report; if only the test harness is unavailable, continue isolated repository-native checks as local/advisory non-governed results, never as release evidence."
 
 policy:
   allow_implicit_invocation: true

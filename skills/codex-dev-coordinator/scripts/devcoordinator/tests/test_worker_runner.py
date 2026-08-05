@@ -192,9 +192,19 @@ class WorkerRunnerTests(unittest.TestCase):
             canonical_root=str(self.project),
             repo_id=self.repo_id,
             generation=0,
+            owner_uid=1000,
             server_ids={"worker": self.worker_id},
             container_ids={},
             compose_definition_id=None,
+            compose_container_ids=frozenset(),
+            compose_run_once_services={},
+            ephemeral_templates={},
+            ephemeral_image_prefetch_template_ids=frozenset(),
+            ephemeral_secret_policies={},
+            account_id="account-runner",
+            enabled=True,
+            issued_at="2026-08-03T00:00:00Z",
+            valid_until_epoch=int(time.time()) + 3600,
         )
         profile = mock.Mock(spec=BrokerClientProfile)
         profile.client_uid = os.geteuid()
@@ -448,6 +458,119 @@ class WorkerRunnerTests(unittest.TestCase):
             [(row["exit_kind"], row["exit_code"]) for row in attempts],
             [("exit_code", 4)],
         )
+
+    def test_pending_exit_fenced_by_manager_is_acknowledged_without_rewriting_evidence(
+        self,
+    ) -> None:
+        marker = self.root / "worker-runs.txt"
+        self._set_command(
+            (
+                sys.executable,
+                "-c",
+                (
+                    "from pathlib import Path; "
+                    f"p=Path({str(marker)!r}); "
+                    "p.write_text((p.read_text() if p.exists() else '') + 'run\\n'); "
+                    "raise SystemExit(4)"
+                ),
+            )
+        )
+        self._start_policy(keep_alive=False)
+        direct = DirectWorkerAuthority(self.supervision)
+
+        class BrokerUnavailableAtExit:
+            def active_attempt(inner_self, **kwargs: object) -> object:
+                return direct.active_attempt(**kwargs)  # type: ignore[arg-type]
+
+            def launch_candidate(inner_self, **kwargs: object) -> object:
+                return direct.launch_candidate(**kwargs)  # type: ignore[arg-type]
+
+            def begin_attempt(inner_self, **kwargs: object) -> object:
+                return direct.begin_attempt(**kwargs)  # type: ignore[arg-type]
+
+            def mark_attempt_launched(inner_self, **kwargs: object) -> object:
+                return direct.mark_attempt_launched(**kwargs)  # type: ignore[arg-type]
+
+            def record_attempt_exit(inner_self, **_kwargs: object) -> object:
+                raise WorkerAuthorityUnavailable("broker is offline")
+
+        class SimulatedRunnerInterruption(RuntimeError):
+            pass
+
+        interrupted = WorkerRunner(
+            authority=BrokerUnavailableAtExit(),
+            artifact_root=self.home / "logs",
+            restart_delay_seconds=0,
+            sleeper=lambda _seconds: (_ for _ in ()).throw(
+                SimulatedRunnerInterruption("runner stopped during broker outage")
+            ),
+            clock=lambda: 1_000.0,
+        )
+        with self.assertRaises(SimulatedRunnerInterruption):
+            interrupted.run(worker_id=self.worker_id)
+
+        pending = WorkerExitJournal(self.home / "logs").pending_path(
+            worker_id=self.worker_id
+        )
+        self.assertTrue(pending.exists())
+        old_attempt = self.supervision.policy(self.worker_id)["current_attempt_id"]
+        self.assertIsInstance(old_attempt, str)
+        attempt = self.supervision.attempt(str(old_attempt))
+        self.supervision.fence_startup(supervisor_epoch="broker-restarted")
+        fence_exit_id = str(uuid.uuid4())
+        fenced = self.supervision.record_attempt_exit(
+            attempt_id=str(attempt["attempt_id"]),
+            exit_report_id=fence_exit_id,
+            supervisor_epoch=str(attempt["supervisor_epoch"]),
+            supervisor_generation=int(attempt["supervisor_generation"]),
+            exit_kind="supervisor_lost",
+            occurred_at_epoch=1_001.0,
+        )
+        self.assertEqual(fenced["exit_classification"], "stale_generation")
+
+        recovered = self._runner().run(worker_id=self.worker_id)
+
+        self.assertTrue(recovered["ok"], recovered)
+        self.assertEqual(recovered["classification"], "worker_stopped")
+        self.assertEqual(recovered["attempts"], 0)
+        self.assertEqual(marker.read_text(encoding="utf-8"), "run\n")
+        self.assertFalse(pending.exists())
+        stored = self.supervision.attempt(str(attempt["attempt_id"]))
+        self.assertEqual(stored["exit_report_id"], fence_exit_id)
+        self.assertEqual(stored["exit_kind"], "supervisor_lost")
+        self.assertEqual(stored["exit_classification"], "stale_generation")
+
+    def test_authoritative_fence_reconciliation_rejects_an_ordinary_stale_exit(
+        self,
+    ) -> None:
+        attempt_id = str(uuid.uuid4())
+
+        class OrdinaryStaleExitAuthority:
+            def read_attempt(inner_self, **_kwargs: object) -> object:
+                return {
+                    "attempt_id": attempt_id,
+                    "server_definition_id": self.worker_id,
+                    "supervisor_epoch": "old-supervisor",
+                    "supervisor_generation": 7,
+                    "state": "exited",
+                    "exit_kind": "exit_code",
+                    "exit_classification": "stale_generation",
+                    "exit_decision_known": True,
+                    "restart_allowed": True,
+                }
+
+        acknowledgement = self._runner(
+            OrdinaryStaleExitAuthority()
+        )._authoritative_fence_acknowledgement(
+            worker_id=self.worker_id,
+            document={
+                "attempt_id": attempt_id,
+                "supervisor_epoch": "old-supervisor",
+                "supervisor_generation": 7,
+            },
+        )
+
+        self.assertIsNone(acknowledgement)
 
     def test_corrupt_pending_exit_fails_closed_without_authority_or_launch(self) -> None:
         self._set_command((sys.executable, "-c", "raise SystemExit(0)"))

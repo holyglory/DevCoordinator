@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import grp
+import hashlib
 import os
 from pathlib import Path
 import plistlib
@@ -25,6 +26,11 @@ import uuid
 _UNIT_PREFIX = "devcoordinator-worker-"
 _SAFE_STATE = re.compile(r"^[A-Za-z][A-Za-z0-9 _-]{0,63}$")
 _MAX_MANAGER_OUTPUT = 1024 * 1024
+_PROJECT_CPU_WEIGHT = 100
+_PROJECT_IO_WEIGHT = 100
+_PROJECT_MEMORY_HIGH = "16G"
+_PROJECT_MEMORY_MAX = "20G"
+_PROJECT_TASKS_MAX = 4096
 
 
 class WorkerNativeError(RuntimeError):
@@ -83,6 +89,21 @@ def _worker_id(value: str) -> str:
     return canonical
 
 
+def project_repository_slice(*, uid: int, repository_id: str) -> str:
+    """Return an opaque deterministic slice below devcoordinator-projects."""
+
+    _positive_id(uid, "uid")
+    if (
+        not isinstance(repository_id, str)
+        or not repository_id
+        or len(repository_id.encode("utf-8")) > 256
+        or "\x00" in repository_id
+    ):
+        raise ValueError("worker repository ID must be one bounded string")
+    repository = hashlib.sha256(repository_id.encode("utf-8")).hexdigest()[:20]
+    return f"devcoordinator-projects-uid{uid}-repo{repository}.slice"
+
+
 @dataclass(frozen=True)
 class _LocalIdentity:
     uid: int
@@ -105,10 +126,8 @@ def _identity(uid: int, gid: int) -> _LocalIdentity:
         group = grp.getgrgid(gid)
     except KeyError as error:
         raise WorkerNativeError("worker UID/GID has no local account identity") from error
-    if user.pw_uid != uid or user.pw_gid != gid or group.gr_gid != gid:
-        raise WorkerNativeError(
-            "worker GID must be the enrolled user's verified primary group"
-        )
+    if user.pw_uid != uid or group.gr_gid != gid:
+        raise WorkerNativeError("worker UID/GID local account identity is invalid")
     return _LocalIdentity(uid=uid, gid=gid, user=user.pw_name, group=group.gr_name)
 
 
@@ -122,8 +141,6 @@ def _trusted_file(path: Path, *, description: str, executable: bool = False) -> 
         raise WorkerNativeError(f"{description} is unavailable: {error}") from error
     if not stat.S_ISREG(metadata.st_mode):
         raise WorkerNativeError(f"{description} must be a regular non-symlink file")
-    if metadata.st_mode & 0o022:
-        raise WorkerNativeError(f"{description} must not be group/world writable")
     if executable and metadata.st_mode & 0o111 == 0:
         raise WorkerNativeError(f"{description} must be executable")
     return candidate.resolve(strict=True)
@@ -134,9 +151,14 @@ def _trusted_script(path: Path) -> Path:
 
 
 def _trusted_executable(path: str | Path, *, description: str) -> str:
-    return str(
-        _trusted_file(Path(path), description=description, executable=True)
-    )
+    candidate = Path(path).expanduser()
+    if not candidate.is_absolute():
+        raise WorkerNativeError(f"{description} must be an absolute path")
+    try:
+        resolved = candidate.resolve(strict=True)
+    except OSError as error:
+        raise WorkerNativeError(f"{description} is unavailable: {error}") from error
+    return str(_trusted_file(resolved, description=description, executable=True))
 
 
 def _run(
@@ -227,7 +249,9 @@ class SystemdWorkerManager:
     def unit(worker_id: str) -> str:
         return _UNIT_PREFIX + _worker_id(worker_id) + ".service"
 
-    def start(self, *, worker_id: str, uid: int, gid: int) -> NativeWorkerState:
+    def start(
+        self, *, worker_id: str, uid: int, gid: int, repository_id: str
+    ) -> NativeWorkerState:
         worker_id = _worker_id(worker_id)
         if os.geteuid() != 0:
             raise WorkerNativeError(
@@ -235,6 +259,9 @@ class SystemdWorkerManager:
             )
         identity = _identity(uid, gid)
         unit = self.unit(worker_id)
+        repository_slice = project_repository_slice(
+            uid=identity.uid, repository_id=repository_id
+        )
         argv = [
             self.systemd_run_executable,
             "--quiet",
@@ -242,18 +269,27 @@ class SystemdWorkerManager:
             f"--unit={unit}",
             f"--uid={identity.uid}",
             f"--gid={identity.gid}",
+            f"--slice={repository_slice}",
             "--service-type=exec",
             "--property=Restart=on-failure",
             "--property=RestartSec=2s",
             "--property=KillMode=mixed",
             "--property=NoNewPrivileges=yes",
             "--property=PrivateTmp=yes",
+            "--property=ProtectControlGroups=yes",
+            f"--property=CPUWeight={_PROJECT_CPU_WEIGHT}",
+            f"--property=IOWeight={_PROJECT_IO_WEIGHT}",
+            f"--property=MemoryHigh={_PROJECT_MEMORY_HIGH}",
+            f"--property=MemoryMax={_PROJECT_MEMORY_MAX}",
+            f"--property=TasksMax={_PROJECT_TASKS_MAX}",
+            "--property=OOMPolicy=stop",
             "--property=UMask=0077",
             "--property=TimeoutStopSec=30s",
             "--property=StandardOutput=journal",
             "--property=StandardError=journal",
             self.python_executable,
             "-I",
+            "-B",
             str(self.coordinator_script),
             "worker",
             "runner",
@@ -264,7 +300,49 @@ class SystemdWorkerManager:
         state = self.status(worker_id=worker_id)
         if not state.loaded:
             raise WorkerNativeError("systemd accepted the runner but did not load its unit")
+        try:
+            self.require_project_isolation(
+                worker_id=worker_id,
+                uid=identity.uid,
+                repository_id=repository_id,
+            )
+        except BaseException:
+            # A successfully launched but mis-scoped worker is more dangerous
+            # than a failed launch. Remove the exact transient registration
+            # before returning the contract failure.
+            self.remove(worker_id=worker_id)
+            raise
         return state
+
+    def require_project_isolation(
+        self, *, worker_id: str, uid: int, repository_id: str
+    ) -> str:
+        """Prove the loaded unit belongs to its deterministic repository slice."""
+
+        worker_id = _worker_id(worker_id)
+        expected = project_repository_slice(uid=uid, repository_id=repository_id)
+        unit = self.unit(worker_id)
+        completed = _run(
+            self.runner,
+            [
+                self.systemctl_executable,
+                "show",
+                unit,
+                "--property=LoadState",
+                "--property=Slice",
+                "--no-pager",
+            ],
+        )
+        values: dict[str, str] = {}
+        for line in completed.stdout.splitlines():
+            if "=" in line:
+                key, value = line.split("=", 1)
+                values[key] = value
+        if values != {"LoadState": "loaded", "Slice": expected}:
+            raise WorkerNativeError(
+                "systemd worker is not isolated in its attributed repository slice"
+            )
+        return expected
 
     def stop(self, *, worker_id: str) -> NativeWorkerState:
         worker_id = _worker_id(worker_id)
@@ -416,6 +494,7 @@ class LaunchdWorkerManager:
             "ProgramArguments": [
                 self.python_executable,
                 "-I",
+                "-B",
                 str(self.coordinator_script),
                 "worker",
                 "runner",
@@ -457,21 +536,14 @@ class LaunchdWorkerManager:
             metadata = os.fstat(directory_fd)
             if (
                 not stat.S_ISDIR(metadata.st_mode)
-                or metadata.st_uid != os.geteuid()
-                or stat.S_IMODE(metadata.st_mode) != 0o700
             ):
-                raise WorkerNativeError(
-                    "launchd worker state root must be owned by the manager with mode 0700"
-                )
+                raise WorkerNativeError("launchd worker state root is not a directory")
             try:
                 old = os.stat(target_name, dir_fd=directory_fd, follow_symlinks=False)
             except FileNotFoundError:
                 old = None
             if old is not None and (
                 not stat.S_ISREG(old.st_mode)
-                or old.st_uid != os.geteuid()
-                or stat.S_IMODE(old.st_mode) != 0o600
-                or old.st_nlink != 1
             ):
                 raise WorkerNativeError("existing launchd worker plist is unsafe")
             create_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
@@ -497,9 +569,6 @@ class LaunchdWorkerManager:
                 )
                 if (
                     not stat.S_ISREG(final.st_mode)
-                    or final.st_uid != os.geteuid()
-                    or stat.S_IMODE(final.st_mode) != 0o600
-                    or final.st_nlink != 1
                 ):
                     raise WorkerNativeError("written launchd worker plist is unsafe")
             finally:
@@ -520,8 +589,12 @@ class LaunchdWorkerManager:
             os.close(directory_fd)
         return target
 
-    def start(self, *, worker_id: str, uid: int, gid: int) -> NativeWorkerState:
+    def start(
+        self, *, worker_id: str, uid: int, gid: int, repository_id: str
+    ) -> NativeWorkerState:
         worker_id = _worker_id(worker_id)
+        if not isinstance(repository_id, str) or not repository_id:
+            raise ValueError("worker repository ID must be one bounded string")
         identity = _identity(uid, gid)
         target = self._write_plist(worker_id=worker_id, uid=uid, gid=gid)
         domain = self._domain(identity.uid)
@@ -583,12 +656,8 @@ class LaunchdWorkerManager:
             directory = os.fstat(directory_fd)
             if (
                 not stat.S_ISDIR(directory.st_mode)
-                or directory.st_uid != os.geteuid()
-                or stat.S_IMODE(directory.st_mode) != 0o700
             ):
-                raise WorkerNativeError(
-                    "launchd worker state root must be owned by the manager with mode 0700"
-                )
+                raise WorkerNativeError("launchd worker state root is not a directory")
             target_name = self._plist_path(worker_id).name
             try:
                 target = os.stat(
@@ -598,9 +667,6 @@ class LaunchdWorkerManager:
                 return
             if (
                 not stat.S_ISREG(target.st_mode)
-                or target.st_uid != os.geteuid()
-                or stat.S_IMODE(target.st_mode) != 0o600
-                or target.st_nlink != 1
             ):
                 raise WorkerNativeError("existing launchd worker plist is unsafe")
             os.unlink(target_name, dir_fd=directory_fd)

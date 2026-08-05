@@ -27,9 +27,10 @@ sys.modules[SPEC.name] = coordinator
 SPEC.loader.exec_module(coordinator)
 
 from devcoordinator.host_observation import commit_host_inventory_observation
+from devcoordinator.inventory_projection import envelope as inventory_envelope
 from devcoordinator.observer import SingleFlightObserver
 from devcoordinator.repository_lifecycle import ResourceKind
-from devcoordinator.schema import SCHEMA_VERSION
+from devcoordinator.schema import SCHEMA_VERSION, establish_repository_owner_authority
 from devcoordinator.sqlite_lifecycle import SQLiteLifecyclePersistence
 import devcoordinator.store as store_module
 from devcoordinator.store import AccountStore, StoreError, deterministic_id, utc_timestamp
@@ -740,6 +741,22 @@ os._exit(0)
                 {"repo_id": "repo-target", "canonical_root": project},
                 {"repo_id": "repo-foreign", "canonical_root": foreign},
             ],
+            "repository_trees": [
+                {
+                    "family_id": "family-target",
+                    "root_repository": {"repo_id": "repo-target"},
+                    "scopes": [{"repo_id": "repo-target"}],
+                },
+                {
+                    "family_id": "family-foreign",
+                    "root_repository": {"repo_id": "repo-foreign"},
+                    "scopes": [{"repo_id": "repo-foreign"}],
+                },
+            ],
+            "test_statistics": [
+                {"repo_id": "repo-target", "summary": {"run_count": 1}},
+                {"repo_id": "repo-foreign", "summary": {"run_count": 2}},
+            ],
             "coordinator_sources": [
                 {"source_id": "source-target"},
                 {"source_id": "source-foreign"},
@@ -982,6 +999,14 @@ os._exit(0)
 
         self.assertEqual([row["repo_id"] for row in result["repositories"]], ["repo-target"])
         self.assertEqual(
+            [row["family_id"] for row in result["repository_trees"]],
+            ["family-target"],
+        )
+        self.assertEqual(
+            [row["repo_id"] for row in result["test_statistics"]],
+            ["repo-target"],
+        )
+        self.assertEqual(
             [row["membership_id"] for row in result["memberships"]],
             ["membership-server-target", "membership-docker-target"],
         )
@@ -1064,6 +1089,60 @@ os._exit(0)
             ["http://target"],
         )
         self.assertEqual(result["servers"], result["v1_compatibility"]["servers"])
+
+    def test_project_filter_keeps_one_complete_publishable_repository_family(self) -> None:
+        target = self.root / "target"
+        foreign = self.root / "foreign"
+        target.mkdir()
+        foreign.mkdir()
+        # These are repository-contract fixtures, not arbitrary nested
+        # directories.  Mark each root explicitly so an unrelated ancestor
+        # worktree (for example a test runner rooted at /tmp) cannot collapse
+        # both canonical paths into one repository.
+        (target / ".git").mkdir()
+        (foreign / ".git").mkdir()
+        now = "2026-07-30T12:00:00Z"
+        with AccountStore.open_default(self.home) as store:
+            host_id = store.ensure_local_host()
+            with store.immediate_transaction() as connection:
+                for repo_id, root in (("repo-target", target), ("repo-foreign", foreign)):
+                    connection.execute(
+                        """
+                        INSERT INTO repositories(
+                            repo_id, host_id, canonical_root, display_name, state,
+                            generation, created_at, updated_at
+                        ) VALUES (?, ?, ?, ?, 'active', 0, ?, ?)
+                        """,
+                        (repo_id, host_id, str(root), root.name, now, now),
+                    )
+                    connection.execute(
+                        """
+                        INSERT INTO repository_installations(
+                            repo_id, status, startup_fenced, generation, actor, updated_at
+                        ) VALUES (?, 'installed', 0, 0, 'test', ?)
+                        """,
+                        (repo_id, now),
+                    )
+            inventory = store.inventory_v2()
+
+        scoped = coordinator.filter_normalized_inventory_project(
+            inventory,
+            str(target),
+        )
+        self.assertEqual(
+            [row["repo_id"] for row in scoped["repositories"]],
+            ["repo-target"],
+        )
+        self.assertEqual(len(scoped["repository_trees"]), 1)
+        self.assertEqual(
+            scoped["repository_trees"][0]["root_repository"]["repo_id"],
+            "repo-target",
+        )
+        inventory_envelope(
+            generation=1,
+            inventory=scoped,
+            published_at="2026-07-30T12:00:01Z",
+        )
 
     def test_project_filter_preserves_disabled_repository_violation_context(self) -> None:
         project = str(Path(__file__).resolve().parents[3])
@@ -1606,6 +1685,7 @@ os._exit(0)
                 self.container_sample(full_id, status="Up 1 minute", restart_policy="always"),
             )
             repo_a_id = deterministic_id("repository", host_id, str(repo_a))
+            repo_b_id = deterministic_id("repository", host_id, str(repo_b))
             now = utc_timestamp()
             with store.immediate_transaction() as connection:
                 connection.execute(
@@ -1624,6 +1704,55 @@ os._exit(0)
                     ) VALUES (?, 'installed', 0, 0, 'test', ?)
                     """,
                     (repo_a_id, now),
+                )
+                establish_repository_owner_authority(
+                    connection,
+                    repository_id=repo_a_id,
+                    owner_uid=store.expected_uid,
+                    repository_generation=0,
+                    operation_id="fixture-pathless-attachment-owner",
+                    actor="test",
+                    reason="explicit pathless attachment fixture enrollment",
+                    timestamp=now,
+                    evidence={
+                        "kind": "pathless-attachment-owner-fixture",
+                        "repository_id": repo_a_id,
+                        "repository_generation": 0,
+                        "owner_uid": store.expected_uid,
+                    },
+                )
+                connection.execute(
+                    """
+                    INSERT INTO repositories(
+                        repo_id, host_id, canonical_root, display_name, state,
+                        generation, created_at, updated_at
+                    ) VALUES (?, ?, ?, 'repo-b', 'active', 0, ?, ?)
+                    """,
+                    (repo_b_id, host_id, str(repo_b), now, now),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO repository_installations(
+                        repo_id, status, startup_fenced, generation, actor, updated_at
+                    ) VALUES (?, 'installed', 0, 0, 'test', ?)
+                    """,
+                    (repo_b_id, now),
+                )
+                establish_repository_owner_authority(
+                    connection,
+                    repository_id=repo_b_id,
+                    owner_uid=store.expected_uid,
+                    repository_generation=0,
+                    operation_id="fixture-contradictory-claim-owner",
+                    actor="test",
+                    reason="explicit contradictory claim fixture enrollment",
+                    timestamp=now,
+                    evidence={
+                        "kind": "contradictory-claim-owner-fixture",
+                        "repository_id": repo_b_id,
+                        "repository_generation": 0,
+                        "owner_uid": store.expected_uid,
+                    },
                 )
             persistence = SQLiteLifecyclePersistence(store)
             inventory = store.inventory_v2()
@@ -1674,6 +1803,21 @@ os._exit(0)
                 (exact.resource_id,),
             ).fetchone()
             self.assertEqual(tuple(policy), (repo_a_id, "always"))
+            owner = store.connection.execute(
+                """
+                SELECT repository.generation, authority.owner_uid,
+                       authority.repository_generation,
+                       authority.authority_generation
+                FROM repositories repository
+                JOIN repository_owners authority USING(repo_id)
+                WHERE repository.repo_id = ?
+                """,
+                (repo_a_id,),
+            ).fetchone()
+            self.assertEqual(
+                tuple(owner),
+                (1, store.expected_uid, 1, 2),
+            )
 
             # A different exact Git root is positive contradictory evidence.
             self.observe_sample(
@@ -1807,7 +1951,7 @@ os._exit(0)
             running = store.inventory_v2()
             violations = [
                 item
-                for item in running["unassigned_resources"]
+                for item in running["lifecycle_violations"]
                 if item["resource_id"] == resource["resource_id"]
             ]
             self.assertEqual(len(violations), 1)
@@ -1815,6 +1959,14 @@ os._exit(0)
             self.assertTrue(violations[0]["lifecycle_violation"])
             self.assertFalse(violations[0]["can_attach"])
             self.assertFalse(violations[0]["can_retire"])
+            self.assertFalse(
+                [
+                    item
+                    for item in running["unassigned_resources"]
+                    if item["resource_id"] == resource["resource_id"]
+                ],
+                "one lifecycle violation must not be duplicated as an unassigned claim",
+            )
             retained_v2_resources = [
                 item
                 for item in running["resources"]["docker"]
@@ -1848,6 +2000,47 @@ os._exit(0)
             restart_policy="unless-stopped",
             project=repository,
         )
+        with AccountStore.open_default(self.home) as store:
+            host_id = store.ensure_local_host()
+            repo_id = deterministic_id("repository", host_id, str(repository))
+            now = utc_timestamp()
+            with store.immediate_transaction() as connection:
+                connection.execute(
+                    """
+                    INSERT INTO repositories(
+                        repo_id, host_id, canonical_root, display_name, state,
+                        generation, created_at, updated_at
+                    ) VALUES (?, ?, ?, 'repo', 'active', 0, ?, ?)
+                    """,
+                    (repo_id, host_id, str(repository), now, now),
+                )
+                establish_repository_owner_authority(
+                    connection,
+                    repository_id=repo_id,
+                    owner_uid=store.expected_uid,
+                    repository_generation=0,
+                    operation_id="fixture-repository-plan-owner",
+                    actor="test",
+                    reason="explicit repository planning fixture enrollment",
+                    timestamp=now,
+                    evidence={
+                        "kind": "repository-plan-owner-fixture",
+                        "repository_id": repo_id,
+                        "repository_generation": 0,
+                        "owner_uid": store.expected_uid,
+                    },
+                )
+                connection.execute(
+                    """
+                    INSERT INTO repository_installations(
+                        repo_id, status, startup_fenced, generation, reason,
+                        actor, updated_at
+                    ) VALUES (?, 'installed', 0, 0,
+                              'explicit repository planning fixture enrollment',
+                              'test', ?)
+                    """,
+                    (repo_id, now),
+                )
         args = coordinator.build_parser().parse_args(
             [
                 "repository",
@@ -1870,6 +2063,7 @@ os._exit(0)
             result = coordinator.handle_cli(args)
         self.assertEqual(sampler.call_count, 1)
         self.assertEqual(result["kind"], "repository_decommission")
+        self.assertEqual(result["repo_id"], repo_id)
         self.assertEqual(len(result["targets"]), 1)
         self.assertEqual(
             [policy["kind"] for policy in result["targets"][0]["policies"]],
@@ -1878,13 +2072,20 @@ os._exit(0)
         with AccountStore.open_default(self.home) as store:
             policy = store.connection.execute(
                 """
-                SELECT p.current_value, p.repo_id, e.capability_state
+                SELECT p.current_value, p.repo_id, e.capability_state,
+                       r.generation, authority.owner_uid,
+                       authority.repository_generation
                 FROM startup_policies p
                 JOIN docker_resources d ON d.docker_resource_id = p.resource_id
                 JOIN docker_engines e USING(engine_id)
+                JOIN repositories r ON r.repo_id = p.repo_id
+                JOIN repository_owners authority ON authority.repo_id = r.repo_id
                 """
             ).fetchone()
-            self.assertEqual(tuple(policy), ("unless-stopped", result["repo_id"], "available"))
+            self.assertEqual(
+                tuple(policy),
+                ("unless-stopped", repo_id, "available", 0, store.expected_uid, 0),
+            )
             self.assertEqual(
                 store.connection.execute(
                     "SELECT COUNT(*) FROM operations WHERE kind='repository_decommission' AND status='planned'"

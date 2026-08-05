@@ -1,0 +1,15 @@
+[Unit]
+Description=DevCoordinator bounded background-service slice
+Before=slices.target
+
+[Slice]
+CPUAccounting=yes
+MemoryAccounting=yes
+IOAccounting=yes
+TasksAccounting=yes
+CPUWeight=200
+IOWeight=200
+CPUQuota=DEVCOORDINATOR_BACKGROUND_CPU_QUOTA_PERCENT%
+MemoryHigh=DEVCOORDINATOR_BACKGROUND_MEMORY_HIGH_BYTES
+MemoryMax=DEVCOORDINATOR_BACKGROUND_MEMORY_MAX_BYTES
+TasksMax=4096

@@ -14,6 +14,10 @@ These rules apply to every agent working in this repository.
 
 ## Delegate runtime coordination to Python
 
+- Ordinary source inspection, editing, formatting, static checks, and isolated
+  unit tests do not need a Coordinator preflight or inventory call. Use the
+  Coordinator only when work observes or changes host-visible runtime state or
+  must publish durable shared test evidence.
 - Never start, stop, restart, replace, remove, or inspect a process, Docker
   resource, Compose stack, or local database directly. Use:
   `python3 skills/codex-dev-coordinator/scripts/dev_coordinator.py runtime --help`.
@@ -53,8 +57,13 @@ These rules apply to every agent working in this repository.
 ## Native and verification work
 
 - Use Build macOS Apps before any Board build/test/run/package/automation work.
-- Reproduce reported failures when feasible, strengthen the nearest focused
-  regression guard, and retest the original and adjacent paths.
-- Before readiness, run focused suites, `scripts/check_repository_boundaries.py`,
+- Reproduce reported failures when feasible and strengthen the nearest
+  regression guard, but do not replay the whole suite after each small edit.
+- Accumulate related edits, then run one software-owned validation cycle that
+  records every independent failure. Batch-fix the report and repeat the whole
+  cycle once. DevCoordinator delivery uses
+  `scripts/software_owned_delivery.py`; do not reconstruct its test, package,
+  deploy, and browser workflow manually.
+- Before readiness, the accumulated cycle must include repository boundaries
   and the applicable repository validation. Report unresolved ledger items as
   incomplete; never describe partial or unverified behavior as ready.

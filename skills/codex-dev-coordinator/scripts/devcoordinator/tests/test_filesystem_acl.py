@@ -326,76 +326,40 @@ class DarwinFilesystemACLIntegrationTests(unittest.TestCase):
 
 
 class RepositoryACLIntegrationTests(unittest.TestCase):
-    def test_repository_proof_checks_anchored_root_and_git_components(self) -> None:
-        checked: list[str] = []
-
-        def trusted(
-            _descriptor: int, *, owner_uid: int, field: str
-        ) -> filesystem_acl.ACLInspection:
-            self.assertGreaterEqual(owner_uid, 0)
-            checked.append(field)
-            return inspection()
-
-        with CanonicalRepositoryFixture() as repository, mock.patch.object(
-            repository_context._filesystem_acl,
-            "require_fd_acl_trusted",
-            side_effect=trusted,
-        ):
+    def test_repository_proof_uses_structural_identity_without_acl_authority(self) -> None:
+        with CanonicalRepositoryFixture() as repository:
             context = repository_context.resolve_repository_context(
                 root_repo=str(repository), temporary_repo=None
             )
 
         self.assertEqual(context.root.canonical_root, str(repository))
-        self.assertIn("root_repo path component /", checked)
-        self.assertTrue(any("root_repo path component" in item for item in checked))
-        self.assertTrue(any(".git" in item for item in checked))
-        self.assertTrue(any("config" in item for item in checked))
+        self.assertFalse(hasattr(repository_context, "_filesystem_acl"))
 
-    def test_repository_proof_rejects_an_unsafe_component_before_git_use(self) -> None:
-        def reject_repository(
-            _descriptor: int, *, owner_uid: int, field: str
-        ) -> filesystem_acl.ACLInspection:
-            del owner_uid
-            if "root_repo path component" in field and field.endswith("repository"):
-                raise filesystem_acl.FilesystemACLTrustError(
-                    "fixture grants non-owner write authority"
-                )
-            return inspection()
-
+    def test_repository_proof_never_consults_legacy_acl_authority(self) -> None:
         with CanonicalRepositoryFixture() as repository, mock.patch.object(
-            repository_context._filesystem_acl,
+            filesystem_acl,
             "require_fd_acl_trusted",
-            side_effect=reject_repository,
-        ), mock.patch.object(repository_context, "_git") as git:
-            with self.assertRaisesRegex(
-                filesystem_acl.FilesystemACLTrustError,
-                "grants non-owner write authority",
-            ):
-                repository_context.resolve_repository_context(
-                    root_repo=str(repository), temporary_repo=None
-                )
-            git.assert_not_called()
+            side_effect=AssertionError("legacy ACL gate was consulted"),
+        ) as acl_check:
+            context = repository_context.resolve_repository_context(
+                root_repo=str(repository), temporary_repo=None
+            )
+        self.assertEqual(context.root.canonical_root, str(repository))
+        acl_check.assert_not_called()
 
-    def test_privileged_compose_reads_check_root_descendants_and_input(self) -> None:
-        checked: list[str] = []
-
-        def trusted(
-            _descriptor: int, *, owner_uid: int, field: str
-        ) -> filesystem_acl.ACLInspection:
-            self.assertGreaterEqual(owner_uid, 0)
-            checked.append(field)
-            return inspection()
-
+    def test_trusted_local_compose_reads_do_not_consult_acl_authority(self) -> None:
         with CanonicalRepositoryFixture() as repository:
             nested = repository / "deploy"
             nested.mkdir()
             compose = nested / "compose.yaml"
             compose.write_text("services: {}\n", encoding="utf-8")
             with mock.patch.object(
-                compose_contract._filesystem_acl,
+                filesystem_acl,
                 "require_fd_acl_trusted",
-                side_effect=trusted,
-            ):
+                side_effect=AssertionError(
+                    "trusted-local Compose paths must not use ACL admission"
+                ),
+            ) as acl_check:
                 root_descriptor = compose_contract.open_anchored_compose_root(
                     str(repository)
                 )
@@ -410,45 +374,25 @@ class RepositoryACLIntegrationTests(unittest.TestCase):
 
         self.assertEqual(payload, b"services: {}\n")
         self.assertEqual(evidence["byte_size"], len(payload))
-        self.assertIn("Compose repository path component /", checked)
-        self.assertTrue(any("Compose repository path component" in item for item in checked))
-        self.assertTrue(any("descendant component deploy" in item for item in checked))
-        self.assertTrue(any("input component compose.yaml" in item for item in checked))
+        acl_check.assert_not_called()
 
-    def test_privileged_compose_read_rejects_unsafe_input_acl(self) -> None:
-        def reject_input(
-            _descriptor: int, *, owner_uid: int, field: str
-        ) -> filesystem_acl.ACLInspection:
-            del owner_uid
-            if "input component" in field:
-                raise filesystem_acl.FilesystemACLTrustError(
-                    "fixture grants non-owner append authority"
-                )
-            return inspection()
-
+    def test_trusted_local_compose_read_still_rejects_symlink_input(self) -> None:
         with CanonicalRepositoryFixture() as repository:
-            compose = repository / "compose.yaml"
-            compose.write_text("services: {}\n", encoding="utf-8")
-            with mock.patch.object(
-                compose_contract._filesystem_acl,
-                "require_fd_acl_trusted",
-                side_effect=reject_input,
-            ):
-                root_descriptor = compose_contract.open_anchored_compose_root(
-                    str(repository)
-                )
-                try:
-                    with self.assertRaisesRegex(
-                        filesystem_acl.FilesystemACLTrustError,
-                        "non-owner append authority",
-                    ):
-                        compose_contract.read_anchored_compose_file(
-                            root_descriptor,
-                            ("compose.yaml",),
-                            maximum_bytes=1024,
-                        )
-                finally:
-                    os.close(root_descriptor)
+            target = repository / "target.yaml"
+            target.write_text("services: {}\n", encoding="utf-8")
+            (repository / "compose.yaml").symlink_to(target)
+            root_descriptor = compose_contract.open_anchored_compose_root(
+                str(repository)
+            )
+            try:
+                with self.assertRaises(OSError):
+                    compose_contract.read_anchored_compose_file(
+                        root_descriptor,
+                        ("compose.yaml",),
+                        maximum_bytes=1024,
+                    )
+            finally:
+                os.close(root_descriptor)
 
 
 if __name__ == "__main__":

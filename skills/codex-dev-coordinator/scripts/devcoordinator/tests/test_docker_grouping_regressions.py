@@ -11,6 +11,7 @@ from unittest import mock
 import dev_coordinator
 from devcoordinator.broker_host import EPHEMERAL_DOCKER_LABELS
 from devcoordinator.host_observation import commit_host_inventory_observation
+from devcoordinator.inventory_projection import envelope as inventory_envelope
 from devcoordinator.observer import SingleFlightObserver
 from devcoordinator.store import AccountStore, deterministic_id, utc_timestamp
 
@@ -606,6 +607,85 @@ class NormalizedDockerGroupingTests(unittest.TestCase):
         )
         self.assertEqual(active_unassigned, 0)
 
+    def test_testcontainers_dependencies_do_not_publish_ownership_or_crash_incidents(self) -> None:
+        """Normal Testcontainers setup/teardown is not a Console incident."""
+
+        full_id = "9" * 64
+        container = self._container(full_id, "testcontainers-ryuk-fixture")
+        container["labels"] = {
+            "org.testcontainers": "true",
+            "org.testcontainers.session-id": "fixture-session",
+        }
+        with AccountStore.open_default(self.home) as store:
+            host_id = store.ensure_local_host()
+            self._observe(store, host_id, [container])
+            stopped = dict(container)
+            stopped["status"] = "Exited (0)"
+            stopped["running"] = False
+            self._observe(store, host_id, [stopped])
+            graph = store.inventory_v2()
+            with store.read_transaction() as connection:
+                event_codes = [
+                    str(row[0])
+                    for row in connection.execute(
+                        "SELECT code FROM events ORDER BY occurred_at, event_id"
+                    )
+                ]
+
+        self.assertEqual(graph["resources"]["docker"], [])
+        self.assertEqual(graph["unassigned_resources"], [])
+        self.assertEqual(graph["v1_compatibility"]["docker"]["containers"], [])
+        self.assertNotIn("docker_unassigned_discovered", event_codes)
+        self.assertNotIn("docker_crashed", event_codes)
+        inventory_envelope(
+            generation=1,
+            inventory=graph,
+            published_at="2026-07-31T00:00:00Z",
+        )
+
+    def test_uninspectable_test_setup_row_never_becomes_an_incident_or_database_group(self) -> None:
+        """A ps/inspect race must not briefly pollute the Console inventory."""
+
+        full_id = "8" * 64
+        container = self._container(full_id, "naughty_haibt")
+        container.update(
+            {
+                "inspection_observable": False,
+                "metadata_source": "inspection_unavailable",
+                "labels": {},
+                "databases": [{"name": "skydive_fixture", "size_bytes": 42}],
+            }
+        )
+        with AccountStore.open_default(self.home) as store:
+            host_id = store.ensure_local_host()
+            self._observe(store, host_id, [container])
+            graph = store.inventory_v2()
+            with store.read_transaction() as connection:
+                event_codes = [
+                    str(row[0])
+                    for row in connection.execute(
+                        "SELECT code FROM events ORDER BY occurred_at, event_id"
+                    )
+                ]
+                database_binding_count = int(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM database_bindings"
+                    ).fetchone()[0]
+                )
+
+        self.assertEqual(graph["resources"]["docker"], [])
+        self.assertEqual(graph["resources"]["databases"], [])
+        self.assertEqual(graph["unassigned_resources"], [])
+        self.assertEqual(graph["v1_compatibility"]["docker"]["containers"], [])
+        self.assertEqual(database_binding_count, 0)
+        self.assertNotIn("docker_unassigned_discovered", event_codes)
+        self.assertNotIn("docker_crashed", event_codes)
+        inventory_envelope(
+            generation=1,
+            inventory=graph,
+            published_at="2026-07-31T00:00:00Z",
+        )
+
     def test_post_start_ephemeral_observation_repairs_missing_persisted_ids(self) -> None:
         repository = self.root / "ephemeral-recovery"
         repository.mkdir()
@@ -1168,6 +1248,84 @@ class NormalizedDockerGroupingTests(unittest.TestCase):
         self.assertEqual(usage["container_names"], ["gf-v2-dev-api-1"])
         self.assertEqual(usage["container_resource_ids"], [resource_id])
 
+    def test_ownership_problem_telemetry_is_excluded_from_repository_usage(self) -> None:
+        repository = self.root / "ownership-problem-usage"
+        repository.mkdir()
+        (repository / ".git").mkdir()
+        full_id = "e" * 64
+        container = self._container(
+            full_id,
+            "ownership-problem-worker",
+            project=repository,
+        )
+        container["stats"] = {
+            "timestamp": "2026-08-03T00:00:01Z",
+            "cpu_percent": 24.0,
+            "memory_usage_bytes": 3 * 1024**3,
+        }
+
+        with AccountStore.open_default(self.home) as store:
+            host_id = store.ensure_local_host()
+            repo_id = self._insert_repository(store, host_id, repository)
+            self._observe(store, host_id, [container])
+            resource_id = deterministic_id(
+                "docker-resource",
+                deterministic_id("docker-engine", host_id, "default"),
+                full_id,
+            )
+            timestamp = utc_timestamp()
+            with store.immediate_transaction() as connection:
+                connection.execute(
+                    """
+                    INSERT INTO unassigned_resources(
+                        unassigned_id, host_id, resource_kind, resource_id,
+                        display_name, reason_code, status, created_at, updated_at
+                    ) VALUES (?, ?, 'container', ?, ?, 'stale_observation',
+                              'active', ?, ?)
+                    """,
+                    (
+                        "problem-usage-container",
+                        host_id,
+                        resource_id,
+                        "ownership-problem-worker",
+                        timestamp,
+                        timestamp,
+                    ),
+                )
+            graph = store.inventory_v2()
+
+        problem_ids = {
+            item["resource_id"] for item in graph["unassigned_resources"]
+        }
+        self.assertIn(resource_id, problem_ids)
+        usage = next(
+            item
+            for item in graph["v1_compatibility"]["project_usage"]
+            if item["project"] == str(repository)
+        )
+        self.assertEqual(usage["container_resource_ids"], [])
+        self.assertEqual(usage["container_names"], [])
+        self.assertEqual(usage["process_count"], 0)
+        self.assertIsNone(usage["cpu_percent"])
+        self.assertIsNone(usage["memory_bytes"])
+        tree = next(
+            item
+            for item in graph["repository_trees"]
+            if item["root_repository"]["repo_id"] == repo_id
+        )
+        self.assertEqual(tree["usage"]["process_count"], 0)
+        self.assertIsNone(tree["usage"]["cpu_percent"])
+        self.assertIsNone(tree["usage"]["memory_bytes"])
+        self.assertNotIn(
+            resource_id,
+            {
+                container_id
+                for scope in tree["scopes"]
+                for container_id in scope["container_resource_ids"]
+            },
+            "an ownership-problem resource must not contribute membership or aggregate usage to its former family",
+        )
+
     def test_available_empty_snapshot_hides_retained_resources_from_active_views(self) -> None:
         repository = self.root / "current-owner"
         repository.mkdir()
@@ -1360,6 +1518,14 @@ class NormalizedDockerGroupingTests(unittest.TestCase):
         with AccountStore.open_default(self.home) as store:
             host_id = store.ensure_local_host()
             repo_id = self._insert_repository(store, host_id, repository)
+            running_container = self._container(
+                running_container_full_id,
+                "archived-running-container",
+                project=repository,
+            )
+            running_container["databases"] = [
+                {"name": "archived-running-database", "size_bytes": 1024}
+            ]
             self._observe(
                 store,
                 host_id,
@@ -1370,11 +1536,7 @@ class NormalizedDockerGroupingTests(unittest.TestCase):
                         project=repository,
                         status="Exited (0) 1 minute ago",
                     ),
-                    self._container(
-                        running_container_full_id,
-                        "archived-running-container",
-                        project=repository,
-                    ),
+                    running_container,
                 ],
             )
             engine_id = deterministic_id("docker-engine", host_id, "default")
@@ -1513,6 +1675,11 @@ class NormalizedDockerGroupingTests(unittest.TestCase):
                 }
 
         self.assertEqual(durable, {"retirements": 4, "memberships": 4})
+        inventory_envelope(
+            generation=1,
+            inventory=graph,
+            published_at="2026-07-30T00:00:00.000Z",
+        )
         membership_ids = {item["host_resource_id"] for item in graph["memberships"]}
         binding_ids = {item["resource_id"] for item in graph["control_bindings"]}
         docker_resource_ids = {
@@ -1556,6 +1723,36 @@ class NormalizedDockerGroupingTests(unittest.TestCase):
                 {item["resource_id"] for item in graph["lifecycle_violations"]}
             ),
             "false-positive guard: physically running archived resources remain visible as fence violations",
+        )
+        self.assertTrue(
+            {running_container_id, running_server_id}.isdisjoint(
+                {item["resource_id"] for item in graph["unassigned_resources"]}
+            ),
+            "one running archived resource must not be claimed in both ownership-problem lists",
+        )
+        database_ids = {
+            item["database_binding_id"] for item in graph["resources"]["databases"]
+        }
+        self.assertEqual(len(database_ids), 1)
+        self.assertTrue(
+            database_ids.isdisjoint(
+                {
+                    database_id
+                    for tree in graph["repository_trees"]
+                    for scope in tree["scopes"]
+                    for database_id in scope["database_binding_ids"]
+                }
+            ),
+            "a database cannot stay repository-classified after its parent container is fenced",
+        )
+        self.assertEqual(
+            database_ids,
+            {
+                item["resource_id"]
+                for item in graph["unassigned_resources"]
+                if item["resource_kind"] == "database"
+            },
+            "every current child database of a lifecycle-violating container needs one explicit problem",
         )
 
     def test_only_observed_server_instances_enter_compatibility_server_collections(self) -> None:
@@ -1857,7 +2054,7 @@ class NormalizedDockerGroupingTests(unittest.TestCase):
             "positive absence stays durable history without becoming a current project resource",
         )
 
-    def test_nested_git_worktree_is_not_collapsed_into_enrolled_outer_repository(self) -> None:
+    def test_unenrolled_nested_git_worktree_is_unassigned_not_given_inferred_owner(self) -> None:
         outer = self.root / "outer"
         nested = outer / "services" / "nested"
         nested_deploy = nested / "deploy"
@@ -1883,16 +2080,19 @@ class NormalizedDockerGroupingTests(unittest.TestCase):
             deterministic_id("docker-engine", host_id, "default"),
             full_id,
         )
-        membership = next(
-            item for item in graph["memberships"] if item["host_resource_id"] == resource_id
+        self.assertNotIn(
+            resource_id,
+            {item["host_resource_id"] for item in graph["memberships"]},
         )
-        nested_repo_id = deterministic_id("repository", host_id, str(nested))
-        self.assertEqual(membership["repo_id"], nested_repo_id)
-        self.assertNotEqual(membership["repo_id"], outer_repo_id)
-        self.assertIn(
-            str(nested),
-            {item["canonical_root"] for item in graph["repositories"]},
+        self.assertEqual(
+            {item["repo_id"] for item in graph["repositories"]}, {outer_repo_id}
         )
+        unassigned = next(
+            item
+            for item in graph["unassigned_resources"]
+            if item["host_resource_id"] == resource_id
+        )
+        self.assertEqual(unassigned["reason_code"], "missing_repo")
 
     def test_existing_non_git_path_is_not_mislabeled_as_a_conflicting_claim(self) -> None:
         non_repository = self.root / "plain-directory"
@@ -1910,6 +2110,385 @@ class NormalizedDockerGroupingTests(unittest.TestCase):
             item for item in graph["unassigned_resources"] if item["display_name"] == "plain-container"
         )
         self.assertEqual(unassigned["reason_code"], "not_git")
+
+    def test_registered_non_git_root_revokes_weak_claim_and_all_database_links(
+        self,
+    ) -> None:
+        repository = self.root / "stale-compose-root"
+        repository.mkdir()
+        (repository / ".git").mkdir()
+        full_id = "1" * 64
+        with AccountStore.open_default(self.home) as store:
+            host_id = store.ensure_local_host()
+            repo_id = self._insert_repository(store, host_id, repository)
+            attributed = self._container(
+                full_id, "stale-compose-postgres", project=repository
+            )
+            attributed["databases"] = [
+                {"name": "app", "size_bytes": 1024},
+                {"name": "history", "size_bytes": 2048},
+            ]
+            self._observe(store, host_id, [attributed])
+
+            # The repository marker disappeared while the exact native
+            # container survived. A registered path alone is not ownership
+            # evidence, and a failed database catalog must not leave any
+            # resource-local database binding attached to the ghost project.
+            (repository / ".git").rmdir()
+            unattributed = self._container(
+                full_id, "stale-compose-postgres", project=repository
+            )
+            unattributed["database_discovery_error"] = "catalog timed out"
+            self._observe(store, host_id, [unattributed])
+
+            resource_id = deterministic_id(
+                "docker-resource",
+                deterministic_id("docker-engine", host_id, "default"),
+                full_id,
+            )
+            with store.read_transaction() as connection:
+                membership = connection.execute(
+                    """
+                    SELECT repo_id FROM repository_memberships
+                    WHERE resource_kind = 'container' AND host_resource_id = ?
+                    """,
+                    (resource_id,),
+                ).fetchone()
+                binding = connection.execute(
+                    """
+                    SELECT repo_id, provenance, authority_state
+                    FROM control_bindings
+                    WHERE resource_kind = 'container' AND resource_id = ?
+                    """,
+                    (resource_id,),
+                ).fetchone()
+                source = connection.execute(
+                    """
+                    SELECT repo_id FROM source_resources
+                    WHERE resource_kind = 'container' AND native_id = ?
+                    """,
+                    (full_id,),
+                ).fetchone()
+                policy = connection.execute(
+                    """
+                    SELECT repo_id, current_value, generation
+                    FROM startup_policies
+                    WHERE resource_kind = 'container' AND resource_id = ?
+                    """,
+                    (resource_id,),
+                ).fetchone()
+                databases = list(
+                    connection.execute(
+                        """
+                        SELECT database_binding_id, repo_id
+                        FROM database_bindings
+                        WHERE docker_resource_id = ?
+                        ORDER BY database_binding_id
+                        """,
+                        (resource_id,),
+                    )
+                )
+                database_observation_count = int(
+                    connection.execute(
+                        """
+                        SELECT COUNT(*) FROM database_observations
+                        WHERE docker_resource_id = ?
+                        """,
+                        (resource_id,),
+                    ).fetchone()[0]
+                )
+                unassigned = connection.execute(
+                    """
+                    SELECT reason_code, suggested_root, status
+                    FROM unassigned_resources
+                    WHERE resource_kind = 'container' AND resource_id = ?
+                      AND status = 'active'
+                    """,
+                    (resource_id,),
+                ).fetchone()
+                native_resource_count = int(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM docker_resources WHERE docker_resource_id = ?",
+                        (resource_id,),
+                    ).fetchone()[0]
+                )
+            graph = store.inventory_v2()
+
+        inventory_envelope(
+            generation=1,
+            inventory=graph,
+            published_at="2026-07-30T00:00:00.000Z",
+        )
+
+        self.assertIsNone(membership)
+        self.assertIsNone(binding["repo_id"])
+        self.assertEqual(binding["provenance"], "docker_labels")
+        self.assertEqual(binding["authority_state"], "authoritative")
+        self.assertIsNone(source["repo_id"])
+        self.assertIsNone(policy["repo_id"])
+        self.assertEqual(policy["current_value"], "unless-stopped")
+        self.assertEqual(policy["generation"], 1)
+        self.assertEqual(len(databases), 2)
+        self.assertTrue(all(row["repo_id"] is None for row in databases))
+        self.assertEqual(database_observation_count, 2)
+        self.assertEqual(native_resource_count, 1)
+        self.assertEqual(unassigned["reason_code"], "not_git")
+        self.assertEqual(unassigned["suggested_root"], str(repository))
+        self.assertEqual(unassigned["status"], "active")
+        self.assertNotEqual(repo_id, binding["repo_id"])
+        binding_ids = {str(row["database_binding_id"]) for row in databases}
+        database_problems = {
+            str(item["resource_id"]): item
+            for item in graph["unassigned_resources"]
+            if item["resource_kind"] == "database"
+        }
+        self.assertEqual(
+            set(database_problems),
+            binding_ids,
+            "every current child database of an unassigned container needs an explicit ownership problem",
+        )
+        self.assertTrue(
+            all(
+                item["parent_resource_id"] == resource_id
+                and item["reason_code"] == "not_git"
+                and item["can_attach"] is False
+                and item["can_retire"] is False
+                for item in database_problems.values()
+            )
+        )
+        classified_database_ids = {
+            str(binding_id)
+            for tree in graph["repository_trees"]
+            for scope in tree["scopes"]
+            for binding_id in scope["database_binding_ids"]
+        }
+        normalized_database_ids = {
+            str(item["database_binding_id"])
+            for item in graph["resources"]["databases"]
+        }
+        self.assertFalse(classified_database_ids & set(database_problems))
+        self.assertEqual(
+            classified_database_ids | set(database_problems),
+            normalized_database_ids,
+            "tree scopes plus explicit database problems must partition normalized bindings",
+        )
+
+    def test_operator_attachment_survives_registered_git_marker_loss(self) -> None:
+        repository = self.root / "operator-owned"
+        repository.mkdir()
+        (repository / ".git").mkdir()
+        full_id = "2" * 64
+        with AccountStore.open_default(self.home) as store:
+            host_id = store.ensure_local_host()
+            repo_id = self._insert_repository(store, host_id, repository)
+            self._observe(
+                store,
+                host_id,
+                [self._container(full_id, "operator-owned-web", project=repository)],
+            )
+            resource_id = deterministic_id(
+                "docker-resource",
+                deterministic_id("docker-engine", host_id, "default"),
+                full_id,
+            )
+            with store.immediate_transaction() as connection:
+                connection.execute(
+                    """
+                    UPDATE control_bindings SET provenance = 'operator_attach'
+                    WHERE resource_kind = 'container' AND resource_id = ?
+                    """,
+                    (resource_id,),
+                )
+            (repository / ".git").rmdir()
+            self._observe(
+                store,
+                host_id,
+                [self._container(full_id, "operator-owned-web", project=repository)],
+            )
+            with store.read_transaction() as connection:
+                membership = connection.execute(
+                    """
+                    SELECT repo_id FROM repository_memberships
+                    WHERE resource_kind = 'container' AND host_resource_id = ?
+                    """,
+                    (resource_id,),
+                ).fetchone()
+                binding = connection.execute(
+                    """
+                    SELECT repo_id, provenance, authority_state
+                    FROM control_bindings
+                    WHERE resource_kind = 'container' AND resource_id = ?
+                    """,
+                    (resource_id,),
+                ).fetchone()
+                policy = connection.execute(
+                    """
+                    SELECT repo_id FROM startup_policies
+                    WHERE resource_kind = 'container' AND resource_id = ?
+                    """,
+                    (resource_id,),
+                ).fetchone()
+                active_unassigned = int(
+                    connection.execute(
+                        """
+                        SELECT COUNT(*) FROM unassigned_resources
+                        WHERE resource_kind = 'container' AND resource_id = ?
+                          AND status = 'active'
+                        """,
+                        (resource_id,),
+                    ).fetchone()[0]
+                )
+
+        self.assertEqual(membership["repo_id"], repo_id)
+        self.assertEqual(binding["repo_id"], repo_id)
+        self.assertEqual(binding["provenance"], "operator_attach")
+        self.assertEqual(binding["authority_state"], "authoritative")
+        self.assertEqual(policy["repo_id"], repo_id)
+        self.assertEqual(active_unassigned, 0)
+
+    def test_ephemeral_attachment_survives_non_git_path_without_fresh_labels(
+        self,
+    ) -> None:
+        repository = self.root / "ephemeral-owner"
+        repository.mkdir()
+        (repository / ".git").mkdir()
+        full_id = "3" * 64
+        run_id = "52345678-1234-4234-8234-123456789abc"
+        with AccountStore.open_default(self.home) as store:
+            host_id = store.ensure_local_host()
+            repo_id = self._insert_repository(store, host_id, repository)
+            resource_id = deterministic_id(
+                "docker-resource",
+                deterministic_id("docker-engine", host_id, "default"),
+                full_id,
+            )
+            self._observe(
+                store,
+                host_id,
+                [self._container(full_id, "ephemeral-provenance-web")],
+            )
+            labels = self._insert_ephemeral_run(
+                store,
+                repo_id=repo_id,
+                run_id=run_id,
+                creation_nonce="eeeeeeee-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+                template_id="ephemeral-template-provenance",
+                definition_fingerprint="a" * 64,
+                container_name="ephemeral-provenance-web",
+                full_container_id=full_id,
+                docker_resource_id=resource_id,
+            )
+            first = self._container(full_id, "ephemeral-provenance-web")
+            first["labels"] = labels
+            self._observe(store, host_id, [first])
+
+            (repository / ".git").rmdir()
+            self._observe(
+                store,
+                host_id,
+                [
+                    self._container(
+                        full_id,
+                        "ephemeral-provenance-web",
+                        project=repository,
+                    )
+                ],
+            )
+            with store.read_transaction() as connection:
+                membership = connection.execute(
+                    """
+                    SELECT repo_id FROM repository_memberships
+                    WHERE resource_kind = 'container' AND host_resource_id = ?
+                    """,
+                    (resource_id,),
+                ).fetchone()
+                binding = connection.execute(
+                    """
+                    SELECT repo_id, provenance, authority_state
+                    FROM control_bindings
+                    WHERE resource_kind = 'container' AND resource_id = ?
+                    """,
+                    (resource_id,),
+                ).fetchone()
+                active_unassigned = int(
+                    connection.execute(
+                        """
+                        SELECT COUNT(*) FROM unassigned_resources
+                        WHERE resource_kind = 'container' AND resource_id = ?
+                          AND status = 'active'
+                        """,
+                        (resource_id,),
+                    ).fetchone()[0]
+                )
+
+        self.assertEqual(membership["repo_id"], repo_id)
+        self.assertEqual(binding["repo_id"], repo_id)
+        self.assertEqual(binding["provenance"], "coordinator_ephemeral")
+        self.assertEqual(binding["authority_state"], "authoritative")
+        self.assertEqual(active_unassigned, 0)
+
+    def test_symlinked_git_marker_is_not_positive_ownership_evidence(self) -> None:
+        repository = self.root / "symlinked-marker"
+        git_target = self.root / "git-target"
+        repository.mkdir()
+        git_target.mkdir()
+        (repository / ".git").symlink_to(git_target, target_is_directory=True)
+        full_id = "4" * 64
+        with AccountStore.open_default(self.home) as store:
+            host_id = store.ensure_local_host()
+            self._insert_repository(store, host_id, repository)
+            self._observe(
+                store,
+                host_id,
+                [self._container(full_id, "symlinked-marker-web", project=repository)],
+            )
+            graph = store.inventory_v2()
+
+        resource_id = deterministic_id(
+            "docker-resource",
+            deterministic_id("docker-engine", host_id, "default"),
+            full_id,
+        )
+        self.assertNotIn(
+            resource_id,
+            {item["host_resource_id"] for item in graph["memberships"]},
+        )
+        unassigned = next(
+            item
+            for item in graph["unassigned_resources"]
+            if item["host_resource_id"] == resource_id
+        )
+        self.assertEqual(unassigned["reason_code"], "not_git")
+        self.assertEqual(unassigned["suggested_root"], str(repository))
+
+    def test_regular_file_git_marker_remains_valid_worktree_evidence(self) -> None:
+        repository = self.root / "linked-worktree"
+        repository.mkdir()
+        (repository / ".git").write_text(
+            "gitdir: /fixture/worktrees/linked\n", encoding="utf-8"
+        )
+        full_id = "5" * 64
+        with AccountStore.open_default(self.home) as store:
+            host_id = store.ensure_local_host()
+            repo_id = self._insert_repository(store, host_id, repository)
+            self._observe(
+                store,
+                host_id,
+                [self._container(full_id, "linked-worktree-web", project=repository)],
+            )
+            graph = store.inventory_v2()
+
+        resource_id = deterministic_id(
+            "docker-resource",
+            deterministic_id("docker-engine", host_id, "default"),
+            full_id,
+        )
+        membership = next(
+            item
+            for item in graph["memberships"]
+            if item["host_resource_id"] == resource_id
+        )
+        self.assertEqual(membership["repo_id"], repo_id)
 
     def test_unobservable_inspect_preserves_prior_compose_membership_and_provenance(self) -> None:
         repository = self.root / "compose-owner"

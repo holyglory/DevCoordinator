@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import errno
 import fcntl
-import grp
 import json
 import os
 import signal
@@ -18,12 +17,19 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable
 
+from .call_journal import (
+    DEFAULT_CALL_JOURNAL_BACKUPS,
+    DEFAULT_CALL_JOURNAL_MAX_BYTES,
+    DEFAULT_CALL_JOURNAL_PATH,
+    RollingCallJournal,
+)
 from .broker import (
     BrokerClient,
     BrokerError,
     BrokerOperation,
     BrokerRequest,
     UnixBrokerServer,
+    SYSTEM_BROKER_SOCKET_PATH,
     _validate_socket_path,
     validate_runtime_directory,
 )
@@ -44,8 +50,20 @@ from .store_backup import (
     restore_store_backup,
     restore_store_export,
 )
+from .universal_test_transport import UnixTestPlaneClient
+from .systemd_activation import take_systemd_listener
 
 BROKER_SERVICE_LOCK_NAME = ".broker-service.lock"
+
+
+def _socket_mode(value: str) -> int:
+    try:
+        mode = int(str(value), 8)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("socket mode must be octal") from error
+    if mode not in {0o660, 0o666}:
+        raise argparse.ArgumentTypeError("socket mode must be 0660 or 0666")
+    return mode
 
 
 @contextmanager
@@ -58,14 +76,6 @@ def exclusive_broker_service_lock(
     parent = database.parent
     if not parent.is_dir() or parent.is_symlink() or parent.resolve() != parent:
         raise PermissionError("broker service database parent is missing or unsafe")
-    parent_metadata = parent.stat()
-    if (
-        parent_metadata.st_uid != os.geteuid()
-        or stat.S_IMODE(parent_metadata.st_mode) & 0o022
-    ):
-        raise PermissionError(
-            "broker service database parent must be service-owned and not group/other writable"
-        )
     lock_path = parent / BROKER_SERVICE_LOCK_NAME
     flags = os.O_RDWR | os.O_CREAT
     if hasattr(os, "O_CLOEXEC"):
@@ -78,8 +88,6 @@ def exclusive_broker_service_lock(
         after = lock_path.lstat()
         if (
             not stat.S_ISREG(opened.st_mode)
-            or opened.st_uid != os.geteuid()
-            or stat.S_IMODE(opened.st_mode) != 0o600
             or (opened.st_dev, opened.st_ino) != (after.st_dev, after.st_ino)
         ):
             raise PermissionError("broker service lifetime lock is unsafe")
@@ -111,14 +119,70 @@ def add_broker_parser(subparsers: Any) -> None:
 
     serve = actions.add_parser("serve")
     _database_argument(serve)
-    serve.add_argument("--socket", required=True)
+    serve_socket = serve.add_mutually_exclusive_group(required=True)
+    serve_socket.add_argument("--socket")
+    serve_socket.add_argument(
+        "--systemd-socket",
+        action="store_true",
+        help="Adopt the sole systemd descriptor named authority.",
+    )
     serve_access = serve.add_mutually_exclusive_group()
     serve_access.add_argument("--access-gid", type=int)
     serve_access.add_argument(
         "--access-group",
-        help="Resolve this system group to the broker socket GID at service startup.",
+        help="Deprecated compatibility metadata; local access is not group-authorized.",
     )
+    serve.add_argument("--socket-mode", type=_socket_mode, default=0o666)
     serve.add_argument("--max-clients", type=int, default=32)
+    serve.add_argument(
+        "--call-log",
+        default=str(DEFAULT_CALL_JOURNAL_PATH),
+        help="bounded structured JSONL journal for every authority call",
+    )
+    serve.add_argument(
+        "--call-log-max-bytes",
+        type=int,
+        default=DEFAULT_CALL_JOURNAL_MAX_BYTES,
+        help="maximum bytes retained in each active or rotated call-log file",
+    )
+    serve.add_argument(
+        "--call-log-backups",
+        type=int,
+        default=DEFAULT_CALL_JOURNAL_BACKUPS,
+        help="number of rotated call-log files retained alongside the active file",
+    )
+    serve.add_argument(
+        "--test-plane-socket",
+        help="Protected AF_UNIX socket for the separately supervised testd service.",
+    )
+    test_plane_identity = serve.add_mutually_exclusive_group()
+    test_plane_identity.add_argument(
+        "--test-plane-uid",
+        type=int,
+        help="Deprecated compatibility metadata; ignored on this local host.",
+    )
+    test_plane_identity.add_argument(
+        "--test-plane-user",
+        help="Deprecated compatibility metadata; ignored on this local host.",
+    )
+    internal_testd_identity = serve.add_mutually_exclusive_group()
+    internal_testd_identity.add_argument(
+        "--internal-testd-uid",
+        type=int,
+        help="Deprecated compatibility metadata; ignored on this local host.",
+    )
+    internal_testd_identity.add_argument(
+        "--internal-testd-user",
+        help="Deprecated compatibility metadata; ignored on this local host.",
+    )
+    serve.add_argument(
+        "--test-capability-policy",
+        default="/etc/devcoordinator/test-execution-capabilities.json",
+        help=(
+            "Administrator-published repository-generation capability policy; an "
+            "absent file denies every fixture and non-none network request."
+        ),
+    )
 
     enroll = actions.add_parser(
         "enroll",
@@ -126,13 +190,23 @@ def add_broker_parser(subparsers: Any) -> None:
     )
     _database_argument(enroll)
     enroll.add_argument("--socket", required=True)
-    enroll_access = enroll.add_mutually_exclusive_group(required=True)
+    enroll_access = enroll.add_mutually_exclusive_group()
     enroll_access.add_argument("--access-gid", type=int)
     enroll_access.add_argument(
         "--access-group",
-        help="Resolve this system group to the broker socket GID during enrollment.",
+        help="Deprecated compatibility metadata; local access is not group-authorized.",
     )
     enroll.add_argument("--client-uid", type=int, required=True)
+    enroll.add_argument(
+        "--repository-owner-uid",
+        type=int,
+        required=True,
+        help=(
+            "Explicit execution-owner UID for this repository. This is independent "
+            "of the authorized client UID and is never inferred from the caller."
+        ),
+    )
+    enroll.add_argument("--socket-mode", type=_socket_mode, default=0o666)
     enroll.add_argument("--account-id", required=True)
     enroll.add_argument("--project", required=True)
     enroll.add_argument("--agent", required=True)
@@ -185,6 +259,15 @@ def add_broker_parser(subparsers: Any) -> None:
             "Explicitly approve the exact rendered Compose definition to use "
             "host-equivalent capabilities such as bind mounts, devices, host "
             "namespaces, or added capabilities. Approval is fingerprint-bound."
+        ),
+    )
+    enroll.add_argument(
+        "--compose-run-once-service",
+        action="append",
+        default=[],
+        help=(
+            "Explicitly grant this UID one manifest-sealed Compose run-once "
+            "service; repeat for an exact service allowlist."
         ),
     )
 
@@ -442,10 +525,15 @@ def add_broker_parser(subparsers: Any) -> None:
 
     call = actions.add_parser("call")
     call.add_argument("--socket", required=True)
-    call.add_argument("--expected-broker-uid", type=int, required=True)
+    call.add_argument(
+        "--expected-broker-uid",
+        type=int,
+        help="Deprecated compatibility metadata; local UID is attribution only.",
+    )
     call.add_argument("--expected-socket-gid", type=int)
-    call.add_argument("--expected-socket-mode", type=_octal_mode, default=0o660)
+    call.add_argument("--expected-socket-mode", type=_octal_mode, default=0o666)
     call.add_argument("--timeout-seconds", type=float, default=10.0)
+    call.add_argument("--run-once-timeout-seconds", type=int)
     call.add_argument("--account-id", required=True)
     call.add_argument("--database-generation", required=True)
     call.add_argument("--project-id", required=True)
@@ -458,11 +546,15 @@ def add_broker_parser(subparsers: Any) -> None:
     call.add_argument("--protocol", choices=("tcp", "udp"))
     call.add_argument("--ttl-seconds", type=int)
     call.add_argument("--agent")
+    call.add_argument("--service")
     call.add_argument("--reason")
     call.add_argument("--expected-observation-revision", type=int)
     call.add_argument("--database-name")
     call.add_argument("--database-backup-id")
     call.add_argument("--explicit", action="store_true")
+    call.add_argument("--drain-purpose")
+    call.add_argument("--drain-id")
+    call.add_argument("--proof-sha256")
 
 
 def handle_broker_cli(args: argparse.Namespace) -> Any:
@@ -487,7 +579,7 @@ def handle_broker_cli(args: argparse.Namespace) -> Any:
         )
         client = BrokerClient(
             Path(args.socket),
-            expected_broker_uid=int(args.expected_broker_uid),
+            expected_broker_uid=args.expected_broker_uid,
             expected_socket_gid=args.expected_socket_gid,
             expected_socket_mode=int(args.expected_socket_mode),
             timeout_seconds=float(args.timeout_seconds),
@@ -755,24 +847,73 @@ def serve_broker(
     observe_before_lifecycle_plan: Callable[[AccountStore], dict[str, Any]]
     | None = None,
 ) -> None:
-    if args.access_group:
-        try:
-            access_gid = int(grp.getgrnam(str(args.access_group)).gr_gid)
-        except KeyError as error:
-            raise RuntimeError(
-                f"broker access group does not exist: {args.access_group}"
-            ) from error
+    inherited_listener = None
+    if bool(getattr(args, "systemd_socket", False)):
+        socket_path = SYSTEM_BROKER_SOCKET_PATH
+        inherited_listener = take_systemd_listener(
+            descriptor_name="authority",
+            family=socket.AF_UNIX,
+            expected_address=str(socket_path),
+        )
     else:
-        access_gid = args.access_gid
+        socket_path = Path(args.socket)
+    # GID is retained only for the legacy profile schema.  Same-server access
+    # is granted by the typed request/catalog contract, never group metadata.
+    access_gid = int(args.access_gid) if args.access_gid is not None else os.getegid()
+    call_journal_path = Path(
+        getattr(args, "call_log", str(DEFAULT_CALL_JOURNAL_PATH))
+    )
+    call_journal_max_bytes = int(
+        getattr(args, "call_log_max_bytes", DEFAULT_CALL_JOURNAL_MAX_BYTES)
+    )
+    call_journal_backups = int(
+        getattr(args, "call_log_backups", DEFAULT_CALL_JOURNAL_BACKUPS)
+    )
+    test_plane = None
+    test_plane_socket = getattr(args, "test_plane_socket", None)
+    # Legacy identity flags remain parseable so old units keep starting, but
+    # neither side of a same-developer AF_UNIX connection authenticates by
+    # Unix UID. The server captures peer credentials for attribution only.
+    _legacy_test_plane_identity = (
+        getattr(args, "test_plane_user", None),
+        getattr(args, "test_plane_uid", None),
+    )
+    del _legacy_test_plane_identity
+    if test_plane_socket:
+        test_plane = UnixTestPlaneClient(
+            Path(test_plane_socket),
+            call_journal=RollingCallJournal(
+                call_journal_path,
+                max_bytes=call_journal_max_bytes,
+                backups=call_journal_backups,
+            ),
+        )
+    _legacy_internal_testd_identity = (
+        getattr(args, "internal_testd_user", None),
+        getattr(args, "internal_testd_uid", None),
+    )
+    del _legacy_internal_testd_identity
     database_path = Path(args.database).expanduser().absolute()
     with exclusive_broker_service_lock(database_path):
         runtime = build_store_backed_broker_runtime(
             database_path=database_path,
-            socket_path=Path(args.socket),
+            socket_path=socket_path,
             host_mutations=host_mutations_factory(),
             access_gid=access_gid,
+            socket_mode=int(getattr(args, "socket_mode", 0o666)),
             max_clients=int(args.max_clients),
             observe_before_lifecycle_plan=observe_before_lifecycle_plan,
+            test_plane=test_plane,
+            test_capability_path=Path(
+                getattr(
+                    args,
+                    "test_capability_policy",
+                    "/etc/devcoordinator/test-execution-capabilities.json",
+                )
+            ),
+            call_journal_path=call_journal_path,
+            call_journal_max_bytes=call_journal_max_bytes,
+            call_journal_backups=call_journal_backups,
         )
         runtime.persistence.recover_interrupted_docker_operations()
         runtime.persistence.recover_interrupted_compose_operations()
@@ -795,14 +936,6 @@ def serve_broker(
                 expected_uid=server._expected_uid,
                 expected_gid=server._expected_gid,
             )
-            if server._socket_mode & 0o060 and not (
-                stat.S_IMODE(runtime_info.st_mode) & stat.S_IXGRP
-            ):
-                raise BrokerError(
-                    "unsafe_runtime_directory",
-                    "Broker runtime directory must grant traversal to its "
-                    "configured access group.",
-                )
             try:
                 initial = os.lstat(str(socket_path))
             except FileNotFoundError:
@@ -812,16 +945,10 @@ def serve_broker(
                     "unsafe_socket_path",
                     "Broker socket path could not be inspected.",
                 ) from None
-            if not (
-                stat.S_ISSOCK(initial.st_mode)
-                and initial.st_uid == server._expected_uid
-                and initial.st_gid == server._expected_gid
-                and stat.S_IMODE(initial.st_mode) == server._socket_mode
-            ):
+            if not stat.S_ISSOCK(initial.st_mode):
                 raise BrokerError(
                     "unsafe_socket_path",
-                    "Existing broker socket is not an expected service-owned "
-                    "AF_UNIX socket; it was not replaced.",
+                    "Existing broker path is not an AF_UNIX socket; it was not replaced.",
                 )
             initial_identity = (
                 initial.st_dev,
@@ -879,12 +1006,7 @@ def serve_broker(
                 current.st_ctime_ns,
             )
             if (
-                not (
-                    stat.S_ISSOCK(current.st_mode)
-                    and current.st_uid == server._expected_uid
-                    and current.st_gid == server._expected_gid
-                    and stat.S_IMODE(current.st_mode) == server._socket_mode
-                )
+                not stat.S_ISSOCK(current.st_mode)
                 or current_identity != initial_identity
                 or (runtime_after.st_dev, runtime_after.st_ino)
                 != (runtime_info.st_dev, runtime_info.st_ino)
@@ -970,9 +1092,12 @@ def serve_broker(
             signal.signal(signum, request_stop)
         try:
             runtime.backend.start_ephemeral_reaper()
-            if isinstance(runtime.server, UnixBrokerServer):
+            if isinstance(runtime.server, UnixBrokerServer) and inherited_listener is None:
                 reclaim_stale_socket_before_admission()
-            runtime.server.start()
+            if inherited_listener is None:
+                runtime.server.start()
+            else:
+                runtime.server.start(listener=inherited_listener)
             print(
                 json.dumps(
                     {
@@ -983,7 +1108,8 @@ def serve_broker(
                             if access_gid is None
                             else int(access_gid)
                         ),
-                        "socket": str(Path(args.socket)),
+                        "socket": str(socket_path),
+                        "socket_activated": inherited_listener is not None,
                         "database": str(database_path),
                         "wire_identity": "opaque_normalized_ids_only",
                     },
@@ -1022,10 +1148,63 @@ def _octal_mode(raw: str) -> int:
 def _request_arguments(
     args: argparse.Namespace, operation: BrokerOperation
 ) -> dict[str, Any]:
+    drain_purpose = getattr(args, "drain_purpose", None)
+    drain_id = getattr(args, "drain_id", None)
+    proof_sha256 = getattr(args, "proof_sha256", None)
+    if operation is BrokerOperation.TEST_ADMISSION_DRAIN_BEGIN:
+        if drain_id or proof_sha256:
+            raise ValueError("test admission drain begin does not accept clear evidence")
+        return {
+            "purpose": str(
+                drain_purpose or "legacy-test-history-cutover"
+            )
+        }
+    if operation is BrokerOperation.TEST_ADMISSION_DRAIN_STATUS:
+        if drain_purpose or drain_id or proof_sha256:
+            raise ValueError("test admission drain status accepts no arguments")
+        return {}
+    if operation is BrokerOperation.TEST_ADMISSION_DRAIN_CLEAR:
+        if drain_purpose or not drain_id or not proof_sha256:
+            raise ValueError(
+                "test admission drain clear requires --drain-id and --proof-sha256"
+            )
+        return {
+            "drain_id": str(drain_id),
+            "proof_sha256": str(proof_sha256),
+        }
+    if drain_purpose or drain_id or proof_sha256:
+        raise ValueError("drain evidence is valid only for test admission administration")
     if operation is BrokerOperation.EPHEMERAL_SECRET_FD:
         raise ValueError(
             "ephemeral.secret_fd is in-process descriptor transport only; "
             "the generic broker CLI never prints or forwards credentials"
+        )
+    if operation is BrokerOperation.COMPOSE_RUN_ONCE:
+        if (
+            not args.agent
+            or not args.service
+            or args.reason
+            or args.run_once_timeout_seconds is None
+            or args.requested_port is not None
+            or args.protocol is not None
+            or args.ttl_seconds is not None
+            or args.expected_observation_revision is not None
+            or args.database_name
+            or args.database_backup_id
+            or args.explicit
+        ):
+            raise ValueError(
+                "compose.run_once requires --agent, --service, and "
+                "--run-once-timeout-seconds only"
+            )
+        return {
+            "agent": str(args.agent),
+            "service": str(args.service),
+            "timeout_seconds": int(args.run_once_timeout_seconds),
+        }
+    if args.run_once_timeout_seconds is not None:
+        raise ValueError(
+            "--run-once-timeout-seconds is valid only for compose.run_once"
         )
     port_fields = (args.requested_port, args.protocol, args.ttl_seconds)
     if operation in {
@@ -1043,6 +1222,7 @@ def _request_arguments(
             or args.database_name
             or args.database_backup_id
             or args.explicit
+            or args.service
         ):
             raise ValueError(
                 "ephemeral operations do not accept port, Docker-observation, or database arguments"
@@ -1102,7 +1282,7 @@ def _request_arguments(
         }
     if args.database_name or args.database_backup_id or args.explicit:
         raise ValueError("only PostgreSQL database operations accept database arguments")
-    if args.agent or args.reason:
+    if args.agent or args.service or args.reason:
         raise ValueError("only ephemeral mutations accept agent or reason arguments")
     if operation is BrokerOperation.PORT_LEASE:
         if args.expected_observation_revision is not None:

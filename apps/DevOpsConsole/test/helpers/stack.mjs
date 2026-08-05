@@ -57,25 +57,18 @@ if (!Number.isInteger(COORDINATOR_STORE_SCHEMA_VERSION)) {
   throw new Error('canonical Coordinator store schema version is unreadable');
 }
 
-async function isOutsideGitWorktree(base) {
-  let cursor = path.resolve(base);
-  for (;;) {
-    try {
-      await fsp.lstat(path.join(cursor, '.git'));
-      return false;
-    } catch (error) {
-      if (error?.code !== 'ENOENT') throw error;
-    }
-    const parent = path.dirname(cursor);
-    if (parent === cursor) return true;
-    cursor = parent;
+async function assertFixtureEntry(target, expectedKind, label) {
+  const info = await fsp.lstat(target);
+  const actualKind = info.isDirectory() ? 'directory' : info.isFile() ? 'file' : 'other';
+  if (info.isSymbolicLink() || actualKind !== expectedKind) {
+    throw new Error(`${label} is not a real ${expectedKind}: ${target}`);
   }
 }
 
 export async function canonicalTempDir(prefix) {
-  // The backup guard intentionally rejects any path below a Git marker. Test
-  // roots therefore cannot trust global /tmp: a developer may legitimately
-  // have /tmp/.git. Select and verify one canonical, user-writable base first.
+  // Select the first canonical writable local base. Each repository fixture
+  // creates its own nearer .git identity; an unrelated ancestor marker must
+  // not make the entire server temp area unusable.
   const candidates = [
     process.env.DEVCOORDINATOR_TEST_TMP_ROOT,
     os.homedir(),
@@ -83,16 +76,93 @@ export async function canonicalTempDir(prefix) {
   ].filter(Boolean);
   for (const candidate of [...new Set(candidates)]) {
     let base;
+    let created;
     try {
       base = await fsp.realpath(candidate);
-      if (!(await isOutsideGitWorktree(base))) continue;
-      const created = await fsp.mkdtemp(path.join(base, prefix));
-      return fsp.realpath(created);
+      created = await fsp.mkdtemp(path.join(base, prefix));
     } catch (error) {
       if (!['EACCES', 'ENOENT', 'EROFS'].includes(error?.code)) throw error;
+      continue;
     }
+    const canonical = await fsp.realpath(created);
+    await assertFixtureEntry(canonical, 'directory', 'E2E temporary root');
+    return canonical;
   }
-  throw new Error('no writable test temp root outside every Git worktree');
+  throw new Error('no writable canonical test temp root');
+}
+
+export async function assertFixtureRepositorySecurity(repositoryRoot) {
+  const canonical = await fsp.realpath(repositoryRoot);
+  if (canonical !== path.resolve(repositoryRoot)) {
+    throw new Error(`E2E repository fixture is not canonical: ${repositoryRoot}`);
+  }
+  await assertFixtureEntry(canonical, 'directory', 'E2E repository root');
+  await assertFixtureEntry(
+    path.join(canonical, '.git'),
+    'directory',
+    'E2E repository .git metadata',
+  );
+  await assertFixtureEntry(
+    path.join(canonical, '.git', 'config'),
+    'file',
+    'E2E repository config metadata',
+  );
+
+  // Use the production repository resolver for canonical identity. Local
+  // UID/GID/mode/ACL metadata is deliberately not a same-server trust gate.
+  const verifier = String.raw`
+import json
+import sys
+
+sys.path.insert(0, sys.argv[1])
+from devcoordinator.repository_context import resolve_repository_context
+
+context = resolve_repository_context(root_repo=sys.argv[2], temporary_repo=None)
+print(json.dumps({
+    "root": context.root.canonical_root,
+    "git_dir": context.root.git_dir,
+    "git_common_dir": context.root.git_common_dir,
+}))
+`;
+  const { stdout } = await execFileAsync(
+    'python3',
+    ['-c', verifier, path.dirname(COORDINATOR_SCRIPT), canonical],
+    {
+      env: { ...process.env },
+      timeout: 30_000,
+      maxBuffer: 1024 * 1024,
+    },
+  );
+  let evidence;
+  try {
+    evidence = JSON.parse(stdout);
+  } catch (error) {
+    throw new Error(
+      `E2E production repository proof emitted invalid JSON: ${error}; stdout=${JSON.stringify(stdout)}`,
+    );
+  }
+  if (
+    evidence?.root !== canonical
+    || evidence?.git_dir !== path.join(canonical, '.git')
+    || evidence?.git_common_dir !== path.join(canonical, '.git')
+  ) {
+    throw new Error(`E2E production repository proof contradicted the fixture: ${JSON.stringify(evidence)}`);
+  }
+  return canonical;
+}
+
+export async function initializeFixtureGitRepository(repositoryRoot) {
+  const canonical = await fsp.realpath(repositoryRoot);
+  if (canonical !== path.resolve(repositoryRoot)) {
+    throw new Error(`E2E repository fixture is not canonical: ${repositoryRoot}`);
+  }
+  await execFileAsync('git', ['-C', canonical, 'init', '-q']);
+  return assertFixtureRepositorySecurity(canonical);
+}
+
+export async function canonicalGitTempDir(prefix) {
+  const root = await canonicalTempDir(prefix);
+  return initializeFixtureGitRepository(root);
 }
 
 // ---------------------------------------------------------------------------
@@ -346,7 +416,110 @@ async function runNormalizedObservation({
   }
 }
 
-async function initializeNormalizedCoordinator(home, extraEnv = {}, { expectDocker = false } = {}) {
+async function enrollFixtureRepositoryOwners(home, roots, extraEnv = {}) {
+  if (!Array.isArray(roots) || roots.length === 0) return;
+  const ownerUid = process.getuid?.();
+  if (!Number.isInteger(ownerUid) || ownerUid <= 0) {
+    throw new Error('E2E repository owner authority requires a positive non-root UID');
+  }
+  const script = String.raw`
+import json
+import sys
+import uuid
+from pathlib import Path
+
+sys.path.insert(0, sys.argv[1])
+from devcoordinator.repository_lifecycle import RepositoryLifecycle
+from devcoordinator.schema import establish_repository_owner_authority
+from devcoordinator.sqlite_lifecycle import SQLiteLifecyclePersistence
+from devcoordinator.store import AccountStore, deterministic_id, utc_timestamp
+
+home = Path(sys.argv[2])
+owner_uid = int(sys.argv[3])
+roots = json.loads(sys.argv[4])
+with AccountStore.open_default(home) as store:
+    host_id = store.ensure_local_host()
+    for raw_root in roots:
+        root = Path(raw_root).resolve(strict=True)
+        marker = root / '.git'
+        if not marker.exists() or marker.is_symlink():
+            raise RuntimeError(f'fixture repository is not a canonical Git worktree: {root}')
+        repository_id = deterministic_id('repository', host_id, str(root))
+        timestamp = utc_timestamp()
+        with store.immediate_transaction() as connection:
+            existing = connection.execute(
+                '''
+                SELECT repository.repo_id, repository.generation,
+                       owner.owner_uid, owner.repository_generation
+                FROM repositories repository
+                LEFT JOIN repository_owners owner USING(repo_id)
+                WHERE repository.host_id = ? AND repository.canonical_root = ?
+                ''',
+                (host_id, str(root)),
+            ).fetchone()
+            if existing is None:
+                connection.execute(
+                    '''
+                    INSERT INTO repositories(
+                        repo_id, host_id, canonical_root, display_name, state,
+                        generation, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, 'active', 0, ?, ?)
+                    ''',
+                    (repository_id, host_id, str(root), root.name or str(root), timestamp, timestamp),
+                )
+                establish_repository_owner_authority(
+                    connection,
+                    repository_id=repository_id,
+                    owner_uid=owner_uid,
+                    repository_generation=0,
+                    operation_id=str(uuid.uuid4()),
+                    actor='devops-console-e2e-bootstrap',
+                    reason='explicit E2E fixture repository enrollment',
+                    timestamp=timestamp,
+                    evidence={
+                        'kind': 'devops-console-e2e-repository-owner',
+                        'repository_id': repository_id,
+                        'canonical_root': str(root),
+                        'repository_generation': 0,
+                        'owner_uid': owner_uid,
+                    },
+                )
+            elif (
+                str(existing['repo_id']) != repository_id
+                or int(existing['owner_uid']) != owner_uid
+                or int(existing['repository_generation']) != int(existing['generation'])
+            ):
+                raise RuntimeError(f'fixture repository owner authority conflicts for {root}')
+        persistence = SQLiteLifecyclePersistence(store)
+        with store.read_transaction() as connection:
+            installed = connection.execute(
+                'SELECT 1 FROM repository_installations WHERE repo_id = ?',
+                (repository_id,),
+            ).fetchone()
+        if installed is None:
+            RepositoryLifecycle(persistence, object()).install_repository(
+                repository_id,
+                actor='devops-console-e2e-bootstrap',
+                reason='explicit E2E fixture repository enrollment',
+                explicit=True,
+            )
+`;
+  await execFileAsync(
+    'python3',
+    ['-c', script, path.dirname(COORDINATOR_SCRIPT), home, String(ownerUid), JSON.stringify(roots)],
+    {
+      env: { ...process.env, ...extraEnv, CODEX_AGENT_COORDINATOR_HOME: home },
+      timeout: 60_000,
+      maxBuffer: 4 * 1024 * 1024,
+    },
+  );
+}
+
+async function initializeNormalizedCoordinator(
+  home,
+  extraEnv = {},
+  { expectDocker = false, repositoryOwnerRoots = [] } = {},
+) {
   // A production SQLite mutation deliberately discovers every eligible
   // same-UID legacy home before it establishes authority. E2E must not import
   // the developer/runner's real coordinator state, so create one exact,
@@ -376,6 +549,11 @@ async function initializeNormalizedCoordinator(home, extraEnv = {}, { expectDock
       maxBuffer: 4 * 1024 * 1024,
     },
   );
+
+  // Observation deliberately never invents execution ownership from Docker
+  // labels or filesystem UID. Test Docker projects therefore use the same
+  // explicit owner-authority boundary as production enrollment.
+  await enrollFixtureRepositoryOwners(home, repositoryOwnerRoots, extraEnv);
 
   const observation = await runNormalizedObservation({
     home,
@@ -429,9 +607,15 @@ async function assertNormalizedCoordinatorAuthority(coordinator, initialization,
   }
 }
 
-async function spawnCoordinator(home, extraEnv = {}, { expectDocker = false } = {}) {
-  const initialization = await initializeNormalizedCoordinator(home, extraEnv, { expectDocker });
-  const tokenFile = path.join(home, 'api-token');
+async function spawnCoordinator(
+  home,
+  extraEnv = {},
+  { expectDocker = false, repositoryOwnerRoots = [] } = {},
+) {
+  const initialization = await initializeNormalizedCoordinator(home, extraEnv, {
+    expectDocker,
+    repositoryOwnerRoots,
+  });
   const proc = spawn(
     'python3',
     [COORDINATOR_SCRIPT, 'api', 'serve', '--host', '127.0.0.1', '--port', '0'],
@@ -494,14 +678,9 @@ async function spawnCoordinator(home, extraEnv = {}, { expectDocker = false } = 
 
   const url = `http://127.0.0.1:${port}`;
   const deadline = Date.now() + 30_000;
-  let token = '';
   for (;;) {
     try {
-      token = (await fsp.readFile(tokenFile, 'utf8')).trim();
-      const res = await fetch(`${url}/v1/ports`, {
-        headers: { authorization: `Bearer ${token}` },
-        signal: AbortSignal.timeout(1000),
-      });
+      const res = await fetch(`${url}/v1/ports`, { signal: AbortSignal.timeout(1000) });
       await res.arrayBuffer().catch(() => {});
       if (res.status === 200) break;
     } catch {
@@ -515,7 +694,7 @@ async function spawnCoordinator(home, extraEnv = {}, { expectDocker = false } = 
   }
 
   async function api(method, apiPath, body, { timeoutMs = 60_000 } = {}) {
-    const headers = { authorization: `Bearer ${token}` };
+    const headers = {};
     if (body != null) headers['content-type'] = 'application/json';
     const res = await fetch(url + apiPath, {
       method,
@@ -561,7 +740,7 @@ async function spawnCoordinator(home, extraEnv = {}, { expectDocker = false } = 
     return result;
   }
 
-  const coordinator = { proc, port, url, home, tokenFile, api, observe };
+  const coordinator = { proc, port, url, home, api, observe };
   try {
     await assertNormalizedCoordinatorAuthority(coordinator, initialization, { expectDocker });
   } catch (err) {
@@ -597,13 +776,17 @@ async function stopProcess(proc) {
  *   process only (e.g. a PATH with a fake `docker` first).
  * @param {boolean} [options.expectDocker] require the supplied Docker fixture
  *   to be available in the committed normalized observation.
+ * @param {string[]} [options.repositoryOwnerRoots] explicitly enrolled E2E
+ *   repository roots needed by pre-existing observed resources.
  */
 export async function startStack({
+  domain = 'vr.ae',
   allowedEmails = ['ja@vr.ae'],
   claims,
   routes = [],
   coordinatorEnv = {},
   expectDocker = false,
+  repositoryOwnerRoots = [],
 } = {}) {
   ensureDevCert(); // fresh clones (CI) generate the throwaway TLS fixture
   const cleanups = []; // LIFO
@@ -630,7 +813,10 @@ export async function startStack({
     const wsEcho = await startWsEcho();
     cleanups.push(() => wsEcho.close());
 
-    const coordinator = await spawnCoordinator(coordHome, coordinatorEnv, { expectDocker });
+    const coordinator = await spawnCoordinator(coordHome, coordinatorEnv, {
+      expectDocker,
+      repositoryOwnerRoots,
+    });
     cleanups.push(async () => {
       // Stop any servers the coordinator still manages (e.g. a test failed
       // between servers/start and servers/stop), then the coordinator itself.
@@ -672,7 +858,7 @@ export async function startStack({
     await fsp.writeFile(
       envFile,
       [
-        'DOMAIN=vr.ae',
+        `DOMAIN=${domain}`,
         // Semantic ports (non-zero keeps the plain HTTP redirect listener
         // enabled); actual binds are OS-assigned via listenPorts below.
         'HTTP_PORT=8080',
@@ -687,7 +873,6 @@ export async function startStack({
         `COORDINATOR_URL=http://127.0.0.1:${coordinator.port}`,
         'COORDINATOR_AUTOSTART=0',
         `CODEX_AGENT_COORDINATOR_HOME=${coordHome}`,
-        `COORDINATOR_TOKEN_FILE=${coordinator.tokenFile}`,
         `STATE_DIR=${stateDir}`,
         'LOG_LEVEL=error',
         '',

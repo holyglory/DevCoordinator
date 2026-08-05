@@ -13,8 +13,6 @@ import pwd
 import stat
 from typing import Any
 
-from . import filesystem_acl as _filesystem_acl
-
 try:
     import yaml
     from yaml.constructor import ConstructorError
@@ -37,7 +35,6 @@ _TOP_LEVEL_UNSEALED_KEYS = frozenset({"include", "configs", "secrets"})
 _SERVICE_UNSEALED_KEYS = frozenset(
     {
         "extends",
-        "build",
         "env_file",
         "label_file",
         "configs",
@@ -59,6 +56,9 @@ _EFFECTIVE_SERVICE_KEYS = frozenset(
         "annotations",
         "attach",
         "blkio_config",
+        # Build metadata is retained for inventory and provenance only.
+        # Broker lifecycle commands always use ``--no-build``.
+        "build",
         "cap_add",
         "cap_drop",
         "cgroup",
@@ -210,6 +210,7 @@ class EffectiveComposeEvidence:
     profiles: tuple[str, ...]
     host_access_risks: tuple[str, ...]
     service_replicas: tuple[tuple[str, int], ...]
+    service_images: tuple[tuple[str, str], ...]
     replica_budget: int
 
 
@@ -288,15 +289,6 @@ def _anchored_directory_flags() -> int:
     return os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
 
 
-def _require_descriptor_acl(descriptor: int, *, field: str) -> None:
-    metadata = os.fstat(descriptor)
-    _filesystem_acl.require_fd_acl_trusted(
-        descriptor,
-        owner_uid=int(metadata.st_uid),
-        field=field,
-    )
-
-
 def open_anchored_compose_root(path: str) -> int:
     """Open an absolute directory without following any pathname component."""
 
@@ -312,17 +304,10 @@ def open_anchored_compose_root(path: str) -> int:
     flags = _anchored_directory_flags()
     descriptor = os.open("/", flags)
     try:
-        _require_descriptor_acl(descriptor, field="Compose repository path component /")
-        current = Path("/")
         for component in Path(path).parts[1:]:
             next_descriptor = os.open(component, flags, dir_fd=descriptor)
             os.close(descriptor)
             descriptor = next_descriptor
-            current /= component
-            _require_descriptor_acl(
-                descriptor,
-                field=f"Compose repository path component {current}",
-            )
         return descriptor
     except BaseException:
         os.close(descriptor)
@@ -339,19 +324,12 @@ def open_compose_directory_beneath(
     descriptor = os.dup(root_descriptor)
     os.set_inheritable(descriptor, False)
     try:
-        _require_descriptor_acl(
-            descriptor, field="Compose repository descendant root"
-        )
         for component in relative_parts:
             if component in {"", ".", ".."} or "/" in component:
                 raise ValueError("Compose descendant path is invalid")
             next_descriptor = os.open(component, flags, dir_fd=descriptor)
             os.close(descriptor)
             descriptor = next_descriptor
-            _require_descriptor_acl(
-                descriptor,
-                field=f"Compose repository descendant component {component}",
-            )
         return descriptor
     except BaseException:
         os.close(descriptor)
@@ -396,15 +374,7 @@ def _open_compose_file_beneath(
             | getattr(os, "O_NOCTTY", 0)
         )
         descriptor = os.open(relative_parts[-1], flags, dir_fd=parent)
-        try:
-            _require_descriptor_acl(
-                descriptor,
-                field=f"Compose input component {relative_parts[-1]}",
-            )
-            return descriptor
-        except BaseException:
-            os.close(descriptor)
-            raise
+        return descriptor
     finally:
         os.close(parent)
 
@@ -414,8 +384,6 @@ def read_anchored_compose_file(
     relative_parts: tuple[str, ...],
     *,
     maximum_bytes: int,
-    require_private: bool = False,
-    allowed_owner_uids: frozenset[int] | None = None,
 ) -> tuple[dict[str, int | str], bytes]:
     """Read and re-identify one bounded regular file beneath a held root."""
 
@@ -427,13 +395,6 @@ def read_anchored_compose_file(
         identity = (int(opened.st_dev), int(opened.st_ino))
         if not stat.S_ISREG(opened.st_mode):
             raise ValueError("Compose input must be a regular file")
-        if require_private and stat.S_IMODE(opened.st_mode) & 0o077:
-            raise ValueError("Compose environment file grants group or other access")
-        if (
-            allowed_owner_uids is not None
-            and int(opened.st_uid) not in allowed_owner_uids
-        ):
-            raise ValueError("Compose environment file has an untrusted owner")
         if opened.st_size > maximum_bytes:
             raise ValueError("Compose input exceeds its bounded size limit")
         digest = hashlib.sha256()
@@ -935,6 +896,7 @@ def require_effective_compose_model(
 
     available_profiles: set[str] = set()
     service_replicas: dict[str, int] = {}
+    service_images: dict[str, str] = {}
     replica_budget = 0
     for service_name, raw_service in services_value.items():
         if not isinstance(raw_service, Mapping):
@@ -955,6 +917,21 @@ def require_effective_compose_model(
             if not isinstance(profile, str) or not profile:
                 raise ValueError("effective Compose service profile is invalid")
             available_profiles.add(profile)
+
+        image = raw_service.get("image")
+        if image is not None:
+            if (
+                not isinstance(image, str)
+                or not image
+                or image != image.strip()
+                or any(character.isspace() for character in image)
+                or "\x00" in image
+                or len(image.encode("utf-8")) > 512
+            ):
+                raise ValueError(
+                    "effective Compose service image reference is invalid"
+                )
+            service_images[service_name] = image
 
         dependencies = raw_service.get("depends_on", {})
         if isinstance(dependencies, Sequence) and not isinstance(
@@ -1098,5 +1075,6 @@ def require_effective_compose_model(
         profiles=tuple(sorted(available_profiles)),
         host_access_risks=ordered_risks,
         service_replicas=tuple(sorted(service_replicas.items())),
+        service_images=tuple(sorted(service_images.items())),
         replica_budget=replica_budget,
     )

@@ -1,11 +1,13 @@
-"""Authenticated Unix-socket broker for host-global coordinator mutations.
+"""Typed Unix-socket broker for host-global coordinator operations.
 
 The broker is deliberately a narrow capability boundary.  Clients identify an
 account, repository, resource, and one operation from :class:`BrokerOperation`.
 They cannot submit commands, paths, SQL, or a writable database handle.  The
-trusted broker process authenticates the operating-system peer, applies an
-explicit per-UID ACL, and sends the resulting typed request through one
-serialized mutation writer.
+broker records operating-system peer credentials when available, resolves the
+exact account/project/resource/operation against the host's combined local
+policy, and sends the resulting typed request through one serialized mutation
+writer. Unix accounts identify activity by one developer; they are not
+security tenants.
 
 The mutation backend is responsible for revalidating the current repository /
 resource binding and durably deduplicating ``operation_id`` in the coordinator
@@ -17,6 +19,7 @@ in particular, an untrusted client can never acquire a SQLite connection.
 from __future__ import annotations
 
 import ctypes
+import errno
 import hashlib
 import json
 import logging
@@ -38,12 +41,15 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Callable, FrozenSet, Iterable, Mapping, Optional, Protocol
 
+from .call_journal import RollingCallJournal, call_record, event_record
+from .compose_run_once import MAX_COMPOSE_RUN_ONCE_TIMEOUT_SECONDS
 from .maintenance import (
     MAINTENANCE_ROOT,
     MaintenanceMarkerError,
     PUBLIC_MAINTENANCE_MESSAGE,
     load_maintenance_state,
 )
+from .universal_test_admission import TestSubmissionAdmissionGate
 
 PROTOCOL_VERSION = 1
 # Inventory is a bounded whole-host graph.  Keep the local protocol bounded,
@@ -52,7 +58,8 @@ PROTOCOL_VERSION = 1
 DEFAULT_MAX_MESSAGE_BYTES = 32 * 1024 * 1024
 DEFAULT_REQUEST_TIMEOUT_SECONDS = 10.0
 DEFAULT_SOCKET_MODE = 0o660
-SYSTEM_BROKER_SOCKET_PATH = Path("/run/devcoordinator/broker.sock")
+SYSTEM_BROKER_SOCKET_PATH = Path("/run/devcoordinator-authority.sock")
+UNMAPPED_LOCAL_IDENTITY = 65534
 DEFAULT_MAX_CLIENTS = 32
 DEFAULT_COMPLETED_OPERATION_CACHE = 1024
 # POSIX guarantees an atomic pipe write of at least 512 bytes.  Keeping this
@@ -89,6 +96,8 @@ _NON_TERMINAL_OPERATION_ERRORS = frozenset(
         "operation_in_progress",
         "operation_outcome_uncertain",
         "service_shutting_down",
+        "test_admission_drained",
+        "test_attempt_runtime_unavailable",
         "worker_operation_uncertain",
     }
 )
@@ -97,23 +106,55 @@ _IDENTIFIER_CHARS = frozenset(
     "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.:@-"
 )
 _SHA256_FINGERPRINT = re.compile(r"[0-9a-f]{64}")
+_COMPOSE_SERVICE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
 _LOGGER = logging.getLogger(__name__)
 
 
 class BrokerOperation(str, Enum):
     """The complete typed operation set accepted from broker clients."""
 
+    CAPABILITIES_READ = "capabilities.read"
     PORT_LEASE = "port.lease"
     PORT_RELEASE = "port.release"
     PORT_ASSIGN = "port.assign"
     PORT_UNASSIGN = "port.unassign"
+    OPERATION_FOLLOW = "operation.follow"
     INVENTORY_READ = "inventory.read"
     EVENTS_READ = "events.read"
     HOST_OBSERVE = "host.observe"
     TEST_RUN_START = "test.run_start"
     TEST_RUN_FINISH = "test.run_finish"
     TEST_STATS_READ = "test.stats_read"
+    TEST_HEALTH = "test.health"
+    TEST_FLEET_STATS_READ = "test.fleet_stats_read"
+    TEST_PLAN_PREVIEW = "test.plan_preview"
+    TEST_PLAN_REGISTER = "test.plan_register"
+    TEST_RUN_SUBMIT = "test.run_submit"
+    TEST_RUN_LIST = "test.run_list"
+    TEST_RUN_STATUS = "test.run_status"
+    TEST_RUN_SUMMARY = "test.run_summary"
+    TEST_RUN_FAILURES = "test.run_failures"
+    TEST_RUN_ARTIFACTS = "test.run_artifacts"
+    TEST_ARTIFACT_RESOLVE = "test.artifact_resolve"
+    TEST_RUN_CASES = "test.run_cases"
+    TEST_RUN_CANCEL = "test.run_cancel"
+    TEST_RUN_RETRY = "test.run_retry"
+    TEST_EVENTS_READ = "test.events_read"
+    TEST_REPOSITORY_SETUP = "test.repository_setup"
+    TEST_REPOSITORY_CATALOG = "test.repository_catalog"
+    TEST_EVIDENCE_CHECK = "test.evidence_check"
+    TEST_EVIDENCE_CONSUME = "test.evidence_consume"
+    TEST_ADMISSION_DRAIN_BEGIN = "test.admission_drain_begin"
+    TEST_ADMISSION_DRAIN_STATUS = "test.admission_drain_status"
+    TEST_ADMISSION_DRAIN_CLEAR = "test.admission_drain_clear"
+    TEST_ATTEMPT_TICKET = "test.attempt_ticket"
+    TEST_ATTEMPT_LAUNCH = "test.attempt_launch"
+    TEST_ATTEMPT_STATUS = "test.attempt_status"
+    TEST_ATTEMPT_CANCEL = "test.attempt_cancel"
+    RUNTIME_ENSURE = "runtime.ensure"
     RUNTIME_REQUEST = "runtime.request"
+    REPOSITORY_ENSURE = "repository.ensure"
+    REPOSITORY_RESOLVE = "repository.resolve"
     WORKER_LAUNCH_TICKET = "worker.launch_ticket"
     WORKER_LAUNCHED = "worker.launched"
     WORKER_EXIT = "worker.exit"
@@ -136,6 +177,7 @@ class BrokerOperation(str, Enum):
     COMPOSE_STOP = "compose.stop"
     COMPOSE_RESTART = "compose.restart"
     COMPOSE_DOWN = "compose.down"
+    COMPOSE_RUN_ONCE = "compose.run_once"
     REPOSITORY_PLAN_REMOVE = "repository.plan_remove"
     REPOSITORY_LIST_REMOVED = "repository.list_removed"
     REPOSITORY_REMOVE = "repository.remove"
@@ -150,6 +192,24 @@ class BrokerOperation(str, Enum):
     CLEANUP_PLAN = "cleanup.plan"
     CLEANUP_APPLY = "cleanup.apply"
     LIFECYCLE_RESTORE = "lifecycle.restore"
+
+
+_WORKER_RUNNER_CALLBACK_OPERATIONS = frozenset(
+    {
+        BrokerOperation.WORKER_LAUNCH_TICKET,
+        BrokerOperation.WORKER_LAUNCHED,
+        BrokerOperation.WORKER_EXIT,
+    }
+)
+
+TESTD_INTERNAL_OPERATIONS = frozenset(
+    {
+        BrokerOperation.TEST_ATTEMPT_TICKET,
+        BrokerOperation.TEST_ATTEMPT_LAUNCH,
+        BrokerOperation.TEST_ATTEMPT_STATUS,
+        BrokerOperation.TEST_ATTEMPT_CANCEL,
+    }
+)
 
 
 class BrokerError(RuntimeError):
@@ -353,10 +413,22 @@ class BrokerRequest:
 
 @dataclass(frozen=True)
 class AuthorizedBrokerRequest:
-    """A typed request whose peer and ACL have already been verified."""
+    """A typed request with separate caller attribution and policy identity."""
 
     peer: PeerCredentials
     request: BrokerRequest
+    policy_uid: int | None = None
+
+    @property
+    def authorization_uid(self) -> int:
+        """Return the configured local policy UID selected for this request.
+
+        ``peer`` always remains the actual/best-effort caller attribution. The
+        optional policy identity prevents later authority queries from
+        accidentally treating that attribution UID as a tenancy boundary.
+        """
+
+        return self.peer.uid if self.policy_uid is None else self.policy_uid
 
 
 @dataclass(frozen=True)
@@ -420,7 +492,7 @@ class EphemeralSecretFdDelivery(Protocol):
 
 
 class EphemeralSecretFdRetriever(Protocol):
-    """Broker-local descriptor delivery after generic peer/ACL authorization.
+    """Broker-local descriptor delivery after exact typed authorization.
 
     The store-backed implementation re-proves the exact running run, consumes
     the manager's one-time request tombstone, and holds the run mutation lock
@@ -576,7 +648,14 @@ class Authorizer(Protocol):
 
 
 class StaticPeerAuthorizer:
-    """Kernel-UID authorizer backed by immutable explicit ACLs."""
+    """Single-developer authorizer backed by immutable explicit ACLs.
+
+    Unix peer credentials are retained on the authorized request for
+    attribution and diagnostics.  They are not a tenancy boundary: every
+    configured policy contributes to one host-local developer's effective
+    permissions, while account/project/resource/operation matching remains
+    exact.
+    """
 
     def __init__(self, policies: Mapping[int, AccountAccessPolicy]) -> None:
         frozen: dict[int, AccountAccessPolicy] = {}
@@ -593,44 +672,55 @@ class StaticPeerAuthorizer:
     def authorize(
         self, peer: PeerCredentials, request: BrokerRequest
     ) -> AuthorizedBrokerRequest:
-        policy = self._policies.get(peer.uid)
-        if policy is None:
-            raise BrokerError(
-                "peer_not_authorized",
-                "This operating-system account is not authorized to use the broker.",
-                operation_id=request.operation_id,
-            )
-        if request.account_id != policy.account_id:
+        account_policies = tuple(
+            (uid, policy)
+            for uid, policy in self._policies.items()
+            if policy.account_id == request.account_id
+        )
+        if not account_policies:
             raise BrokerError(
                 "cross_account_access_denied",
-                "The authenticated account cannot act for the requested account.",
+                "No configured local policy grants the requested account.",
                 operation_id=request.operation_id,
             )
-        resources = policy.grants.get(request.project_id)
-        if resources is None:
+        project_policies = tuple(
+            (uid, policy)
+            for uid, policy in account_policies
+            if request.project_id in policy.grants
+        )
+        if not project_policies:
             raise BrokerError(
                 "project_access_denied",
-                "The authenticated account is not authorized for this project.",
+                "No configured local policy grants the requested project.",
                 operation_id=request.operation_id,
             )
-        operations = resources.get(request.resource_id)
-        if operations is None:
+        resource_policies = tuple(
+            (uid, policy)
+            for uid, policy in project_policies
+            if request.resource_id in policy.grants[request.project_id]
+        )
+        if not resource_policies:
             raise BrokerError(
                 "resource_access_denied",
-                "The authenticated account is not authorized for this resource.",
+                "No configured local policy grants the requested resource.",
                 operation_id=request.operation_id,
             )
-        if request.operation not in operations:
+        operation_policies = tuple(
+            (uid, policy)
+            for uid, policy in resource_policies
+            if request.operation
+            in policy.grants[request.project_id][request.resource_id]
+        )
+        if not operation_policies:
             raise BrokerError(
                 "operation_access_denied",
-                "The authenticated account is not authorized for this resource operation.",
+                "No configured local policy grants this resource operation.",
                 operation_id=request.operation_id,
             )
         if request.operation in {
             BrokerOperation.PORT_LEASE,
             BrokerOperation.PORT_ASSIGN,
         }:
-            policies = policy.port_policies[request.project_id][request.resource_id]
             if request.operation == BrokerOperation.PORT_ASSIGN:
                 port = request.arguments["port"]
                 protocol = "tcp"
@@ -639,20 +729,34 @@ class StaticPeerAuthorizer:
                 port = request.arguments.get("requested_port")
                 protocol = str(request.arguments.get("protocol", "tcp"))
                 ttl_seconds = int(request.arguments.get("ttl_seconds", 600))
-            if not any(
-                item.permits(
-                    port=port,
-                    protocol=protocol,
-                    ttl_seconds=ttl_seconds,
+            permitted = tuple(
+                uid
+                for uid, policy in operation_policies
+                if any(
+                    item.permits(
+                        port=port,
+                        protocol=protocol,
+                        ttl_seconds=ttl_seconds,
+                    )
+                    for item in policy.port_policies[request.project_id][
+                        request.resource_id
+                    ]
                 )
-                for item in policies
-            ):
+            )
+            if not permitted:
                 raise BrokerError(
                     "port_policy_denied",
                     "The requested port, protocol, or lease duration is outside the account policy.",
                     operation_id=request.operation_id,
                 )
-        return AuthorizedBrokerRequest(peer=peer, request=request)
+            policy_uid = permitted[0]
+        else:
+            policy_uid = operation_policies[0][0]
+        return AuthorizedBrokerRequest(
+            peer=peer,
+            request=request,
+            policy_uid=policy_uid,
+        )
 
 
 class MutationBackend(Protocol):
@@ -726,6 +830,8 @@ class SerializedMutationWriter:
         completed_cache_size: int = DEFAULT_COMPLETED_OPERATION_CACHE,
         max_result_bytes: int = DEFAULT_MAX_MESSAGE_BYTES // 2,
         max_concurrent_host_observations: int = 4,
+        test_submission_gate: TestSubmissionAdmissionGate | None = None,
+        test_admission_drain_timeout_seconds: float = 30.0,
     ) -> None:
         if not _is_exact_int(completed_cache_size) or completed_cache_size <= 0:
             raise ValueError("completed_cache_size must be positive")
@@ -738,6 +844,8 @@ class SerializedMutationWriter:
             raise ValueError(
                 "max_concurrent_host_observations must be a non-negative integer"
             )
+        if test_admission_drain_timeout_seconds < 0:
+            raise ValueError("test admission drain timeout must be non-negative")
         self._backend = backend
         self._completed_cache_size = completed_cache_size
         self._max_result_bytes = max_result_bytes
@@ -752,6 +860,12 @@ class SerializedMutationWriter:
         self._inflight_mutation_count = 0
         self._admitted_mutation_count = 0
         self._accepting_mutations = True
+        self._test_submission_gate = (
+            test_submission_gate or TestSubmissionAdmissionGate()
+        )
+        self._test_admission_drain_timeout_seconds = float(
+            test_admission_drain_timeout_seconds
+        )
         self._host_observation_slots = (
             threading.BoundedSemaphore(max_concurrent_host_observations)
             if max_concurrent_host_observations > 0
@@ -824,16 +938,34 @@ class SerializedMutationWriter:
 
     def execute(self, request: AuthorizedBrokerRequest) -> dict[str, Any]:
         read_only = request.request.operation in {
+            BrokerOperation.CAPABILITIES_READ,
+            BrokerOperation.REPOSITORY_RESOLVE,
+            BrokerOperation.OPERATION_FOLLOW,
             BrokerOperation.INVENTORY_READ,
             BrokerOperation.EVENTS_READ,
             BrokerOperation.TEST_STATS_READ,
+            BrokerOperation.TEST_HEALTH,
+            BrokerOperation.TEST_FLEET_STATS_READ,
+            BrokerOperation.TEST_RUN_LIST,
+            BrokerOperation.TEST_RUN_STATUS,
+            BrokerOperation.TEST_RUN_SUMMARY,
+            BrokerOperation.TEST_RUN_FAILURES,
+            BrokerOperation.TEST_RUN_ARTIFACTS,
+            BrokerOperation.TEST_ARTIFACT_RESOLVE,
+            BrokerOperation.TEST_RUN_CASES,
+            BrokerOperation.TEST_EVENTS_READ,
+            BrokerOperation.TEST_REPOSITORY_SETUP,
+            BrokerOperation.TEST_REPOSITORY_CATALOG,
+            BrokerOperation.TEST_EVIDENCE_CHECK,
+            BrokerOperation.TEST_ADMISSION_DRAIN_STATUS,
+            BrokerOperation.TEST_ATTEMPT_STATUS,
             BrokerOperation.EPHEMERAL_STATUS,
             BrokerOperation.EPHEMERAL_IMAGE_STATUS,
             BrokerOperation.WORKER_POLICY_READ,
             BrokerOperation.WORKER_ATTEMPT_READ,
         } or (
             request.request.operation is BrokerOperation.RUNTIME_REQUEST
-            and request.request.arguments.get("action") == "status"
+            and request.request.arguments.get("action") in {"status", "capture_logs"}
         )
         if read_only:
             # A query-only snapshot does not need the mutation lock, durable
@@ -843,35 +975,64 @@ class SerializedMutationWriter:
                 self._backend.execute(request), max_bytes=self._max_result_bytes
             )
         operation_id = request.request.operation_id
-        with self._metrics_condition:
-            if not self._accepting_mutations:
+        operation = request.request.operation
+        admitted_test_submission = False
+        if operation is BrokerOperation.TEST_RUN_SUBMIT:
+            admitted_test_submission = self._test_submission_gate.admit_submission()
+            if not admitted_test_submission:
                 raise BrokerError(
-                    "service_shutting_down",
-                    "The broker is shutting down; retry with its replacement.",
+                    "test_admission_drained",
+                    "New test submissions are temporarily paused for a verified history cutover; retry shortly.",
                     operation_id=operation_id,
                 )
-            self._inflight_mutation_count += 1
-            self._metrics_condition.notify_all()
         try:
-            if request.request.operation == BrokerOperation.HOST_OBSERVE:
-                slots = self._host_observation_slots
-                if slots is None or not slots.acquire(blocking=False):
+            if operation is BrokerOperation.TEST_ADMISSION_DRAIN_BEGIN:
+                try:
+                    self._test_submission_gate.begin_drain(
+                        timeout_seconds=self._test_admission_drain_timeout_seconds
+                    )
+                except TimeoutError as error:
                     raise BrokerError(
-                        "host_observation_busy",
-                        "The broker already has the maximum number of host observation callers; retry later.",
+                        "test_admission_drain_timeout",
+                        "Existing test submissions did not drain before the migration deadline.",
+                        operation_id=operation_id,
+                    ) from error
+            with self._metrics_condition:
+                if not self._accepting_mutations:
+                    raise BrokerError(
+                        "service_shutting_down",
+                        "The broker is shutting down; retry with its replacement.",
                         operation_id=operation_id,
                     )
-                try:
-                    return self._execute_mutation(request)
-                finally:
-                    slots.release()
-            return self._execute_mutation(request)
-        finally:
-            with self._metrics_condition:
-                self._inflight_mutation_count -= 1
-                if self._inflight_mutation_count < 0:
-                    raise RuntimeError("broker mutation in-flight count underflow")
+                self._inflight_mutation_count += 1
                 self._metrics_condition.notify_all()
+            try:
+                if operation == BrokerOperation.HOST_OBSERVE:
+                    slots = self._host_observation_slots
+                    if slots is None or not slots.acquire(blocking=False):
+                        raise BrokerError(
+                            "host_observation_busy",
+                            "The broker already has the maximum number of host observation callers; retry later.",
+                            operation_id=operation_id,
+                        )
+                    try:
+                        result = self._execute_mutation(request)
+                    finally:
+                        slots.release()
+                else:
+                    result = self._execute_mutation(request)
+                if operation is BrokerOperation.TEST_ADMISSION_DRAIN_CLEAR:
+                    self._test_submission_gate.resume()
+                return result
+            finally:
+                with self._metrics_condition:
+                    self._inflight_mutation_count -= 1
+                    if self._inflight_mutation_count < 0:
+                        raise RuntimeError("broker mutation in-flight count underflow")
+                    self._metrics_condition.notify_all()
+        finally:
+            if admitted_test_submission:
+                self._test_submission_gate.finish_submission()
 
     def _execute_mutation(
         self, request: AuthorizedBrokerRequest
@@ -889,8 +1050,17 @@ class SerializedMutationWriter:
             )
         )
         lock_keys = ["operation:" + operation_id]
-        if request.request.operation != BrokerOperation.HOST_OBSERVE:
+        if (
+            request.request.operation != BrokerOperation.HOST_OBSERVE
+            and request.request.operation not in _WORKER_RUNNER_CALLBACK_OPERATIONS
+        ):
             lock_keys.append("resource:" + resource_key)
+        # A runtime lifecycle request starts/stops a fixed runner while holding
+        # the exact resource lock. Its launch and exit callbacks must re-enter
+        # the broker for state-machine transitions; taking that same generic
+        # lock would deadlock the lifecycle request. Callback operations retain
+        # their operation-id lock, authenticated identity checks, and worker
+        # generation/CAS fencing in BrokerWorkerOperations.
         # Host observation is a repeat-safe state measurement. Distinct
         # requests must reach the database-backed host-domain SingleFlight
         # boundary together so they can join one durable snapshot. Keep the
@@ -992,12 +1162,30 @@ class BrokerService:
         writer: SerializedMutationWriter,
         *,
         secret_fd_retriever: Optional[EphemeralSecretFdRetriever] = None,
+        call_journal: RollingCallJournal | None = None,
     ) -> None:
         self._authorizer = authorizer
         self._writer = writer
         self._secret_fd_retriever = secret_fd_retriever
+        self._call_journal = call_journal
 
     def reply_for_document(
+        self, peer: PeerCredentials, document: Any
+    ) -> dict[str, Any]:
+        call_id = str(uuid.uuid4())
+        started_at = time.monotonic()
+        self._record_received(peer, document, call_id=call_id)
+        reply = self._reply_for_document_unlogged(peer, document)
+        self._record_reply(
+            peer,
+            document,
+            reply,
+            call_id=call_id,
+            started_at=started_at,
+        )
+        return reply
+
+    def _reply_for_document_unlogged(
         self, peer: PeerCredentials, document: Any
     ) -> dict[str, Any]:
         operation_id = _valid_operation_id_or_none(document)
@@ -1023,20 +1211,54 @@ class BrokerService:
                 exc.message,
                 operation_id=exc.operation_id or operation_id,
             )
+        except Exception:
+            _LOGGER.exception(
+                "broker request failed unexpectedly operation_id=%s", operation_id
+            )
+            return _error_reply(
+                "internal_error",
+                "The Coordinator could not complete the request; retry shortly.",
+                operation_id=operation_id,
+            )
 
     def reply_for_payload(
         self, peer: PeerCredentials, payload: bytes
     ) -> bytes:
+        call_id = str(uuid.uuid4())
+        started_at = time.monotonic()
         try:
             document = _decode_json_document(payload)
         except BrokerError as exc:
-            return _encode_json_document(
-                _error_reply(exc.code, exc.message, operation_id=exc.operation_id)
+            reply = _error_reply(
+                exc.code, exc.message, operation_id=exc.operation_id
             )
-        return _encode_json_document(self.reply_for_document(peer, document))
+            self._record_received(peer, None, call_id=call_id)
+            self._record_reply(
+                peer,
+                None,
+                reply,
+                call_id=call_id,
+                started_at=started_at,
+            )
+            return _encode_json_document(reply)
+        self._record_received(peer, document, call_id=call_id)
+        reply = self._reply_for_document_unlogged(peer, document)
+        self._record_reply(
+            peer,
+            document,
+            reply,
+            call_id=call_id,
+            started_at=started_at,
+        )
+        return _encode_json_document(reply)
 
     def transport_response_for_payload(
-        self, peer: PeerCredentials, payload: bytes
+        self,
+        peer: PeerCredentials,
+        payload: bytes,
+        *,
+        call_id: str | None = None,
+        started_at: float | None = None,
     ) -> _BrokerTransportResponse:
         """Return a redacted reply and, only when authorized, one secret FD.
 
@@ -1046,24 +1268,48 @@ class BrokerService:
         transport that can carry a descriptor with ``SCM_RIGHTS``.
         """
 
+        effective_call_id = call_id or str(uuid.uuid4())
+        effective_started_at = (
+            time.monotonic() if started_at is None else float(started_at)
+        )
         try:
             document = _decode_json_document(payload)
         except BrokerError as exc:
-            return _BrokerTransportResponse(
-                _encode_json_document(
-                    _error_reply(exc.code, exc.message, operation_id=exc.operation_id)
-                )
+            reply = _error_reply(
+                exc.code, exc.message, operation_id=exc.operation_id
             )
+            self._record_received(peer, None, call_id=effective_call_id)
+            self._record_reply(
+                peer,
+                None,
+                reply,
+                call_id=effective_call_id,
+                started_at=effective_started_at,
+            )
+            return _BrokerTransportResponse(_encode_json_document(reply))
+
+        self._record_received(peer, document, call_id=effective_call_id)
+        if not (
+            isinstance(document, Mapping)
+            and document.get("operation") == BrokerOperation.EPHEMERAL_SECRET_FD.value
+        ):
+            reply = self._reply_for_document_unlogged(peer, document)
+            self._record_reply(
+                peer,
+                document,
+                reply,
+                call_id=effective_call_id,
+                started_at=effective_started_at,
+            )
+            return _BrokerTransportResponse(_encode_json_document(reply))
 
         operation_id = _valid_operation_id_or_none(document)
         secret_fd: Optional[int] = None
         secret_delivery: Optional[EphemeralSecretFdDelivery] = None
+        response: _BrokerTransportResponse
+        reply: dict[str, Any]
         try:
             request = BrokerRequest.from_wire(document)
-            if request.operation is not BrokerOperation.EPHEMERAL_SECRET_FD:
-                return _BrokerTransportResponse(
-                    _encode_json_document(self.reply_for_document(peer, document))
-                )
             # Consume-once material must not be requested until this process
             # has proved it can deliver a descriptor.  Otherwise a platform
             # without SCM_RIGHTS support could burn the only credential before
@@ -1112,42 +1358,168 @@ class BrokerService:
             )
             secret_fd = None
             secret_delivery = None
-            return response
         except BrokerError as exc:
-            return _BrokerTransportResponse(
-                _encode_json_document(
-                    _error_reply(
-                        exc.code,
-                        exc.message,
-                        operation_id=exc.operation_id or operation_id,
-                    )
-                )
+            reply = _error_reply(
+                exc.code,
+                exc.message,
+                operation_id=exc.operation_id or operation_id,
             )
+            response = _BrokerTransportResponse(_encode_json_document(reply))
         except (AttributeError, TypeError, ValueError):
             # Material validation deliberately does not interpolate an object
             # or exception: either could contain the secret in an unsafe repr.
-            return _BrokerTransportResponse(
-                _encode_json_document(
-                    _error_reply(
-                        "secret_delivery_invalid",
-                        "The broker could not safely prepare the ephemeral credential.",
-                        operation_id=operation_id,
-                    )
-                )
+            reply = _error_reply(
+                "secret_delivery_invalid",
+                "The broker could not safely prepare the ephemeral credential.",
+                operation_id=operation_id,
             )
+            response = _BrokerTransportResponse(_encode_json_document(reply))
         finally:
             if secret_fd is not None:
                 _close_descriptor_quietly(secret_fd)
             if secret_delivery is not None:
                 secret_delivery.close()
+        self._record_reply(
+            peer,
+            document,
+            reply,
+            call_id=effective_call_id,
+            started_at=effective_started_at,
+        )
+        return response
+
+    def record_transport_rejection(
+        self,
+        *,
+        peer: PeerCredentials | None,
+        call_id: str,
+        started_at: float,
+        code: str,
+        message: str,
+        include_received: bool = True,
+    ) -> None:
+        """Record a pre-dispatch rejection or post-dispatch delivery failure."""
+
+        journal = self._call_journal
+        if journal is None:
+            return
+        uid = None if peer is None else peer.uid
+        gid = None if peer is None else peer.gid
+        pid = None if peer is None else peer.pid
+        if include_received:
+            self._record(
+                event_record(
+                    boundary="authority.transport",
+                    phase="received",
+                    call_id=call_id,
+                    peer_uid=uid,
+                    peer_gid=gid,
+                    peer_pid=pid,
+                    outcome="received",
+                )
+            )
+        self._record(
+            event_record(
+                boundary="authority.transport",
+                phase="rejected",
+                call_id=call_id,
+                peer_uid=uid,
+                peer_gid=gid,
+                peer_pid=pid,
+                duration_seconds=max(0.0, time.monotonic() - started_at),
+                outcome=(
+                    "busy"
+                    if code == "server_busy"
+                    else "timeout"
+                    if code in {"request_timeout", "response_timeout"}
+                    else "unavailable"
+                    if code in {
+                        "transport_aborted",
+                        "response_transport_aborted",
+                    }
+                    else "rejected"
+                ),
+                code=code,
+                message=message,
+            )
+        )
+
+    def _record_received(
+        self,
+        peer: PeerCredentials,
+        document: object,
+        *,
+        call_id: str,
+    ) -> None:
+        request = document if isinstance(document, Mapping) else {}
+        arguments = (
+            request.get("arguments")
+            if isinstance(request.get("arguments"), Mapping)
+            else {}
+        )
+        self._record(
+            event_record(
+                boundary="authority",
+                phase="received",
+                call_id=call_id,
+                operation=request.get("operation"),
+                operation_id=request.get("operation_id"),
+                peer_uid=peer.uid,
+                peer_gid=peer.gid,
+                peer_pid=peer.pid,
+                outcome="received",
+                account_id=request.get("account_id"),
+                project_id=request.get("project_id"),
+                repository_generation=request.get("repository_generation"),
+                resource_id=request.get("resource_id"),
+                run_id=arguments.get("run_id"),
+                attempt_id=arguments.get("attempt_id"),
+            )
+        )
+
+    def _record_reply(
+        self,
+        peer: PeerCredentials,
+        document: object,
+        reply: object,
+        *,
+        call_id: str,
+        started_at: float,
+    ) -> None:
+        ok = isinstance(reply, Mapping) and reply.get("ok") is True
+        self._record(
+            call_record(
+                peer_uid=peer.uid,
+                peer_gid=peer.gid,
+                peer_pid=peer.pid,
+                document=document,
+                reply=reply,
+                duration_seconds=max(0.0, time.monotonic() - started_at),
+                call_id=call_id,
+                phase="completed" if ok else "rejected",
+                boundary="authority",
+            )
+        )
+
+    def _record(self, record: Mapping[str, object]) -> None:
+        journal = self._call_journal
+        if journal is None:
+            return
+        try:
+            journal.record(record)
+        except Exception:
+            # Recording is strictly observational.  An implementation defect
+            # in the journal must never change the authority call outcome.
+            _LOGGER.exception("Coordinator call journal rejected a bounded record")
 
 
 def resolve_peer_credentials(connection: socket.socket) -> PeerCredentials:
-    """Read kernel-authenticated credentials for an ``AF_UNIX`` peer.
+    """Read best-effort attribution credentials for an ``AF_UNIX`` peer.
 
     Linux uses ``SO_PEERCRED``.  macOS and BSD use ``getpeereid`` through a
-    native socket method when exposed, otherwise through libc.  Unsupported or
-    unreadable credentials fail closed.
+    native socket method when exposed, otherwise through libc.  Local transport
+    remains usable when an OS or test double cannot expose credentials; that
+    case receives the explicit unmapped attribution identity.
     """
 
     if connection.family != socket.AF_UNIX:
@@ -1159,9 +1531,10 @@ def resolve_peer_credentials(connection: socket.socket) -> PeerCredentials:
     if sys.platform.startswith("linux"):
         option = getattr(socket, "SO_PEERCRED", None)
         if option is None:
-            raise BrokerError(
-                "peer_credentials_unavailable",
-                "Kernel peer credentials are unavailable on this host.",
+            return PeerCredentials(
+                uid=UNMAPPED_LOCAL_IDENTITY,
+                gid=UNMAPPED_LOCAL_IDENTITY,
+                pid=None,
             )
         size = struct.calcsize("3i")
         try:
@@ -1169,10 +1542,11 @@ def resolve_peer_credentials(connection: socket.socket) -> PeerCredentials:
             pid, uid, gid = struct.unpack("3i", raw[:size])
             return PeerCredentials(uid=uid, gid=gid, pid=pid)
         except (OSError, struct.error, ValueError):
-            raise BrokerError(
-                "peer_credentials_unavailable",
-                "Kernel peer credentials could not be verified.",
-            ) from None
+            return PeerCredentials(
+                uid=UNMAPPED_LOCAL_IDENTITY,
+                gid=UNMAPPED_LOCAL_IDENTITY,
+                pid=None,
+            )
 
     native_getpeereid = getattr(connection, "getpeereid", None)
     if callable(native_getpeereid):
@@ -1180,10 +1554,11 @@ def resolve_peer_credentials(connection: socket.socket) -> PeerCredentials:
             uid, gid = native_getpeereid()
             return PeerCredentials(uid=int(uid), gid=int(gid), pid=None)
         except (OSError, TypeError, ValueError):
-            raise BrokerError(
-                "peer_credentials_unavailable",
-                "Kernel peer credentials could not be verified.",
-            ) from None
+            return PeerCredentials(
+                uid=UNMAPPED_LOCAL_IDENTITY,
+                gid=UNMAPPED_LOCAL_IDENTITY,
+                pid=None,
+            )
 
     if sys.platform == "darwin" or "bsd" in sys.platform:
         try:
@@ -1208,14 +1583,16 @@ def resolve_peer_credentials(connection: socket.socket) -> PeerCredentials:
                 uid=int(uid_value.value), gid=int(gid_value.value), pid=None
             )
         except (AttributeError, OSError, TypeError, ValueError):
-            raise BrokerError(
-                "peer_credentials_unavailable",
-                "Kernel peer credentials could not be verified.",
-            ) from None
+            return PeerCredentials(
+                uid=UNMAPPED_LOCAL_IDENTITY,
+                gid=UNMAPPED_LOCAL_IDENTITY,
+                pid=None,
+            )
 
-    raise BrokerError(
-        "peer_credentials_unavailable",
-        "This platform does not provide a supported Unix peer-credential API.",
+    return PeerCredentials(
+        uid=UNMAPPED_LOCAL_IDENTITY,
+        gid=UNMAPPED_LOCAL_IDENTITY,
+        pid=None,
     )
 
 
@@ -1225,11 +1602,12 @@ def validate_runtime_directory(
     expected_uid: Optional[int] = None,
     expected_gid: Optional[int] = None,
 ) -> os.stat_result:
-    """Validate a coordinator-owned, non-symlink Unix-socket directory.
+    """Validate the structural Unix-socket directory contract.
 
-    Group read/execute is allowed so a deliberately provisioned broker access
-    group can reach the socket.  Group write and all access by ``other`` are
-    rejected; cross-UID authorization remains a kernel-credential ACL decision.
+    A managed host is one trusted developer boundary.  Unix ownership, groups,
+    and mode bits only determine whether the kernel lets a local account reach
+    the transport; they are not Coordinator authorization evidence.  Peer UID
+    remains available from ``SO_PEERCRED`` for attribution.
     """
 
     path = Path(runtime_directory)
@@ -1243,18 +1621,8 @@ def validate_runtime_directory(
             "unsafe_runtime_directory",
             "Broker runtime directory must not contain parent traversal.",
         )
-    owner_uid = os.geteuid() if expected_uid is None else expected_uid
-    if not _is_exact_int(owner_uid) or owner_uid < 0:
-        raise BrokerError(
-            "unsafe_runtime_directory", "Broker runtime owner UID is invalid."
-        )
-    if expected_gid is not None and (
-        not _is_exact_int(expected_gid) or expected_gid < 0
-    ):
-        raise BrokerError(
-            "unsafe_runtime_directory", "Broker runtime access GID is invalid."
-        )
-    _validate_trusted_path_components(path, expected_uid=owner_uid)
+    del expected_uid, expected_gid
+    _validate_trusted_path_components(path, expected_uid=0)
     try:
         info = os.lstat(str(path))
     except OSError:
@@ -1266,28 +1634,6 @@ def validate_runtime_directory(
         raise BrokerError(
             "unsafe_runtime_directory",
             "Broker runtime path is not a directory.",
-        )
-    if info.st_uid != owner_uid:
-        raise BrokerError(
-            "unsafe_runtime_directory",
-            "Broker runtime directory is not owned by the coordinator service.",
-        )
-    if expected_gid is not None and info.st_gid != expected_gid:
-        raise BrokerError(
-            "unsafe_runtime_directory",
-            "Broker runtime directory does not use the configured access group.",
-        )
-    mode = stat.S_IMODE(info.st_mode)
-    if mode & stat.S_IWGRP or mode & stat.S_IRWXO:
-        raise BrokerError(
-            "unsafe_runtime_directory",
-            "Broker runtime directory must not be group-writable or accessible by other users.",
-        )
-    required_owner = stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR
-    if mode & required_owner != required_owner:
-        raise BrokerError(
-            "unsafe_runtime_directory",
-            "Broker runtime directory owner requires read, write, and execute access.",
         )
     return info
 
@@ -1319,12 +1665,12 @@ class UnixBrokerServer:
         if not _is_exact_int(self._expected_gid) or self._expected_gid < 0:
             raise ValueError("expected_gid must be a non-negative integer")
         self._peer_resolver = peer_resolver
-        if not _is_exact_int(socket_mode) or socket_mode < 0:
+        if (
+            not _is_exact_int(socket_mode)
+            or socket_mode < 0
+            or socket_mode > 0o7777
+        ):
             raise ValueError("socket_mode must be a permission mode")
-        if socket_mode & 0o117 or socket_mode & 0o7000:
-            raise ValueError("socket_mode may grant only owner/group read-write")
-        if socket_mode & 0o600 != 0o600:
-            raise ValueError("socket_mode must grant owner read-write")
         if not _is_exact_int(max_message_bytes) or max_message_bytes <= 0:
             raise ValueError("max_message_bytes must be positive")
         if request_timeout_seconds <= 0:
@@ -1340,13 +1686,14 @@ class UnixBrokerServer:
         self._client_slots = threading.BoundedSemaphore(max_clients)
         self._listener: Optional[socket.socket] = None
         self._socket_identity: Optional[tuple[int, int]] = None
+        self._owns_socket_path = False
         self._stop = threading.Event()
         self._accept_thread: Optional[threading.Thread] = None
         self._clients_lock = threading.Lock()
         self._client_threads: set[threading.Thread] = set()
         self._client_connections: set[socket.socket] = set()
 
-    def start(self) -> None:
+    def start(self, *, listener: Optional[socket.socket] = None) -> None:
         if self._listener is not None:
             raise RuntimeError("broker server is already started")
         _validate_socket_path(self.socket_path)
@@ -1355,45 +1702,64 @@ class UnixBrokerServer:
             expected_uid=self._expected_uid,
             expected_gid=self._expected_gid,
         )
-        if self._socket_mode & 0o060 and not (
-            stat.S_IMODE(runtime_info.st_mode) & stat.S_IXGRP
-        ):
-            raise BrokerError(
-                "unsafe_runtime_directory",
-                "Broker runtime directory must grant traversal to its configured access group.",
-            )
-        try:
-            os.lstat(str(self.socket_path))
-        except FileNotFoundError:
-            pass
-        except OSError:
-            raise BrokerError(
-                "unsafe_socket_path", "Broker socket path could not be inspected."
-            ) from None
-        else:
-            raise BrokerError(
-                "socket_path_exists",
-                "Broker socket path already exists; direct server startup never "
-                "replaces it.",
-            )
+        inherited = listener is not None
+        if not inherited:
+            try:
+                os.lstat(str(self.socket_path))
+            except FileNotFoundError:
+                pass
+            except OSError:
+                raise BrokerError(
+                    "unsafe_socket_path", "Broker socket path could not be inspected."
+                ) from None
+            else:
+                raise BrokerError(
+                    "socket_path_exists",
+                    "Broker socket path already exists; direct server startup never "
+                    "replaces it.",
+                )
+            listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 
-        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        assert listener is not None
         listener.set_inheritable(False)
         try:
-            listener.bind(str(self.socket_path))
+            if inherited:
+                if listener.family != socket.AF_UNIX:
+                    raise BrokerError(
+                        "invalid_inherited_socket",
+                        "Inherited broker listener is not AF_UNIX.",
+                    )
+                if listener.getsockopt(socket.SOL_SOCKET, socket.SO_TYPE) != socket.SOCK_STREAM:
+                    raise BrokerError(
+                        "invalid_inherited_socket",
+                        "Inherited broker listener is not a stream socket.",
+                    )
+                if listener.getsockopt(socket.SOL_SOCKET, socket.SO_ACCEPTCONN) != 1:
+                    raise BrokerError(
+                        "invalid_inherited_socket",
+                        "Inherited broker stream socket is not listening.",
+                    )
+                if listener.getsockname() != str(self.socket_path):
+                    raise BrokerError(
+                        "invalid_inherited_socket",
+                        "Inherited broker listener path does not match the configured authority socket.",
+                    )
+            else:
+                listener.bind(str(self.socket_path))
+
             created = os.lstat(str(self.socket_path))
-            if not stat.S_ISSOCK(created.st_mode) or created.st_uid != self._expected_uid:
+            if not stat.S_ISSOCK(created.st_mode):
                 raise BrokerError(
                     "unsafe_socket_path",
-                    "Created broker socket failed ownership validation.",
+                    "Broker socket path is not a Unix socket.",
                 )
-            # Record the exact inode as soon as bind succeeds so every later
-            # startup failure can remove only the socket this process created.
+            # Direct startup owns the pathname it created.  A systemd-owned
+            # pathname remains present across daemon replacement and must
+            # never be unlinked by this process.
             self._socket_identity = (created.st_dev, created.st_ino)
-            os.chown(
-                str(self.socket_path), self._expected_uid, self._expected_gid
-            )
-            os.chmod(str(self.socket_path), self._socket_mode)
+            self._owns_socket_path = not inherited
+            if not inherited:
+                os.chmod(str(self.socket_path), self._socket_mode)
             runtime_after = validate_runtime_directory(
                 self.socket_path.parent,
                 expected_uid=self._expected_uid,
@@ -1402,27 +1768,22 @@ class UnixBrokerServer:
             info = os.lstat(str(self.socket_path))
             if (
                 not stat.S_ISSOCK(info.st_mode)
-                or info.st_uid != self._expected_uid
-                or info.st_gid != self._expected_gid
                 or (info.st_dev, info.st_ino) != self._socket_identity
                 or (runtime_after.st_dev, runtime_after.st_ino)
                 != (runtime_info.st_dev, runtime_info.st_ino)
             ):
                 raise BrokerError(
                     "unsafe_socket_path",
-                    "Created broker socket failed ownership validation.",
+                    "Broker socket identity changed during startup.",
                 )
-            if stat.S_IMODE(info.st_mode) != self._socket_mode:
-                raise BrokerError(
-                    "unsafe_socket_path",
-                    "Created broker socket failed permission validation.",
-                )
-            listener.listen()
+            if not inherited:
+                listener.listen()
             listener.settimeout(0.2)
         except Exception:
             listener.close()
             self._remove_created_socket_if_owned()
             self._socket_identity = None
+            self._owns_socket_path = False
             raise
 
         self._listener = listener
@@ -1485,6 +1846,7 @@ class UnixBrokerServer:
             )
         self._remove_created_socket_if_owned()
         self._socket_identity = None
+        self._owns_socket_path = False
         if drain_error is not None:
             raise drain_error
 
@@ -1516,6 +1878,15 @@ class UnixBrokerServer:
             if not self._client_slots.acquire(blocking=False):
                 # Never let a saturated client that refuses to read block the
                 # accept loop for the normal request timeout.
+                call_id = str(uuid.uuid4())
+                started_at = time.monotonic()
+                self._service.record_transport_rejection(
+                    peer=None,
+                    call_id=call_id,
+                    started_at=started_at,
+                    code="server_busy",
+                    message="Broker has reached its bounded client capacity; retry later.",
+                )
                 connection.settimeout(min(self._request_timeout_seconds, 0.1))
                 _safe_send_reply(
                     connection,
@@ -1559,9 +1930,20 @@ class UnixBrokerServer:
 
     def _handle_connection(self, connection: socket.socket) -> None:
         connection.settimeout(self._request_timeout_seconds)
+        call_id = str(uuid.uuid4())
+        started_at = time.monotonic()
+        peer: PeerCredentials | None = None
+        dispatched = False
         try:
             peer = self._peer_resolver(connection)
         except BrokerError as exc:
+            self._service.record_transport_rejection(
+                peer=None,
+                call_id=call_id,
+                started_at=started_at,
+                code=exc.code,
+                message=exc.message,
+            )
             _safe_send_reply(
                 connection,
                 _error_reply(exc.code, exc.message, operation_id=None),
@@ -1572,7 +1954,13 @@ class UnixBrokerServer:
             payload = _receive_frame_rejecting_fds(
                 connection, max_message_bytes=self._max_message_bytes
             )
-            response = self._service.transport_response_for_payload(peer, payload)
+            dispatched = True
+            response = self._service.transport_response_for_payload(
+                peer,
+                payload,
+                call_id=call_id,
+                started_at=started_at,
+            )
             try:
                 if response.secret_fd is None:
                     _send_frame(
@@ -1593,15 +1981,55 @@ class UnixBrokerServer:
                 if response.secret_delivery is not None:
                     response.secret_delivery.close()
         except BrokerError as exc:
+            self._service.record_transport_rejection(
+                peer=peer,
+                call_id=call_id,
+                started_at=started_at,
+                code=exc.code,
+                message=exc.message,
+                include_received=not dispatched,
+            )
             _safe_send_reply(
                 connection,
                 _error_reply(exc.code, exc.message, operation_id=exc.operation_id),
                 max_message_bytes=self._max_message_bytes,
             )
-        except (OSError, socket.timeout):
+        except socket.timeout:
+            self._service.record_transport_rejection(
+                peer=peer,
+                call_id=call_id,
+                started_at=started_at,
+                code="response_timeout" if dispatched else "request_timeout",
+                message=(
+                    "Broker reply transport timed out after dispatch."
+                    if dispatched
+                    else "Broker request transport timed out before dispatch."
+                ),
+                include_received=not dispatched,
+            )
+            return
+        except OSError:
+            self._service.record_transport_rejection(
+                peer=peer,
+                call_id=call_id,
+                started_at=started_at,
+                code=(
+                    "response_transport_aborted"
+                    if dispatched
+                    else "transport_aborted"
+                ),
+                message=(
+                    "Broker reply transport closed after dispatch."
+                    if dispatched
+                    else "Broker request transport closed before dispatch."
+                ),
+                include_received=not dispatched,
+            )
             return
 
     def _remove_created_socket_if_owned(self) -> None:
+        if not self._owns_socket_path:
+            return
         identity = self._socket_identity
         if identity is None:
             return
@@ -1614,7 +2042,6 @@ class UnixBrokerServer:
             return
         if (
             (info.st_dev, info.st_ino) == identity
-            and info.st_uid == self._expected_uid
             and stat.S_ISSOCK(info.st_mode)
         ):
             try:
@@ -1624,35 +2051,33 @@ class UnixBrokerServer:
 
 
 class BrokerClient:
-    """One-request client that authenticates the service and reply identity."""
+    """One-request client using a stable local Unix-socket endpoint.
+
+    ``SO_PEERCRED`` is always captured for attribution.  On a single-developer
+    host the peer UID, socket owner/group, and permission bits are not an
+    authorization contract; successful connection plus stable Unix-socket
+    identity is sufficient.
+    """
 
     def __init__(
         self,
         socket_path: Path,
         *,
-        expected_broker_uid: int,
+        expected_broker_uid: int | None = None,
         expected_socket_gid: Optional[int] = None,
-        expected_socket_mode: int = DEFAULT_SOCKET_MODE,
+        expected_socket_mode: int | None = None,
         timeout_seconds: float = DEFAULT_REQUEST_TIMEOUT_SECONDS,
         max_message_bytes: int = DEFAULT_MAX_MESSAGE_BYTES,
         maintenance_root: Optional[Path] = None,
     ) -> None:
         self.socket_path = Path(socket_path)
-        if not _is_exact_int(expected_broker_uid) or expected_broker_uid < 0:
-            raise ValueError("expected_broker_uid must be a non-negative integer")
-        if expected_socket_gid is not None and (
-            not _is_exact_int(expected_socket_gid) or expected_socket_gid < 0
-        ):
-            raise ValueError("expected_socket_gid must be a non-negative integer")
-        if (
-            not _is_exact_int(expected_socket_mode)
-            or expected_socket_mode < 0
-            or expected_socket_mode > 0o7777
-        ):
-            raise ValueError("expected_socket_mode must be a permission mode")
-        self._expected_broker_uid = expected_broker_uid
-        self._expected_socket_gid = expected_socket_gid
-        self._expected_socket_mode = expected_socket_mode
+        # Compatibility-only inputs for older profiles/callers. Local
+        # ownership and mode metadata does not authenticate this same-host
+        # transport; keep one neutral value only for legacy helper signatures.
+        del expected_broker_uid, expected_socket_gid, expected_socket_mode
+        self._expected_broker_uid = 0
+        self._expected_socket_gid: int | None = None
+        self._expected_socket_mode = 0
         if timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be positive")
         if not _is_exact_int(max_message_bytes) or max_message_bytes <= 0:
@@ -1665,6 +2090,11 @@ class BrokerClient:
             and self.socket_path == SYSTEM_BROKER_SOCKET_PATH
             else (None if maintenance_root is None else Path(maintenance_root))
         )
+        self._allow_unmapped_system_identity = (
+            self.socket_path == SYSTEM_BROKER_SOCKET_PATH
+            and self._expected_broker_uid == 0
+        )
+        self.last_peer_credentials: PeerCredentials | None = None
 
     def _require_available(self, *, operation_id: str) -> None:
         if self._maintenance_root is None:
@@ -1672,11 +2102,6 @@ class BrokerClient:
         try:
             maintenance = load_maintenance_state(
                 expected_uid=self._expected_broker_uid,
-                expected_gid=(
-                    self._expected_broker_uid
-                    if self._expected_socket_gid is None
-                    else self._expected_socket_gid
-                ),
                 maintenance_root=self._maintenance_root,
             )
         except MaintenanceMarkerError as error:
@@ -1686,6 +2111,16 @@ class BrokerClient:
                 operation_id=operation_id,
                 retry_after_seconds=60,
             ) from error
+        bypass = str(
+            os.environ.get("DEVCOORDINATOR_MAINTENANCE_DEPLOYMENT_ID") or ""
+        ).strip()
+        if maintenance is not None and bypass == maintenance.deployment_id:
+            # The clean-adoption route producer runs one owner-attributed,
+            # read-only inventory call while the exact root-owned maintenance
+            # deployment remains active.  A stale or guessed value cannot
+            # bypass another deployment because it must equal the currently
+            # verified marker identity.
+            return
         if maintenance is not None:
             raise BrokerError(
                 "maintenance_in_progress",
@@ -1800,22 +2235,30 @@ class BrokerClient:
             expected_uid=self._expected_broker_uid,
             expected_gid=self._expected_socket_gid,
             expected_mode=self._expected_socket_mode,
+            allow_unmapped_identity=self._allow_unmapped_system_identity,
         )
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
             connection.settimeout(self._timeout_seconds)
-            connection.connect(str(self.socket_path))
-            peer = resolve_peer_credentials(connection)
-            if peer.uid != self._expected_broker_uid:
+            try:
+                connection.connect(str(self.socket_path))
+            except PermissionError as error:
+                if error.errno not in {errno.EACCES, errno.EPERM}:
+                    raise
                 raise BrokerError(
-                    "broker_identity_mismatch",
-                    "Connected Unix peer is not the configured coordinator broker.",
+                    "broker_transport_forbidden",
+                    "This execution environment blocks the Coordinator's local Unix-socket transport; retry through an approved host Coordinator invocation.",
                     operation_id=request.operation_id,
-                )
+                ) from error
+            # Capture the kernel-reported peer for attribution and
+            # diagnostics.  Multiple local Unix accounts belong to the same
+            # developer, so its UID is deliberately not an authorization gate.
+            self.last_peer_credentials = resolve_peer_credentials(connection)
             socket_after = _validate_client_socket(
                 self.socket_path,
                 expected_uid=self._expected_broker_uid,
                 expected_gid=self._expected_socket_gid,
                 expected_mode=self._expected_socket_mode,
+                allow_unmapped_identity=self._allow_unmapped_system_identity,
             )
             if (socket_before.st_dev, socket_before.st_ino) != (
                 socket_after.st_dev,
@@ -1935,6 +2378,96 @@ def _validate_arguments(
                 operation_id=operation_id,
             )
         return {}
+
+    if operation == BrokerOperation.CAPABILITIES_READ:
+        if value:
+            raise BrokerError(
+                "invalid_arguments",
+                "Capability reads accept no client-controlled arguments.",
+                operation_id=operation_id,
+            )
+        return {}
+
+    if operation == BrokerOperation.REPOSITORY_ENSURE:
+        if set(value) != {
+            "agent",
+            "canonical_root",
+            "owner_uid",
+            "project_kind",
+        }:
+            raise BrokerError(
+                "invalid_arguments",
+                "Repository ensure requires one canonical root, owner UID, project kind, and agent attribution.",
+                operation_id=operation_id,
+            )
+        canonical_root = value["canonical_root"]
+        if (
+            not isinstance(canonical_root, str)
+            or not 1 <= len(os.fsencode(canonical_root)) <= 4096
+            or "\x00" in canonical_root
+            or not Path(canonical_root).is_absolute()
+            or os.path.normpath(canonical_root) != canonical_root
+        ):
+            raise BrokerError(
+                "invalid_arguments",
+                "canonical_root must be one normalized absolute path.",
+                operation_id=operation_id,
+            )
+        owner_uid = value["owner_uid"]
+        if not _is_exact_int(owner_uid) or owner_uid <= 0:
+            raise BrokerError(
+                "invalid_arguments",
+                "owner_uid must be a positive integer.",
+                operation_id=operation_id,
+            )
+        project_kind = value["project_kind"]
+        if project_kind not in {"primary", "temporary"}:
+            raise BrokerError(
+                "invalid_arguments",
+                "project_kind must be primary or temporary.",
+                operation_id=operation_id,
+            )
+        return {
+            "agent": _bounded_agent(value["agent"], operation_id),
+            "canonical_root": canonical_root,
+            "owner_uid": owner_uid,
+            "project_kind": project_kind,
+        }
+
+    if operation == BrokerOperation.REPOSITORY_RESOLVE:
+        if set(value) != {"canonical_root"}:
+            raise BrokerError(
+                "invalid_arguments",
+                "Repository resolution requires exactly one canonical root.",
+                operation_id=operation_id,
+            )
+        canonical_root = value["canonical_root"]
+        if (
+            not isinstance(canonical_root, str)
+            or not 1 <= len(os.fsencode(canonical_root)) <= 4096
+            or "\x00" in canonical_root
+            or not Path(canonical_root).is_absolute()
+            or os.path.normpath(canonical_root) != canonical_root
+        ):
+            raise BrokerError(
+                "invalid_arguments",
+                "canonical_root must be one normalized absolute path.",
+                operation_id=operation_id,
+            )
+        return {"canonical_root": canonical_root}
+
+    if operation == BrokerOperation.OPERATION_FOLLOW:
+        if set(value) != {"operation_id"}:
+            raise BrokerError(
+                "invalid_arguments",
+                "Operation follow accepts exactly one operation_id.",
+                operation_id=operation_id,
+            )
+        return {
+            "operation_id": _canonical_uuid_argument(
+                value["operation_id"], "operation_id", operation_id
+            )
+        }
 
     if operation == BrokerOperation.INVENTORY_READ:
         if value:
@@ -2180,6 +2713,15 @@ def _validate_arguments(
             "cases": normalized_cases,
         }
 
+    if operation == BrokerOperation.TEST_HEALTH:
+        if value:
+            raise BrokerError(
+                "invalid_arguments",
+                "Authenticated test health accepts no arguments.",
+                operation_id=operation_id,
+            )
+        return {}
+
     if operation == BrokerOperation.TEST_STATS_READ:
         if set(value) - {"days", "limit"}:
             raise BrokerError(
@@ -2198,6 +2740,497 @@ def _validate_arguments(
                 "invalid_arguments", "limit must be from 1 through 500.", operation_id=operation_id
             )
         return {"days": days, "limit": limit}
+
+    if operation == BrokerOperation.TEST_FLEET_STATS_READ:
+        if set(value) - {"hours"}:
+            raise BrokerError(
+                "invalid_arguments",
+                "Fleet test statistics accept only hours.",
+                operation_id=operation_id,
+            )
+        hours = value.get("hours", 24)
+        if not _is_exact_int(hours) or not 1 <= hours <= 168:
+            raise BrokerError(
+                "invalid_arguments",
+                "hours must be from 1 through 168.",
+                operation_id=operation_id,
+            )
+        return {"hours": hours}
+
+    if operation == BrokerOperation.TEST_PLAN_PREVIEW:
+        expected = {
+            "intent",
+            "temporary_root",
+            "requested_targets",
+            "execution_timeout_seconds",
+            "launch_timeout_seconds",
+        }
+        if set(value) != expected:
+            raise BrokerError(
+                "invalid_arguments",
+                "Test plan preview requires intent, source, targets, and exact timeout policy.",
+                operation_id=operation_id,
+            )
+        intent = value["intent"]
+        if intent not in {"change", "checkpoint", "handoff", "release", "manual"}:
+            raise BrokerError(
+                "invalid_arguments",
+                "Test plan preview intent is invalid.",
+                operation_id=operation_id,
+            )
+        temporary_root = value.get("temporary_root")
+        if temporary_root is not None:
+            temporary_root = _bounded_single_line_argument(
+                temporary_root,
+                "temporary_root",
+                operation_id,
+                maximum_bytes=4096,
+            )
+            if not temporary_root.startswith("/"):
+                raise BrokerError(
+                    "invalid_arguments",
+                    "temporary_root must be absolute.",
+                    operation_id=operation_id,
+                )
+        requested_raw = value.get("requested_targets", [])
+        if (
+            not isinstance(requested_raw, list)
+            or len(requested_raw) > 256
+        ):
+            raise BrokerError(
+                "invalid_arguments",
+                "requested_targets must be a bounded array.",
+                operation_id=operation_id,
+            )
+        requested_targets = [
+            _bounded_single_line_argument(
+                item,
+                "requested_targets[]",
+                operation_id,
+                maximum_bytes=128,
+            )
+            for item in requested_raw
+        ]
+        if len(set(requested_targets)) != len(requested_targets):
+            raise BrokerError(
+                "invalid_arguments",
+                "requested_targets must be unique.",
+                operation_id=operation_id,
+            )
+        if requested_targets and intent != "manual":
+            raise BrokerError(
+                "invalid_arguments",
+                "requested_targets are supported only for manual intent.",
+                operation_id=operation_id,
+            )
+        execution_timeout = value["execution_timeout_seconds"]
+        if execution_timeout is not None and (
+            not _is_exact_int(execution_timeout)
+            or not 1 <= execution_timeout <= 86_400
+        ):
+            raise BrokerError(
+                "invalid_arguments",
+                "execution_timeout_seconds must be null or an integer from 1 through 86400.",
+                operation_id=operation_id,
+            )
+        launch_timeout = value["launch_timeout_seconds"]
+        if (
+            not _is_exact_int(launch_timeout)
+            or not 1 <= launch_timeout <= 3_600
+        ):
+            raise BrokerError(
+                "invalid_arguments",
+                "launch_timeout_seconds must be an integer from 1 through 3600.",
+                operation_id=operation_id,
+            )
+        return {
+            "intent": intent,
+            "temporary_root": temporary_root,
+            "requested_targets": requested_targets,
+            "execution_timeout_seconds": execution_timeout,
+            "launch_timeout_seconds": launch_timeout,
+        }
+
+    if operation == BrokerOperation.TEST_PLAN_REGISTER:
+        if set(value) != {"plan", "manifest", "actor"}:
+            raise BrokerError(
+                "invalid_arguments",
+                "Test plan registration requires exactly plan, manifest, and actor.",
+                operation_id=operation_id,
+            )
+        return {
+            "plan": _bounded_json_object(
+                value["plan"], "plan", operation_id, maximum_bytes=8 * 1024 * 1024
+            ),
+            "manifest": _bounded_json_object(
+                value["manifest"], "manifest", operation_id, maximum_bytes=1024 * 1024
+            ),
+            "actor": _bounded_single_line_argument(
+                value["actor"], "actor", operation_id, maximum_bytes=256
+            ),
+        }
+
+    if operation == BrokerOperation.TEST_RUN_SUBMIT:
+        required = {"plan_id", "expected_repository_id", "actor"}
+        if set(value) != required:
+            raise BrokerError(
+                "invalid_arguments",
+                "Test submission requires exactly plan_id, expected_repository_id, and actor.",
+                operation_id=operation_id,
+            )
+        return {
+            "plan_id": _opaque_argument(value["plan_id"], "plan_id", operation_id),
+            "expected_repository_id": _opaque_argument(
+                value["expected_repository_id"],
+                "expected_repository_id",
+                operation_id,
+            ),
+            "actor": _bounded_single_line_argument(
+                value["actor"],
+                "actor",
+                operation_id,
+                maximum_bytes=256,
+            ),
+        }
+
+    if operation == BrokerOperation.TEST_RUN_LIST:
+        allowed = {"after", "limit", "state"}
+        if set(value) - allowed:
+            raise BrokerError(
+                "invalid_arguments",
+                "Test run history accepts only after, limit, and state.",
+                operation_id=operation_id,
+            )
+        limit = value.get("limit", 50)
+        if not _is_exact_int(limit) or not 1 <= limit <= 200:
+            raise BrokerError(
+                "invalid_arguments",
+                "Test run history limit must be from 1 through 200.",
+                operation_id=operation_id,
+            )
+        normalized = {"limit": limit}
+        if "after" in value:
+            normalized["after"] = _opaque_argument(
+                value["after"], "after", operation_id
+            )
+        if "state" in value:
+            state = value["state"]
+            if state not in {
+                "queued",
+                "running",
+                "cancelling",
+                "superseding",
+                "succeeded",
+                "failed",
+                "timed_out",
+                "cancelled",
+                "incomplete",
+                "abandoned",
+                "superseded",
+            }:
+                raise BrokerError(
+                    "invalid_arguments",
+                    "Test run history state is invalid.",
+                    operation_id=operation_id,
+                )
+            normalized["state"] = state
+        return normalized
+
+    if operation in {BrokerOperation.TEST_RUN_STATUS, BrokerOperation.TEST_RUN_SUMMARY}:
+        if set(value) != {"run_id"}:
+            raise BrokerError(
+                "invalid_arguments",
+                "Test run read requires exactly run_id.",
+                operation_id=operation_id,
+            )
+        return {"run_id": _opaque_argument(value["run_id"], "run_id", operation_id)}
+
+    if operation in {BrokerOperation.TEST_RUN_FAILURES, BrokerOperation.TEST_RUN_ARTIFACTS}:
+        allowed = {"run_id", "after", "limit"}
+        if "run_id" not in value or set(value) - allowed:
+            raise BrokerError(
+                "invalid_arguments",
+                "Test evidence reads require run_id and accept only after and limit.",
+                operation_id=operation_id,
+            )
+        limit = value.get("limit", 25)
+        if not _is_exact_int(limit) or not 1 <= limit <= 50:
+            raise BrokerError(
+                "invalid_arguments",
+                "Test evidence limit must be from 1 through 50.",
+                operation_id=operation_id,
+            )
+        normalized = {
+            "run_id": _opaque_argument(value["run_id"], "run_id", operation_id),
+            "limit": limit,
+        }
+        if "after" in value:
+            normalized["after"] = _opaque_argument(value["after"], "after", operation_id)
+        return normalized
+
+    if operation == BrokerOperation.TEST_RUN_CASES:
+        allowed = {"run_id", "after", "limit"}
+        if "run_id" not in value or set(value) - allowed:
+            raise BrokerError(
+                "invalid_arguments",
+                "Test case reads require run_id and accept only after and limit.",
+                operation_id=operation_id,
+            )
+        limit = value.get("limit", 25)
+        after = value.get("after", 0)
+        if not _is_exact_int(limit) or not 1 <= limit <= 50:
+            raise BrokerError(
+                "invalid_arguments",
+                "Test case limit must be from 1 through 50.",
+                operation_id=operation_id,
+            )
+        if not _is_exact_int(after) or after < 0:
+            raise BrokerError(
+                "invalid_arguments",
+                "Test case cursor must be non-negative.",
+                operation_id=operation_id,
+            )
+        return {
+            "run_id": _opaque_argument(value["run_id"], "run_id", operation_id),
+            "after": after,
+            "limit": limit,
+        }
+
+    if operation == BrokerOperation.TEST_EVENTS_READ:
+        allowed = {"after_event_id", "limit"}
+        if set(value) - allowed:
+            raise BrokerError(
+                "invalid_arguments",
+                "Test event reads accept only after_event_id and limit.",
+                operation_id=operation_id,
+            )
+        after_event_id = value.get("after_event_id", 0)
+        limit = value.get("limit", 200)
+        if not _is_exact_int(after_event_id) or after_event_id < 0:
+            raise BrokerError(
+                "invalid_arguments",
+                "Test event cursor must be non-negative.",
+                operation_id=operation_id,
+            )
+        if not _is_exact_int(limit) or not 1 <= limit <= 500:
+            raise BrokerError(
+                "invalid_arguments",
+                "Test event limit must be from 1 through 500.",
+                operation_id=operation_id,
+            )
+        return {"after_event_id": after_event_id, "limit": limit}
+
+    if operation == BrokerOperation.TEST_REPOSITORY_SETUP:
+        if value:
+            raise BrokerError(
+                "invalid_arguments",
+                "Test repository setup read accepts no arguments.",
+                operation_id=operation_id,
+            )
+        return {}
+
+    if operation == BrokerOperation.TEST_REPOSITORY_CATALOG:
+        if value:
+            raise BrokerError(
+                "invalid_arguments",
+                "Test repository catalog read accepts no arguments.",
+                operation_id=operation_id,
+            )
+        return {}
+
+    if operation == BrokerOperation.TEST_RUN_CANCEL:
+        if set(value) != {"run_id", "reason", "actor"}:
+            raise BrokerError(
+                "invalid_arguments",
+                "Test cancellation requires exactly run_id, reason, and actor.",
+                operation_id=operation_id,
+            )
+        return {
+            "run_id": _opaque_argument(value["run_id"], "run_id", operation_id),
+            "reason": _bounded_reason(value["reason"], operation_id),
+            "actor": _bounded_single_line_argument(
+                value["actor"],
+                "actor",
+                operation_id,
+                maximum_bytes=256,
+            ),
+        }
+
+    if operation == BrokerOperation.TEST_RUN_RETRY:
+        if (
+            set(value) != {"run_id", "failed_only", "actor"}
+            or type(value["failed_only"]) is not bool
+        ):
+            raise BrokerError(
+                "invalid_arguments",
+                "Test retry requires exactly run_id, boolean failed_only, and actor.",
+                operation_id=operation_id,
+            )
+        return {
+            "run_id": _opaque_argument(value["run_id"], "run_id", operation_id),
+            "failed_only": value["failed_only"],
+            "actor": _bounded_single_line_argument(
+                value["actor"],
+                "actor",
+                operation_id,
+                maximum_bytes=256,
+            ),
+        }
+
+    if operation == BrokerOperation.TEST_EVIDENCE_CHECK:
+        if set(value) != {"snapshot_id", "policy_name"}:
+            raise BrokerError(
+                "invalid_arguments",
+                "Evidence checks require snapshot_id and policy_name.",
+                operation_id=operation_id,
+            )
+        return {
+            "snapshot_id": _opaque_argument(value["snapshot_id"], "snapshot_id", operation_id),
+            "policy_name": _opaque_argument(value["policy_name"], "policy_name", operation_id),
+        }
+
+    if operation == BrokerOperation.TEST_EVIDENCE_CONSUME:
+        if set(value) != {"snapshot_id", "policy_name"}:
+            raise BrokerError(
+                "invalid_arguments",
+                "Evidence consumption requires snapshot_id and policy_name.",
+                operation_id=operation_id,
+            )
+        return {
+            "snapshot_id": _opaque_argument(
+                value["snapshot_id"], "snapshot_id", operation_id
+            ),
+            "policy_name": _opaque_argument(
+                value["policy_name"], "policy_name", operation_id
+            ),
+        }
+
+    if operation == BrokerOperation.TEST_ADMISSION_DRAIN_BEGIN:
+        if set(value) != {"purpose"} or value["purpose"] != "legacy-test-history-cutover":
+            raise BrokerError(
+                "invalid_arguments",
+                "Test admission drain requires the fixed legacy-history purpose.",
+                operation_id=operation_id,
+            )
+        return {"purpose": "legacy-test-history-cutover"}
+
+    if operation == BrokerOperation.TEST_ADMISSION_DRAIN_STATUS:
+        if value:
+            raise BrokerError(
+                "invalid_arguments",
+                "Test admission drain status accepts no arguments.",
+                operation_id=operation_id,
+            )
+        return {}
+
+    if operation == BrokerOperation.TEST_ADMISSION_DRAIN_CLEAR:
+        if set(value) != {"drain_id", "proof_sha256"}:
+            raise BrokerError(
+                "invalid_arguments",
+                "Test admission drain clear requires the exact drain ID and proof fingerprint.",
+                operation_id=operation_id,
+            )
+        return {
+            "drain_id": _canonical_uuid_argument(
+                value["drain_id"], "drain_id", operation_id
+            ),
+            "proof_sha256": _bare_sha256_argument(
+                value["proof_sha256"], "proof_sha256", operation_id
+            ),
+        }
+
+    if operation == BrokerOperation.TEST_ATTEMPT_TICKET:
+        if set(value) != {"descriptor", "launch_timeout_seconds"}:
+            raise BrokerError(
+                "invalid_arguments",
+                "Internal test ticket requests require one descriptor and its launch deadline.",
+                operation_id=operation_id,
+            )
+        launch_timeout = value["launch_timeout_seconds"]
+        if (
+            not _is_exact_int(launch_timeout)
+            or not 1 <= launch_timeout <= 3_600
+        ):
+            raise BrokerError(
+                "invalid_arguments",
+                "launch_timeout_seconds must be an integer from 1 through 3600.",
+                operation_id=operation_id,
+            )
+        return {
+            "descriptor": _bounded_json_object(
+                value["descriptor"],
+                "descriptor",
+                operation_id,
+                maximum_bytes=128 * 1024,
+            ),
+            "launch_timeout_seconds": launch_timeout,
+        }
+
+    if operation == BrokerOperation.TEST_ATTEMPT_LAUNCH:
+        if set(value) != {
+            "ticket_id",
+            "attempt_id",
+            "generation",
+        }:
+            raise BrokerError(
+                "invalid_arguments",
+                "Internal test launch requires exact ticket identity.",
+                operation_id=operation_id,
+            )
+        generation = value["generation"]
+        if not _is_exact_int(generation) or not 1 <= generation <= 1_000_000:
+            raise BrokerError(
+                "invalid_arguments",
+                "generation must be an integer from 1 through 1000000.",
+                operation_id=operation_id,
+            )
+        return {
+            "ticket_id": _opaque_argument(
+                value["ticket_id"], "ticket_id", operation_id
+            ),
+            "attempt_id": _opaque_argument(
+                value["attempt_id"], "attempt_id", operation_id
+            ),
+            "generation": generation,
+        }
+
+    if operation == BrokerOperation.TEST_ATTEMPT_STATUS:
+        if set(value) != {"runtime_id", "result_chunk_index"}:
+            raise BrokerError(
+                "invalid_arguments",
+                "Internal test status requires runtime_id and result_chunk_index.",
+                operation_id=operation_id,
+            )
+        result_chunk_index = value["result_chunk_index"]
+        if (
+            not _is_exact_int(result_chunk_index)
+            or not 0 <= result_chunk_index < 4_096
+        ):
+            raise BrokerError(
+                "invalid_arguments",
+                "result_chunk_index must be an integer from 0 through 4095.",
+                operation_id=operation_id,
+            )
+        return {
+            "runtime_id": _opaque_argument(
+                value["runtime_id"], "runtime_id", operation_id
+            ),
+            "result_chunk_index": result_chunk_index,
+        }
+
+    if operation == BrokerOperation.TEST_ATTEMPT_CANCEL:
+        if set(value) != {"runtime_id", "reason"}:
+            raise BrokerError(
+                "invalid_arguments",
+                "Internal test cancellation requires runtime_id and reason.",
+                operation_id=operation_id,
+            )
+        return {
+            "runtime_id": _opaque_argument(
+                value["runtime_id"], "runtime_id", operation_id
+            ),
+            "reason": _bounded_reason(value["reason"], operation_id),
+        }
 
     if operation in {
         BrokerOperation.EPHEMERAL_START,
@@ -2287,6 +3320,52 @@ def _validate_arguments(
         normalized["agent"] = _bounded_agent(value["agent"], operation_id)
         return normalized
 
+    if operation == BrokerOperation.RUNTIME_ENSURE:
+        required = {
+            "agent",
+            "root_repo_id",
+            "temporary_repo_id",
+            "target_kind",
+            "desired_state",
+        }
+        if set(value) != required:
+            raise BrokerError(
+                "invalid_arguments",
+                "Runtime ensure accepts exactly enrolled repository/resource IDs "
+                "and a desired ready or stopped state; TTL, commands, and "
+                "lifecycle options are forbidden.",
+                operation_id=operation_id,
+            )
+        target_kind = value["target_kind"]
+        if target_kind not in {"service", "docker", "database_stack"}:
+            raise BrokerError(
+                "invalid_arguments",
+                "target_kind must be service, docker, or database_stack.",
+                operation_id=operation_id,
+            )
+        desired_state = value["desired_state"]
+        if desired_state not in {"ready", "stopped"}:
+            raise BrokerError(
+                "invalid_arguments",
+                "desired_state must be ready or stopped.",
+                operation_id=operation_id,
+            )
+        root_repo_id = _opaque_argument(
+            value["root_repo_id"], "root_repo_id", operation_id
+        )
+        temporary_repo_id = value["temporary_repo_id"]
+        if temporary_repo_id is not None:
+            temporary_repo_id = _opaque_argument(
+                temporary_repo_id, "temporary_repo_id", operation_id
+            )
+        return {
+            "agent": _bounded_agent(value["agent"], operation_id),
+            "root_repo_id": root_repo_id,
+            "temporary_repo_id": temporary_repo_id,
+            "target_kind": target_kind,
+            "desired_state": desired_state,
+        }
+
     if operation == BrokerOperation.RUNTIME_REQUEST:
         required = {
             "action",
@@ -2310,8 +3389,18 @@ def _validate_arguments(
             "cwd",
             "environment",
         }
+        temporary_service_fields = {
+            "name",
+            "argv",
+            "cwd",
+            "port",
+            "launch_timeout_seconds",
+        }
         if not required.issubset(value) or not set(value) <= (
-            required | supervision_fields | replacement_fields
+            required
+            | supervision_fields
+            | replacement_fields
+            | temporary_service_fields
         ):
             raise BrokerError(
                 "invalid_arguments",
@@ -2319,10 +3408,18 @@ def _validate_arguments(
                 operation_id=operation_id,
             )
         action = value["action"]
-        if action not in {"status", "start", "stop", "restart", "replace"}:
+        if action not in {
+            "status",
+            "capture_logs",
+            "start",
+            "stop",
+            "restart",
+            "replace",
+            "temporary_start",
+        }:
             raise BrokerError(
                 "unsupported_runtime_action",
-                "The broker runtime endpoint supports status and existing-resource start, stop, restart, or typed worker replacement only; run and shell commands are forbidden.",
+                "The broker runtime endpoint supports status, bounded log capture, existing-resource lifecycle, typed worker replacement, and bounded temporary services; shell commands are forbidden.",
                 operation_id=operation_id,
             )
         target_kind = value["target_kind"]
@@ -2333,6 +3430,7 @@ def _validate_arguments(
                 operation_id=operation_id,
             )
         supplied_replacement = replacement_fields & set(value)
+        supplied_temporary = temporary_service_fields & set(value)
         if action == "replace":
             if target_kind != "service" or supplied_replacement != replacement_fields:
                 raise BrokerError(
@@ -2340,7 +3438,18 @@ def _validate_arguments(
                     "Worker replacement requires service target plus exact generation, argv, cwd, and environment.",
                     operation_id=operation_id,
                 )
-        elif supplied_replacement:
+        elif action == "temporary_start":
+            if (
+                target_kind != "service"
+                or supplied_temporary != temporary_service_fields
+                or supplied_replacement - {"argv", "cwd"}
+            ):
+                raise BrokerError(
+                    "invalid_arguments",
+                    "A temporary service requires exact name, argv, repository-relative cwd, fixed port, and launch timeout fields.",
+                    operation_id=operation_id,
+                )
+        elif supplied_replacement or supplied_temporary:
             raise BrokerError(
                 "invalid_arguments",
                 "Replacement definition fields are valid only for service replace.",
@@ -2391,16 +3500,16 @@ def _validate_arguments(
                 "kill_after_run must be a JSON boolean.",
                 operation_id=operation_id,
             )
-        if kill_after_run:
+        if kill_after_run and action != "temporary_start":
             raise BrokerError(
                 "unsupported_runtime_action",
                 "kill_after_run=true is reserved for broker-owned run sessions; client-supplied run commands are forbidden.",
                 operation_id=operation_id,
             )
-        if action == "status" and ttl_seconds is not None:
+        if action in {"status", "capture_logs"} and ttl_seconds is not None:
             raise BrokerError(
                 "invalid_arguments",
-                "Runtime status requires ttl_seconds=null.",
+                "Runtime read operations require ttl_seconds=null.",
                 operation_id=operation_id,
             )
         if action == "stop" and ttl_seconds is not None:
@@ -2466,7 +3575,7 @@ def _validate_arguments(
             )
         if (
             purpose in {"test", "temporary"}
-            and action in {"start", "restart", "replace"}
+            and action in {"start", "restart", "replace", "temporary_start"}
             and ttl_seconds is None
         ):
             raise BrokerError(
@@ -2482,7 +3591,7 @@ def _validate_arguments(
             "target_kind": target_kind,
             "purpose": purpose,
             "ttl_seconds": ttl_seconds,
-            "kill_after_run": False,
+            "kill_after_run": kill_after_run if action == "temporary_start" else False,
         }
         for field, normalized_value in (
             ("keep_alive", keep_alive),
@@ -2557,6 +3666,80 @@ def _validate_arguments(
                     "argv": list(argv),
                     "cwd": cwd,
                     "environment": dict(sorted(environment.items())),
+                }
+            )
+        elif action == "temporary_start":
+            if purpose != "temporary":
+                raise BrokerError(
+                    "invalid_arguments",
+                    "A temporary service requires purpose=temporary.",
+                    operation_id=operation_id,
+                )
+            argv = value["argv"]
+            if (
+                not isinstance(argv, list)
+                or not argv
+                or len(argv) > 256
+                or not all(
+                    isinstance(argument, str)
+                    and bool(argument)
+                    and "\x00" not in argument
+                    and len(argument.encode("utf-8")) <= 8192
+                    for argument in argv
+                )
+                or sum(len(argument.encode("utf-8")) for argument in argv) > 32768
+            ):
+                raise BrokerError(
+                    "invalid_arguments",
+                    "argv must be a bounded non-empty array of NUL-free strings.",
+                    operation_id=operation_id,
+                )
+            shell = str(argv[0]).rsplit("/", 1)[-1]
+            if shell in {"ash", "bash", "csh", "dash", "fish", "ksh", "sh", "tcsh", "zsh"}:
+                raise BrokerError(
+                    "invalid_arguments",
+                    "Temporary services require structured argv, not a shell.",
+                    operation_id=operation_id,
+                )
+            cwd = _bounded_single_line_argument(
+                value["cwd"], "cwd", operation_id, maximum_bytes=4096
+            )
+            if cwd.startswith("/") or any(part in {"", ".."} for part in cwd.split("/")):
+                raise BrokerError(
+                    "invalid_arguments",
+                    "Temporary-service cwd must be repository-relative and cannot traverse upward.",
+                    operation_id=operation_id,
+                )
+            name = _bounded_single_line_argument(
+                value["name"], "name", operation_id, maximum_bytes=64
+            )
+            if re.fullmatch(r"[a-z0-9](?:[a-z0-9_.-]{0,62}[a-z0-9])?", name) is None:
+                raise BrokerError(
+                    "invalid_arguments",
+                    "Temporary-service name must be a bounded lowercase identifier.",
+                    operation_id=operation_id,
+                )
+            port = value["port"]
+            if not _is_exact_int(port) or not 1 <= port <= 65535:
+                raise BrokerError(
+                    "invalid_arguments",
+                    "Temporary-service port must be one exact TCP port from 1 through 65535.",
+                    operation_id=operation_id,
+                )
+            launch_timeout = value["launch_timeout_seconds"]
+            if not _is_exact_int(launch_timeout) or not 1 <= launch_timeout <= 300:
+                raise BrokerError(
+                    "invalid_arguments",
+                    "launch_timeout_seconds must be from 1 through 300.",
+                    operation_id=operation_id,
+                )
+            normalized_runtime.update(
+                {
+                    "name": name,
+                    "argv": list(argv),
+                    "cwd": cwd,
+                    "port": port,
+                    "launch_timeout_seconds": launch_timeout,
                 }
             )
         return normalized_runtime
@@ -2884,6 +4067,42 @@ def _validate_arguments(
             )
         return {}
 
+    if operation is BrokerOperation.COMPOSE_RUN_ONCE:
+        if set(value) != {"agent", "service", "timeout_seconds"}:
+            raise BrokerError(
+                "invalid_arguments",
+                "Compose run-once accepts exactly agent, service, and timeout_seconds; "
+                "commands, environment, mounts, paths, and options are forbidden.",
+                operation_id=operation_id,
+            )
+        service = value["service"]
+        if (
+            not isinstance(service, str)
+            or _COMPOSE_SERVICE_NAME.fullmatch(service) is None
+        ):
+            raise BrokerError(
+                "invalid_arguments",
+                "Compose run-once service must be one exact Docker Compose service name.",
+                operation_id=operation_id,
+            )
+        timeout_seconds = value["timeout_seconds"]
+        if (
+            not _is_exact_int(timeout_seconds)
+            or not 1
+            <= timeout_seconds
+            <= MAX_COMPOSE_RUN_ONCE_TIMEOUT_SECONDS
+        ):
+            raise BrokerError(
+                "invalid_arguments",
+                "Compose run-once timeout_seconds must be from one through 3600.",
+                operation_id=operation_id,
+            )
+        return {
+            "agent": _bounded_agent(value["agent"], operation_id),
+            "service": service,
+            "timeout_seconds": timeout_seconds,
+        }
+
     if operation in {
         BrokerOperation.DOCKER_START,
         BrokerOperation.DOCKER_STOP,
@@ -3126,6 +4345,20 @@ def _validate_arguments(
             )
         return result
 
+    if operation == BrokerOperation.TEST_ARTIFACT_RESOLVE:
+        if set(value) != {"run_id", "artifact_id"}:
+            raise BrokerError(
+                "invalid_arguments",
+                "Exact test artifact resolution requires run_id and artifact_id.",
+                operation_id=operation_id,
+            )
+        return {
+            "run_id": _opaque_argument(value["run_id"], "run_id", operation_id),
+            "artifact_id": _opaque_argument(
+                value["artifact_id"], "artifact_id", operation_id
+            ),
+        }
+
     raise BrokerError(
         "unknown_operation",
         "Requested broker operation is not allowed.",
@@ -3267,6 +4500,53 @@ def _bounded_single_line_argument(
             operation_id=operation_id,
         )
     return value
+
+
+def _bounded_json_object(
+    value: Any,
+    field: str,
+    operation_id: str,
+    *,
+    maximum_bytes: int,
+) -> dict[str, Any]:
+    """Freeze one nested untrusted document and enforce its byte budget."""
+
+    if not isinstance(value, Mapping):
+        raise BrokerError(
+            "invalid_arguments",
+            f"{field} must be a JSON object.",
+            operation_id=operation_id,
+        )
+    try:
+        encoded = json.dumps(
+            dict(value),
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        if len(encoded) > maximum_bytes:
+            raise BrokerError(
+                "invalid_arguments",
+                f"{field} exceeds its bounded byte limit.",
+                operation_id=operation_id,
+            )
+        decoded = json.loads(encoded.decode("utf-8"))
+    except BrokerError:
+        raise
+    except (TypeError, ValueError, UnicodeError, RecursionError):
+        raise BrokerError(
+            "invalid_arguments",
+            f"{field} must contain only finite JSON values.",
+            operation_id=operation_id,
+        ) from None
+    if not isinstance(decoded, dict):
+        raise BrokerError(
+            "invalid_arguments",
+            f"{field} must be a JSON object.",
+            operation_id=operation_id,
+        )
+    return decoded
 
 
 def _opaque_argument(value: Any, field: str, operation_id: str) -> str:
@@ -3484,11 +4764,9 @@ def _normalize_backend_result(value: Any, *, max_bytes: int) -> dict[str, Any]:
 
 def _request_fingerprint(request: AuthorizedBrokerRequest) -> str:
     document = request.request.to_wire()
-    # Authorization is deliberately per effective UID.  The peer's incidental
-    # effective GID may differ between two sessions of the same account and is
-    # not part of the authenticated principal unless an authorizer explicitly
-    # models it as such.
-    document["authenticated_uid"] = request.peer.uid
+    # Unix credentials are audit attribution, not a tenancy boundary.  The
+    # typed request identity is therefore stable when the same developer
+    # retries an operation from another local account or agent.
     encoded = json.dumps(
         document,
         ensure_ascii=True,
@@ -3500,7 +4778,7 @@ def _request_fingerprint(request: AuthorizedBrokerRequest) -> str:
 
 
 def authenticated_request_fingerprint(request: AuthorizedBrokerRequest) -> str:
-    """Stable durable idempotency fingerprint for the authenticated UID."""
+    """Stable durable idempotency fingerprint for the typed request."""
 
     return _request_fingerprint(request)
 
@@ -3921,10 +5199,13 @@ def _validate_client_socket(
     expected_uid: int,
     expected_gid: Optional[int],
     expected_mode: int,
+    allow_unmapped_identity: bool = False,
 ) -> os.stat_result:
+    del expected_uid, expected_gid, expected_mode, allow_unmapped_identity
     _validate_socket_path(socket_path)
     _validate_trusted_path_components(
-        socket_path.parent, expected_uid=expected_uid
+        socket_path.parent,
+        expected_uid=0,
     )
     try:
         info = os.lstat(str(socket_path))
@@ -3932,26 +5213,23 @@ def _validate_client_socket(
         raise BrokerError(
             "broker_identity_mismatch", "Configured broker socket is unavailable."
         ) from None
-    if not stat.S_ISSOCK(info.st_mode) or info.st_uid != expected_uid:
+    if not stat.S_ISSOCK(info.st_mode):
         raise BrokerError(
             "broker_identity_mismatch",
-            "Configured broker socket has the wrong type or owner.",
-        )
-    if expected_gid is not None and info.st_gid != expected_gid:
-        raise BrokerError(
-            "broker_identity_mismatch",
-            "Configured broker socket has the wrong access group.",
-        )
-    if stat.S_IMODE(info.st_mode) != expected_mode:
-        raise BrokerError(
-            "broker_identity_mismatch",
-            "Configured broker socket has unexpected permissions.",
+            "Configured broker path is not a Unix socket.",
         )
     return info
 
 
-def _validate_trusted_path_components(path: Path, *, expected_uid: int) -> None:
-    """Reject symlinks and replaceable ancestors of a security boundary."""
+def _validate_trusted_path_components(
+    path: Path,
+    *,
+    expected_uid: int,
+    allow_unmapped_owner: bool = False,
+) -> None:
+    """Reject symlink and non-directory transport path components."""
+
+    del expected_uid, allow_unmapped_owner
 
     current = Path(path.anchor)
     parts = path.parts[1:] if path.anchor else path.parts
@@ -3974,23 +5252,12 @@ def _validate_trusted_path_components(path: Path, *, expected_uid: int) -> None:
                 "unsafe_runtime_directory",
                 "Broker runtime path contains a non-directory component.",
             )
-        mode = stat.S_IMODE(info.st_mode)
-        if info.st_uid not in {0, expected_uid}:
-            raise BrokerError(
-                "unsafe_runtime_directory",
-                "Broker runtime path has an ancestor owned by an untrusted account.",
-            )
-        if mode & (stat.S_IWGRP | stat.S_IWOTH):
-            raise BrokerError(
-                "unsafe_runtime_directory",
-                "Broker runtime path has a replaceable group/world-writable ancestor.",
-            )
 
 
 def _reject_symlink_components(path: Path) -> None:
     # Backward-compatible private helper retained for callers that need only a
-    # symlink check.  Security-boundary callers use the stricter trusted-path
-    # validation above.
+    # symlink check.  Transport callers use the component/type validation
+    # above; neither helper treats ownership or Unix mode as authorization.
     current = Path(path.anchor)
     parts = path.parts[1:] if path.anchor else path.parts
     for part in parts:

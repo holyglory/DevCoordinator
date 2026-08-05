@@ -26,10 +26,13 @@ import { createPrefsStore } from '../src/prefs.mjs';
 import { createRouteStore } from '../src/routes.mjs';
 import { createUpstreamAuthStore } from '../src/upstream-auth.mjs';
 import { createAccessStore } from '../src/access.mjs';
+import { createBugStore } from '../src/bugs.mjs';
 import { createConsoleApi } from '../src/api.mjs';
 import { createStaticServer } from '../src/static.mjs';
 import { createTelegramService } from '../src/telegram.mjs';
-import { createIdentityAssertionSigner } from '../src/identity-assertion.mjs';
+import { createTelegramIpcClient } from '../src/telegram-ipc.mjs';
+import { createEdgePublicationClient } from '../edge/publication-client.mjs';
+import { createEdgePublicationProducer } from '../edge/publication-producer.mjs';
 
 const APP_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 export const PRODUCTION_BACKGROUND_START_DELAY_MS = 90_000;
@@ -209,7 +212,13 @@ function buildProxy({ log, pages, config }) {
   });
 }
 
-function buildTelegram({ config, log, coordinator, accessStore }) {
+function buildTelegram({ config, log, coordinator, accessStore, env = process.env }) {
+  const notificationSocket = String(env.DEVCOORDINATOR_NOTIFICATION_SOCKET ?? '').trim();
+  if (notificationSocket) {
+    return createTelegramIpcClient({
+      socketPath: notificationSocket,
+    });
+  }
   return createTelegramService({
     file: path.join(config.stateDir, 'telegram-control.json'),
     log,
@@ -226,6 +235,34 @@ function buildTelegram({ config, log, coordinator, accessStore }) {
       }),
       readEvents: ({ after, limit }) => coordinator.events({ after, limit }),
     },
+  });
+}
+
+function buildEdgePublication({
+  config,
+  log,
+  coordinator,
+  routeStore,
+  upstreamAuthStore,
+  accessStore,
+}) {
+  if (!config.edgePublication) return null;
+  const client = createEdgePublicationClient({
+    socketPath: config.edgePublication.socketPath,
+    releaseRoot: config.edgePublication.releaseRoot,
+    timeoutMs: config.edgePublication.timeoutMs,
+  });
+  return createEdgePublicationProducer({
+    client,
+    config: {
+      domain: config.domain,
+      releaseRoot: config.edgePublication.releaseRoot,
+    },
+    coordinator,
+    routeStore,
+    upstreamAuthStore,
+    accessStore,
+    log,
   });
 }
 
@@ -284,7 +321,13 @@ export async function start({ envFile, env, overrides = {}, listenPorts } = {}) 
   });
   await accessStore.load();
   const guard = createGuard({ sessions, access: accessStore, config, log });
-  const telegram = buildTelegram({ config, log, coordinator, accessStore });
+  const telegram = buildTelegram({
+    config,
+    log,
+    coordinator,
+    accessStore,
+    env: env ?? process.env,
+  });
   await telegram.load();
 
   // Listen first (router attaches afterwards) so OS-assigned ports are known
@@ -331,16 +374,21 @@ export async function start({ envFile, env, overrides = {}, listenPorts } = {}) 
     log,
   });
   const prefs = createPrefsStore({ file: path.join(config.stateDir, 'ui-prefs.json'), log });
+  const bugStore = createBugStore({
+    directory: config.bugReportDir,
+    log,
+    originServerId: config.consoleHost,
+  });
+  const edgePublication = buildEdgePublication({
+    config, log, coordinator, routeStore, upstreamAuthStore, accessStore,
+  });
   const consoleApi = createConsoleApi({
     config, log, coordinator, routeStore, upstreamAuthStore, accessStore, guard, certManager, metrics, prefs, telegram,
+    bugStore,
+    edgePublication,
   });
   const staticServer = createStaticServer({ dir: path.join(APP_ROOT, 'src', 'ui'), log });
   const proxy = buildProxy({ log, pages, config });
-  const identitySigner = createIdentityAssertionSigner({
-    stateDir: config.stateDir,
-    issuer: config.consoleOrigin,
-  });
-  await identitySigner.load();
 
   routerRef.current = createRouter({
     config,
@@ -354,7 +402,6 @@ export async function start({ envFile, env, overrides = {}, listenPorts } = {}) 
     routeStore,
     accessStore,
     upstreamAuthStore,
-    identitySigner,
     coordinator,
     proxy,
   });
@@ -392,8 +439,8 @@ export async function start({ envFile, env, overrides = {}, listenPorts } = {}) 
     coordinator,
     routeStore,
     upstreamAuthStore,
-    identitySigner,
     accessStore,
+    edgePublication,
     telegram,
     close,
   };
@@ -508,21 +555,26 @@ async function main() {
   });
   await accessStore.load();
   const guard = createGuard({ sessions, access: accessStore, config, log });
-  telegram = buildTelegram({ config, log, coordinator, accessStore });
+  telegram = buildTelegram({ config, log, coordinator, accessStore, env: process.env });
   await telegram.load();
 
   const prefs = createPrefsStore({ file: path.join(config.stateDir, 'ui-prefs.json'), log });
+  const bugStore = createBugStore({
+    directory: config.bugReportDir,
+    log,
+    originServerId: config.consoleHost,
+  });
+  const edgePublication = buildEdgePublication({
+    config, log, coordinator, routeStore, upstreamAuthStore, accessStore,
+  });
   const consoleApi = createConsoleApi({
     config, log, coordinator, routeStore, upstreamAuthStore, accessStore, guard, certManager, metrics, prefs, telegram,
+    bugStore,
+    edgePublication,
   });
   const staticServer = createStaticServer({ dir: path.join(APP_ROOT, 'src', 'ui'), log });
 
   proxy = buildProxy({ log, pages, config });
-  const identitySigner = createIdentityAssertionSigner({
-    stateDir: config.stateDir,
-    issuer: config.consoleOrigin,
-  });
-  await identitySigner.load();
 
   const router = createRouter({
     config,
@@ -536,7 +588,6 @@ async function main() {
     routeStore,
     accessStore,
     upstreamAuthStore,
-    identitySigner,
     coordinator,
     proxy,
   });

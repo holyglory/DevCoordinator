@@ -46,7 +46,7 @@ API_UNIT = "dev-coordinator.service"
 CONSOLE_UNIT = "devops-console.service"
 DATABASE = Path("/var/lib/devcoordinator/coordinator.sqlite3")
 PROFILE = Path("/etc/devcoordinator/client-profiles.json")
-BROKER_SOCKET = Path("/run/devcoordinator/broker.sock")
+BROKER_SOCKET = Path("/run/devcoordinator-authority.sock")
 DEPLOY_LOCK = Path("/run/devcoordinator-deploy.lock")
 CLIENT_GROUP = "devcoordinator-clients"
 SCHEMA_BEFORE = 9
@@ -91,7 +91,6 @@ class Driver:
         self.schema_after = SCHEMA_AFTER
         self.repository = Path(args.repository).resolve(strict=True)
         self.transaction = Path(args.transaction_dir)
-        self.token_file = Path(args.token_file)
         self.console_env_file = Path(args.console_env_file)
         console_state_dir = Path(args.console_state_dir)
         if not console_state_dir.is_absolute() or ".." in console_state_dir.parts:
@@ -510,31 +509,6 @@ class Driver:
             )
 
     def inventory(self, name: str) -> dict[str, Any]:
-        if not self.token_file.is_absolute() or ".." in self.token_file.parts:
-            raise DeploymentError("Coordinator API token path must be absolute")
-        metadata = self.token_file.lstat()
-        if (
-            stat.S_ISLNK(metadata.st_mode)
-            or not stat.S_ISREG(metadata.st_mode)
-            or stat.S_IMODE(metadata.st_mode) != 0o600
-            or metadata.st_size <= 0
-            or metadata.st_size > 16 * 1024
-        ):
-            raise DeploymentError("Coordinator API token file is unsafe")
-        descriptor = os.open(
-            self.token_file,
-            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
-        )
-        try:
-            opened = os.fstat(descriptor)
-            if (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino):
-                raise DeploymentError("Coordinator API token changed while opening")
-            payload = os.read(descriptor, 16 * 1024 + 1)
-        finally:
-            os.close(descriptor)
-        token = payload.decode("utf-8").strip()
-        if not token:
-            raise DeploymentError("Coordinator API token is empty")
         query = urllib.parse.urlencode(
             {
                 "project": str(self.repository),
@@ -544,27 +518,26 @@ class Driver:
         )
         request = urllib.request.Request(
             f"http://127.0.0.1:29876/v1/inventory/no-docker?{query}",
-            headers={"Authorization": f"Bearer {token}"},
         )
         with urllib.request.urlopen(request, timeout=20) as response:
             if response.status != 200:
                 raise DeploymentError(
-                    f"authenticated inventory returned {response.status}"
+                    f"trusted-loopback inventory returned {response.status}"
                 )
             payload = response.read(MAX_INVENTORY_RESPONSE_BYTES + 1)
         if len(payload) > MAX_INVENTORY_RESPONSE_BYTES:
             raise DeploymentError(
-                "authenticated inventory exceeds the bounded "
+                "trusted-loopback inventory exceeds the bounded "
                 f"{MAX_INVENTORY_RESPONSE_BYTES}-byte deployment limit"
             )
         try:
             document = json.loads(payload)
         except (UnicodeDecodeError, json.JSONDecodeError) as error:
             raise DeploymentError(
-                "authenticated inventory returned invalid JSON"
+                "trusted-loopback inventory returned invalid JSON"
             ) from error
         if not isinstance(document, dict):
-            raise DeploymentError("authenticated inventory must be a JSON object")
+            raise DeploymentError("trusted-loopback inventory must be a JSON object")
         _json_write(self.transaction / name, document)
         return document
 
@@ -899,8 +872,6 @@ class Driver:
                 "--",
                 "/usr/bin/python3",
                 str(self.repository / "scripts/check_coordinator_auth_boundary.py"),
-                "--token-file",
-                str(self.token_file),
                 "--host",
                 "127.0.0.1",
                 "--port",
@@ -911,7 +882,7 @@ class Driver:
         inventory = self.inventory(inventory_name)
         if CONSOLE_SERVER_ID not in json.dumps(inventory, sort_keys=True):
             raise DeploymentError(
-                "authenticated inventory omitted the exact Console server identity"
+                "trusted-loopback inventory omitted the exact Console server identity"
             )
         self.run(
             [
@@ -921,10 +892,6 @@ class Driver:
                 CONSOLE_UNIT,
                 "--main-pid",
                 str(console["MainPID"]),
-                "--token-file",
-                str(self.token_file),
-                "--token-owner-uid",
-                str(self.console_uid),
                 "--project",
                 str(self.repository),
                 "--name",
@@ -1261,7 +1228,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--client-user", action="append", required=True)
     parser.add_argument("--public-url", action="append", required=True)
-    parser.add_argument("--token-file", required=True)
     parser.add_argument("--console-env-file", required=True)
     parser.add_argument("--console-state-dir", required=True)
     parser.add_argument(

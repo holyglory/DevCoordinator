@@ -20,12 +20,12 @@ from devcoordinator.broker_backend import StoreBackedMutationBackend
 from devcoordinator.broker_persistence import StoreBackedAuthorizer
 from devcoordinator.broker_profile import (
     BrokerClientProfile,
-    BrokerProfileError,
     BrokerRepositoryProfile,
     BrokerServiceProfile,
 )
 from devcoordinator.cleanup_lifecycle import DockerCleanupBackend
 from devcoordinator.repository_lifecycle import ResourceKind
+from devcoordinator.schema import establish_repository_owner_authority
 from devcoordinator.sqlite_lifecycle import SQLiteLifecyclePersistence
 from devcoordinator.store import CoordinatorStore, fingerprint, utc_timestamp
 from devcoordinator.tests import test_broker as fixtures
@@ -395,6 +395,22 @@ class GenericLifecycleBrokerTests(unittest.TestCase):
                                   'fixture', ?, 'removed anchor', ?)
                         """,
                         (now, now),
+                    )
+                    establish_repository_owner_authority(
+                        connection,
+                        repository_id="repo-inactive-anchor",
+                        owner_uid=os.geteuid(),
+                        repository_generation=1,
+                        operation_id="generic-inactive-anchor-owner-fixture",
+                        actor="generic-lifecycle-fixture",
+                        reason="explicit inactive transport anchor owner",
+                        timestamp=now,
+                        evidence={
+                            "kind": "generic-inactive-anchor-owner-fixture",
+                            "repository_id": "repo-inactive-anchor",
+                            "repository_generation": 1,
+                            "owner_uid": os.geteuid(),
+                        },
                     )
             persistence.provision_repository_enrollment(
                 uid=os.geteuid(),
@@ -807,22 +823,32 @@ class GenericLifecycleHttpTests(unittest.TestCase):
             self.assertEqual(observations, 2)
             self.assertTrue(applied["pre_apply_observation"]["docker_available"])
 
-    def test_expired_profile_fails_before_archive_broker_call(self) -> None:
+    def test_profile_expiry_is_informational_for_local_archive_reads(self) -> None:
         root = str(Path("/repos/expired").resolve())
         repository = BrokerRepositoryProfile(
             canonical_root=root,
             repo_id="repo-expired",
             generation=1,
+            owner_uid=1000,
             server_ids={},
             container_ids={},
             compose_definition_id=None,
+            compose_container_ids=frozenset(),
+            compose_run_once_services={},
+            ephemeral_templates={},
+            ephemeral_image_prefetch_template_ids=frozenset(),
+            ephemeral_secret_policies={},
+            account_id="account-expired",
+            enabled=True,
+            issued_at="2026-07-18T00:00:00Z",
+            valid_until_epoch=int(time.time()) - 1,
         )
         profile = BrokerClientProfile(
             service=BrokerServiceProfile(
-                socket_path=Path("/run/devcoordinator/broker.sock"),
+                socket_path=Path("/run/devcoordinator-authority.sock"),
                 service_uid=0,
                 socket_gid=0,
-                socket_mode=0o660,
+                socket_mode=0o666,
                 database_generation="generation-expired",
             ),
             client_uid=os.geteuid(),
@@ -833,10 +859,14 @@ class GenericLifecycleHttpTests(unittest.TestCase):
         )
         with mock.patch.object(
             dev_coordinator, "configured_broker_profile", return_value=profile
-        ), mock.patch.object(BrokerClientProfile, "call") as broker_call:
-            with self.assertRaisesRegex(BrokerProfileError, "expired"):
-                dev_coordinator.coordinated_list_archives()
-        broker_call.assert_not_called()
+        ), mock.patch.object(
+            BrokerClientProfile,
+            "call",
+            return_value=("archive-read-operation", {"archives": []}),
+        ) as broker_call:
+            result = dev_coordinator.coordinated_list_archives()
+        self.assertEqual(result, {"archives": []})
+        broker_call.assert_called_once()
 
 
 if __name__ == "__main__":

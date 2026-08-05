@@ -10,13 +10,16 @@ import {
 
 const config = { projectRoot: '/home/DevCoordinator' };
 
-test('production coordinator definition probes the Console through TLS', async () => {
+test('production Console is not cataloged as a project development server', async () => {
   const runtime = JSON.parse(
     await readFile(new URL('../../../.codex/dev-runtime.json', import.meta.url), 'utf8'),
   );
-  const definition = runtime.servers?.find((server) => server.name === 'devops-console');
-  assert.ok(definition, 'devops-console coordinator definition must exist');
-  assert.equal(definition.health_url, 'https://127.0.0.1:{port}/healthz');
+  assert.equal(runtime.name, 'devcoordinator');
+  assert.deepEqual(
+    runtime.servers,
+    [],
+    'the blue/green control-plane Console must not appear as an unobserved project server',
+  );
 });
 
 test('production registration retries and sends the exact edge identity', async () => {

@@ -1,0 +1,15 @@
+[Unit]
+Description=DevCoordinator stable loopback API listener
+
+[Socket]
+ListenStream=127.0.0.1:29876
+Accept=no
+Service=devcoordinator-api.service
+FileDescriptorName=api
+Backlog=256
+NoDelay=yes
+KeepAlive=yes
+RemoveOnStop=no
+
+[Install]
+WantedBy=sockets.target

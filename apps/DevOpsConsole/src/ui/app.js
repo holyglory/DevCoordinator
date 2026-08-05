@@ -1,6 +1,6 @@
 /* DevOps Console control panel.
  * Vanilla JS, no dependencies. Talks only to same-origin /api/*.
- * Hash-routed pages (#/projects, #/tests, #/servers, #/routes, #/docker, #/ports,
+ * Hash-routed pages (#/projects, #/tests, #/bugs, #/servers, #/routes, #/docker, #/ports,
  * #/performance, #/access, #/invites, #/telegram)
  * share one sticky status bar. Polls GET /api/overview every 6s and
  * GET /api/metrics/history every 10s (both paused while the tab is hidden),
@@ -11,6 +11,7 @@
 
   const POLL_MS = 6000;
   const METRICS_POLL_MS = 10_000;
+  const TESTS_POLL_MS = 5000;
   const METRICS_LIMIT_SPARK = 90; // row sparkline window (~15 min at 10s sampling)
   const METRICS_LIMIT_FULL = 360; // performance-page window (~1 h at 10s)
   const RESOURCE_PAGE_SIZE = 75;  // bound selectable DOM for host-wide inventories
@@ -31,15 +32,53 @@
     access: null,        // owner-only GET /api/access payload ({ users, resources })
     invites: null,       // owner-only GET /api/access/requests payload
     telegram: null,      // GET /api/telegram payload for bots manageable by this account
+    bugs: null,          // independent open-only Coordinator bug registry
+    bugsError: null,     // local retained/cold error; never promoted to the global banner
+    bugsErrorContext: null, // refresh or close, for truthful retained-state copy
+    bugsLoading: false,
+    bugsClosing: new Set(),
+    bugsTransferBusy: false,
     archives: null,      // owner-only GET /api/lifecycle/list ({ archives })
     tests: null,         // selected repository's Coordinator-owned test statistics
+    testsFleet: null,    // retained fleet-wide test projection
     testsRepositories: null, // lightweight enrolled repository catalog
     testsProject: null,
     testsDays: 30,
+    testsHours: 24,
+    testsSearch: '',
     testsLoading: false,
+    testsDetailLoading: false,
+    testsDetailLoadingKey: null,
+    testsDetailRequest: 0,
     testsRepositoriesLoading: false,
     testsQueryKey: null,
     testsLoadedAt: 0,
+    testsFleetQueryKey: null,
+    testsFleetLoadedAt: 0,
+    testsFleetStale: false,
+    testsRenderSignature: null,
+    testsError: null,
+    testsDetailError: null,
+    testsDetailTab: 'overview',
+    testsRuns: null,
+    testsRunsLoading: false,
+    testsRunsError: null,
+    testsRunEvidence: new Map(),
+    testsSetup: null,
+    testsSetupLoading: false,
+    testsSetupError: null,
+    testsCatalogError: null,
+    testsPlan: null,
+    testsPlanOperationId: null,
+    testsRunTargetSetup: null,
+    testsRunTargetLoading: false,
+    testsRunTargetError: null,
+    testsRunTargetRequest: 0,
+    testsRunSourceCatalog: null,
+    testsRunSourceLoading: false,
+    testsRunSourceError: null,
+    testsRunSourceRequest: 0,
+    testsRunSourceSelections: new Map(),
   };
 
   const ui = {
@@ -56,8 +95,18 @@
     resourcePages: { projects: 0, servers: 0, docker: 0 }, // zero-based page per large collection
     lifecycleViews: { projects: 'active', servers: 'active', docker: 'active' },
     archiveGroupsExpanded: { projects: new Set(), servers: new Set(), docker: new Set() },
+    performanceProjectKey: null, // stable segment key selected in the Performance legend
+    performanceProjectRecord: null, // retained detail while a fresh sample is incomplete
+    performanceReturnFocus: null, // exact legend button when it survives a refresh
+    performanceReturnFocusMetric: null, // fallback legend when the button is rebuilt
+    // Native <details> are rebuilt as inventory observations refresh. Retain
+    // their user-selected state outside the DOM so an opaque host-resource ID
+    // changing during a fresh observation cannot close evidence being read.
+    sectionDisclosures: new Map(),
     lifecycleDialog: null, // { action, target, stage, plan, returnFocusKey }
     lifecycleFocus: null,  // target revealed after a successful archive/restore/purge
+    bugFocusAfterClose: null, // logical row to focus after an exact report disappears
+    bugTransferReturnFocus: null,
     version: 0,            // bumped on any ui-state change to invalidate sigs
   };
   const bump = () => { ui.version += 1; };
@@ -100,9 +149,15 @@
     link: '<svg viewBox="0 0 16 16" width="13" height="13"><path d="M6.5 9.5l3-3M7 4.5l1-1a2.1 2.1 0 0 1 3 3l-1 1M9 11.5l-1 1a2.1 2.1 0 0 1-3-3l1-1" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>',
     edit: '<svg viewBox="0 0 16 16" width="13" height="13"><path d="M11.2 3.3l1.5 1.5-7 7-2 .5.5-2z" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/></svg>',
     plus: '<svg viewBox="0 0 16 16" width="13" height="13"><path d="M8 3.5v9M3.5 8h9" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>',
+    clock: '<svg viewBox="0 0 16 16" width="13" height="13"><circle cx="8" cy="8" r="5.5" fill="none" stroke="currentColor" stroke-width="1.3"/><path d="M8 4.8v3.5l2.4 1.4" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>',
     eyeoff: '<svg viewBox="0 0 16 16" width="13" height="13"><path d="M2 8s2.2-3.8 6-3.8S14 8 14 8s-2.2 3.8-6 3.8S2 8 2 8Z" fill="none" stroke="currentColor" stroke-width="1.3"/><circle cx="8" cy="8" r="1.7" fill="none" stroke="currentColor" stroke-width="1.3"/><path d="M3 13 13 3" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>',
     eye: '<svg viewBox="0 0 16 16" width="13" height="13"><path d="M2 8s2.2-3.8 6-3.8S14 8 14 8s-2.2 3.8-6 3.8S2 8 2 8Z" fill="none" stroke="currentColor" stroke-width="1.3"/><circle cx="8" cy="8" r="1.7" fill="none" stroke="currentColor" stroke-width="1.3"/></svg>',
     archive: '<svg viewBox="0 0 16 16" width="13" height="13"><path d="M2.5 4.5h11v8.2a.8.8 0 0 1-.8.8H3.3a.8.8 0 0 1-.8-.8Z" fill="none" stroke="currentColor" stroke-width="1.3"/><path d="M2 2.5h12v2H2zM6 7.5h4" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg>',
+    server: '<svg viewBox="0 0 16 16" width="16" height="16"><rect x="2.5" y="2.5" width="11" height="4.5" rx="1" fill="none" stroke="currentColor" stroke-width="1.3"/><rect x="2.5" y="9" width="11" height="4.5" rx="1" fill="none" stroke="currentColor" stroke-width="1.3"/><circle cx="5" cy="4.75" r=".75" fill="currentColor"/><circle cx="5" cy="11.25" r=".75" fill="currentColor"/><path d="M8 4.75h3M8 11.25h3" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/></svg>',
+    worker: '<svg viewBox="0 0 16 16" width="16" height="16"><circle cx="8" cy="8" r="2.25" fill="none" stroke="currentColor" stroke-width="1.3"/><path d="M8 2.2v1.4M8 12.4v1.4M2.2 8h1.4M12.4 8h1.4M3.9 3.9l1 1M11.1 11.1l1 1M12.1 3.9l-1 1M4.9 11.1l-1 1" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg>',
+    container: '<svg viewBox="0 0 16 16" width="16" height="16"><path d="m8 2.2 5 2.7v6.2L8 13.8l-5-2.7V4.9Z" fill="none" stroke="currentColor" stroke-width="1.25" stroke-linejoin="round"/><path d="m3.3 5 4.7 2.6L12.7 5M8 7.6v5.8" fill="none" stroke="currentColor" stroke-width="1.25" stroke-linejoin="round"/></svg>',
+    database: '<svg viewBox="0 0 16 16" width="16" height="16"><ellipse cx="8" cy="3.8" rx="5" ry="2.1" fill="none" stroke="currentColor" stroke-width="1.25"/><path d="M3 3.8v4.1C3 9.1 5.2 10 8 10s5-.9 5-2.1V3.8M3 7.9V12c0 1.2 2.2 2.1 5 2.1s5-.9 5-2.1V7.9" fill="none" stroke="currentColor" stroke-width="1.25"/></svg>',
+    temporary: '<svg viewBox="0 0 16 16" width="16" height="16"><path d="M2.7 4.3h4l1.2 1.4h5.4v7.1a1 1 0 0 1-1 1H3.7a1 1 0 0 1-1-1Z" fill="none" stroke="currentColor" stroke-width="1.25" stroke-linejoin="round"/><circle cx="11.2" cy="5" r="3" fill="var(--bg, #111820)" stroke="currentColor" stroke-width="1.2"/><path d="M11.2 3.4v1.8l1.1.7" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/></svg>',
   };
 
   function icon(name) {
@@ -240,13 +295,55 @@
     return value?.classification === 'maintenance' || value?.code === 'maintenance_in_progress';
   }
 
+  function isEdgePublicationError(value) {
+    return value?.classification === 'edge_publication'
+      || (typeof value?.code === 'string' && value.code.startsWith('edge_publication_'));
+  }
+
+  function renderLocalPublicationError(element, value, { onActivated } = {}) {
+    const message = value?.message ?? String(value);
+    const retry = h('button', { class: 'btn small', type: 'button' }, 'Activate now');
+    retry.addEventListener('click', async () => {
+      retry.disabled = true;
+      retry.textContent = 'Activating…';
+      try {
+        await api('/api/edge-publication/reconcile', { method: 'POST' });
+        element.remove();
+        announce('Public routes updated');
+        await onActivated?.();
+      } catch (error) {
+        retry.disabled = false;
+        retry.textContent = 'Try again';
+        const copy = element.querySelector('.local-publication-copy');
+        if (copy) copy.textContent = error?.message ?? String(error);
+      }
+    });
+    element.classList.add('local-publication-error');
+    element.setAttribute('role', 'alert');
+    element.replaceChildren(
+      h('span', { class: 'local-publication-copy' }, message),
+      retry,
+    );
+    element.hidden = false;
+  }
+
+  function showSectionPublicationError(bodyId, value, onActivated) {
+    const body = document.getElementById(bodyId);
+    if (!body) return;
+    body.querySelector('.local-publication-error')?.remove();
+    const local = h('div', { class: 'form-error local-publication-error' });
+    body.prepend(local);
+    renderLocalPublicationError(local, value, { onActivated });
+  }
+
   function showBanner(value, retry, key = 'action') {
     const maintenance = isMaintenanceError(value);
-    if (maintenance) {
+    if (maintenance || isEdgePublicationError(value)) {
       // Planned maintenance and background refreshes are not decisions the
-      // user can act on. Keep retained content or skeletons in place without
-      // turning normal loading into a global text badge.
-      clearBanner('maintenance');
+      // user can act on globally. Publication failures belong beside the
+      // route/access control that caused them; the edge keeps serving its
+      // last-known-good snapshot.
+      if (maintenance) clearBanner('maintenance');
       return;
     }
     const message = value?.message ?? String(value);
@@ -348,6 +445,170 @@
     if (popover.key !== null && !popEl.contains(e.target)) popover.close();
   }, true);
 
+  // Resource-kind icons replace repetitive text badges in the Projects tree.
+  // Their explanation remains available without spending permanent row width:
+  // hover/focus is transient, while click/touch pins the same tooltip.
+  const PROJECT_RESOURCE_KINDS = Object.freeze({
+    server: Object.freeze({
+      icon: 'server', css: 'k-srv', label: 'Server',
+      hint: 'A host process registered to this repository.',
+    }),
+    worker: Object.freeze({
+      icon: 'worker', css: 'k-worker', label: 'Worker',
+      hint: 'A supervised host process that the Coordinator can keep alive.',
+    }),
+    container: Object.freeze({
+      icon: 'container', css: 'k-dock', label: 'Container',
+      hint: 'A Docker container attributed to this repository.',
+    }),
+    database: Object.freeze({
+      icon: 'database', css: 'k-db', label: 'Database',
+      hint: 'A database service running in an attributed Docker container.',
+    }),
+    temporary: Object.freeze({
+      icon: 'temporary', css: 'k-temp', label: 'Temporary repository',
+      hint: 'An isolated repository scope with its own expiry and cleanup policy.',
+    }),
+  });
+
+  const resourceKindTooltipEl = $('#resource-kind-tooltip');
+  let activeResourceKindTooltipKey = null;
+  let pinnedResourceKindTooltipKey = null;
+  let resourceKindTooltipFrame = null;
+
+  function resourceKindTooltipTarget(key) {
+    if (!key) return null;
+    return document.querySelector(`[data-fk="${CSS.escape(key)}"]`);
+  }
+
+  function positionResourceKindTooltip(target) {
+    if (!target?.isConnected || resourceKindTooltipEl.hidden) return;
+    // Keep the measurement position inside the viewport. Browser automation
+    // (and assistive focus changes) can observe geometry between style/layout
+    // updates; briefly placing the tooltip at 0,0 made an otherwise correctly
+    // clamped hint appear flush with the viewport edge on narrow screens.
+    const margin = 8;
+    resourceKindTooltipEl.style.visibility = 'hidden';
+    resourceKindTooltipEl.style.left = `${margin}px`;
+    resourceKindTooltipEl.style.top = `${margin}px`;
+    const targetRect = target.getBoundingClientRect();
+    const tooltipRect = resourceKindTooltipEl.getBoundingClientRect();
+    const gap = 7;
+    const maxLeft = Math.max(margin, window.innerWidth - tooltipRect.width - margin);
+    const left = Math.min(
+      maxLeft,
+      Math.max(margin, targetRect.left + (targetRect.width / 2) - (tooltipRect.width / 2)),
+    );
+    let top = targetRect.top - tooltipRect.height - gap;
+    if (top < margin) top = targetRect.bottom + gap;
+    const maxTop = Math.max(margin, window.innerHeight - tooltipRect.height - margin);
+    top = Math.min(maxTop, Math.max(margin, top));
+    resourceKindTooltipEl.style.left = `${Math.round(left)}px`;
+    resourceKindTooltipEl.style.top = `${Math.round(top)}px`;
+    resourceKindTooltipEl.style.visibility = '';
+  }
+
+  function showResourceKindTooltip(target) {
+    if (!target?.isConnected) return;
+    const key = target.dataset.fk;
+    if (!key || (pinnedResourceKindTooltipKey && pinnedResourceKindTooltipKey !== key)) return;
+    activeResourceKindTooltipKey = key;
+    target.setAttribute('aria-pressed', String(pinnedResourceKindTooltipKey === key));
+    resourceKindTooltipEl.replaceChildren(
+      h('strong', { class: 'resource-kind-tooltip-label' }, target.dataset.kindLabel || ''),
+      h('span', { class: 'resource-kind-tooltip-copy' }, target.dataset.kindHint || ''),
+    );
+    resourceKindTooltipEl.hidden = false;
+    positionResourceKindTooltip(target);
+  }
+
+  function hideResourceKindTooltip(key = null, force = false) {
+    if (key && activeResourceKindTooltipKey !== key) return;
+    if (!force && pinnedResourceKindTooltipKey) return;
+    if (force && pinnedResourceKindTooltipKey) {
+      resourceKindTooltipTarget(pinnedResourceKindTooltipKey)?.setAttribute('aria-pressed', 'false');
+      pinnedResourceKindTooltipKey = null;
+    }
+    activeResourceKindTooltipKey = null;
+    resourceKindTooltipEl.hidden = true;
+  }
+
+  function togglePinnedResourceKindTooltip(target) {
+    const key = target.dataset.fk;
+    if (pinnedResourceKindTooltipKey === key) {
+      target.setAttribute('aria-pressed', 'false');
+      pinnedResourceKindTooltipKey = null;
+      hideResourceKindTooltip(null, true);
+      return;
+    }
+    resourceKindTooltipTarget(pinnedResourceKindTooltipKey)?.setAttribute('aria-pressed', 'false');
+    pinnedResourceKindTooltipKey = key;
+    target.setAttribute('aria-pressed', 'true');
+    showResourceKindTooltip(target);
+  }
+
+  function refreshResourceKindTooltip() {
+    const key = pinnedResourceKindTooltipKey || activeResourceKindTooltipKey;
+    if (!key) return;
+    const target = resourceKindTooltipTarget(key);
+    if (!target) {
+      hideResourceKindTooltip(null, true);
+      return;
+    }
+    showResourceKindTooltip(target);
+  }
+
+  function scheduleResourceKindTooltipRefresh() {
+    if (resourceKindTooltipFrame !== null) return;
+    resourceKindTooltipFrame = window.requestAnimationFrame(() => {
+      resourceKindTooltipFrame = null;
+      refreshResourceKindTooltip();
+    });
+  }
+
+  function projectResourceKindTrigger(kind, stableKey) {
+    const meta = PROJECT_RESOURCE_KINDS[kind];
+    const fk = `tree-kind:${kind}:${String(stableKey ?? '')}`;
+    const trigger = h('button', {
+      class: `resource-kind-trigger kind-icon-button ${meta.css}`,
+      type: 'button',
+      'data-fk': fk,
+      'data-resource-kind': kind,
+      'data-kind-label': meta.label,
+      'data-kind-hint': meta.hint,
+      'aria-label': `${meta.label}: ${meta.hint}`,
+      'aria-describedby': 'resource-kind-tooltip',
+      'aria-pressed': String(pinnedResourceKindTooltipKey === fk),
+      onclick: (event) => {
+        event.stopPropagation();
+        togglePinnedResourceKindTooltip(trigger);
+      },
+      onpointerenter: () => showResourceKindTooltip(trigger),
+      onpointerleave: () => {
+        if (document.activeElement !== trigger) hideResourceKindTooltip(fk);
+      },
+      onfocus: () => showResourceKindTooltip(trigger),
+      onblur: () => {
+        if (!trigger.matches(':hover')) hideResourceKindTooltip(fk);
+      },
+    }, icon(meta.icon), h('span', { class: 'visually-hidden' }, meta.label));
+    return trigger;
+  }
+
+  document.addEventListener('pointerdown', (event) => {
+    if (!pinnedResourceKindTooltipKey) return;
+    const target = resourceKindTooltipTarget(pinnedResourceKindTooltipKey);
+    if (target?.contains(event.target) || resourceKindTooltipEl.contains(event.target)) return;
+    hideResourceKindTooltip(null, true);
+  }, true);
+  document.addEventListener('keydown', (event) => {
+    if (event.key !== 'Escape' || !activeResourceKindTooltipKey) return;
+    event.preventDefault();
+    hideResourceKindTooltip(null, true);
+  });
+  window.addEventListener('resize', scheduleResourceKindTooltipRefresh);
+  document.addEventListener('scroll', scheduleResourceKindTooltipRefresh, true);
+
   function popHead(title) {
     return h('div', { class: 'pop-head' },
       h('span', { class: 'pop-title' }, title),
@@ -368,6 +629,7 @@
   const PAGES = [
     { id: 'projects', title: 'Projects' },
     { id: 'tests', title: 'Tests' },
+    { id: 'bugs', title: 'Bugs' },
     { id: 'servers', title: 'Servers' },
     { id: 'routes', title: 'Routes' },
     { id: 'docker', title: 'Docker' },
@@ -397,6 +659,18 @@
 
   function applyPage() {
     const page = currentPage();
+    if (page === 'bugs') {
+      clearBanner('maintenance');
+      clearBanner('overview');
+    }
+    if (page !== 'tests' && $('#test-detail-dialog')?.open) closeTestDetail();
+    if (page !== 'bugs') {
+      closeBugTransfer('export', { restoreFocus: false });
+      closeBugTransfer('import', { restoreFocus: false });
+    }
+    if (page !== 'performance' && $('#perf-project-dialog')?.open) {
+      closePerformanceProject({ restoreFocus: false });
+    }
     for (const sec of document.querySelectorAll('#main [data-page]')) {
       sec.hidden = sec.dataset.page !== page;
     }
@@ -410,13 +684,14 @@
     // Hash navigation changes which dynamic body is allowed to stay mounted.
     // Rebuild immediately from the latest overview instead of waiting for the
     // next six-second poll.
-    if (state.overview) renderAll(true);
+    if (state.overview || page === 'bugs') renderAll(true);
     // The performance page charts use a longer history window than sparklines.
     if (page === 'performance') refreshMetrics();
     if (page === 'tests') {
       loadTestRepositories();
-      loadTests();
+      loadTests({ force: true });
     }
+    if (page === 'bugs') loadBugs();
     if (page === 'access' && state.session?.accessAdmin === true) loadAccess();
     if (page === 'invites' && state.session?.accessAdmin === true) loadInvites();
     if (page === 'telegram' && state.session?.email) loadTelegram();
@@ -424,17 +699,114 @@
 
   function wireNav() {
     $('#nav-toggle').addEventListener('click', () => setNavOpen(!navOpen()));
-    $('#tests-project').addEventListener('change', (event) => {
-      state.testsProject = event.currentTarget.value;
-      state.tests = null;
-      state.testsQueryKey = null;
+    $('#tests-search').addEventListener('input', (event) => {
+      state.testsSearch = event.currentTarget.value;
+      renderTests();
+    });
+    $('#tests-hours').addEventListener('change', (event) => {
+      state.testsHours = Number(event.currentTarget.value);
+      state.testsFleetQueryKey = null;
       loadTests({ force: true });
     });
     $('#tests-days').addEventListener('change', (event) => {
       state.testsDays = Number(event.currentTarget.value);
       state.tests = null;
       state.testsQueryKey = null;
-      loadTests({ force: true });
+      loadTestDetail({ force: true });
+    });
+    $('#tests-run').addEventListener('click', () => openTestRunDialog());
+    $('#bugs-refresh').addEventListener('click', () => loadBugs({ force: true }));
+    $('#bugs-export').addEventListener('click', openBugExport);
+    $('#bugs-import').addEventListener('click', openBugImport);
+    $('#bugs-export-close').append(icon('x'));
+    $('#bugs-export-close').addEventListener('click', () => closeBugTransfer('export'));
+    $('#bugs-export-cancel').addEventListener('click', () => closeBugTransfer('export'));
+    $('#bugs-export-copy').addEventListener('click', copyBugExport);
+    $('#bugs-export-dialog').addEventListener('cancel', (event) => {
+      event.preventDefault();
+      closeBugTransfer('export');
+    });
+    $('#bugs-import-close').append(icon('x'));
+    $('#bugs-import-close').addEventListener('click', () => closeBugTransfer('import'));
+    $('#bugs-import-cancel').addEventListener('click', () => closeBugTransfer('import'));
+    $('#bugs-import-form').addEventListener('submit', (event) => {
+      event.preventDefault();
+      importBugs();
+    });
+    $('#bugs-import-dialog').addEventListener('cancel', (event) => {
+      event.preventDefault();
+      closeBugTransfer('import');
+    });
+    $('#test-detail-close').append(icon('x'));
+    $('#test-detail-close').addEventListener('click', closeTestDetail);
+    $('#test-detail-dialog').addEventListener('cancel', (event) => {
+      event.preventDefault();
+      closeTestDetail();
+    });
+    $('#perf-project-dialog-close').append(icon('x'));
+    $('#perf-project-dialog-close').addEventListener('click', () => closePerformanceProject());
+    $('#perf-project-dialog').addEventListener('cancel', (event) => {
+      event.preventDefault();
+      closePerformanceProject();
+    });
+    window.addEventListener('resize', positionTestDetail, { passive: true });
+    testDetailNarrowViewport.addEventListener('change', syncTestDetailSurface);
+    window.addEventListener('keydown', (event) => {
+      const dialog = $('#test-detail-dialog');
+      if (event.key !== 'Escape' || !dialog.open || dialog.matches(':modal')) return;
+      event.preventDefault();
+      closeTestDetail();
+    });
+    $('#test-detail-run').addEventListener('click', () => openTestRunDialog(state.testsProject));
+    $('#test-detail-runs').addEventListener('click', () => selectTestDetailTab('runs'));
+    for (const tab of document.querySelectorAll('[data-test-detail-tab]')) {
+      tab.addEventListener('click', () => selectTestDetailTab(tab.dataset.testDetailTab));
+      tab.addEventListener('keydown', (event) => {
+        if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
+        event.preventDefault();
+        const tabs = [...document.querySelectorAll('[data-test-detail-tab]')];
+        const current = tabs.indexOf(event.currentTarget);
+        const index = event.key === 'Home' ? 0
+          : event.key === 'End' ? tabs.length - 1
+            : (current + (event.key === 'ArrowRight' ? 1 : -1) + tabs.length) % tabs.length;
+        const next = tabs[index];
+        selectTestDetailTab(next.dataset.testDetailTab);
+        next.focus();
+      });
+    }
+    $('#test-run-close').append(icon('x'));
+    $('#test-run-close').addEventListener('click', closeTestRunDialog);
+    $('#test-run-cancel').addEventListener('click', closeTestRunDialog);
+    $('#test-run-dialog').addEventListener('cancel', (event) => {
+      event.preventDefault();
+      closeTestRunDialog();
+    });
+    $('#test-run-preview-button').addEventListener('click', previewTestRun);
+    $('#test-run-project').addEventListener('change', () => {
+      resetTestRunPreview();
+      const repoId = $('#test-run-project').value;
+      state.testsRunTargetSetup = null;
+      state.testsRunTargetError = null;
+      state.testsRunSourceCatalog = null;
+      state.testsRunSourceError = null;
+      loadTestRunTargets(repoId);
+      loadTestRunSources(repoId);
+    });
+    $('#test-run-source').addEventListener('change', () => {
+      const source = selectedTestRunSource();
+      if (source) state.testsRunSourceSelections.set($('#test-run-project').value, sourceKey(source.selector));
+      resetTestRunPreview();
+    });
+    $('#test-run-intent').addEventListener('change', () => {
+      resetTestRunPreview();
+      updateTestRunTargetField();
+      if ($('#test-run-intent').value === 'manual') {
+        loadTestRunTargets($('#test-run-project').value);
+      }
+    });
+    $('#test-run-form').addEventListener('submit', (event) => {
+      event.preventDefault();
+      submitTestRun();
     });
     window.addEventListener('hashchange', applyPage);
     document.addEventListener('pointerdown', (e) => {
@@ -445,6 +817,367 @@
     document.addEventListener('keydown', (e) => {
       if (e.key === 'Escape' && navOpen()) setNavOpen(false);
     });
+  }
+
+  // ---------------------------------------------------------------- open Coordinator bugs
+
+  function validBugsPayload(payload) {
+    if (!payload || payload.schema_version !== 1 || !Array.isArray(payload.bugs)) return false;
+    return payload.bugs.every((bug) => (
+      bug && typeof bug === 'object' && !Array.isArray(bug)
+      && typeof bug.bug_id === 'string' && bug.bug_id.length > 0
+      && typeof bug.fingerprint === 'string' && bug.fingerprint.length > 0
+      && typeof bug.component === 'string' && bug.component.length > 0
+      && typeof bug.summary === 'string' && bug.summary.length > 0
+      && typeof bug.expected === 'string' && bug.expected.length > 0
+      && typeof bug.actual === 'string' && bug.actual.length > 0
+      && Array.isArray(bug.reproduction_steps) && bug.reproduction_steps.length > 0
+      && bug.reproduction_steps.length <= 8
+      && bug.reproduction_steps.every((step) => typeof step === 'string' && step.length > 0)
+      && Array.isArray(bug.command_argv) && bug.command_argv.length <= 64
+      && bug.command_argv.every((argument) => typeof argument === 'string' && argument.length > 0)
+      && Number.isInteger(bug.occurrence_count) && bug.occurrence_count > 0
+      && Number.isInteger(bug.peer_uid) && bug.peer_uid >= 0
+      && Number.isFinite(Date.parse(bug.first_seen_at))
+      && Number.isFinite(Date.parse(bug.last_seen_at))
+      && bug.origin && typeof bug.origin === 'object' && !Array.isArray(bug.origin)
+      && ['local', 'remote'].includes(bug.origin.kind)
+      && typeof bug.origin.server_id === 'string' && bug.origin.server_id.length > 0
+      && typeof bug.origin.bug_id === 'string' && bug.origin.bug_id.length > 0
+      && typeof bug.origin.fingerprint === 'string' && bug.origin.fingerprint.length > 0
+      && (bug.local_fallback == null || (
+        typeof bug.local_fallback === 'object' && !Array.isArray(bug.local_fallback)
+        && ['not_run', 'passed', 'failed', 'incomplete'].includes(bug.local_fallback.status)
+        && Array.isArray(bug.local_fallback.command_argv)
+        && bug.local_fallback.command_argv.length <= 64
+        && bug.local_fallback.command_argv.every((argument) => (
+          typeof argument === 'string' && argument.length > 0
+        ))
+        && bug.local_fallback.advisory === true
+        && bug.local_fallback.coordinator_evidence === false
+      ))
+    ));
+  }
+
+  function bugCommand(argv) {
+    return (argv || []).map((argument) => {
+      const value = String(argument);
+      return /^[A-Za-z0-9_./:@%+=,-]+$/.test(value)
+        ? value
+        : `'${value.replaceAll("'", "'\\''")}'`;
+    }).join(' ');
+  }
+
+  function bugFact(label, value, { mono = false } = {}) {
+    if (value === null || value === undefined || value === '') return null;
+    return h('div', { class: 'bug-fact' },
+      h('dt', null, label),
+      h('dd', { class: mono ? 'mono' : null }, String(value)));
+  }
+
+  function bugCorrelationFacts(bug) {
+    const correlations = bug.correlations || {};
+    return [
+      bugFact('Coordinator release', bug.release_digest, { mono: true }),
+      bugFact('Coordinator instance', bug.instance_id, { mono: true }),
+      bugFact('Call', correlations.call_id, { mono: true }),
+      bugFact('Operation', correlations.operation_id, { mono: true }),
+      bugFact('Run', correlations.run_id, { mono: true }),
+      bugFact('Attempt', correlations.attempt_id, { mono: true }),
+    ].filter(Boolean);
+  }
+
+  function bugArgvBlock(title, argv, description = null) {
+    if (!Array.isArray(argv) || !argv.length) return null;
+    return h('section', { class: 'bug-command-section' },
+      h('h4', null, title),
+      description ? h('p', { class: 'bug-command-context' }, description) : null,
+      h('pre', { class: 'bug-command' },
+        h('code', null, bugCommand(argv))),
+      h('details', { class: 'bug-argv-disclosure' },
+        h('summary', null, `${argv.length} structured argument${sfx(argv.length)}`),
+        h('ol', { class: 'bug-argv-list', 'aria-label': `${title} argument boundaries` },
+          argv.map((argument, index) => h('li', null,
+            h('span', { 'aria-hidden': 'true' }, `${index + 1}`),
+            h('code', null, argument))))));
+  }
+
+  function bugFallbackBlock(fallback) {
+    if (!fallback) return null;
+    const status = fallback.status.replaceAll('_', ' ');
+    return h('section', { class: 'bug-local-fallback' },
+      h('div', { class: 'bug-local-fallback-head' },
+        h('h4', null, 'Local fallback'),
+        h('span', { class: `bug-fallback-status is-${fallback.status}` }, status)),
+      h('p', { class: 'bug-advisory-label' },
+        'Advisory local check only — this is not governed Coordinator evidence.'),
+      fallback.summary ? h('p', null, fallback.summary) : null,
+      bugArgvBlock('Local command', fallback.command_argv));
+  }
+
+  function buildBugCard(bug) {
+    const busy = state.bugsClosing.has(bug.bug_id);
+    const closeButton = state.session?.accessAdmin === true
+      ? h('button', {
+          class: `btn small danger${busy ? ' is-busy' : ''}`,
+          type: 'button',
+          disabled: busy,
+          'data-fk': `bug-close:${bug.bug_id}`,
+          'aria-label': `Close Coordinator bug: ${bug.summary}`,
+          onclick: () => closeBug(bug),
+        }, busy ? 'Closing…' : 'Close')
+      : null;
+    const metadata = [
+      bugFact('Origin server', bug.origin.server_id, { mono: true }),
+      bug.origin.kind === 'remote' ? bugFact('Origin bug', bug.origin.bug_id, { mono: true }) : null,
+      bugFact('Surface', bug.surface),
+      bugFact('Stage', bug.stage),
+      bugFact('Classification', bug.classification),
+      bugFact('Code', bug.code, { mono: true }),
+      bugFact('Operation', bug.operation),
+      bugFact('Repository', bug.repository),
+      bugFact('Reported by', bug.reporter),
+      bugFact('Reporter account', `UID ${bug.peer_uid}`),
+    ].filter(Boolean);
+    const correlations = bugCorrelationFacts(bug);
+    const details = h('details', {
+      class: 'bug-details',
+      'data-section-disclosure': `bug:${bug.bug_id}`,
+      'data-section-disclosure-match': `bug-fingerprint:${bug.fingerprint}`,
+    },
+    h('summary', {
+      'data-fk': `bug-details:${bug.bug_id}`,
+      'data-section-disclosure-match': `bug-fingerprint:${bug.fingerprint}`,
+    }, 'Expected, actual and reproduction'),
+    h('div', { class: 'bug-details-body' },
+      h('div', { class: 'bug-behavior' },
+        h('section', null, h('h4', null, 'Expected'), h('p', null, bug.expected)),
+        h('section', null, h('h4', null, 'Actual'), h('p', null, bug.actual))),
+      h('section', { class: 'bug-reproduction' },
+        h('h4', null, 'Reproduce'),
+        h('ol', null, bug.reproduction_steps.map((step) => h('li', null, step)))),
+      bugArgvBlock('Coordinator command', bug.command_argv,
+        'Run with these exact argument boundaries.'),
+      bugFallbackBlock(bug.local_fallback),
+      metadata.length || correlations.length
+        ? h('dl', { class: 'bug-facts' }, metadata, correlations) : null));
+    return h('article', {
+      class: 'bug-card',
+      'data-bug-id': bug.bug_id,
+      'data-fk': `bug:${bug.bug_id}`,
+      tabindex: '-1',
+    },
+    h('div', { class: 'bug-card-head' },
+      h('div', { class: 'bug-card-copy' },
+        h('p', { class: `bug-origin${bug.origin.kind === 'remote' ? ' is-remote' : ''}` },
+          bug.origin.kind === 'remote'
+            ? `Imported from ${bug.origin.server_id}`
+            : `This server · ${bug.origin.server_id}`),
+        h('p', { class: 'bug-component' }, bug.component),
+        h('h3', null, bug.summary),
+        h('p', { class: 'bug-occurrence' },
+          `${bug.occurrence_count} occurrence${sfx(bug.occurrence_count)} · last seen ${timeAgo(Date.parse(bug.last_seen_at))}`,
+          bug.occurrence_count > 1 ? ` · first seen ${timeAgo(Date.parse(bug.first_seen_at))}` : '')),
+      closeButton),
+    details);
+  }
+
+  function buildBugs() {
+    if (!state.bugs) {
+      if (!state.bugsError) return [h('div', { class: 'skel', 'aria-hidden': 'true' })];
+      return [h('div', { class: 'bugs-local-error', role: 'alert' },
+        h('div', null,
+          h('h3', null, 'Open bugs could not be loaded'),
+          h('p', null, state.bugsError)),
+        h('button', { class: 'btn', type: 'button', onclick: () => loadBugs({ force: true }) },
+          icon('refresh'), 'Try again'))];
+    }
+    if (!state.bugs.bugs.length) {
+      return [h('div', { class: 'bugs-empty' },
+        h('p', null, 'No open Coordinator bugs.'),
+        h('span', null, 'New agent reports appear here automatically.'))];
+    }
+    return [h('div', { class: 'bug-list' }, state.bugs.bugs.map(buildBugCard))];
+  }
+
+  function renderBugs(force = false) {
+    const count = state.bugs?.bugs?.length ?? null;
+    setCount('bugs-count', count);
+    setNavCount('bugs', count > 0 ? count : null);
+    $('#bugs-import').hidden = state.session?.accessAdmin !== true;
+    const retained = $('#bugs-retained');
+    if (state.bugsError && state.bugs) {
+      retained.hidden = false;
+      retained.textContent = state.bugsErrorContext === 'close'
+        ? `${state.bugsError} The retained open collection is unchanged.`
+        : `Latest refresh failed — showing ${count} retained open report${sfx(count)}. ${state.bugsError}`;
+    } else {
+      retained.hidden = true;
+      retained.textContent = '';
+    }
+    if (currentPage() === 'bugs') {
+      setSection('bugs-body', sig(
+        state.bugs?.revision ?? null,
+        state.bugsError,
+        state.session?.accessAdmin === true,
+        [...state.bugsClosing].sort(),
+      ), buildBugs, force);
+    }
+    if (ui.bugFocusAfterClose) {
+      const key = ui.bugFocusAfterClose;
+      ui.bugFocusAfterClose = null;
+      queueMicrotask(() => (
+        document.querySelector(`[data-fk="${CSS.escape(`bug:${key}`)}"]`)
+        || $('#bugs-refresh')
+      )?.focus({ preventScroll: true }));
+    }
+  }
+
+  async function loadBugs({ force = false } = {}) {
+    if (state.bugsLoading) return;
+    if (!force && state.bugs && currentPage() !== 'bugs') {
+      setNavCount('bugs', state.bugs.bugs.length || null);
+    }
+    state.bugsLoading = true;
+    try {
+      const payload = await api('/api/bugs');
+      if (!validBugsPayload(payload)) throw new ApiError('The open-bug registry returned malformed data.', 502);
+      state.bugs = payload;
+      state.bugsError = null;
+      state.bugsErrorContext = null;
+      renderBugs();
+    } catch (error) {
+      if (error.status === 401) return;
+      state.bugsError = error.message || 'Open Coordinator bugs are temporarily unavailable.';
+      state.bugsErrorContext = 'refresh';
+      renderBugs();
+    } finally {
+      state.bugsLoading = false;
+    }
+  }
+
+  function bugTransferError(kind, message = null) {
+    const error = $(`#bugs-${kind}-error`);
+    error.hidden = !message;
+    error.textContent = message || '';
+  }
+
+  function closeBugTransfer(kind, { restoreFocus = true } = {}) {
+    const dialog = $(`#bugs-${kind}-dialog`);
+    if (dialog.open) dialog.close();
+    bugTransferError(kind);
+    if (restoreFocus) {
+      const focus = ui.bugTransferReturnFocus;
+      ui.bugTransferReturnFocus = null;
+      focus?.focus?.({ preventScroll: true });
+    }
+  }
+
+  async function openBugExport(event) {
+    const dialog = $('#bugs-export-dialog');
+    ui.bugTransferReturnFocus = event?.currentTarget || $('#bugs-export');
+    bugTransferError('export');
+    $('#bugs-export-json').value = 'Preparing export…';
+    $('#bugs-export-copy').disabled = true;
+    dialog.showModal();
+    try {
+      const payload = await api('/api/bugs/export');
+      if (!payload || payload.schema_version !== 1
+          || payload.kind !== 'devcoordinator-open-bugs' || !Array.isArray(payload.bugs)) {
+        throw new ApiError('The bug export returned malformed data.', 502);
+      }
+      $('#bugs-export-json').value = JSON.stringify(payload, null, 2);
+      $('#bugs-export-copy').disabled = false;
+      $('#bugs-export-json').focus();
+      $('#bugs-export-json').select();
+    } catch (error) {
+      $('#bugs-export-json').value = '';
+      bugTransferError('export', error.message || 'Open bugs could not be exported.');
+    }
+  }
+
+  async function copyBugExport(event) {
+    const text = $('#bugs-export-json').value;
+    if (!text) return;
+    await copyText(text, event?.currentTarget);
+    $('#bugs-export-json').focus();
+    $('#bugs-export-json').select();
+  }
+
+  function openBugImport(event) {
+    if (state.session?.accessAdmin !== true) return;
+    ui.bugTransferReturnFocus = event?.currentTarget || $('#bugs-import');
+    bugTransferError('import');
+    $('#bugs-import-json').value = '';
+    $('#bugs-import-submit').disabled = false;
+    $('#bugs-import-submit').textContent = 'Import';
+    $('#bugs-import-dialog').showModal();
+    $('#bugs-import-json').focus();
+  }
+
+  async function importBugs() {
+    if (state.bugsTransferBusy) return;
+    let bundle;
+    try {
+      bundle = JSON.parse($('#bugs-import-json').value);
+    } catch {
+      bugTransferError('import', 'Paste one valid JSON export bundle.');
+      $('#bugs-import-json').focus();
+      return;
+    }
+    state.bugsTransferBusy = true;
+    const submit = $('#bugs-import-submit');
+    submit.disabled = true;
+    submit.textContent = 'Importing…';
+    bugTransferError('import');
+    try {
+      const payload = await api('/api/bugs/import', { method: 'POST', body: bundle });
+      if (!validBugsPayload(payload)) throw new ApiError('The imported bug collection is malformed.', 502);
+      state.bugs = payload;
+      state.bugsError = null;
+      state.bugsErrorContext = null;
+      const imported = payload.import_result?.imported ?? 0;
+      const present = payload.import_result?.already_present ?? 0;
+      closeBugTransfer('import');
+      renderBugs(true);
+      announce(`Imported ${imported} open bug${sfx(imported)}${present ? `; ${present} already present` : ''}`);
+    } catch (error) {
+      bugTransferError('import', error.message || 'Open bugs could not be imported.');
+    } finally {
+      state.bugsTransferBusy = false;
+      submit.disabled = false;
+      submit.textContent = 'Import';
+    }
+  }
+
+  async function closeBug(bug) {
+    if (state.bugsClosing.has(bug.bug_id)) return;
+    const label = `${bug.component}: ${bug.summary}`;
+    if (!window.confirm(
+      `Close “${label}”?\n\nThe open report will be removed from every Console instance. No closed history is kept.`,
+    )) return;
+    const current = state.bugs?.bugs || [];
+    const index = current.findIndex((candidate) => candidate.bug_id === bug.bug_id);
+    const next = current[index + 1] || current[index - 1] || null;
+    state.bugsClosing.add(bug.bug_id);
+    renderBugs(true);
+    try {
+      const payload = await api(`/api/bugs/${encodeURIComponent(bug.bug_id)}`, { method: 'DELETE' });
+      if (!validBugsPayload(payload)) throw new ApiError('The open-bug registry returned malformed data.', 502);
+      state.bugs = payload;
+      state.bugsError = null;
+      state.bugsErrorContext = null;
+      ui.bugFocusAfterClose = next?.bug_id || '__refresh__';
+      $('#live').textContent = `Closed Coordinator bug: ${label}`;
+    } catch (error) {
+      if (error.status !== 401) {
+        state.bugsError = `Could not close “${label}”. ${error.message}`;
+        state.bugsErrorContext = 'close';
+      }
+    } finally {
+      state.bugsClosing.delete(bug.bug_id);
+      renderBugs(true);
+    }
   }
 
   // ---------------------------------------------------------------- access policy
@@ -584,10 +1317,15 @@
       announce(`${resource.host} ${allowed ? 'granted to' : 'removed from'} ${email}`);
       renderAccess();
     } catch (err) {
-      input.checked = !allowed;
-      input.disabled = false;
-      if (err.status !== 401) {
-        showBanner(err, () => changeAccessGrant(email, resource, input, allowed));
+      if (isEdgePublicationError(err)) {
+        await loadAccess({ force: true });
+        showSectionPublicationError('access-body', err, () => loadAccess({ force: true }));
+      } else {
+        input.checked = !allowed;
+        input.disabled = false;
+        if (err.status !== 401) {
+          showBanner(err, () => changeAccessGrant(email, resource, input, allowed));
+        }
       }
     }
   }
@@ -600,7 +1338,10 @@
       renderAccess();
       $('#access-add').focus({ preventScroll: true });
     } catch (err) {
-      if (err.status !== 401) showBanner(err, () => removeAccessUser(email));
+      if (isEdgePublicationError(err)) {
+        await loadAccess({ force: true });
+        showSectionPublicationError('access-body', err, () => loadAccess({ force: true }));
+      } else if (err.status !== 401) showBanner(err, () => removeAccessUser(email));
     }
   }
 
@@ -649,8 +1390,17 @@
         row?.scrollIntoView({ block: 'nearest' });
         row?.focus({ preventScroll: true });
       } catch (err) {
-        error.textContent = err.message;
-        error.hidden = false;
+        if (isEdgePublicationError(err)) {
+          renderLocalPublicationError(error, err, {
+            onActivated: async () => {
+              closeAccessDialog();
+              await loadAccess({ force: true });
+            },
+          });
+        } else {
+          error.textContent = err.message;
+          error.hidden = false;
+        }
       } finally {
         submit.disabled = false;
         submit.textContent = 'Add user';
@@ -801,7 +1551,10 @@
       announce(`Access request ${decision === 'approve' ? 'approved' : 'denied'}`);
       if (decision === 'approve' && !result?.access) loadAccess({ force: true });
     } catch (err) {
-      if (err.status !== 401) showBanner(err, () => decideInvite(request, decision), 'invites');
+      if (isEdgePublicationError(err)) {
+        await loadInvites({ force: true });
+        showSectionPublicationError('invites-body', err, () => loadInvites({ force: true }));
+      } else if (err.status !== 401) showBanner(err, () => decideInvite(request, decision), 'invites');
     } finally {
       ui.busy.delete(busyKey);
       bump();
@@ -950,12 +1703,50 @@
     return bots.map(telegramBotCard);
   }
 
+  let pendingRegisteredTelegramFocus = null;
+
+  function telegramBotRow(botId) {
+    return botId ? document.querySelector(
+      `[data-telegram-bot="${CSS.escape(String(botId))}"]`,
+    ) : null;
+  }
+
+  function restorePendingRegisteredTelegramFocus() {
+    const pending = pendingRegisteredTelegramFocus;
+    if (!pending || currentPage() !== 'telegram' || $('#telegram-dialog').open) return;
+    const active = document.activeElement;
+    const mayRestore = active === document.body
+      || active === $('#telegram-add')
+      || $('#telegram-dialog').contains(active)
+      || active?.dataset?.telegramBot === pending.botId;
+    if (!mayRestore) return;
+    setTimeout(() => {
+      if (pendingRegisteredTelegramFocus !== pending) return;
+      const row = telegramBotRow(pending.botId);
+      if (!row) return;
+      row.scrollIntoView({ block: 'nearest' });
+      row.focus({ preventScroll: true });
+    }, 0);
+  }
+
+  function requestRegisteredTelegramFocus(botId) {
+    const normalizedBotId = String(botId || '');
+    if (!normalizedBotId) return;
+    const pending = { botId: normalizedBotId };
+    pendingRegisteredTelegramFocus = pending;
+    restorePendingRegisteredTelegramFocus();
+    setTimeout(() => {
+      if (pendingRegisteredTelegramFocus === pending) pendingRegisteredTelegramFocus = null;
+    }, 5_000);
+  }
+
   function renderTelegram() {
     if (!state.session?.email) return;
     setNavCount('telegram', state.telegram ? telegramBots().length : null);
     if (currentPage() !== 'telegram') return;
     setSection('telegram-body', sig(state.telegram), buildTelegram, true);
     setCount('telegram-count', state.telegram ? telegramBots().length : null);
+    restorePendingRegisteredTelegramFocus();
   }
 
   async function loadTelegram({ force = false } = {}) {
@@ -1083,12 +1874,8 @@
           || telegramBots()[telegramBots().length - 1];
         closeTelegramDialog();
         renderTelegram();
+        requestRegisteredTelegramFocus(telegramBotId(registered));
         announce('Telegram bot registered');
-        const row = registered ? document.querySelector(
-          `[data-telegram-bot="${CSS.escape(telegramBotId(registered))}"]`,
-        ) : null;
-        row?.scrollIntoView({ block: 'nearest' });
-        row?.focus({ preventScroll: true });
       } catch (err) {
         const webhookActive = err.code === 'telegram_webhook_active'
           || (err.status === 409 && /webhook/i.test(err.message));
@@ -1259,11 +2046,18 @@
 
   function archiveButton(target, { compact = false } = {}) {
     if (!lifecycleAvailable() || !target) return compact ? ghostIconSlot() : null;
+    const inventoryProblem = inventoryMutationProblemOf(state.overview, target);
+    const blocked = !!inventoryProblem;
     return h('button', {
       class: compact ? 'iconbtn' : 'btn small', type: 'button',
       'data-fk': `archive:${target.target_kind}:${target.target_id}`,
-      'aria-label': `Archive ${target.display_name}`,
-      title: 'Archive — stop and fence this resource while retaining its data and history',
+      disabled: blocked || undefined,
+      'aria-label': blocked
+        ? `Archive ${target.display_name} unavailable — repository ownership needs attention`
+        : `Archive ${target.display_name}`,
+      title: blocked
+        ? 'Archive is disabled only for this affected resource until its exact ownership problem is resolved'
+        : 'Archive — stop and fence this resource while retaining its data and history',
       onclick: (event) => openLifecycleDialog('archive', target, event.currentTarget),
     }, icon('archive'), compact ? null : 'Archive');
   }
@@ -1272,11 +2066,19 @@
     if (state.session?.accessAdmin !== true || !server?.supervision) {
       return compact ? ghostIconSlot() : null;
     }
+    const inventoryProblem = inventoryMutationProblemOf(state.overview, {
+      target_kind: 'server', target_id: server.id,
+    });
     return h('button', {
       class: compact ? 'iconbtn' : 'btn small', type: 'button',
       'data-fk': `worker-remove:${server.id}`,
-      'aria-label': `Remove worker ${server.name || server.id}`,
-      title: 'Remove worker — first stop, archive and hide it; permanent deletion is a separate reviewed step',
+      disabled: !!inventoryProblem || undefined,
+      'aria-label': inventoryProblem
+        ? `Remove worker ${server.name || server.id} unavailable — repository ownership needs attention`
+        : `Remove worker ${server.name || server.id}`,
+      title: inventoryProblem
+        ? 'Removal is disabled only for this affected worker until its exact ownership problem is resolved'
+        : 'Remove worker — first stop, archive and hide it; permanent deletion is a separate reviewed step',
       onclick: (event) => openWorkerRemovalDialog(server, event.currentTarget),
     }, icon('trash'), compact ? null : 'Remove worker');
   }
@@ -1380,9 +2182,13 @@
 
   function openWorkerRemovalDialog(server, trigger) {
     if (state.session?.accessAdmin !== true || !server?.supervision) return;
-    const inventoryProblems = authoritativeInventoryProblemsOf(state.overview);
-    if (inventoryProblems.length) {
-      showBanner('Worker removal is disabled until every active resource belongs to an authoritative repository scope.');
+    const inventoryProblem = inventoryMutationProblemOf(state.overview, {
+      target_kind: 'server', target_id: server.id,
+    });
+    if (inventoryProblem) {
+      showBanner(inventoryProblem.kind === 'inventory'
+        ? 'Worker removal is disabled because the repository inventory contract is invalid.'
+        : 'Worker removal is disabled only for this worker until its ownership problem is resolved.');
       return;
     }
     ui.lifecycleDialog = {
@@ -1403,9 +2209,11 @@
 
   function openLifecycleDialog(action, target, trigger) {
     if (!lifecycleAvailable() || !target) return;
-    const inventoryProblems = authoritativeInventoryProblemsOf(state.overview);
-    if (inventoryProblems.length) {
-      showBanner('Lifecycle controls are disabled until every active resource belongs to an authoritative repository scope.');
+    const inventoryProblem = inventoryMutationProblemOf(state.overview, target);
+    if (inventoryProblem) {
+      showBanner(inventoryProblem.kind === 'inventory'
+        ? 'Lifecycle controls are disabled because the repository inventory contract is invalid.'
+        : 'Lifecycle controls are disabled only for this affected resource until its ownership problem is resolved.');
       return;
     }
     ui.lifecycleDialog = {
@@ -1482,8 +2290,11 @@
     if (!model || ['planning', 'applying'].includes(model.stage)) return;
     const error = $('#lifecycle-form-error');
     error.hidden = true;
-    if (authoritativeInventoryProblemsOf(state.overview).length) {
-      error.textContent = 'Inventory changed: every active resource must belong to a repository scope before this action can continue.';
+    const inventoryProblem = inventoryMutationProblemOf(state.overview, model.target);
+    if (inventoryProblem) {
+      error.textContent = inventoryProblem.kind === 'inventory'
+        ? 'Inventory changed: the repository tree contract is invalid, so this action cannot continue.'
+        : 'Inventory changed: this exact resource now has an ownership or lifecycle problem, so its action cannot continue.';
       error.hidden = false;
       return;
     }
@@ -1764,6 +2575,9 @@
   // a crash-looping "Restarting (1) …" container is very much running work
   // and must be neither hideable nor kept hidden.
   const isContainerActive = (c) => !/^\s*(exited|created|dead|stopped)\b/i.test(String(c.status || ''));
+  // Framework-owned Testcontainers are disposable test dependencies, not
+  // deployable project services. Keep them out of normal inventory attention.
+  const isTransientTestContainer = (c) => c?.transient_test === true;
 
   // ---- docker-hosted web servers ------------------------------------------
   // Mirrors src/routes.mjs parsePublishedPorts: `docker ps` Ports column
@@ -1849,7 +2663,8 @@
     const unhideServers = (hidden.servers || []).filter((k) => runningServerKeys.has(k));
     if (unhideServers.length) unhide.servers = unhideServers;
 
-    const containers = o.inventory.docker?.available ? (o.inventory.docker.containers || []) : [];
+    const containers = o.inventory.docker?.available
+      ? (o.inventory.docker.containers || []).filter((c) => !isTransientTestContainer(c)) : [];
     const activeContainers = new Set(containers.filter(isContainerActive).map((c) => c.name));
     const unhideDocker = (hidden.docker || []).filter((n) => activeContainers.has(n));
     if (unhideDocker.length) unhide.docker = unhideDocker;
@@ -2210,7 +3025,8 @@
     // only purpose is to bind a port lease ACL.  They have no concrete server
     // lifecycle and belong to the Ports workflow, never Servers or Projects.
     const servers = (inv.servers || []).filter(isOperationalServer);
-    const containers = inv.docker?.available ? (inv.docker.containers || []) : [];
+    const containers = inv.docker?.available
+      ? (inv.docker.containers || []).filter((c) => c?.transient_test !== true) : [];
     const containerIdOf = (container) => container?.host_resource_id ?? container?.docker_resource_id ?? null;
     const databases = Array.isArray(inv.resources?.databases) ? inv.resources.databases : [];
     const databaseById = new Map(databases
@@ -2360,6 +3176,7 @@
     const reportedKeys = new Set();
     const reportedResourceKeys = new Set();
     const pushReportedProblem = (item, fallbackKind, fallbackName) => {
+      if (item?.transient_test === true) return;
       const kind = item.resource_kind || fallbackKind;
       const resourceId = item.resource_id || item.host_resource_id || '';
       const reasonCode = item.reason_code || '';
@@ -2369,6 +3186,15 @@
       if (resourceId) reportedResourceKeys.add(`${kind}|${resourceId}`);
       problems.push({
         kind,
+        resourceId: resourceId ? String(resourceId) : null,
+        repoId: item.affected_repo_id || item.repo_id || null,
+        reasonCode: reasonCode || null,
+        parentResourceKind: item.parent_resource_kind || null,
+        parentResourceId: item.parent_resource_id == null
+          ? null : String(item.parent_resource_id),
+        parentDisplayName: item.parent_display_name || null,
+        canAttach: typeof item.can_attach === 'boolean' ? item.can_attach : null,
+        canRetire: typeof item.can_retire === 'boolean' ? item.can_retire : null,
         name: item.display_name || fallbackName,
         reason: item.explanation || item.reason_code || null,
         nextStep: item.recommended_next_step
@@ -2385,7 +3211,8 @@
       if (isServerRunning(server) && !claimedServers.has(String(server.id))
           && !reportedResourceKeys.has(`server|${server.id}`)) {
         problems.push({
-          kind: 'server', name: server.name || 'Unnamed server',
+          kind: 'server', resourceId: String(server.id), repoId: server.repo_id || null,
+          reasonCode: 'missing_inventory_evidence', name: server.name || 'Unnamed server',
           reason: 'The running server is absent from both the repository tree and the coordinator ownership-problem list.',
           nextStep: 'Rerun Coordinator installation for the original root repository, or attach or retire this exact server, then refresh.',
         });
@@ -2394,6 +3221,9 @@
     const containers = inv.docker?.available ? (inv.docker.containers || []) : [];
     const activeContainerIds = new Set();
     for (const container of containers) {
+      // Keep this helper self-contained: its contract is unit-tested by
+      // extracting it independently from the page module.
+      if (container?.transient_test === true) continue;
       const resourceId = container.host_resource_id ?? container.docker_resource_id ?? null;
       const status = String(container.status || '').trim();
       const active = isContainerActive(container) && !/^stopped\b/i.test(status);
@@ -2401,7 +3231,9 @@
       if (active && (resourceId == null || !claimedContainers.has(String(resourceId)))
           && !reportedResourceKeys.has(`container|${resourceId}`)) {
         problems.push({
-          kind: 'container', name: container.name || 'Unnamed container',
+          kind: 'container', resourceId: resourceId == null ? null : String(resourceId),
+          repoId: container.repo_id || null, reasonCode: 'missing_inventory_evidence',
+          name: container.name || 'Unnamed container',
           reason: 'The active container is absent from both the repository tree and the coordinator ownership-problem list.',
           nextStep: 'Rerun Coordinator installation for the original root repository, or attach or retire this exact container, then refresh.',
         });
@@ -2417,7 +3249,9 @@
       if (active && (bindingId == null || !claimedDatabases.has(bindingId))
           && !reportedResourceKeys.has(`database|${bindingId}`)) {
         problems.push({
-          kind: 'database', name: database.database_name || 'Unnamed database',
+          kind: 'database', resourceId: bindingId, repoId: database.repo_id || null,
+          reasonCode: 'missing_inventory_evidence',
+          name: database.database_name || 'Unnamed database',
           reason: 'The active database binding is absent from both the repository tree and the coordinator ownership-problem list.',
           nextStep: 'Rerun Coordinator installation for the original root repository, or bind this exact database stack, then refresh.',
         });
@@ -2426,25 +3260,178 @@
     return problems;
   }
 
+  function inventoryProblemMatchesTarget(o, problem, target) {
+    if (!problem || !target) return false;
+    const inv = o?.inventory;
+    const kind = target.target_kind || target.kind;
+    const id = target.target_id ?? target.id;
+    if (!inv || id == null) return false;
+    const targetId = String(id);
+    if (kind === problem.kind && problem.resourceId != null
+        && String(problem.resourceId) === targetId) return true;
+    if (kind === 'container' && problem.kind === 'database' && problem.resourceId != null) {
+      const database = (inv.resources?.databases || []).find((item) => (
+        String(item?.database_binding_id) === String(problem.resourceId)
+      ));
+      if (database?.docker_resource_id != null
+          && String(database.docker_resource_id) === targetId) return true;
+    }
+    if (kind !== 'project') return false;
+    if (problem.repoId != null && String(problem.repoId) === targetId) return true;
+    const scope = (inv.repository_trees || []).flatMap((tree) => tree?.scopes || [])
+      .find((item) => String(item?.repo_id) === targetId);
+    if (!scope || problem.resourceId == null) return false;
+    const ids = problem.kind === 'server' ? scope.server_ids
+      : problem.kind === 'container' ? scope.container_resource_ids
+        : problem.kind === 'database' ? scope.database_binding_ids : [];
+    return (ids || []).some((resourceId) => String(resourceId) === String(problem.resourceId));
+  }
+
+  function inventoryMutationProblemOf(o, targets = []) {
+    const structural = repositoryTreeContractProblemsOf(o?.inventory);
+    if (structural.length) return structural[0];
+    const exactTargets = Array.isArray(targets) ? targets.filter(Boolean) : [targets].filter(Boolean);
+    if (!exactTargets.length) return null;
+    return authoritativeInventoryProblemsOf(o).find((problem) => exactTargets.some(
+      (target) => inventoryProblemMatchesTarget(o, problem, target),
+    )) || null;
+  }
+
   function authoritativeInventoryErrorPanel(o) {
-    const problems = authoritativeInventoryProblemsOf(o);
+    const problems = repositoryTreeContractProblemsOf(o?.inventory);
     if (!problems.length) return null;
-    const structural = problems.some((problem) => problem.kind === 'inventory');
     return h('div', { class: 'degraded repository-inventory-error', role: 'alert' },
       icon('warn'),
       h('div', null,
-        h('p', { class: 'deg-title' }, structural
-          ? 'Repository inventory contract is invalid'
-          : 'Repository assignment is incomplete'),
+        h('p', { class: 'deg-title' }, 'Repository inventory contract is invalid'),
         h('p', { class: 'deg-msg' },
-          structural
-            ? 'The coordinator returned a malformed or contradictory repository tree. Lifecycle controls are disabled; refresh after correcting the producer.'
-            : `${problems.length} resource ownership problem${sfx(problems.length)} ${problems.length === 1 ? 'blocks' : 'block'} lifecycle controls. Follow the exact next step below, then refresh.`),
+          'The coordinator returned a malformed or contradictory repository tree. Lifecycle controls are disabled; refresh after correcting the producer.'),
         h('ul', { class: 'inventory-problem-list' },
           problems.map((problem) => h('li', null,
             h('strong', null, `${problem.kind}: ${problem.name}`),
             problem.reason ? h('span', null, problem.reason) : null,
             problem.nextStep ? h('span', { class: 'inventory-problem-next-step' }, problem.nextStep) : null)))));
+  }
+
+  function authoritativeInventoryDiagnosticPanel(o) {
+    if (repositoryTreeContractProblemsOf(o?.inventory).length) return null;
+    const problems = authoritativeInventoryProblemsOf(o);
+    if (!problems.length) return null;
+
+    // Database problems projected from one unassigned PostgreSQL container
+    // are evidence about that parent problem, not dozens of independently
+    // actionable ownership failures. Keep the exact child bindings available
+    // on demand while counting and presenting the parent as the one repair.
+    const childrenByParent = new Map();
+    for (const problem of problems) {
+      if (!problem.parentResourceKind || problem.parentResourceId == null) continue;
+      const key = `${problem.parentResourceKind}:${problem.parentResourceId}`;
+      if (!childrenByParent.has(key)) childrenByParent.set(key, []);
+      childrenByParent.get(key).push(problem);
+    }
+    const issues = [];
+    const representedParents = new Set();
+    for (const problem of problems) {
+      if (problem.parentResourceKind && problem.parentResourceId != null) continue;
+      const key = problem.resourceId == null ? null : `${problem.kind}:${problem.resourceId}`;
+      const children = key == null ? [] : (childrenByParent.get(key) || []);
+      if (key != null) representedParents.add(key);
+      issues.push({ problem, children });
+    }
+    // A valid producer normally reports the parent too. If it does not, keep
+    // the children visible as one parent-scoped diagnostic instead of turning
+    // them back into one top-level warning per database.
+    for (const [key, children] of childrenByParent) {
+      if (representedParents.has(key)) continue;
+      const child = children[0];
+      issues.push({
+        problem: {
+          kind: child.parentResourceKind,
+          resourceId: child.parentResourceId,
+          name: child.parentDisplayName || `${child.parentResourceKind} ${child.parentResourceId}`,
+          reason: `The Coordinator reported ${children.length} affected child resource${sfx(children.length)} for this parent.`,
+          nextStep: child.nextStep,
+        },
+        children,
+      });
+    }
+    const issueCount = issues.length;
+    const affectedResourceCount = problems.length;
+    return h('aside', {
+      class: 'inventory-diagnostics', role: 'status',
+      'aria-label': 'Repository ownership diagnostics',
+    },
+      h('div', { class: 'inventory-diagnostics-head' },
+        icon('warn'),
+        h('div', null,
+          h('p', { class: 'deg-title' },
+            `${issueCount} ownership issue${sfx(issueCount)} need${issueCount === 1 ? 's' : ''} attention`),
+          h('p', { class: 'deg-msg' },
+            `${issueCount} actionable issue${sfx(issueCount)} affect${issueCount === 1 ? 's' : ''} `
+            + `${affectedResourceCount} resource${sfx(affectedResourceCount)}. `
+            + 'Healthy repositories remain available; only actions that affect the listed resources are disabled.'))),
+      h('div', { class: 'inventory-diagnostic-groups' },
+        issues.map(({ problem, children }) => {
+          const kind = problem.kind || 'resource';
+          const childDatabases = children.filter((child) => child.kind === 'database');
+          const childCountLabel = childDatabases.length
+            ? `${childDatabases.length} database${sfx(childDatabases.length)} affected`
+            : `${children.length} child resource${sfx(children.length)} affected`;
+          const issueLabel = children.length
+            ? `${problem.name} · ${childCountLabel}`
+            : `${problem.name} · ${kind}`;
+          const disclosureKey = `inventory-diagnostic:${kind}:${problem.resourceId || problem.name}`;
+          const childrenDisclosureKey = `${disclosureKey}:children`;
+          // The exact ID remains the primary key. The sibling match key is
+          // deliberately stable across an inventory observer replacing an
+          // opaque host resource ID (or an aggregate count) for the same
+          // ownership finding. setSection uses it only when it identifies one
+          // disclosure on both sides of a refresh, so separate findings can
+          // never inherit each other's expanded state.
+          const normalizedName = String(problem.name || '')
+            .trim()
+            .replace(/^\d+\s+(?:containers?|servers?|databases?|resources?)$/i, '')
+            .toLowerCase();
+          const disclosureMatch = [
+            'inventory-diagnostic',
+            kind,
+            problem.reasonCode || 'unspecified',
+            problem.parentResourceKind || 'root',
+            problem.parentResourceId || normalizedName || 'aggregate',
+          ].join(':');
+          const childrenDisclosureMatch = `${disclosureMatch}:children`;
+          return h('details', {
+            class: 'inventory-diagnostic-group',
+            'data-section-disclosure': disclosureKey,
+            'data-section-disclosure-match': disclosureMatch,
+          },
+            h('summary', {
+              'data-fk': disclosureKey,
+              'data-section-disclosure-match': disclosureMatch,
+            }, issueLabel),
+            h('ul', { class: 'inventory-problem-list' },
+              h('li', null,
+                h('strong', null, problem.name),
+                problem.reason ? h('span', null, problem.reason) : null,
+                problem.nextStep
+                  ? h('span', { class: 'inventory-problem-next-step' }, problem.nextStep) : null)),
+            children.length
+              ? h('details', {
+                  class: 'inventory-diagnostic-children',
+                  'data-section-disclosure': childrenDisclosureKey,
+                  'data-section-disclosure-match': childrenDisclosureMatch,
+                },
+                  h('summary', {
+                    'data-fk': childrenDisclosureKey,
+                    'data-section-disclosure-match': childrenDisclosureMatch,
+                  },
+                    `View exact ${childCountLabel}`),
+                  h('ul', { class: 'inventory-problem-list' },
+                    children.map((child) => h('li', null,
+                      h('strong', null, child.name),
+                      child.reason ? h('span', null, child.reason) : null))))
+              : null);
+        })));
   }
 
   // Stable project-group order: groups with something running first, then
@@ -2775,7 +3762,14 @@
       state.overview = data;
       state.stale = false;
       state.lastFetch = Date.now();
-      if (data.coordinator?.failureKind === 'maintenance') {
+      if (currentPage() === 'bugs') {
+        // The out-of-band bug registry exists specifically for reporting a
+        // broken Coordinator. Its collection remains the complete page-level
+        // truth while the normal overview path is unavailable; do not obscure
+        // it with the failure of the system being reported.
+        clearBanner('maintenance');
+        clearBanner('overview');
+      } else if (data.coordinator?.failureKind === 'maintenance') {
         clearBanner('overview');
         if (data.inventory) {
           // The retained authority snapshot is still a healthy decision
@@ -2819,7 +3813,11 @@
     } catch (err) {
       if (err.status === 401) return;
       state.stale = true;
-      showBanner(err, () => refreshOverview({ force: true, fresh: true }), 'overview');
+      if (currentPage() === 'bugs') {
+        clearBanner('overview');
+      } else {
+        showBanner(err, () => refreshOverview({ force: true, fresh: true }), 'overview');
+      }
       if (!state.overview) renderFirstLoadError();
       else renderHeader();
     } finally {
@@ -2837,7 +3835,7 @@
     const page = currentPage();
     unmountInactiveSections(page);
     for (const [id, ownerPage] of Object.entries(SECTION_BODY_PAGES)) {
-      if (ownerPage !== page || id === 'access-body') continue;
+      if (ownerPage !== page || id === 'access-body' || id === 'bugs-body') continue;
       document.getElementById(id).replaceChildren(
         h('p', { class: 'empty err' }, 'Could not load — use Retry in the error banner above.'));
     }
@@ -2845,9 +3843,12 @@
 
   // ---------------------------------------------------------------- mutations
 
-  async function runAction(busyKey, fn, { confirmText, onError } = {}) {
-    if (authoritativeInventoryProblemsOf(state.overview).length) {
-      showBanner('Coordinator mutation is disabled until every active resource belongs to an authoritative repository scope.');
+  async function runAction(busyKey, fn, { confirmText, onError, inventoryTargets = [] } = {}) {
+    const inventoryProblem = inventoryMutationProblemOf(state.overview, inventoryTargets);
+    if (inventoryProblem) {
+      showBanner(inventoryProblem.kind === 'inventory'
+        ? 'Coordinator mutation is disabled because the repository inventory contract is invalid.'
+        : 'This action is disabled only for the affected resource until its ownership problem is resolved.');
       return false;
     }
     if (confirmText && !window.confirm(confirmText)) return false;
@@ -2865,7 +3866,7 @@
       bump();
       renderAll(true);
       if (err.status !== 401) {
-        showBanner(err, () => runAction(busyKey, fn, { onError }));
+        showBanner(err, () => runAction(busyKey, fn, { onError, inventoryTargets }));
         onError?.(err);
       }
       return false;
@@ -2921,39 +3922,90 @@
         throw new Error('test repository catalog is invalid');
       }
       state.testsRepositories = catalog;
+      state.testsCatalogError = null;
     } catch (err) {
       // During a rolling deployment an older Console process has no catalog
       // endpoint. Retained metrics still provide canonical repository roots,
       // so test data need not wait for heavyweight inventory.
-      if (err.status !== 401 && err.status !== 404 && testRepositories().length === 0) {
-        showBanner(err, () => loadTestRepositories({ force: true }), 'tests');
-      }
+      if (err.status !== 401 && err.status !== 404) state.testsCatalogError = err;
     } finally {
       state.testsRepositoriesLoading = false;
       loadTests();
     }
   }
 
+  function boundedTestCount(...values) {
+    return values.reduce((highest, value) => {
+      const count = Number(value || 0);
+      return Number.isFinite(count) && count > highest ? count : highest;
+    }, 0);
+  }
+
+  function normalizeTestFleetSemantics(fleet) {
+    if (!fleet || fleet.schema_version !== 2 || !Array.isArray(fleet.repositories)) return fleet;
+    const correctedRepositories = new Set();
+    let changed = false;
+    const repositories = fleet.repositories.map((repository) => {
+      if (!repository || repository.state !== 'failing') return repository;
+      const summary = repository.summary && typeof repository.summary === 'object'
+        ? repository.summary : {};
+      const testFailures = boundedTestCount(
+        summary.test_failure_count,
+        summary.failed_run_count,
+        summary.failure_count,
+        Number(summary.failed_count || 0) + Number(summary.error_count || 0),
+      );
+      const infrastructureFailures = boundedTestCount(
+        summary.infrastructure_failure_count,
+        summary.infrastructure_count,
+      );
+      if (testFailures > 0 || infrastructureFailures <= 0) return repository;
+      changed = true;
+      correctedRepositories.add(repository.repo_id);
+      return {
+        ...repository,
+        state: 'infrastructure',
+        state_detail: {
+          code: 'recent_infrastructure_failures',
+          title: 'Recent test infrastructure failures',
+          detail: `${fmtTestCount(infrastructureFailures)} infrastructure ${infrastructureFailures === 1 ? 'failure prevented' : 'failures prevented'} tests from completing; no test assertion failures were recorded`,
+          scope: repository.state_scope || 'selected_window',
+          test_failure_count: 0,
+          infrastructure_failure_count: infrastructureFailures,
+        },
+        summary: {
+          ...summary,
+          test_failure_count: 0,
+          infrastructure_failure_count: infrastructureFailures,
+        },
+      };
+    });
+    if (!changed) return fleet;
+    const attention = Array.isArray(fleet.attention) ? fleet.attention.map((item) => {
+      if (!correctedRepositories.has(item?.repo_id)) return item;
+      const repository = repositories.find((candidate) => candidate?.repo_id === item.repo_id);
+      const infrastructureFailures = Number(
+        repository?.summary?.infrastructure_failure_count || 0,
+      );
+      return {
+        ...item,
+        severity: 'warning',
+        code: 'recent_infrastructure_failures',
+        title: 'Recent test infrastructure failures',
+        detail: `${fmtTestCount(infrastructureFailures)} infrastructure ${infrastructureFailures === 1 ? 'failure prevented' : 'failures prevented'} tests from completing; no test assertion failures were recorded`,
+        test_failure_count: 0,
+        infrastructure_failure_count: infrastructureFailures,
+      };
+    }) : fleet.attention;
+    return { ...fleet, repositories, attention };
+  }
+
   async function loadTests({ force = false } = {}) {
-    const repositories = testRepositories();
-    const select = $('#tests-project');
-    const available = new Set(repositories.map((repository) => String(repository.project)));
-    if (!state.testsProject || !available.has(state.testsProject)) {
-      state.testsProject = repositories[0]?.project ?? null;
-      state.tests = null;
-      state.testsQueryKey = null;
-    }
-    select.replaceChildren(...repositories.map((repository) => h('option', {
-      value: repository.project,
-      selected: repository.project === state.testsProject,
-    }, repository.display_name || projectTail(repository.canonical_root) || repository.repo_id)));
-    $('#tests-days').value = String(state.testsDays);
-    if (!state.testsProject) {
-      renderTests();
-      return;
-    }
-    const queryKey = `${state.testsProject}\u0000${state.testsDays}`;
-    if (!force && state.tests && state.testsQueryKey === queryKey) {
+    const hours = Math.max(1, Math.min(168, Number(state.testsHours || 24)));
+    $('#tests-hours').value = String(hours);
+    const queryKey = String(hours);
+    const age = Date.now() - Number(state.testsFleetLoadedAt || 0);
+    if (!force && state.testsFleet && state.testsFleetQueryKey === queryKey && age < 15_000) {
       renderTests();
       return;
     }
@@ -2961,15 +4013,1466 @@
     state.testsLoading = true;
     renderTests();
     try {
-      state.tests = await api(`/api/tests?project=${encodeURIComponent(state.testsProject)}&days=${state.testsDays}&limit=50`);
-      state.testsQueryKey = queryKey;
-      state.testsLoadedAt = Date.now();
+      const fleet = await api(`/api/tests/fleet?hours=${hours}`);
+      if (!fleet || fleet.schema_version !== 2 || !Array.isArray(fleet.repositories) || !Array.isArray(fleet.hours)) {
+        throw new Error('fleet test statistics are invalid');
+      }
+      state.testsFleet = normalizeTestFleetSemantics(fleet);
+      state.testsFleetQueryKey = queryKey;
+      state.testsFleetLoadedAt = Date.now();
+      // A warm retained response is the normal fast delivery path, not a
+      // failure or an operator decision. Reserve the stale notice for a real
+      // refresh request failure while prior fleet data remains available.
+      state.testsFleetStale = false;
+      state.testsError = null;
       clearBanner('tests');
     } catch (err) {
-      showBanner(err, () => loadTests({ force: true }), 'tests');
+      state.testsFleetStale = Boolean(state.testsFleet);
+      // A retained fleet projection is still the correct operational view.
+      // Project/test-store refresh failures stay local to Tests and never
+      // replace useful data with a global banner or a blinking skeleton.
+      if (!state.testsFleet && err.status !== 401 && err.classification !== 'maintenance') {
+        state.testsError = err;
+      }
     } finally {
       state.testsLoading = false;
       renderTests();
+    }
+  }
+
+  function refreshTestsInPlace() {
+    if (document.hidden || currentPage() !== 'tests') return;
+    // An existing fleet projection remains mounted while this request is in
+    // flight. renderTests() uses a content signature and restores focus/open
+    // disclosures, so unchanged polling is a no-op and changed data is
+    // replaced without a loading flash or a scroll jump.
+    loadTests({ force: true });
+  }
+
+  async function loadTestDetail({ force = false } = {}) {
+    if (!state.testsProject) return;
+    $('#tests-days').value = String(state.testsDays);
+    const project = state.testsProject;
+    const days = state.testsDays;
+    const queryKey = `${project}\u0000${days}`;
+    if (!force && state.tests && state.testsQueryKey === queryKey) {
+      renderTestDetail();
+      return;
+    }
+    if (state.testsDetailLoading && state.testsDetailLoadingKey === queryKey) return;
+    const request = state.testsDetailRequest + 1;
+    state.testsDetailRequest = request;
+    state.testsDetailLoading = true;
+    state.testsDetailLoadingKey = queryKey;
+    renderTestDetail();
+    try {
+      const result = await api(`/api/tests?project=${encodeURIComponent(project)}&days=${days}&limit=50`);
+      if (request !== state.testsDetailRequest || project !== state.testsProject || days !== state.testsDays) return;
+      if (result?.repo_id && result.repo_id !== project) {
+        throw new ApiError('repository test statistics identity is invalid', 502);
+      }
+      state.tests = result;
+      state.testsQueryKey = queryKey;
+      state.testsLoadedAt = Date.now();
+      state.testsDetailError = null;
+      clearBanner('tests');
+    } catch (err) {
+      if (request !== state.testsDetailRequest || project !== state.testsProject || days !== state.testsDays) return;
+      if (!state.tests && err.status !== 401 && err.classification !== 'maintenance') {
+        state.testsDetailError = err;
+      }
+    } finally {
+      if (request !== state.testsDetailRequest) return;
+      state.testsDetailLoading = false;
+      state.testsDetailLoadingKey = null;
+      renderTestDetail();
+    }
+  }
+
+  function selectTestDetailTab(tab) {
+    if (!['overview', 'runs', 'setup'].includes(tab)) return;
+    state.testsDetailTab = tab;
+    for (const button of document.querySelectorAll('[data-test-detail-tab]')) {
+      const selected = button.dataset.testDetailTab === tab;
+      button.setAttribute('aria-selected', String(selected));
+      button.tabIndex = selected ? 0 : -1;
+    }
+    $('#tests-days').hidden = tab !== 'overview';
+    $('#test-detail-runs').hidden = tab === 'runs';
+    $('#test-detail-body').setAttribute('aria-labelledby', `test-detail-tab-${tab}`);
+    renderTestDetail();
+    if (tab === 'runs') loadTestRuns();
+    if (tab === 'setup') loadTestSetup();
+  }
+
+  function testRunsNextCursor(page = state.testsRuns) {
+    const cursor = page?.next_cursor ?? page?.next ?? null;
+    return typeof cursor === 'string' && cursor ? cursor : null;
+  }
+
+  async function loadTestRuns({ force = false, append = false } = {}) {
+    const project = state.testsProject;
+    const current = state.testsRuns?.repo_id === project ? state.testsRuns : null;
+    const after = append ? testRunsNextCursor(current) : null;
+    if (!project || state.testsRunsLoading || (append && !after)
+      || (!append && !force && current)) return;
+    state.testsRunsLoading = true;
+    state.testsRunsError = null;
+    if (!append) renderTestDetail();
+    else {
+      const loadMore = $('[data-test-runs-load-more]');
+      if (loadMore) {
+        loadMore.disabled = true;
+        loadMore.textContent = 'Loading…';
+      }
+    }
+    try {
+      const query = new URLSearchParams({ repo_id: project, limit: '50' });
+      if (after) query.set('after', after);
+      const result = await api(`/api/tests/runs?${query.toString()}`);
+      if (project !== state.testsProject) return;
+      if (!result || ((result.repo_id ?? result.repository_id) !== project) || !Array.isArray(result.runs)) {
+        throw new ApiError('repository test run history is invalid', 502);
+      }
+      const nextCursor = result.next_cursor ?? result.next ?? null;
+      if (nextCursor !== null && (typeof nextCursor !== 'string' || !nextCursor)) {
+        throw new ApiError('repository test run history cursor is invalid', 502);
+      }
+      const runs = append
+        ? [...new Map([...(current?.runs || []), ...result.runs]
+          .map((run) => [run.run_id, run])).values()]
+        : result.runs;
+      state.testsRuns = {
+        ...result,
+        repo_id: project,
+        runs,
+        next_cursor: nextCursor,
+      };
+    } catch (err) {
+      if (project === state.testsProject && err.status !== 401 && err.classification !== 'maintenance') {
+        state.testsRunsError = err;
+      }
+    } finally {
+      state.testsRunsLoading = false;
+      if (project === state.testsProject) {
+        renderTestDetail();
+      }
+    }
+  }
+
+  async function loadTestSetup({ force = false } = {}) {
+    const project = state.testsProject;
+    if (!project || state.testsSetupLoading || (!force && state.testsSetup?.repo_id === project)) return;
+    state.testsSetupLoading = true;
+    state.testsSetupError = null;
+    renderTestDetail();
+    try {
+      const result = await api(`/api/tests/repositories/${encodeURIComponent(project)}/setup`);
+      if (project !== state.testsProject) return;
+      if (!result || (result.repo_id && result.repo_id !== project)) {
+        throw new ApiError('repository test setup identity is invalid', 502);
+      }
+      state.testsSetup = { ...result, repo_id: project };
+    } catch (err) {
+      if (project === state.testsProject && err.status !== 401 && err.classification !== 'maintenance') {
+        state.testsSetupError = err;
+      }
+    } finally {
+      if (project === state.testsProject) {
+        state.testsSetupLoading = false;
+        renderTestDetail();
+      }
+    }
+  }
+
+  function testFleetRepositories(fleet = state.testsFleet) {
+    const query = state.testsSearch.trim().toLocaleLowerCase();
+    return (fleet?.repositories || [])
+      .filter((repository) => repository && typeof repository.repo_id === 'string')
+      .filter((repository) => !query
+        || String(repository.display_name || repository.repo_id).toLocaleLowerCase().includes(query))
+      .slice()
+      .sort((a, b) => {
+        const rank = { failing: 0, infrastructure: 1, stale: 2, idle: 3, healthy: 4 };
+        const stateOrder = (rank[a.state] ?? 2) - (rank[b.state] ?? 2);
+        if (stateOrder !== 0) return stateOrder;
+        return String(a.display_name || a.repo_id).localeCompare(String(b.display_name || b.repo_id));
+      });
+  }
+
+  function testFleetRepository(repoId) {
+    return (state.testsFleet?.repositories || []).find((repository) => repository.repo_id === repoId) || null;
+  }
+
+  function testFleetHourKey(value) {
+    const date = new Date(value);
+    if (!Number.isFinite(date.getTime())) return String(value || '');
+    date.setUTCMinutes(0, 0, 0);
+    return date.toISOString();
+  }
+
+  function testFleetHours(fleet) {
+    const values = (fleet?.hours || []).map(testFleetHourKey).filter(Boolean);
+    return values.slice(Math.max(0, values.length - 24));
+  }
+
+  function testFleetLocalHourSlots(fleet) {
+    const hourStartsByLocalHour = Array.from({ length: 24 }, () => []);
+    for (const hourStart of testFleetHours(fleet)) {
+      const date = new Date(hourStart);
+      if (!Number.isFinite(date.getTime())) continue;
+      hourStartsByLocalHour[date.getHours()].push(hourStart);
+    }
+    return hourStartsByLocalHour.map((hourStarts, localHour) => ({ localHour, hourStarts }));
+  }
+
+  function testFleetLocalHourLabel(localHour) {
+    return `${String(localHour).padStart(2, '0')}:00`;
+  }
+
+  function testFleetLocalPeriod(slot) {
+    if (slot.hourStarts.length === 0) {
+      return `${testFleetLocalHourLabel(slot.localHour)} local time`;
+    }
+    return slot.hourStarts.map((hourStart) => new Date(hourStart).toLocaleString([], {
+      month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit',
+      hourCycle: 'h23', timeZoneName: 'short',
+    })).join(' and ');
+  }
+
+  function testFleetCellMap(repository) {
+    return new Map((repository?.hourly || []).map((cell) => [
+      testFleetHourKey(cell.hour_start ?? cell.timestamp ?? `${cell.day}T${String(cell.hour).padStart(2, '0')}:00:00Z`),
+      cell,
+    ]));
+  }
+
+  function testFleetLocalCell(cells, slot) {
+    return slot.hourStarts.reduce((combined, hourStart) => {
+      const cell = cells.get(hourStart);
+      if (!cell) return combined;
+      combined.test_seconds += Number(cell.test_seconds || 0);
+      combined.test_count += Number(cell.test_count || 0);
+      combined.failure_count += Number(cell.failure_count || 0);
+      combined.infrastructure_count += Number(cell.infrastructure_count || 0);
+      return combined;
+    }, { test_seconds: 0, test_count: 0, failure_count: 0, infrastructure_count: 0 });
+  }
+
+  function testRate(value, fallbackSummary = null) {
+    if (value !== null && value !== undefined && value !== '') {
+      const explicit = Number(value);
+      if (Number.isFinite(explicit)) return explicit > 1 ? explicit : explicit * 100;
+    }
+    return testPassRate(fallbackSummary);
+  }
+
+  function fmtTestCount(value) {
+    const count = Number(value || 0);
+    if (!Number.isFinite(count)) return '—';
+    if (count >= 1_000_000) return `${(count / 1_000_000).toFixed(count >= 10_000_000 ? 0 : 1)}m`;
+    if (count >= 1_000) return `${(count / 1_000).toFixed(count >= 10_000 ? 0 : 1)}k`;
+    return String(Math.round(count));
+  }
+
+  function fmtTestMinutes(seconds) {
+    const minutes = Number(seconds || 0) / 60;
+    if (minutes >= 10_000) return `${(minutes / 1_000).toFixed(1)}k min`;
+    if (minutes >= 100) return `${Math.round(minutes)} min`;
+    if (minutes >= 10) return `${minutes.toFixed(1)} min`;
+    return `${minutes.toFixed(1)} min`;
+  }
+
+  function testRepositoryState(repository) {
+    const summary = repository?.summary || {};
+    const rawState = String(repository?.state || 'idle');
+    const infrastructureFailures = boundedTestCount(
+      summary.infrastructure_failure_count,
+      summary.infrastructure_count,
+    );
+    const testFailedAttempts = boundedTestCount(
+      summary.test_failure_count,
+      summary.failed_run_count,
+    );
+    const testFailures = boundedTestCount(
+      testFailedAttempts,
+      summary.failure_count,
+      Number(summary.failed_count || 0) + Number(summary.error_count || 0),
+    );
+    const legacyInfrastructureOnly = rawState === 'failing'
+      && testFailures === 0
+      && infrastructureFailures > 0;
+    const attempts = boundedTestCount(
+      summary.attempt_count,
+      testFailedAttempts + infrastructureFailures,
+    );
+    const tests = Number(summary.test_count || 0);
+    const detail = !legacyInfrastructureOnly
+      && repository?.state_detail && typeof repository.state_detail === 'object'
+      ? repository.state_detail : {};
+    const infrastructure = rawState === 'infrastructure'
+      || rawState === 'infrastructure_failed'
+      || rawState === 'setup_failed'
+      || legacyInfrastructureOnly;
+    let state = rawState;
+    let label = 'Healthy';
+    let fallbackDetail = tests > 0 ? `${fmtTestCount(tests)} tests completed` : 'Recent test runs completed';
+    if (infrastructure) {
+      state = 'infrastructure';
+      label = 'Could not run';
+      fallbackDetail = `${fmtTestCount(infrastructureFailures)} infrastructure ${infrastructureFailures === 1 ? 'failure' : 'failures'} across ${fmtTestCount(attempts)} ${attempts === 1 ? 'attempt' : 'attempts'}; ${tests > 0 ? `${fmtTestCount(tests)} tests reported` : 'no tests started'}`;
+    } else if (rawState === 'failing') {
+      label = 'Tests failed';
+      fallbackDetail = `${fmtTestCount(testFailures)} test ${testFailures === 1 ? 'failure' : 'failures'} across ${fmtTestCount(attempts)} ${attempts === 1 ? 'attempt' : 'attempts'}`;
+    } else if (rawState === 'stale') {
+      label = 'Delayed';
+      fallbackDetail = 'Recent test evidence is delayed';
+    } else if (rawState === 'idle') {
+      label = 'No recent activity';
+      fallbackDetail = 'No test attempts were recorded in this period';
+    }
+    const reason = String(detail.detail || fallbackDetail);
+    const heading = String(detail.title || label);
+    return {
+      state,
+      label,
+      title: heading === label ? `${label}: ${reason}` : `${label} — ${heading}: ${reason}`,
+      attempts,
+      tests,
+      testFailures,
+      infrastructureFailures,
+    };
+  }
+
+  function testStatePill(repository) {
+    const status = testRepositoryState(repository);
+    return h('span', {
+      class: `test-state is-${status.state}`,
+      title: status.title,
+      'aria-label': status.title,
+    }, status.label);
+  }
+
+  function testRepositoryWorkLabel(repository) {
+    const summary = repository?.summary || {};
+    const seconds = Number(summary.test_seconds || 0);
+    if (seconds > 0) return seconds < 60 ? fmtSeconds(seconds) : fmtTestMinutes(seconds);
+    const attempts = testRepositoryState(repository).attempts;
+    if (attempts > 0) return `${fmtTestCount(attempts)} ${attempts === 1 ? 'attempt' : 'attempts'}`;
+    return 'No tests';
+  }
+
+  function testLocalFailure(title, error, retry) {
+    return h('section', { class: 'test-local-failure', role: 'alert' },
+      h('div', null,
+        h('strong', null, title),
+        error?.message ? h('p', null, String(error.message)) : null),
+      h('button', { class: 'btn small', type: 'button', onclick: retry }, 'Try again'));
+  }
+
+  function testFleetSummary(fleet) {
+    const summary = fleet.summary || {};
+    const repositories = Number(summary.repository_count || fleet.repositories?.length || 0);
+    const active = Number(summary.repositories_with_activity || 0);
+    const efficiency = Number(summary.parallel_efficiency_ratio || 0);
+    const passRate = testRate(summary.pass_rate, summary);
+    const flakeRate = testRate(summary.flake_rate);
+    const avoided = summary.avoided_work || {};
+    const metrics = [
+      ['Repositories tested', `${active} of ${repositories}`, active < repositories ? 'is-attention' : 'is-good'],
+      ['Test time / wall time', efficiency > 0 ? `${efficiency.toFixed(1)}×` : '—', efficiency >= 1 ? 'is-good' : ''],
+      ['Queue wait (P95)', Number.isFinite(Number(summary.p95_queue_wait_seconds)) ? fmtSeconds(summary.p95_queue_wait_seconds) : '—', Number(summary.p95_queue_wait_seconds || 0) > 300 ? 'is-attention' : ''],
+      ['Pass rate', Number.isFinite(passRate) ? `${passRate.toFixed(1)}%` : '—', Number.isFinite(passRate) && passRate < 98 ? 'is-attention' : 'is-good'],
+      ['Flake rate', Number.isFinite(flakeRate) ? `${flakeRate.toFixed(1)}%` : '—', Number.isFinite(flakeRate) && flakeRate > 2 ? 'is-attention' : ''],
+      ['Avoided work', avoided.available ? `${fmtTestCount(avoided.test_count)} tests` : 'Not measured', avoided.available ? 'is-good' : ''],
+    ];
+    return h('dl', { class: 'test-fleet-summary', 'aria-label': 'Fleet test health summary' },
+      metrics.map(([label, value, className]) => h('div', { class: className },
+        h('dt', null, label), h('dd', null, value))));
+  }
+
+  function testFleetMatrix(fleet, repositories) {
+    const slots = testFleetLocalHourSlots(fleet);
+    const head = h('tr', null, h('th', { scope: 'col', class: 'test-fleet-repository-head' }, 'Repository'));
+    for (const slot of slots) {
+      const label = testFleetLocalHourLabel(slot.localHour);
+      head.append(h('th', {
+        scope: 'col',
+        class: `test-fleet-hour${slot.localHour % 2 === 0 ? ' is-even' : ''}${slot.localHour % 6 === 0 ? ' is-six' : ''}`,
+        title: `${label} local time`,
+        'aria-label': `${label} local time`,
+        'data-test-local-hour': label,
+      }, label));
+    }
+    head.append(h('th', { scope: 'col', class: 'test-fleet-total-head' }, '24h'));
+    const body = h('tbody');
+    for (const repository of repositories) {
+      const cells = testFleetCellMap(repository);
+      const summary = repository.summary || {};
+      const status = testRepositoryState(repository);
+      const row = h('tr', { class: `test-fleet-row is-${status.state}`, title: status.title },
+        h('th', { scope: 'row', class: 'test-fleet-repository' },
+          h('button', {
+            type: 'button', class: 'test-repository-button',
+            onclick: () => openTestRepository(repository.repo_id),
+            'data-test-focus-key': `repo:${repository.repo_id}`,
+            'aria-label': `Open ${repository.display_name || repository.repo_id} test details. ${status.title}`,
+          },
+          h('span', { class: 'test-state-dot', 'aria-hidden': 'true' }),
+          h('span', null, repository.display_name || repository.repo_id))));
+      for (const slot of slots) {
+        const cell = testFleetLocalCell(cells, slot);
+        const failures = Number(cell.failure_count || 0);
+        const infrastructureFailures = Number(cell.infrastructure_count || 0);
+        const period = testFleetLocalPeriod(slot);
+        const localHour = testFleetLocalHourLabel(slot.localHour);
+        const node = h('td', {
+          class: 'test-heat-cell test-fleet-cell',
+          style: `background-color:${testHeatColor(cell.test_seconds)}`,
+          tabindex: Number(cell.test_seconds || 0) > 0 || Number(cell.test_count || 0) > 0 || failures || infrastructureFailures ? '0' : null,
+          title: `${repository.display_name || repository.repo_id} · ${period} — ${(Number(cell.test_seconds || 0) / 60).toFixed(1)} aggregate test-minutes; ${failures} test failures; ${infrastructureFailures} infrastructure failures`,
+          'aria-label': `${repository.display_name || repository.repo_id}, ${period}: ${(Number(cell.test_seconds || 0) / 60).toFixed(1)} aggregate test-minutes; ${Number(cell.test_count || 0)} tests; ${failures} test failures; ${infrastructureFailures} infrastructure failures`,
+          'data-test-period': `${repository.display_name || repository.repo_id} · ${period}`,
+          'data-test-focus-key': `cell:${repository.repo_id}:local:${localHour}`,
+          'data-test-local-hour': localHour,
+          'data-test-source-hours': slot.hourStarts.join(','),
+          'data-test-seconds': Number(cell.test_seconds || 0),
+          'data-test-count': Number(cell.test_count || 0),
+          'data-test-failures': failures,
+          'data-test-infrastructure': infrastructureFailures,
+          onpointerenter: (event) => showTestHeatTooltip(event.currentTarget),
+          onpointerleave: (event) => hideTestHeatTooltip(event.currentTarget),
+          onfocus: (event) => showTestHeatTooltip(event.currentTarget),
+          onblur: (event) => hideTestHeatTooltip(event.currentTarget),
+        });
+        row.append(node);
+      }
+      row.append(h('td', { class: 'test-fleet-total', title: status.title }, testRepositoryWorkLabel(repository)));
+      body.append(row);
+    }
+    return h('section', { class: 'test-fleet-matrix-panel' },
+      h('div', { class: 'test-panel-title' },
+        h('div', null,
+          h('h3', null, 'Testing time by repository'),
+          h('p', { class: 'meta-passive' }, 'Aggregate test-minutes by local hour. Select a repository for detail.')),
+        h('span', { class: 'test-matrix-now' }, 'Last 24 hours · local time')),
+      repositories.length === 0
+        ? h('p', { class: 'empty-inline' }, 'No repositories match this search.')
+        : h('div', { class: 'test-fleet-matrix-wrap' },
+          h('table', {
+            class: 'test-fleet-matrix',
+            'aria-label': 'Aggregate test-minutes by repository and local hour, from 00:00 through 23:00',
+          }, h('thead', null, head), body)),
+      h('div', { class: 'test-heat-legend test-fleet-legend', 'aria-label': 'Heat scale from no activity through 60, 120 and 180 or more aggregate test-minutes' },
+        h('div', { class: 'test-heat-scale', 'aria-hidden': 'true' }),
+        h('div', { class: 'test-heat-ticks' }, h('span', null, '0m'), h('span', null, '60m'), h('span', null, '120m'), h('span', null, '180m+')),
+        h('p', null, 'More than 60 test-minutes in one hour means tests ran in parallel. Hover, focus or tap a cell for reported tests and diagnostics.')));
+  }
+
+  function testFleetMobileList(repositories) {
+    return h('section', { class: 'test-fleet-mobile', 'aria-label': 'Repository test health' },
+      repositories.map((repository) => {
+        const summary = repository.summary || {};
+        const rate = testRate(summary.pass_rate, summary);
+        const status = testRepositoryState(repository);
+        const infrastructure = status.state === 'infrastructure';
+        return h('button', {
+          class: `test-fleet-mobile-row is-${status.state}`,
+          type: 'button', onclick: () => openTestRepository(repository.repo_id),
+          'data-test-focus-key': `repo:${repository.repo_id}`,
+          title: status.title,
+          'aria-label': `Open ${repository.display_name || repository.repo_id} test details. ${status.title}`,
+        },
+        h('span', { class: 'test-fleet-mobile-main' },
+          h('strong', null, repository.display_name || repository.repo_id),
+          h('span', null, repository.last_activity_at
+            ? `${infrastructure ? 'Last attempt' : 'Last tested'} ${timeAgo(Date.parse(repository.last_activity_at))}`
+            : 'No test activity')),
+        testStatePill(repository),
+        h('span', { class: 'test-fleet-mobile-metrics' },
+          h('span', null, testRepositoryWorkLabel(repository)),
+          h('span', null, infrastructure && status.tests === 0
+            ? 'No tests started'
+            : Number.isFinite(rate) ? `${rate.toFixed(1)}% pass` : '— pass'),
+          h('span', null, infrastructure
+            ? `${fmtTestCount(status.infrastructureFailures)} infrastructure ${status.infrastructureFailures === 1 ? 'failure' : 'failures'}`
+            : status.testFailures > 0
+              ? `${fmtTestCount(status.testFailures)} test ${status.testFailures === 1 ? 'failure' : 'failures'}`
+              : Number(summary.parallel_efficiency_ratio || 0) > 0 ? `${Number(summary.parallel_efficiency_ratio).toFixed(1)}× parallel` : '— parallel')));
+      }));
+  }
+
+  function testFleetCapacity(fleet) {
+    const hours = testFleetHours(fleet);
+    const byHour = new Map((fleet.capacity || []).map((cell) => [testFleetHourKey(cell.hour_start), cell]));
+    const rows = hours.map((hour) => byHour.get(hour) || { test_seconds: 0, p95_queue_wait_seconds: 0 });
+    const maxTests = Math.max(1, ...rows.map((row) => Number(row.test_seconds || 0)));
+    const maxQueue = Math.max(1, ...rows.map((row) => Number(row.p95_queue_wait_seconds || 0)));
+    const width = 1000;
+    const height = 110;
+    const plotBottom = 86;
+    const svg = svgEl('svg', {
+      class: 'test-capacity-chart', viewBox: `0 0 ${width} ${height}`, preserveAspectRatio: 'none',
+      role: 'img', 'aria-label': 'Fleet testing load and queue wait over the last 24 hours',
+    });
+    rows.forEach((row, index) => {
+      const step = width / Math.max(1, rows.length);
+      const barHeight = (Number(row.test_seconds || 0) / maxTests) * 58;
+      const hourStart = hours[index];
+      const period = testFleetLocalPeriod({ hourStarts: [hourStart] });
+      const testCount = Number(row.test_count || 0);
+      const failures = Number(row.failure_count || 0);
+      const infrastructureFailures = Number(row.infrastructure_count || 0);
+      const queueWait = Number(row.p95_queue_wait_seconds || 0);
+      const bar = svgEl('rect', {
+        class: 'test-capacity-bar', x: (index * step + 2).toFixed(1), y: (plotBottom - barHeight).toFixed(1),
+        width: Math.max(2, step - 5).toFixed(1), height: barHeight.toFixed(1), rx: 1,
+        tabindex: 0,
+        role: 'img',
+        'aria-label': `${period}: ${(Number(row.test_seconds || 0) / 60).toFixed(1)} aggregate test-minutes; ${testCount} tests; ${failures} test failures; ${infrastructureFailures} infrastructure failures; queue P95 ${fmtSeconds(queueWait)}`,
+      });
+      bar.dataset.testPeriod = `Fleet · ${period}`;
+      bar.dataset.testSourceHour = hourStart;
+      bar.dataset.testSeconds = Number(row.test_seconds || 0);
+      bar.dataset.testCount = testCount;
+      bar.dataset.testFailures = failures;
+      bar.dataset.testInfrastructure = infrastructureFailures;
+      bar.dataset.testTooltipDetail = `${testCount} ${testCount === 1 ? 'test' : 'tests'} · ${failures} test ${failures === 1 ? 'failure' : 'failures'} · ${infrastructureFailures} infrastructure ${infrastructureFailures === 1 ? 'failure' : 'failures'} · queue P95 ${fmtSeconds(queueWait)}`;
+      bar.addEventListener('pointerenter', () => showTestHeatTooltip(bar));
+      bar.addEventListener('pointerleave', () => hideTestHeatTooltip(bar));
+      bar.addEventListener('focus', () => showTestHeatTooltip(bar));
+      bar.addEventListener('blur', () => hideTestHeatTooltip(bar));
+      svg.append(bar);
+    });
+    const queuePoints = rows.map((row, index) => {
+      const x = ((index + .5) / Math.max(1, rows.length)) * width;
+      const y = plotBottom - (Number(row.p95_queue_wait_seconds || 0) / maxQueue) * 68;
+      return `${x.toFixed(1)},${y.toFixed(1)}`;
+    }).join(' ');
+    svg.append(svgEl('polyline', { class: 'test-capacity-queue', fill: 'none', points: queuePoints }));
+    return h('section', { class: 'test-fleet-capacity' },
+      h('div', { class: 'test-panel-title' },
+        h('h3', null, 'Fleet load & queue'),
+        h('div', { class: 'test-capacity-legend' }, h('span', { class: 'is-load' }, 'Test load'), h('span', { class: 'is-queue' }, 'Queue P95'))),
+      svg,
+      h('div', { class: 'test-capacity-hours' }, h('span', null, '24h ago'), h('span', null, '12h ago'), h('span', null, 'Now')),
+      testChartDataDisclosure('Hourly fleet data',
+        ['Hour (local)', 'Test time', 'Tests', 'Test failures', 'Infrastructure failures', 'Queue P95'],
+        rows.map((row, index) => [
+          testFleetLocalPeriod({ hourStarts: [hours[index]] }),
+          fmtTestMinutes(row.test_seconds),
+          fmtTestCount(row.test_count),
+          fmtTestCount(row.failure_count),
+          fmtTestCount(row.infrastructure_count),
+          fmtSeconds(row.p95_queue_wait_seconds || 0),
+        ])));
+  }
+
+  function testFleetAttention(fleet) {
+    const attention = fleet.attention || [];
+    const row = (item) => h('button', {
+      class: `test-attention-row is-${item.severity || 'warning'}`,
+      type: 'button', onclick: () => openTestRepository(item.repo_id),
+    },
+    h('span', { class: 'test-attention-project' }, testFleetRepository(item.repo_id)?.display_name || item.repo_id),
+    h('span', { class: 'test-attention-copy' }, h('strong', null, item.title || item.code), h('span', null, item.detail || 'Open repository details')),
+    h('span', { class: 'test-attention-time' }, item.observed_at ? timeAgo(Date.parse(item.observed_at)) : '—'));
+    const primary = attention.slice(0, 8).map(row);
+    const remaining = attention.slice(8).map(row);
+    return h('section', { class: 'test-fleet-attention' },
+      h('div', { class: 'test-panel-title' }, h('h3', null, 'Needs attention'), h('span', { class: 'meta-passive' }, `${attention.length} current`)),
+      primary.length ? h('div', { class: 'test-attention-list' }, primary) : h('p', { class: 'empty-inline' }, 'No repository needs intervention.'),
+      remaining.length ? h('details', { class: 'test-attention-more', 'data-test-disclosure': 'all-attention' },
+        h('summary', null, `Show ${remaining.length} more`),
+        h('div', { class: 'test-attention-list' }, remaining)) : null);
+  }
+
+  const testDetailNarrowViewport = window.matchMedia('(max-width: 680px)');
+
+  function positionTestDetail() {
+    const dialog = $('#test-detail-dialog');
+    if (!dialog?.open) return;
+    const top = Math.max(0, Math.round($('#topbar')?.getBoundingClientRect().bottom || 0));
+    dialog.style.setProperty('--test-detail-top', `${top}px`);
+  }
+
+  function showTestDetailSurface() {
+    const dialog = $('#test-detail-dialog');
+    document.documentElement.classList.add('test-detail-open');
+    if (!dialog.open) {
+      if (testDetailNarrowViewport.matches) dialog.showModal();
+      else dialog.show();
+    }
+    positionTestDetail();
+  }
+
+  function syncTestDetailSurface() {
+    const dialog = $('#test-detail-dialog');
+    if (!dialog?.open) return;
+    positionTestDetail();
+    const modal = dialog.matches(':modal');
+    if (modal === testDetailNarrowViewport.matches) return;
+    const focusWasInside = dialog.contains(document.activeElement);
+    dialog.close();
+    if (testDetailNarrowViewport.matches) dialog.showModal();
+    else dialog.show();
+    document.documentElement.classList.add('test-detail-open');
+    positionTestDetail();
+    if (focusWasInside) $('#test-detail-close').focus({ preventScroll: true });
+  }
+
+  function openTestRepository(repoId) {
+    const repository = testFleetRepository(repoId);
+    if (!repository) return;
+    if (state.testsProject !== repoId) {
+      state.testsProject = repoId;
+      state.tests = null;
+      state.testsQueryKey = null;
+      state.testsDetailError = null;
+      state.testsRuns = null;
+      state.testsRunsError = null;
+      state.testsRunEvidence = new Map();
+      state.testsSetup = null;
+      state.testsSetupError = null;
+    }
+    state.testsDetailTab = 'overview';
+    $('#test-detail-h').textContent = repository.display_name || repository.repo_id;
+    $('#test-detail-status').replaceChildren(testStatePill(repository), document.createTextNode(
+      repository.last_activity_at ? ` · updated ${timeAgo(Date.parse(repository.last_activity_at))}` : ' · no recent activity',
+    ));
+    showTestDetailSurface();
+    selectTestDetailTab('overview');
+    renderTestDetail();
+    loadTestDetail();
+  }
+
+  function closeTestDetail() {
+    hideTestHeatTooltip();
+    const dialog = $('#test-detail-dialog');
+    if (dialog.open) dialog.close();
+    dialog.style.removeProperty('--test-detail-top');
+    document.documentElement.classList.remove('test-detail-open');
+  }
+
+  function testDetailFacts(stats) {
+    const summary = stats?.summary || {};
+    const efficiency = stats?.efficiency || {};
+    const health = stats?.health || {};
+    const passRate = testRate(health.pass_rate, summary);
+    const parallel = Number(efficiency.parallel_efficiency_ratio
+      ?? (Number(summary.run_seconds || 0) > 0 ? Number(summary.test_seconds || 0) / Number(summary.run_seconds) : 0));
+    const queue = Number(efficiency.p95_queue_wait_seconds ?? summary.p95_queue_wait_seconds);
+    return h('dl', { class: 'test-detail-facts' },
+      h('div', null, h('dt', null, 'Tests'), h('dd', null, fmtTestCount(summary.test_count))),
+      h('div', null, h('dt', null, 'Pass rate'), h('dd', null, Number.isFinite(passRate) ? `${passRate.toFixed(1)}%` : '—')),
+      h('div', null, h('dt', null, 'Test / wall time'), h('dd', null, parallel > 0 ? `${parallel.toFixed(1)}×` : '—')),
+      h('div', null, h('dt', null, 'Queue P95'), h('dd', null, Number.isFinite(queue) ? fmtSeconds(queue) : '—')));
+  }
+
+  function testRepositoryDayDetail(repository) {
+    if (!repository) return null;
+    const cells = testFleetCellMap(repository);
+    return h('section', { class: 'test-detail-day', 'aria-labelledby': 'test-detail-day-h' },
+      h('div', { class: 'test-panel-title' },
+        h('h3', { id: 'test-detail-day-h' }, 'Last 24 hours'),
+        h('span', { class: 'meta-passive' }, 'Tap an hour for the exact value')),
+      h('div', {
+        class: 'test-detail-day-grid',
+        'aria-label': 'Repository test activity by local hour, from 00:00 through 23:00',
+      }, testFleetLocalHourSlots(state.testsFleet).map((slot) => {
+        const cell = testFleetLocalCell(cells, slot);
+        const failures = Number(cell.failure_count || 0);
+        const infrastructureFailures = Number(cell.infrastructure_count || 0);
+        const localHour = testFleetLocalHourLabel(slot.localHour);
+        const period = `${repository.display_name || repository.repo_id} · ${testFleetLocalPeriod(slot)}`;
+        return h('button', {
+          type: 'button',
+          class: 'test-detail-day-cell',
+          style: `background-color:${testHeatColor(cell.test_seconds)}`,
+          title: `${period} — ${(Number(cell.test_seconds || 0) / 60).toFixed(1)} aggregate test-minutes; ${Number(cell.test_count || 0)} tests; ${failures} test failures; ${infrastructureFailures} infrastructure failures`,
+          'aria-label': `${period}: ${(Number(cell.test_seconds || 0) / 60).toFixed(1)} aggregate test-minutes; ${Number(cell.test_count || 0)} tests; ${failures} test failures; ${infrastructureFailures} infrastructure failures`,
+          'data-test-period': period,
+          'data-test-local-hour': localHour,
+          'data-test-source-hours': slot.hourStarts.join(','),
+          'data-test-seconds': Number(cell.test_seconds || 0),
+          'data-test-count': Number(cell.test_count || 0),
+          'data-test-failures': failures,
+          'data-test-infrastructure': infrastructureFailures,
+          'aria-describedby': 'test-heat-tooltip',
+          'aria-pressed': 'false',
+          onpointerenter: (event) => showTestHeatTooltip(event.currentTarget),
+          onpointerleave: (event) => hideTestHeatTooltip(event.currentTarget),
+          onfocus: (event) => showTestHeatTooltip(event.currentTarget),
+          onblur: (event) => hideTestHeatTooltip(event.currentTarget),
+          onclick: (event) => togglePinnedTestHeatTooltip(event.currentTarget),
+        }, h('span', null, localHour));
+      })));
+  }
+
+  function testDetailEfficiency(stats) {
+    const summary = stats.summary || {};
+    const efficiency = stats.efficiency || {};
+    const avoided = stats.avoided_work || {};
+    const parallel = Number(efficiency.parallel_efficiency_ratio
+      ?? (Number(summary.run_seconds || 0) > 0 ? Number(summary.test_seconds || 0) / Number(summary.run_seconds) : 0));
+    const flakeRate = testRate(stats.health?.flake_rate);
+    return h('section', { class: 'test-detail-efficiency' },
+      h('div', null, h('span', null, 'Aggregate test time'), h('strong', null, fmtSeconds(summary.test_seconds || 0))),
+      h('div', null, h('span', null, 'Wall time'), h('strong', null, fmtSeconds(summary.run_seconds || efficiency.wall_seconds || 0))),
+      h('div', null, h('span', null, 'Parallelism'), h('strong', null, parallel > 0 ? `${parallel.toFixed(1)}×` : '—')),
+      h('div', null, h('span', null, 'Avoided work'), h('strong', null, avoided.available ? `${fmtTestCount(avoided.test_count)} tests` : 'Not measured')),
+      h('div', null, h('span', null, 'Flake rate'), h('strong', null, Number.isFinite(flakeRate) ? `${flakeRate.toFixed(1)}%` : '—')));
+  }
+
+  function testDetailHealthSpark(values, label, className) {
+    const series = values.map(Number).filter(Number.isFinite);
+    const width = 240;
+    const height = 44;
+    const pad = 3;
+    const max = Math.max(1, ...series);
+    const points = series.map((value, index) => {
+      const x = pad + (index / Math.max(1, series.length - 1)) * (width - pad * 2);
+      const y = height - pad - (value / max) * (height - pad * 2);
+      return `${x.toFixed(1)},${y.toFixed(1)}`;
+    }).join(' ');
+    const svg = svgEl('svg', {
+      class: `test-detail-health-spark ${className}`,
+      viewBox: `0 0 ${width} ${height}`,
+      preserveAspectRatio: 'none',
+      role: 'img',
+      'aria-label': label,
+    });
+    if (points) svg.append(svgEl('polyline', { points, fill: 'none' }));
+    return svg;
+  }
+
+  function testDetailHealthTrends(stats) {
+    const rows = [...(stats.daily || [])]
+      .filter((row) => typeof row?.day === 'string')
+      .sort((a, b) => a.day.localeCompare(b.day))
+      .slice(-14);
+    const failureRates = rows.map((row) => {
+      const passed = Number(row.passed_count || 0);
+      const failed = Number(row.failure_count || 0);
+      return passed + failed > 0 ? (100 * failed) / (passed + failed) : 0;
+    });
+    const flakeRates = rows.map((row) => {
+      const rate = Number(row.flake_rate);
+      return Number.isFinite(rate) ? (rate > 1 ? rate : rate * 100) : 0;
+    });
+    const latestFailure = failureRates.at(-1);
+    const latestFlake = flakeRates.at(-1);
+    return h('section', { class: 'test-detail-health-trends', 'aria-labelledby': 'test-detail-health-h' },
+      h('div', { class: 'test-panel-title' },
+        h('h3', { id: 'test-detail-health-h' }, 'Failure & flake trend'),
+        h('span', { class: 'meta-passive' }, rows.length ? `Last ${rows.length} recorded days` : 'No recorded days')),
+      h('div', { class: 'test-detail-health-grid' },
+        h('div', null,
+          h('span', null, 'Failure rate'),
+          h('strong', null, Number.isFinite(latestFailure) ? `${latestFailure.toFixed(1)}%` : '—'),
+          testDetailHealthSpark(failureRates, 'Daily failure-rate trend', 'is-failure')),
+        h('div', null,
+          h('span', null, 'Flake rate'),
+          h('strong', null, Number.isFinite(latestFlake) ? `${latestFlake.toFixed(1)}%` : '—'),
+          testDetailHealthSpark(flakeRates, 'Daily flake-rate trend', 'is-flake'))),
+      testChartDataDisclosure(
+        'Daily failure and flake data',
+        ['Day', 'Passed', 'Failed', 'Failure rate', 'Flake rate'],
+        rows.map((row, index) => [
+          row.day,
+          fmtTestCount(row.passed_count),
+          fmtTestCount(row.failure_count),
+          `${failureRates[index].toFixed(1)}%`,
+          `${flakeRates[index].toFixed(1)}%`,
+        ]),
+      ));
+  }
+
+  function testTopRegression(stats) {
+    const top = stats.top_actionable_regression || (stats.dynamics || [])
+      .filter((item) => Number(item.failure_count || 0) > 0)
+      .sort((a, b) => Number(b.failure_count || 0) - Number(a.failure_count || 0))[0];
+    if (!top) return h('section', { class: 'test-detail-regression is-clear' },
+      h('div', { class: 'test-panel-title' }, h('h3', null, 'Top actionable regression')),
+      h('p', { class: 'empty-inline' }, 'No actionable regression in this period.'));
+    const currentFailures = Number(top.current_failure_count ?? top.failure_count);
+    const previousFailures = Number(top.previous_failure_count);
+    const durationChange = Number(top.duration_change_percent ?? top.change_percent);
+    const kind = top.kind === 'duration_regression' || (!currentFailures && Number.isFinite(durationChange))
+      ? 'Duration regression' : 'Test failure';
+    const impact = currentFailures > 0
+      ? `${fmtTestCount(currentFailures)} current ${currentFailures === 1 ? 'failure' : 'failures'}`
+      : Number.isFinite(durationChange) ? `${testDeltaText(durationChange)} average duration` : 'Needs review';
+    const comparison = Number.isFinite(previousFailures)
+      ? `${fmtTestCount(previousFailures)} → ${fmtTestCount(currentFailures)} failures`
+      : Number.isFinite(durationChange) ? `${testDeltaText(durationChange)} vs previous period` : 'No comparable baseline';
+    return h('section', { class: 'test-detail-regression' },
+      h('div', { class: 'test-panel-title' }, h('h3', null, 'Top actionable regression')),
+      h('strong', { class: 'mono' }, top.name || top.suite || top.title || 'Failing test'),
+      h('p', null, top.detail || `${Number(top.failure_count || 0)} failures · ${top.last_run ? `last seen ${fmtWhen(top.last_run)}` : 'open runs for evidence'}`),
+      h('dl', { class: 'test-detail-regression-facts' },
+        h('div', null, h('dt', null, 'Evidence'), h('dd', null, kind)),
+        h('div', null, h('dt', null, 'Impact'), h('dd', null, impact)),
+        h('div', null, h('dt', null, 'Change'), h('dd', null, comparison)),
+        h('div', null, h('dt', null, 'Last observed'), h('dd', null, top.last_run ? fmtWhen(top.last_run) : 'Not recorded'))));
+  }
+
+  function testRunStateLabel(value) {
+    return ({
+      queued: 'Queued', running: 'Running', cancelling: 'Cancelling', superseding: 'Superseding',
+      succeeded: 'Passed', failed: 'Failed', timed_out: 'Timed out', cancelled: 'Cancelled',
+      incomplete: 'Incomplete', abandoned: 'Abandoned', superseded: 'Superseded',
+    })[value] || 'Unknown';
+  }
+
+  async function operateTestRun(run, action) {
+    const repoId = run.repo_id || run.repository_id || state.testsProject;
+    const endpoint = `/api/tests/repositories/${encodeURIComponent(repoId)}/runs/${encodeURIComponent(run.run_id)}/${action}`;
+    const body = action === 'cancel'
+      ? { reason: 'Cancelled from DevOps Console', operation_id: crypto.randomUUID() }
+      : { failed_only: true, operation_id: crypto.randomUUID() };
+    try {
+      await api(endpoint, { method: 'POST', body });
+      state.testsRunEvidence.delete(run.run_id);
+      await Promise.all([loadTestRuns({ force: true }), loadTests({ force: true })]);
+    } catch (error) {
+      state.testsRunsError = error;
+      renderTestDetail();
+    }
+  }
+
+  function testRunMemoryWait(run) {
+    const targets = Array.isArray(run?.targets) ? run.targets : [];
+    const candidates = [run?.wait, ...targets.map((target) => target?.wait)];
+    return candidates.find((wait) => wait && typeof wait === 'object'
+      && !Array.isArray(wait) && wait.code === 'host_memory') || null;
+  }
+
+  function testMemorySize(mib) {
+    if (mib === null || mib === undefined || typeof mib !== 'number'
+      || !Number.isFinite(mib) || mib < 0) return null;
+    return fmtBytes(mib * 1024 * 1024);
+  }
+
+  function testRunMemoryWaitLabel(wait) {
+    if (!wait || wait.code !== 'host_memory') return null;
+    const required = testMemorySize(wait.required_mib);
+    const available = testMemorySize(wait.available_mib);
+    return [
+      'Waiting for memory',
+      required ? `~${required} needed` : null,
+      available ? `${available} available` : null,
+    ].filter(Boolean).join(' · ');
+  }
+
+  function testRunUsage(detail, summary, run) {
+    const candidates = [detail?.usage, summary?.usage, run?.usage].filter((usage) => (
+      usage && typeof usage === 'object' && !Array.isArray(usage)
+      && typeof usage.available === 'boolean'
+    ));
+    return candidates.find((usage) => usage.available === true) || candidates[0] || null;
+  }
+
+  function testRunMeasurementCoverage(usage) {
+    if (!usage || usage.available !== true) return null;
+    const measured = usage.measured_attempts;
+    const total = usage.total_attempts;
+    if (!Number.isInteger(measured) || measured < 0) return null;
+    if (Number.isInteger(total) && total >= measured) {
+      return `${measured} of ${total} ${total === 1 ? 'attempt' : 'attempts'}`;
+    }
+    return `${measured} measured ${measured === 1 ? 'attempt' : 'attempts'}`;
+  }
+
+  function testRunEvidenceFact(label, value, { wide = false, mono = false } = {}) {
+    if (value === null || value === undefined || value === '') return null;
+    return h('div', { class: wide ? 'test-run-evidence-wide' : null },
+      h('dt', null, label), h('dd', { class: mono ? 'mono' : null }, value));
+  }
+
+  function testRunEvidenceContent(run, evidence) {
+    const detail = evidence?.detail || run;
+    const summary = detail?.summary || {};
+    const failures = evidence?.failures?.failures || [];
+    const artifacts = evidence?.artifacts?.artifacts || [];
+    const wait = (detail.state || run.state) === 'queued'
+      ? testRunMemoryWait(detail) || testRunMemoryWait(run) : null;
+    const waitLabel = testRunMemoryWaitLabel(wait);
+    const usage = testRunUsage(detail, summary, run);
+    const peakMemory = usage?.available === true ? testMemorySize(usage.peak_memory_mib) : null;
+    const cpuTime = usage?.available === true && typeof usage.cpu_seconds === 'number'
+      && Number.isFinite(usage.cpu_seconds) && usage.cpu_seconds >= 0
+      ? fmtSeconds(usage.cpu_seconds) : null;
+    const evidenceFacts = [
+      testRunEvidenceFact('Run ID', run.run_id, { mono: true }),
+      testRunEvidenceFact('Queue status', waitLabel, { wide: true }),
+      testRunEvidenceFact('Queue wait', fmtSeconds(summary.queue_seconds ?? run.queue_seconds)),
+      testRunEvidenceFact('Test time', fmtSeconds(summary.aggregate_test_seconds ?? run.aggregate_test_seconds)),
+      testRunEvidenceFact('Peak memory', peakMemory),
+      testRunEvidenceFact('CPU time', cpuTime),
+      testRunEvidenceFact('Measurements', testRunMeasurementCoverage(usage)),
+      testRunEvidenceFact('Conclusion', detail.conclusion || run.conclusion || '—'),
+      testRunEvidenceFact('Failures', fmtTestCount(summary.failure_record_count ?? failures.length)),
+      testRunEvidenceFact('Artifacts', fmtTestCount(summary.artifact_count ?? artifacts.length)),
+    ].filter(Boolean);
+    return [
+      h('dl', { class: 'test-run-evidence' }, evidenceFacts),
+      failures.length ? h('section', { class: 'test-run-failures' },
+        h('strong', null, 'Top actionable failures'),
+        h('ol', null, failures.slice(0, 3).map((failure) => h('li', null,
+          h('span', { class: 'mono' }, failure.target_name || failure.case_id || failure.classification || 'failure'),
+          h('span', null, failure.message || 'No bounded failure message was recorded.'))))) : null,
+      artifacts.length ? h('section', { class: 'test-run-artifacts' },
+        h('strong', null, 'Artifacts'),
+        h('ul', null, artifacts.slice(0, 12).map((artifact) => h('li', null,
+          h('span', null, artifact.kind || 'artifact'),
+          h('span', { class: 'mono' }, artifact.artifact_id || artifact.name || '—'),
+          h('span', null, fmtBytes(Number(artifact.size_bytes || 0))))))) : null,
+      run.can_cancel ? h('button', {
+        class: 'btn small', type: 'button', onclick: () => operateTestRun(run, 'cancel'),
+      }, 'Cancel run') : null,
+      run.can_retry ? h('button', {
+        class: 'btn small', type: 'button', onclick: () => operateTestRun(run, 'retry'),
+      }, 'Retry failed') : null,
+    ].filter(Boolean);
+  }
+
+  async function loadTestRunEvidence(run, host) {
+    const cached = state.testsRunEvidence.get(run.run_id);
+    if (cached?.value) {
+      host.replaceChildren(...testRunEvidenceContent(run, cached.value));
+      return;
+    }
+    if (cached?.loading) return;
+    state.testsRunEvidence.set(run.run_id, { loading: true });
+    host.replaceChildren(h('p', { class: 'meta-passive' }, 'Loading bounded run evidence…'));
+    try {
+      const runId = encodeURIComponent(run.run_id);
+      const repoId = run.repo_id || run.repository_id || state.testsProject;
+      const base = `/api/tests/repositories/${encodeURIComponent(repoId)}/runs/${encodeURIComponent(runId)}`;
+      const [detail, failures, artifacts] = await Promise.all([
+        api(base),
+        api(`${base}/failures?limit=3`),
+        api(`${base}/artifacts?limit=12`),
+      ]);
+      if ([detail, failures, artifacts].some((value) => value?.run_id !== run.run_id)) {
+        throw new ApiError('run evidence identity is invalid', 502);
+      }
+      const value = { detail, failures, artifacts };
+      state.testsRunEvidence.set(run.run_id, { loading: false, value });
+      if (host.isConnected) host.replaceChildren(...testRunEvidenceContent(run, value));
+    } catch (error) {
+      state.testsRunEvidence.set(run.run_id, { loading: false, error });
+      if (host.isConnected) host.replaceChildren(testLocalFailure(
+        'Run evidence is unavailable', error, () => loadTestRunEvidence(run, host),
+      ));
+    }
+  }
+
+  function testRunHistoryCard(run) {
+    const targetCount = Number(run.target_count || run.targets?.length || 0);
+    const completed = Number(run.completed_target_count || 0);
+    const progress = targetCount > 0
+      ? Math.max(0, Math.min(100, (completed / targetCount) * 100)) : 100;
+    const active = ['queued', 'running', 'cancelling', 'superseding'].includes(run.state);
+    const wallSeconds = run.wall_seconds ?? (run.started_at
+      ? Number(run.finished_at || Date.now() / 1000) - Number(run.started_at) : null);
+    const waitLabel = run.state === 'queued'
+      ? testRunMemoryWaitLabel(testRunMemoryWait(run)) : null;
+    const evidenceHost = h('div', { class: 'test-run-history-evidence-body' });
+    const evidence = h('details', {
+      class: 'test-run-history-evidence',
+      'data-test-run-id': run.run_id,
+      ontoggle: (event) => {
+        if (event.currentTarget.open) loadTestRunEvidence(run, evidenceHost);
+      },
+    }, h('summary', { 'data-test-focus-key': `run:${run.run_id}` }, 'Run evidence'), evidenceHost);
+    return h('article', { class: `test-run-history-card is-${run.state || 'unknown'}` },
+      h('div', { class: 'test-run-history-main' },
+        h('div', null,
+          h('strong', null, `${run.intent || 'manual'} · ${run.actor || 'unknown actor'}`),
+          h('span', { class: `test-run-status is-${run.state || 'unknown'}` }, testRunStateLabel(run.state))),
+        h('p', null, `${run.queued_at ? fmtWhen(run.queued_at) : 'Time unavailable'} · ${run.source_mode || 'unknown'} source`)),
+      h('div', { class: 'test-run-history-metrics' },
+        h('span', null, `${completed}/${targetCount} targets`),
+        h('span', null, wallSeconds === null ? '— wall' : `${fmtSeconds(wallSeconds)} wall`)),
+      waitLabel ? h('p', { class: 'test-run-wait' }, waitLabel) : null,
+      active ? h('div', {
+        class: 'test-run-history-progress', role: 'progressbar',
+        'aria-label': `${completed} of ${targetCount} targets complete`,
+        'aria-valuemin': 0, 'aria-valuemax': targetCount, 'aria-valuenow': completed,
+      }, h('span', { style: `width:${progress.toFixed(1)}%` })) : null,
+      evidence);
+  }
+
+  function renderTestRunsTab() {
+    if (state.testsRunsLoading && !state.testsRuns) {
+      return [h('div', { class: 'skel', 'aria-hidden': 'true' }), h('div', { class: 'skel', 'aria-hidden': 'true' })];
+    }
+    if (!state.testsRuns) {
+      return [testLocalFailure('Run history is unavailable', state.testsRunsError, () => loadTestRuns({ force: true }))];
+    }
+    const rows = state.testsRuns.runs || [];
+    if (!rows.length) return [h('p', { class: 'empty-inline' }, 'No Coordinator test runs have been recorded for this repository.')];
+    const nextCursor = testRunsNextCursor();
+    return [
+      h('section', {
+        class: 'test-run-history',
+        'aria-label': 'Repository test run history',
+        'aria-busy': String(state.testsRunsLoading),
+      }, rows.map(testRunHistoryCard)),
+      state.testsRunsError ? testLocalFailure(
+        'More run history is unavailable',
+        state.testsRunsError,
+        () => loadTestRuns({ append: true }),
+      ) : null,
+      nextCursor && !state.testsRunsError ? h('div', { class: 'test-runs-pager' },
+        h('button', {
+          class: 'btn',
+          type: 'button',
+          disabled: state.testsRunsLoading,
+          'data-test-runs-load-more': true,
+          'data-test-focus-key': 'runs:load-more',
+          onclick: () => loadTestRuns({ append: true }),
+        }, state.testsRunsLoading ? 'Loading…' : 'Load more runs')) : null,
+    ];
+  }
+
+  function setupEntries(value) {
+    if (Array.isArray(value)) return value.map((item) => [String(item), '']);
+    if (!value || typeof value !== 'object') return [];
+    return Object.entries(value).map(([name, detail]) => [name, Array.isArray(detail) ? detail.join(', ') : String(detail ?? '')]);
+  }
+
+  function setupCard(title, description, entries, empty) {
+    return h('section', { class: 'test-setup-card' },
+      h('h3', null, title),
+      description ? h('p', null, description) : null,
+      entries.length ? h('ul', { class: 'test-setup-list' }, entries.map(([name, detail]) => h('li', null,
+        h('strong', null, name), h('span', null, detail)))) : h('p', { class: 'empty-inline' }, empty));
+  }
+
+  function testSetupTargetEntries(setup) {
+    const missing = new Set(setup.capability_policy?.missing || []);
+    if (!Array.isArray(setup.targets)) return setupEntries(setup.target_graph);
+    return setup.targets.map((target) => {
+      if (typeof target === 'string') return [target, ''];
+      const requirements = [];
+      if (target.network && target.network !== 'none') requirements.push(`network.${target.network}`);
+      for (const fixture of target.fixtures || []) requirements.push(`fixture.${fixture}`);
+      const blocked = requirements.filter((requirement) => missing.has(requirement));
+      const detail = [];
+      if ((target.depends_on || []).length) detail.push(`after ${target.depends_on.join(', ')}`);
+      if (requirements.length) detail.push(requirements.join(', '));
+      if (blocked.length) detail.push(`blocked: ${blocked.join(', ')}`);
+      return [target.name || 'Unnamed target', detail.join(' · ')];
+    });
+  }
+
+  function testSetupCapabilityEntries(setup) {
+    const policy = setup.capability_policy;
+    if (!policy || typeof policy !== 'object') return [];
+    const missing = new Set(policy.missing || []);
+    return (policy.requested || []).map((capability) => [
+      capability,
+      missing.has(capability) ? 'Blocked — administrator grant required' : 'Approved',
+    ]);
+  }
+
+  function renderTestSetupTab() {
+    if (state.testsSetupLoading && !state.testsSetup) {
+      return [h('div', { class: 'skel', 'aria-hidden': 'true' }), h('div', { class: 'skel', 'aria-hidden': 'true' })];
+    }
+    if (!state.testsSetup) {
+      return [testLocalFailure('Repository setup is unavailable', state.testsSetupError, () => loadTestSetup({ force: true }))];
+    }
+    const setup = state.testsSetup;
+    const issues = (setup.issues || setup.input_coverage_gaps || []).map((item) => [
+      item.code || item.path || 'Coverage gap', item.message || item.detail || String(item),
+    ]);
+    const targets = testSetupTargetEntries(setup);
+    const policies = setupEntries(setup.evidence_policies || setup.policies);
+    const fixtures = setupEntries(setup.fixtures);
+    const isolation = setupEntries(setup.isolation || setup.capabilities || setup.network_requirements);
+    const capabilities = testSetupCapabilityEntries(setup);
+    return [h('div', { class: 'test-setup-grid' },
+      setupCard(
+        `Manifest · ${setup.status || 'unknown'}`,
+        setup.manifest_fingerprint ? `Schema ${setup.manifest_schema || '—'} · ${String(setup.manifest_fingerprint).slice(0, 12)}` : 'The repository manifest has not produced a verified fingerprint.',
+        issues,
+        setup.status === 'ready' ? 'No manifest or input-coverage gaps detected.' : 'No structured issue details were returned.',
+      ),
+      setupCard('Target graph', 'Dependency-aware targets selected by repository inputs and intent.', targets, 'No targets are declared.'),
+      setupCard('Evidence policies', 'Named policies are evaluated against exact immutable provenance.', policies, 'No evidence policies are declared.'),
+      setupCard('Capabilities & fixtures', 'Network and fixture requirements for these targets.', [...capabilities, ...isolation, ...fixtures], 'No additional capabilities or fixtures are required.'),
+    )];
+  }
+
+  function renderTestDetail() {
+    const host = $('#test-detail-body');
+    if (!host || !$('#test-detail-dialog').open) return;
+    if (state.testsDetailTab === 'runs') {
+      const focusKey = document.activeElement?.dataset?.testFocusKey || null;
+      const openRuns = new Set([...host.querySelectorAll('details[open][data-test-run-id]')]
+        .map((node) => node.dataset.testRunId));
+      host.replaceChildren(...renderTestRunsTab());
+      for (const disclosure of host.querySelectorAll('details[data-test-run-id]')) {
+        if (openRuns.has(disclosure.dataset.testRunId)) disclosure.open = true;
+      }
+      if (focusKey) {
+        const restore = [...host.querySelectorAll('[data-test-focus-key]')]
+          .find((node) => node.dataset.testFocusKey === focusKey);
+        restore?.focus({ preventScroll: true });
+      }
+      return;
+    }
+    if (state.testsDetailTab === 'setup') {
+      host.replaceChildren(...renderTestSetupTab());
+      return;
+    }
+    if (state.testsDetailLoading && !state.tests) {
+      host.replaceChildren(h('div', { class: 'skel', 'aria-hidden': 'true' }), h('div', { class: 'skel', 'aria-hidden': 'true' }));
+      return;
+    }
+    const stats = state.tests;
+    if (!stats) {
+      host.replaceChildren(testLocalFailure(
+        'Repository statistics are unavailable',
+        state.testsDetailError,
+        () => loadTestDetail({ force: true }),
+      ));
+      return;
+    }
+    const dynamicsRows = (stats.dynamics || []).slice(0, 12).map((row) => {
+      const change = row.change_percent === null || row.change_percent === undefined ? Number.NaN : Number(row.change_percent);
+      return h('tr', null,
+        h('td', { class: 'mono test-name' }, row.suite),
+        h('td', null, fmtSeconds(row.current_seconds)),
+        h('td', { class: `test-dynamic-change ${Number.isFinite(change) && change > 0 ? 'is-worse' : 'is-better'}` }, testDeltaText(change)),
+        h('td', null, row.failure_count),
+        h('td', null, row.last_run ? fmtWhen(row.last_run) : '—'));
+    });
+    const openDisclosures = new Set([...host.querySelectorAll('details[open][data-test-disclosure]')]
+      .map((node) => node.dataset.testDisclosure));
+    host.replaceChildren(
+      testDetailFacts(stats),
+      testRepositoryDayDetail(testFleetRepository(state.testsProject)),
+      h('section', { class: 'test-detail-throughput' },
+        h('div', { class: 'test-panel-title' }, h('h3', null, 'Throughput & efficiency'), h('span', { class: 'meta-passive' }, `Last ${state.testsDays} days`)),
+        testTrendChart(stats),
+        testDetailEfficiency(stats),
+        testDetailHealthTrends(stats)),
+      testTopRegression(stats),
+      h('details', { class: 'test-detail-dynamics', 'data-test-disclosure': 'largest-dynamics' },
+        h('summary', null, 'Largest dynamics'),
+        testTable('Dynamics evidence', ['Suite / test set', 'Current time', 'Change', 'Failures', 'Last run'], dynamicsRows)),
+    );
+    for (const disclosure of host.querySelectorAll('details[data-test-disclosure]')) {
+      if (openDisclosures.has(disclosure.dataset.testDisclosure)) disclosure.open = true;
+    }
+  }
+
+  function fillTestRunRepositories(selected = null) {
+    const repositories = state.testsFleet?.repositories || [];
+    const select = $('#test-run-project');
+    select.replaceChildren(...repositories.map((repository) => h('option', {
+      value: repository.repo_id,
+      selected: repository.repo_id === selected,
+    }, repository.display_name || repository.repo_id)));
+  }
+
+  function sourceKey(selector) {
+    if (!selector || typeof selector !== 'object' || Array.isArray(selector)
+      || Object.keys(selector).sort().join(',') !== [
+        'kind', 'repository_generation', 'repository_id', 'schema_version',
+      ].sort().join(',')
+      || selector.schema_version !== 1
+      || !['original', 'temporary'].includes(selector.kind)
+      || typeof selector.repository_id !== 'string'
+      || !selector.repository_id
+      || !Number.isInteger(selector.repository_generation)
+      || selector.repository_generation < 0) return '';
+    return `${selector.kind}:${selector.repository_id}:${selector.repository_generation}`;
+  }
+
+  function selectedTestRunSource() {
+    const catalog = state.testsRunSourceCatalog;
+    if (!catalog || catalog.repository_id !== $('#test-run-project').value) return null;
+    const selected = $('#test-run-source').value;
+    return (catalog.sources || []).find((source) => sourceKey(source.selector) === selected) || null;
+  }
+
+  function updateTestRunPreviewAvailability() {
+    const button = $('#test-run-preview-button');
+    if (!button) return;
+    button.disabled = state.testsRunSourceLoading || !selectedTestRunSource();
+  }
+
+  function renderTestRunSources() {
+    const select = $('#test-run-source');
+    const repoId = $('#test-run-project').value;
+    const catalog = state.testsRunSourceCatalog?.repository_id === repoId
+      ? state.testsRunSourceCatalog : null;
+    const previous = state.testsRunSourceSelections.get(repoId)
+      || sourceKey(catalog?.default_source);
+    if (state.testsRunSourceLoading && !catalog) {
+      select.replaceChildren(h('option', { value: '' }, 'Reading authorized sources…'));
+      select.disabled = true;
+      updateTestRunPreviewAvailability();
+      return;
+    }
+    if (!catalog) {
+      const detail = state.testsRunSourceError?.message || 'Authorized sources are unavailable';
+      select.replaceChildren(h('option', { value: '' }, detail));
+      select.disabled = true;
+      updateTestRunPreviewAvailability();
+      return;
+    }
+    const options = (catalog.sources || []).map((source) => h('option', {
+      value: sourceKey(source.selector),
+      selected: sourceKey(source.selector) === previous,
+    }, source.selector.kind === 'temporary'
+      ? `${source.label} · temporary worktree`
+      : source.label));
+    select.replaceChildren(...options);
+    if (!select.value && options.length) select.value = sourceKey(catalog.default_source);
+    select.disabled = options.length === 0;
+    const selected = selectedTestRunSource();
+    if (selected) state.testsRunSourceSelections.set(repoId, sourceKey(selected.selector));
+    updateTestRunPreviewAvailability();
+  }
+
+  async function loadTestRunSources(repoId) {
+    if (!repoId) return;
+    if (state.testsRunSourceCatalog?.repository_id === repoId) {
+      renderTestRunSources();
+      return;
+    }
+    const request = state.testsRunSourceRequest + 1;
+    state.testsRunSourceRequest = request;
+    state.testsRunSourceLoading = true;
+    state.testsRunSourceError = null;
+    renderTestRunSources();
+    try {
+      const catalog = await api(`/api/tests/repositories/${encodeURIComponent(repoId)}/sources`);
+      if (request !== state.testsRunSourceRequest || $('#test-run-project').value !== repoId) return;
+      if (!catalog || catalog.schema_version !== 1 || catalog.repository_id !== repoId
+        || !Array.isArray(catalog.sources) || catalog.sources.length === 0) {
+        throw new ApiError('repository test source authority is invalid', 502);
+      }
+      const keys = catalog.sources.map((source) => sourceKey(source.selector));
+      if (keys.some((key) => !key) || new Set(keys).size !== keys.length
+        || !keys.includes(sourceKey(catalog.default_source))) {
+        throw new ApiError('repository test source identities are invalid', 502);
+      }
+      state.testsRunSourceCatalog = catalog;
+    } catch (error) {
+      if (request !== state.testsRunSourceRequest || $('#test-run-project').value !== repoId) return;
+      state.testsRunSourceCatalog = null;
+      state.testsRunSourceError = error;
+    } finally {
+      if (request === state.testsRunSourceRequest) {
+        state.testsRunSourceLoading = false;
+        renderTestRunSources();
+      }
+    }
+  }
+
+  function resetTestRunPreview() {
+    state.testsPlan = null;
+    state.testsPlanOperationId = null;
+    $('#test-run-submit').disabled = true;
+    $('#test-run-error').hidden = true;
+    $('#test-run-preview').replaceChildren(h('p', { class: 'meta-passive' },
+      'Preview the plan to see selected targets, reasons, dependency waves and resource policy.'));
+    updateTestRunPreviewAvailability();
+  }
+
+  function testRunTargetNames(setup) {
+    const declared = Array.isArray(setup?.targets)
+      ? setup.targets.map((target) => (typeof target === 'string' ? target : target?.name))
+      : Object.keys(setup?.target_graph || {});
+    return [...new Set(declared
+      .filter((target) => typeof target === 'string' && target)
+      .map(String))].sort((a, b) => a.localeCompare(b));
+  }
+
+  function selectedTestRunTargets() {
+    return [...document.querySelectorAll('#test-run-targets input[type="checkbox"]:checked')]
+      .map((input) => input.value);
+  }
+
+  function renderTestRunTargets() {
+    const host = $('#test-run-targets');
+    const repoId = $('#test-run-project').value;
+    if (state.testsRunTargetLoading && state.testsRunTargetSetup?.repo_id !== repoId) {
+      host.replaceChildren(h('p', { class: 'meta-passive' }, 'Reading declared targets…'));
+      return;
+    }
+    if (state.testsRunTargetError && state.testsRunTargetSetup?.repo_id !== repoId) {
+      host.replaceChildren(h('p', { class: 'meta-passive' }, state.testsRunTargetError.message));
+      return;
+    }
+    const targets = state.testsRunTargetSetup?.repo_id === repoId
+      ? testRunTargetNames(state.testsRunTargetSetup) : [];
+    if (!targets.length) {
+      host.replaceChildren(h('p', { class: 'meta-passive' }, 'No runnable targets are declared for this repository.'));
+      return;
+    }
+    host.replaceChildren(...targets.map((target) => h('label', null,
+      h('input', {
+        type: 'checkbox', value: target, checked: true,
+        onchange: resetTestRunPreview,
+      }),
+      h('span', { title: target }, target))));
+  }
+
+  function updateTestRunTargetField() {
+    const manual = $('#test-run-intent').value === 'manual';
+    $('#test-run-target-field').hidden = !manual;
+    if (manual) renderTestRunTargets();
+  }
+
+  async function loadTestRunTargets(repoId) {
+    if (!repoId || $('#test-run-intent').value !== 'manual') return;
+    if (state.testsRunTargetSetup?.repo_id === repoId) {
+      renderTestRunTargets();
+      return;
+    }
+    const request = state.testsRunTargetRequest + 1;
+    state.testsRunTargetRequest = request;
+    state.testsRunTargetLoading = true;
+    state.testsRunTargetError = null;
+    renderTestRunTargets();
+    try {
+      const setup = await api(`/api/tests/repositories/${encodeURIComponent(repoId)}/setup`);
+      if (request !== state.testsRunTargetRequest || $('#test-run-project').value !== repoId) return;
+      if (!setup || (setup.repo_id && setup.repo_id !== repoId)) {
+        throw new ApiError('repository test setup identity is invalid', 502);
+      }
+      state.testsRunTargetSetup = { ...setup, repo_id: repoId };
+    } catch (err) {
+      if (request !== state.testsRunTargetRequest || $('#test-run-project').value !== repoId) return;
+      state.testsRunTargetError = err;
+      state.testsRunTargetSetup = null;
+    } finally {
+      if (request === state.testsRunTargetRequest) {
+        state.testsRunTargetLoading = false;
+        renderTestRunTargets();
+      }
+    }
+  }
+
+  function openTestRunDialog(repoId = null) {
+    fillTestRunRepositories(repoId || state.testsProject);
+    $('#test-run-intent').value = 'manual';
+    state.testsRunTargetSetup = null;
+    state.testsRunTargetError = null;
+    state.testsRunSourceCatalog = null;
+    state.testsRunSourceError = null;
+    resetTestRunPreview();
+    updateTestRunTargetField();
+    const dialog = $('#test-run-dialog');
+    if (!dialog.open) dialog.showModal();
+    const selectedRepoId = $('#test-run-project').value;
+    loadTestRunTargets(selectedRepoId);
+    loadTestRunSources(selectedRepoId);
+  }
+
+  function closeTestRunDialog() {
+    state.testsRunTargetRequest += 1;
+    state.testsRunSourceRequest += 1;
+    const dialog = $('#test-run-dialog');
+    if (dialog.open) dialog.close();
+  }
+
+  async function previewTestRun() {
+    const error = $('#test-run-error');
+    error.hidden = true;
+    $('#test-run-preview-button').disabled = true;
+    try {
+      const intent = $('#test-run-intent').value;
+      const source = selectedTestRunSource();
+      if (!source) {
+        throw new ApiError('Choose an authorized repository source.', 400);
+      }
+      const requestedTargets = intent === 'manual' ? selectedTestRunTargets() : [];
+      if (intent === 'manual' && requestedTargets.length === 0) {
+        throw new ApiError('Select at least one declared target for a manual run.', 400);
+      }
+      const operationId = state.testsPlanOperationId || crypto.randomUUID();
+      state.testsPlanOperationId = operationId;
+      const plan = await api('/api/tests/plan', {
+        method: 'POST',
+        body: {
+          repo_id: $('#test-run-project').value,
+          intent,
+          operation_id: operationId,
+          source: source.selector,
+          ...(intent === 'manual' ? { requested_targets: requestedTargets } : {}),
+        },
+      });
+      if (plan.operation_id !== operationId) {
+        throw new ApiError('repository test plan operation identity is invalid', 502);
+      }
+      if (sourceKey(plan.source_selector) !== sourceKey(source.selector)) {
+        throw new ApiError('repository test plan source identity is invalid', 502);
+      }
+      state.testsPlan = plan;
+      const planDocument = plan.plan || plan;
+      const targets = planDocument.targets || planDocument.selected_targets || [];
+      const reasons = planDocument.selection_reasons || planDocument.reasons
+        || Object.values(planDocument.selection || {}).flatMap((item) => item?.reasons || []);
+      $('#test-run-preview').replaceChildren(
+        h('div', { class: 'test-run-preview-head' },
+          h('strong', null, `${targets.length} selected target${sfx(targets.length)}`),
+          h('span', null, plan.estimated_seconds ? `~${fmtSeconds(plan.estimated_seconds)}` : 'Estimate unavailable')),
+        h('p', null, reasons.slice(0, 3).join(' · ') || 'Targets selected by the repository manifest and dependency graph.'),
+        h('dl', null,
+          h('div', null, h('dt', null, 'Source'), h('dd', null, plan.source_label || source.label)),
+          h('div', null, h('dt', null, 'Waves'), h('dd', null, String((planDocument.waves || planDocument.dependency_waves || []).length || '—'))),
+          h('div', null, h('dt', null, 'Parallelism'), h('dd', null, String(planDocument.parallelism || planDocument.max_parallel || 'policy'))),
+          h('div', null, h('dt', null, 'Network'), h('dd', null, planDocument.network || 'manifest policy'))));
+      $('#test-run-submit').disabled = !plan.plan_id;
+    } catch (err) {
+      error.textContent = err.message;
+      error.hidden = false;
+    } finally {
+      updateTestRunPreviewAvailability();
+    }
+  }
+
+  async function submitTestRun() {
+    const error = $('#test-run-error');
+    error.hidden = true;
+    const submit = $('#test-run-submit');
+    submit.disabled = true;
+    try {
+      const result = await api('/api/tests/runs', {
+        method: 'POST',
+        body: {
+          repo_id: state.testsPlan?.repository_id ?? state.testsPlan?.repo_id,
+          plan_id: state.testsPlan?.plan_id,
+          operation_id: crypto.randomUUID(),
+        },
+      });
+      closeTestRunDialog();
+      await loadTests({ force: true });
+      const submittedRepoId = result.repo_id ?? result.repository_id;
+      if (submittedRepoId === state.testsProject) {
+        // The same repository may already have a mounted/cached Runs tab.
+        // An accepted submission changes that collection even though the
+        // selected repository identity did not change, so make its next
+        // disclosure read fresh Coordinator history instead of preserving a
+        // pre-submission snapshot.
+        state.testsRuns = null;
+        state.testsRunsError = null;
+      }
+      if (submittedRepoId) openTestRepository(submittedRepoId);
+    } catch (err) {
+      error.textContent = err.message;
+      error.hidden = false;
+      submit.disabled = false;
     }
   }
 
@@ -2988,6 +5491,54 @@
           h('table', { class: 'test-table' },
             h('thead', null, h('tr', null, headers.map((label) => h('th', { scope: 'col' }, label)))),
             h('tbody', null, rows))));
+  }
+
+  function testChartDataDisclosure(title, headers, values) {
+    const rows = values.map((valuesRow) => h('tr', null,
+      valuesRow.map((value, index) => h('td', {
+        'data-label': headers[index],
+        'aria-label': `${headers[index]}: ${value}`,
+      }, value))));
+    return h('details', { class: 'test-chart-data', 'data-test-disclosure': title },
+      h('summary', null, title),
+      h('div', { class: 'test-table-wrap' },
+        h('table', { class: 'test-table' },
+          h('thead', null, h('tr', null, headers.map((label) => h('th', { scope: 'col' }, label)))),
+          h('tbody', null, rows))));
+  }
+
+  function testRecentRuns(stats) {
+    const runs = (stats?.recent_runs || []).slice(0, 50);
+    const rows = runs.map((run) => {
+      const failures = Number(run.failed_count || 0) + Number(run.error_count || 0);
+      const started = run.client_started_at || run.admitted_at;
+      const finished = run.recorded_finished_at || run.client_finished_at;
+      return h('details', { class: 'test-run-row' },
+        h('summary', null,
+          h('span', { class: 'mono test-name' }, run.suite || run.run_kind || run.run_id),
+          h('span', { class: `test-run-status is-${run.status || 'unknown'}` }, run.status || 'unknown'),
+          h('span', null, fmtSeconds(run.duration_seconds || 0)),
+          h('span', null, `${fmtTestCount(run.case_count)} tests`),
+          h('span', { class: failures ? 'err' : '' }, `${fmtTestCount(failures)} failed`),
+          h('span', null, started ? fmtWhen(started) : '—')),
+        h('dl', { class: 'test-run-evidence' },
+          h('div', null, h('dt', null, 'Run ID'), h('dd', { class: 'mono' }, run.run_id)),
+          h('div', null, h('dt', null, 'Passed'), h('dd', null, fmtTestCount(run.passed_count))),
+          h('div', null, h('dt', null, 'Skipped'), h('dd', null, fmtTestCount(run.skipped_count))),
+          h('div', null, h('dt', null, 'Errors'), h('dd', null, fmtTestCount(run.error_count))),
+          h('div', null, h('dt', null, 'Exit code'), h('dd', null, run.exit_code ?? '—')),
+          h('div', null, h('dt', null, 'Finished'), h('dd', null, finished ? fmtWhen(finished) : 'In progress'))));
+    });
+    return h('details', {
+      class: 'test-panel test-runs-panel', id: 'test-detail-runs-panel',
+      'data-test-disclosure': 'recent-runs',
+    },
+      h('summary', null,
+        h('span', null, 'Recent runs'),
+        h('span', { class: 'meta-passive' }, runs.length ? `${runs.length} shown on demand` : 'No recorded runs')),
+      rows.length
+        ? h('div', { class: 'test-run-list' }, rows)
+        : h('p', { class: 'empty-inline' }, 'No recorded runs in this period.'));
   }
 
   function testPassRate(summary) {
@@ -3071,6 +5622,11 @@
   }
 
   let activeTestHeatTooltipTarget = null;
+  let pinnedTestHeatTooltipTarget = null;
+
+  function testHeatTooltipFact(label, value) {
+    return h('div', null, h('dt', null, label), h('dd', null, value));
+  }
 
   function testHeatTooltipNode() {
     let tooltip = $('#test-heat-tooltip');
@@ -3090,27 +5646,54 @@
       }
     });
     document.addEventListener('scroll', () => hideTestHeatTooltip(), true);
+    document.addEventListener('pointerdown', (event) => {
+      if (!pinnedTestHeatTooltipTarget) return;
+      if (pinnedTestHeatTooltipTarget.contains(event.target)
+        || tooltip.contains(event.target)) return;
+      hideTestHeatTooltip();
+    }, true);
+    document.addEventListener('keydown', (event) => {
+      if (event.key === 'Escape' && pinnedTestHeatTooltipTarget) {
+        event.preventDefault();
+        hideTestHeatTooltip();
+      }
+    });
     return tooltip;
   }
 
   function hideTestHeatTooltip(target = null) {
     if (target && activeTestHeatTooltipTarget !== target) return;
+    if (target && pinnedTestHeatTooltipTarget === target) return;
+    if (!target && pinnedTestHeatTooltipTarget) {
+      pinnedTestHeatTooltipTarget.setAttribute('aria-pressed', 'false');
+      pinnedTestHeatTooltipTarget = null;
+    }
     activeTestHeatTooltipTarget = null;
     const tooltip = $('#test-heat-tooltip');
     if (tooltip) tooltip.hidden = true;
   }
 
   function showTestHeatTooltip(target) {
+    if (pinnedTestHeatTooltipTarget && pinnedTestHeatTooltipTarget !== target) return;
     const tooltip = testHeatTooltipNode();
     const seconds = Number(target.dataset.testSeconds || 0);
     const minutes = seconds / 60;
+    const hasTests = target.dataset.testCount !== undefined;
+    const hasFailures = target.dataset.testFailures !== undefined;
+    const hasInfrastructureFailures = target.dataset.testInfrastructure !== undefined;
+    const tests = Number(target.dataset.testCount || 0);
     const failures = Number(target.dataset.testFailures || 0);
+    const infrastructureFailures = Number(target.dataset.testInfrastructure || 0);
     activeTestHeatTooltipTarget = target;
     tooltip.replaceChildren(
       h('span', { class: 'test-heat-tooltip-period' }, target.dataset.testPeriod || ''),
-      h('strong', null, `${minutes.toFixed(1)} test-min`),
+      h('strong', null, target.dataset.testTooltipValue || `${minutes.toFixed(1)} test-min`),
+      h('dl', { class: 'test-heat-tooltip-facts' },
+        testHeatTooltipFact('Tests', hasTests ? fmtTestCount(tests) : 'Not reported'),
+        testHeatTooltipFact('Test failures', hasFailures ? fmtTestCount(failures) : 'Not reported'),
+        testHeatTooltipFact('Infrastructure', hasInfrastructureFailures ? fmtTestCount(infrastructureFailures) : 'Not reported')),
       h('span', { class: 'test-heat-tooltip-detail' },
-        `${String(seconds)} aggregate seconds${failures ? ` · ${failures} failed ${failures === 1 ? 'test' : 'tests'}` : ''}`),
+        target.dataset.testTooltipDetail || `${String(seconds)} aggregate seconds`),
     );
     tooltip.hidden = false;
     tooltip.style.left = '0px';
@@ -3128,6 +5711,21 @@
     top = Math.min(window.innerHeight - tooltipRect.height - margin, Math.max(margin, top));
     tooltip.style.left = `${Math.round(left)}px`;
     tooltip.style.top = `${Math.round(top)}px`;
+  }
+
+  function togglePinnedTestHeatTooltip(target) {
+    if (pinnedTestHeatTooltipTarget === target) {
+      pinnedTestHeatTooltipTarget = null;
+      target.setAttribute('aria-pressed', 'false');
+      hideTestHeatTooltip(target);
+      return;
+    }
+    if (pinnedTestHeatTooltipTarget) {
+      pinnedTestHeatTooltipTarget.setAttribute('aria-pressed', 'false');
+    }
+    pinnedTestHeatTooltipTarget = target;
+    target.setAttribute('aria-pressed', 'true');
+    showTestHeatTooltip(target);
   }
 
   function testHeatmap(stats) {
@@ -3160,7 +5758,7 @@
         const failures = Number(cell.failure_count || 0);
         const period = `${testDayLabel(day)} · ${String(hour).padStart(2, '0')}:00 UTC`;
         const node = h('td', {
-          class: `test-heat-cell${failures > 0 ? ' has-failure' : ''}`,
+          class: 'test-heat-cell',
           style: `background-color:${testHeatColor(cell.test_seconds)}`,
           title: `${period} — ${minutes.toFixed(1)} aggregate test-minutes${failures ? `, ${failures} failed ${failures === 1 ? 'test' : 'tests'}` : ''}`,
           'aria-label': `${testDayLabel(day)}, ${String(hour).padStart(2, '0')}:00 UTC: ${minutes.toFixed(1)} aggregate test-minutes${failures ? `; ${failures} failures` : ''}`,
@@ -3176,7 +5774,6 @@
             if (event.key === 'Escape') hideTestHeatTooltip(event.currentTarget);
           },
         });
-        if (failures > 0) node.append(icon('x'));
         row.append(node);
       }
       body.append(row);
@@ -3209,6 +5806,47 @@
       result.push({ day, seconds: values.get(day) || 0 });
     }
     return result;
+  }
+
+  function testTrendPoint(point, series, index, count) {
+    const label = series === 'current' ? 'Current period' : 'Previous period';
+    const node = svgEl('circle', {
+      class: `test-trend-point is-${series}`,
+      cx: point.x,
+      cy: point.y,
+      r: 7,
+      tabindex: index === count - 1 ? 0 : -1,
+      role: 'img',
+      'aria-label': `${point.day}, ${label}: ${point.seconds} aggregate test-seconds`,
+      'aria-pressed': 'false',
+      'data-test-trend-series': series,
+    });
+    node.dataset.testPeriod = `${point.day} · ${label}`;
+    node.dataset.testSeconds = point.seconds;
+    node.dataset.testTooltipValue = `${point.seconds} aggregate seconds`;
+    node.dataset.testTooltipDetail = fmtSeconds(point.seconds);
+    node.addEventListener('pointerenter', () => showTestHeatTooltip(node));
+    node.addEventListener('pointerleave', () => hideTestHeatTooltip(node));
+    node.addEventListener('focus', () => showTestHeatTooltip(node));
+    node.addEventListener('blur', () => hideTestHeatTooltip(node));
+    node.addEventListener('click', () => togglePinnedTestHeatTooltip(node));
+    node.addEventListener('keydown', (event) => {
+      if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
+      event.preventDefault();
+      const peers = [...node.ownerSVGElement.querySelectorAll(
+        `[data-test-trend-series="${series}"]`,
+      )];
+      const current = peers.indexOf(node);
+      const nextIndex = event.key === 'Home' ? 0
+        : event.key === 'End' ? peers.length - 1
+          : Math.max(0, Math.min(peers.length - 1,
+            current + (event.key === 'ArrowRight' ? 1 : -1)));
+      if (nextIndex === current) return;
+      node.setAttribute('tabindex', '-1');
+      peers[nextIndex].setAttribute('tabindex', '0');
+      peers[nextIndex].focus({ preventScroll: true });
+    });
+    return node;
   }
 
   function testTrendChart(stats) {
@@ -3258,6 +5896,12 @@
         svgEl('circle', { class: `test-trend-dot is-${kind}`, cx: point.x, cy: point.y, r: 4 }),
       );
     }
+    currentPoints.forEach((point, index) => {
+      svg.append(testTrendPoint(point, 'current', index, currentPoints.length));
+    });
+    previousPoints.forEach((point, index) => {
+      svg.append(testTrendPoint(point, 'previous', index, previousPoints.length));
+    });
     const first = current[0]?.day || '';
     const middle = current[Math.floor(current.length / 2)]?.day || '';
     const last = current.at(-1)?.day || '';
@@ -3270,7 +5914,9 @@
       h('div', { class: 'test-trend-wrap' },
         h('div', { class: 'test-trend-y' }, h('span', null, fmtSeconds(maxValue)), h('span', null, fmtSeconds(maxValue / 2)), h('span', null, '0s')),
         svg),
-      h('div', { class: 'test-trend-x' }, h('span', null, first), h('span', null, middle), h('span', null, last)));
+      h('div', { class: 'test-trend-x' }, h('span', null, first), h('span', null, middle), h('span', null, last)),
+      testChartDataDisclosure('Daily trend data', ['Day', 'Current period', 'Previous period'],
+        current.map((item, index) => [item.day, fmtSeconds(item.seconds), fmtSeconds(previous[index]?.seconds || 0)])));
   }
 
   function testSummary(stats) {
@@ -3286,59 +5932,78 @@
         h('div', null, h('dt', null, 'Busiest day'), h('dd', null, busiestDay ? testDayLabel(busiestDay) : '—'))));
   }
 
-  function renderTestHeader(stats) {
-    $('#tests-comparison').textContent = `Previous ${state.testsDays} days`;
-    $('#tests-updated').textContent = state.testsLoadedAt ? `Updated ${fmtWhen(new Date(state.testsLoadedAt).toISOString())}` : 'Waiting for data';
-    const rate = testPassRate(stats?.summary);
-    $('#tests-pass-rate').textContent = Number.isFinite(rate) ? `${rate.toFixed(1)}%` : '—';
-    $('#tests-failed-runs').textContent = stats
-      ? String(stats.summary?.failed_run_count ?? (stats.recent_runs || []).filter((run) => ['failed', 'incomplete'].includes(run.status)).length)
-      : '—';
+  function renderTestHeader(fleet) {
+    const generatedAt = fleet?.snapshot?.generated_at || fleet?.snapshot?.observed_through;
+    const updated = $('#tests-updated');
+    updated.textContent = generatedAt
+      ? `Updated ${fmtWhen(generatedAt)}`
+      : state.testsFleetLoadedAt ? `Updated ${timeAgo(state.testsFleetLoadedAt)}` : '';
+    const retained = $('#tests-retained');
+    retained.hidden = !state.testsFleetStale;
+    updated.closest('.test-refresh-line').hidden = !updated.textContent && retained.hidden;
+    $('#tests-run').disabled = !(fleet?.repositories || []).length;
+  }
+
+  function testAttentionCount(fleet = state.testsFleet) {
+    if (!fleet) return null;
+    // Thousands of healthy runs can be active in a normal day. The navigation
+    // badge is reserved for fleet conditions that may require a decision, not
+    // for raw activity volume or individual-test progress.
+    const count = (fleet.attention || []).filter((item) => (
+      item.severity === 'critical' || item.severity === 'error'
+    )).length;
+    return count > 0 ? count : null;
   }
 
   function renderTests() {
     if (currentPage() !== 'tests') return;
     const host = $('#tests-body');
-    renderTestHeader(state.tests);
-    if (state.testsLoading && !state.tests) {
+    renderTestHeader(state.testsFleet);
+    if (state.testsLoading && !state.testsFleet) {
+      if (state.testsRenderSignature === 'loading') return;
       host.replaceChildren(h('div', { class: 'skel', 'aria-hidden': 'true' }), h('div', { class: 'skel', 'aria-hidden': 'true' }));
+      state.testsRenderSignature = 'loading';
       return;
     }
-    const stats = state.tests;
-    if (!state.testsProject) {
-      if (!state.testsRepositories && !state.overview && !state.metrics) {
-        host.replaceChildren(
-          h('div', { class: 'skel', 'aria-hidden': 'true' }),
-          h('div', { class: 'skel', 'aria-hidden': 'true' }),
-        );
-        return;
-      }
-      host.replaceChildren(emptyState('No enrolled repositories are available for test statistics.'));
+    const fleet = state.testsFleet;
+    if (!fleet) {
+      const failureSignature = `failure:${state.testsError?.message || ''}`;
+      if (state.testsRenderSignature === failureSignature) return;
+      host.replaceChildren(testLocalFailure(
+        'Fleet statistics are unavailable',
+        state.testsError,
+        () => loadTests({ force: true }),
+      ));
+      state.testsRenderSignature = failureSignature;
       return;
     }
-    if (!stats) {
-      host.replaceChildren(emptyState('Test statistics are unavailable.'));
-      return;
-    }
-    renderTestHeader(stats);
-    const dynamicsRows = (stats.dynamics || []).map((row) => {
-      const change = row.change_percent === null || row.change_percent === undefined
-        ? Number.NaN
-        : Number(row.change_percent);
-      const changeClass = Number.isFinite(change) ? (change > 0 ? 'is-worse' : 'is-better') : '';
-      return h('tr', null,
-        h('td', { class: 'mono test-name' }, row.suite),
-        h('td', null, fmtSeconds(row.current_seconds)),
-        h('td', null, fmtSeconds(row.previous_seconds)),
-        h('td', { class: `test-dynamic-change ${changeClass}` }, testDeltaText(change)),
-        h('td', null, row.failure_count),
-        h('td', null, row.last_run ? fmtWhen(row.last_run) : '—'));
-    });
+    renderTestHeader(fleet);
+    const repositories = testFleetRepositories(fleet);
+    const revision = fleet.snapshot?.source_revision || JSON.stringify([
+      fleet.summary, fleet.repositories, fleet.capacity, fleet.attention,
+    ]);
+    const renderSignature = JSON.stringify([
+      revision, state.testsSearch, state.testsHours,
+    ]);
+    if (state.testsRenderSignature === renderSignature && host.childElementCount) return;
+    const focusKey = document.activeElement?.dataset?.testFocusKey || null;
+    const openDisclosures = new Set([...host.querySelectorAll('details[open][data-test-disclosure]')]
+      .map((node) => node.dataset.testDisclosure));
     host.replaceChildren(
-      h('div', { class: 'test-overview-grid' }, testHeatmap(stats), testSummary(stats)),
-      testTrendChart(stats),
-      testTable('Largest dynamics', ['Suite / test set', 'Current time', 'Previous time', 'Change', 'Failures', 'Last run'], dynamicsRows),
+      testFleetSummary(fleet),
+      testFleetMatrix(fleet, repositories),
+      testFleetMobileList(repositories),
+      h('div', { class: 'test-fleet-lower' }, testFleetCapacity(fleet), testFleetAttention(fleet)),
     );
+    for (const disclosure of host.querySelectorAll('details[data-test-disclosure]')) {
+      if (openDisclosures.has(disclosure.dataset.testDisclosure)) disclosure.open = true;
+    }
+    state.testsRenderSignature = renderSignature;
+    if (focusKey) {
+      const restore = [...host.querySelectorAll('[data-test-focus-key]')]
+        .find((node) => node.dataset.testFocusKey === focusKey);
+      restore?.focus({ preventScroll: true });
+    }
   }
 
   // ---------------------------------------------------------------- render root
@@ -3346,13 +6011,13 @@
   const SECTION_BODY_PAGES = Object.freeze({
     'projects-body': 'projects',
     'tests-body': 'tests',
+    'bugs-body': 'bugs',
     'routes-body': 'routes',
     'servers-body': 'servers',
     'docker-body': 'docker',
     'leases-body': 'ports',
     'assignments-body': 'ports',
     'perf-body': 'performance',
-    'usage-body': 'performance',
     'access-body': 'access',
     'invites-body': 'invites',
     'telegram-body': 'telegram',
@@ -3369,16 +6034,19 @@
 
   function renderAll(force = false) {
     const page = currentPage();
+    if (page !== 'projects') hideResourceKindTooltip(null, true);
     unmountInactiveSections(page);
     const o = state.overview;
+    if (page === 'bugs') {
+      if (o) renderHeader();
+      renderBugs(force);
+      return;
+    }
     if (!o) {
       if (page === 'performance') {
-        setSection('usage-body', sig('overview-loading'),
-          () => [emptyState('Loading current project usage…')], force);
         setSection('perf-body', sig(state.metricsAt, 'metrics-only'), () => buildPerf(null), force);
-        const count = state.metrics
-          ? (state.metrics.entities || []).filter((e) => e.kind === 'server' || e.kind === 'docker').length
-          : null;
+        renderPerformanceProjectDialog();
+        const count = performanceProjectCount(null);
         setCount('perf-count', count);
         setNavCount('performance', count);
       }
@@ -3404,7 +6072,8 @@
       setSection('projects-body',
         sig(o.inventory?.servers ?? null, o.inventory?.docker ?? null, o.inventory?.project_usage ?? null,
           o.inventory?.repository_trees ?? null, o.inventory?.repositories ?? null,
-          o.inventory?.resources?.databases ?? null, o.routes ?? null, state.archives,
+          o.inventory?.resources?.databases ?? null, o.inventory?.unassigned_resources ?? null,
+          o.inventory?.lifecycle_violations ?? null, o.routes ?? null, state.archives,
           ui.lifecycleViews.projects, coordSig),
         () => ui.lifecycleViews.projects === 'archived'
           ? buildArchivedCollection('projects') : buildProjects(o), force);
@@ -3412,39 +6081,41 @@
       renderTests();
     } else if (page === 'routes') {
       setSection('routes-body', sig(o.routes), () => buildRoutes(o), force);
+      restorePendingCreatedRouteFocus();
     } else if (page === 'servers') {
       setSection('servers-body',
         sig(o.inventory?.servers ?? null, o.inventory?.port_assignments ?? null,
           o.inventory?.docker ?? null, o.inventory?.repository_trees ?? null,
-          o.inventory?.resources?.databases ?? null, o.routes ?? null, state.archives,
+          o.inventory?.resources?.databases ?? null, o.inventory?.unassigned_resources ?? null,
+          o.inventory?.lifecycle_violations ?? null, o.routes ?? null, state.archives,
           ui.lifecycleViews.servers, coordSig),
         () => ui.lifecycleViews.servers === 'archived'
           ? buildArchivedCollection('servers') : buildServers(o), force);
     } else if (page === 'docker') {
       setSection('docker-body',
         sig(o.inventory?.docker ?? null, o.inventory?.repository_trees ?? null,
-          o.inventory?.resources?.databases ?? null, o.routes ?? null, state.archives,
+          o.inventory?.resources?.databases ?? null, o.inventory?.unassigned_resources ?? null,
+          o.inventory?.lifecycle_violations ?? null, o.routes ?? null, state.archives,
           ui.lifecycleViews.docker, coordSig),
         () => ui.lifecycleViews.docker === 'archived'
           ? buildArchivedCollection('docker') : buildDocker(o), force);
     } else if (page === 'ports') {
       setSection('leases-body', sig(o.inventory?.leases ?? null, coordSig), () => buildLeases(o), force);
       setSection('assignments-body', sig(o.inventory?.port_assignments ?? null, coordSig), () => buildAssignments(o), force);
+      restorePendingCreatedLeaseFocus();
     } else if (page === 'performance') {
-      setSection('usage-body',
-        sig(o.inventory?.project_usage ?? null, o.inventory?.repository_trees ?? null,
-          o.inventory?.resources?.databases ?? null, coordSig),
-        () => buildUsage(o), force);
-      setSection('perf-body', sig(state.metricsAt, o.inventory ? 1 : 0, coordSig), () => buildPerf(o), force);
+      setSection('perf-body',
+        sig(state.metricsAt, o.inventory?.project_usage ?? null,
+          o.inventory?.repository_trees ?? null, coordSig),
+        () => buildPerf(o), force);
+      renderPerformanceProjectDialog();
     } else if (page === 'invites') {
       renderInvites();
     } else if (page === 'telegram') {
       renderTelegram();
     }
 
-    const perfEntities = state.metrics
-      ? (state.metrics.entities || []).filter((e) => e.kind === 'server' || e.kind === 'docker').length
-      : null;
+    const perfEntities = performanceProjectCount(o);
     const projectGroups = o.inventory ? projectGroupsOf(o).length : null;
     // The Servers page lists coordinator servers plus docker-hosted web
     // servers, so its badges count both.
@@ -3454,32 +6125,30 @@
       : 0;
     setCount('projects-count', ui.lifecycleViews.projects === 'archived'
       ? (archivesCurrent ? archivesForPage('projects').length : null) : projectGroups);
-    setCount('tests-count', state.tests?.summary?.test_count ?? null);
+    setCount('tests-count', testAttentionCount());
     setCount('routes-count', (o.routes || []).length);
     setCount('servers-count', ui.lifecycleViews.servers === 'archived'
       ? (archivesCurrent ? archivesForPage('servers').length : null)
       : o.inventory ? (o.inventory.servers || []).length + webContainerCount : null);
     setCount('docker-count', ui.lifecycleViews.docker === 'archived'
       ? (archivesCurrent ? archivesForPage('docker').length : null)
-      : o.inventory?.docker?.available ? (o.inventory.docker.containers || []).length : null);
+      : o.inventory?.docker?.available
+        ? (o.inventory.docker.containers || []).filter((c) => !isTransientTestContainer(c)).length : null);
     setCount('leases-count', o.inventory ? (o.inventory.leases || []).length : null);
     setCount('assignments-count', o.inventory ? (o.inventory.port_assignments || []).length : null);
-    setCount('usage-count', o.inventory
-      ? (Array.isArray(o.inventory.repository_trees)
-          ? projectGroupsOf(o).filter((group) => group.row).length
-          : (o.inventory.project_usage || []).length)
-      : null);
     setCount('perf-count', perfEntities);
     setCount('projects-active-count', projectGroups);
     setCount('servers-active-count', o.inventory ? (o.inventory.servers || []).length + webContainerCount : null);
-    setCount('docker-active-count', o.inventory?.docker?.available ? (o.inventory.docker.containers || []).length : null);
+    setCount('docker-active-count', o.inventory?.docker?.available
+      ? (o.inventory.docker.containers || []).filter((c) => !isTransientTestContainer(c)).length : null);
     syncLifecycleFilters();
 
     setNavCount('projects', projectGroups);
-    setNavCount('tests', state.tests?.summary?.test_count ?? null);
+    setNavCount('tests', testAttentionCount());
     setNavCount('servers', o.inventory ? (o.inventory.servers || []).length + webContainerCount : null);
     setNavCount('routes', (o.routes || []).length);
-    setNavCount('docker', o.inventory?.docker?.available ? (o.inventory.docker.containers || []).length : null);
+    setNavCount('docker', o.inventory?.docker?.available
+      ? (o.inventory.docker.containers || []).filter((c) => !isTransientTestContainer(c)).length : null);
     setNavCount('ports', o.inventory
       ? (o.inventory.leases || []).length + (o.inventory.port_assignments || []).length
       : null);
@@ -3524,19 +6193,77 @@
     sigs[id] = signature;
     const host = document.getElementById(id);
 
+    // Polling replaces section nodes when visible inventory facts change. Keep
+    // user-controlled native disclosures stable across that replacement just
+    // like the custom project accordions: a five-second refresh must not close
+    // the ownership evidence someone is reading. The key is scoped to this
+    // section, so identical diagnostics on Servers and Docker remain
+    // independent. Inventory observers can also replace one opaque resource
+    // ID while preserving the same finding; use the optional match key only
+    // when it is unambiguous on both the old and new DOM.
+    const disclosures = new Map();
+    const disclosureMatchCounts = new Map();
+    const disclosureStateKey = (key) => `${id}\u0000${key}`;
+    const countDisclosureMatch = (match) => {
+      if (!match) return;
+      disclosureMatchCounts.set(match, (disclosureMatchCounts.get(match) || 0) + 1);
+    };
+    const rememberDisclosure = (el) => {
+      const key = el.dataset.sectionDisclosure;
+      if (key) ui.sectionDisclosures.set(disclosureStateKey(key), el.open);
+      const match = el.dataset.sectionDisclosureMatch;
+      if (match) ui.sectionDisclosures.set(disclosureStateKey(match), el.open);
+    };
+    for (const el of host.querySelectorAll('details[data-section-disclosure]')) {
+      disclosures.set(el.dataset.sectionDisclosure, el.open);
+      countDisclosureMatch(el.dataset.sectionDisclosureMatch);
+      rememberDisclosure(el);
+    }
     const scrolls = new Map();
     for (const el of host.querySelectorAll('[data-scrollkey]')) scrolls.set(el.dataset.scrollkey, el.scrollTop);
+    const preserveViewport = host.childNodes.length > 0;
+    const viewport = preserveViewport ? { x: window.scrollX, y: window.scrollY } : null;
     const active = document.activeElement;
     const fk = active && host.contains(active) ? active.dataset.fk : null;
+    const fkMatch = active && host.contains(active)
+      ? active.dataset.sectionDisclosureMatch : null;
 
     const nodes = build();
     host.replaceChildren(...(Array.isArray(nodes) ? nodes.filter(Boolean) : [nodes]));
 
+    const replacementDisclosures = [...host.querySelectorAll('details[data-section-disclosure]')];
+    const replacementMatchCounts = new Map();
+    for (const el of replacementDisclosures) {
+      const match = el.dataset.sectionDisclosureMatch;
+      if (match) replacementMatchCounts.set(match, (replacementMatchCounts.get(match) || 0) + 1);
+    }
+    for (const el of replacementDisclosures) {
+      const key = el.dataset.sectionDisclosure;
+      const match = el.dataset.sectionDisclosureMatch;
+      const storedExact = key ? ui.sectionDisclosures.get(disclosureStateKey(key)) : undefined;
+      const storedMatch = match ? ui.sectionDisclosures.get(disclosureStateKey(match)) : undefined;
+      if (storedExact !== undefined) {
+        el.open = storedExact;
+      } else if (
+        match
+        && disclosureMatchCounts.get(match) === 1
+        && replacementMatchCounts.get(match) === 1
+        && storedMatch !== undefined
+      ) {
+        el.open = storedMatch;
+      } else if (disclosures.has(key)) {
+        el.open = disclosures.get(key);
+      }
+      el.addEventListener('toggle', () => rememberDisclosure(el));
+    }
     for (const el of host.querySelectorAll('[data-scrollkey]')) {
       if (scrolls.has(el.dataset.scrollkey)) el.scrollTop = scrolls.get(el.dataset.scrollkey);
     }
     if (fk) {
-      const again = host.querySelector(`[data-fk="${CSS.escape(fk)}"]`);
+      const again = host.querySelector(`[data-fk="${CSS.escape(fk)}"]`)
+        || (fkMatch ? host.querySelector(
+          `[data-fk][data-section-disclosure-match="${CSS.escape(fkMatch)}"]`,
+        ) : null);
       let focusTarget = again;
       if (again?.matches(':disabled') && again.dataset.disabledFocusFallback) {
         focusTarget = host.querySelector(
@@ -3547,6 +6274,8 @@
         focusTarget.focus({ preventScroll: true });
       }
     }
+    if (viewport) window.scrollTo(viewport.x, viewport.y);
+    if (id === 'projects-body') queueMicrotask(refreshResourceKindTooltip);
   }
 
   function setCount(id, n) {
@@ -3581,10 +6310,11 @@
   function headerProblems(o) {
     const problems = [];
     if (!o) return problems;
+    const reportingCoordinatorBug = currentPage() === 'bugs';
 
     const c = o.coordinator || {};
     const coordOk = !!c.ok && !!o.inventory;
-    if (!coordOk && c.failureKind !== 'maintenance') {
+    if (!reportingCoordinatorBug && !coordOk && c.failureKind !== 'maintenance') {
       problems.push({
         severity: 'err',
         title: coordinatorFailureTitle(o),
@@ -3675,7 +6405,7 @@
       }
     }
 
-    if (state.stale && state.lastFetch) {
+    if (!reportingCoordinatorBug && state.stale && state.lastFetch) {
       problems.push({
         severity: 'warn',
         title: 'Live data is stale',
@@ -3835,14 +6565,22 @@
     const routes = o.routes || [];
     const domain = o.console?.domain || 'vr.ae';
     if (!routes.length) {
-      return [emptyState(`No routes yet — use the form above to publish a dev server at https://<name>.${domain}.`)];
+      return [emptyState(`No routes yet — choose Create route to publish an HTTP target at https://<name>.${domain}.`)];
     }
     const out = [
       h('div', { class: 'grid-head routes-grid', 'aria-hidden': 'true' },
         h('span', null, 'URL'), h('span', null, 'Target'), h('span', null, 'Status'),
         h('span', null, 'Access'), h('span', null, '')),
     ];
-    for (const r of routes) out.push(h('div', { class: 'item' }, routeRow(o, r)));
+    for (const r of routes) {
+      out.push(h('div', {
+        class: 'item',
+        'data-route-slug': r.slug,
+        'data-fk': `route-row:${r.slug}`,
+        tabindex: '-1',
+        'aria-label': `Route ${r.slug}.${domain}`,
+      }, routeRow(o, r)));
+    }
     if (o.coordinator && o.coordinator.ok === false && o.coordinator.failureKind !== 'maintenance') {
       out.push(h('p', { class: 'inline-note warn-note' },
         'Coordinator is unreachable — live status for server-linked routes may be stale.'));
@@ -3910,6 +6648,15 @@
             confirmText: makingPublic
               ? `Make https://${host} public?\n\nAnyone on the internet will reach this dev server without signing in.`
               : undefined,
+            onError: (error) => {
+              if (!isEdgePublicationError(error)) return;
+              void refreshOverview({ force: true, fresh: true }).finally(() => {
+                showSectionPublicationError(
+                  'routes-body', error,
+                  () => refreshOverview({ force: true, fresh: true }),
+                );
+              });
+            },
           });
       },
     }, h('span', { class: 'knob', 'aria-hidden': 'true' }),
@@ -3954,6 +6701,15 @@
             () => api(`/api/routes/${encodeURIComponent(r.slug)}`, { method: 'DELETE' }),
             {
               confirmText: `Remove the route https://${host}?\n\nThe dev server keeps running — only this public URL stops working.`,
+              onError: (error) => {
+                if (!isEdgePublicationError(error)) return;
+                void refreshOverview({ force: true, fresh: true }).finally(() => {
+                  showSectionPublicationError(
+                    'routes-body', error,
+                    () => refreshOverview({ force: true, fresh: true }),
+                  );
+                });
+              },
             }),
         }, icon('trash'))));
   }
@@ -4000,6 +6756,7 @@
     if (o.inventory?.docker?.available) {
       const dbNames = new Set((o.inventory.docker.postgres || []).map((c) => c.name));
       for (const c of o.inventory.docker.containers || []) {
+        if (isTransientTestContainer(c)) continue;
         if (!c?.name || dbNames.has(c.name) || !isContainerRunning(c)) continue;
         for (const p of publishedContainerPorts(c.ports)) {
           rows.push({ name: c.name, port: p.containerPort, hostPort: p.hostPort, project: c.project || c.compose_project || '' });
@@ -4068,10 +6825,110 @@
     }
   }
 
+  let routeDialogReturnFocus = null;
+  let pendingCreatedRouteFocus = null;
+
+  function createdRouteRow(slug) {
+    return [...document.querySelectorAll('#routes-body [data-route-slug]')]
+      .find((candidate) => candidate.dataset.routeSlug === String(slug || '')) || null;
+  }
+
+  function restorePendingCreatedRouteFocus() {
+    const pending = pendingCreatedRouteFocus;
+    if (!pending || currentPage() !== 'routes' || $('#route-dialog').open) return;
+    const active = document.activeElement;
+    const mayRestore = active === document.body
+      || active === $('#route-add')
+      || active?.dataset?.routeSlug === pending.slug;
+    if (!mayRestore) return;
+    setTimeout(() => {
+      if (pendingCreatedRouteFocus !== pending) return;
+      const row = createdRouteRow(pending.slug);
+      if (!row) return;
+      row.focus({ preventScroll: true });
+      row.scrollIntoView({ block: 'center' });
+    }, 0);
+  }
+
+  function requestCreatedRouteFocus(slug) {
+    const pending = { slug: String(slug || '') };
+    pendingCreatedRouteFocus = pending;
+    restorePendingCreatedRouteFocus();
+    setTimeout(() => {
+      if (pendingCreatedRouteFocus === pending) pendingCreatedRouteFocus = null;
+    }, 5_000);
+  }
+
+  function updateRouteTargetFields() {
+    const kind = $('#route-form').querySelector('input[name="rf-kind"]:checked')?.value || 'port';
+    $('#rf-port-wrap').hidden = kind !== 'port';
+    $('#rf-server-wrap').hidden = kind !== 'server';
+    $('#rf-container-wrap').hidden = kind !== 'docker';
+  }
+
+  function resetRouteForm() {
+    $('#route-form').reset();
+    $('#rf-error').hidden = true;
+    $('#rf-error').textContent = '';
+    const access = $('#rf-access');
+    access.setAttribute('aria-checked', 'true');
+    access.classList.remove('public-on');
+    $('#rf-access-text').textContent = 'Google sign-in required';
+    updateRouteTargetFields();
+    updatePreview();
+  }
+
+  function openRouteDialog() {
+    const dialog = $('#route-dialog');
+    routeDialogReturnFocus = document.activeElement instanceof HTMLElement
+      ? document.activeElement : $('#route-add');
+    resetRouteForm();
+    dialog.showModal();
+    queueMicrotask(() => $('#rf-slug').focus());
+  }
+
+  function focusAfterRouteDialog(target) {
+    routeDialogReturnFocus = null;
+    setTimeout(() => {
+      if (!target?.isConnected) return;
+      target.focus({ preventScroll: true });
+      target.scrollIntoView({ block: 'nearest' });
+    }, 0);
+  }
+
+  function closeRouteDialog(focusTarget = null) {
+    const dialog = $('#route-dialog');
+    const target = focusTarget || routeDialogReturnFocus || $('#route-add');
+    if (dialog.open) dialog.close();
+    focusAfterRouteDialog(target);
+  }
+
+  async function waitForCreatedRouteRow(slug, timeoutMs = 5_000) {
+    const deadline = Date.now() + timeoutMs;
+    do {
+      const row = createdRouteRow(slug);
+      if (row && !fetching && !refetchQueued) {
+        await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+        if (row.isConnected && !fetching && !refetchQueued) return row;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    } while (Date.now() < deadline);
+    return null;
+  }
+
   function wireForm() {
     const form = $('#route-form');
     const slug = $('#rf-slug');
     const access = $('#rf-access');
+
+    $('#route-add').addEventListener('click', openRouteDialog);
+    $('#route-dialog-close').append(icon('x'));
+    $('#route-dialog-close').addEventListener('click', () => closeRouteDialog());
+    $('#route-cancel').addEventListener('click', () => closeRouteDialog());
+    $('#route-dialog').addEventListener('cancel', (event) => {
+      event.preventDefault();
+      closeRouteDialog();
+    });
 
     slug.addEventListener('input', () => {
       const lower = slug.value.toLowerCase();
@@ -4080,12 +6937,7 @@
     });
 
     for (const radio of form.querySelectorAll('input[name="rf-kind"]')) {
-      radio.addEventListener('change', () => {
-        const kind = form.querySelector('input[name="rf-kind"]:checked').value;
-        $('#rf-port-wrap').hidden = kind !== 'port';
-        $('#rf-server-wrap').hidden = kind !== 'server';
-        $('#rf-container-wrap').hidden = kind !== 'docker';
-      });
+      radio.addEventListener('change', updateRouteTargetFields);
     }
 
     access.addEventListener('click', () => {
@@ -4096,7 +6948,7 @@
     });
 
     form.addEventListener('submit', onCreateRoute);
-    updatePreview();
+    resetRouteForm();
   }
 
   async function onCreateRoute(e) {
@@ -4159,20 +7011,29 @@
     btn.textContent = 'Creating…';
     try {
       await api('/api/routes', { method: 'POST', body });
-      $('#rf-slug').value = '';
-      $('#rf-title').value = '';
-      // Access always snaps back to the safe default for the next route.
-      const access = $('#rf-access');
-      access.setAttribute('aria-checked', 'true');
-      access.classList.remove('public-on');
-      $('#rf-access-text').textContent = 'Google sign-in required';
-      updatePreview();
+      resetRouteForm();
       announce(`Route ${slug}.${domain} created`);
       await refreshOverview({ force: true, fresh: true });
+      const createdRow = await waitForCreatedRouteRow(slug);
+      closeRouteDialog(createdRow || $('#route-add'));
+      requestCreatedRouteFocus(slug);
     } catch (err) {
       if (err.status !== 401) {
-        fail(err.message);
-        showBanner(err, () => $('#route-form').requestSubmit());
+        if (isEdgePublicationError(err)) {
+          renderLocalPublicationError(errEl, err, {
+            onActivated: async () => {
+              resetRouteForm();
+              announce(`Route ${slug}.${domain} created`);
+              await refreshOverview({ force: true, fresh: true });
+              const createdRow = await waitForCreatedRouteRow(slug);
+              closeRouteDialog(createdRow || $('#route-add'));
+              requestCreatedRouteFocus(slug);
+            },
+          });
+        } else {
+          fail(err.message);
+          showBanner(err, () => $('#route-form').requestSubmit());
+        }
       }
     } finally {
       btn.disabled = false;
@@ -4412,7 +7273,10 @@
         method: 'POST',
         body: workerActionBody(server, action, options),
       }),
-      options.confirmText ? { confirmText: options.confirmText } : undefined,
+      {
+        ...(options.confirmText ? { confirmText: options.confirmText } : {}),
+        inventoryTargets: [{ target_kind: 'server', target_id: server.id }],
+      },
     );
   }
 
@@ -4424,11 +7288,16 @@
       || server.status === 'stopped'
       || supervision?.state === 'stopped'
     );
+    const inventoryProblem = inventoryMutationProblemOf(state.overview, {
+      target_kind: 'server', target_id: server.id,
+    });
     const button = (action, label, iconName, options = {}) => h('button', {
       class: `btn small act-${action}${busy ? ' is-busy' : ''}`, type: 'button',
       'data-fk': `${prefix}-worker-${action}:${server.id}`,
-      disabled: (busy || options.disabled) || undefined,
-      title: options.title || `${label} ${server.name}`,
+      disabled: (busy || options.disabled || inventoryProblem) || undefined,
+      title: inventoryProblem
+        ? `${label} is disabled only for this worker until its ownership problem is resolved`
+        : (options.title || `${label} ${server.name}`),
       onclick: () => runWorkerAction(server, action, options),
     }, icon(iconName), busy ? 'Working…' : label);
 
@@ -4459,10 +7328,72 @@
     ];
   }
 
+  function treeWorkerActionSlots(server, busy) {
+    const supervision = server.supervision || {};
+    const tripped = supervision.breaker?.state === 'tripped'
+      || supervision.state === 'tripped';
+    const stopped = !tripped && (
+      supervision.desired_state === 'stopped'
+      || server.status === 'stopped'
+      || supervision.state === 'stopped'
+    );
+    const options = (action) => ({
+      keepAlive: supervision.keep_alive === true,
+      rearmCrashLoop: action === 'start' && tripped,
+      ...(action === 'stop' ? {
+        confirmText: `Stop worker ${server.name}?\n\nThis sets its desired state to stopped. It will not restart until explicitly started.`,
+      } : {}),
+    });
+    const inventoryProblem = inventoryMutationProblemOf(state.overview, {
+      target_kind: 'server', target_id: server.id,
+    });
+    const slot = (action, label, iconName, disabled, title) => ({
+      fk: `tree-worker-${action}:${server.id}`,
+      label,
+      icon: iconName,
+      busy,
+      disabled: !!inventoryProblem || disabled,
+      title: inventoryProblem
+        ? `${label} is disabled only for this worker until its ownership problem is resolved`
+        : title,
+      onclick: () => runWorkerAction(server, action, options(action)),
+    });
+    return treeActionSlots({
+      start: slot(
+        'start',
+        tripped ? 'Start and re-arm' : 'Start',
+        'play',
+        !tripped && !stopped,
+        tripped
+          ? `Explicitly re-arm the crash breaker and start ${server.name}`
+          : (stopped ? `Start ${server.name}` : `${server.name} is already running`),
+      ),
+      restart: slot(
+        'restart',
+        'Restart',
+        'refresh',
+        tripped || stopped,
+        tripped
+          ? 'Re-arm the crash breaker with Start'
+          : (stopped ? 'Worker is stopped — use Start' : `Restart ${server.name}`),
+      ),
+      stop: slot(
+        'stop',
+        'Stop',
+        'stop',
+        tripped || stopped,
+        tripped
+          ? 'Worker is already stopped by its crash breaker'
+          : (stopped ? 'Worker is already stopped' : `Stop ${server.name} and set desired state to stopped`),
+      ),
+    });
+  }
+
   function buildServers(o) {
     if (!o.inventory) return [degradedPanel(o)];
     const inventoryError = authoritativeInventoryErrorPanel(o);
     if (inventoryError) return [inventoryError];
+    const inventoryDiagnostics = authoritativeInventoryDiagnosticPanel(o);
     const hidden = hiddenSet('servers');
     const hiddenDocker = hiddenSet('docker');
     const focus = ui.lifecycleFocus?.view === 'active' && ui.lifecycleFocus.page === 'servers'
@@ -4475,6 +7406,7 @@
     const groups = [];
 
     const out = [
+      inventoryDiagnostics,
       h('div', { class: 'grid-head srv-grid', 'aria-hidden': 'true' },
         h('span', null, ''), h('span', null, 'Server'), h('span', null, 'Port'),
         h('span', null, 'CPU / Mem'), h('span', null, 'Status'), h('span', null, ''),
@@ -4527,7 +7459,8 @@
     }
 
     if (total === 0) {
-      return [emptyState('No dev servers registered with the coordinator yet — start one with "server start" and it appears here.')];
+      return [inventoryDiagnostics,
+        emptyState('No dev servers registered with the coordinator yet — start one with "server start" and it appears here.')].filter(Boolean);
     }
     for (const entry of groups) out.push(serverProjectBlock(o, entry));
     const toggle = revealToggle('servers', hiddenCount);
@@ -4606,6 +7539,9 @@
     const meta = containerStatusMeta(c);
     const panelId = `srv-dock-panel-${name}`;
     const ownership = containerOwnershipState(c);
+    const inventoryProblem = inventoryMutationProblemOf(o, {
+      target_kind: 'container', target_id: c.host_resource_id,
+    });
     const archiveTarget = ownership.genericLifecycle
       ? lifecycleTarget('container', c.host_resource_id, name, 'docker', {
           projectId: c.repo_id || null,
@@ -4615,11 +7551,12 @@
     const chev = h('button', {
       class: `chev${open ? ' open' : ''}`, type: 'button',
       'data-fk': `srv-dock-x:${name}`,
+      'data-log-capable': 'true',
       'aria-expanded': String(open),
       'aria-controls': panelId,
       'aria-label': `${open ? 'Collapse' : 'Expand'} logs for ${name}`,
       title: open ? 'Collapse logs' : 'Expand container logs',
-      onclick: () => toggleDocker(name),
+      onclick: () => toggleDocker(c),
     }, icon('chevron'));
 
     const badgeKey = `srv-dock-badge:${name}`;
@@ -4649,11 +7586,16 @@
     const act = (action, label, iconName, confirmText) => h('button', {
       class: `btn small ${ACTION_CLS[action]}${busy ? ' is-busy' : ''}`, type: 'button',
       'data-fk': `srv-dock-${action}:${name}`,
-      disabled: busy || undefined,
-      title: `${label} container ${name}`,
+      disabled: (busy || inventoryProblem) || undefined,
+      title: inventoryProblem
+        ? `${label} is disabled only for this container until its ownership problem is resolved`
+        : `${label} container ${name}`,
       onclick: () => runAction(`docker:${name}`,
         () => api('/api/docker/action', { method: 'POST', body: { name, action } }),
-        confirmText ? { confirmText } : undefined),
+        {
+          ...(confirmText ? { confirmText } : {}),
+          inventoryTargets: [{ target_kind: 'container', target_id: c.host_resource_id }],
+        }),
     }, icon(iconName), busy ? 'Working…' : label);
 
     const ports = publishedContainerPorts(c.ports);
@@ -4670,7 +7612,7 @@
         ? `${archiveTarget.target_kind}:${archiveTarget.target_id}` : null,
       onclick: (e) => {
         if (e.target.closest('button, a, input, select')) return;
-        toggleDocker(name);
+        toggleDocker(c);
       },
     },
       chev,
@@ -4683,7 +7625,7 @@
           h('span', { class: 'dim', title: c.project || '' }, projectTail(c.project || c.compose_project))),
         ownership.genericLifecycle ? dockerSubdomainControl(o, c, 'srv') : null,
         unverifiedOwnershipNote(ownership)),
-      h('span', { class: 'cell mono', 'data-label': 'Port' }, portCell),
+      h('span', { class: 'cell mono srv-port', 'data-label': 'Port' }, portCell),
       usageCellNode({
         key: `dock:${name}`,
         title: name,
@@ -4692,9 +7634,9 @@
         running: running && !!c.stats,
         scope: 'srv',
       }),
-      h('span', { class: 'cell', 'data-label': 'Status' }, badge),
-      h('span', { 'aria-hidden': 'true' }),
-      h('span', { class: 'cell actions' },
+      h('span', { class: 'cell srv-status', 'data-label': 'Status' }, badge),
+      h('span', { class: 'srv-warning', 'aria-hidden': 'true' }),
+      h('span', { class: 'cell actions srv-actions' },
         ownership.genericLifecycle && running
           ? [act('restart', 'Restart', 'refresh'),
              act('stop', 'Stop', 'stop', `Stop container ${name}?\n\nAnything depending on it (like a database) loses its service.`)]
@@ -4718,10 +7660,18 @@
     return h('div', { class: 'item' }, row, open ? dockerPanel(c, panelId) : null);
   }
 
+  function serverHasAuthoritativeLog(server) {
+    return typeof server?.log_path === 'string' && server.log_path.trim().length > 0;
+  }
+
   function serverItem(o, s, hiddenRow = false) {
     const id = s.id;
     const open = ui.expanded.has(id);
+    const hasAuthoritativeLog = serverHasAuthoritativeLog(s);
     const busy = ui.busy.has(`server:${id}`);
+    const inventoryProblem = inventoryMutationProblemOf(o, {
+      target_kind: 'server', target_id: id,
+    });
     const meta = serverStatusMeta(s);
     const panelId = `srv-panel-${id}`;
     const archiveTarget = lifecycleTarget('server', id, s.name || 'Unnamed server', 'servers');
@@ -4729,11 +7679,14 @@
     const chev = h('button', {
       class: `chev${open ? ' open' : ''}`, type: 'button',
       'data-fk': `srv-x:${id}`,
+      'data-log-capable': hasAuthoritativeLog ? 'true' : null,
       'aria-expanded': String(open),
       'aria-controls': panelId,
       'aria-label': `${open ? 'Collapse' : 'Expand'} details for ${s.name}`,
-      title: open ? 'Collapse details' : 'Expand details and logs',
-      onclick: () => toggleServer(id),
+      title: open
+        ? 'Collapse details'
+        : (hasAuthoritativeLog ? 'Expand details and logs' : 'Expand details'),
+      onclick: () => toggleServer(s),
     }, icon('chevron'));
 
     const badgeKey = `srv-badge:${id}`;
@@ -4757,26 +7710,32 @@
     const stoppable = ['running', 'starting', 'unhealthy'].includes(s.status);
     const restartable = stoppable || s.status === 'stopped';
     const supervised = !!s.supervision;
-    const actions = h('span', { class: 'cell actions' },
+    const actions = h('span', { class: 'cell actions srv-actions' },
       supervised ? workerControlButtons(s, busy) : h('button', {
         class: `btn small act-restart${busy ? ' is-busy' : ''}`, type: 'button',
         'data-fk': `srv-restart:${id}`,
-        disabled: (busy || s.missing_command || !restartable) || undefined,
-        title: !restartable
+        disabled: (busy || inventoryProblem || s.missing_command || !restartable) || undefined,
+        title: inventoryProblem
+          ? 'Restart is disabled only for this server until its ownership problem is resolved'
+          : !restartable
           ? 'No observed server instance is available to restart'
           : s.missing_command
           ? 'Registered without a start command — cannot be restarted from here'
           : `Restart ${s.name} on the same port`,
         onclick: () => runAction(`server:${id}`,
-          () => api('/api/servers/action', { method: 'POST', body: { id, action: 'restart' } })),
+          () => api('/api/servers/action', { method: 'POST', body: { id, action: 'restart' } }),
+          { inventoryTargets: [{ target_kind: 'server', target_id: id }] }),
       }, icon('refresh'), busy ? 'Working…' : 'Restart'),
       supervised ? null : h('button', {
         class: `btn small act-stop${busy ? ' is-busy' : ''}`, type: 'button',
         'data-fk': `srv-stop:${id}`,
-        disabled: (busy || !stoppable) || undefined,
-        title: stoppable ? `Stop ${s.name}` : 'Server is not running',
+        disabled: (busy || inventoryProblem || !stoppable) || undefined,
+        title: inventoryProblem
+          ? 'Stop is disabled only for this server until its ownership problem is resolved'
+          : (stoppable ? `Stop ${s.name}` : 'Server is not running'),
         onclick: () => runAction(`server:${id}`,
-          () => api('/api/servers/action', { method: 'POST', body: { id, action: 'stop' } })),
+          () => api('/api/servers/action', { method: 'POST', body: { id, action: 'stop' } }),
+          { inventoryTargets: [{ target_kind: 'server', target_id: id }] }),
       }, icon('stop'), busy ? 'Working…' : 'Stop'),
       hiddenRow
         ? unhideButton('servers', s.key, s.name || 'server')
@@ -4791,7 +7750,7 @@
       'data-lifecycle-target': `${archiveTarget.target_kind}:${archiveTarget.target_id}`,
       onclick: (e) => {
         if (e.target.closest('button, a, input, select')) return;
-        toggleServer(id);
+        toggleServer(s);
       },
     },
       chev,
@@ -4801,7 +7760,7 @@
           ' ',
           h('span', { class: 'dim', title: s.project || '' }, projectTail(s.project))),
         subdomainControl(o, s)),
-      h('span', { class: 'cell mono', 'data-label': 'Port' }, serverPortCell(o, s)),
+      h('span', { class: 'cell mono srv-port', 'data-label': 'Port' }, serverPortCell(o, s)),
       usageCellNode({
         key: `srv:${id}`,
         title: s.name || 'Server',
@@ -4809,8 +7768,8 @@
         mem: s.process_usage?.memory_bytes ?? null,
         running: !!s.process_usage,
       }),
-      h('span', { class: 'cell', 'data-label': 'Status' }, badge),
-      warnFlag,
+      h('span', { class: 'cell srv-status', 'data-label': 'Status' }, badge),
+      h('span', { class: 'srv-warning' }, warnFlag),
       actions);
 
     return h('div', { class: 'item' }, row, open ? serverPanel(s, panelId) : null);
@@ -4874,7 +7833,7 @@
       routeOf: (ov) => serverRouteFor(ov, s),
       save: (slug, auth, opts) => runAction(`subdomain:${s.id}`,
         () => api('/api/servers/subdomain', { method: 'POST', body: { id: s.id, slug, auth } }),
-        opts),
+        { ...opts, inventoryTargets: [{ target_kind: 'server', target_id: s.id }] }),
       portOptions: null,
     };
   }
@@ -4890,7 +7849,7 @@
           method: 'POST',
           body: { name: c.name, slug, auth, ...(slug && port ? { port } : {}) },
         }),
-        opts),
+        { ...opts, inventoryTargets: [{ target_kind: 'container', target_id: c.host_resource_id }] }),
       portOptions: publishedContainerPorts(c.ports),
     };
   }
@@ -4961,7 +7920,18 @@
       placeholder: 'myapp', value: route ? route.slug : '',
     });
     const preview = h('p', { class: 'preview sub-preview', 'aria-live': 'polite' });
+    const publicationError = h('div', { class: 'form-error', hidden: true });
     const save = h('button', { class: 'btn primary small', type: 'button' }, route ? 'Update' : 'Assign');
+
+    const handlePublicationFailure = (error) => {
+      if (!isEdgePublicationError(error)) return;
+      renderLocalPublicationError(publicationError, error, {
+        onActivated: async () => {
+          popover.close();
+          await refreshOverview({ force: true, fresh: true });
+        },
+      });
+    };
 
     function currentProblem() {
       const v = input.value.trim();
@@ -5046,6 +8016,7 @@
         confirmText: makingPublic
           ? `Make https://${v}.${domain} public?\n\nAnyone on the internet will reach this dev server without signing in.`
           : undefined,
+        onError: handlePublicationFailure,
       }, chosenPort());
     };
 
@@ -5055,6 +8026,7 @@
           'aria-label': `Remove the ${route.slug}.${domain} subdomain`, title: 'Remove subdomain (server keeps running)',
           onclick: () => spec.save('', access, {
             confirmText: `Remove https://${route.slug}.${domain}?\n\nThe dev server keeps running — only this public URL stops working.`,
+            onError: handlePublicationFailure,
           }),
         }, icon('trash'), 'Remove')
       : null;
@@ -5072,6 +8044,7 @@
         "The Console terminates public HTTPS and forwards plain HTTP. Choose the app's HTTP listener, not its HTTPS/TLS listener.") : null,
       h('div', { class: 'sub-lab' }, 'Access'),
       seg,
+      publicationError,
       h('div', { class: 'sub-actions' }, save, remove));
   }
 
@@ -5106,33 +8079,52 @@
         : null);
   }
 
-  function toggleServer(id) {
+  function toggleServer(server) {
+    const id = server.id;
     if (ui.expanded.has(id)) {
       ui.expanded.delete(id);
     } else {
       ui.expanded.add(id);
       const cached = ui.logs.get(`srv:${id}`);
-      if (!cached || (cached.text == null && !cached.loading)) loadServerLogs(id);
+      if (serverHasAuthoritativeLog(server)
+          && (!cached || (cached.text == null && !cached.loading))) {
+        loadServerLogs(id);
+      }
     }
     bump();
     renderAll(true);
   }
 
+  function restoreAsyncActionFocus(focusKey) {
+    if (!focusKey) return;
+    const active = document.activeElement;
+    // A loading render temporarily replaces the triggering button with its
+    // disabled copy, which moves focus to <body>. Restore that exact logical
+    // control when the request settles, but never steal focus if the user
+    // moved elsewhere while the request was in flight.
+    if (active && active !== document.body && active !== document.documentElement) return;
+    document.querySelector(`[data-fk="${CSS.escape(focusKey)}"]`)
+      ?.focus({ preventScroll: true });
+  }
+
   async function loadServerLogs(id) {
     const key = `srv:${id}`;
+    const refreshFocusKey = `srv-logs-refresh:${id}`;
+    const restoreFocus = document.activeElement?.dataset?.fk === refreshFocusKey
+      ? refreshFocusKey : null;
     ui.logs.set(key, { ...(ui.logs.get(key) || {}), loading: true, error: null });
     bump();
     renderAll(true);
     try {
-      const resp = await api('/api/servers/logs', { method: 'POST', body: { id, tail: 200 } });
+      const resp = await api('/api/servers/logs', { method: 'POST', body: { id } });
       ui.logs.set(key, { loading: false, text: resp?.text ?? '', error: null, at: Date.now() });
     } catch (err) {
       if (err.status === 401) return;
       ui.logs.set(key, { loading: false, text: null, error: err.message, at: Date.now() });
-      showBanner(err, () => loadServerLogs(id));
     }
     bump();
     renderAll(true);
+    restoreAsyncActionFocus(restoreFocus);
   }
 
   function workerSupervisionPanel(s) {
@@ -5201,6 +8193,7 @@
   function serverPanel(s, panelId) {
     const key = `srv:${s.id}`;
     const lg = ui.logs.get(key);
+    const hasAuthoritativeLog = serverHasAuthoritativeLog(s);
     return h('div', { class: 'panel', id: panelId },
       workerSupervisionPanel(s),
       h('div', { class: 'panel-meta' },
@@ -5208,17 +8201,20 @@
         kv('Working dir', s.cwd || '—', { mono: true }),
         kv('Command', s.cmd || s.cmd_template || '—', { mono: true }),
         kv('Log file', s.log_path || '—', { mono: true })),
-      h('div', { class: 'panel-toolbar' },
-        h('span', { class: 'panel-title' }, 'Recent log'),
-        lg?.at ? h('span', { class: 'meta-passive' }, `fetched ${fmtClock(lg.at)}`) : null,
-        h('button', {
-          class: 'btn small', type: 'button',
-          'data-fk': `srv-logs-refresh:${s.id}`,
-          disabled: lg?.loading || undefined,
-          title: 'Fetch the latest 200 log lines',
-          onclick: () => loadServerLogs(s.id),
-        }, icon('refresh'), lg?.loading ? 'Loading…' : 'Refresh')),
-      logboxNode(key, lg));
+      hasAuthoritativeLog
+        ? h('div', { class: 'panel-toolbar' },
+          h('span', { class: 'panel-title' }, 'Recent log'),
+          lg?.at ? h('span', { class: 'meta-passive' }, `fetched ${fmtClock(lg.at)}`) : null,
+          h('button', {
+            class: 'btn small', type: 'button',
+            'data-fk': `srv-logs-refresh:${s.id}`,
+            disabled: lg?.loading || undefined,
+            title: 'Fetch the latest 200 log lines',
+            onclick: () => loadServerLogs(s.id),
+          }, icon('refresh'), lg?.loading ? 'Loading…' : 'Refresh'))
+        : h('p', { class: 'inline-note panel-log-unavailable' },
+          'No authoritative log source is registered for this server.'),
+      hasAuthoritativeLog ? logboxNode(key, lg) : null);
   }
 
   // Leading ISO timestamp or [bracketed] prefix rendered as passive metadata.
@@ -5265,6 +8261,7 @@
     if (!o.inventory) return [degradedPanel(o)];
     const inventoryError = authoritativeInventoryErrorPanel(o);
     if (inventoryError) return [inventoryError];
+    const inventoryDiagnostics = authoritativeInventoryDiagnosticPanel(o);
     const docker = o.inventory.docker;
     if (!docker || docker.available === false) {
       return [h('div', { class: 'degraded' },
@@ -5286,6 +8283,7 @@
     const groups = [];
 
     const out = [
+      inventoryDiagnostics,
       h('div', { class: 'grid-head dock-grid', 'aria-hidden': 'true' },
         h('span', null, ''), h('span', null, 'Container'), h('span', null, 'Image'),
         h('span', null, 'CPU / Mem'), h('span', null, 'Ports'), h('span', null, 'Actions')),
@@ -5327,7 +8325,8 @@
     }
 
     if (total === 0) {
-      return [emptyState('No containers found — anything started with docker run or compose shows up here.')];
+      return [inventoryDiagnostics,
+        emptyState('No containers found — anything started with docker run or compose shows up here.')].filter(Boolean);
     }
     for (const entry of groups) out.push(dockerProjectBlock(o, entry));
     if (docker.stats_error) {
@@ -5403,6 +8402,9 @@
     const busy = ui.busy.has(`docker:${name}`);
     const panelId = `dock-panel-${name}`;
     const ownership = containerOwnershipState(c);
+    const inventoryProblem = inventoryMutationProblemOf(o, {
+      target_kind: 'container', target_id: c.host_resource_id,
+    });
     const archiveTarget = ownership.genericLifecycle
       ? lifecycleTarget('container', c.host_resource_id, name, 'docker', {
           projectId: c.repo_id || null,
@@ -5433,11 +8435,16 @@
     const act = (action, label, iconName, confirmText) => h('button', {
       class: `btn small ${ACTION_CLS[action]}${busy ? ' is-busy' : ''}`, type: 'button',
       'data-fk': `dock-${action}:${name}`,
-      disabled: busy || undefined,
-      title: `${label} ${name}`,
+      disabled: (busy || inventoryProblem) || undefined,
+      title: inventoryProblem
+        ? `${label} is disabled only for this container until its ownership problem is resolved`
+        : `${label} ${name}`,
       onclick: () => runAction(`docker:${name}`,
         () => api('/api/docker/action', { method: 'POST', body: { name, action } }),
-        confirmText ? { confirmText } : undefined),
+        {
+          ...(confirmText ? { confirmText } : {}),
+          inventoryTargets: [{ target_kind: 'container', target_id: c.host_resource_id }],
+        }),
     }, icon(iconName), busy ? 'Working…' : label);
 
     const row = h('div', {
@@ -5449,7 +8456,7 @@
         ? `${archiveTarget.target_kind}:${archiveTarget.target_id}` : null,
       onclick: (e) => {
         if (e.target.closest('button, a, input, select')) return;
-        toggleDocker(name);
+        toggleDocker(c);
       },
     },
       h('span', { class: 'cell c-dot' }, dot),
@@ -5484,7 +8491,7 @@
           'aria-expanded': String(open),
           'aria-controls': panelId,
           title: open ? 'Hide logs' : `Show logs for ${name}`,
-          onclick: () => toggleDocker(name),
+          onclick: () => toggleDocker(c),
         }, icon('chevron'), 'Logs'),
         hiddenRow
           ? unhideButton('docker', name, name)
@@ -5500,25 +8507,48 @@
     return h('div', { class: 'item' }, row, open ? dockerPanel(c, panelId) : null);
   }
 
-  function toggleDocker(name) {
+  function toggleDocker(container) {
+    const name = container?.name;
+    if (typeof name !== 'string' || !name) return;
     if (ui.dockerOpen.has(name)) {
       ui.dockerOpen.delete(name);
     } else {
       ui.dockerOpen.add(name);
       const cached = ui.logs.get(`dock:${name}`);
-      if (!cached || (cached.text == null && !cached.loading)) loadDockerLogs(name);
+      if (!cached || (cached.text == null && !cached.loading)) loadDockerLogs(container);
     }
     bump();
     renderAll(true);
   }
 
-  async function loadDockerLogs(name) {
+  async function loadDockerLogs(container) {
+    const name = container?.name;
+    const resourceId = container?.host_resource_id ?? container?.docker_resource_id ?? null;
     const key = `dock:${name}`;
+    const refreshFocusKey = `dock-logs-refresh:${name}`;
+    const restoreFocus = document.activeElement?.dataset?.fk === refreshFocusKey
+      ? refreshFocusKey : null;
+    if (typeof name !== 'string' || !name || typeof resourceId !== 'string' || !resourceId) {
+      if (typeof name === 'string' && name) {
+        ui.logs.set(key, {
+          loading: false,
+          text: null,
+          error: 'Container logs require an immutable Coordinator resource ID.',
+          at: Date.now(),
+        });
+        bump();
+        renderAll(true);
+        restoreAsyncActionFocus(restoreFocus);
+      }
+      return;
+    }
     ui.logs.set(key, { ...(ui.logs.get(key) || {}), loading: true, error: null });
     bump();
     renderAll(true);
     try {
-      const resp = await api('/api/docker/logs', { method: 'POST', body: { name, tail: 120 } });
+      const resp = await api('/api/docker/logs', {
+        method: 'POST', body: { resource_id: resourceId },
+      });
       const text = typeof resp?.text === 'string'
         ? resp.text
         : [resp?.stdout, resp?.stderr].filter(Boolean).join('\n');
@@ -5526,10 +8556,10 @@
     } catch (err) {
       if (err.status === 401) return;
       ui.logs.set(key, { loading: false, text: null, error: err.message, at: Date.now() });
-      showBanner(err, () => loadDockerLogs(name));
     }
     bump();
     renderAll(true);
+    restoreAsyncActionFocus(restoreFocus);
   }
 
   function dockerPanel(c, panelId) {
@@ -5544,7 +8574,7 @@
           'data-fk': `dock-logs-refresh:${c.name}`,
           disabled: lg?.loading || undefined,
           title: 'Fetch the latest 120 log lines',
-          onclick: () => loadDockerLogs(c.name),
+          onclick: () => loadDockerLogs(c),
         }, icon('refresh'), lg?.loading ? 'Loading…' : 'Refresh')),
       logboxNode(key, lg));
   }
@@ -5580,7 +8610,7 @@
     if (!o.inventory) return [degradedPanel(o)];
     const leases = (o.inventory.leases || []).slice().sort((a, b) => (a.port || 0) - (b.port || 0));
     if (!leases.length) {
-      return [emptyState('No active port leases — lease one with the form above, or through the coordinator CLI, and it shows up here with its expiry.')];
+      return [emptyState('No active port leases — use Lease port or the coordinator CLI to reserve one.')];
     }
     const out = [
       h('div', { class: 'grid-head lease-grid', 'aria-hidden': 'true' },
@@ -5596,7 +8626,12 @@
 
   function leaseRow(o, l) {
       const busy = ui.busy.has(`lease:${l.id}`);
-      return (h('div', { class: 'item' },
+      return (h('div', {
+        class: 'item',
+        tabindex: '-1',
+        'data-lease-id': l.id,
+        'data-lease-port': l.port,
+      },
         h('div', { class: 'row lease-grid' },
           h('span', { class: 'cell mono', 'data-label': 'Port' }, h('strong', null, String(l.port ?? '—'))),
           h('span', { class: 'cell', 'data-label': 'Purpose', title: l.agent ? `Leased by ${l.agent}` : '' },
@@ -5681,7 +8716,93 @@
 
   // ---------------------------------------------------------------- lease form
 
+  let leaseDialogReturnFocus = null;
+  let pendingCreatedLeaseFocus = null;
+
+  function createdLeaseRow(lease) {
+    return [...document.querySelectorAll('#leases-body [data-lease-id]')]
+      .find((candidate) => (
+        lease?.id != null
+          ? candidate.dataset.leaseId === String(lease.id)
+          : candidate.dataset.leasePort === String(lease?.port ?? '')
+      )) || null;
+  }
+
+  function restorePendingCreatedLeaseFocus() {
+    const pending = pendingCreatedLeaseFocus;
+    if (!pending || currentPage() !== 'ports' || $('#lease-dialog').open) return;
+    const active = document.activeElement;
+    const mayRestore = active === document.body
+      || active === $('#lease-add')
+      || active?.dataset?.leaseId === String(pending.lease?.id ?? '');
+    if (!mayRestore) return;
+    setTimeout(() => {
+      if (pendingCreatedLeaseFocus !== pending) return;
+      const row = createdLeaseRow(pending.lease);
+      if (!row) return;
+      row.focus({ preventScroll: true });
+      row.scrollIntoView({ block: 'center' });
+    }, 0);
+  }
+
+  function requestCreatedLeaseFocus(lease) {
+    const pending = { lease };
+    pendingCreatedLeaseFocus = pending;
+    restorePendingCreatedLeaseFocus();
+    setTimeout(() => {
+      if (pendingCreatedLeaseFocus === pending) pendingCreatedLeaseFocus = null;
+    }, 2_000);
+  }
+
+  function openLeaseDialog() {
+    const dialog = $('#lease-dialog');
+    leaseDialogReturnFocus = document.activeElement instanceof HTMLElement
+      ? document.activeElement : $('#lease-add');
+    $('#lease-form').reset();
+    $('#lf-error').hidden = true;
+    $('#lf-error').textContent = '';
+    dialog.showModal();
+    queueMicrotask(() => $('#lf-purpose').focus());
+  }
+
+  function focusAfterLeaseDialog(target) {
+    leaseDialogReturnFocus = null;
+    setTimeout(() => {
+      if (!target?.isConnected) return;
+      target.focus({ preventScroll: true });
+      target.scrollIntoView({ block: 'nearest' });
+    }, 0);
+  }
+
+  function closeLeaseDialog(focusTarget = null) {
+    const dialog = $('#lease-dialog');
+    const target = focusTarget || leaseDialogReturnFocus || $('#lease-add');
+    if (dialog.open) dialog.close();
+    focusAfterLeaseDialog(target);
+  }
+
+  async function waitForCreatedLeaseRow(lease, timeoutMs = 5_000) {
+    const deadline = Date.now() + timeoutMs;
+    do {
+      const row = createdLeaseRow(lease);
+      if (row && !fetching && !refetchQueued) {
+        await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+        if (row.isConnected && !fetching && !refetchQueued) return row;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    } while (Date.now() < deadline);
+    return null;
+  }
+
   function wireLeaseForm() {
+    $('#lease-add').addEventListener('click', openLeaseDialog);
+    $('#lease-dialog-close').append(icon('x'));
+    $('#lease-dialog-close').addEventListener('click', () => closeLeaseDialog());
+    $('#lease-cancel').addEventListener('click', () => closeLeaseDialog());
+    $('#lease-dialog').addEventListener('cancel', (event) => {
+      event.preventDefault();
+      closeLeaseDialog();
+    });
     $('#lease-form').addEventListener('submit', onLeasePort);
   }
 
@@ -5714,11 +8835,15 @@
     btn.textContent = 'Leasing…';
     try {
       const resp = await api('/api/ports/lease', { method: 'POST', body });
+      const lease = resp?.lease || null;
       $('#lf-purpose').value = '';
       $('#lf-preferred').value = '';
       $('#lf-project').value = '';
-      announce(`Port ${resp?.lease?.port ?? ''} leased`);
+      announce(`Port ${lease?.port ?? ''} leased`);
       await refreshOverview({ force: true, fresh: true });
+      const createdRow = await waitForCreatedLeaseRow(lease);
+      closeLeaseDialog(createdRow || $('#lease-add'));
+      requestCreatedLeaseFocus(lease);
     } catch (err) {
       if (err.status !== 401) {
         fail(err.message);
@@ -5730,50 +8855,7 @@
     }
   }
 
-  // ---------------------------------------------------------------- usage
-
-  function buildUsage(o) {
-    if (!o.inventory) return [degradedPanel(o)];
-    const inventoryError = authoritativeInventoryErrorPanel(o);
-    if (inventoryError) return [inventoryError];
-    const authoritative = Array.isArray(o.inventory.repository_trees);
-    const groups = authoritative ? projectGroupsOf(o).filter((group) => group.row) : [];
-    const items = authoritative ? groups.map((group) => ({ ...group.row, metricsKey: group.metricsKey }))
-      : (o.inventory.project_usage || []);
-    if (!items.length) {
-      return [emptyState('No per-project usage measured yet — start a server or container and its CPU/memory appears here.')];
-    }
-    const maxMem = Math.max(1, ...items.map((p) => p.memory_bytes || 0));
-    const maxCpu = Math.max(100, ...items.map((p) => p.cpu_percent || 0));
-    return items.map((p) => {
-      const key = p.metricsKey || `proj:${p.usage_key ?? p.project_key ?? p.project ?? p.name}`;
-      const familyLabel = p.temporary_repo_count > 0
-        ? `Family total · root + ${p.temporary_repo_count} temporary repo${sfx(p.temporary_repo_count)}`
-        : null;
-      return h('div', { class: 'usage-item' },
-        h('div', { class: 'usage-head' },
-          h('strong', { title: p.project || '' }, p.name || projectTail(p.project)),
-          sparkline(metricsEntity(key)),
-          h('span', { class: 'meta-passive' },
-            familyLabel ? `${familyLabel} · ` : '',
-            `${p.server_count || 0} server${sfx(p.server_count || 0)} · `
-            + `${p.container_count || 0} container${sfx(p.container_count || 0)} · `
-            + `${p.process_count || 0} process${(p.process_count || 0) === 1 ? '' : 'es'}`)),
-        barRow('CPU', `${(p.cpu_percent ?? 0).toFixed(1)}%`, (p.cpu_percent || 0) / maxCpu, false),
-        barRow('Memory', fmtBytes(p.memory_bytes || 0), (p.memory_bytes || 0) / maxMem, true));
-    });
-  }
-
-  function barRow(label, valueText, frac, isMem) {
-    const fill = h('div', { class: `fill${isMem ? ' mem' : ''}` });
-    fill.style.width = `${Math.min(100, Math.max(2, frac * 100)).toFixed(1)}%`;
-    return h('div', { class: 'bar-row' },
-      h('span', { class: 'bar-label' }, label),
-      h('div', { class: 'bar', 'aria-hidden': 'true' }, fill),
-      h('span', { class: `bar-val mono ${isMem ? 'u-mem' : 'u-cpu'}` }, valueText));
-  }
-
-  // ---------------------------------------------------------------- projects tree
+ // ---------------------------------------------------------------- projects tree
 
   function projectAction(group, action) {
     // Wording matches what the coordinator actually does: it acts on the
@@ -5783,9 +8865,16 @@
       stop: `Stop root repository "${group.name}"?\n\nThe coordinator stops only the runtime declared by this root checkout. Temporary repository runs remain separate.`,
       restart: `Restart root repository "${group.name}"?\n\nThe coordinator restarts only the runtime declared by this root checkout. Temporary repository runs remain separate.`,
     };
+    const operationId = crypto.randomUUID();
     runAction(`project:${group.key}`,
-      () => api('/api/projects/action', { method: 'POST', body: { project: group.project, action } }),
-      confirms[action] ? { confirmText: confirms[action] } : undefined);
+      () => api('/api/projects/action', {
+        method: 'POST',
+        body: { project: group.project, action, operation_id: operationId },
+      }),
+      {
+        ...(confirms[action] ? { confirmText: confirms[action] } : {}),
+        inventoryTargets: [{ target_kind: 'project', target_id: group.rootScope.repoId }],
+      });
   }
 
   // Color code shared by every action button in the console: green starts,
@@ -5812,13 +8901,18 @@
   function projectActionButtons(group) {
     const busy = ui.busy.has(`project:${group.key}`);
     const noPath = !group.project;
+    const inventoryProblem = inventoryMutationProblemOf(state.overview, {
+      target_kind: 'project', target_id: group.rootScope.repoId,
+    });
     const slot = (action, label, iconName) => ({
       fk: `proj-${action}:${group.key}`,
       label,
       icon: iconName,
       busy,
-      disabled: noPath,
-      title: noPath
+      disabled: noPath || !!inventoryProblem,
+      title: inventoryProblem
+        ? `${label} is disabled only for this repository until its affected resource is repaired`
+        : noPath
         ? 'No repo path known for this group — control its items individually'
         : `${label} the root repository runtime only (temporary repository runs stay separate)`,
       onclick: () => projectAction(group, action),
@@ -5849,15 +8943,21 @@
       ? `${s.supervision.keep_alive === true ? 'Keep alive on' : 'Keep alive off'}${s.url ? ` · ${s.url}` : ''}`
       : (s.url || '');
     const archiveTarget = lifecycleTarget('server', s.id, s.name || 'Unnamed server', 'servers');
+    const inventoryProblem = inventoryMutationProblemOf(o, {
+      target_kind: 'server', target_id: s.id,
+    });
     const slot = (action, label, iconName, disabled, title) => ({
       fk: `tree-srv-${action}-${label}:${s.id}`,
       label,
       icon: iconName,
       busy,
-      disabled,
-      title,
+      disabled: !!inventoryProblem || disabled,
+      title: inventoryProblem
+        ? `${label} is disabled only for this server until its ownership problem is resolved`
+        : title,
       onclick: () => runAction(`server:${s.id}`,
-        () => api('/api/servers/action', { method: 'POST', body: { id: s.id, action } })),
+        () => api('/api/servers/action', { method: 'POST', body: { id: s.id, action } }),
+        { inventoryTargets: [{ target_kind: 'server', target_id: s.id }] }),
     });
     return h('div', {
       class: `row tree-grid tree-item${hiddenRow ? ' is-hidden' : ''}`,
@@ -5865,7 +8965,7 @@
       'data-lifecycle-target': `${archiveTarget.target_kind}:${archiveTarget.target_id}`,
     },
       h('span', { class: 'cell c-kind' },
-        h('span', { class: 'kind-tag k-srv' }, supervised ? 'worker' : 'server')),
+        projectResourceKindTrigger(supervised ? 'worker' : 'server', s.id || s.key || s.name)),
       h('span', { class: 'cell c-primary' },
         h('strong', null, s.name || '—'),
         h('span', { class: 'dim mono' }, s.port != null ? ` :${s.port}` : ''),
@@ -5881,7 +8981,7 @@
       h('span', { class: 'cell c-status' }, treeStatusBadge(meta.css, meta.label)),
       h('span', { class: 'cell actions' },
         // A stopped coordinator server starts through the restart action.
-        supervised ? workerControlButtons(s, busy, 'tree') : treeActionSlots({
+        supervised ? treeWorkerActionSlots(s, busy) : treeActionSlots({
           start: slot('restart', 'Start', 'play', !stopped || s.missing_command,
             !stopped ? 'Already running'
               : (s.missing_command ? 'Registered without a start command' : `Start ${s.name} on its pinned port`)),
@@ -5903,6 +9003,9 @@
     const busy = ui.busy.has(`docker:${c.name}`);
     const running = isContainerRunning(c);
     const ownership = containerOwnershipState(c);
+    const inventoryProblem = inventoryMutationProblemOf(o, {
+      target_kind: 'container', target_id: c.host_resource_id,
+    });
     const archiveTarget = ownership.genericLifecycle
       ? lifecycleTarget('container', c.host_resource_id, c.name, 'docker')
       : null;
@@ -5911,8 +9014,10 @@
       label,
       icon: iconName,
       busy,
-      disabled: !ownership.genericLifecycle || disabled,
-      title: ownership.genericLifecycle
+      disabled: !ownership.genericLifecycle || !!inventoryProblem || disabled,
+      title: inventoryProblem
+        ? `${label} is disabled only for this container until its ownership problem is resolved`
+        : ownership.genericLifecycle
         ? title
         : (ownership.ephemeral
             ? `${label} is unavailable here; use coordinator ephemeral renew or finish`
@@ -5920,7 +9025,10 @@
       onclick: ownership.genericLifecycle
         ? () => runAction(`docker:${c.name}`,
             () => api('/api/docker/action', { method: 'POST', body: { name: c.name, action } }),
-            confirmText ? { confirmText } : undefined)
+            {
+              ...(confirmText ? { confirmText } : {}),
+              inventoryTargets: [{ target_kind: 'container', target_id: c.host_resource_id }],
+            })
         : undefined,
     });
     return h('div', {
@@ -5932,7 +9040,7 @@
         ? `${archiveTarget.target_kind}:${archiveTarget.target_id}` : null,
     },
       h('span', { class: 'cell c-kind' },
-        h('span', { class: `kind-tag ${isDb ? 'k-db' : 'k-dock'}` }, isDb ? 'database' : 'container')),
+        projectResourceKindTrigger(isDb ? 'database' : 'container', c.host_resource_id || c.name)),
       h('span', { class: 'cell c-primary' },
         h('strong', null, c.name),
         h('span', { class: 'tree-detail dim mono', title: c.image || '' }, c.image || ''),
@@ -6030,7 +9138,6 @@
       },
     },
       h('span', { class: `chev${expanded ? ' open' : ''}`, 'aria-hidden': 'true' }, icon('chevron')),
-      h('span', { class: 'kind-tag k-temp' }, 'temporary'),
       h('strong', { class: 'proj-name' }, scope.name),
       h('span', { class: 'meta-passive temporary-scope-count' },
         `${scope.runningCount} of ${memberCount} running`),
@@ -6043,7 +9150,8 @@
       ? projectScopeRows(o, group, scope, revealing, hiddenServers, hiddenDocker, 'Temporary repo items')
       : [];
     return h('section', { class: 'temporary-scope-block' },
-      h('h4', { class: `temporary-scope-head${expanded ? ' is-open' : ''}` }, toggle),
+      h('h4', { class: `temporary-scope-head${expanded ? ' is-open' : ''}` },
+        projectResourceKindTrigger('temporary', scope.key), toggle),
       h('div', {
         class: 'temporary-scope-items', id: panelId,
         hidden: expanded ? undefined : true,
@@ -6056,25 +9164,26 @@
       + group.rootScope.members.containers.length;
     const rootRunningCount = group.rootScope.runningCount || 0;
     const archiveTarget = lifecycleTarget('project', group.repoId, group.name, 'projects');
+    const toggleProject = () => {
+      if (collapsed) {
+        ui.treeExpanded.clear();
+        ui.treeExpanded.add(group.key);
+      } else {
+        ui.treeExpanded.delete(group.key);
+      }
+      ui.temporaryScopesExpanded.clear();
+      ui.projectScopePages.clear();
+      ui.resourcePages.projects = 0;
+      bump();
+      renderAll(true);
+    };
     const chev = h('button', {
       class: `chev${collapsed ? '' : ' open'}`, type: 'button',
       'data-fk': `tree-x:${group.key}`,
       'aria-expanded': String(!collapsed),
       'aria-label': `${collapsed ? 'Expand' : 'Collapse'} project ${group.name}`,
       title: collapsed ? 'Expand project' : 'Collapse project',
-      onclick: () => {
-        if (collapsed) {
-          ui.treeExpanded.clear();
-          ui.treeExpanded.add(group.key);
-        } else {
-          ui.treeExpanded.delete(group.key);
-        }
-        ui.temporaryScopesExpanded.clear();
-        ui.projectScopePages.clear();
-        ui.resourcePages.projects = 0;
-        bump();
-        renderAll(true);
-      },
+      onclick: toggleProject,
     }, icon('chevron'));
 
     const header = h('div', {
@@ -6083,10 +9192,13 @@
       tabindex: '-1',
       'data-lifecycle-target': archiveTarget
         ? `${archiveTarget.target_kind}:${archiveTarget.target_id}` : null,
-    },
+      onclick: (event) => {
+        if (event.target.closest?.('button, a, input, select, textarea, [role="button"]')) return;
+        toggleProject();
+      },
+      },
       h('span', { class: 'cell c-kind' }, chev),
       h('span', { class: 'cell c-primary' },
-        group.authoritative ? h('span', { class: 'kind-tag k-root' }, 'root') : null,
         h('strong', { class: 'proj-name', title: group.name }, group.name)),
       group.metricsKey
         ? usageCellNode({
@@ -6102,7 +9214,7 @@
         : h('span', { class: 'cell usage-cell dim' }, '—'),
       h('span', { class: 'cell c-status meta-passive tree-count' },
         `${rootRunningCount} of ${rootMemberCount} root services running`),
-      h('span', { class: 'cell actions' },
+      h('span', { class: 'cell actions project-actions' },
         projectActionButtons(group),
         hiddenProject
           ? unhideButton('projects', group.key, group.name)
@@ -6138,9 +9250,11 @@
     if (!o.inventory) return [degradedPanel(o)];
     const inventoryError = authoritativeInventoryErrorPanel(o);
     if (inventoryError) return [inventoryError];
+    const inventoryDiagnostics = authoritativeInventoryDiagnosticPanel(o);
     const groups = projectGroupsOf(o);
     if (!groups.length) {
-      return [emptyState('No projects yet — anything an agent starts or registers through the coordinator appears here, grouped by repo.')];
+      return [inventoryDiagnostics,
+        emptyState('No projects yet — anything an agent starts or registers through the coordinator appears here, grouped by repo.')].filter(Boolean);
     }
     const hiddenProjects = hiddenSet('projects');
     const hiddenServers = hiddenSet('servers');
@@ -6151,7 +9265,7 @@
     const revealing = ui.reveal.has('projects');
 
     let hiddenCount = 0;
-    const out = [];
+    const out = inventoryDiagnostics ? [inventoryDiagnostics] : [];
     for (const group of groups) {
       const isHidden = hiddenProjects.has(group.key);
       const hiddenItems = group.members.servers.filter((s) => hiddenServers.has(s.key)).length
@@ -6185,131 +9299,1542 @@
     return `${min}m`;
   }
 
-  // Overall machine health: CPU, memory, storage, load and uptime for the
-  // box everything above runs on, with the same history charts as any row.
-  function hostPanel() {
-    const info = state.metrics?.host;
-    if (!info) return null;
+  const PERFORMANCE_PROJECT_COLORS = [
+    '#f17074', '#ffaa75', '#d29000', '#c9cb61',
+    '#63b650', '#5bdfb7', '#00bac5', '#5ad3ff',
+    '#619dff', '#c3b5ff', '#c97adb', '#ffa0d0',
+  ];
+  const PERFORMANCE_CATEGORY_COLORS = Object.freeze({
+    'project-runtimes': '#16d39a',
+    'coordinator-control': '#2f81f7',
+    'coordinator-background': '#b56cff',
+    'active-test-attempts': '#ff8a2a',
+    'developer-sessions': '#e8eef6',
+    'agent-browsers': '#8bd5ff',
+    'control-other': '#8056b3',
+    'system-unclassified': '#68717d',
+    available: '#27313d',
+  });
 
-    const meter = (frac, alarm) => {
-      const fill = h('div', { class: `fill${alarm ? ' alarm' : ''}` });
-      fill.style.width = `${Math.min(100, Math.max(2, (frac || 0) * 100)).toFixed(1)}%`;
-      return h('div', { class: 'host-meter', 'aria-hidden': 'true' }, fill);
+  function perfFinite(...values) {
+    for (const value of values) {
+      if (value === null || value === undefined || value === '') continue;
+      const number = Number(value);
+      if (Number.isFinite(number)) return number;
+    }
+    return null;
+  }
+
+  function perfEpochMs(value) {
+    if (value === null || value === undefined || value === '') return null;
+    const parsed = typeof value === 'string' ? Date.parse(value) : Number(value);
+    if (!Number.isFinite(parsed)) return null;
+    return parsed > 0 && parsed < 100_000_000_000 ? parsed * 1000 : parsed;
+  }
+
+  function perfBound(value, min, max) {
+    return Math.min(max, Math.max(min, Number(value) || 0));
+  }
+
+  function perfCoveragePercent(value) {
+    const number = perfFinite(value);
+    if (number === null) return null;
+    return perfBound(number <= 1 ? number * 100 : number, 0, 100);
+  }
+
+  function perfPercent(value, digits = 1) {
+    const number = perfFinite(value);
+    return number === null ? '—' : number.toFixed(digits) + '%';
+  }
+
+  function perfSkewText(value) {
+    const ms = Math.max(0, perfFinite(value) || 0);
+    if (ms < 1000) return Math.round(ms) + ' ms';
+    if (ms < 60_000) return (ms / 1000).toFixed(ms < 10_000 ? 1 : 0) + ' s';
+    return (ms / 60_000).toFixed(1) + ' min';
+  }
+
+  function perfLocalTime(value) {
+    const at = perfEpochMs(value);
+    if (at === null) return '—';
+    return new Date(at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  }
+
+  function perfProjectColorIndex(key) {
+    let hash = 0;
+    for (const char of String(key || 'project')) {
+      hash = ((hash << 5) - hash + char.charCodeAt(0)) | 0;
+    }
+    return Math.abs(hash) % PERFORMANCE_PROJECT_COLORS.length;
+  }
+
+  function assignPerformanceProjectColors(segments) {
+    const projects = segments.filter((segment) => segment.project)
+      .slice()
+      .sort((left, right) => String(left.key).localeCompare(String(right.key)));
+    const used = new Set();
+    for (const project of projects) {
+      const preferred = perfProjectColorIndex(project.key);
+      let offset = 0;
+      while (offset < PERFORMANCE_PROJECT_COLORS.length
+        && used.has(PERFORMANCE_PROJECT_COLORS[(preferred + offset)
+          % PERFORMANCE_PROJECT_COLORS.length])) {
+        offset += 1;
+      }
+      const color = PERFORMANCE_PROJECT_COLORS[(preferred + offset)
+        % PERFORMANCE_PROJECT_COLORS.length];
+      project.color = color;
+      used.add(color);
+    }
+  }
+
+  function perfSegmentKind(value) {
+    const kind = String(value || '').toLowerCase().replaceAll('_', '-');
+    if (kind === 'project-family' || kind === 'family' || kind === 'repository-family') {
+      return 'project-family';
+    }
+    if (kind === 'project' || kind === 'repository') return 'project';
+    if (kind === 'project-runtimes' || kind === 'project-runtime') return 'project-runtimes';
+    if (kind === 'coordinator-control' || kind === 'control-plane') return 'coordinator-control';
+    if (kind === 'coordinator-background' || kind === 'background-scheduler') {
+      return 'coordinator-background';
+    }
+    if (kind === 'active-test-attempts' || kind === 'test-attempts') {
+      return 'active-test-attempts';
+    }
+    if (kind === 'developer-sessions' || kind === 'developer-account-sessions') {
+      return 'developer-sessions';
+    }
+    if (kind === 'agent-browsers' || kind === 'agent-browser') return 'agent-browsers';
+    if (kind === 'control-other' || kind === 'control' || kind === 'other') return 'control-other';
+    if (kind === 'available' || kind === 'idle') return 'available';
+    return 'system-unclassified';
+  }
+
+  function perfSegmentName(segment, kind) {
+    if (kind === 'system-unclassified') return 'Estimated System & unattributed';
+    if (kind === 'available') return 'Available';
+    if (kind === 'project-runtimes') return 'Project runtimes';
+    if (kind === 'coordinator-control') return 'Coordinator control plane';
+    if (kind === 'coordinator-background') return 'Coordinator background / scheduler';
+    if (kind === 'active-test-attempts') return 'Active test attempts';
+    if (kind === 'developer-sessions') return 'Developer-account sessions';
+    if (kind === 'agent-browsers') return 'Agent browsers';
+    if (kind === 'control-other') {
+      return segment?.name || 'Measured control-plane / other workloads';
+    }
+    return segment?.name || projectTail(segment?.project) || segment?.key || 'Project';
+  }
+
+  function perfContributor(raw, cores) {
+    const current = raw?.current || {};
+    return {
+      key: String(raw?.key ?? raw?.id ?? raw?.name ?? 'contributor'),
+      kind: raw?.kind === 'docker' ? 'container' : (raw?.kind || 'service'),
+      name: raw?.name || raw?.key || 'Unnamed workload',
+      memoryBytes: Math.max(0, perfFinite(raw?.memoryBytes, raw?.memory_bytes,
+        current.memoryBytes, current.memory_bytes) || 0),
+      cpuPercent: Math.max(0, perfFinite(raw?.cpuPercent, raw?.cpu_percent,
+        current.cpuPercent, current.cpu_percent,
+        (perfFinite(raw?.cpuRawPercent, raw?.cpu_raw_percent) || 0) / Math.max(1, cores)) || 0),
+      cpuRawPercent: Math.max(0, perfFinite(raw?.cpuRawPercent, raw?.cpu_raw_percent,
+        current.cpuRawPercent, current.cpu_raw_percent) || 0),
+      sampledAt: perfEpochMs(raw?.sampledAt ?? raw?.sampled_at),
+      exact: raw?.exact === true,
+      fresh: raw?.fresh !== false,
     };
-    const tile = ({ label, value, sub, frac, alarm, valueClass }) => h('div', { class: `host-tile${alarm ? ' alarm' : ''}` },
-      h('span', { class: 'host-tile-label' }, label),
-      h('strong', { class: `host-tile-value mono${valueClass ? ` ${valueClass}` : ''}` }, value),
-      sub ? h('span', { class: 'host-tile-sub' }, sub) : null,
-      frac !== undefined ? meter(frac, alarm) : null);
+  }
 
-    const tiles = [];
-    const cpu = info.cpuPercent;
-    const load = (info.load || []).map((n) => n.toFixed(2)).join(' · ');
-    tiles.push(tile({
-      label: 'CPU',
-      value: cpu === null || cpu === undefined ? '—' : fmtCpu(cpu),
-      valueClass: 'u-cpu',
-      sub: `${info.cores ?? '—'} cores · load ${load}`,
-      frac: cpu === null || cpu === undefined ? 0 : cpu / 100,
-      alarm: cpu > 90,
+  function perfAgentBrowserInventory(segment) {
+    const source = segment?.agentBrowsers ?? segment?.agent_browsers;
+    if (!source || typeof source !== 'object') return null;
+    const totals = source.totals || {};
+    const policy = source.policy || {};
+    const sessions = (Array.isArray(source.sessions) ? source.sessions : []).map((session) => ({
+      sessionId: String(session?.sessionId ?? session?.session_id ?? 'browser session'),
+      state: String(session?.state || 'unknown'),
+      agent: session?.agent || null,
+      repositoryName: session?.repositoryName ?? session?.repository_name ?? null,
+      firstSeenAt: perfEpochMs(session?.firstSeenAt ?? session?.first_seen_at),
+      lastObservedAt: perfEpochMs(session?.lastObservedAt ?? session?.last_observed_at),
+      lastObservedWorkAt: perfEpochMs(
+        session?.lastObservedWorkAt ?? session?.last_observed_work_at,
+      ),
+      idleSeconds: Math.max(0, perfFinite(session?.idleSeconds, session?.idle_seconds) || 0),
+      processCount: Math.max(0, perfFinite(session?.processCount, session?.process_count) || 0),
+      memoryBytes: Math.max(0, perfFinite(session?.memoryBytes, session?.memory_bytes) || 0),
+      cpuPercent: Math.max(0, perfFinite(session?.cpuPercent, session?.cpu_percent) || 0),
+      reapEligible: session?.reapEligible === true || session?.reap_eligible === true,
     }));
+    const recentReaps = (Array.isArray(source.recentReaps)
+      ? source.recentReaps : (Array.isArray(source.recent_reaps) ? source.recent_reaps : []))
+      .map((reap) => ({
+        sessionId: String(reap?.sessionId ?? reap?.session_id ?? 'browser session'),
+        agent: reap?.agent || null,
+        repositoryName: reap?.repositoryName ?? reap?.repository_name ?? null,
+        reapedAt: perfEpochMs(reap?.reapedAt ?? reap?.reaped_at ?? reap?.at),
+        reason: reap?.reason || null,
+        processCount: Math.max(0, perfFinite(reap?.processCount, reap?.process_count) || 0),
+        reclaimedMemoryBytes: Math.max(0, perfFinite(
+          reap?.reclaimedMemoryBytes,
+          reap?.reclaimed_memory_bytes,
+          reap?.memory_bytes,
+        ) || 0),
+      }));
+    return {
+      sampledAt: perfEpochMs(source.sampledAt ?? source.sampled_at),
+      policy: {
+        idleTimeoutSeconds: Math.max(0, perfFinite(
+          policy.idleTimeoutSeconds,
+          policy.idle_timeout_seconds,
+        ) || 0),
+        terminationGraceSeconds: Math.max(0, perfFinite(
+          policy.terminationGraceSeconds,
+          policy.termination_grace_seconds,
+        ) || 0),
+      },
+      totals: {
+        sessionCount: Math.max(0, perfFinite(totals.sessionCount, totals.session_count) || 0),
+        processCount: Math.max(0, perfFinite(totals.processCount, totals.process_count) || 0),
+        idleSessionCount: Math.max(0, perfFinite(
+          totals.idleSessionCount,
+          totals.idle_session_count,
+        ) || 0),
+        protectedSessionCount: Math.max(0, perfFinite(
+          totals.protectedSessionCount,
+          totals.protected_session_count,
+        ) || 0),
+        reapedTotal: Math.max(0, perfFinite(totals.reapedTotal, totals.reaped_total) || 0),
+        reclaimedMemoryBytes: Math.max(0, perfFinite(
+          totals.reclaimedMemoryBytes,
+          totals.reclaimed_memory_bytes,
+        ) || 0),
+      },
+      sessions,
+      recentReaps,
+    };
+  }
 
-    const mem = info.mem || {};
-    const memFrac = mem.totalBytes ? (mem.usedBytes || 0) / mem.totalBytes : 0;
-    tiles.push(tile({
-      label: 'Memory',
-      value: `${fmtBytes(mem.usedBytes || 0)} / ${fmtBytes(mem.totalBytes || 0)}`,
-      valueClass: 'u-mem',
-      sub: `${(memFrac * 100).toFixed(0)}% used · ${fmtBytes(mem.availableBytes || 0)} available`,
-      frac: memFrac,
-      alarm: memFrac > 0.9,
-    }));
+  function perfValues(rawSegments) {
+    const values = new Map();
+    for (const raw of Array.isArray(rawSegments) ? rawSegments : []) {
+      if (raw?.key === null || raw?.key === undefined) continue;
+      values.set(String(raw.key), {
+        value: Math.max(0, perfFinite(raw.value, raw.stackValue, raw.stack_value) || 0),
+        observedValue: Math.max(0, perfFinite(raw.observedValue, raw.observed_value,
+          raw.value, raw.stackValue, raw.stack_value) || 0),
+        exact: raw.exact === true,
+      });
+    }
+    return values;
+  }
 
-    for (const disk of info.disks || []) {
-      const frac = disk.totalBytes ? (disk.usedBytes || 0) / disk.totalBytes : 0;
-      tiles.push(tile({
-        label: `Storage ${disk.mount}`,
-        value: `${fmtBytes(disk.usedBytes || 0)} / ${fmtBytes(disk.totalBytes || 0)}`,
-        sub: `${(frac * 100).toFixed(0)}% used · ${fmtBytes(disk.availableBytes || 0)} free`,
-        frac,
-        alarm: frac > 0.9,
+  function coherentPerformanceModel(performance) {
+    const host = state.metrics?.host || {};
+    const memory = performance.memory || {};
+    const cpu = performance.cpu || {};
+    const cores = Math.max(1, perfFinite(cpu.cores, host.cores) || 1);
+    const rawSegments = Array.isArray(performance.segments) ? performance.segments : [];
+    const segments = rawSegments
+      .filter((segment) => segment?.key !== null && segment?.key !== undefined)
+      .map((segment) => {
+        const kind = perfSegmentKind(segment.kind);
+        const project = kind === 'project-family' || kind === 'project';
+        const current = segment.current || {};
+        const peak = segment.peak || {};
+        const key = String(segment.key);
+        let memoryObserved = perfFinite(current.memoryBytes, current.memory_bytes);
+        let memoryStack = perfFinite(current.stackMemoryBytes, current.stack_memory_bytes,
+          memoryObserved);
+        let cpuObserved = perfFinite(current.cpuPercent, current.cpu_percent);
+        let cpuStack = perfFinite(current.stackCpuPercent, current.stack_cpu_percent,
+          cpuObserved);
+        if (kind === 'system-unclassified') {
+          memoryObserved = perfFinite(memoryObserved, memory.residualBytes, memory.residual_bytes);
+          memoryStack = perfFinite(memoryStack, memory.residualBytes, memory.residual_bytes);
+          cpuObserved = perfFinite(cpuObserved, cpu.residualPercent, cpu.residual_percent);
+          cpuStack = perfFinite(cpuStack, cpu.residualPercent, cpu.residual_percent);
+        } else if (kind === 'available') {
+          memoryObserved = perfFinite(memoryObserved, memory.availableBytes, memory.available_bytes);
+          memoryStack = perfFinite(memoryStack, memory.availableBytes, memory.available_bytes);
+          cpuObserved = perfFinite(cpuObserved, cpu.availablePercent, cpu.available_percent);
+          cpuStack = perfFinite(cpuStack, cpu.availablePercent, cpu.available_percent);
+        }
+        return {
+          key,
+          kind,
+          project,
+          familyId: segment.familyId ?? segment.family_id ?? null,
+          repoId: segment.repoId ?? segment.repo_id ?? null,
+          name: perfSegmentName(segment, kind),
+          path: segment.project || null,
+          active: segment.active !== false,
+          additive: segment.additive !== false,
+          exact: segment.exact === true,
+          fresh: segment.fresh !== false,
+          sampledAt: perfEpochMs(segment.sampledAt ?? segment.sampled_at),
+          color: project ? null : PERFORMANCE_CATEGORY_COLORS[kind],
+          memoryObserved: Math.max(0, memoryObserved || 0),
+          memoryStack: Math.max(0, memoryStack || 0),
+          cpuObserved: Math.max(0, cpuObserved || 0),
+          cpuStack: Math.max(0, cpuStack || 0),
+          cpuRaw: Math.max(0, perfFinite(current.cpuRawPercent, current.cpu_raw_percent) || 0),
+          memoryPeak: Math.max(0, perfFinite(peak.memoryBytes, peak.memory_bytes,
+            memoryObserved) || 0),
+          cpuPeak: Math.max(0, perfFinite(peak.cpuPercent, peak.cpu_percent,
+            cpuObserved) || 0),
+          agentBrowsers: kind === 'agent-browsers'
+            ? perfAgentBrowserInventory(segment) : null,
+          accounting: segment.accounting && typeof segment.accounting === 'object'
+            ? segment.accounting : null,
+          contributors: (Array.isArray(segment.contributors) ? segment.contributors : [])
+            .map((item) => perfContributor(item, cores)),
+        };
+      });
+    assignPerformanceProjectColors(segments);
+    const samples = (Array.isArray(performance.samples) ? performance.samples : [])
+      .map((sample) => ({
+        at: perfEpochMs(sample?.at ?? sample?.sampledAt ?? sample?.sampled_at),
+        sampleSkewMs: Math.max(0, perfFinite(sample?.sampleSkewMs, sample?.sample_skew_ms) || 0),
+        exact: sample?.exact === true,
+        memory: {
+          total: Math.max(0, perfFinite(sample?.memory?.totalBytes,
+            sample?.memory?.total_bytes, memory.totalBytes, memory.total_bytes) || 0),
+          used: Math.max(0, perfFinite(sample?.memory?.usedBytes,
+            sample?.memory?.used_bytes, memory.usedBytes, memory.used_bytes) || 0),
+          values: perfValues(sample?.memory?.segments),
+        },
+        cpu: {
+          total: Math.max(0, perfFinite(sample?.cpu?.capacityPercent,
+            sample?.cpu?.capacity_percent, cpu.capacityPercent, cpu.capacity_percent, 100) || 100),
+          used: Math.max(0, perfFinite(sample?.cpu?.usedPercent,
+            sample?.cpu?.used_percent, cpu.usedPercent, cpu.used_percent) || 0),
+          values: perfValues(sample?.cpu?.segments),
+        },
+      }))
+      .filter((sample) => sample.at !== null)
+      .sort((a, b) => a.at - b.at);
+    if (!samples.length) {
+      const at = perfEpochMs(performance.sampledAt ?? performance.sampled_at) || Date.now();
+      samples.push({
+        at,
+        sampleSkewMs: Math.max(0, perfFinite(performance.sampleSkewMs,
+          performance.sample_skew_ms) || 0),
+        exact: performance.exact === true,
+        memory: {
+          total: Math.max(0, perfFinite(memory.totalBytes, memory.total_bytes) || 0),
+          used: Math.max(0, perfFinite(memory.usedBytes, memory.used_bytes) || 0),
+          values: new Map(segments.map((segment) => [segment.key, {
+            value: segment.memoryStack, observedValue: segment.memoryObserved, exact: segment.exact,
+          }])),
+        },
+        cpu: {
+          total: Math.max(0, perfFinite(cpu.capacityPercent, cpu.capacity_percent, 100) || 100),
+          used: Math.max(0, perfFinite(cpu.usedPercent, cpu.used_percent) || 0),
+          values: new Map(segments.map((segment) => [segment.key, {
+            value: segment.cpuStack, observedValue: segment.cpuObserved, exact: segment.exact,
+          }])),
+        },
+      });
+    }
+    const latestSample = samples.at(-1);
+    for (const segment of segments) {
+      const memoryValue = latestSample.memory.values.get(segment.key);
+      const cpuValue = latestSample.cpu.values.get(segment.key);
+      if (memoryValue) {
+        segment.memoryStack = memoryValue.value;
+        segment.memoryObserved = memoryValue.observedValue;
+      } else if (segment.active === false) {
+        segment.memoryStack = 0;
+        segment.memoryObserved = 0;
+      }
+      if (cpuValue) {
+        segment.cpuStack = cpuValue.value;
+        segment.cpuObserved = cpuValue.observedValue;
+      } else if (segment.active === false) {
+        segment.cpuStack = 0;
+        segment.cpuObserved = 0;
+      }
+      if (segment.active === false) segment.fresh = false;
+    }
+    const projects = segments.filter((segment) => segment.project);
+    for (const segment of segments.filter((item) => (
+      item.project || item.kind === 'agent-browsers'
+    ))) {
+      segment.history = samples.map((sample) => ({
+        at: sample.at,
+        cpu: sample.cpu.values.get(segment.key)?.observedValue ?? 0,
+        memory: sample.memory.values.get(segment.key)?.observedValue ?? 0,
       }));
     }
+    const coverage = performance.coverage || {};
+    const sampledAt = perfEpochMs(performance.sampledAt ?? performance.sampled_at)
+      || samples.at(-1)?.at || null;
+    return {
+      source: 'coherent',
+      exact: performance.exact === true,
+      issues: Array.isArray(performance.issues) ? performance.issues : [],
+      semantics: performance.semantics || {},
+      sampledAt,
+      sampleSkewMs: Math.max(0, perfFinite(performance.sampleSkewMs,
+        performance.sample_skew_ms) || 0),
+      window: performance.window || {},
+      diagnostics: performance.residual?.diagnostics || host.mem?.diagnostics || null,
+      memoryBasis: memory.basis || null,
+      host: {
+        cores,
+        cpuUsed: Math.max(0, perfFinite(cpu.usedPercent, cpu.used_percent,
+          host.cpuPercent) || 0),
+        cpuAvailable: Math.max(0, perfFinite(cpu.availablePercent, cpu.available_percent,
+          100 - (perfFinite(cpu.usedPercent, cpu.used_percent, host.cpuPercent) || 0)) || 0),
+        load: Array.isArray(host.load) ? host.load : [],
+        memoryTotal: Math.max(0, perfFinite(memory.totalBytes, memory.total_bytes,
+          host.mem?.totalBytes) || 0),
+        memoryUsed: Math.max(0, perfFinite(memory.usedBytes, memory.used_bytes,
+          host.mem?.usedBytes) || 0),
+        memoryAvailable: Math.max(0, perfFinite(memory.availableBytes, memory.available_bytes,
+          host.mem?.availableBytes) || 0),
+        disks: Array.isArray(host.disks) ? host.disks : [],
+        uptimeSec: perfFinite(host.uptimeSec),
+      },
+      attributed: {
+        memory: Math.max(0, perfFinite(performance.attributed?.memoryBytes,
+          performance.attributed?.memory_bytes, memory.attributedBytes,
+          memory.attributed_bytes) || 0),
+        cpu: Math.max(0, perfFinite(performance.attributed?.cpuPercent,
+          performance.attributed?.cpu_percent, cpu.attributedPercent,
+          cpu.attributed_percent) || 0),
+      },
+      coverage: {
+        memory: perfCoveragePercent(coverage.memoryRatio ?? coverage.memory_ratio
+          ?? memory.coverageRatio ?? memory.coverage_ratio),
+        cpu: perfCoveragePercent(coverage.cpuRatio ?? coverage.cpu_ratio
+          ?? cpu.coverageRatio ?? cpu.coverage_ratio),
+        measured: perfFinite(coverage.measuredResources, coverage.measured_resources),
+        expected: perfFinite(coverage.expectedResources, coverage.expected_resources),
+        missing: perfFinite(coverage.missingResources, coverage.missing_resources),
+        stale: perfFinite(coverage.staleResources, coverage.stale_resources),
+      },
+      segments,
+      projects,
+      samples,
+    };
+  }
 
-    tiles.push(tile({
-      label: 'Uptime',
-      value: fmtUptime(info.uptimeSec),
-      sub: 'since last boot',
+  function legacyPerfPointAt(points, at) {
+    if (!points?.length) return null;
+    let low = 0;
+    let high = points.length - 1;
+    let found = -1;
+    while (low <= high) {
+      const middle = Math.floor((low + high) / 2);
+      if ((perfEpochMs(points[middle]?.[0]) || 0) <= at) {
+        found = middle;
+        low = middle + 1;
+      } else {
+        high = middle - 1;
+      }
+    }
+    return found >= 0 ? points[found] : points[0];
+  }
+
+  function legacyPerfContributors(group, cores) {
+    if (!group) return [];
+    const contributors = [];
+    for (const server of group.members?.servers || []) {
+      if (!server?.process_usage) continue;
+      contributors.push(perfContributor({
+        key: 'srv:' + server.id,
+        kind: 'server',
+        id: server.id,
+        name: server.name || server.id,
+        memoryBytes: server.process_usage.memory_bytes ?? server.process_usage.rss_bytes,
+        cpuRawPercent: server.process_usage.cpu_percent,
+        cpuPercent: (Number(server.process_usage.cpu_percent) || 0) / Math.max(1, cores),
+        exact: false,
+      }, cores));
+    }
+    for (const container of group.members?.containers || []) {
+      if (!container?.stats) continue;
+      contributors.push(perfContributor({
+        key: 'dock:' + container.name,
+        kind: 'docker',
+        id: container.id,
+        name: container.name,
+        memoryBytes: container.stats.memory_usage_bytes,
+        cpuRawPercent: container.stats.cpu_percent,
+        cpuPercent: (Number(container.stats.cpu_percent) || 0) / Math.max(1, cores),
+        exact: false,
+      }, cores));
+    }
+    return contributors;
+  }
+
+  function legacyPerformanceModel(o) {
+    const metrics = state.metrics || {};
+    const host = metrics.host || {};
+    const hostEntity = metricsEntity('host');
+    const cores = Math.max(1, perfFinite(host.cores) || 1);
+    const authoritativeGroups = Array.isArray(o?.inventory?.repository_trees)
+      ? projectGroupsOf(o).filter((group) => group.row) : [];
+    let projectDefs = authoritativeGroups.map((group) => ({
+      key: group.metricsKey,
+      name: group.name,
+      path: group.project,
+      active: group.runningCount > 0,
+      row: group.row,
+      group,
+      entity: metricsEntity(group.metricsKey),
     }));
+    if (!projectDefs.length) {
+      const entities = Array.isArray(metrics.entities) ? metrics.entities : [];
+      let candidates = entities.filter((entity) => entity.kind === 'project-family');
+      if (!candidates.length) candidates = entities.filter((entity) => entity.kind === 'project');
+      projectDefs = candidates.map((entity) => ({
+        key: entity.key,
+        name: entity.name || projectTail(entity.project) || entity.key,
+        path: entity.project,
+        active: true,
+        row: null,
+        group: null,
+        entity,
+      }));
+    }
+    const projects = projectDefs.map((definition) => {
+      const points = Array.isArray(definition.entity?.points) ? definition.entity.points : [];
+      const last = points.at(-1);
+      const currentCpuRaw = Math.max(0, perfFinite(definition.row?.cpu_percent, last?.[1]) || 0);
+      const currentMemory = Math.max(0, perfFinite(definition.row?.memory_bytes, last?.[2]) || 0);
+      const history = points.map((point) => ({
+        at: perfEpochMs(point[0]) || 0,
+        cpu: Math.max(0, (Number(point[1]) || 0) / cores),
+        memory: Math.max(0, Number(point[2]) || 0),
+      })).filter((point) => point.at > 0);
+      return {
+        key: String(definition.key),
+        kind: definition.key.startsWith('family:') ? 'project-family' : 'project',
+        project: true,
+        familyId: definition.key.startsWith('family:') ? definition.key.slice(7) : null,
+        repoId: definition.group?.repoId ?? null,
+        name: definition.name,
+        path: definition.path || null,
+        active: definition.active,
+        exact: false,
+        fresh: true,
+        sampledAt: perfEpochMs(last?.[0]),
+        color: null,
+        memoryObserved: currentMemory,
+        memoryStack: currentMemory,
+        cpuObserved: currentCpuRaw / cores,
+        cpuStack: currentCpuRaw / cores,
+        cpuRaw: currentCpuRaw,
+        memoryPeak: Math.max(currentMemory, ...history.map((point) => point.memory)),
+        cpuPeak: Math.max(currentCpuRaw / cores, ...history.map((point) => point.cpu)),
+        contributors: legacyPerfContributors(definition.group, cores),
+        history,
+        rawPoints: points,
+      };
+    });
+    assignPerformanceProjectColors(projects);
+    const memoryTotal = Math.max(0, perfFinite(host.mem?.totalBytes) || 0);
+    const hostPoints = Array.isArray(hostEntity?.points) ? hostEntity.points : [];
+    const samplePoints = hostPoints.length ? hostPoints : [[
+      perfEpochMs(host.at) || Date.now(),
+      perfFinite(host.cpuPercent) || 0,
+      perfFinite(host.mem?.usedBytes) || 0,
+    ]];
+    let sampleSkewMs = 0;
+    const samples = samplePoints.map((hostPoint) => {
+      const at = perfEpochMs(hostPoint[0]) || Date.now();
+      const memoryUsed = perfBound(hostPoint[2], 0, memoryTotal || Number.MAX_SAFE_INTEGER);
+      const cpuUsed = perfBound(hostPoint[1], 0, 100);
+      const projectValues = projects.map((project) => {
+        const point = legacyPerfPointAt(project.rawPoints, at);
+        const pointAt = perfEpochMs(point?.[0]);
+        if (pointAt !== null) sampleSkewMs = Math.max(sampleSkewMs, Math.abs(at - pointAt));
+        return {
+          project,
+          memory: Math.max(0, Number(point?.[2]) || 0),
+          cpu: Math.max(0, (Number(point?.[1]) || 0) / cores),
+        };
+      });
+      const observedMemory = projectValues.reduce((sum, item) => sum + item.memory, 0);
+      const observedCpu = projectValues.reduce((sum, item) => sum + item.cpu, 0);
+      const memoryScale = observedMemory > memoryUsed && observedMemory > 0
+        ? memoryUsed / observedMemory : 1;
+      const cpuScale = observedCpu > cpuUsed && observedCpu > 0 ? cpuUsed / observedCpu : 1;
+      const memoryValues = new Map();
+      const cpuValues = new Map();
+      for (const item of projectValues) {
+        memoryValues.set(item.project.key, {
+          value: item.memory * memoryScale, observedValue: item.memory, exact: false,
+        });
+        cpuValues.set(item.project.key, {
+          value: item.cpu * cpuScale, observedValue: item.cpu, exact: false,
+        });
+      }
+      memoryValues.set('system-unclassified', {
+        value: Math.max(0, memoryUsed - observedMemory * memoryScale),
+        observedValue: Math.max(0, memoryUsed - observedMemory),
+        exact: false,
+      });
+      memoryValues.set('available', {
+        value: Math.max(0, memoryTotal - memoryUsed),
+        observedValue: Math.max(0, memoryTotal - memoryUsed),
+        exact: true,
+      });
+      cpuValues.set('system-unclassified', {
+        value: Math.max(0, cpuUsed - observedCpu * cpuScale),
+        observedValue: Math.max(0, cpuUsed - observedCpu),
+        exact: false,
+      });
+      cpuValues.set('available', {
+        value: Math.max(0, 100 - cpuUsed),
+        observedValue: Math.max(0, 100 - cpuUsed),
+        exact: true,
+      });
+      return {
+        at,
+        sampleSkewMs,
+        exact: false,
+        memory: { total: memoryTotal, used: memoryUsed, values: memoryValues },
+        cpu: { total: 100, used: cpuUsed, values: cpuValues },
+      };
+    });
+    const latest = samples.at(-1);
+    for (const project of projects) {
+      project.memoryStack = latest?.memory.values.get(project.key)?.value ?? project.memoryObserved;
+      project.cpuStack = latest?.cpu.values.get(project.key)?.value ?? project.cpuObserved;
+      delete project.rawPoints;
+    }
+    const system = {
+      key: 'system-unclassified',
+      kind: 'system-unclassified',
+      project: false,
+      name: 'Estimated System & unattributed',
+      color: PERFORMANCE_CATEGORY_COLORS['system-unclassified'],
+      exact: false,
+      fresh: true,
+      memoryObserved: latest?.memory.values.get('system-unclassified')?.observedValue || 0,
+      memoryStack: latest?.memory.values.get('system-unclassified')?.value || 0,
+      cpuObserved: latest?.cpu.values.get('system-unclassified')?.observedValue || 0,
+      cpuStack: latest?.cpu.values.get('system-unclassified')?.value || 0,
+      memoryPeak: Math.max(0, ...samples.map((sample) =>
+        sample.memory.values.get('system-unclassified')?.value || 0)),
+      cpuPeak: Math.max(0, ...samples.map((sample) =>
+        sample.cpu.values.get('system-unclassified')?.value || 0)),
+      contributors: [],
+    };
+    const available = {
+      key: 'available',
+      kind: 'available',
+      project: false,
+      name: 'Available',
+      color: PERFORMANCE_CATEGORY_COLORS.available,
+      exact: true,
+      fresh: true,
+      memoryObserved: latest?.memory.values.get('available')?.value || 0,
+      memoryStack: latest?.memory.values.get('available')?.value || 0,
+      cpuObserved: latest?.cpu.values.get('available')?.value || 0,
+      cpuStack: latest?.cpu.values.get('available')?.value || 0,
+      memoryPeak: Math.max(0, ...samples.map((sample) =>
+        sample.memory.values.get('available')?.value || 0)),
+      cpuPeak: Math.max(0, ...samples.map((sample) =>
+        sample.cpu.values.get('available')?.value || 0)),
+      contributors: [],
+    };
+    const attributedMemory = projects.reduce((sum, project) => sum + project.memoryObserved, 0);
+    const attributedCpu = projects.reduce((sum, project) => sum + project.cpuObserved, 0);
+    const memoryUsed = latest?.memory.used || 0;
+    const cpuUsed = latest?.cpu.used || 0;
+    return {
+      source: 'legacy',
+      exact: false,
+      issues: ['Host and project readings do not share a proven sample boundary.'],
+      semantics: {},
+      sampledAt: perfEpochMs(metrics.sampler?.lastSampleAt ?? host.at) || latest?.at || null,
+      sampleSkewMs,
+      window: {
+        startAt: samples[0]?.at || null,
+        endAt: latest?.at || null,
+        intervalMs: metrics.intervalMs || METRICS_POLL_MS,
+      },
+      diagnostics: host.mem?.diagnostics || null,
+      memoryBasis: host.mem?.basis || null,
+      host: {
+        cores,
+        cpuUsed,
+        cpuAvailable: Math.max(0, 100 - cpuUsed),
+        load: Array.isArray(host.load) ? host.load : [],
+        memoryTotal,
+        memoryUsed,
+        memoryAvailable: Math.max(0, memoryTotal - memoryUsed),
+        disks: Array.isArray(host.disks) ? host.disks : [],
+        uptimeSec: perfFinite(host.uptimeSec),
+      },
+      attributed: { memory: attributedMemory, cpu: attributedCpu },
+      coverage: {
+        memory: memoryUsed > 0 ? perfBound(attributedMemory / memoryUsed * 100, 0, 100) : 0,
+        cpu: cpuUsed > 0 ? perfBound(attributedCpu / cpuUsed * 100, 0, 100) : 0,
+        measured: projects.length,
+        expected: projects.length,
+        missing: 0,
+        stale: 0,
+      },
+      segments: [...projects, system, available],
+      projects,
+      samples,
+    };
+  }
 
-    const ent = metricsEntity('host');
-    const charts = ent && ent.points.length >= 2
-      ? h('div', { class: 'host-charts' },
-          chartBlock('CPU', ent.points, (p) => p[1], fmtCpu, 'c-cpu'),
-          chartBlock('Memory used', ent.points, (p) => p[2], fmtBytes, 'c-mem'))
-      : h('p', { class: 'pop-hint' }, 'History charts appear after a couple of samples.');
+  function performanceModel(o = state.overview) {
+    const performance = state.metrics?.performance;
+    if (performance && Array.isArray(performance.segments)) {
+      return coherentPerformanceModel(performance);
+    }
+    if (!state.metrics) return null;
+    return legacyPerformanceModel(o);
+  }
 
-    return h('div', { class: 'host-panel' },
-      h('div', { class: 'host-head' },
-        h('strong', null, 'Machine'),
-        h('span', { class: 'meta-passive' }, 'everything below runs on this box')),
-      h('div', { class: 'host-tiles' }, ...tiles),
-      charts);
+  function performanceProjectCount(o = state.overview) {
+    if (!state.metrics) return null;
+    return performanceModel(o)?.projects.length ?? 0;
+  }
+
+  function perfDownsample(samples, limit = 72) {
+    if (samples.length <= limit) return samples;
+    const selected = [];
+    for (let index = 0; index < limit; index += 1) {
+      const sourceIndex = Math.round(index * (samples.length - 1) / (limit - 1));
+      selected.push(samples[sourceIndex]);
+    }
+    return selected;
+  }
+
+  function perfSegmentValue(segment, metric, stack = true) {
+    if (metric === 'memory') {
+      return stack ? segment.memoryStack : segment.memoryObserved;
+    }
+    return stack ? segment.cpuStack : segment.cpuObserved;
+  }
+
+  function perfSegmentPeak(model, segment, metric) {
+    if (segment.project) {
+      return metric === 'memory' ? segment.memoryPeak : segment.cpuPeak;
+    }
+    const values = model.samples.map((sample) => {
+      const value = sample[metric].values.get(segment.key);
+      return segment.additive === false ? value?.observedValue || 0 : value?.value || 0;
+    });
+    return Math.max(perfSegmentValue(segment, metric, segment.additive !== false), ...values);
+  }
+
+  function perfMetricText(metric, value) {
+    return metric === 'memory' ? fmtBytes(value || 0) : perfPercent(value || 0);
+  }
+
+  function performanceStackedChart(model, metric, id) {
+    const width = 1000;
+    const height = 220;
+    const samples = perfDownsample(model.samples);
+    const segments = model.segments.filter((segment) => segment.additive !== false
+      && (metric === 'memory' || segment.kind !== 'available'));
+    const svg = svgEl('svg', {
+      id,
+      class: 'perf-stacked-chart',
+      viewBox: '0 0 ' + width + ' ' + height,
+      preserveAspectRatio: 'none',
+      role: 'img',
+      'data-performance-metric': metric,
+    });
+    const title = svgEl('title');
+    title.textContent = metric === 'memory'
+      ? 'Whole-host memory composition for the last 60 minutes'
+      : 'Whole-host CPU composition normalized to host capacity for the last 60 minutes';
+    const description = svgEl('desc');
+    description.textContent = metric === 'memory'
+      ? 'Each bar adds disjoint project, Coordinator, test, developer-session, residual, and available host categories exactly once. Focusing a non-additive drilldown draws only its exact observed history as a temporary overlay.'
+      : 'Each bar adds disjoint measured or residual host work against one hundred percent of total host CPU capacity. Focusing a non-additive drilldown draws only its exact observed history as a temporary overlay.';
+    svg.append(title, description);
+    for (const ratio of [0, .25, .5, .75, 1]) {
+      const y = height - ratio * height;
+      svg.append(svgEl('line', {
+        class: 'perf-chart-grid', x1: 0, y1: y, x2: width, y2: y,
+      }));
+    }
+    const drilldownLayer = svgEl('g', {
+      class: 'perf-drilldown-layer',
+      'aria-hidden': 'true',
+      'data-performance-drilldown-layer': metric,
+    });
+    if (!samples.length) {
+      svg.append(drilldownLayer);
+      return svg;
+    }
+    const slot = width / samples.length;
+    const barWidth = Math.max(1.4, slot - Math.min(4, slot * .28));
+    samples.forEach((sample, index) => {
+      const total = Math.max(1, Number(sample[metric].total) || (metric === 'cpu' ? 100 : 1));
+      let stack = 0;
+      for (const segment of segments) {
+        const raw = Math.max(0, sample[metric].values.get(segment.key)?.value || 0);
+        const value = Math.min(raw, Math.max(0, total - stack));
+        if (value <= 0) continue;
+        const rectHeight = value / total * height;
+        const rect = svgEl('rect', {
+          class: 'perf-stack-segment perf-stack-' + segment.kind,
+          x: (index * slot + (slot - barWidth) / 2).toFixed(2),
+          y: (height - (stack + value) / total * height).toFixed(2),
+          width: barWidth.toFixed(2),
+          height: Math.max(.7, rectHeight).toFixed(2),
+          'data-performance-segment': segment.key,
+          'data-performance-series-role': 'stack',
+          'data-performance-value': String(value),
+          'data-performance-total': String(total),
+          'data-performance-sampled-at': String(sample.at),
+          'data-performance-key': segment.project ? segment.key : null,
+        });
+        rect.style.fill = segment.color;
+        svg.append(rect);
+        stack += value;
+      }
+    });
+    svg.append(drilldownLayer);
+    return svg;
+  }
+
+  function renderPerformanceDrilldownOverlay(chart, model, metric, key) {
+    const layer = chart?.querySelector('[data-performance-drilldown-layer]');
+    if (!layer) return false;
+    layer.replaceChildren();
+    const segment = model?.segments?.find((candidate) => (
+      candidate.key === key && candidate.additive === false
+    ));
+    if (!segment) return false;
+    const samples = Array.isArray(model.samples) ? model.samples : [];
+    if (!samples.length) return false;
+    const width = 1000;
+    const height = 220;
+    const slot = width / samples.length;
+    const barWidth = Math.max(.8, slot - Math.min(1.2, slot * .18));
+    let rendered = 0;
+    samples.forEach((sample, index) => {
+      const total = Math.max(1, Number(sample?.[metric]?.total)
+        || (metric === 'cpu' ? 100 : 1));
+      const observed = Math.max(0,
+        Number(sample?.[metric]?.values?.get(key)?.observedValue) || 0);
+      if (observed <= 0) return;
+      const visibleValue = Math.min(observed, total);
+      const rectHeight = visibleValue / total * height;
+      if (rectHeight <= 0) return;
+      const rect = svgEl('rect', {
+        class: 'perf-drilldown-segment',
+        x: (index * slot + (slot - barWidth) / 2).toFixed(4),
+        y: (height - rectHeight).toFixed(4),
+        width: barWidth.toFixed(4),
+        height: rectHeight.toFixed(4),
+        'data-performance-segment': segment.key,
+        'data-performance-series-role': 'drilldown',
+        'data-performance-value': String(observed),
+        'data-performance-visible-value': String(visibleValue),
+        'data-performance-total': String(total),
+        'data-performance-sampled-at': String(sample.at),
+      });
+      rect.style.fill = segment.color;
+      rect.style.stroke = segment.color;
+      layer.append(rect);
+      rendered += 1;
+    });
+    return rendered > 0;
+  }
+
+  function performanceSampleTable(model, metric) {
+    const segments = model.segments.filter((segment) => segment.additive !== false
+      && (metric === 'memory' || segment.kind !== 'available'));
+    const table = h('table', { class: 'perf-chart-data-table' },
+      h('caption', { class: 'visually-hidden' },
+        'Exact ' + metric + ' values for every retained performance sample'),
+      h('thead', null,
+        h('tr', null,
+          h('th', { scope: 'col' }, 'Sample time'),
+          segments.map((segment) =>
+            h('th', { scope: 'col' }, segment.name)),
+          h('th', { scope: 'col' }, 'Host used'),
+          h('th', { scope: 'col' }, metric === 'memory' ? 'Host total' : 'Host capacity'))),
+      h('tbody', null, model.samples.map((sample) => {
+        const date = new Date(sample.at);
+        const validTime = Number.isFinite(date.getTime());
+        const exactTime = validTime ? date.toISOString() : String(sample.at);
+        const localTime = validTime ? date.toLocaleString([], {
+          year: 'numeric',
+          month: 'short',
+          day: '2-digit',
+          hour: '2-digit',
+          minute: '2-digit',
+          second: '2-digit',
+          fractionalSecondDigits: 3,
+          timeZoneName: 'short',
+        }) : 'Unavailable';
+        return h('tr', {
+          'data-performance-sample': String(sample.at),
+          'data-performance-exact': String(sample.exact === true),
+        },
+          h('th', { scope: 'row' },
+            h('time', { datetime: exactTime }, localTime)),
+          segments.map((segment) => h('td', {
+            class: 'mono',
+            'data-performance-table-segment': segment.key,
+          }, perfMetricText(metric, sample[metric].values.get(segment.key)?.value || 0))),
+          h('td', { class: 'mono' }, perfMetricText(metric, sample[metric].used)),
+          h('td', { class: 'mono' }, perfMetricText(metric, sample[metric].total)));
+      })));
+    return table;
+  }
+
+  function performanceSampleDisclosure(model, metric) {
+    const summaryText = metric === 'memory'
+      ? 'Exact memory sample data'
+      : 'Exact CPU sample data';
+    const regionLabel = metric === 'memory'
+      ? 'Exact memory sample values'
+      : 'Exact CPU sample values';
+    const disclosureKey = 'performance-' + metric + '-sample-data';
+    const scroll = h('div', {
+      class: 'perf-chart-data-scroll',
+      role: 'region',
+      tabindex: '0',
+      'aria-label': regionLabel,
+    });
+    let populated = false;
+    const details = h('details', {
+      class: 'perf-chart-data',
+      'data-performance-data-table': metric,
+      'data-section-disclosure': disclosureKey,
+    },
+      h('summary', null, summaryText),
+      scroll);
+    details.addEventListener('toggle', () => {
+      if (!details.open || populated) return;
+      scroll.replaceChildren(performanceSampleTable(model, metric));
+      populated = true;
+    });
+    if (ui.sectionDisclosures.get('perf-body\u0000' + disclosureKey) === true) {
+      scroll.replaceChildren(performanceSampleTable(model, metric));
+      populated = true;
+    }
+    return details;
+  }
+
+  function performanceLegendRow(model, segment, metric) {
+    const current = perfSegmentValue(segment, metric, segment.additive !== false);
+    const peak = perfSegmentPeak(model, segment, metric);
+    const actionable = segment.project || segment.kind === 'agent-browsers';
+    const emphasisKey = segment.key;
+    const common = [
+      h('span', { class: 'perf-legend-swatch', 'aria-hidden': 'true' }),
+      h('span', { class: 'perf-legend-name', title: segment.name }, segment.name),
+      h('span', { class: 'perf-legend-value mono' }, perfMetricText(metric, current)),
+      h('span', { class: 'perf-legend-value mono perf-legend-peak' },
+        h('span', { class: 'perf-legend-mobile-label' }, 'Peak '),
+        perfMetricText(metric, peak)),
+    ];
+    common[0].style.backgroundColor = segment.color;
+    const attrs = {
+      class: (actionable ? 'perf-legend-button' : 'perf-legend-item')
+        + (segment.exact ? '' : ' is-estimated')
+        + (segment.fresh === false ? ' is-stale' : '')
+        + (segment.additive === false ? ' is-nonadditive' : ''),
+      'data-performance-segment': segment.key,
+      'data-performance-kind': segment.kind,
+      'data-performance-additive': String(segment.additive !== false),
+    };
+    if (!actionable) return h('div', attrs, common);
+    return h('button', {
+      ...attrs,
+      type: 'button',
+      'data-performance-key': segment.key,
+      'data-performance-emphasis-key': emphasisKey,
+      'data-performance-metric': metric,
+      'data-fk': 'performance:' + metric + ':' + segment.key,
+      'aria-haspopup': 'dialog',
+      'aria-controls': 'perf-project-dialog',
+      'aria-label': segment.name + ', current ' + perfMetricText(metric, current)
+        + ', peak ' + perfMetricText(metric, peak)
+        + (segment.additive === false ? '. Drilldown only; already represented in the host stack.' : '')
+        + '. Open performance details.',
+      onpointerenter: (event) => {
+        if (event.pointerType !== 'touch') {
+          setPerformanceSeriesEmphasis(model, metric, emphasisKey, 'hover', true);
+        }
+      },
+      onpointerleave: (event) => {
+        if (event.pointerType !== 'touch') {
+          setPerformanceSeriesEmphasis(model, metric, emphasisKey, 'hover', false);
+        }
+      },
+      onfocus: () => setPerformanceSeriesEmphasis(model, metric, emphasisKey, 'focus', true),
+      onblur: () => setPerformanceSeriesEmphasis(model, metric, emphasisKey, 'focus', false),
+      onclick: (event) => {
+        clearPerformanceSeriesEmphasis(model, metric);
+        openPerformanceProject(segment.key, event.currentTarget);
+      },
+    }, common);
+  }
+
+  const performanceSeriesEmphasis = new Map();
+
+  function renderPerformanceSeriesEmphasis(model, metric) {
+    const chart = document.getElementById('perf-' + metric + '-chart');
+    if (!chart) return;
+    const state = performanceSeriesEmphasis.get(metric);
+    const requestedKey = state?.hover || state?.focus || null;
+    const selected = model?.segments?.find((segment) => segment.key === requestedKey);
+    const drilldown = selected?.additive === false;
+    const hasDrilldownSeries = requestedKey && drilldown
+      ? renderPerformanceDrilldownOverlay(chart, model, metric, requestedKey)
+      : false;
+    if (!drilldown) {
+      chart.querySelector('[data-performance-drilldown-layer]')?.replaceChildren();
+    }
+    const key = drilldown && !hasDrilldownSeries ? null : requestedKey;
+    const segments = chart.querySelectorAll('[data-performance-segment]');
+    if (key) chart.dataset.highlightedSegment = key;
+    else delete chart.dataset.highlightedSegment;
+    for (const segment of segments) {
+      const matching = Boolean(key) && segment.dataset.performanceSegment === key;
+      segment.classList.toggle('is-series-highlighted', matching);
+      segment.classList.toggle('is-series-dimmed', Boolean(key) && !matching);
+    }
+  }
+
+  function setPerformanceSeriesEmphasis(model, metric, key, source, active) {
+    const emphasis = performanceSeriesEmphasis.get(metric) || { hover: null, focus: null };
+    if (active) emphasis[source] = key;
+    else if (emphasis[source] === key) emphasis[source] = null;
+    if (emphasis.hover || emphasis.focus) performanceSeriesEmphasis.set(metric, emphasis);
+    else performanceSeriesEmphasis.delete(metric);
+    renderPerformanceSeriesEmphasis(model, metric);
+  }
+
+  function clearPerformanceSeriesEmphasis(model, metric) {
+    performanceSeriesEmphasis.delete(metric);
+    renderPerformanceSeriesEmphasis(model, metric);
+  }
+
+  function performanceLegend(model, metric, id) {
+    const projects = model.segments.filter((segment) => segment.project);
+    const categories = model.segments.filter((segment) => !segment.project
+      && segment.additive !== false
+      && (metric === 'memory' || segment.kind !== 'available'));
+    const drilldowns = model.segments.filter((segment) => !segment.project
+      && segment.additive === false
+      && (segment.kind === 'agent-browsers' || segment.kind === 'control-other'));
+    const body = [
+      h('div', { class: 'perf-legend-columns', 'aria-hidden': 'true' },
+        h('span', null),
+        h('span', null),
+        h('span', null, 'Current'),
+        h('span', null, 'Peak (60 min)')),
+      h('p', { class: 'perf-legend-group' }, 'Host stack · disjoint categories'),
+    ];
+    if (categories.length) {
+      body.push(...categories.map((segment) => performanceLegendRow(model, segment, metric)));
+    }
+    if (projects.length) {
+      body.push(h('p', { class: 'perf-legend-group perf-legend-reconcile' },
+        'Repository drilldown · included in Project runtimes'));
+      body.push(...projects.map((segment) => performanceLegendRow(model, segment, metric)));
+    }
+    if (drilldowns.length) {
+      body.push(h('p', { class: 'perf-legend-group perf-legend-reconcile' },
+        'Measured drilldowns · included above'));
+      body.push(...drilldowns.map((segment) => performanceLegendRow(model, segment, metric)));
+    }
+    return h('div', {
+      id,
+      class: 'perf-legend',
+      'aria-label': (metric === 'memory' ? 'Memory' : 'CPU') + ' project and accounting legend',
+    }, body);
+  }
+
+  function perfAxisValue(metric, total, ratio) {
+    return metric === 'memory' ? fmtBytes(total * ratio) : perfPercent(total * ratio, 0);
+  }
+
+  function performanceCompositionPanel(model, metric) {
+    const memory = metric === 'memory';
+    const latest = model.samples.at(-1);
+    const total = latest?.[metric].total || (memory ? model.host.memoryTotal : 100);
+    const current = latest?.[metric].used || (memory ? model.host.memoryUsed : model.host.cpuUsed);
+    const peak = Math.max(current || 0, ...model.samples.map((sample) => sample[metric].used || 0));
+    const firstAt = model.samples[0]?.at;
+    const middleAt = model.samples[Math.floor(model.samples.length / 2)]?.at;
+    const lastAt = latest?.at;
+    const chartId = memory ? 'perf-memory-chart' : 'perf-cpu-chart';
+    const legendId = memory ? 'perf-legend' : 'perf-cpu-legend';
+    return h('section', {
+      id: memory ? 'perf-memory-panel' : 'perf-cpu-panel',
+      class: 'perf-composition-panel',
+      'aria-labelledby': (memory ? 'perf-memory-title' : 'perf-cpu-title'),
+    },
+      h('div', { class: 'perf-panel-head' },
+        h('div', null,
+          h('h3', { id: memory ? 'perf-memory-title' : 'perf-cpu-title' },
+            memory
+              ? 'Memory composition — Host used (not immediately available)'
+              : 'CPU load — normalized to host capacity'),
+          h('p', null, memory
+            ? 'Disjoint host workload roots + estimated residual + available = host total.'
+            : 'Disjoint workload CPU is normalized to host capacity; unused capacity remains visible as headroom.')),
+        h('div', { class: 'perf-panel-totals' },
+          h('span', null, 'Current ', h('strong', { class: 'mono' }, perfMetricText(metric, current))),
+          h('span', null, 'Peak ', h('strong', { class: 'mono' }, perfMetricText(metric, peak))))),
+      h('div', { class: 'perf-panel-body' },
+        h('div', { class: 'perf-chart-region' },
+          h('div', { class: 'perf-chart-y', 'aria-hidden': 'true' },
+            h('span', null, perfAxisValue(metric, total, 1)),
+            h('span', null, perfAxisValue(metric, total, .75)),
+            h('span', null, perfAxisValue(metric, total, .5)),
+            h('span', null, perfAxisValue(metric, total, .25)),
+            h('span', null, perfAxisValue(metric, total, 0))),
+          h('div', { class: 'perf-chart-column' },
+            performanceStackedChart(model, metric, chartId),
+            h('div', { class: 'perf-chart-x', 'aria-hidden': 'true' },
+              h('span', null, perfLocalTime(firstAt)),
+              h('span', null, perfLocalTime(middleAt)),
+              h('span', null, perfLocalTime(lastAt))),
+            performanceSampleDisclosure(model, metric))),
+        performanceLegend(model, metric, legendId)),
+      memory ? performanceResidualDiagnostics(model) : null);
+  }
+
+  function perfSummaryTile(label, value, ...sub) {
+    return h('div', { class: 'perf-summary-tile' },
+      h('dt', null, label),
+      h('dd', null,
+        h('strong', { class: 'mono' }, value),
+        sub.filter(Boolean).map((line) => h('span', null, line))));
+  }
+
+  function performanceSummary(model) {
+    const host = model.host;
+    const cpuCores = host.cpuUsed / 100 * host.cores;
+    const load = host.load.map((value) => Number(value).toFixed(2)).join(' · ');
+    const disk = host.disks[0] || null;
+    const diskUsed = Math.max(0, perfFinite(disk?.usedBytes) || 0);
+    const diskTotal = Math.max(0, perfFinite(disk?.totalBytes) || 0);
+    const memoryCoverage = model.coverage.memory;
+    const cpuCoverage = model.coverage.cpu;
+    const sampled = model.sampledAt ? timeAgo(model.sampledAt) : 'sample unavailable';
+    return h('dl', { id: 'perf-summary', class: 'perf-summary' },
+      perfSummaryTile('CPU', perfPercent(host.cpuUsed, 0),
+        cpuCores.toFixed(1) + ' of ' + host.cores + ' cores',
+        load ? 'Load ' + load : null),
+      perfSummaryTile('Memory', fmtBytes(host.memoryUsed),
+        'Host used · not immediately available',
+        fmtBytes(host.memoryAvailable) + ' available of ' + fmtBytes(host.memoryTotal)),
+      perfSummaryTile('Storage', disk
+        ? fmtBytes(diskUsed) + ' / ' + fmtBytes(diskTotal) : 'Unavailable',
+        disk ? (disk.mount || '/') + ' · ' + perfPercent(diskTotal ? diskUsed / diskTotal * 100 : 0, 0) + ' used' : null),
+      perfSummaryTile('Uptime', host.uptimeSec === null ? 'Unavailable' : fmtUptime(host.uptimeSec),
+        host.uptimeSec === null ? null : 'since last boot'),
+      perfSummaryTile('Accounting coverage',
+        memoryCoverage === null ? 'Unavailable' : perfPercent(memoryCoverage, 0) + ' memory',
+        cpuCoverage === null ? null : perfPercent(cpuCoverage, 0) + ' CPU',
+        'Attributed working set'),
+      perfSummaryTile('Sample skew', perfSkewText(model.sampleSkewMs),
+        sampled === 'now' ? 'sampled now' : 'sampled ' + sampled));
+  }
+
+  function perfDiagnosticCgroupName(group) {
+    const role = String(group?.role || group?.key || '');
+    if (role === 'project-runtimes') return 'Project runtimes';
+    if (role === 'coordinator-control') return 'Coordinator control plane';
+    if (role === 'coordinator-background') return 'Coordinator background / scheduler';
+    if (role === 'active-test-attempts') return 'Active test attempts';
+    if (role === 'developer-sessions') return 'Developer-account sessions';
+    if (role === 'system-services') return 'System services';
+    return group?.label || role || 'Host cgroup';
+  }
+
+  function perfDiagnosticValues(group) {
+    const values = [
+      ['Working', perfFinite(group?.workingBytes, group?.working_bytes), 'memory'],
+      ['Current', perfFinite(group?.workingBytes, group?.working_bytes) === null
+        ? perfFinite(group?.currentBytes, group?.current_bytes) : null, 'memory'],
+      ['Anonymous', perfFinite(group?.anonBytes, group?.anon_bytes), 'memory'],
+      ['Shared', perfFinite(group?.shmemBytes, group?.shmem_bytes), 'memory'],
+      ['Kernel', perfFinite(group?.kernelBytes, group?.kernel_bytes), 'memory'],
+      ['CPU', perfFinite(group?.cpuRawPercent, group?.cpu_raw_percent), 'cpu'],
+      ['Processes', perfFinite(group?.processCount, group?.process_count), 'count'],
+    ].filter((entry) => entry[1] !== null);
+    return h('span', { class: 'perf-residual-diagnostic-values' }, values.map(([label, value, kind]) =>
+      h('span', null,
+        h('small', null, label),
+        h('strong', { class: 'mono' }, kind === 'memory' ? fmtBytes(value)
+          : kind === 'cpu' ? perfPercent(value) + ' raw' : String(Math.round(value))))));
+  }
+
+  function perfDiagnosticChild(child) {
+    const active = Math.max(0, perfFinite(child?.activeChildCount, child?.active_child_count) || 0);
+    const detail = child?.accountUid !== null && child?.accountUid !== undefined
+      ? (active ? active + ' active session' + (active === 1 ? '' : 's') : 'account session tree')
+      : (child?.populated === true ? 'active' : 'idle');
+    return h('div', {
+      class: 'perf-residual-child',
+      'data-performance-diagnostic-child': String(child?.key || 'child'),
+    },
+      h('span', { class: 'perf-residual-child-name' },
+        h('strong', null, child?.accountName || child?.label || 'Workload'),
+        h('span', null, detail)),
+      perfDiagnosticValues(child));
+  }
+
+  function performanceCgroupDiagnostic(group, crosscheck) {
+    const role = String(group?.role || group?.key || 'unknown');
+    const children = (Array.isArray(group?.children) ? group.children : []).slice(0, 12);
+    const active = Math.max(0, perfFinite(group?.activeChildCount, group?.active_child_count) || 0);
+    const relationship = group?.additive === true
+      ? 'In host stack'
+      : 'Drilldown only' + (group?.overlap ? ' · overlaps ' + group.overlap : '');
+    const heading = h('span', { class: 'perf-residual-diagnostic-head' },
+      h('span', { class: 'perf-residual-diagnostic-name' },
+        h('strong', null, perfDiagnosticCgroupName(group)),
+        h('span', { class: group?.additive === true ? 'is-additive' : 'is-overlap' }, relationship),
+        role === 'active-test-attempts' && active
+          ? h('span', { class: 'is-count' }, active + ' active') : null),
+      perfDiagnosticValues(group));
+    const crosscheckNode = role === 'project-runtimes' && crosscheck
+      ? h('p', { class: 'perf-residual-crosscheck' },
+          fmtBytes(perfFinite(crosscheck.repositoryMemoryBytes,
+            crosscheck.repository_memory_bytes) || 0)
+          + ' reported across ' + Math.max(0, perfFinite(crosscheck.repositoryCount,
+            crosscheck.repository_count) || 0)
+          + ' repositories · already included above'
+          + (perfFinite(crosscheck.differenceBytes, crosscheck.difference_bytes) === null
+            ? ' · cgroup comparison unavailable'
+            : ' · difference ' + fmtBytes(Math.abs(perfFinite(
+              crosscheck.differenceBytes, crosscheck.difference_bytes) || 0))))
+      : null;
+    const childrenNode = children.length
+      ? h('div', { class: 'perf-residual-children' }, children.map(perfDiagnosticChild),
+          group?.childrenTruncated === true
+            ? h('p', { class: 'perf-residual-truncated' }, 'Additional cgroups omitted from this bounded view.')
+            : null)
+      : h('p', { class: 'perf-residual-diagnostics-empty' },
+          group?.childrenAvailable === false
+            ? 'Child cgroups are unavailable for this sample.' : 'No active child cgroups.');
+    if (!children.length && !crosscheckNode) {
+      return h('div', {
+        class: 'perf-residual-diagnostic',
+        'data-performance-diagnostic': 'cgroup:' + role,
+      }, heading);
+    }
+    return h('details', {
+      class: 'perf-residual-diagnostic perf-residual-diagnostic-group',
+      'data-performance-diagnostic': 'cgroup:' + role,
+      'data-section-disclosure': 'performance-diagnostic:' + role,
+    }, h('summary', null, heading), crosscheckNode, childrenNode);
+  }
+
+  function performanceResidualDiagnostics(model) {
+    const diagnostics = model.diagnostics;
+    const cgroups = (Array.isArray(diagnostics?.cgroups) ? diagnostics.cgroups : [])
+      .filter((group) => group?.available !== false)
+      .slice()
+      .sort((left, right) => (perfFinite(right.workingBytes, right.working_bytes) || 0)
+        - (perfFinite(left.workingBytes, left.working_bytes) || 0));
+    const rows = cgroups.map((group) => performanceCgroupDiagnostic(
+      group,
+      diagnostics?.projectRuntimeCrosscheck || diagnostics?.project_runtime_crosscheck,
+    ));
+    const meminfo = diagnostics?.meminfo || null;
+    if (meminfo?.available !== false && meminfo) {
+      const meminfoRows = [
+        ['meminfo:shmem', 'Host shared memory (Shmem)',
+          perfFinite(meminfo.shmemBytes, meminfo.shmem_bytes)],
+        ['meminfo:anon', 'Host anonymous pages (AnonPages)',
+          perfFinite(meminfo.anonPagesBytes, meminfo.anon_pages_bytes)],
+        ['meminfo:sunreclaim', 'Host unreclaimable slab (SUnreclaim)',
+          perfFinite(meminfo.sUnreclaimBytes, meminfo.s_unreclaim_bytes)],
+        ['meminfo:slab', 'Host slab memory (Slab)',
+          perfFinite(meminfo.slabBytes, meminfo.slab_bytes)],
+        ['meminfo:pagetables', 'Host page tables (PageTables)',
+          perfFinite(meminfo.pageTablesBytes, meminfo.page_tables_bytes)],
+        ['meminfo:kernelstack', 'Host kernel stacks (KernelStack)',
+          perfFinite(meminfo.kernelStackBytes, meminfo.kernel_stack_bytes)],
+      ].filter((row) => row[2] !== null);
+      rows.push(h('details', {
+        class: 'perf-residual-diagnostic perf-residual-diagnostic-group',
+        'data-performance-diagnostic': 'meminfo',
+        'data-section-disclosure': 'performance-diagnostic:meminfo',
+      },
+      h('summary', null, h('span', { class: 'perf-residual-diagnostic-head' },
+        h('span', { class: 'perf-residual-diagnostic-name' },
+          h('strong', null, 'Host kernel & shared-memory counters'),
+          h('span', { class: 'is-overlap' }, 'Drilldown only · overlaps host used')))),
+      h('div', { class: 'perf-residual-children' }, meminfoRows.map(([key, label, value]) =>
+        h('div', {
+          class: 'perf-residual-child',
+          'data-performance-diagnostic-child': key,
+        },
+        h('span', { class: 'perf-residual-child-name' }, h('strong', null, label)),
+        h('span', { class: 'perf-residual-diagnostic-values' },
+          h('span', null, h('strong', { class: 'mono' }, fmtBytes(value || 0)))))))));
+    }
+    return h('details', {
+      id: 'perf-residual-diagnostics',
+      'data-section-disclosure': 'performance-residual-diagnostics',
+    },
+      h('summary', null, 'Host accounting detail'),
+      h('p', { class: 'perf-residual-diagnostics-note' },
+        'Stack categories are added once. Repository, child-cgroup and host-counter drilldowns overlap a parent total and add nothing. Working memory is memory.current minus inactive file; anonymous, shared and kernel are exact cgroup-v2 counters. PSS is not inferred.'),
+      rows.length
+        ? h('div', { class: 'perf-residual-diagnostics-list' }, rows)
+        : h('p', { class: 'perf-residual-diagnostics-empty' },
+            'No overlapping host diagnostics are available for this sample.'));
+  }
+
+  function performanceContributorList(project, metric) {
+    const sorted = project.contributors.slice().sort((left, right) =>
+      (metric === 'memory' ? right.memoryBytes - left.memoryBytes
+        : right.cpuPercent - left.cpuPercent)
+      || left.name.localeCompare(right.name)).slice(0, 3);
+    return h('section', { class: 'perf-contributor-group' },
+      h('h4', null, metric === 'memory' ? 'By memory' : 'By CPU'),
+      sorted.length
+        ? h('ol', null, sorted.map((contributor) =>
+            h('li', null,
+              h('span', { class: 'perf-contributor-name' },
+                h('strong', null, contributor.name),
+                h('span', { class: 'kind-tag ' + (contributor.kind === 'container' ? 'k-dock' : 'k-srv') },
+                  contributor.kind)),
+              h('span', { class: 'mono' }, metric === 'memory'
+                ? fmtBytes(contributor.memoryBytes)
+                : perfPercent(contributor.cpuPercent)
+                  + (contributor.cpuRawPercent
+                    ? ' (' + (contributor.cpuRawPercent / 100).toFixed(1) + ' cores)' : '')))))
+        : h('p', { class: 'perf-dialog-empty' }, 'No contributor breakdown is available for this sample.'));
+  }
+
+  function performanceProjectMetric(project, model, metric) {
+    const current = metric === 'memory' ? project.memoryObserved : project.cpuObserved;
+    const peak = metric === 'memory' ? project.memoryPeak : project.cpuPeak;
+    const currentExtra = metric === 'cpu'
+      ? (current / 100 * model.host.cores).toFixed(1) + ' cores'
+      : (project.kind === 'agent-browsers'
+          ? 'measured non-project working set' : 'attributed working set');
+    const peakExtra = metric === 'cpu'
+      ? (peak / 100 * model.host.cores).toFixed(1) + ' cores'
+      : 'last 60 minutes';
+    return h('section', { class: 'perf-dialog-metric' },
+      h('h3', null, metric === 'memory' ? 'Memory usage' : 'CPU load'),
+      h('dl', null,
+        h('div', null, h('dt', null, 'Current'),
+          h('dd', { class: 'mono ' + (metric === 'memory' ? 'u-mem' : 'u-cpu') },
+            perfMetricText(metric, current),
+            h('span', null, currentExtra))),
+        h('div', null, h('dt', null, 'Peak (60 min)'),
+          h('dd', { class: 'mono ' + (metric === 'memory' ? 'u-mem' : 'u-cpu') },
+            perfMetricText(metric, peak),
+            h('span', null, peakExtra)))));
+  }
+
+  function performanceAgentBrowserState(session, policy) {
+    const state = String(session.state || '').toLowerCase();
+    if (state.includes('protected')) return { label: 'Protected', tone: 'is-protected' };
+    if (session.reapEligible) return { label: 'Cleanup eligible', tone: 'is-eligible' };
+    if (state.includes('idle') || session.idleSeconds >= policy.idleTimeoutSeconds) {
+      return { label: 'Idle', tone: 'is-idle' };
+    }
+    return { label: state === 'unknown' ? 'Observed' : session.state, tone: 'is-active' };
+  }
+
+  function performanceAgentBrowserDetail(segment) {
+    const browser = segment.agentBrowsers;
+    if (!browser) {
+      return h('p', { class: 'perf-dialog-empty' },
+        'Session-level browser telemetry is unavailable for this sample.');
+    }
+    const totals = browser.totals;
+    const sessions = browser.sessions.slice().sort((left, right) =>
+      right.memoryBytes - left.memoryBytes
+      || right.cpuPercent - left.cpuPercent
+      || left.sessionId.localeCompare(right.sessionId));
+    const visibleSessions = sessions.slice(0, 8);
+    const recentReaps = browser.recentReaps.slice(0, 4);
+    const sessionRows = visibleSessions.map((session) => {
+      const state = performanceAgentBrowserState(session, browser.policy);
+      const identity = [session.agent, session.repositoryName].filter(Boolean).join(' · ')
+        || 'Agent browser session';
+      const lastWork = session.lastObservedWorkAt;
+      return h('li', { class: 'perf-agent-session' },
+        h('div', { class: 'perf-agent-session-head' },
+          h('strong', { title: identity }, identity),
+          h('span', { class: 'perf-agent-state ' + state.tone }, state.label)),
+        h('dl', { class: 'perf-agent-session-stats' },
+          h('div', null, h('dt', null, 'Memory'),
+            h('dd', { class: 'mono u-mem' }, fmtBytes(session.memoryBytes))),
+          h('div', null, h('dt', null, 'CPU'),
+            h('dd', { class: 'mono u-cpu' }, perfPercent(session.cpuPercent) + ' raw')),
+          h('div', null, h('dt', null, 'Processes'),
+            h('dd', { class: 'mono' }, String(session.processCount))),
+          h('div', null, h('dt', null, 'Idle'),
+            h('dd', { class: 'mono' }, fmtSeconds(session.idleSeconds))),
+          h('div', { class: 'perf-agent-last-work' }, h('dt', null, 'Last observed work'),
+            h('dd', null, lastWork
+              ? h('time', { datetime: new Date(lastWork).toISOString(), title: fmtWhen(lastWork) },
+                  timeAgo(lastWork))
+              : 'Unavailable'))));
+    });
+    const cleanupRows = recentReaps.map((reap) => {
+      const identity = [reap.agent, reap.repositoryName].filter(Boolean).join(' · ')
+        || 'Agent browser session';
+      return h('li', null,
+        h('span', null, h('strong', null, identity),
+          reap.reason ? h('small', null, reap.reason) : null),
+        h('span', { class: 'mono' }, fmtBytes(reap.reclaimedMemoryBytes)
+          + (reap.reapedAt ? ' · ' + timeAgo(reap.reapedAt) : '')));
+    });
+    return h('div', { class: 'perf-agent-browser-detail' },
+      h('section', { class: 'perf-agent-summary', 'aria-labelledby': 'perf-agent-summary-title' },
+        h('h3', { id: 'perf-agent-summary-title' }, 'Worker sessions'),
+        h('dl', null,
+          h('div', null, h('dt', null, 'Sessions'), h('dd', { class: 'mono' }, String(totals.sessionCount))),
+          h('div', null, h('dt', null, 'Processes'), h('dd', { class: 'mono' }, String(totals.processCount))),
+          h('div', null, h('dt', null, 'Idle'), h('dd', { class: 'mono' }, String(totals.idleSessionCount))),
+          h('div', null, h('dt', null, 'Protected'), h('dd', { class: 'mono' }, String(totals.protectedSessionCount)))),
+        h('p', null, 'Idle cleanup after ' + fmtSeconds(browser.policy.idleTimeoutSeconds)
+          + ' · ' + fmtSeconds(browser.policy.terminationGraceSeconds) + ' grace')),
+      h('section', { class: 'perf-agent-sessions', 'aria-labelledby': 'perf-agent-sessions-title' },
+        h('div', { class: 'perf-agent-section-head' },
+          h('h3', { id: 'perf-agent-sessions-title' }, 'Current sessions'),
+          sessions.length > visibleSessions.length
+            ? h('span', null, 'Showing ' + visibleSessions.length + ' of ' + sessions.length)
+            : null),
+        sessionRows.length
+          ? h('ol', null, sessionRows)
+          : h('p', { class: 'perf-dialog-empty' }, 'No non-project browser sessions are active.')),
+      h('section', { class: 'perf-agent-cleanup', 'aria-labelledby': 'perf-agent-cleanup-title' },
+        h('div', { class: 'perf-agent-section-head' },
+          h('h3', { id: 'perf-agent-cleanup-title' }, 'Recent cleanup'),
+          h('span', null, totals.reapedTotal + ' reaped · '
+            + fmtBytes(totals.reclaimedMemoryBytes) + ' reclaimed')),
+        cleanupRows.length ? h('ol', null, cleanupRows)
+          : h('p', { class: 'perf-dialog-empty' }, 'No recent browser cleanup events.')));
+  }
+
+  function renderPerformanceProjectDialog() {
+    const dialog = $('#perf-project-dialog');
+    if (!dialog || !ui.performanceProjectKey) return;
+    const model = performanceModel();
+    const latest = model?.segments.find((segment) =>
+      segment.key === ui.performanceProjectKey) || null;
+    if (latest) ui.performanceProjectRecord = latest;
+    const project = latest || ui.performanceProjectRecord;
+    const inCurrentComposition = Boolean(latest && latest.active !== false);
+    if (!project || !model) return;
+    const body = $('#perf-project-dialog-body');
+    const priorScroll = body.scrollTop;
+    $('#perf-project-dialog-title').textContent = project.name;
+    const history = Array.isArray(project.history) ? project.history : [];
+    const historyPoints = history.map((point) => [point.at, point.cpu, point.memory]);
+    const sampledAt = project.sampledAt || model.sampledAt;
+    $('#perf-project-dialog-subtitle').textContent = (project.kind === 'agent-browsers'
+      ? 'Measured non-project browser workers · ' : 'History for the last 60 minutes · ')
+      + history.length + ' sample' + (history.length === 1 ? '' : 's')
+      + (sampledAt ? ' · sampled ' + timeAgo(sampledAt) : '');
+    const content = [
+      inCurrentComposition ? null : h('p', { class: 'perf-dialog-retained' },
+        'This item is absent from the newest composition. Showing its retained history and last available detail.'),
+      h('div', { class: 'perf-dialog-metrics' },
+        performanceProjectMetric(project, model, 'cpu'),
+        performanceProjectMetric(project, model, 'memory')),
+      h('section', { class: 'perf-dialog-history', 'aria-label': 'Performance history' },
+        chartBlock('CPU history', historyPoints, (point) => point[1], fmtCpu, 'c-cpu'),
+        chartBlock('Memory history', historyPoints, (point) => point[2], fmtBytes, 'c-mem')),
+      project.kind === 'agent-browsers' ? performanceAgentBrowserDetail(project)
+        : h('section', { class: 'perf-dialog-contributors' },
+        h('h3', null, 'Top contributors'),
+        h('div', null,
+          performanceContributorList(project, 'cpu'),
+          performanceContributorList(project, 'memory'))),
+    ].filter(Boolean);
+    body.replaceChildren(...content);
+    body.scrollTop = priorScroll;
+  }
+
+  function openPerformanceProject(key, trigger) {
+    const model = performanceModel();
+    const project = model?.segments.find((candidate) => (
+      candidate.key === String(key)
+      && (candidate.project || candidate.kind === 'agent-browsers')
+    ));
+    if (!project) return;
+    ui.performanceProjectKey = project.key;
+    ui.performanceProjectRecord = project;
+    ui.performanceReturnFocus = trigger || document.activeElement;
+    ui.performanceReturnFocusMetric = trigger?.dataset.performanceMetric || 'memory';
+    renderPerformanceProjectDialog();
+    const dialog = $('#perf-project-dialog');
+    if (!dialog.open) dialog.showModal();
+    requestAnimationFrame(() => $('#perf-project-dialog-close')?.focus({ preventScroll: true }));
+  }
+
+  function closePerformanceProject({ restoreFocus = true } = {}) {
+    const dialog = $('#perf-project-dialog');
+    const key = ui.performanceProjectKey;
+    const metric = ui.performanceReturnFocusMetric;
+    const original = ui.performanceReturnFocus;
+    if (dialog?.open) dialog.close();
+    ui.performanceProjectKey = null;
+    ui.performanceProjectRecord = null;
+    ui.performanceReturnFocus = null;
+    ui.performanceReturnFocusMetric = null;
+    if (!restoreFocus) return;
+    // Escape dispatches the dialog cancel event while the browser is still
+    // completing its own modal-focus steps. Resolve the current keyed control
+    // on the next frame, so both an unchanged render and a refresh-replaced
+    // legend return focus to the same logical item without a delayed retry
+    // stealing focus after the user has already moved on.
+    const restore = () => {
+      if (dialog?.open || ui.performanceProjectKey !== null) return;
+      const buttons = [...document.querySelectorAll('.perf-legend-button')];
+      const current = key
+        ? buttons.find((button) => button.dataset.performanceKey === key
+          && button.dataset.performanceMetric === metric)
+          || buttons.find((button) => button.dataset.performanceKey === key)
+        : null;
+      const target = current || (original?.isConnected ? original : null);
+      target?.focus({ preventScroll: true });
+    };
+    requestAnimationFrame(restore);
   }
 
   function buildPerf(o) {
-    const m = state.metrics;
-    if (!m) {
-      return [emptyState('Collecting metrics — charts appear after the first samples.')];
+    // Section replacement can remove a hovered legend row without dispatching
+    // pointerleave. Drop transient DOM state before rebuilding; setSection's
+    // focus restoration will reapply the surviving keyboard focus explicitly.
+    performanceSeriesEmphasis.clear();
+    const model = performanceModel(o);
+    if (!model) {
+      return [emptyState('Collecting metrics — the whole-host composition appears after the first coherent sample.')];
     }
-    const out = [];
-    if (m.sampler?.lastError) {
-      out.push(h('p', { class: 'inline-note warn-note' },
-        `Sampling is failing right now (${m.sampler.lastError}) — charts show the last collected history.`));
-    }
-
-    const hp = hostPanel();
-    if (hp) out.push(hp);
-
-    // Live inventory tells us which charted entities are still running.
-    const running = new Set();
-    for (const s of o?.inventory?.servers || []) {
-      if (s.process_usage) running.add(`srv:${s.id}`);
-    }
-    if (o?.inventory?.docker?.available) {
-      for (const c of o.inventory.docker.containers || []) {
-        if (isContainerRunning(c)) running.add(`dock:${c.name}`);
-      }
-    }
-
-    const entities = (m.entities || []).filter((e) => e.kind === 'server' || e.kind === 'docker');
-    if (entities.length) {
-      out.push(h('p', { class: 'perf-sec-title' }, 'Servers & containers'));
-    }
-    if (!entities.length) {
-      out.push(emptyState('Nothing to chart yet — start a dev server or container and its CPU/memory history appears here.'));
-      return out;
-    }
-    // Same stable-ordering contract as the list pages: running cards first,
-    // then name/key — never current load, which changes every sample.
-    entities.sort((a, b) => (running.has(b.key) ? 1 : 0) - (running.has(a.key) ? 1 : 0)
-      || String(a.name).localeCompare(String(b.name))
-      || String(a.key).localeCompare(String(b.key)));
-    out.push(h('div', { class: 'perf-grid' }, entities.map((e) => perfCard(e, running.has(e.key)))));
-    return out;
-  }
-
-  function perfCard(e, isRunning) {
-    const points = e.points || [];
-    return h('div', { class: `perf-card${isRunning ? '' : ' stale'}` },
-      h('div', { class: 'perf-head' },
-        h('span', { class: `kind-tag ${e.kind === 'docker' ? 'k-dock' : 'k-srv'}` },
-          e.kind === 'docker' ? 'container' : 'server'),
-        h('strong', { class: 'perf-name', title: e.project || '' }, e.name || e.key),
-        h('span', { class: 'dim' }, projectTail(e.project)),
-        isRunning ? null : h('span', { class: 'meta-passive' }, 'not running — recent history')),
-      chartBlock('CPU', points, (p) => p[1], fmtCpu, 'c-cpu'),
-      chartBlock('Memory', points, (p) => p[2], fmtBytes, 'c-mem'));
+    const retained = state.metrics?.sampler?.lastError
+      ? h('p', { class: 'perf-retained-warning' },
+          'Latest sampling failed — showing retained performance history. '
+          + String(state.metrics.sampler.lastError))
+      : null;
+    const footerAt = model.sampledAt ? new Date(model.sampledAt).toLocaleString() : 'unavailable';
+    return [h('div', { class: 'performance-dashboard' },
+      retained,
+      performanceSummary(model),
+      performanceCompositionPanel(model, 'memory'),
+      performanceCompositionPanel(model, 'cpu'),
+      h('p', { class: 'perf-footnote' },
+        'Last coherent sample ' + footerAt + ' local · '
+        + model.samples.length + ' retained sample' + (model.samples.length === 1 ? '' : 's')
+        + ' · CPU normalized to ' + model.host.cores + ' logical cores.'))];
   }
 
   // ---------------------------------------------------------------- timers
@@ -6324,20 +10849,28 @@
         if (currentPage() === 'telegram' && state.session?.email) {
           loadTelegram({ force: true });
         }
+        loadBugs({ force: true });
       }
     }, POLL_MS);
     setInterval(() => {
       if (!document.hidden) refreshMetrics();
     }, METRICS_POLL_MS);
+    setInterval(refreshTestsInPlace, TESTS_POLL_MS);
+    window.addEventListener('focus', refreshTestsInPlace);
+    window.addEventListener('online', refreshTestsInPlace);
+    window.addEventListener('focus', () => loadBugs({ force: true }));
+    window.addEventListener('online', () => loadBugs({ force: true }));
     document.addEventListener('visibilitychange', () => {
       if (!document.hidden) {
         refreshOverview();
         refreshMetrics();
+        refreshTestsInPlace();
         // Pick up hides made on another device while this tab slept.
         loadPrefs();
         if (state.session?.accessAdmin === true) loadAccess({ force: true });
         if (state.session?.accessAdmin === true) loadInvites({ force: true });
         if (state.session?.email) loadTelegram({ force: true });
+        loadBugs({ force: true });
         if (lifecycleAvailable()) loadArchives({ force: true });
       }
     });
@@ -6376,6 +10909,7 @@
         state.session = s;
         syncAccessVisibility();
         renderHeader();
+        if (currentPage() === 'bugs') renderBugs(true);
         if (s.accessAdmin === true) {
           loadAccess();
           loadInvites();
@@ -6391,6 +10925,7 @@
             state.session = s;
             syncAccessVisibility();
             renderHeader();
+            if (currentPage() === 'bugs') renderBugs(true);
             if (s.accessAdmin === true) {
               loadAccess();
               loadInvites();
@@ -6403,11 +10938,12 @@
         }
       });
 
+    const initialBugs = loadBugs();
     const initialOverview = refreshOverview({ force: true });
     const initialMetrics = refreshMetrics();
     startPolling();
     startCountdowns();
-    await Promise.allSettled([initialOverview, initialMetrics]);
+    await Promise.allSettled([initialBugs, initialOverview, initialMetrics]);
   }
 
   boot();

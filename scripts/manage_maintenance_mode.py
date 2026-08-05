@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime, timezone
-import grp
 import json
 import os
 from pathlib import Path
@@ -26,11 +25,15 @@ from devcoordinator.maintenance import (  # noqa: E402
 )
 
 
-ACCESS_GROUP = "devcoordinator-clients"
 def _identity() -> tuple[int, int]:
     if os.geteuid() != 0:
         raise PermissionError("maintenance mode requires root")
-    return 0, grp.getgrnam(ACCESS_GROUP).gr_gid
+    # The maintenance marker is non-secret, root-owned control-plane state.
+    # Clean adoption deliberately removed the legacy shared-client group and
+    # normalizes the canonical runtime directory to root:root.  Keep the
+    # packaged CLI on that same identity instead of depending on an obsolete
+    # system group that trusted local accounts no longer need.
+    return 0, 0
 
 
 def _document(state: object | None, *, changed: bool) -> dict[str, object]:

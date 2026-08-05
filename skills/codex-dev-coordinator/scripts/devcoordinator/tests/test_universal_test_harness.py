@@ -12,6 +12,7 @@ import uuid
 from devcoordinator.broker import (
     AuthorizedBrokerRequest,
     BrokerBackendError,
+    BrokerError,
     BrokerOperation,
     BrokerRequest,
     PeerCredentials,
@@ -19,13 +20,115 @@ from devcoordinator.broker import (
 from devcoordinator.broker_backend import StoreBackedMutationBackend
 from devcoordinator.broker_persistence import BrokerPersistence
 from devcoordinator.store import CoordinatorStore
+from devcoordinator.schema import establish_repository_owner_authority
 from devcoordinator.test_records import CoordinatorTestRecords
 from devcoordinator.test_runner import TestHarnessError, load_manifest
+from devcoordinator.universal_test_contract import SourceMode, parse_test_manifest
+from devcoordinator.universal_test_capabilities import (
+    RepositoryTestCapabilities,
+    SealedTestCapabilityRegistry,
+)
+from devcoordinator.universal_test_planner import SourceIdentity, create_test_plan
+from devcoordinator.universal_test_snapshot_service import SnapshotAuthority
+from devcoordinator.universal_test_store import TestStoreContractError
+from devcoordinator.universal_test_transport import TestPlaneTransportError
+from devcoordinator.tests.test_universal_test_plane import (
+    manifest_document as universal_manifest_document,
+)
 
 UTC = timezone.utc
 
 
+class PreviewTestPlane:
+    def __init__(self, selected_plan) -> None:
+        self.selected_plan = selected_plan
+        self.registered: list[dict[str, object]] = []
+        self.preview_calls: list[dict[str, object]] = []
+        self.preview_error: Exception | None = None
+
+    def health(self):
+        return {
+            "schema_version": 1,
+            "status": "ok",
+            "test_store_schema_version": 5,
+            "store_generation": "generation-tests",
+        }
+
+    def preview(self, **values):
+        self.preview_calls.append(dict(values))
+        if self.preview_error is not None:
+            raise self.preview_error
+        resources = {
+            target: {
+                "cpu_millis": 1000,
+                "memory_mib": 512,
+                "pids": 128,
+                "estimated_seconds": 60.0,
+                "shard_count": 1,
+                "max_attempts": 2,
+                "worktree_key": f"/var/lib/devcoordinator-test-snapshots/{self.selected_plan.source.snapshot_id}/root",
+                "exclusive_resources": [],
+            }
+            for target in self.selected_plan.selected_targets
+        }
+        return {
+            "schema_version": 1,
+            "repository_id": self.selected_plan.repository_id,
+            "intent": self.selected_plan.intent,
+            "plan": self.selected_plan.to_document(),
+            "registered": False,
+            "target_resources": resources,
+            "capability_requests": {
+                "networks": ["none"],
+                "fixtures": [],
+                "credentials": [],
+            },
+        }
+
+    def register_plan(self, plan_document, *, target_resources=None):
+        document = dict(plan_document)
+        self.registered.append(document)
+        self.target_resources = target_resources
+        return {
+            "schema_version": 1,
+            "repository_id": self.selected_plan.repository_id,
+            "plan_id": self.selected_plan.plan_id,
+            "registered": True,
+        }
+
+    def dashboard_fleet(self, *, repository_ids, hours):
+        return {
+            "schema_version": 2,
+            "window": {"hours": hours},
+            "snapshot": {"source": "testdb-rollups"},
+            "summary": {},
+            "hours": [],
+            "repositories": [
+                {
+                    "repo_id": repository_id,
+                    "repository_id": repository_id,
+                    "state": "idle",
+                    "summary": {},
+                    "hourly": [],
+                }
+                for repository_id in repository_ids
+            ],
+            "capacity": [],
+            "attention": [],
+        }
+
+
 class UniversalTestHarnessTests(unittest.TestCase):
+    @staticmethod
+    def preview_arguments(intent: str) -> dict[str, object]:
+        return {
+            "intent": intent,
+            "temporary_root": None,
+            "requested_targets": [],
+            "execution_timeout_seconds": None,
+            "launch_timeout_seconds": 300,
+        }
+
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
@@ -45,6 +148,20 @@ class UniversalTestHarnessTests(unittest.TestCase):
                 connection.execute(
                     "INSERT INTO repository_installations(repo_id, status, startup_fenced, actor, updated_at) VALUES (?, 'installed', 0, 'test', ?)",
                     (self.repo_id, now),
+                )
+                establish_repository_owner_authority(
+                    connection,
+                    repository_id=self.repo_id,
+                    owner_uid=os.geteuid(),
+                    repository_generation=0,
+                    operation_id=str(uuid.uuid4()),
+                    actor="test",
+                    reason="universal harness fixture owner",
+                    timestamp=now,
+                    evidence={"kind": "universal-harness-fixture"},
+                )
+                connection.execute(
+                    "UPDATE schema_metadata SET migration_state = 'ready' WHERE singleton = 1"
                 )
         self.persistence = BrokerPersistence(self.database)
         with CoordinatorStore.open(self.database) as store:
@@ -69,6 +186,62 @@ class UniversalTestHarnessTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.temporary.cleanup()
+
+    def test_execution_owner_is_independent_of_authorized_collaborator(self) -> None:
+        collaborator_uid = os.geteuid() + 1000
+        self.persistence.provision_principal(
+            uid=collaborator_uid, account_id="account-collaborator"
+        )
+        self.persistence.provision_repository_enrollment(
+            uid=collaborator_uid,
+            repo_id=self.repo_id,
+            account_id="account-collaborator",
+            issued_at=datetime.now(UTC).isoformat(),
+            valid_until_epoch=4_102_444_800,
+        )
+        authority = self.persistence.test_repository_execution_authority(
+            repo_id=self.repo_id,
+            operation_id=str(uuid.uuid4()),
+        )
+        self.assertEqual(authority.owner_uid, os.geteuid())
+        snapshot_authority = SnapshotAuthority(
+            self.database, expected_uid=os.geteuid()
+        )
+        self.assertEqual(
+            snapshot_authority.repository(repository_id=self.repo_id)["owner_uid"],
+            os.geteuid(),
+        )
+        with self.assertRaisesRegex(
+            TestStoreContractError, "test_execution_owner_unavailable"
+        ):
+            snapshot_authority.repository(
+                repository_id=self.repo_id, owner_uid=collaborator_uid
+            )
+        attempt_authority = self.persistence.test_attempt_repository_authority(
+            repo_id=self.repo_id,
+            owner_uid=collaborator_uid,
+            operation_id=str(uuid.uuid4()),
+        )
+        self.assertEqual(attempt_authority.owner_uid, os.geteuid())
+
+    def test_execution_owner_fails_closed_when_owner_enrollment_is_disabled(self) -> None:
+        with CoordinatorStore.open(self.database) as store:
+            with store.immediate_transaction() as connection:
+                connection.execute(
+                    """
+                    UPDATE broker_repository_enrollments SET enabled = 0
+                    WHERE repo_id = ? AND uid = ?
+                    """,
+                    (self.repo_id, os.geteuid()),
+                )
+        with self.assertRaises(BrokerError) as unavailable:
+            self.persistence.test_repository_execution_authority(
+                repo_id=self.repo_id,
+                operation_id=str(uuid.uuid4()),
+            )
+        self.assertEqual(
+            unavailable.exception.code, "test_execution_owner_unavailable"
+        )
 
     def request(
         self,
@@ -140,6 +313,11 @@ class UniversalTestHarnessTests(unittest.TestCase):
             stats["slow_tests"][0]["test_id"], "tests/unit/test_example.py::test_case"
         )
         self.assertEqual(stats["slow_tests"][0]["percent_of_test_time"], 100.0)
+        self.assertEqual(stats["efficiency"]["parallel_efficiency_ratio"], 1.0)
+        self.assertEqual(stats["health"]["pass_rate"], 1.0)
+        self.assertEqual(stats["series"]["daily"], stats["daily"])
+        self.assertEqual(stats["snapshot"]["source"], "coordinator-test-store")
+        self.assertFalse(stats["avoided_work"]["available"])
 
     def test_hourly_statistics_add_parallel_case_intervals(self) -> None:
         run_id = str(uuid.uuid4())
@@ -199,12 +377,94 @@ class UniversalTestHarnessTests(unittest.TestCase):
         self.assertEqual(stats["summary"]["failed_run_count"], 1)
         self.assertEqual(stats["dynamics"][0]["suite"], "parallel-suite")
         self.assertEqual(stats["dynamics"][0]["current_seconds"], 10_800)
+        self.assertEqual(stats["top_actionable_regression"]["kind"], "test_failure")
+        self.assertEqual(stats["series"]["daily"][0]["failure_count"], 1)
 
     def test_hourly_statistics_never_reintroduce_case_by_bucket_cross_join(self) -> None:
         source = inspect.getsource(CoordinatorTestRecords.stats_for_repository)
         self.assertIn("_hourly_case_statistics", source)
         self.assertNotIn("WITH RECURSIVE hours", source)
         self.assertNotIn("LEFT JOIN recent_cases", source)
+
+    def test_fleet_statistics_are_bounded_exact_and_parallel_aware(self) -> None:
+        hour = datetime.now(UTC).replace(minute=0, second=0, microsecond=0)
+        started = hour + timedelta(minutes=5)
+        finished = hour + timedelta(minutes=35)
+        run_id = str(uuid.uuid4())
+        self.records.start(
+            self.request(
+                BrokerOperation.TEST_RUN_START,
+                {
+                    "agent": "fleet-test",
+                    "suite": "fleet-suite",
+                    "run_kind": "test",
+                    "selection": [],
+                    "command_fingerprint": "d" * 64,
+                    "started_at": started.isoformat(),
+                },
+                operation_id=run_id,
+            )
+        )
+        self.records.finish(
+            self.request(
+                BrokerOperation.TEST_RUN_FINISH,
+                {
+                    "run_id": run_id,
+                    "status": "failed",
+                    "finished_at": finished.isoformat(),
+                    "duration_seconds": 1_800,
+                    "exit_code": 1,
+                    "cases": [
+                        {
+                            "test_id": "tests/test_flake.py::test_unstable",
+                            "display_name": "test_unstable",
+                            "status": status,
+                            "started_at": started.isoformat(),
+                            "finished_at": finished.isoformat(),
+                            "duration_seconds": 1_800,
+                        }
+                        for status in ("failed", "passed")
+                    ]
+                    + [
+                        {
+                            "test_id": "tests/test_parallel.py::test_other",
+                            "display_name": "test_other",
+                            "status": "passed",
+                            "started_at": started.isoformat(),
+                            "finished_at": finished.isoformat(),
+                            "duration_seconds": 1_800,
+                        }
+                    ],
+                },
+            )
+        )
+
+        fleet = self.records.fleet_overview(
+            hours=24, now=hour + timedelta(minutes=45)
+        )
+
+        self.assertEqual(fleet["schema_version"], 2)
+        self.assertEqual(fleet["repositories"][0]["repo_id"], self.repo_id)
+        self.assertEqual(fleet["repositories"][0]["state"], "failing")
+        self.assertEqual(fleet["summary"]["test_seconds"], 5_400)
+        self.assertEqual(fleet["summary"]["parallel_efficiency_ratio"], 3.0)
+        self.assertEqual(fleet["summary"]["flaky_test_count"], 1)
+        self.assertFalse(fleet["summary"]["avoided_work"]["available"])
+        self.assertEqual(
+            sum(cell["test_seconds"] for cell in fleet["capacity"]), 5_400
+        )
+        self.assertGreater(
+            max(cell["test_seconds"] for cell in fleet["capacity"]), 3_600
+        )
+        self.assertIsNotNone(
+            next(
+                cell["p95_queue_wait_seconds"]
+                for cell in fleet["capacity"]
+                if cell["test_count"]
+            )
+        )
+        self.assertNotIn(str(self.root), json.dumps(fleet))
+        self.assertLessEqual(len(fleet["attention"]), 25)
 
     def test_passed_run_rejects_failed_case(self) -> None:
         run_id = str(uuid.uuid4())
@@ -340,6 +600,97 @@ class UniversalTestHarnessTests(unittest.TestCase):
         )
         self.assertEqual(backend.execute(authorized_finish)["status"], "passed")
 
+    def test_broker_authority_checks_immutable_preview_before_registration(self) -> None:
+        manifest = parse_test_manifest(universal_manifest_document())
+
+        def selected(root: Path):
+            return create_test_plan(
+                manifest,
+                intent="release",
+                source=SourceIdentity(
+                    mode=SourceMode.IMMUTABLE,
+                    repository_id=self.repo_id,
+                    content_fingerprint="a" * 64,
+                    original_root=str(root),
+                    temporary_root=None,
+                    snapshot_id="snapshot-" + "b" * 32,
+                ),
+            )
+
+        valid_plane = PreviewTestPlane(selected(self.root))
+        repository_generation = self.persistence.test_attempt_repository_authority(
+            repo_id=self.repo_id,
+            owner_uid=os.geteuid(),
+            operation_id=str(uuid.uuid4()),
+        ).generation
+        capabilities = SealedTestCapabilityRegistry(
+            {
+                self.repo_id: RepositoryTestCapabilities(
+                    generation=repository_generation,
+                    capabilities=frozenset(),
+                )
+            }
+        )
+        backend = StoreBackedMutationBackend(
+            self.persistence,
+            object(),  # type: ignore[arg-type]
+            test_plane=valid_plane,  # type: ignore[arg-type]
+            test_capabilities=capabilities,
+        )
+        preview = self.request(
+            BrokerOperation.TEST_PLAN_PREVIEW,
+            self.preview_arguments("release"),
+        )
+        result = backend.execute(
+            self.persistence.authorize(preview.peer, preview.request)
+        )
+        self.assertEqual(result["plan_id"], valid_plane.selected_plan.plan_id)
+        self.assertEqual(len(valid_plane.registered), 1)
+        self.assertEqual(valid_plane.preview_calls[0]["access_uid"], preview.peer.uid)
+        self.assertEqual(valid_plane.preview_calls[0]["owner_uid"], os.geteuid())
+
+        invalid_plane = PreviewTestPlane(selected(self.root / "not-authorized"))
+        invalid_backend = StoreBackedMutationBackend(
+            self.persistence,
+            object(),  # type: ignore[arg-type]
+            test_plane=invalid_plane,  # type: ignore[arg-type]
+            test_capabilities=capabilities,
+        )
+        with self.assertLogs("devcoordinator.broker_backend", level="WARNING") as logs:
+            with self.assertRaises(BrokerBackendError) as rejected:
+                invalid_backend.execute(
+                    self.persistence.authorize(preview.peer, preview.request)
+                )
+        self.assertEqual(rejected.exception.code, "test_contract_invalid")
+        self.assertIn(
+            "plan source is not the exact authorized root repository",
+            str(rejected.exception),
+        )
+        self.assertIn(preview.request.operation_id, "\n".join(logs.output))
+        self.assertIn(
+            "plan source is not the exact authorized root repository",
+            "\n".join(logs.output),
+        )
+        self.assertEqual(invalid_plane.registered, [])
+
+        fleet_request = self.request(
+            BrokerOperation.TEST_FLEET_STATS_READ,
+            {"hours": 24},
+        )
+        authorized_fleet = self.persistence.authorize(
+            fleet_request.peer, fleet_request.request
+        )
+        self.assertEqual(backend.execute(authorized_fleet)["schema_version"], 2)
+
+        health_request = self.request(BrokerOperation.TEST_HEALTH, {})
+        health = backend.execute(
+            self.persistence.authorize(health_request.peer, health_request.request)
+        )
+        self.assertEqual(health["status"], "ok")
+        self.assertEqual(health["test_store_schema_version"], 5)
+        self.assertEqual(health["store_generation"], "generation-tests")
+        self.assertEqual(health["repository_id"], self.repo_id)
+
         wrong_resource = BrokerRequest.create(
             account_id="account-tests",
             project_id=self.repo_id,
@@ -350,6 +701,155 @@ class UniversalTestHarnessTests(unittest.TestCase):
         )
         with self.assertRaises(Exception):
             self.persistence.authorize(start_request.peer, wrong_resource)
+
+        with self.assertRaises(BrokerError):
+            BrokerRequest.create(
+                account_id="account-tests",
+                project_id=self.repo_id,
+                resource_id=self.repo_id,
+                operation=BrokerOperation.TEST_FLEET_STATS_READ,
+                arguments={"hours": 169},
+                authority_generation=self.generation,
+            )
+
+    def test_fleet_projection_is_limited_to_current_peer_enrollments(self) -> None:
+        """A repository enrollment is not authority to enumerate other accounts."""
+
+        other_repo = "repo-private-other-account"
+        other_uid = os.geteuid() + 10_000
+        now = datetime.now(UTC).isoformat()
+        with CoordinatorStore.open(self.database) as store:
+            with store.immediate_transaction() as connection:
+                connection.execute(
+                    "INSERT INTO repositories(repo_id, host_id, canonical_root, display_name, state, created_at, updated_at) VALUES (?, 'host-tests', ?, 'Private Other', 'active', ?, ?)",
+                    (other_repo, str(self.root / "other"), now, now),
+                )
+                connection.execute(
+                    "INSERT INTO repository_installations(repo_id, status, startup_fenced, actor, updated_at) VALUES (?, 'installed', 0, 'test', ?)",
+                    (other_repo, now),
+                )
+                establish_repository_owner_authority(
+                    connection,
+                    repository_id=other_repo,
+                    owner_uid=other_uid,
+                    repository_generation=0,
+                    operation_id=str(uuid.uuid4()),
+                    actor="test",
+                    reason="private fleet fixture owner",
+                    timestamp=now,
+                    evidence={"kind": "private-fleet-fixture"},
+                )
+                connection.execute(
+                    "INSERT INTO broker_acl_principals(uid, account_id, enabled, updated_at) VALUES (?, 'account-other', 1, ?)",
+                    (other_uid, now),
+                )
+                connection.execute(
+                    "INSERT INTO broker_repository_enrollments(uid, repo_id, account_id, enabled, issued_at, valid_until_epoch, updated_at) VALUES (?, ?, 'account-other', 1, ?, ?, ?)",
+                    (other_uid, other_repo, now, 4_102_444_800, now),
+                )
+
+        unscoped = self.records.fleet_overview(hours=24)
+        self.assertEqual(
+            {item["repo_id"] for item in unscoped["repositories"]},
+            {self.repo_id, other_repo},
+        )
+        scoped = self.records.fleet(
+            self.request(BrokerOperation.TEST_FLEET_STATS_READ, {"hours": 24})
+        )
+        self.assertEqual(
+            [item["repo_id"] for item in scoped["repositories"]], [self.repo_id]
+        )
+        self.assertEqual(scoped["summary"]["repository_count"], 1)
+        self.assertNotIn(other_repo, json.dumps(scoped))
+
+    def test_snapshot_source_failure_exposes_only_actionable_bounded_detail(self) -> None:
+        plane = PreviewTestPlane(object())
+        plane.preview_error = TestPlaneTransportError(
+            "test_plan_source_invalid",
+            "snapshot file could not be opened safely: "
+            "deploy/ceph-vault-probe/temporal_scope_probe.py: "
+            "[Errno 13] Permission denied: 'temporal_scope_probe.py'",
+        )
+        backend = StoreBackedMutationBackend(
+            self.persistence,
+            object(),  # type: ignore[arg-type]
+            test_plane=plane,  # type: ignore[arg-type]
+        )
+        preview = self.request(
+            BrokerOperation.TEST_PLAN_PREVIEW, self.preview_arguments("manual")
+        )
+
+        with self.assertRaises(BrokerBackendError) as raised:
+            backend.execute(self.persistence.authorize(preview.peer, preview.request))
+
+        self.assertEqual(raised.exception.code, "test_plan_source_invalid")
+        self.assertEqual(
+            raised.exception.message,
+            "Snapshot source path is unreadable: "
+            "deploy/ceph-vault-probe/temporal_scope_probe.py.",
+        )
+        self.assertNotIn("Errno", raised.exception.message)
+
+        plane.preview_error = TestPlaneTransportError(
+            "test_plan_source_invalid", "unexpected secret at /outside/path"
+        )
+        with self.assertRaises(BrokerBackendError) as opaque:
+            backend.execute(self.persistence.authorize(preview.peer, preview.request))
+        self.assertNotIn("/outside/path", opaque.exception.message)
+
+        plane.preview_error = TestPlaneTransportError(
+            "snapshot_materialization_failed",
+            "snapshot file is unavailable: tests.json: "
+            "[Errno 2] No such file or directory: 'tests.json'",
+        )
+        with self.assertRaises(BrokerBackendError) as missing:
+            backend.execute(self.persistence.authorize(preview.peer, preview.request))
+        self.assertEqual(missing.exception.code, "test_plan_source_invalid")
+        self.assertEqual(
+            missing.exception.message,
+            "Snapshot source path is unavailable: tests.json.",
+        )
+        self.assertIsNone(missing.exception.retry_after_seconds)
+
+    def test_async_preview_is_exactly_repository_authorized_and_bounded(self) -> None:
+        preview = self.request(
+            BrokerOperation.TEST_PLAN_PREVIEW, self.preview_arguments("manual")
+        )
+        authorized = self.persistence.authorize(preview.peer, preview.request)
+        self.assertEqual(authorized.request.project_id, self.repo_id)
+        self.assertEqual(authorized.request.resource_id, self.repo_id)
+        self.assertEqual(
+            authorized.request.arguments,
+            {
+                "intent": "manual",
+                "temporary_root": None,
+                "requested_targets": [],
+                "execution_timeout_seconds": None,
+                "launch_timeout_seconds": 300,
+            },
+        )
+
+        with self.assertRaises(BrokerError):
+            BrokerRequest.create(
+                account_id="account-tests",
+                project_id=self.repo_id,
+                resource_id=self.repo_id,
+                operation=BrokerOperation.TEST_PLAN_PREVIEW,
+                arguments={"intent": "manual", "source": "client-selected"},
+                authority_generation=self.generation,
+            )
+        with self.assertRaises(BrokerError):
+            BrokerRequest.create(
+                account_id="account-tests",
+                project_id=self.repo_id,
+                resource_id=self.repo_id,
+                operation=BrokerOperation.TEST_RUN_SUBMIT,
+                arguments={
+                    "plan_id": "plan-1",
+                    "expected_repository_id": "/client/path",
+                },
+                authority_generation=self.generation,
+            )
 
 
 if __name__ == "__main__":

@@ -7,7 +7,6 @@ from dataclasses import dataclass
 import json
 import os
 from pathlib import Path
-import pwd
 import socket
 import struct
 import sys
@@ -51,6 +50,7 @@ from devcoordinator.ephemeral_secrets import (  # noqa: E402
     POSTGRES_INITDB_PASSWORD_FILE_V1,
     VolatileRunSecretManager,
 )
+from devcoordinator.schema import establish_repository_owner_authority  # noqa: E402
 from devcoordinator.store import CoordinatorStore, utc_timestamp  # noqa: E402
 
 
@@ -145,17 +145,15 @@ class _OneTimeSecretRetriever:
 
 
 class _SocketDirectory:
-    """Test-owned canonical private socket directory."""
+    """Test-owned canonical socket directory with stable path/type identity."""
 
     def __enter__(self) -> Path:
-        account_home = Path(pwd.getpwuid(os.geteuid()).pw_dir).resolve()
         self._temporary = tempfile.TemporaryDirectory(
-            prefix=".dc-fd-", dir=str(account_home)
+            prefix="devcoordinator-fd-", dir="/tmp"
         )
         self.path = Path(self._temporary.name).resolve()
-        # The production broker socket is group-readable/writable (0660), so
-        # its immediate private parent must grant the configured group search
-        # permission while all ancestors remain test-owned and non-replaceable.
+        # This is a creation default, not an authorization assertion. The
+        # transport checks stable local socket identity and connectivity.
         os.chmod(self.path, 0o750)
         return self.path
 
@@ -335,6 +333,20 @@ class _StoreBackedFixture:
                     """,
                     (STORE_BACKED_REPO, now),
                 )
+                establish_repository_owner_authority(
+                    connection,
+                    repository_id=STORE_BACKED_REPO,
+                    owner_uid=os.geteuid(),
+                    repository_generation=0,
+                    operation_id=str(uuid.uuid4()),
+                    actor="test",
+                    reason="store-backed secret fixture owner",
+                    timestamp=now,
+                    evidence={"kind": "ephemeral-secret-transport-fixture"},
+                )
+                connection.execute(
+                    "UPDATE schema_metadata SET migration_state = 'ready' WHERE singleton = 1"
+                )
             self.generation = store.metadata.database_generation
         self.persistence.provision_principal(
             uid=os.geteuid(), account_id=STORE_BACKED_ACCOUNT
@@ -424,11 +436,7 @@ def _service(retriever: _OneTimeSecretRetriever) -> tuple[BrokerService, _Unused
 
 
 def _client(path: Path) -> BrokerClient:
-    return BrokerClient(
-        path,
-        expected_broker_uid=os.geteuid(),
-        expected_socket_gid=os.getegid(),
-    )
+    return BrokerClient(path)
 
 
 def _recv_exact(connection: socket.socket, size: int) -> bytes:
@@ -450,7 +458,7 @@ class EphemeralSecretTransportTests(unittest.TestCase):
                 argparse.Namespace(), BrokerOperation.EPHEMERAL_SECRET_FD
             )
 
-    def test_mismatched_run_binding_and_unauthorized_peer_never_reach_retriever(self) -> None:
+    def test_mismatched_run_binding_fails_before_local_peer_attribution(self) -> None:
         retriever = _OneTimeSecretRetriever()
         service, _backend = _service(retriever)
         with self.assertRaises(BrokerError) as mismatched:
@@ -469,19 +477,25 @@ class EphemeralSecretTransportTests(unittest.TestCase):
         self.assertEqual(mismatched.exception.code, "invalid_arguments")
 
         request = _request()
-        denied = service.transport_response_for_payload(
+        alternate_uid = os.geteuid() + 100_000
+        response = service.transport_response_for_payload(
             PeerCredentials(
-                uid=os.geteuid() + 100_000,
+                uid=alternate_uid,
                 gid=os.getegid(),
                 pid=os.getpid(),
             ),
             json.dumps(request.to_wire(), sort_keys=True).encode("utf-8"),
         )
-        self.assertIsNone(denied.secret_fd)
-        reply = json.loads(denied.payload)
-        self.assertFalse(reply["ok"])
-        self.assertEqual(reply["error"]["code"], "peer_not_authorized")
-        self.assertEqual(retriever.calls, [])
+        try:
+            self.assertIsNotNone(response.secret_fd)
+            reply = json.loads(response.payload)
+            self.assertTrue(reply["ok"])
+            self.assertEqual(retriever.calls[0][0], alternate_uid)
+        finally:
+            if response.secret_fd is not None:
+                os.close(response.secret_fd)
+            if response.secret_delivery is not None:
+                response.secret_delivery.close()
 
     def test_success_is_fd_only_read_only_close_on_exec_and_never_writer_cached(self) -> None:
         retriever = _OneTimeSecretRetriever()

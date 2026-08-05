@@ -12,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import uuid
 from unittest import mock
 
 
@@ -119,6 +120,86 @@ class RuntimeCliTests(unittest.TestCase):
                 "options": {},
             },
         )
+
+    def test_operation_id_is_outer_metadata_for_flag_and_json_modes(self) -> None:
+        operation_id = "11111111-1111-4111-8111-111111111111"
+        flagged_args = self.parse(
+            *self.existing_service_flags(),
+            "--operation-id",
+            operation_id,
+        )
+        flagged = runtime_cli.load_runtime_cli_request(flagged_args)
+
+        self.assertEqual(
+            runtime_cli.runtime_cli_operation_id(flagged_args), operation_id
+        )
+        self.assertNotIn("operation_id", flagged)
+        encoded_args = self.parse(
+            "--request-json",
+            json.dumps(flagged),
+            "--operation-id",
+            operation_id,
+        )
+        self.assertEqual(
+            runtime_cli.load_runtime_cli_request(encoded_args), flagged
+        )
+        self.assertEqual(
+            runtime_cli.runtime_cli_operation_id(encoded_args), operation_id
+        )
+
+    def test_cli_generates_one_operation_id_before_dispatch(self) -> None:
+        generated = uuid.UUID("22222222-2222-4222-8222-222222222222")
+        args = self.parse(*self.existing_service_flags())
+        expected_request = runtime_cli.load_runtime_cli_request(
+            self.parse(*self.existing_service_flags())
+        )
+        with mock.patch.object(
+            runtime_cli.uuid, "uuid4", return_value=generated
+        ) as uuid4, mock.patch.object(
+            dev_coordinator,
+            "coordinated_runtime_request",
+            return_value={"ok": True},
+        ) as submit:
+            result = dev_coordinator.handle_cli(args)
+
+        self.assertTrue(result["ok"])
+        uuid4.assert_called_once_with()
+        submit.assert_called_once_with(
+            expected_request,
+            operation_id=str(generated),
+        )
+        self.assertEqual(args.operation_id, str(generated))
+
+    def test_runtime_validation_error_preserves_valid_operation_id(self) -> None:
+        operation_id = "33333333-3333-4333-8333-333333333333"
+        malformed = self.existing_service_flags()
+        kill_index = malformed.index("--kill-after-run")
+        del malformed[kill_index : kill_index + 2]
+
+        result = dev_coordinator.handle_cli(
+            self.parse(*malformed, "--operation-id", operation_id)
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["operation_id"], operation_id)
+        self.assertNotIn("operation_id", result.get("evidence") or {})
+
+    def test_runtime_rejects_noncanonical_operation_id_before_dispatch(self) -> None:
+        args = self.parse(
+            *self.existing_service_flags(),
+            "--operation-id",
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".upper(),
+        )
+        with mock.patch.object(
+            dev_coordinator, "coordinated_runtime_request"
+        ) as submit:
+            result = dev_coordinator.handle_cli(args)
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["classification"], "invalid_request")
+        self.assertIn("canonical UUID", result["error"])
+        self.assertNotIn("operation_id", result)
+        submit.assert_not_called()
 
     def test_simple_flag_actions_and_target_kinds_delegate_to_the_validator(self) -> None:
         for action in sorted(
@@ -427,14 +508,21 @@ class RuntimeCliTests(unittest.TestCase):
         self.assertEqual(represented, runtime_api_module.RUNTIME_REQUIRED_KEYS)
 
     def test_flag_mode_cli_is_compact_and_identical_under_optimized_python(self) -> None:
-        invocation = repr(self.existing_service_flags())
+        invocation = repr(
+            [
+                *self.existing_service_flags(),
+                "--operation-id",
+                "55555555-5555-4555-8555-555555555555",
+            ]
+        )
         source = (
             "from unittest import mock\n"
             "import dev_coordinator\n"
             "argv = " + invocation + "\n"
             "with mock.patch.object(dev_coordinator, 'authority_mode', return_value='account'), "
             "mock.patch.object(dev_coordinator, 'coordinated_runtime_request', "
-            "side_effect=lambda request: {'ok': True, 'request': request}):\n"
+            "side_effect=lambda request, operation_id=None: "
+            "{'ok': True, 'request': request, 'operation_id': operation_id}):\n"
             " raise SystemExit(dev_coordinator.main(['runtime', *argv]))\n"
         )
         environment = os.environ.copy()
@@ -495,6 +583,9 @@ class RuntimeCliTests(unittest.TestCase):
             self.assertNotIn("\n", completed.stdout.strip())
             payload = json.loads(completed.stdout)
             self.assertFalse(payload["ok"])
+            self.assertEqual(
+                str(uuid.UUID(payload["operation_id"])), payload["operation_id"]
+            )
             self.assertEqual(payload["classification"], "invalid_request")
             self.assertEqual(payload["error_type"], "RuntimeRequestError")
             self.assertIn("kill-after-run", payload["error"])

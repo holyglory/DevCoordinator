@@ -24,13 +24,13 @@ test('production units split coordinator ownership and keep runtime data outside
   assert.match(coordinator, /^Group=holyglory$/m);
   assert.match(coordinator, /WorkingDirectory=\/home\/DevCoordinator/);
   assert.match(coordinator, /\/home\/DevCoordinator\/skills\/codex-dev-coordinator\/scripts\/dev_coordinator\.py/);
-  assert.match(coordinator, /--token-file \/home\/holyglory\/\.codex\/agent-coordinator\/api-token/);
+  assert.doesNotMatch(coordinator, /--token-file|api-token|COORDINATOR_TOKEN_FILE/);
   assert.deepEqual(
     coordinator.split('\n').filter((line) => line.startsWith('ExecStartPost=')),
     [
-      'ExecStartPost=/usr/bin/python3 /home/DevCoordinator/scripts/check_coordinator_auth_boundary.py --token-file /home/holyglory/.codex/agent-coordinator/api-token --host 127.0.0.1 --port 29876 --wait-seconds 10 --poll-interval-seconds 0.1',
+      'ExecStartPost=/usr/bin/python3 /home/DevCoordinator/scripts/check_coordinator_auth_boundary.py --host 127.0.0.1 --port 29876 --wait-seconds 10 --poll-interval-seconds 0.1',
     ],
-    'coordinator readiness must use exactly one pinned authenticated loopback probe',
+    'coordinator readiness must use exactly one pinned trusted-loopback probe',
   );
   assert.deepEqual(
     coordinator.split('\n').filter((line) => line.startsWith('TimeoutStartSec=')),
@@ -96,15 +96,14 @@ test('production units split coordinator ownership and keep runtime data outside
     '/home/holyglory/.local/state/devops-console',
     '/home/holyglory/.local/state/devops-console/acme',
     '/home/holyglory/.codex/agent-coordinator',
-    '/home/holyglory/.codex/agent-coordinator/api-token',
   ]) assert.ok(preflightLine.includes(expectedPath), expectedPath);
-  assert.match(consoleUnit, /ExecStartPre=.*--require-token --wait-token-seconds 10/);
+  assert.doesNotMatch(preflightLine, /--token-file|--require-token|--wait-token-seconds/);
   assert.match(consoleUnit, /ExecStart=\/usr\/bin\/env DEVCOORDINATOR_ROOT=\/home\/DevCoordinator/);
   assert.match(consoleUnit, /ExecStart=.*COORDINATOR_AUTOSTART=0/);
   assert.match(consoleUnit, /ExecStart=.*COORDINATOR_REGISTRATION_REQUIRED=1/);
   assert.match(consoleUnit, /ExecStart=.*COORDINATOR_URL=http:\/\/127\.0\.0\.1:29876/);
   assert.match(consoleUnit, /ExecStart=.*COORDINATOR_SCRIPT=\/home\/DevCoordinator\/skills\/codex-dev-coordinator\/scripts\/dev_coordinator\.py/);
-  assert.match(consoleUnit, /ExecStart=.*COORDINATOR_TOKEN_FILE=\/home\/holyglory\/\.codex\/agent-coordinator\/api-token/);
+  assert.doesNotMatch(consoleUnit, /COORDINATOR_TOKEN_FILE|api-token|--token-file/);
   assert.match(consoleUnit, /ExecStart=.*DEVCOORDINATOR_AUTHORITY=system/);
   assert.match(consoleUnit, /ExecStart=.*CODEX_AGENT_COORDINATOR_HOME=\/var\/lib\/devcoordinator-clients\/1000/);
   assert.match(consoleUnit, /ExecStart=.*STATE_DIR=\/home\/holyglory\/\.local\/state\/devops-console/);
@@ -113,7 +112,7 @@ test('production units split coordinator ownership and keep runtime data outside
   assert.deepEqual(
     consoleUnit.split('\n').filter((line) => line.startsWith('ExecStartPost=')),
     [
-      'ExecStartPost=/usr/bin/python3 /home/DevCoordinator/scripts/check_console_registration_ready.py --unit devops-console.service --main-pid $MAINPID --token-file /home/holyglory/.codex/agent-coordinator/api-token --project /home/DevCoordinator --name devops-console --port 443 --host 127.0.0.1 --coordinator-port 29876 --expected-executable /usr/bin/node --expected-script bin/devops-console.mjs --env-file /home/holyglory/.config/devops-console/console.env --expected-working-directory /home/DevCoordinator/apps/DevOpsConsole --wait-seconds 80 --poll-interval-seconds 0.1',
+      'ExecStartPost=/usr/bin/python3 /home/DevCoordinator/scripts/check_console_registration_ready.py --unit devops-console.service --main-pid $MAINPID --project /home/DevCoordinator --name devops-console --port 443 --host 127.0.0.1 --coordinator-port 29876 --expected-executable /usr/bin/node --expected-script bin/devops-console.mjs --env-file /home/holyglory/.config/devops-console/console.env --expected-working-directory /home/DevCoordinator/apps/DevOpsConsole --wait-seconds 80 --poll-interval-seconds 0.1',
     ],
     'Console startup must have one exact MainPID-bound registration readiness gate',
   );

@@ -1,0 +1,9 @@
+[Unit]
+Description=DevCoordinator test-attempt accounting slice
+Before=slices.target
+
+[Slice]
+CPUAccounting=yes
+MemoryAccounting=yes
+IOAccounting=yes
+TasksAccounting=yes

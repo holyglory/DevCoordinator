@@ -1,0 +1,37 @@
+[Unit]
+Description=DevCoordinator bounded host observer
+After=network-online.target devcoordinator-api.socket
+Wants=network-online.target devcoordinator-api.socket
+
+[Service]
+Type=exec
+User=devcoordinator-observer
+Group=devcoordinator-observer
+Slice=devcoordinator-background.slice
+UMask=0077
+Environment=DEVCOORDINATOR_ROLE=observer
+EnvironmentFile=/etc/devcoordinator/observer.env
+ExecStartPre=/opt/devcoordinator/releases/RELEASE_DIGEST/bin/devcoordinator-observer config-check --api-url http://127.0.0.1:29876 --project ${DEVCOORDINATOR_OBSERVER_PROJECT} --interval-seconds ${DEVCOORDINATOR_OBSERVER_INTERVAL_SECONDS} --request-timeout-seconds ${DEVCOORDINATOR_OBSERVER_REQUEST_TIMEOUT_SECONDS} --log-level ${LOG_LEVEL}
+ExecStartPre=/opt/devcoordinator/releases/RELEASE_DIGEST/bin/devcoordinator-observer verify --database /var/lib/devcoordinator-observer/inventory.sqlite3 --publication /var/lib/devcoordinator-observer/inventory.publication
+ExecStart=/opt/devcoordinator/releases/RELEASE_DIGEST/bin/devcoordinator-observer serve --database /var/lib/devcoordinator-observer/inventory.sqlite3 --publication /var/lib/devcoordinator-observer/inventory.publication --api-url http://127.0.0.1:29876 --project ${DEVCOORDINATOR_OBSERVER_PROJECT} --interval-seconds ${DEVCOORDINATOR_OBSERVER_INTERVAL_SECONDS} --request-timeout-seconds ${DEVCOORDINATOR_OBSERVER_REQUEST_TIMEOUT_SECONDS} --log-level ${LOG_LEVEL}
+Restart=always
+RestartSec=3
+TimeoutStopSec=30s
+KillMode=control-group
+RuntimeDirectory=devcoordinator-observer
+RuntimeDirectoryMode=0750
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=devcoordinator-observer
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=/var/lib/devcoordinator-observer /run/devcoordinator-observer
+
+[Install]
+WantedBy=multi-user.target

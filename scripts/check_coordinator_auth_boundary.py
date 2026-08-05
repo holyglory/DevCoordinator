@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prove the production coordinator anonymous/authenticated HTTP boundary."""
+"""Prove the production Coordinator trusted-loopback HTTP boundary."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ import time
 from pathlib import Path
 from typing import Callable
 
-from secure_cutover_io import SecureIOError, open_private_parent, read_private_regular
+from secure_cutover_io import SecureIOError, open_private_parent
 
 
 class AuthBoundaryError(RuntimeError):
@@ -31,34 +31,16 @@ TRANSIENT_TRANSPORT_ERRORS = (
 )
 
 
-def caused_by_missing_file(error: BaseException) -> bool:
-    """Return true only when a wrapped secure read failed with ENOENT."""
-
-    current: BaseException | None = error
-    seen: set[int] = set()
-    while current is not None and id(current) not in seen:
-        if isinstance(current, FileNotFoundError):
-            return True
-        seen.add(id(current))
-        current = current.__cause__ or current.__context__
-    return False
-
-
-def read_token(token_file: Path) -> str:
-    try:
-        token = read_private_regular(token_file, label="coordinator token").decode("utf-8").strip()
-    except (SecureIOError, UnicodeDecodeError) as error:
-        raise AuthBoundaryError(str(error)) from error
-    if not token or len(token.encode("utf-8")) > 4096:
-        raise AuthBoundaryError("coordinator token is empty or oversized")
-    return token
-
-
-def http_status(host: str, port: int, timeout: float, path: str, bearer: str | None) -> int:
+def http_status(
+    host: str,
+    port: int,
+    timeout: float,
+    path: str,
+    headers: dict[str, str] | None,
+) -> int:
     connection = http.client.HTTPConnection(host, port, timeout=timeout)
-    headers = {"Authorization": f"Bearer {bearer}"} if bearer else {}
     try:
-        connection.request("GET", path, headers=headers)
+        connection.request("GET", path, headers=headers or {})
         response = connection.getresponse()
         response.read()
         return response.status
@@ -68,18 +50,17 @@ def http_status(host: str, port: int, timeout: float, path: str, bearer: str | N
 
 def check_boundary(
     *,
-    token_file: Path,
     host: str = "127.0.0.1",
     port: int = 29876,
     timeout: float = 60.0,
     wait_seconds: float = 10.0,
     poll_interval_seconds: float = 0.1,
-    status_fn: Callable[[str, int, float, str, str | None], int] = http_status,
+    status_fn: Callable[[str, int, float, str, dict[str, str] | None], int] = http_status,
     monotonic_fn: Callable[[], float] = time.monotonic,
     sleep_fn: Callable[[float], None] = time.sleep,
 ) -> dict[str, int]:
     if host not in {"127.0.0.1", "::1"}:
-        raise AuthBoundaryError("coordinator auth preflight is restricted to loopback")
+        raise AuthBoundaryError("coordinator local-boundary preflight is restricted to loopback")
     if (
         port < 1
         or port > 65535
@@ -92,44 +73,36 @@ def check_boundary(
     ):
         raise AuthBoundaryError("invalid coordinator port, timeout, or readiness wait")
     expected = {
-        "anonymous_health": 200,
-        "anonymous_ready": 401,
-        "authenticated_ready": 200,
+        "local_health": 200,
+        "local_ready": 200,
+        "foreign_host_ready": 400,
+        "foreign_origin_ready": 403,
     }
     deadline = monotonic_fn() + wait_seconds
     attempts = 0
-    token: str | None = None
     while True:
         attempts += 1
-        def probe(path: str, bearer: str | None) -> int:
+        def probe(path: str, headers: dict[str, str] | None = None) -> int:
             remaining = deadline - monotonic_fn()
             if remaining <= 0:
                 raise TimeoutError("coordinator readiness deadline expired between requests")
-            return status_fn(host, port, min(timeout, remaining), path, bearer)
+            return status_fn(host, port, min(timeout, remaining), path, headers)
 
         try:
-            if token is None:
-                token = read_token(token_file)
             observed = {
-                "anonymous_health": probe("/healthz", None),
-                "anonymous_ready": probe("/v1/ready", None),
-                "authenticated_ready": probe("/v1/ready", token),
+                "local_health": probe("/healthz"),
+                "local_ready": probe("/v1/ready"),
+                "foreign_host_ready": probe(
+                    "/v1/ready", {"Host": "external.example"}
+                ),
+                "foreign_origin_ready": probe(
+                    "/v1/ready",
+                    {
+                        "Host": f"127.0.0.1:{port}",
+                        "Origin": "https://external.example",
+                    },
+                ),
             }
-        except AuthBoundaryError as error:
-            # The coordinator creates a missing token atomically before it
-            # binds. Only ENOENT is a startup condition; a symlink, FIFO,
-            # unsafe mode/owner, malformed value, or oversized token remains
-            # an immediate credential failure.
-            if not caused_by_missing_file(error):
-                raise
-            remaining = deadline - monotonic_fn()
-            if remaining <= 0:
-                raise AuthBoundaryError(
-                    "coordinator token did not appear before the readiness deadline "
-                    f"after {attempts} attempt(s)"
-                ) from error
-            sleep_fn(min(poll_interval_seconds, remaining))
-            continue
         except (OSError, http.client.HTTPException) as error:
             if not isinstance(error, TRANSIENT_TRANSPORT_ERRORS):
                 raise AuthBoundaryError(
@@ -144,41 +117,42 @@ def check_boundary(
             sleep_fn(min(poll_interval_seconds, remaining))
             continue
         if observed != expected:
-            authenticated_status = observed["authenticated_ready"]
-            anonymous_contract_ready = (
-                observed["anonymous_health"] == expected["anonymous_health"]
-                and observed["anonymous_ready"] == expected["anonymous_ready"]
+            ready_status = observed["local_ready"]
+            boundary_contract_ready = (
+                observed["local_health"] == expected["local_health"]
+                and observed["foreign_host_ready"] == expected["foreign_host_ready"]
+                and observed["foreign_origin_ready"] == expected["foreign_origin_ready"]
             )
             if (
-                anonymous_contract_ready
-                and type(authenticated_status) is int
-                and 500 <= authenticated_status <= 599
+                boundary_contract_ready
+                and type(ready_status) is int
+                and 500 <= ready_status <= 599
             ):
-                # A reachable API can publish its health/auth middleware just
-                # before its authenticated readiness handler finishes opening.
+                # A reachable API can publish its health/locality middleware
+                # just before its local readiness handler finishes opening.
                 # Retry only that exact, fail-closed startup shape. Re-probing
-                # all three endpoints on the next attempt ensures an anonymous
+                # all four probes on the next attempt ensures a locality
                 # boundary regression is never hidden by readiness polling.
                 remaining = deadline - monotonic_fn()
                 if remaining <= 0:
                     raise AuthBoundaryError(
-                        "authenticated coordinator endpoint did not become ready "
+                        "local coordinator endpoint did not become ready "
                         "before the readiness deadline "
-                        f"after {attempts} attempt(s); last status=HTTP {authenticated_status}"
+                        f"after {attempts} attempt(s); last status=HTTP {ready_status}"
                     )
                 sleep_fn(min(poll_interval_seconds, remaining))
                 if monotonic_fn() >= deadline:
                     raise AuthBoundaryError(
-                        "authenticated coordinator endpoint did not become ready "
+                        "local coordinator endpoint did not become ready "
                         "before the readiness deadline "
-                        f"after {attempts} attempt(s); last status=HTTP {authenticated_status}"
+                        f"after {attempts} attempt(s); last status=HTTP {ready_status}"
                     )
                 continue
             # Any other reachable response is a configuration/security or
             # protocol-contract failure, not a startup race. That includes an
-            # anonymous mismatch and authenticated 2xx/4xx responses.
+            # locality mismatch and non-ready 2xx/4xx responses.
             raise AuthBoundaryError(
-                f"coordinator health/auth boundary mismatch: expected {expected}, got {observed}"
+                f"coordinator trusted-loopback boundary mismatch: expected {expected}, got {observed}"
             )
         if monotonic_fn() > deadline:
             raise AuthBoundaryError(
@@ -187,10 +161,10 @@ def check_boundary(
         return observed
 
 
-def http_inventory(host: str, port: int, timeout: float, bearer: str) -> tuple[int, bytes]:
+def http_inventory(host: str, port: int, timeout: float) -> tuple[int, bytes]:
     connection = http.client.HTTPConnection(host, port, timeout=timeout)
     try:
-        connection.request("GET", "/v1/inventory", headers={"Authorization": f"Bearer {bearer}"})
+        connection.request("GET", "/v1/inventory", headers={"Host": f"127.0.0.1:{port}"})
         response = connection.getresponse()
         payload = response.read(INVENTORY_MAX_BYTES + 1)
         return response.status, payload
@@ -198,26 +172,24 @@ def http_inventory(host: str, port: int, timeout: float, bearer: str) -> tuple[i
         connection.close()
 
 
-def fetch_authenticated_inventory(
+def fetch_local_inventory(
     *,
-    token_file: Path,
     host: str = "127.0.0.1",
     port: int = 29876,
     timeout: float = 60.0,
-    fetch_fn: Callable[[str, int, float, str], tuple[int, bytes]] = http_inventory,
+    fetch_fn: Callable[[str, int, float], tuple[int, bytes]] = http_inventory,
 ) -> dict[str, object]:
-    token = read_token(token_file)
-    status, payload = fetch_fn(host, port, timeout, token)
+    status, payload = fetch_fn(host, port, timeout)
     if status != 200:
-        raise AuthBoundaryError(f"authenticated coordinator inventory returned HTTP {status}")
+        raise AuthBoundaryError(f"local coordinator inventory returned HTTP {status}")
     if len(payload) > INVENTORY_MAX_BYTES:
-        raise AuthBoundaryError("authenticated coordinator inventory is oversized")
+        raise AuthBoundaryError("local coordinator inventory is oversized")
     try:
         value = json.loads(payload.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise AuthBoundaryError(f"authenticated coordinator inventory is invalid JSON: {error}") from error
+        raise AuthBoundaryError(f"local coordinator inventory is invalid JSON: {error}") from error
     if not isinstance(value, dict):
-        raise AuthBoundaryError("authenticated coordinator inventory JSON root must be an object")
+        raise AuthBoundaryError("local coordinator inventory JSON root must be an object")
     return value
 
 
@@ -243,7 +215,6 @@ def write_private_inventory(path: Path, inventory: dict[str, object]) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--token-file", required=True)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=29876)
     parser.add_argument("--timeout", type=float, default=60.0)
@@ -253,7 +224,6 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         observed = check_boundary(
-            token_file=Path(args.token_file),
             host=args.host,
             port=args.port,
             timeout=args.timeout,
@@ -261,15 +231,14 @@ def main(argv: list[str] | None = None) -> int:
             poll_interval_seconds=args.poll_interval_seconds,
         )
         if args.inventory_output:
-            inventory = fetch_authenticated_inventory(
-                token_file=Path(args.token_file),
+            inventory = fetch_local_inventory(
                 host=args.host,
                 port=args.port,
                 timeout=args.timeout,
             )
             write_private_inventory(Path(args.inventory_output), inventory)
     except (AuthBoundaryError, OSError, SecureIOError, http.client.HTTPException) as error:
-        print(f"coordinator auth preflight failed: {error}", file=sys.stderr)
+        print(f"coordinator local-boundary preflight failed: {error}", file=sys.stderr)
         return 1
     print(json.dumps({"ok": True, "statuses": observed}, sort_keys=True))
     return 0

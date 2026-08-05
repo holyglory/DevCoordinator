@@ -33,25 +33,14 @@ def _absolute_unresolved(path: str | Path) -> Path:
 
 
 def _validate_private_path(path: Path, expected_uid: int) -> os.stat_result:
+    del expected_uid
     refuse_symlink_components(path)
     parent = path.parent.lstat()
-    if (
-        not stat.S_ISDIR(parent.st_mode)
-        or parent.st_uid != expected_uid
-        or stat.S_IMODE(parent.st_mode) != 0o700
-    ):
-        raise PermissionError(
-            "backup artifact directory must be an expected-UID mode-0700 directory"
-        )
+    if not stat.S_ISDIR(parent.st_mode) or stat.S_ISLNK(parent.st_mode):
+        raise PermissionError("backup artifact parent must be a real directory")
     metadata = path.lstat()
     if not stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
         raise PermissionError("backup evidence must be a real regular file")
-    if metadata.st_uid != expected_uid:
-        raise PermissionError(
-            f"backup evidence is owned by uid {metadata.st_uid}, not {expected_uid}"
-        )
-    if stat.S_IMODE(metadata.st_mode) != 0o600:
-        raise PermissionError("backup evidence must be private mode 0600")
     return metadata
 
 
@@ -75,10 +64,8 @@ def _read_private_bytes(
             raise RuntimeError("backup evidence identity changed while opening")
         if (
             not stat.S_ISREG(opened.st_mode)
-            or opened.st_uid != expected_uid
-            or stat.S_IMODE(opened.st_mode) != 0o600
         ):
-            raise PermissionError("opened backup evidence lost its private identity")
+            raise PermissionError("opened backup evidence is not a regular file")
         chunks: list[bytes] | None = [] if maximum_bytes is not None else None
         digest = hashlib.sha256()
         remaining = None if maximum_bytes is None else maximum_bytes + 1

@@ -27,7 +27,7 @@ EFFECTIVE = """Type=simple
 FragmentPath=/etc/systemd/system/devcoordinator-broker.service
 DropInPaths=/etc/systemd/system/devcoordinator-broker.service.d/80-enrolled-home-write-paths.conf
 User=root
-Group=devcoordinator-clients
+Group=root
 Environment=DEVCOORDINATOR_AUTHORITY=service DOCKER_CONFIG=/var/lib/devcoordinator/docker
 KillMode=mixed
 KillSignal=15
@@ -42,8 +42,7 @@ NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
 ProtectHome=read-only
-RuntimeDirectoryPreserve=restart
-ReadWritePaths=/var/lib/devcoordinator /run/devcoordinator /home/alice /home/bob
+ReadWritePaths=/var/lib/devcoordinator -/run/devcoordinator /home/alice /home/bob
 ReadOnlyPaths=
 BindPaths=
 AmbientCapabilities=
@@ -55,7 +54,7 @@ EXPECTED_HOME_PATHS = ("/home/alice", "/home/bob")
 HOME_DROPIN = """[Service]
 # Generated transactionally from the complete explicit --client-user set.
 ReadWritePaths=
-ReadWritePaths=/var/lib/devcoordinator /run/devcoordinator /home/alice /home/bob
+ReadWritePaths=/var/lib/devcoordinator -/run/devcoordinator /home/alice /home/bob
 """
 
 
@@ -152,7 +151,7 @@ def main() -> int:
         ),
         ("User=root", "User=operator", "service user"),
         (
-            "Group=devcoordinator-clients",
+            "Group=root",
             "Group=operator",
             "service group",
         ),
@@ -162,19 +161,14 @@ def main() -> int:
             "Docker configuration environment",
         ),
         (
-            "ReadWritePaths=/var/lib/devcoordinator /run/devcoordinator /home/alice /home/bob",
-            "ReadWritePaths=/var/lib/devcoordinator /run/devcoordinator /home/alice /home/bob /etc",
+            "ReadWritePaths=/var/lib/devcoordinator -/run/devcoordinator /home/alice /home/bob",
+            "ReadWritePaths=/var/lib/devcoordinator -/run/devcoordinator /home/alice /home/bob /etc",
             "extra writable system path",
         ),
         (
             "ProtectHome=read-only",
             "ProtectHome=no",
             "writable home baseline",
-        ),
-        (
-            "RuntimeDirectoryPreserve=restart",
-            "RuntimeDirectoryPreserve=no",
-            "volatile runtime directory cleanup on restart",
         ),
         (
             "ProtectSystem=strict",
@@ -207,6 +201,10 @@ def main() -> int:
             EFFECTIVE.replace(original, replacement),
             label,
         )
+    must_reject_effective(
+        EFFECTIVE + "RuntimeDirectoryPreserve=restart\n",
+        "obsolete runtime directory preservation",
+    )
     must_reject_effective(
         EFFECTIVE.replace("KillMode=mixed", "KillMode=control-group"),
         "control-group SIGTERM",
@@ -265,8 +263,8 @@ def main() -> int:
     )
     must_reject_effective(
         EFFECTIVE.replace(
-            "ReadWritePaths=/var/lib/devcoordinator /run/devcoordinator /home/alice /home/bob",
-            "ReadWritePaths=/ /var/lib/devcoordinator /run/devcoordinator /home/alice /home/bob",
+            "ReadWritePaths=/var/lib/devcoordinator -/run/devcoordinator /home/alice /home/bob",
+            "ReadWritePaths=/ /var/lib/devcoordinator -/run/devcoordinator /home/alice /home/bob",
         ),
         "root filesystem write access",
     )
@@ -306,22 +304,22 @@ def main() -> int:
     )
     must_reject_source(
         source.replace(
-            "ReadWritePaths=/var/lib/devcoordinator /run/devcoordinator",
-            "ReadWritePaths=/var/lib/devcoordinator /run/devcoordinator /etc",
+            "ReadWritePaths=/var/lib/devcoordinator -/run/devcoordinator",
+            "ReadWritePaths=/var/lib/devcoordinator -/run/devcoordinator /etc",
         ),
         "source extra writable system path",
     )
     must_reject_source(
         source.replace(
-            "ReadWritePaths=/var/lib/devcoordinator /run/devcoordinator",
-            "ReadWritePaths=/ /var/lib/devcoordinator /run/devcoordinator",
+            "ReadWritePaths=/var/lib/devcoordinator -/run/devcoordinator",
+            "ReadWritePaths=/ /var/lib/devcoordinator -/run/devcoordinator",
         ),
         "source root filesystem write access",
     )
     must_reject_source(
         source.replace(
-            "ReadWritePaths=/var/lib/devcoordinator /run/devcoordinator",
-            "ReadWritePaths=/home /var/lib/devcoordinator /run/devcoordinator",
+            "ReadWritePaths=/var/lib/devcoordinator -/run/devcoordinator",
+            "ReadWritePaths=/home /var/lib/devcoordinator -/run/devcoordinator",
         ),
         "source ineffective broad home exception",
     )
@@ -353,7 +351,7 @@ def main() -> int:
         source + "\nReadWritePaths=/etc\n",
         "source second writable-path directive",
     )
-    writable = "ReadWritePaths=/var/lib/devcoordinator /run/devcoordinator"
+    writable = f"ReadWritePaths={MODULE.BASE_READ_WRITE_PATHS}"
     must_reject_source(
         source.replace(f"{writable}\n", "", 1) + f"\n{writable}\n",
         "source writable-path directive outside Service",
@@ -389,7 +387,7 @@ def main() -> int:
         "PrivateTmp=true",
         "ProtectSystem=strict",
         "ProtectHome=read-only",
-        "ReadWritePaths=/var/lib/devcoordinator /run/devcoordinator",
+        f"ReadWritePaths={MODULE.BASE_READ_WRITE_PATHS}",
     ):
         must_reject_source(
             source.replace(directive, "", 1),

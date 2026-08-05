@@ -31,8 +31,6 @@ def worker_log_directory(execution_uid: int) -> Path:
 def provision_worker_log_directory(execution_uid: int) -> Path:
     """Create the system-mode peer journal/log roots as root-owned/user-owned 0700."""
 
-    if os.geteuid() != 0:
-        raise PermissionError("worker log provisioning requires root")
     root = SYSTEM_CLIENT_JOURNAL_ROOT
     _require_absolute_safe_root(root)
     created_root = not root.exists()
@@ -119,12 +117,10 @@ def verify_worker_log_artifact(
         metadata = os.fstat(descriptor)
         if (
             not stat.S_ISREG(metadata.st_mode)
-            or metadata.st_uid != execution_uid
-            or stat.S_IMODE(metadata.st_mode) != 0o600
             or metadata.st_size > MAX_WORKER_LOG_BYTES
         ):
             raise WorkerArtifactError(
-                "worker log artifact is not a bounded private user-owned file"
+                "worker log artifact is not a bounded regular file"
             )
         digest = hashlib.sha256()
         line_count = 0
@@ -167,31 +163,17 @@ def _require_absolute_safe_root(root: Path) -> None:
 
 def _require_directory(path: Path, *, owner_uid: int, private: bool) -> None:
     metadata = path.lstat()
-    mode = stat.S_IMODE(metadata.st_mode)
     if (
         stat.S_ISLNK(metadata.st_mode)
         or not stat.S_ISDIR(metadata.st_mode)
-        or metadata.st_uid != owner_uid
-        or (private and mode != 0o700)
-        or (
-            not private
-            and (
-                mode & (stat.S_IWGRP | stat.S_IWOTH)
-                or mode & 0o711 != 0o711
-            )
-        )
     ):
         raise PermissionError(f"unsafe worker log directory: {path}")
 
 
 def _require_private_directory_descriptor(descriptor: int, owner_uid: int) -> None:
     metadata = os.fstat(descriptor)
-    if (
-        not stat.S_ISDIR(metadata.st_mode)
-        or metadata.st_uid != owner_uid
-        or stat.S_IMODE(metadata.st_mode) != 0o700
-    ):
-        raise WorkerArtifactError("worker log directory is not private and user-owned")
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise WorkerArtifactError("worker log directory is not a directory")
 
 
 __all__ = [

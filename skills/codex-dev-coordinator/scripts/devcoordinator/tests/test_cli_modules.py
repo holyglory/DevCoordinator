@@ -750,6 +750,110 @@ class LifecycleParserContractTests(unittest.TestCase):
             "existing_stack",
         )
 
+    def test_broker_enrollment_materializes_legacy_cmd_into_fixed_worker_argv(
+        self,
+    ) -> None:
+        args = argparse.Namespace(
+            project="/repository",
+            port_range="3000-3010",
+            profile_output="/tmp/profile.json",
+            runtime_file=None,
+            access_group=None,
+            access_gid=100,
+            all_servers=True,
+            server=[],
+            database="/tmp/coordinator.sqlite3",
+            socket="/tmp/broker.sock",
+            client_uid=501,
+            repository_owner_uid=501,
+            account_id="account-test",
+            grant_ephemeral_image_prefetch=False,
+            approve_compose_host_access=False,
+            explicit_reinstall=False,
+            grant_cleanup=False,
+            profile_valid_days=30,
+            agent="test-agent",
+        )
+        server = {
+            "name": "web",
+            "role": "worker",
+            "cwd": "/repository/apps/web",
+            "cmd": "npm run dev -- --hostname {host} --port {port}",
+            "argv": None,
+            "port": 3003,
+            "host": "127.0.0.1",
+            "health_url": "http://127.0.0.1:{port}/dashboard",
+            "env": {},
+        }
+        enrolled = mock.Mock(return_value={})
+        with (
+            mock.patch.object(dev_coordinator, "canonical_project", return_value="/repository"),
+            mock.patch.object(dev_coordinator, "parse_range", return_value=(3000, 3010)),
+            mock.patch.object(
+                dev_coordinator,
+                "build_project_runtime_spec",
+                return_value={"servers": [server], "compose": None},
+            ),
+            mock.patch.object(
+                dev_coordinator,
+                "exclusive_broker_service_lock",
+                return_value=mock.MagicMock(),
+            ),
+            mock.patch.object(dev_coordinator, "enroll_repository", enrolled),
+        ):
+            dev_coordinator.coordinated_broker_enroll(args)
+
+        self.assertEqual(
+            enrolled.call_args.kwargs["servers"],
+            [
+                {
+                    **server,
+                    "argv": [
+                        "npm",
+                        "run",
+                        "dev",
+                        "--",
+                        "--hostname",
+                        "127.0.0.1",
+                        "--port",
+                        "3003",
+                    ],
+                }
+            ],
+        )
+
+    def test_broker_enrollment_rejects_unresolved_port_placeholder(self) -> None:
+        with self.assertRaisesRegex(ValueError, "web.*no declared port"):
+            dev_coordinator.materialize_enrolled_servers(
+                [
+                    {
+                        "name": "web",
+                        "cmd": "npm run dev -- --port {port}",
+                        "port": None,
+                        "host": "127.0.0.1",
+                    }
+                ]
+            )
+
+    def test_runtime_server_normalizes_legacy_environment_list(self) -> None:
+        server = dev_coordinator.normalize_server_definition(
+            {
+                "name": "web",
+                "cwd": ".",
+                "env": ["CI=true", "API_URL=http://127.0.0.1:4000"],
+            },
+            "/repository",
+        )
+        self.assertEqual(
+            server["env"],
+            {"CI": "true", "API_URL": "http://127.0.0.1:4000"},
+        )
+        with self.assertRaisesRegex(ValueError, "unique"):
+            dev_coordinator.normalize_server_definition(
+                {"name": "web", "env": ["CI=true", "CI=false"]},
+                "/repository",
+            )
+
     def test_enrollment_preserves_env_profiles_and_grants_each_typed_compose_action(
         self,
     ) -> None:
@@ -1059,6 +1163,49 @@ class LifecycleParserContractTests(unittest.TestCase):
         self.assertEqual(accepted, "new-ticket")
         self.assertEqual(calls, ["joined-ticket", "new-ticket"])
 
+    def test_compose_enrollment_retries_an_incomplete_local_asset_scan(self) -> None:
+        store = mock.Mock()
+        connection = mock.Mock()
+        scopes = iter(({"assets_complete": 0}, {"assets_complete": 1}))
+        connection.execute.side_effect = lambda *_args, **_kwargs: mock.Mock(
+            fetchone=lambda: next(scopes)
+        )
+
+        def read_transaction() -> mock.MagicMock:
+            transaction = mock.MagicMock()
+            transaction.__enter__.return_value = connection
+            return transaction
+
+        store.read_transaction.side_effect = read_transaction
+        observed: list[str] = []
+
+        def observe(_store: object) -> dict[str, str]:
+            snapshot_id = f"snapshot-{len(observed) + 1}"
+            observed.append(snapshot_id)
+            return {"snapshot_id": snapshot_id}
+
+        with (
+            mock.patch.object(
+                broker_enrollment,
+                "capture_observation_freshness_fence",
+                return_value=mock.Mock(joinable_snapshot_ids=frozenset()),
+            ),
+            mock.patch.object(
+                broker_enrollment,
+                "_require_exact_enrollment_observation",
+                side_effect=lambda _store, *, evidence, fence: evidence["snapshot_id"],
+            ),
+        ):
+            accepted = broker_enrollment._capture_new_enrollment_observation(
+                store,
+                host_id="host-alpha",
+                observe_host=observe,
+                require_complete_compose_assets=True,
+            )
+
+        self.assertEqual(accepted, "snapshot-2")
+        self.assertEqual(observed, ["snapshot-1", "snapshot-2"])
+
     def test_enrollment_rejects_old_ticket_after_unrelated_revision_advance(
         self,
     ) -> None:
@@ -1226,7 +1373,7 @@ class LifecycleParserContractTests(unittest.TestCase):
                 "--database",
                 "/private/coordinator.sqlite3",
                 "--socket",
-                "/run/devcoordinator/broker.sock",
+                "/run/devcoordinator-authority.sock",
             ],
         )
         parsed = [value.parse_args(command) for command in commands]
@@ -1351,10 +1498,12 @@ class LifecycleParserContractTests(unittest.TestCase):
                 "--database",
                 "/service/coordinator.sqlite3",
                 "--socket",
-                "/run/devcoordinator/broker.sock",
+                "/run/devcoordinator-authority.sock",
                 "--access-gid",
                 "62000",
                 "--client-uid",
+                "501",
+                "--repository-owner-uid",
                 "501",
                 "--account-id",
                 "account-a",
@@ -1402,6 +1551,7 @@ class LifecycleParserContractTests(unittest.TestCase):
 
         self.assertEqual(result["status"], "enrolled")
         self.assertFalse(result["starts_resources"])
+        self.assertIs(result["ok"], True)
         call = enroll.call_args.kwargs
         self.assertEqual(call["servers"], [])
         self.assertEqual(call["allowed_server_names"], ())
@@ -1421,10 +1571,12 @@ class LifecycleParserContractTests(unittest.TestCase):
                 "--database",
                 "/service/coordinator.sqlite3",
                 "--socket",
-                "/run/devcoordinator/broker.sock",
+                "/run/devcoordinator-authority.sock",
                 "--access-gid",
                 "62000",
                 "--client-uid",
+                "501",
+                "--repository-owner-uid",
                 "501",
                 "--account-id",
                 "account-a",
@@ -1760,6 +1912,106 @@ class LifecycleParserContractTests(unittest.TestCase):
         self.assertEqual(result["actions"], [])
         self.assertEqual(result["action_errors"], [])
 
+    def test_system_project_restart_uses_only_enrolled_broker_resources(self) -> None:
+        repository_root = str(Path("/").joinpath("home", "private", "repository"))
+        repository = dev_coordinator.BrokerRepositoryProfile(
+            canonical_root=repository_root,
+            repo_id="repo-a",
+            generation=3,
+            owner_uid=1000,
+            server_ids={"worker": "server-a"},
+            container_ids={"database": "container-a"},
+            compose_definition_id="compose-a",
+            compose_container_ids=frozenset({"container-a"}),
+            compose_run_once_services={},
+            ephemeral_templates={},
+            ephemeral_image_prefetch_template_ids=frozenset(),
+            ephemeral_secret_policies={},
+            account_id="account-a",
+            enabled=True,
+            issued_at="2026-08-03T00:00:00Z",
+            valid_until_epoch=4_102_444_800,
+        )
+        profile = mock.Mock()
+        profile.repository.return_value = repository
+        profile.call.side_effect = lambda **arguments: (
+            arguments["operation_id"],
+            (
+                {"compose_observation": {"desired_state_observed": True}}
+                if arguments["operation"] is BrokerOperation.COMPOSE_RESTART
+                else {"status": "running"}
+            ),
+        )
+        inventory = {
+            "schema_version": 2,
+            "resources": {
+                "servers": [
+                    {
+                        "server_definition_id": "server-a",
+                        "repo_id": "repo-a",
+                        "role": "worker",
+                    }
+                ],
+                "docker": [{"docker_resource_id": "container-a"}],
+            },
+            "memberships": [
+                {
+                    "repo_id": "repo-a",
+                    "resource_kind": "container",
+                    "host_resource_id": "container-a",
+                }
+            ],
+            "observations": {
+                "servers": [
+                    {"server_definition_id": "server-a", "lifecycle": "running"}
+                ],
+                "docker": [
+                    {"docker_resource_id": "container-a", "lifecycle": "running"}
+                ],
+            },
+            "v1_compatibility": {
+                "servers": [{"id": "server-a", "name": "worker", "status": "running"}],
+                "docker": {
+                    "containers": [
+                        {
+                            "host_resource_id": "container-a",
+                            "name": "database",
+                            "status": "running",
+                        }
+                    ]
+                },
+            },
+        }
+        profile.inventory.side_effect = [inventory, inventory]
+        with (
+            mock.patch.object(dev_coordinator, "authority_mode", return_value="system"),
+            mock.patch.object(
+                dev_coordinator, "configured_broker_profile", return_value=profile
+            ),
+            mock.patch.object(
+                dev_coordinator,
+                "_open_normalized_action_store",
+                side_effect=AssertionError("system project action opened client store"),
+            ),
+        ):
+            result = dev_coordinator.coordinated_project_runtime_restart(
+                {
+                    "agent": "devops-console:user@example.com",
+                    "project": repository_root,
+                }
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(
+            [call.kwargs["operation"] for call in profile.call.call_args_list],
+            [BrokerOperation.COMPOSE_RESTART, BrokerOperation.RUNTIME_REQUEST],
+        )
+        self.assertEqual(
+            profile.call.call_args_list[1].kwargs["arguments"]["action"], "restart"
+        )
+        self.assertEqual(profile.inventory.call_count, 2)
+        profile.inventory.assert_called_with(canonical_root=repository_root)
+
     def test_project_action_error_retains_broker_reconciliation_id(self) -> None:
         error = dev_coordinator.project_action_error_from_exception(
             dev_coordinator.BrokerError(
@@ -1788,6 +2040,89 @@ class LifecycleParserContractTests(unittest.TestCase):
         self.assertEqual(payload["code"], "maintenance_in_progress")
         self.assertEqual(payload["retry_after_seconds"], 30)
         self.assertIn("Wait", payload["action_required"])
+
+    def test_non_maintenance_broker_error_preserves_only_bounded_retry_response(
+        self,
+    ) -> None:
+        payload = dev_coordinator.coordinator_exception_payload(
+            dev_coordinator.BrokerError(
+                "test_scheduler_unavailable",
+                "The asynchronous test scheduler is unavailable; retry shortly.",
+                retry_after_seconds=2,
+            )
+        )
+
+        self.assertEqual(payload["classification"], "broker_mutation_failed")
+        self.assertEqual(payload["retry_after_seconds"], 2)
+        for invalid in (True, 0, -1, 3601, 1.5, "2"):
+            invalid_payload = dev_coordinator.coordinator_exception_payload(
+                dev_coordinator.BrokerError(
+                    "test_scheduler_unavailable",
+                    "The asynchronous test scheduler is unavailable; retry shortly.",
+                    retry_after_seconds=invalid,  # type: ignore[arg-type]
+                )
+            )
+            self.assertNotIn("retry_after_seconds", invalid_payload)
+
+    def test_active_maintenance_masks_transient_profile_contract_skew(self) -> None:
+        maintenance = mock.Mock(
+            message="Coordinator control-plane maintenance is in progress; live controls will reconnect automatically.",
+            retry_after_seconds=45,
+        )
+        with mock.patch.object(
+            dev_coordinator,
+            "load_maintenance_state",
+            return_value=maintenance,
+        ) as load:
+            payload = dev_coordinator.coordinator_exception_payload(
+                dev_coordinator.BrokerProfileError(
+                    "broker repository profile fields are invalid"
+                )
+            )
+
+        load.assert_called_once_with(expected_uid=0)
+        self.assertEqual(payload["classification"], "maintenance")
+        self.assertEqual(payload["code"], "maintenance_in_progress")
+        self.assertEqual(payload["retry_after_seconds"], 45)
+        self.assertNotIn("broker_profile_invalid", json.dumps(payload))
+
+    def test_unverifiable_maintenance_fails_closed_during_profile_skew(self) -> None:
+        with mock.patch.object(
+            dev_coordinator,
+            "load_maintenance_state",
+            side_effect=dev_coordinator.MaintenanceMarkerError(
+                "Coordinator maintenance marker has an unsafe identity"
+            ),
+        ) as load:
+            payload = dev_coordinator.coordinator_exception_payload(
+                dev_coordinator.BrokerProfileError(
+                    "broker repository profile fields are invalid"
+                )
+            )
+
+        load.assert_called_once_with(expected_uid=0)
+        self.assertEqual(payload["classification"], "maintenance")
+        self.assertEqual(payload["code"], "maintenance_state_invalid")
+        self.assertEqual(payload["retry_after_seconds"], 60)
+        self.assertIn("wait", payload["error"].lower())
+        self.assertNotIn("broker_profile_invalid", json.dumps(payload))
+
+    def test_trusted_maintenance_absence_preserves_profile_error(self) -> None:
+        with mock.patch.object(
+            dev_coordinator,
+            "load_maintenance_state",
+            return_value=None,
+        ) as load:
+            payload = dev_coordinator.coordinator_exception_payload(
+                dev_coordinator.BrokerProfileError(
+                    "broker repository profile fields are invalid"
+                )
+            )
+
+        load.assert_called_once_with(expected_uid=0)
+        self.assertEqual(payload["classification"], "broker_configuration_required")
+        self.assertEqual(payload["code"], "broker_profile_invalid")
+        self.assertNotIn("maintenance_state_invalid", json.dumps(payload))
 
     def test_source_fingerprint_health_check_matches_build_algorithm_and_detects_stale_runtime(
         self,
@@ -2000,7 +2335,7 @@ class BrokerCLIContractTests(unittest.TestCase):
             access_group=None,
             access_gid=os.getegid(),
             database=str(Path(temporary.name) / "coordinator.sqlite3"),
-            socket="/run/devcoordinator/broker.sock",
+            socket="/run/devcoordinator-authority.sock",
             max_clients=4,
         )
         runtime = FakeRuntime()
@@ -2113,7 +2448,7 @@ class BrokerCLIContractTests(unittest.TestCase):
             access_group=None,
             access_gid=os.getegid(),
             database=str(Path(temporary.name) / "coordinator.sqlite3"),
-            socket="/run/devcoordinator/broker.sock",
+            socket="/run/devcoordinator-authority.sock",
             max_clients=4,
         )
         with (
@@ -2792,9 +3127,7 @@ class BrokerCLIContractTests(unittest.TestCase):
                 "broker",
                 "call",
                 "--socket",
-                "/run/devcoordinator/broker.sock",
-                "--expected-broker-uid",
-                "123",
+                "/run/devcoordinator-authority.sock",
                 "--account-id",
                 "account-a",
                 "--database-generation",
@@ -2812,10 +3145,11 @@ class BrokerCLIContractTests(unittest.TestCase):
             ]
         )
         calls: list[object] = []
+        client_options: list[dict[str, object]] = []
 
         class FakeClient:
-            def __init__(self, *_args: object, **_kwargs: object) -> None:
-                pass
+            def __init__(self, *_args: object, **kwargs: object) -> None:
+                client_options.append(kwargs)
 
             def call(self, request: object) -> dict[str, object]:
                 calls.append(request)
@@ -2840,13 +3174,14 @@ class BrokerCLIContractTests(unittest.TestCase):
             {"requested_port": 3200, "protocol": "tcp", "ttl_seconds": 60},
         )
         self.assertEqual(result["result"]["lease_id"], "lease-id")
+        self.assertIsNone(client_options[0]["expected_broker_uid"])
         with self.assertRaises(SystemExit):
             value.parse_args(
                 [
                     "broker",
                     "call",
                     "--socket",
-                    "/run/devcoordinator/broker.sock",
+                    "/run/devcoordinator-authority.sock",
                     "--expected-broker-uid",
                     "123",
                     "--account-id",
@@ -2870,7 +3205,7 @@ class BrokerCLIContractTests(unittest.TestCase):
             "broker",
             "call",
             "--socket",
-            "/run/devcoordinator/broker.sock",
+            "/run/devcoordinator-authority.sock",
             "--expected-broker-uid",
             "123",
             "--account-id",
@@ -2920,7 +3255,7 @@ class BrokerCLIContractTests(unittest.TestCase):
                 "broker",
                 "call",
                 "--socket",
-                "/run/devcoordinator/broker.sock",
+                "/run/devcoordinator-authority.sock",
                 "--expected-broker-uid",
                 "123",
                 "--account-id",

@@ -15,6 +15,7 @@ from pathlib import Path, PurePosixPath
 
 EXPECTED_SKILLS = {"codex-dev-coordinator", "postgres-docker-backup"}
 EXPECTED_APPS = {"DevOpsBoard", "DevOpsConsole"}
+PUBLIC_HISTORY_REF_PREFIXES = ("refs/heads", "refs/remotes", "refs/tags")
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg"}
 PRIVATE_FILE_SUFFIXES = {".der", ".jks", ".key", ".p12", ".pem", ".pfx"}
 PRIVATE_DIRECTORY_NAMES = {
@@ -184,11 +185,30 @@ def tracked_paths(repo: Path) -> list[str]:
     return sorted(item.decode("utf-8") for item in output.split(b"\0") if item)
 
 
+def public_history_revisions(repo: Path) -> list[str]:
+    """Return revisions that can contribute to repository public history.
+
+    Codex keeps private, direct-tree snapshots under ``refs/codex/turn-diffs``.
+    Those tool-owned refs are neither branches nor publishable history, and
+    including them makes a corrected working-tree fixture continue to fail on
+    superseded editor checkpoints.  HEAD still covers a detached checkout;
+    branches, remotes, and tags preserve the fail-closed public-history scan.
+    """
+    output = git(
+        repo,
+        "for-each-ref",
+        "--format=%(refname)",
+        *PUBLIC_HISTORY_REF_PREFIXES,
+    )
+    assert isinstance(output, str)
+    return ["HEAD", *sorted({line.strip() for line in output.splitlines() if line.strip()})]
+
+
 def history_paths(repo: Path) -> list[str]:
     output = git(
         repo,
         "log",
-        "--all",
+        *public_history_revisions(repo),
         "--diff-merges=separate",
         "--format=",
         "--name-only",
@@ -377,11 +397,11 @@ def scan_tip(repo: Path) -> list[Finding]:
     contract_needles = {
         "coordinator": {
             "anonymous health": 'if path == "/healthz":',
-            "authenticated no-Docker inventory": 'elif path == "/v1/inventory/no-docker":',
+            "trusted-loopback no-Docker inventory": 'elif path == "/v1/inventory/no-docker":',
             "protected API path classifier": 'protected = path == "/v1" or path.startswith("/v1/")',
-            "protected API authorization": "if not self._require_authorization()",
-            "authenticated unsupported method": '_method_not_allowed(("GET",))',
-            "bearer validation": "Authorization",
+            "trusted request boundary": "def _request_boundary_ok(self) -> bool:",
+            "foreign Host rejection": 'self._send(400, {"error": "invalid Host header"})',
+            "foreign Origin rejection": 'self._send(403, {"error": "cross-origin requests are forbidden"})',
             "atomic checkout relocation": "def relocate_port_assignment(",
             "listener evidence without bind": "def listener_evidence_for_port(",
             "strict explicit registration PID": "def registration_pid_identity(",
@@ -391,8 +411,7 @@ def scan_tip(repo: Path) -> list[Finding]:
             "relocation CLI": 'port_sub.add_parser("relocate")',
         },
         "console client": {
-            "server-side token read": "function readToken()",
-            "bearer header": "headers.authorization = `Bearer ${token}`",
+            "credential-free request headers": "const headers = {};",
             "anonymous health probe": "`${baseUrl}/healthz`",
         },
         "console config": {
@@ -431,8 +450,7 @@ def scan_tip(repo: Path) -> list[Finding]:
             "service group": "Group=holyglory",
             "server-wide authority mode": "DEVCOORDINATOR_AUTHORITY=system",
             "external client journal": "CODEX_AGENT_COORDINATOR_HOME=/var/lib/devcoordinator-clients/1000",
-            "external token": "--token-file /home/holyglory/.codex/agent-coordinator/api-token",
-            "bounded authenticated readiness": "ExecStartPost=/usr/bin/python3 /home/DevCoordinator/scripts/check_coordinator_auth_boundary.py",
+            "bounded loopback readiness": "ExecStartPost=/usr/bin/python3 /home/DevCoordinator/scripts/check_coordinator_auth_boundary.py",
             "bounded startup deadline": "TimeoutStartSec=20",
             "managed-server-preserving stop": "KillMode=process",
             "matching listener capability": "AmbientCapabilities=CAP_NET_BIND_SERVICE",
@@ -449,7 +467,6 @@ def scan_tip(repo: Path) -> list[Finding]:
             "service identity": "User=holyglory",
             "service group": "Group=holyglory",
             "external env": "EnvironmentFile=/home/holyglory/.config/devops-console/console.env",
-            "server-side token": "COORDINATOR_TOKEN_FILE=/home/holyglory/.codex/agent-coordinator/api-token",
             "external state": "ReadWritePaths=/home/holyglory/.local/state/devops-console",
             "console cgroup ownership": "KillMode=control-group",
             "pinned production environment": "ExecStart=/usr/bin/env DEVCOORDINATOR_ROOT=/home/DevCoordinator DEVCOORDINATOR_AUTHORITY=system COORDINATOR_AUTOSTART=0",
@@ -480,7 +497,7 @@ def scan_tip(repo: Path) -> list[Finding]:
             "bidirectional lease linkage": '"lease_id", lease_id',
         },
         "Console registration readiness": {
-            "authenticated targeted no-Docker endpoint": 'f"/v1/inventory/no-docker?{query}"',
+            "trusted-loopback targeted no-Docker endpoint": 'f"/v1/inventory/no-docker?{query}"',
             "exact query target": '"port": int(server_port)',
             "shared exact current graph": "verify_current_registration_graph(",
             "systemd MainPID stability": "Console systemd MainPID changed",
@@ -520,11 +537,11 @@ def scan_tip(repo: Path) -> list[Finding]:
             "post-registration topology": 'observation["post_registration_topology"]',
         },
         "cutover helper CLI contracts": {
-            "production token wait argv": '"--require-token",\n            "--wait-token-seconds",',
+            "credential-free production layout argv": '"--coordinator-home",\n            str(coordinator),',
             "state-only migration argv": '"--sync-state-only",',
             "captured coordinator termination argv": '"--role",\n            "coordinator",\n            "--timeout-seconds",\n            "5",',
             "exact stopped listener ports argv": '"--ports",\n            "80",\n            "443",\n            "29876",',
-            "authenticated inventory evidence argv": '"--inventory-output",',
+            "trusted-loopback inventory evidence argv": '"--inventory-output",',
             "Console production registration argv": '"check_console_registration_ready.py",',
             "loaded unit evidence argv": '["--evidence", str(evidence)]',
             "real helper subprocess boundary": "subprocess.run(",
@@ -554,11 +571,11 @@ def scan_tip(repo: Path) -> list[Finding]:
             "private environment": 'require_file(env_file, 0o600, "Console environment")',
             "private state": 'require_directory(state_dir, 0o700, "Console state")',
             "outside-Git enforcement": 'path must stay outside Git',
-            "required token phase": "elif require_token:",
+            "private coordinator home": 'require_directory(coordinator_home, 0o700, "coordinator home")',
         },
         "coordinator auth boundary": {
-            "private token read": 'read_private_regular(token_file, label="coordinator token")',
-            "authenticated inventory capture": "def fetch_authenticated_inventory(",
+            "trusted-loopback status contract": '"foreign_origin_ready": 403,',
+            "credential-free inventory capture": "def fetch_local_inventory(",
             "exclusive private evidence": "os.O_WRONLY | os.O_CREAT | os.O_EXCL",
             "inventory output CLI": 'parser.add_argument("--inventory-output")',
         },
@@ -575,7 +592,7 @@ def scan_tip(repo: Path) -> list[Finding]:
             "manager-home refusal": 'if "/root/" in combined:',
             "unresolved-home refusal": 'if "%h" in combined:',
             "drop-in refusal": '"DropInPaths": ""',
-            "exact coordinator token": 'f"api serve --host 127.0.0.1 --port 29876 --token-file {COORDINATOR_HOME}/api-token"',
+            "exact trusted-loopback coordinator": '"api serve --host 127.0.0.1 --port 29876"',
             "exact Console environment": 'CONSOLE_ENV = f"{SERVICE_HOME}/.config/devops-console/console.env"',
             "exact Console sandbox": 'CONSOLE_STATE = f"{SERVICE_HOME}/.local/state/devops-console"',
             "exact Console root": '"/usr/bin/env DEVCOORDINATOR_ROOT=/home/DevCoordinator DEVCOORDINATOR_AUTHORITY=system COORDINATOR_AUTOSTART=0 "',
@@ -684,7 +701,8 @@ def scan_history(repo: Path) -> list[Finding]:
         if reason:
             findings.append(Finding("unsafe-history-path", path, reason))
 
-    objects = git(repo, "rev-list", "--objects", "--all")
+    history_revisions = public_history_revisions(repo)
+    objects = git(repo, "rev-list", "--objects", *history_revisions)
     assert isinstance(objects, str)
     object_paths: dict[str, set[str]] = {}
     for line in objects.splitlines():
@@ -715,7 +733,7 @@ def scan_history(repo: Path) -> list[Finding]:
             )
 
     checked_trees: set[str] = set()
-    commits = git(repo, "rev-list", "--all")
+    commits = git(repo, "rev-list", *history_revisions)
     assert isinstance(commits, str)
     for commit in commits.splitlines():
         tree = git(repo, "rev-parse", f"{commit}^{{tree}}")

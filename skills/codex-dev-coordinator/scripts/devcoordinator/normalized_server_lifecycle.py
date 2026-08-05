@@ -1898,6 +1898,16 @@ class NormalizedServerLifecycle:
                 raise NormalizedLifecycleConflict(
                     "server changed while host health was observed; retry status"
                 )
+            pending_lifecycle = self._pending_server_lifecycle_operation(
+                connection, server_definition_id
+            )
+            if pending_lifecycle is not None:
+                # Status is passive evidence.  A start/stop transaction owns
+                # this row until its terminal commit, so a concurrent status
+                # sample must never replace ``starting``/``stopping`` or its
+                # exact process identity.  Return the current projection and
+                # let the operation commit the observed boundary.
+                return self._server_payload(connection, row)
             prior_lifecycle = str(row["lifecycle"] or "unobserved")
             identity = health.get("identity") or {}
             unobservable = self._listener_observable(health) == 0
@@ -3073,6 +3083,29 @@ class NormalizedServerLifecycle:
                 timestamp,
             ),
         )
+
+    @staticmethod
+    def _pending_server_lifecycle_operation(
+        connection: sqlite3.Connection, definition_id: str
+    ) -> tuple[str, str] | None:
+        row = connection.execute(
+            """
+            SELECT operation.operation_id, operation.kind
+            FROM operations operation
+            JOIN operation_targets target USING(operation_id)
+            WHERE operation.status = 'running'
+              AND operation.kind IN ('server.start', 'server.stop')
+              AND target.target_kind = 'server'
+              AND target.target_id = ?
+              AND target.status = 'running'
+            ORDER BY operation.created_at DESC, operation.operation_id
+            LIMIT 1
+            """,
+            (definition_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return str(row["operation_id"]), str(row["kind"])
 
     @staticmethod
     def _require_no_pending_server_operation(

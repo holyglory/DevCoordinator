@@ -1,0 +1,16 @@
+[Unit]
+Description=DevCoordinator stable authority socket
+
+[Socket]
+ListenStream=/run/devcoordinator-authority.sock
+Accept=no
+Service=devcoordinator-authority.service
+FileDescriptorName=authority
+SocketUser=root
+SocketMode=0666
+DirectoryMode=0755
+Backlog=256
+RemoveOnStop=no
+
+[Install]
+WantedBy=sockets.target

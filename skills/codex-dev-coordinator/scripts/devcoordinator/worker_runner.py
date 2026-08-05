@@ -89,6 +89,11 @@ class WorkerAuthority(Protocol):
     def active_attempt(self, *, worker_id: str) -> Mapping[str, Any] | None:
         ...
 
+    def read_attempt(
+        self, *, worker_id: str, attempt_id: str
+    ) -> Mapping[str, Any]:
+        ...
+
     def launch_candidate(self, *, worker_id: str) -> Mapping[str, Any]:
         ...
 
@@ -141,6 +146,17 @@ class DirectWorkerAuthority:
                 return None
             attempt = dict(self.supervision.attempt(str(attempt_id)))
             attempt["execution_uid"] = policy["execution_uid"]
+            return attempt
+        except (WorkerCircuitOpen, WorkerNotConfigured, WorkerSupervisionConflict) as error:
+            raise self._blocked(error) from error
+
+    def read_attempt(self, *, worker_id: str, attempt_id: str) -> Mapping[str, Any]:
+        try:
+            attempt = self.supervision.attempt(attempt_id)
+            if str(attempt.get("server_definition_id") or "") != worker_id:
+                raise WorkerSupervisionConflict(
+                    "worker attempt belongs to another worker"
+                )
             return attempt
         except (WorkerCircuitOpen, WorkerNotConfigured, WorkerSupervisionConflict) as error:
             raise self._blocked(error) from error
@@ -563,8 +579,6 @@ class WorkerLogCapture:
             before = os.fstat(self._file_fd)
             if (
                 not stat.S_ISREG(before.st_mode)
-                or before.st_uid != os.geteuid()
-                or stat.S_IMODE(before.st_mode) != 0o600
                 or before.st_size > self.maximum_bytes
             ):
                 os.close(self._file_fd)
@@ -649,15 +663,9 @@ class WorkerExitJournal:
         flags |= getattr(os, "O_NOFOLLOW", 0)
         descriptor = os.open(self.root, flags)
         metadata = os.fstat(descriptor)
-        if (
-            not stat.S_ISDIR(metadata.st_mode)
-            or metadata.st_uid != self.effective_uid
-            or stat.S_IMODE(metadata.st_mode) != 0o700
-        ):
+        if not stat.S_ISDIR(metadata.st_mode):
             os.close(descriptor)
-            raise WorkerRunnerError(
-                "worker reconciliation directory is not private and user-owned"
-            )
+            raise WorkerRunnerError("worker reconciliation path is not a directory")
         return descriptor
 
     def _read_document(self, name: str, *, directory_fd: int) -> dict[str, Any]:
@@ -672,13 +680,10 @@ class WorkerExitJournal:
             before = os.fstat(descriptor)
             if (
                 not stat.S_ISREG(before.st_mode)
-                or before.st_uid != self.effective_uid
-                or stat.S_IMODE(before.st_mode) != 0o600
-                or before.st_nlink != 1
                 or not 1 <= before.st_size <= WORKER_PENDING_EXIT_MAX_BYTES
             ):
                 raise WorkerRunnerError(
-                    "worker reconciliation record is not a bounded private file"
+                    "worker reconciliation record is not a bounded regular file"
                 )
             chunks: list[bytes] = []
             remaining = int(before.st_size)
@@ -811,13 +816,10 @@ class WorkerExitJournal:
             before = os.fstat(descriptor)
             if (
                 not stat.S_ISREG(before.st_mode)
-                or before.st_uid != self.effective_uid
-                or stat.S_IMODE(before.st_mode) != 0o600
-                or before.st_nlink != 1
                 or before.st_size > WORKER_LOG_MAX_BYTES
             ):
                 raise WorkerRunnerError(
-                    "pending worker log artifact is not a bounded private file"
+                    "pending worker log artifact is not a bounded regular file"
                 )
             digest = hashlib.sha256()
             line_count = 0
@@ -1308,6 +1310,14 @@ class BrokerWorkerAuthority:
         attempt["execution_uid"] = self.execution_uid
         return attempt
 
+    def read_attempt(self, *, worker_id: str, attempt_id: str) -> Mapping[str, Any]:
+        if _canonical_uuid("worker_id", worker_id) != self.worker_id:
+            raise WorkerAuthorityBlocked("broker authority belongs to another worker")
+        return self._read_attempt(
+            attempt_id=attempt_id,
+            states=frozenset({"reserved", "running", "exited"}),
+        )
+
     def launch_candidate(self, *, worker_id: str) -> Mapping[str, Any]:
         if _canonical_uuid("worker_id", worker_id) != self.worker_id:
             raise WorkerAuthorityBlocked("broker authority belongs to another worker")
@@ -1591,16 +1601,24 @@ class WorkerRunner:
         worker_id: str,
         attempt_id: str,
         exit_report_id: str,
+        allow_authoritative_fence: bool = False,
     ) -> dict[str, Any]:
         if not isinstance(acknowledgement, Mapping):
             raise WorkerRunnerError(
                 "authority returned invalid worker exit acknowledgement"
             )
         result = dict(acknowledgement)
+        exact_report = result.get("exit_report_id") == exit_report_id
+        authoritative_fence = (
+            allow_authoritative_fence
+            and result.get("exit_kind") == "supervisor_lost"
+            and result.get("exit_classification") == "stale_generation"
+            and result.get("exit_decision_known") is True
+        )
         if (
             result.get("server_definition_id") != worker_id
             or result.get("attempt_id") != attempt_id
-            or result.get("exit_report_id") != exit_report_id
+            or not (exact_report or authoritative_fence)
             or result.get("state") != "exited"
             or type(result.get("restart_allowed")) is not bool
         ):
@@ -1608,6 +1626,43 @@ class WorkerRunner:
                 "authority did not acknowledge the exact worker exit and restart decision"
             )
         return result
+
+    def _authoritative_fence_acknowledgement(
+        self,
+        *,
+        worker_id: str,
+        document: Mapping[str, Any],
+    ) -> Mapping[str, Any] | None:
+        """Accept only a manager fence that closed this exact pending attempt.
+
+        A broker restart can stop an old native runner and durably finalize the
+        attempt before that runner can replay its private exit journal. The
+        journal must not overwrite the manager's immutable fence evidence, but
+        it can be acknowledged once the authority proves the exact stale
+        attempt and its restart decision.
+        """
+
+        try:
+            candidate = self.authority.read_attempt(
+                worker_id=worker_id,
+                attempt_id=str(document["attempt_id"]),
+            )
+            acknowledged = self._validate_attempt(
+                candidate, worker_id=worker_id, state={"exited"}
+            )
+        except (WorkerAuthorityBlocked, WorkerCandidateError):
+            return None
+        if (
+            acknowledged.get("supervisor_epoch") != document["supervisor_epoch"]
+            or acknowledged.get("supervisor_generation")
+            != document["supervisor_generation"]
+            or acknowledged.get("exit_kind") != "supervisor_lost"
+            or acknowledged.get("exit_classification") != "stale_generation"
+            or acknowledged.get("exit_decision_known") is not True
+            or type(acknowledged.get("restart_allowed")) is not bool
+        ):
+            return None
+        return acknowledged
 
     def _record_exit_durably(
         self,
@@ -1669,20 +1724,29 @@ class WorkerRunner:
             "supervisor_epoch": document["supervisor_epoch"],
             "supervisor_generation": document["supervisor_generation"],
         }
-        acknowledgement = self._persist_exit(
-            attempt=attempt,
-            exit_report_id=str(document["exit_report_id"]),
-            exit_kind=str(document["exit_kind"]),
-            exit_code=document["exit_code"],
-            exit_signal=document["exit_signal"],
-            artifact=artifact,
-            occurred_at_epoch=float(document["occurred_at_epoch"]),
-        )
+        try:
+            acknowledgement = self._persist_exit(
+                attempt=attempt,
+                exit_report_id=str(document["exit_report_id"]),
+                exit_kind=str(document["exit_kind"]),
+                exit_code=document["exit_code"],
+                exit_signal=document["exit_signal"],
+                artifact=artifact,
+                occurred_at_epoch=float(document["occurred_at_epoch"]),
+            )
+        except WorkerAuthorityBlocked:
+            acknowledgement = self._authoritative_fence_acknowledgement(
+                worker_id=worker_id,
+                document=document,
+            )
+            if acknowledgement is None:
+                raise
         result = self._validate_exit_acknowledgement(
             acknowledgement,
             worker_id=worker_id,
             attempt_id=str(document["attempt_id"]),
             exit_report_id=str(document["exit_report_id"]),
+            allow_authoritative_fence=True,
         )
         self.exit_journal.acknowledge(document)
         artifacts.append(_artifact_with_link(artifact))

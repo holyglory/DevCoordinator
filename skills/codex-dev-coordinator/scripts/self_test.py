@@ -147,7 +147,6 @@ def request_http(
     path: str,
     *,
     payload: dict | None = None,
-    token: str | None = None,
     headers: dict[str, str] | None = None,
     expected_status: int = 200,
 ) -> tuple[dict[str, str], bytes]:
@@ -156,8 +155,6 @@ def request_http(
     request_headers = dict(headers or {})
     if payload is not None:
         request_headers.setdefault("Content-Type", "application/json")
-    if token:
-        request_headers["Authorization"] = f"Bearer {token}"
     conn.request(method, path, body=body, headers=request_headers)
     response = conn.getresponse()
     response_headers = {name.lower(): value for name, value in response.getheaders()}
@@ -177,7 +174,6 @@ def request_json(
     path: str,
     *,
     payload: dict | None = None,
-    token: str | None = None,
     headers: dict[str, str] | None = None,
     expected_status: int = 200,
 ) -> dict | list:
@@ -186,7 +182,6 @@ def request_json(
         method,
         path,
         payload=payload,
-        token=token,
         headers=headers,
         expected_status=expected_status,
     )
@@ -194,14 +189,14 @@ def request_json(
     return data
 
 
-def post_json(port: int, path: str, payload: dict, *, token: str | None = None) -> dict:
-    result = request_json(port, "POST", path, payload=payload, token=token)
+def post_json(port: int, path: str, payload: dict) -> dict:
+    result = request_json(port, "POST", path, payload=payload)
     check(isinstance(result, dict), f"POST {path} should return an object")
     return result
 
 
-def get_json(port: int, path: str, *, token: str | None = None) -> dict | list:
-    return request_json(port, "GET", path, token=token)
+def get_json(port: int, path: str) -> dict | list:
+    return request_json(port, "GET", path)
 
 
 def wait_for_api(process: subprocess.Popen[str], port: int) -> None:
@@ -1898,7 +1893,7 @@ def main() -> int:
             "docker register",
             "try the default port",
             "ephemeral start",
-            "test run",
+            "test plan",
             "api.profile_reloaded",
         ):
             check(needle in skill_text, f"SKILL.md should retain the minimal runtime contract: {needle}")
@@ -4685,13 +4680,13 @@ else:
             env=fake_env,
         )
         wait_for_api(api_process, api_port)
-        token_file = Path(fake_env["CODEX_AGENT_COORDINATOR_HOME"]) / "api-token"
-        check(token_file.exists(), "API startup must create a local bearer-token file")
-        api_token = token_file.read_text(encoding="utf-8").strip()
-        check(len(api_token) >= 32, "API bearer token must have sufficient entropy")
-        check(stat.S_IMODE(token_file.stat().st_mode) == 0o600, "API token file must be mode 0600")
+        legacy_credential = Path(fake_env["CODEX_AGENT_COORDINATOR_HOME"]) / "api-token"
+        check(
+            not legacy_credential.exists(),
+            "trusted-loopback API startup must not create the removed shared-credential artifact",
+        )
         health = get_json(api_port, "/healthz")
-        check(set(health) == {"ok", "service", "version"}, "anonymous health must not disclose coordinator state")
+        check(set(health) == {"ok", "service", "version"}, "health must not disclose coordinator state")
         health_get_headers, health_get_body = request_http(api_port, "GET", "/healthz")
         health_head_headers, health_head_body = request_http(api_port, "HEAD", "/healthz")
         check(not health_head_body, "HEAD /healthz must return headers only")
@@ -4701,10 +4696,10 @@ else:
             "HEAD /healthz must advertise the same representation length as GET without sending a body",
         )
 
-        # Authentication is a route boundary, not an accident of the two
-        # methods with product handlers. Real clients, scanners, and mistaken
-        # integrations send other standard methods; BaseHTTPRequestHandler's
-        # inherited 501 path must never run before /v1 authorization.
+        # The trusted-loopback transport is a route boundary, not an accident
+        # of the two methods with product handlers. Real clients, scanners, and
+        # mistaken integrations send other standard methods; the inherited
+        # HTML 501 path must never bypass the JSON method contract.
         protected_method_matrix = (
             ("POST", "/v1/state", "GET"),
             ("GET", "/v1/projects/status", "POST"),
@@ -4716,45 +4711,27 @@ else:
             ("PROPFIND", "/v1/state", "GET"),
         )
         for method, path, allowed_method in protected_method_matrix:
-            anonymous_headers, anonymous_body = request_http(
+            method_headers, method_body = request_http(
                 api_port,
                 method,
                 path,
-                expected_status=401,
-            )
-            check(
-                anonymous_headers.get("www-authenticate") == 'Bearer realm="codex-dev-coordinator"',
-                f"anonymous {method} {path} must receive the bearer challenge",
-            )
-            if method == "HEAD":
-                check(not anonymous_body, "HEAD responses must not include a body")
-            else:
-                check(
-                    json.loads(anonymous_body.decode("utf-8")).get("error") == "unauthorized",
-                    f"anonymous {method} {path} must fail at the auth boundary",
-                )
-
-            authenticated_headers, authenticated_body = request_http(
-                api_port,
-                method,
-                path,
-                token=api_token,
                 expected_status=405,
             )
             check(
-                authenticated_headers.get("allow") == allowed_method,
-                f"authenticated {method} {path} must advertise {allowed_method} as the allowed method",
+                method_headers.get("allow") == allowed_method
+                and "www-authenticate" not in method_headers,
+                f"trusted-loopback {method} {path} must advertise {allowed_method} without a credential challenge",
             )
             if method == "HEAD":
-                check(not authenticated_body, "authenticated HEAD error responses must not include a body")
                 check(
-                    int(authenticated_headers.get("content-length") or 0) > 0,
-                    "authenticated HEAD 405 must describe the body a non-HEAD request would receive",
+                    not method_body
+                    and int(method_headers.get("content-length") or 0) > 0,
+                    "trusted-loopback HEAD 405 must describe but not send the JSON body",
                 )
             else:
                 check(
-                    json.loads(authenticated_body.decode("utf-8")).get("error") == "method not allowed",
-                    f"authenticated {method} {path} must receive a JSON 405",
+                    json.loads(method_body.decode("utf-8")).get("error") == "method not allowed",
+                    f"trusted-loopback {method} {path} must receive a JSON 405",
                 )
 
         health_put_headers, health_put_body = request_http(
@@ -4766,7 +4743,7 @@ else:
         check(
             health_put_headers.get("allow") == "GET, HEAD"
             and json.loads(health_put_body.decode("utf-8")).get("error") == "method not allowed",
-            "anonymous health must allow only GET and HEAD",
+            "health must allow only GET and HEAD",
         )
         outside_headers, outside_body = request_http(
             api_port,
@@ -4786,15 +4763,27 @@ else:
             expected_status=404,
         )
         check(not outside_head_body, "non-v1 HEAD 404 must not include a body")
-        unauthorized = request_json(api_port, "GET", "/v1/state", expected_status=401)
-        check(unauthorized.get("error") == "unauthorized", "protected API state must reject missing bearer credentials")
-        wrong_token = request_json(api_port, "GET", "/v1/state", token="definitely-not-the-token", expected_status=401)
-        check(wrong_token.get("error") == "unauthorized", "protected API state must reject incorrect bearer credentials")
+        state_headers, state_body = request_http(api_port, "GET", "/v1/state")
+        trusted_state = json.loads(state_body.decode("utf-8"))
+        check(
+            isinstance(trusted_state.get("history"), list)
+            and "www-authenticate" not in state_headers,
+            "trusted-loopback /v1 reads must succeed without a shared credential or challenge",
+        )
+        same_origin_state = request_json(
+            api_port,
+            "GET",
+            "/v1/state",
+            headers={"Origin": f"http://127.0.0.1:{api_port}"},
+        )
+        check(
+            isinstance(same_origin_state.get("history"), list),
+            "exact loopback browser origins must remain inside the trusted transport boundary",
+        )
         invalid_host = request_json(
             api_port,
             "GET",
             "/v1/state",
-            token=api_token,
             headers={"Host": "attacker.example"},
             expected_status=400,
         )
@@ -4803,7 +4792,6 @@ else:
             api_port,
             "GET",
             "/v1/state",
-            token=api_token,
             headers={"Origin": "https://attacker.example"},
             expected_status=403,
         )
@@ -4813,7 +4801,6 @@ else:
             "POST",
             "/v1/projects/status",
             payload={"project": str(tmp)},
-            token=api_token,
             headers={"Content-Type": "text/plain"},
             expected_status=415,
         )
@@ -4823,7 +4810,6 @@ else:
             "POST",
             "/v1/projects/status",
             payload={"project": str(tmp), "padding": "x" * (70 * 1024)},
-            token=api_token,
             expected_status=413,
         )
         check("exceeds" in str(oversized.get("error")), "API must reject oversized bodies before parsing")
@@ -4831,17 +4817,15 @@ else:
             api_port,
             "/v1/ports/lease",
             {"agent": "api-agent", "project": str(tmp), "range": f"{low}-{high}", "ttl": 60},
-            token=api_token,
         )
         check("port" in api_lease, "API lease should return a port")
-        ports = get_json(api_port, "/v1/ports", token=api_token)
+        ports = get_json(api_port, "/v1/ports")
         check(any(item["id"] == api_lease["id"] for item in ports), "API lease should appear in port list")
         missing_release_identity = request_json(
             api_port,
             "POST",
             "/v1/ports/release",
             payload={"lease_id": api_lease["id"]},
-            token=api_token,
             expected_status=400,
         )
         check(
@@ -4856,7 +4840,6 @@ else:
                 "agent": "api-agent",
                 "project": str(tmp),
             },
-            token=api_token,
         )
         check(
             api_released["status"] == "released"
@@ -4873,7 +4856,6 @@ else:
                 "range": f"{api_exact_port}-{api_exact_port}",
                 "purpose": "manual",
             },
-            token=api_token,
         )
         api_exact_server = post_json(
             api_port,
@@ -4893,7 +4875,6 @@ else:
                 "health_url": "http://127.0.0.1:{port}/",
                 "health_timeout": 5,
             },
-            token=api_token,
         )
         check(
             api_exact_server["lease_id"] == api_exact_lease["id"]
@@ -4909,35 +4890,20 @@ else:
                 "project": str(tmp),
                 "name": "api-exact-lease-web",
             },
-            token=api_token,
         )
         check(api_exact_stopped["status"] == "stopped", "API exact-lease fixture should stop cleanly")
-        api_inventory = get_json(api_port, "/v1/inventory", token=api_token)
+        api_inventory = get_json(api_port, "/v1/inventory")
         check("urls" in api_inventory and "docker" in api_inventory, "API inventory should expose URLs and Docker summary")
-        anonymous_no_docker = request_json(
-            api_port,
-            "GET",
-            "/v1/inventory/no-docker",
-            expected_status=401,
-        )
-        check(
-            anonymous_no_docker.get("error") == "unauthorized",
-            "no-Docker inventory must remain inside the authenticated /v1 boundary",
-        )
-        api_no_docker_inventory = get_json(
-            api_port,
-            "/v1/inventory/no-docker",
-            token=api_token,
-        )
+        api_no_docker_inventory = get_json(api_port, "/v1/inventory/no-docker")
         check(
             api_no_docker_inventory.get("docker")
             == {"available": None, "containers": [], "postgres": []}
             and api_no_docker_inventory.get("postgres") == [],
-            "authenticated no-Docker inventory must observe the graph without Docker evidence",
+            "trusted-loopback no-Docker inventory must observe the graph without Docker evidence",
         )
-        api_runtime = post_json(api_port, "/v1/projects/status", {"project": str(tmp)}, token=api_token)
+        api_runtime = post_json(api_port, "/v1/projects/status", {"project": str(tmp)})
         check("services" in api_runtime and "ok" in api_runtime, "API project status should expose runtime report")
-        api_stats = post_json(api_port, "/v1/docker/stats", {"dry_run": True}, token=api_token)
+        api_stats = post_json(api_port, "/v1/docker/stats", {"dry_run": True})
         check(
             api_stats["command"]
             == ["docker", "stats", "--no-stream", "--no-trunc", "--format", "{{json .}}"],
@@ -4948,10 +4914,9 @@ else:
             api_port,
             "/v1/ports/assign",
             {"agent": "api-agent", "project": str(tmp), "name": "api-pinned", "port": api_assign_port},
-            token=api_token,
         )
         check(api_assigned.get("port") == api_assign_port, "API port assign should pin the requested port")
-        api_assignments = get_json(api_port, "/v1/ports/assignments", token=api_token)
+        api_assignments = get_json(api_port, "/v1/ports/assignments")
         check(
             any(item.get("name") == "api-pinned" and item.get("port") == api_assign_port for item in api_assignments),
             "API assignments listing should include the new pin",
@@ -4960,10 +4925,9 @@ else:
             api_port,
             "/v1/ports/unassign",
             {"agent": "api-agent", "project": str(tmp), "name": "api-pinned"},
-            token=api_token,
         )
         check(api_unassigned.get("status") == "unassigned", "API port unassign should remove the pin")
-        state = get_json(api_port, "/v1/state", token=api_token)
+        state = get_json(api_port, "/v1/state")
         history_types = {item["type"] for item in state["history"]}
         check("port.leased" in history_types and "server.stopped" in history_types, "state should retain action history")
 
@@ -5000,202 +4964,6 @@ else:
             "IPv4 loopback only" in ipv6_api.stderr and "127.0.0.1" in ipv6_api.stderr,
             f"IPv6 refusal should accurately name the supported bind surface: {ipv6_api.stderr}",
         )
-        unsafe_token_file = tmp / "unsafe-api-token"
-        unsafe_token_file.write_text("x" * 64, encoding="utf-8")
-        unsafe_token_file.chmod(0o644)
-        unsafe_token_api = subprocess.run(
-            [
-                sys.executable,
-                str(SCRIPT),
-                "api",
-                "serve",
-                "--host",
-                "127.0.0.1",
-                "--port",
-                str(free_port()),
-                "--token-file",
-                str(unsafe_token_file),
-            ],
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env=fake_env,
-            timeout=5,
-        )
-        check(unsafe_token_api.returncode != 0, "API must reject a group/world-readable token file")
-        check("group or others" in unsafe_token_api.stderr, "unsafe token refusal should explain required permissions")
-
-        oversized_token_file = tmp / "oversized-api-token"
-        oversized_token_file.write_text("x" * (dc.API_TOKEN_MAX_BYTES + 1), encoding="utf-8")
-        oversized_token_file.chmod(0o600)
-        oversized_token_api = subprocess.run(
-            [
-                sys.executable,
-                str(SCRIPT),
-                "api",
-                "serve",
-                "--host",
-                "127.0.0.1",
-                "--port",
-                str(free_port()),
-                "--token-file",
-                str(oversized_token_file),
-            ],
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env=fake_env,
-            timeout=5,
-        )
-        check(oversized_token_api.returncode != 0, "API must reject an oversized private token file")
-        check("exceeds" in oversized_token_api.stderr, "oversized token refusal should explain the bound")
-
-        fifo_token_file = tmp / "fifo-api-token"
-        os.mkfifo(fifo_token_file, 0o600)
-        fifo_token_api = subprocess.run(
-            [
-                sys.executable,
-                str(SCRIPT),
-                "api",
-                "serve",
-                "--host",
-                "127.0.0.1",
-                "--port",
-                str(free_port()),
-                "--token-file",
-                str(fifo_token_file),
-            ],
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env=fake_env,
-            timeout=5,
-        )
-        check(fifo_token_api.returncode != 0, "API must reject a FIFO token path without blocking")
-        check("regular file" in fifo_token_api.stderr, "FIFO token refusal should require a regular file")
-
-        # Concurrent first startup must converge on exactly one persisted
-        # credential. Pause the winner after it exclusively creates the final
-        # path but before it writes. A check-then-open loser observes an empty
-        # file and fails; a serialized creator waits, then reads the complete
-        # winning credential.
-        concurrent_token_file = tmp / "concurrent-api-token"
-        token_results: list[str] = []
-        token_errors: list[str] = []
-        token_results_lock = threading.Lock()
-        writer_has_created = threading.Event()
-        release_writer = threading.Event()
-        original_fdopen = dc.os.fdopen
-
-        def paused_token_writer(fd: int, mode: str = "r", *args: object, **kwargs: object):
-            if str(mode).startswith("w") and not writer_has_created.is_set():
-                writer_has_created.set()
-                release_writer.wait(timeout=15)
-            return original_fdopen(fd, mode, *args, **kwargs)
-
-        def initialize_token() -> None:
-            try:
-                value = dc.load_or_create_api_token(concurrent_token_file)
-                with token_results_lock:
-                    token_results.append(value)
-            except Exception as exc:  # pragma: no cover - failure is asserted below
-                with token_results_lock:
-                    token_errors.append(repr(exc))
-
-        dc.os.fdopen = paused_token_writer
-        token_threads: list[threading.Thread] = []
-        loser_waited_for_winner = False
-        try:
-            winner = threading.Thread(target=initialize_token)
-            winner.start()
-            token_threads.append(winner)
-            check(
-                writer_has_created.wait(timeout=15),
-                "token winner should reach the pre-write fixture gate; "
-                f"results={token_results} errors={token_errors}",
-            )
-            loser = threading.Thread(target=initialize_token)
-            loser.start()
-            token_threads.append(loser)
-            time.sleep(0.2)
-            loser_waited_for_winner = loser.is_alive() and not token_errors and not token_results
-        finally:
-            release_writer.set()
-            for thread in token_threads:
-                thread.join(timeout=15)
-            dc.os.fdopen = original_fdopen
-        token_threads_alive = [thread.name for thread in token_threads if thread.is_alive()]
-        check(
-            not token_threads_alive,
-            f"concurrent token workers did not terminate: {token_threads_alive}; errors={token_errors}",
-        )
-        check(loser_waited_for_winner, "a concurrent token loser must wait while the winner's file is incomplete")
-        check(not token_errors, f"concurrent token initialization should not fail: {token_errors}")
-        check(len(token_results) == 2, f"both concurrent token callers should return: {token_results}")
-        check(
-            len(set(token_results)) == 1
-            and token_results[0] == concurrent_token_file.read_text(encoding="utf-8").strip(),
-            "concurrent first token creation must return the single credential persisted on disk",
-        )
-        check(
-            dc.load_or_create_api_token(concurrent_token_file) == token_results[0],
-            "a legitimate existing private token must remain reusable",
-        )
-
-        # Both token path entry points must inspect the path the caller named,
-        # not resolve a symlink first and then inspect the regular-file target.
-        symlink_target = tmp / "symlink-token-target"
-        symlink_target.write_text("s" * 64, encoding="utf-8")
-        symlink_target.chmod(0o600)
-        explicit_symlink = tmp / "explicit-api-token-link"
-        explicit_symlink.symlink_to(symlink_target)
-        explicit_symlink_api = subprocess.run(
-            [
-                sys.executable,
-                str(SCRIPT),
-                "api",
-                "serve",
-                "--host",
-                "127.0.0.1",
-                "--port",
-                str(free_port()),
-                "--token-file",
-                str(explicit_symlink),
-            ],
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env=fake_env,
-            timeout=5,
-        )
-        check(explicit_symlink_api.returncode != 0, "--token-file must reject a symbolic link")
-        check("symbolic link" in explicit_symlink_api.stderr, "explicit symlink refusal should explain the boundary")
-
-        default_symlink_home = tmp / "default-symlink-home"
-        default_symlink_home.mkdir(mode=0o700)
-        (default_symlink_home / "api-token").symlink_to(symlink_target)
-        default_symlink_env = fake_env.copy()
-        default_symlink_env["CODEX_AGENT_COORDINATOR_HOME"] = str(default_symlink_home)
-        default_symlink_env.pop("CODEX_AGENT_COORDINATOR_TOKEN_FILE", None)
-        default_symlink_api = subprocess.run(
-            [
-                sys.executable,
-                str(SCRIPT),
-                "api",
-                "serve",
-                "--host",
-                "127.0.0.1",
-                "--port",
-                str(free_port()),
-            ],
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env=default_symlink_env,
-            timeout=5,
-        )
-        check(default_symlink_api.returncode != 0, "the default/environment token path must reject a symbolic link")
-        check("symbolic link" in default_symlink_api.stderr, "default symlink refusal should explain the boundary")
 
         # --- Concurrency: parallel port leases must never double-assign a port ---
         # lease_port runs inside locked_state (one flock across read-modify-write),

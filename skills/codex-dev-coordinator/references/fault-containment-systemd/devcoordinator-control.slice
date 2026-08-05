@@ -1,0 +1,13 @@
+[Unit]
+Description=DevCoordinator protected control-plane slice
+Before=slices.target
+
+[Slice]
+CPUAccounting=yes
+MemoryAccounting=yes
+IOAccounting=yes
+TasksAccounting=yes
+CPUWeight=10000
+IOWeight=10000
+MemoryLow=DEVCOORDINATOR_CONTROL_MEMORY_LOW_BYTES
+TasksMax=8192

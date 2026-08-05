@@ -1,0 +1,78 @@
+# These launchers are rebound only by DevCoordinator's transactional immutable-
+# release switch.  Approval bypass is limited to bounded positional forms:
+# read-only discovery plus the independent, outage-safe bug-registry actions.
+# Broker/runtime mutations remain under normal policy.
+# Security posture: project-root security-assumptions.md confirms that local
+# accounts belong to one trusted developer, while malformed/stale operations
+# and broker protocol authorization must remain bounded and fail closed.
+prefix_rule(
+    pattern = [
+        ["devcoordinator", "/usr/local/bin/devcoordinator"],
+        ["capabilities", "targets"],
+    ],
+    decision = "allow",
+    justification = "Allow bounded immutable DevCoordinator discovery calls without an approval prompt.",
+)
+
+# security-assumptions.md confirms that local accounts belong to one trusted
+# developer and non-secret coordination metadata needs no per-account gate.
+# The immutable client still validates and bounds every bug record.
+prefix_rule(
+    pattern = [
+        ["devcoordinator", "/usr/local/bin/devcoordinator"],
+        "bug",
+        ["report", "list", "close"],
+    ],
+    decision = "allow",
+    justification = "Allow bounded out-of-band Coordinator bug reporting, listing, and closing without an approval prompt.",
+)
+
+prefix_rule(
+    pattern = [
+        ["devcoordinator-bug", "/usr/local/bin/devcoordinator-bug"],
+        ["report", "list", "close"],
+    ],
+    decision = "allow",
+    justification = "Allow the immutable outage-safe Coordinator bug tool without an approval prompt.",
+)
+
+prefix_rule(
+    pattern = [
+        ["devcoordinator", "/usr/local/bin/devcoordinator"],
+        "runtime",
+        ["status", "capture_logs"],
+    ],
+    decision = "allow",
+    justification = "Allow bounded immutable DevCoordinator runtime observation without an approval prompt.",
+)
+
+prefix_rule(
+    pattern = [
+        ["devcoordinator", "/usr/local/bin/devcoordinator"],
+        "test",
+        "follow",
+    ],
+    decision = "allow",
+    justification = "Allow bounded immutable DevCoordinator test follow-up without an approval prompt.",
+)
+
+prefix_rule(
+    pattern = [
+        ["devcoordinator", "/usr/local/bin/devcoordinator"],
+        "operation",
+        "follow",
+    ],
+    decision = "allow",
+    justification = "Allow bounded immutable DevCoordinator operation recovery without an approval prompt.",
+)
+
+prefix_rule(
+    pattern = [
+        [
+            "devcoordinator-call-log",
+            "/usr/local/bin/devcoordinator-call-log",
+        ],
+    ],
+    decision = "allow",
+    justification = "Allow the bounded sanitized immutable Coordinator call-log reader without an approval prompt.",
+)

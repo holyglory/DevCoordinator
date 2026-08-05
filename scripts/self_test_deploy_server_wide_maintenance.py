@@ -186,26 +186,31 @@ def main() -> int:
 
     with tempfile.TemporaryDirectory(prefix="maintenance-inventory-test-") as raw:
         root = Path(raw).resolve()
-        token_file = root / "api-token"
-        token_file.write_text("fixture-token\n", encoding="utf-8")
-        token_file.chmod(0o600)
         driver = object.__new__(MODULE.Driver)
-        driver.token_file = token_file
         driver.transaction = root
         driver.repository = Path("/home/DevCoordinator")
         padding = "x" * (8 * 1024 * 1024)
         response_payload = json.dumps({"padding": padding}).encode("utf-8")
         previous_urlopen = MODULE.urllib.request.urlopen
-        MODULE.urllib.request.urlopen = lambda *_args, **_kwargs: InventoryResponse(
-            response_payload
-        )
+        requests = []
+
+        def large_inventory(request, **_kwargs):
+            requests.append(request)
+            return InventoryResponse(response_payload)
+
+        MODULE.urllib.request.urlopen = large_inventory
         try:
             inventory = driver.inventory("large-inventory.json")
         finally:
             MODULE.urllib.request.urlopen = previous_urlopen
         expect(
             inventory == {"padding": padding},
-            "authenticated inventory larger than the former 8 MiB ceiling was truncated",
+            "trusted-loopback inventory larger than the former 8 MiB ceiling was truncated",
+        )
+        expect(len(requests) == 1, "inventory did not make exactly one request")
+        expect(
+            requests[0].get_header("Authorization") is None,
+            "trusted-loopback inventory still sends an Authorization credential",
         )
 
         previous_limit = MODULE.MAX_INVENTORY_RESPONSE_BYTES
@@ -219,10 +224,10 @@ def main() -> int:
             except MODULE.DeploymentError as error:
                 expect(
                     "exceeds the bounded 1024-byte" in str(error),
-                    "oversized authenticated inventory returned the wrong failure",
+                    "oversized trusted-loopback inventory returned the wrong failure",
                 )
             else:
-                raise AssertionError("oversized authenticated inventory was accepted")
+                raise AssertionError("oversized trusted-loopback inventory was accepted")
         finally:
             MODULE.urllib.request.urlopen = previous_urlopen
             MODULE.MAX_INVENTORY_RESPONSE_BYTES = previous_limit
@@ -242,18 +247,18 @@ def main() -> int:
     expect(
         '"/usr/sbin/runuser",\n                "--user",\n                "holyglory"'
         in source,
-        "root deployment still runs private auth evidence as the wrong user",
+        "root deployment does not run loopback boundary evidence as the service user",
     )
     expect(
         source.count(
             '"/usr/sbin/runuser",\n                "--user",\n                "holyglory"'
         )
         == 1,
-        "deployment does not isolate the unprivileged auth check from root process evidence",
+        "deployment does not isolate the unprivileged boundary check from root process evidence",
     )
     expect(
-        '"--token-owner-uid",\n                str(self.console_uid)' in source,
-        "root Console process verification does not bind the private token owner UID",
+        all(marker not in source for marker in ("--token-file", "--token-owner-uid", "api-token", "Authorization")),
+        "deployment retained an internal API bearer-token dependency",
     )
     expect(
         '"project": str(self.repository)' in source
@@ -376,7 +381,7 @@ def main() -> int:
     )
     print(
         "maintenance deployment self-test ok "
-        "(quiescence, dual checkpoints, bounded inventory, auth identity, privacy, rollback guard)"
+        "(quiescence, dual checkpoints, bounded inventory, loopback boundary, privacy, rollback guard)"
     )
     return 0
 

@@ -31,6 +31,9 @@ from devcoordinator.broker_persistence import (  # noqa: E402
 )
 from devcoordinator.events import decode_event_cursor, list_event_page  # noqa: E402
 from devcoordinator.host_observation import commit_host_inventory_observation  # noqa: E402
+from devcoordinator.normalized_server_lifecycle import (  # noqa: E402
+    NormalizedServerLifecycle,
+)
 from devcoordinator.observer import SingleFlightObserver  # noqa: E402
 from devcoordinator.store import AccountStore  # noqa: E402
 
@@ -175,6 +178,7 @@ class ObservationEventTests(unittest.TestCase):
             containers.append(container)
         docker = {
             "available": available,
+            "container_inspection_available": inspectable,
             "containers": containers,
             "postgres": [],
         }
@@ -276,6 +280,196 @@ class ObservationEventTests(unittest.TestCase):
         )
         self.assertTrue(all(item["repo_id"] == self.repo_id for item in events))
 
+    def test_pending_server_start_owns_launch_evidence_until_terminal_commit(self) -> None:
+        self.observe(
+            self.server_sample(
+                "2026-07-18T11:00:00Z",
+                lifecycle="stopped",
+                classification="stopped",
+                ok=False,
+                pid_alive=False,
+                identity={"ok": True, "observable": True},
+            )
+        )
+        with AccountStore.open_default(self.home) as store:
+            with store.immediate_transaction() as connection:
+                connection.execute(
+                    """
+                    INSERT INTO operations(
+                        operation_id, repo_id, kind, status, phase, generation,
+                        request_fingerprint, actor, process_fingerprint,
+                        created_at, updated_at
+                    ) VALUES (
+                        'pending-server-start', ?, 'server.start', 'running',
+                        'health_check', 0, 'fixture-request', 'fixture',
+                        'sha256:operation-launch', ?, ?
+                    )
+                    """,
+                    (
+                        self.repo_id,
+                        "2026-07-18T11:01:00Z",
+                        "2026-07-18T11:01:00Z",
+                    ),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO operation_targets(
+                        operation_id, ordinal, target_kind, target_id, action,
+                        immutable_fingerprint, phase, status
+                    ) VALUES (
+                        'pending-server-start', 0, 'server', ?, 'start',
+                        'fixture-server', 'health_check', 'running'
+                    )
+                    """,
+                    (self.server_id,),
+                )
+                connection.execute(
+                    """
+                    UPDATE server_observations
+                    SET lifecycle = 'starting', pid = 41001,
+                        process_start_time = 'launch-start',
+                        process_fingerprint = 'sha256:operation-launch',
+                        listener_host = '127.0.0.1', listener_port = 3100,
+                        health_classification = 'starting', health_ok = NULL,
+                        sampled_at = ?, observation_fingerprint = 'launch-owned'
+                    WHERE server_definition_id = ?
+                    """,
+                    ("2026-07-18T11:01:00Z", self.server_id),
+                )
+
+        # This sample can be newer wall-clock evidence, but it was collected
+        # while server.start owns the lifecycle row.  In particular, its PID
+        # must not replace the exact process identity committed by launch.
+        self.observe(
+            self.server_sample(
+                "2026-07-18T11:02:00Z",
+                lifecycle="running",
+                classification="healthy",
+                ok=True,
+                pid_alive=True,
+                identity={"ok": True, "observable": True},
+            )
+        )
+
+        with AccountStore.open_default_read_only(self.home) as store:
+            with store.read_transaction() as connection:
+                observation = connection.execute(
+                    """
+                    SELECT lifecycle, pid, process_start_time,
+                           process_fingerprint, observation_fingerprint
+                    FROM server_observations WHERE server_definition_id = ?
+                    """,
+                    (self.server_id,),
+                ).fetchone()
+                snapshot_rows = connection.execute(
+                    """
+                    SELECT COUNT(*) FROM observation_snapshot_resources
+                    WHERE resource_kind = 'server' AND resource_id = ?
+                    """,
+                    (self.server_id,),
+                ).fetchone()[0]
+        self.assertEqual(
+            tuple(observation),
+            (
+                "starting",
+                41001,
+                "launch-start",
+                "sha256:operation-launch",
+                "launch-owned",
+            ),
+        )
+        self.assertGreaterEqual(snapshot_rows, 2)
+        self.assertEqual(self.events(), [])
+        with AccountStore.open_default(self.home) as store:
+            committed = NormalizedServerLifecycle(store).commit_start_health(
+                operation_id="pending-server-start",
+                server_definition_id=self.server_id,
+                definition_generation=0,
+                health={
+                    "ok": True,
+                    "pid_alive": True,
+                    "identity": {"ok": True, "observable": True},
+                    "classification": "healthy",
+                },
+            )
+        self.assertEqual(committed["status"], "running")
+        self.assertEqual(committed["pid"], 41001)
+        self.assertEqual(
+            [(item["event_kind"], item["code"]) for item in self.events()],
+            [("server.started", "server_started")],
+        )
+
+    def test_stale_server_sample_cannot_overwrite_a_completed_operation(self) -> None:
+        self.observe(
+            self.server_sample(
+                "2026-07-18T11:10:00Z",
+                lifecycle="starting",
+                classification="starting",
+                ok=False,
+                pid_alive=True,
+                identity={"ok": True, "observable": True},
+            )
+        )
+        with AccountStore.open_default(self.home) as store:
+            with store.immediate_transaction() as connection:
+                baseline = str(
+                    connection.execute(
+                        """
+                        SELECT observation_fingerprint FROM server_observations
+                        WHERE server_definition_id = ?
+                        """,
+                        (self.server_id,),
+                    ).fetchone()[0]
+                )
+
+        stale = self.server_sample(
+            "2026-07-18T11:11:00Z",
+            lifecycle="starting",
+            classification="starting",
+            ok=False,
+            pid_alive=True,
+            identity={"ok": True, "observable": True},
+        )
+        stale["inventory"]["servers"][0]["_observation_fingerprint"] = baseline
+        with AccountStore.open_default(self.home) as store:
+            with store.immediate_transaction() as connection:
+                connection.execute(
+                    """
+                    UPDATE server_observations
+                    SET lifecycle = 'running', pid = 42002,
+                        process_start_time = 'committed-start',
+                        process_fingerprint = 'sha256:committed-launch',
+                        health_classification = 'healthy', health_ok = 1,
+                        sampled_at = ?, observation_fingerprint = 'post-operation'
+                    WHERE server_definition_id = ?
+                    """,
+                    ("2026-07-18T11:10:30Z", self.server_id),
+                )
+
+        self.observe(stale)
+
+        with AccountStore.open_default_read_only(self.home) as store:
+            with store.read_transaction() as connection:
+                observation = connection.execute(
+                    """
+                    SELECT lifecycle, pid, process_start_time,
+                           process_fingerprint, observation_fingerprint
+                    FROM server_observations WHERE server_definition_id = ?
+                    """,
+                    (self.server_id,),
+                ).fetchone()
+        self.assertEqual(
+            tuple(observation),
+            (
+                "running",
+                42002,
+                "committed-start",
+                "sha256:committed-launch",
+                "post-operation",
+            ),
+        )
+        self.assertEqual(self.events(), [])
+
     def test_intentional_server_stop_defers_to_authoritative_lifecycle_event(self) -> None:
         self.observe(
             self.server_sample(
@@ -342,40 +536,44 @@ class ObservationEventTests(unittest.TestCase):
                 stopped_reason="Stopped by coordinator",
             )
         )
+        with AccountStore.open_default_read_only(self.home) as store:
+            with store.read_transaction() as connection:
+                lifecycle = connection.execute(
+                    """
+                    SELECT lifecycle FROM server_observations
+                    WHERE server_definition_id = ?
+                    """,
+                    (self.server_id,),
+                ).fetchone()[0]
+        self.assertEqual(
+            lifecycle,
+            "stopping",
+            "host observation must not replace an operation-owned stop row",
+        )
         self.assertEqual(
             self.events(), [], "an intentional stop must not be relabeled as a crash"
         )
 
-        with AccountStore.open_default(self.home) as store:
-            with store.immediate_transaction() as connection:
-                connection.execute(
-                    """
-                    UPDATE operations SET status = 'succeeded', phase = 'committed',
-                        updated_at = ? WHERE operation_id = 'intentional-server-stop'
-                    """,
-                    ("2026-07-18T12:02:30Z",),
+        with mock.patch(
+            "devcoordinator.normalized_server_lifecycle.utc_timestamp",
+            return_value="2026-07-18T12:02:30Z",
+        ):
+            with AccountStore.open_default(self.home) as store:
+                stopped = NormalizedServerLifecycle(store).commit_stop(
+                    operation_id="intentional-server-stop",
+                    server_definition_id=self.server_id,
+                    agent="fixture",
+                    reason="Stopped by coordinator",
+                    release_port=False,
+                    stale_lease=False,
+                    final_health={
+                        "ok": False,
+                        "pid_alive": False,
+                        "identity": {"ok": True, "observable": True},
+                        "classification": "stopped",
+                    },
                 )
-                connection.execute(
-                    """
-                    UPDATE operation_targets SET status = 'succeeded',
-                        phase = 'committed', finished_at = ?
-                    WHERE operation_id = 'intentional-server-stop'
-                    """,
-                    ("2026-07-18T12:02:30Z",),
-                )
-                connection.execute(
-                    """
-                    INSERT INTO events(
-                        event_id, repo_id, operation_id, event_kind, code,
-                        message, diagnostic_json, occurred_at
-                    ) VALUES (
-                        'authoritative-server-stop', ?,
-                        'intentional-server-stop', 'server.stopped',
-                        'server_stopped', 'Stopped by coordinator', '{}', ?
-                    )
-                    """,
-                    (self.repo_id, "2026-07-18T12:02:30Z"),
-                )
+        self.assertEqual(stopped["status"], "stopped")
 
         self.observe(
             self.server_sample(

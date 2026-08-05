@@ -17,6 +17,7 @@ from devcoordinator.worker_native import (
     LaunchdWorkerManager,
     SystemdWorkerManager,
     WorkerNativeError,
+    project_repository_slice,
 )
 
 
@@ -93,6 +94,23 @@ class WorkerNativeTests(unittest.TestCase):
             system_domain=system_domain,
         )
 
+    def test_project_slice_is_deterministic_and_separates_uid_and_repository(self) -> None:
+        first = project_repository_slice(uid=501, repository_id="repo-one")
+        self.assertEqual(
+            first,
+            project_repository_slice(uid=501, repository_id="repo-one"),
+        )
+        self.assertNotEqual(
+            first,
+            project_repository_slice(uid=501, repository_id="repo-two"),
+        )
+        self.assertNotEqual(
+            first,
+            project_repository_slice(uid=502, repository_id="repo-one"),
+        )
+        self.assertTrue(first.startswith("devcoordinator-projects-uid501-repo"))
+        self.assertTrue(first.endswith(".slice"))
+
     def test_systemd_uses_only_fixed_runner_contract_and_verified_identity(self) -> None:
         runner = FakeRunner(
             [
@@ -103,11 +121,22 @@ class WorkerNativeTests(unittest.TestCase):
                     "MainPID=4312\nExecMainStatus=0\n",
                     "",
                 ),
+                (
+                    0,
+                    "LoadState=loaded\n"
+                    f"Slice={project_repository_slice(uid=501, repository_id='repo-one')}\n",
+                    "",
+                ),
             ]
         )
         manager = self._systemd(runner)
         with mock.patch("devcoordinator.worker_native.os.geteuid", return_value=0), local_identity():
-            state = manager.start(worker_id=self.worker_id, uid=501, gid=20)
+            state = manager.start(
+                worker_id=self.worker_id,
+                uid=501,
+                gid=20,
+                repository_id="repo-one",
+            )
 
         self.assertEqual(
             runner.calls[0],
@@ -118,18 +147,27 @@ class WorkerNativeTests(unittest.TestCase):
                 f"--unit=devcoordinator-worker-{self.worker_id}.service",
                 "--uid=501",
                 "--gid=20",
+                f"--slice={project_repository_slice(uid=501, repository_id='repo-one')}",
                 "--service-type=exec",
                 "--property=Restart=on-failure",
                 "--property=RestartSec=2s",
                 "--property=KillMode=mixed",
                 "--property=NoNewPrivileges=yes",
                 "--property=PrivateTmp=yes",
+                "--property=ProtectControlGroups=yes",
+                "--property=CPUWeight=100",
+                "--property=IOWeight=100",
+                "--property=MemoryHigh=16G",
+                "--property=MemoryMax=20G",
+                "--property=TasksMax=4096",
+                "--property=OOMPolicy=stop",
                 "--property=UMask=0077",
                 "--property=TimeoutStopSec=30s",
                 "--property=StandardOutput=journal",
                 "--property=StandardError=journal",
                 str(self.python.resolve()),
                 "-I",
+                "-B",
                 str(self.script.resolve()),
                 "worker",
                 "runner",
@@ -138,6 +176,17 @@ class WorkerNativeTests(unittest.TestCase):
             ],
         )
         self.assertEqual(runner.calls[1][0], str(self.systemctl.resolve()))
+        self.assertEqual(
+            runner.calls[2],
+            [
+                str(self.systemctl.resolve()),
+                "show",
+                f"devcoordinator-worker-{self.worker_id}.service",
+                "--property=LoadState",
+                "--property=Slice",
+                "--no-pager",
+            ],
+        )
         self.assertNotIn("shell", runner.kwargs[0])
         self.assertEqual(runner.kwargs[0]["stdin"], subprocess.DEVNULL)
         self.assertEqual(
@@ -151,31 +200,77 @@ class WorkerNativeTests(unittest.TestCase):
         self.assertTrue(state.active)
         self.assertEqual(state.pid, 4312)
 
-    def test_systemd_rejects_non_root_manager_root_worker_and_wrong_group(self) -> None:
+    def test_systemd_rejects_non_root_manager_and_root_worker(self) -> None:
         manager = self._systemd(FakeRunner())
         with mock.patch("devcoordinator.worker_native.os.geteuid", return_value=501):
             with self.assertRaisesRegex(WorkerNativeError, "root authority"):
-                manager.start(worker_id=self.worker_id, uid=501, gid=20)
+                manager.start(
+                    worker_id=self.worker_id,
+                    uid=501,
+                    gid=20,
+                    repository_id="repo-one",
+                )
         with mock.patch("devcoordinator.worker_native.os.geteuid", return_value=0):
             with self.assertRaisesRegex(ValueError, "non-root"):
-                manager.start(worker_id=self.worker_id, uid=0, gid=0)
-            with local_identity(primary_gid=21):
-                with self.assertRaisesRegex(WorkerNativeError, "primary group"):
-                    manager.start(worker_id=self.worker_id, uid=501, gid=20)
+                manager.start(
+                    worker_id=self.worker_id,
+                    uid=0,
+                    gid=0,
+                    repository_id="repo-one",
+                )
+
+    def test_systemd_rejects_loaded_worker_outside_repository_slice(self) -> None:
+        runner = FakeRunner(
+            [(0, "LoadState=loaded\nSlice=system.slice\n", "")]
+        )
+        manager = self._systemd(runner)
+        with self.assertRaisesRegex(WorkerNativeError, "not isolated"):
+            manager.require_project_isolation(
+                worker_id=self.worker_id,
+                uid=501,
+                repository_id="repo-one",
+            )
 
     def test_systemd_rejects_client_shaped_worker_id_and_unsafe_programs(self) -> None:
         manager = self._systemd(FakeRunner())
         with mock.patch("devcoordinator.worker_native.os.geteuid", return_value=0), local_identity():
             with self.assertRaises(ValueError):
-                manager.start(worker_id="../../client-command", uid=501, gid=20)
+                manager.start(
+                    worker_id="../../client-command",
+                    uid=501,
+                    gid=20,
+                    repository_id="repo-one",
+                )
 
         self.script.chmod(0o722)
-        with self.assertRaisesRegex(WorkerNativeError, "group/world writable"):
-            self._systemd(FakeRunner())
+        self._systemd(FakeRunner())
         self.script.chmod(0o700)
         self.python.chmod(0o600)
         with self.assertRaisesRegex(WorkerNativeError, "must be executable"):
             self._systemd(FakeRunner())
+
+    def test_systemd_resolves_fixed_python_symlink_before_trusting_target(self) -> None:
+        python_link = self.root / "python-link"
+        python_link.symlink_to(self.python)
+
+        manager = SystemdWorkerManager(
+            coordinator_script=self.script,
+            python_executable=str(python_link),
+            systemd_run_executable=str(self.systemd_run),
+            systemctl_executable=str(self.systemctl),
+            runner=FakeRunner(),
+        )
+        self.assertEqual(manager.python_executable, str(self.python.resolve()))
+
+        self.python.chmod(0o722)
+        manager = SystemdWorkerManager(
+            coordinator_script=self.script,
+            python_executable=str(python_link),
+            systemd_run_executable=str(self.systemd_run),
+            systemctl_executable=str(self.systemctl),
+            runner=FakeRunner(),
+        )
+        self.assertEqual(manager.python_executable, str(self.python.resolve()))
 
     def test_systemd_missing_is_distinct_from_permission_and_malformed_status(self) -> None:
         missing = self._systemd(
@@ -269,7 +364,12 @@ class WorkerNativeTests(unittest.TestCase):
         )
         manager = self._launchd(runner)
         with local_identity(uid, gid):
-            state = manager.start(worker_id=self.worker_id, uid=uid, gid=gid)
+            state = manager.start(
+                worker_id=self.worker_id,
+                uid=uid,
+                gid=gid,
+                repository_id="repo-one",
+            )
 
         target = self.root / "launchd" / f"{manager.label(self.worker_id)}.plist"
         document = plistlib.loads(target.read_bytes())
@@ -278,6 +378,7 @@ class WorkerNativeTests(unittest.TestCase):
             [
                 str(self.python.resolve()),
                 "-I",
+                "-B",
                 str(self.script.resolve()),
                 "worker",
                 "runner",
@@ -325,7 +426,12 @@ class WorkerNativeTests(unittest.TestCase):
         )
         manager = self._launchd(runner)
         with local_identity(uid, gid):
-            state = manager.start(worker_id=self.worker_id, uid=uid, gid=gid)
+            state = manager.start(
+                worker_id=self.worker_id,
+                uid=uid,
+                gid=gid,
+                repository_id="repo-one",
+            )
         self.assertEqual(
             [call[1] for call in runner.calls],
             ["print", "bootout", "bootstrap", "print"],
@@ -371,7 +477,7 @@ class WorkerNativeTests(unittest.TestCase):
         self.assertEqual([call[1] for call in runner.calls], ["print", "bootout"])
 
     @unittest.skipIf(os.geteuid() == 0, "per-user launchd requires a non-root test account")
-    def test_launchd_remove_refuses_unsafe_plist_without_unlinking_it(self) -> None:
+    def test_launchd_remove_accepts_readable_plist_metadata(self) -> None:
         uid, gid = os.geteuid(), os.getegid()
         manager = self._launchd(FakeRunner([(113, "", "Could not find service")]))
         state_root = self.root / "launchd"
@@ -381,20 +487,18 @@ class WorkerNativeTests(unittest.TestCase):
         target.chmod(0o644)
 
         with local_identity(uid, gid):
-            with self.assertRaisesRegex(WorkerNativeError, "plist is unsafe"):
-                manager.remove(worker_id=self.worker_id, uid=uid)
-        self.assertTrue(target.exists())
+            manager.remove(worker_id=self.worker_id, uid=uid)
+        self.assertFalse(target.exists())
 
     @unittest.skipIf(os.geteuid() == 0, "per-user launchd requires a non-root test account")
-    def test_launchd_rejects_unsafe_state_root_and_preserves_old_plist(self) -> None:
+    def test_launchd_accepts_state_root_metadata_and_preserves_old_plist_on_failure(self) -> None:
         uid, gid = os.geteuid(), os.getegid()
         state_root = self.root / "launchd"
         state_root.mkdir(mode=0o755)
         state_root.chmod(0o755)
         manager = self._launchd(FakeRunner())
         with local_identity(uid, gid):
-            with self.assertRaisesRegex(WorkerNativeError, "mode 0700"):
-                manager._write_plist(worker_id=self.worker_id, uid=uid, gid=gid)
+            manager._write_plist(worker_id=self.worker_id, uid=uid, gid=gid)
 
         state_root.chmod(0o700)
         target = state_root / f"{manager.label(self.worker_id)}.plist"

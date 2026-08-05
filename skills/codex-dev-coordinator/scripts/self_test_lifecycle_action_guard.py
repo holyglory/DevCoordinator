@@ -24,6 +24,7 @@ sys.modules[SPEC.name] = coordinator
 SPEC.loader.exec_module(coordinator)
 
 from devcoordinator.repository_lifecycle import ActionFencedError, RepositoryAction
+from devcoordinator.schema import establish_repository_owner_authority
 from devcoordinator.store import AccountStore
 
 
@@ -930,6 +931,22 @@ class LifecycleActionGuardTests(unittest.TestCase):
                     )
                     """,
                     (str(self.repository), timestamp, timestamp),
+                )
+                establish_repository_owner_authority(
+                    connection,
+                    repository_id="foreign-repo",
+                    owner_uid=os.geteuid(),
+                    repository_generation=0,
+                    operation_id="fixture-foreign-repository-owner",
+                    actor="lifecycle-action-guard-fixture",
+                    reason="explicit foreign repository fixture owner",
+                    timestamp=timestamp,
+                    evidence={
+                        "kind": "lifecycle-action-guard-foreign-owner-fixture",
+                        "repository_id": "foreign-repo",
+                        "repository_generation": 0,
+                        "owner_uid": os.geteuid(),
+                    },
                 )
                 connection.execute(
                     """

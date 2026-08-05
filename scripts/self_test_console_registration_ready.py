@@ -249,7 +249,6 @@ def delayed_inventory_transport_budget_test() -> None:
         result = READY.inventory_probe(
             host="127.0.0.1",
             port=int(server.server_address[1]),
-            token="a" * 64,
             timeout=8.0,
             project=FIXTURES.PROJECT,
             name=FIXTURES.NAME,
@@ -369,7 +368,7 @@ def broker_published_stopped_fixture(
         "authority": {
             "scope": "server-wide",
             "transport": "authenticated-unix-socket",
-            "socket": "/run/devcoordinator/broker.sock",
+            "socket": "/run/devcoordinator-authority.sock",
             "service_uid": 992,
             "database_generation": database_generation,
         },
@@ -611,7 +610,6 @@ def wait_with_snapshots(snapshots: list[object]) -> dict:
         project=FIXTURES.PROJECT,
         name=FIXTURES.NAME,
         port=FIXTURES.PORT,
-        token="x" * 64,
         host="127.0.0.1",
         coordinator_port=29876,
         expected_argv=identity["argv"],
@@ -673,7 +671,6 @@ def real_listener_delayed_registration_test() -> None:
                 project=str(project),
                 name=FIXTURES.NAME,
                 port=port,
-                token="x" * 64,
                 host="127.0.0.1",
                 coordinator_port=29876,
                 expected_argv=identity["argv"],
@@ -712,7 +709,10 @@ def actual_api_delayed_registration_test() -> None:
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
                 text=True,
+                umask=0o077,
             )
+            repository.chmod(0o700)
+            (repository / ".git").chmod(0o700)
         home = root / "coordinator-home"
         home.mkdir(mode=0o700)
         old_listener, listener_port = start_fast_http_listener(cwd=old_project)
@@ -752,6 +752,17 @@ def actual_api_delayed_registration_test() -> None:
                                 timestamp,
                                 timestamp,
                             ),
+                        )
+                        dc.establish_repository_owner_authority(
+                            connection,
+                            repository_id=repo_id,
+                            owner_uid=max(os.geteuid(), 1),
+                            repository_generation=0,
+                            operation_id=f"api-readiness-fixture-owner-{repo_id}",
+                            actor="readiness-test",
+                            reason="actual API readiness fixture owner authority",
+                            timestamp=timestamp,
+                            evidence={"kind": "actual-api-readiness-fixture-owner"},
                         )
                         connection.execute(
                             """
@@ -809,15 +820,13 @@ def actual_api_delayed_registration_test() -> None:
                     )
             old_server_id = str(stale["id"])
             old_lease_id = str(stale["lease_id"])
-            token = "a" * 64
-            api = dc.BoundedThreadingHTTPServer(("127.0.0.1", 0), dc.ApiHandler, token=token)
+            api = dc.BoundedThreadingHTTPServer(("127.0.0.1", 0), dc.ApiHandler)
             api_port = int(api.server_address[1])
             api_thread = threading.Thread(target=api.serve_forever, daemon=True)
             api_thread.start()
             restart_inventory = READY.inventory_probe(
                 host="127.0.0.1",
                 port=api_port,
-                token=token,
                 timeout=3,
                 project=str(old_project),
                 name=FIXTURES.NAME,
@@ -925,7 +934,6 @@ def actual_api_delayed_registration_test() -> None:
             relocated_inventory = READY.inventory_probe(
                 host="127.0.0.1",
                 port=api_port,
-                token=token,
                 timeout=3,
                 project=str(project),
                 name=FIXTURES.NAME,
@@ -978,7 +986,6 @@ def actual_api_delayed_registration_test() -> None:
                         "/v1/servers/register",
                         body=json.dumps(payload),
                         headers={
-                            "Authorization": f"Bearer {token}",
                             "Content-Type": "application/json",
                             "Host": f"127.0.0.1:{api_port}",
                         },
@@ -1000,7 +1007,6 @@ def actual_api_delayed_registration_test() -> None:
                 inventory = READY.inventory_probe(
                     host="127.0.0.1",
                     port=api_port,
-                    token=token,
                     timeout=remaining,
                     project=str(project),
                     name=FIXTURES.NAME,
@@ -1015,7 +1021,6 @@ def actual_api_delayed_registration_test() -> None:
                 project=str(project),
                 name=FIXTURES.NAME,
                 port=listener_port,
-                token=token,
                 host="127.0.0.1",
                 coordinator_port=api_port,
                 expected_argv=identity["argv"],
@@ -1083,6 +1088,9 @@ def normalized_producer_contract_test() -> None:
         root = Path(raw).resolve()
         project = root / "project"
         project.mkdir()
+        # Keep canonical-project discovery inside this isolated fixture even
+        # when an ancestor of the system temporary directory has a Git marker.
+        (project / ".git").mkdir()
         home = root / "coordinator-home"
         home.mkdir(mode=0o700)
         original_home = os.environ.get("CODEX_AGENT_COORDINATOR_HOME")
@@ -1111,6 +1119,17 @@ def normalized_producer_contract_test() -> None:
                             timestamp,
                             timestamp,
                         ),
+                    )
+                    dc.establish_repository_owner_authority(
+                        connection,
+                        repository_id=repo_id,
+                        owner_uid=max(os.geteuid(), 1),
+                        repository_generation=0,
+                        operation_id=f"readiness-fixture-owner-{repo_id}",
+                        actor="readiness-test",
+                        reason="normalized producer fixture owner authority",
+                        timestamp=timestamp,
+                        evidence={"kind": "normalized-producer-fixture-owner"},
                     )
                     connection.execute(
                         """
@@ -1437,7 +1456,6 @@ def identity_and_deadline_tests() -> None:
         project=FIXTURES.PROJECT,
         name=FIXTURES.NAME,
         port=FIXTURES.PORT,
-        token="x" * 64,
         host="127.0.0.1",
         coordinator_port=29876,
         expected_argv=identity["argv"],

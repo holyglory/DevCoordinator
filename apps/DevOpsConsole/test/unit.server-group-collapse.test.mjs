@@ -58,41 +58,46 @@ function assertIntermediateServerLayout(css) {
     /@media \(min-width: 720px\) and \(max-width: 1023px\) \{[\s\S]*?\n\}/,
   )?.[0] || '';
   assert.match(block,
-    /\.srv-grid\s*\{[\s\S]*grid-template-columns:\s*26px minmax\(180px, 1fr\) minmax\(180px, 210px\) 118px;[\s\S]*grid-template-rows:\s*auto auto;/,
+    /\.srv-grid\s*\{[\s\S]*grid-template-columns:\s*26px minmax\(190px, 1fr\) max-content max-content;[\s\S]*grid-template-rows:\s*auto auto;/,
     'intermediate Servers rows must reserve a readable name track and use two bounded rows');
+  assert.match(block, /\.grid-head\.srv-grid\s*\{\s*display:\s*none;/,
+    'tablet server summaries must not render detached desktop column headers');
   assert.match(block,
     /\.srv-grid > :nth-child\(2\)\s*\{[\s\S]*grid-column:\s*2;[\s\S]*grid-row:\s*1;/,
     'the server identity must stay in the readable first-row name track');
   assert.match(block,
-    /\.srv-grid > :nth-child\(7\)\s*\{[\s\S]*grid-column:\s*3 \/ 5;[\s\S]*grid-row:\s*1;/,
-    'actions must occupy their own bounded first-row zone');
+    /\.srv-grid > \.srv-status\s*\{[\s\S]*grid-column:\s*3;[\s\S]*grid-row:\s*1;/,
+    'the status must stay in the first-row control band');
   assert.match(block,
-    /\.srv-grid > :nth-child\(4\)\s*\{[\s\S]*grid-column:\s*3;[\s\S]*grid-row:\s*2;/,
-    'CPU and memory must move below actions instead of crushing the server name');
+    /\.srv-grid > \.srv-actions\s*\{[\s\S]*grid-column:\s*4;[\s\S]*grid-row:\s*1;/,
+    'actions must stay next to the status they affect');
+  assert.match(block,
+    /\.srv-grid > \.usage-cell\s*\{[\s\S]*grid-column:\s*3 \/ 5;[\s\S]*grid-row:\s*2;/,
+    'CPU and memory must remain in one bounded fact band below the controls');
 }
 
 function assertCompactMobileServerLayout(css) {
-  const block = css.match(
-    /@media \(max-width: 719px\) \{[\s\S]*?\n\}/,
-  )?.[0] || '';
+  const block = [...css.matchAll(
+    /@media \(max-width: 719px\) \{[\s\S]*?\n\}/g,
+  )].map((match) => match[0]).find((candidate) => candidate.includes('.srv-grid')) || '';
   assert.match(block,
-    /\.srv-grid\s*\{[\s\S]*grid-template-columns:\s*24px minmax\(0, \.45fr\) minmax\(150px, 1fr\) auto;/,
-    'mobile Servers rows must use one compact four-track summary grid');
+    /\.srv-grid\s*\{[\s\S]*grid-template-columns:\s*24px minmax\(0, 1fr\) max-content;/,
+    'mobile Servers rows must use one compact three-track summary grid');
   assert.match(block,
-    /\.srv-grid > :nth-child\(2\)\s*\{[\s\S]*grid-column:\s*2 \/ 5;[\s\S]*grid-row:\s*1;/,
+    /\.srv-grid > :nth-child\(2\)\s*\{[\s\S]*grid-column:\s*2 \/ 4;[\s\S]*grid-row:\s*1;/,
     'server identity and subdomain must share the first compact row');
   assert.match(block,
-    /\.srv-grid > :nth-child\(3\)\s*\{[\s\S]*grid-column:\s*2;[\s\S]*grid-row:\s*2;/,
+    /\.srv-grid > \.srv-port\s*\{[\s\S]*grid-column:\s*2;[\s\S]*grid-row:\s*2;/,
     'port must join the secondary summary row instead of consuming a line');
   assert.match(block,
-    /\.srv-grid > :nth-child\(4\)\s*\{[\s\S]*grid-column:\s*3;[\s\S]*grid-row:\s*2;/,
+    /\.srv-grid > \.usage-cell\s*\{[\s\S]*grid-column:\s*3;[\s\S]*grid-row:\s*2;/,
     'utilization must join the secondary summary row instead of consuming a line');
   assert.match(block,
-    /\.srv-grid > :nth-child\(5\)\s*\{[\s\S]*grid-column:\s*4;[\s\S]*grid-row:\s*2;/,
-    'status must join the secondary summary row instead of consuming a line');
+    /\.srv-grid > \.srv-status\s*\{[\s\S]*grid-column:\s*2;[\s\S]*grid-row:\s*3;/,
+    'status must share its compact band with the available controls');
   assert.match(block,
-    /\.srv-grid > :nth-child\(7\)\s*\{[\s\S]*grid-column:\s*2 \/ 5;[\s\S]*grid-row:\s*3;/,
-    'actions must occupy one compact final row');
+    /\.srv-grid > \.srv-actions\s*\{[\s\S]*grid-column:\s*3;[\s\S]*grid-row:\s*3;/,
+    'actions must stay next to the status on ordinary mobile widths');
   assert.match(block,
     /\.srv-grid > \.cell\[data-label\]::before\s*\{\s*display:\s*none;/,
     'redundant field labels must not recreate one blank line per value');
@@ -175,8 +180,19 @@ test('Servers disclosure: narrow headers remain compact, tappable, and overflow-
     'wide project headers need an explicit bounded grid');
   assert.match(css, /@media \(max-width: 719px\) \{[\s\S]*\.server-project-toggle\s*\{[\s\S]*min-height:\s*44px/,
     'narrow project headers need a full touch target');
+  assert.match(css, /@media \(max-width: 719px\) \{[\s\S]*\.server-project-toggle\s*\{[\s\S]*grid-template-columns:\s*24px minmax\(96px, 1fr\) minmax\(0, max-content\)/,
+    'the narrow repository-name track must stay readable while utilization remains shrinkable');
+  assert.match(css, /@media \(max-width: 719px\) \{[\s\S]*\.server-project-toggle > \.proj-usage\s*\{[\s\S]*min-width:\s*0;[\s\S]*white-space:\s*normal;[\s\S]*overflow-wrap:\s*anywhere;/,
+    'narrow utilization must wrap instead of forcing the project header beyond its grid');
   assert.match(css, /@media \(max-width: 719px\) \{[\s\S]*\.server-project-toggle \.spark\s*\{\s*display:\s*none;/,
     'the decorative sparkline must yield space on narrow screens');
+  const collapsedTrack = css.replace(
+    '24px minmax(96px, 1fr) minmax(0, max-content)',
+    '24px minmax(0, 1fr) auto',
+  );
+  assert.doesNotMatch(collapsedTrack,
+    /@media \(max-width: 719px\) \{[\s\S]*\.server-project-toggle\s*\{[\s\S]*grid-template-columns:\s*24px minmax\(96px, 1fr\) minmax\(0, max-content\)/,
+    'the must-catch fixture must detect a track that can collapse during viewport transitions');
   assert.match(css, /\.server-group-items\[hidden\],\s*\.docker-group-items\[hidden\]\s*\{\s*display:\s*none;/,
     'closed member regions must not be made visible by layout CSS');
 });
@@ -186,7 +202,7 @@ test('Servers disclosure: intermediate rows protect names from fixed side column
   assertIntermediateServerLayout(css);
 
   const regressed = css.replace(
-    '26px minmax(180px, 1fr) minmax(180px, 210px) 118px',
+    '26px minmax(190px, 1fr) max-content max-content',
     '26px minmax(0, 1fr) 70px 210px 118px 22px 206px',
   );
   assert.throws(() => assertIntermediateServerLayout(regressed), /readable name track/,
@@ -198,9 +214,9 @@ test('Servers disclosure: mobile rows keep identity, facts, and actions compact'
   assertCompactMobileServerLayout(css);
 
   const regressed = css.replace(
-    '24px minmax(0, .45fr) minmax(150px, 1fr) auto',
+    '24px minmax(0, 1fr) max-content',
     '26px minmax(0, 1fr)',
   );
-  assert.throws(() => assertCompactMobileServerLayout(regressed), /compact four-track summary grid/,
+  assert.throws(() => assertCompactMobileServerLayout(regressed), /compact three-track summary grid/,
     'the must-catch fixture must detect a regression to one full-width line per field');
 });

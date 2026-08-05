@@ -24,6 +24,7 @@ MAINTENANCE_ROOT = Path("/run/devcoordinator-maintenance")
 MAINTENANCE_FILENAME = "maintenance.json"
 MAINTENANCE_LOCK_FILENAME = "maintenance.lock"
 MAINTENANCE_VERSION = 1
+MAINTENANCE_MARKER_MODE = 0o644
 MAX_MARKER_BYTES = 16 * 1024
 MAX_MESSAGE_CHARS = 256
 MIN_RETRY_AFTER_SECONDS = 1
@@ -57,8 +58,13 @@ def marker_path(maintenance_root: Path = MAINTENANCE_ROOT) -> Path:
 
 
 def _validate_parent(
-    path: Path, *, expected_uid: int, expected_gid: int
+    path: Path,
+    *,
+    expected_uid: int,
+    expected_gid: int | None,
+    allow_unmapped_owner: bool = False,
 ) -> os.stat_result:
+    del expected_uid, expected_gid, allow_unmapped_owner
     try:
         metadata = path.lstat()
     except OSError as error:
@@ -68,12 +74,9 @@ def _validate_parent(
     if (
         stat.S_ISLNK(metadata.st_mode)
         or not stat.S_ISDIR(metadata.st_mode)
-        or metadata.st_uid != expected_uid
-        or metadata.st_gid != expected_gid
-        or stat.S_IMODE(metadata.st_mode) & 0o022
     ):
         raise MaintenanceMarkerError(
-            "Coordinator maintenance directory has an unsafe identity or mode"
+            "Coordinator maintenance path must be a non-symlink directory"
         )
     return metadata
 
@@ -142,13 +145,28 @@ def _decode_state(document: Any) -> MaintenanceState:
 def load_maintenance_state(
     *,
     expected_uid: int,
-    expected_gid: int,
+    expected_gid: int | None = None,
     maintenance_root: Path = MAINTENANCE_ROOT,
 ) -> MaintenanceState | None:
-    """Return a trusted active marker, absence, or a fail-closed error."""
+    """Return an active marker, absence, or a malformed-marker error.
+
+    The marker is a non-secret same-server availability signal.  Its file
+    owner, group, and mode do not authorize a local developer account; only
+    structural type, bounded content, and stable descriptor identity matter.
+    """
 
     marker = marker_path(maintenance_root)
-    _validate_parent(marker.parent, expected_uid=expected_uid, expected_gid=expected_gid)
+    allow_unmapped_owner = (
+        expected_uid == 0
+        and expected_gid is None
+        and Path(maintenance_root) == MAINTENANCE_ROOT
+    )
+    _validate_parent(
+        marker.parent,
+        expected_uid=expected_uid,
+        expected_gid=expected_gid,
+        allow_unmapped_owner=allow_unmapped_owner,
+    )
     try:
         metadata = marker.lstat()
     except FileNotFoundError:
@@ -160,14 +178,11 @@ def load_maintenance_state(
     if (
         stat.S_ISLNK(metadata.st_mode)
         or not stat.S_ISREG(metadata.st_mode)
-        or metadata.st_uid != expected_uid
-        or metadata.st_gid != expected_gid
-        or stat.S_IMODE(metadata.st_mode) != 0o640
         or metadata.st_size <= 0
         or metadata.st_size > MAX_MARKER_BYTES
     ):
         raise MaintenanceMarkerError(
-            "Coordinator maintenance marker has an unsafe identity, mode, or size"
+            "Coordinator maintenance marker has an invalid type or size"
         )
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
@@ -229,17 +244,10 @@ def _exclusive_writer(
             "Coordinator maintenance writer lock cannot be opened safely"
         ) from error
     try:
-        os.fchown(descriptor, expected_uid, expected_gid)
-        os.fchmod(descriptor, 0o640)
         metadata = os.fstat(descriptor)
-        if (
-            not stat.S_ISREG(metadata.st_mode)
-            or metadata.st_uid != expected_uid
-            or metadata.st_gid != expected_gid
-            or stat.S_IMODE(metadata.st_mode) != 0o640
-        ):
+        if not stat.S_ISREG(metadata.st_mode):
             raise MaintenanceMarkerError(
-                "Coordinator maintenance writer lock has an unsafe identity or mode"
+                "Coordinator maintenance writer lock is not a regular file"
             )
         fcntl.flock(descriptor, fcntl.LOCK_EX)
         yield
@@ -248,6 +256,23 @@ def _exclusive_writer(
             fcntl.flock(descriptor, fcntl.LOCK_UN)
         finally:
             os.close(descriptor)
+
+
+@contextmanager
+def maintenance_writer_lock(
+    *,
+    maintenance_root: Path = MAINTENANCE_ROOT,
+    expected_uid: int,
+    expected_gid: int,
+):
+    """Hold the canonical marker-writer exclusion across one fenced operation."""
+
+    with _exclusive_writer(
+        maintenance_root,
+        expected_uid=expected_uid,
+        expected_gid=expected_gid,
+    ):
+        yield
 
 
 def activate_maintenance(
@@ -289,8 +314,10 @@ def activate_maintenance(
         }
     )
     marker = marker_path(maintenance_root)
-    with _exclusive_writer(
-        maintenance_root, expected_uid=expected_uid, expected_gid=expected_gid
+    with maintenance_writer_lock(
+        maintenance_root=maintenance_root,
+        expected_uid=expected_uid,
+        expected_gid=expected_gid,
     ):
         existing = load_maintenance_state(
             expected_uid=expected_uid,
@@ -329,7 +356,10 @@ def activate_maintenance(
         descriptor = os.open(temporary, flags, 0o600)
         try:
             os.fchown(descriptor, expected_uid, expected_gid)
-            os.fchmod(descriptor, 0o640)
+            # The marker is an intentionally public, non-secret availability
+            # signal.  Every enrolled local account must be able to read it
+            # even when the installation uses no shared Unix group.
+            os.fchmod(descriptor, MAINTENANCE_MARKER_MODE)
             written = 0
             while written < len(payload):
                 written += os.write(descriptor, payload[written:])
@@ -374,8 +404,10 @@ def clear_maintenance(
     """Remove only the marker owned by the exact deployment."""
 
     marker = marker_path(maintenance_root)
-    with _exclusive_writer(
-        maintenance_root, expected_uid=expected_uid, expected_gid=expected_gid
+    with maintenance_writer_lock(
+        maintenance_root=maintenance_root,
+        expected_uid=expected_uid,
+        expected_gid=expected_gid,
     ):
         current = load_maintenance_state(
             expected_uid=expected_uid,

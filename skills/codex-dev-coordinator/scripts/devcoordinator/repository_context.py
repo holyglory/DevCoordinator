@@ -8,7 +8,7 @@ worktree or its Git administrative directory is replaced.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field as dataclass_field
 import hashlib
 import json
 import os
@@ -20,9 +20,6 @@ import stat
 import subprocess
 import time
 from typing import Any
-
-from . import filesystem_acl as _filesystem_acl
-
 
 class RepositoryContextError(ValueError):
     """A supplied root/temporary repository relationship was not proved."""
@@ -70,13 +67,26 @@ class PersistedRepositoryContext:
 
 @dataclass(frozen=True)
 class _PathIdentity:
-    owner_uid: int
-    owner_gid: int
+    # Ownership and mode are useful diagnostics, but one server is one trust
+    # domain.  Exclude them from equality so chmod/chown/ACL changes cannot
+    # invalidate an otherwise identical repository object.
+    owner_uid: int = dataclass_field(compare=False)
+    owner_gid: int = dataclass_field(compare=False)
     device: int
     inode: int
-    mode: int
+    mode: int = dataclass_field(compare=False)
 
     def material(self) -> dict[str, int]:
+        """Return only the structural identity used for trust decisions."""
+
+        return {
+            "device": self.device,
+            "inode": self.inode,
+        }
+
+    def legacy_material(self) -> dict[str, int]:
+        """Retain the historical fingerprint material for stored-row upgrades."""
+
         return {
             "owner_uid": self.owner_uid,
             "owner_gid": self.owner_gid,
@@ -111,7 +121,7 @@ class _AdminSnapshot:
 _MAX_GIT_OUTPUT = 1024 * 1024
 _MAX_ADMIN_FILE = 1024 * 1024
 _GIT_TIMEOUT_SECONDS = 5.0
-_IDENTITY_FINGERPRINT_VERSION = "repository-scope-v1"
+_IDENTITY_FINGERPRINT_VERSION = "repository-scope-v2"
 _TRUSTED_GIT_CANDIDATES = (Path("/usr/bin/git"), Path("/bin/git"))
 _BLOCKED_AMBIENT_GIT_VARIABLES = frozenset(
     {
@@ -184,18 +194,10 @@ def _trusted_git_executable() -> str:
             metadata = candidate.lstat()
         except OSError:
             continue
-        if (
-            stat.S_ISREG(metadata.st_mode)
-            and metadata.st_uid == 0
-            and metadata.st_mode & stat.S_IXUSR
-            and not metadata.st_mode
-            & (stat.S_IWGRP | stat.S_IWOTH | stat.S_ISUID | stat.S_ISGID)
-            and os.access(candidate, os.X_OK)
-        ):
+        if stat.S_ISREG(metadata.st_mode) and os.access(candidate, os.X_OK):
             return str(candidate)
     raise RepositoryContextError(
-        "no root-owned, non-set-id, non-group/world-writable Git executable "
-        "exists at /usr/bin/git or /bin/git"
+        "no executable regular Git file exists at /usr/bin/git or /bin/git"
     )
 
 
@@ -233,10 +235,25 @@ def _terminate_git_process(process: subprocess.Popen[bytes]) -> None:
         pass
 
 
-def _git(path: Path, *arguments: str) -> bytes:
-    command = [
+def _git_command(path: Path, *arguments: str) -> list[str]:
+    canonical_path, _identity = _canonical_existing_directory(
+        os.fspath(path), field="Git inspection worktree"
+    )
+    safe_directory = os.fspath(canonical_path)
+    if safe_directory == "*" or safe_directory.endswith("/*"):
+        raise RepositoryContextError(
+            "Git inspection worktree cannot be represented as an exact "
+            "safe.directory value"
+        )
+    return [
         _trusted_git_executable(),
         "--no-pager",
+        # The confirmed local deployment is one developer operating through
+        # several Unix accounts (security-assumptions.md). Admit only the
+        # already canonical worktree for this subprocess; repository and
+        # filesystem identity proofs below remain authoritative.
+        "-c",
+        f"safe.directory={safe_directory}",
         "-c",
         "core.fsmonitor=false",
         "-c",
@@ -246,9 +263,13 @@ def _git(path: Path, *arguments: str) -> bytes:
         "-c",
         "protocol.allow=never",
         "-C",
-        str(path),
+        safe_directory,
         *arguments,
     ]
+
+
+def _git(path: Path, *arguments: str) -> bytes:
+    command = _git_command(path, *arguments)
     process: subprocess.Popen[bytes] | None = None
     selector = selectors.DefaultSelector()
     streams: tuple[Any, ...] = ()
@@ -369,7 +390,14 @@ def _open_inspected_path(
     expected_kind: str,
     final_owner_uid: int,
 ) -> tuple[int, _PathIdentity]:
-    """Open one exact path by anchored components and return its stable identity."""
+    """Open one exact path by anchored components and return its stable identity.
+
+    A repository may be shared by several Unix accounts belonging to the same
+    developer.  Ownership, Unix modes, and ACLs therefore do not participate
+    in admission; anchored no-follow traversal and object identity still do.
+    """
+
+    del final_owner_uid
 
     path = _normalized_absolute_path(path, field=field)
     no_follow = getattr(os, "O_NOFOLLOW", 0)
@@ -392,11 +420,6 @@ def _open_inspected_path(
     parts = path.parts[1:]
     try:
         anchor_metadata = os.fstat(descriptor)
-        _filesystem_acl.require_fd_acl_trusted(
-            descriptor,
-            owner_uid=int(anchor_metadata.st_uid),
-            field=f"{field} path component {current}",
-        )
         if not parts:
             is_final = True
             identities = ((current, anchor_metadata, is_final),)
@@ -431,41 +454,15 @@ def _open_inspected_path(
             os.close(descriptor)
             descriptor = next_descriptor
             metadata = os.fstat(descriptor)
-            _filesystem_acl.require_fd_acl_trusted(
-                descriptor,
-                owner_uid=int(metadata.st_uid),
-                field=f"{field} path component {current}",
-            )
             identities = ((current, metadata, is_final),)
 
             if not is_final and not stat.S_ISDIR(metadata.st_mode):
                 raise RepositoryContextError(
                     f"{field} has a non-directory ancestor: {current}"
                 )
-            if metadata.st_uid not in {0, final_owner_uid}:
-                raise RepositoryContextError(
-                    f"{field} has an untrusted owner at {current}"
-                )
-            writable_by_others = bool(
-                metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
-            )
-            trusted_sticky_parent = bool(
-                not is_final
-                and metadata.st_uid == 0
-                and metadata.st_mode & stat.S_ISVTX
-            )
-            if writable_by_others and not trusted_sticky_parent:
-                raise RepositoryContextError(
-                    f"{field} has a replaceable group/world-writable path: {current}"
-                )
-
         if not identities:
             raise RepositoryContextError(f"{field} could not be inspected: {path}")
         _current, final_metadata, _is_final = identities[0]
-        if final_metadata.st_uid != final_owner_uid:
-            raise RepositoryContextError(
-                f"{field} must be owned by account uid {final_owner_uid}: {path}"
-            )
         if expected_kind == "directory" and not stat.S_ISDIR(final_metadata.st_mode):
             raise RepositoryContextError(f"{field} must identify a directory: {path}")
         if expected_kind == "file" and not stat.S_ISREG(final_metadata.st_mode):
@@ -624,7 +621,6 @@ def _admin_snapshot_material(snapshot: _AdminSnapshot) -> dict[str, Any]:
 
 def _stable_path_identity(identity: _PathIdentity) -> dict[str, int]:
     return {
-        "owner_uid": identity.owner_uid,
         "device": identity.device,
         "inode": identity.inode,
     }
@@ -649,10 +645,6 @@ def _admin_snapshot(root: Path) -> _AdminSnapshot:
             f"repository .git marker must not be a symbolic link: {marker}"
         )
     marker_identity = _path_identity(marker_metadata)
-    if marker_identity.owner_uid != os.geteuid():
-        raise RepositoryContextError(
-            f"repository .git marker must be owned by account uid {os.geteuid()}: {marker}"
-        )
     if stat.S_ISDIR(marker_metadata.st_mode):
         _inspect_path(
             marker,
@@ -844,11 +836,14 @@ def _scope_identity(path: Path, root_identity: _PathIdentity) -> RepositoryScope
     }
     legacy_material = {
         "canonical_root": str(path),
-        "root": root_identity.material(),
-        "git_dir": {"path": before.git_dir, **before.git_dir_identity.material()},
+        "root": root_identity.legacy_material(),
+        "git_dir": {
+            "path": before.git_dir,
+            **before.git_dir_identity.legacy_material(),
+        },
         "git_common_dir": {
             "path": before.git_common_dir,
-            **before.git_common_dir_identity.material(),
+            **before.git_common_dir_identity.legacy_material(),
         },
         "git_marker_kind": before.marker_kind,
         "git_marker_fingerprint": before.marker_digest,
@@ -890,15 +885,12 @@ def _revalidate_scope(scope: RepositoryScopeIdentity, *, field: str) -> None:
     )
     snapshot = _admin_snapshot(path)
     observed = {
-        "root_owner_uid": root_identity.owner_uid,
         "root_device": root_identity.device,
         "root_inode": root_identity.inode,
         "git_dir": snapshot.git_dir,
-        "git_dir_owner_uid": snapshot.git_dir_identity.owner_uid,
         "git_dir_device": snapshot.git_dir_identity.device,
         "git_dir_inode": snapshot.git_dir_identity.inode,
         "git_common_dir": snapshot.git_common_dir,
-        "git_common_dir_owner_uid": snapshot.git_common_dir_identity.owner_uid,
         "git_common_dir_device": snapshot.git_common_dir_identity.device,
         "git_common_dir_inode": snapshot.git_common_dir_identity.inode,
         "git_marker_fingerprint": _stable_marker_fingerprint(snapshot),
@@ -936,7 +928,7 @@ def _worktree_matches_scope(raw: str, scope: RepositoryScopeIdentity) -> bool:
             expected_kind="directory",
             final_owner_uid=os.geteuid(),
         )
-    except (RepositoryContextError, _filesystem_acl.FilesystemACLTrustError):
+    except RepositoryContextError:
         return False
     return (identity.device, identity.inode) == (
         scope.root_device,
@@ -1028,13 +1020,13 @@ def resolve_repository_context(
 
 
 def resolve_effective_repository_context(*, project: str) -> RepositoryContext:
-    """Discover the primary/temporary relationship for one exact worktree.
+    """Resolve the current project path to one proven repository context.
 
-    Compatibility actions historically accepted only the active project path.
-    Resolve that path through the same trusted Git and filesystem boundary as
-    the explicit runtime API, then return the explicit root/temporary context
-    used by normalized persistence.  The final resolver repeats every proof so
-    a worktree move between discovery and use fails closed.
+    This is the single current project-path resolver.  It passes the path
+    through the same trusted Git and filesystem boundary as the explicit
+    runtime API, then returns the root/temporary context used by normalized
+    persistence.  The final resolver repeats every proof so a worktree move
+    between discovery and use fails closed.
     """
 
     _reject_ambient_git_redirection()
@@ -1066,27 +1058,41 @@ def _scope_identity_changed(row: Any, scope: RepositoryScopeIdentity) -> bool:
     stored = row["identity_fingerprint"]
     if stored is None:
         return False
-    if str(stored) == scope.identity_fingerprint:
+    stored_fingerprint = str(stored)
+    if stored_fingerprint == scope.identity_fingerprint:
         return bool(
             row["root_device"] not in {None, scope.root_device}
             or row["root_inode"] not in {None, scope.root_inode}
         )
-    if str(stored) == scope.legacy_identity_fingerprint:
+    if stored_fingerprint.startswith(f"{_IDENTITY_FINGERPRINT_VERSION}:"):
+        # Version-two fingerprints contain structural object identities only.
+        # A mismatch therefore proves replacement, not chmod/chown/ACL drift.
+        return True
+    if stored_fingerprint == scope.legacy_identity_fingerprint:
         return bool(
             row["git_dir"] not in {None, scope.git_dir}
             or row["git_common_dir"] not in {None, scope.git_common_dir}
         )
-    return True
+    # Historical fingerprints included mode/owner/ACL-adjacent metadata.
+    # Upgrade them in place when the persisted structural object identity is
+    # unchanged; local permission changes are not repository replacement.
+    return bool(
+        row["root_device"] not in {None, scope.root_device}
+        or row["root_inode"] not in {None, scope.root_inode}
+        or row["git_dir"] not in {None, scope.git_dir}
+        or row["git_common_dir"] not in {None, scope.git_common_dir}
+    )
 
 
 def _family_identity_changed(row: Any, scope: RepositoryScopeIdentity) -> bool:
     stored = row["identity_fingerprint"]
     if stored is None or str(stored) == scope.identity_fingerprint:
         return False
-    return bool(
-        str(stored) != scope.legacy_identity_fingerprint
-        or row["git_common_dir"] not in {None, scope.git_common_dir}
-    )
+    if str(stored).startswith(f"{_IDENTITY_FINGERPRINT_VERSION}:"):
+        return True
+    # Family identity is the shared Git common directory; an old fingerprint
+    # may differ solely because it included Unix metadata.
+    return row["git_common_dir"] not in {None, scope.git_common_dir}
 
 
 def _repository_path_matches_scope(
@@ -1098,7 +1104,7 @@ def _repository_path_matches_scope(
         _path, identity = _canonical_existing_directory(
             canonical_root, field="stored repository root"
         )
-    except (RepositoryContextError, _filesystem_acl.FilesystemACLTrustError):
+    except RepositoryContextError:
         return False
     return (identity.device, identity.inode) == (
         scope.root_device,

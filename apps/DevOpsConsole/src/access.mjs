@@ -8,6 +8,7 @@ import path from 'node:path';
 
 const EMAIL_RE = /^[^\s@<>(),;:\\"\[\]]+@[^\s@<>(),;:\\"\[\]]+\.[^\s@<>(),;:\\"\[\]]+$/;
 const ROUTE_GRANT_RE = /^route:([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)$/;
+const TEST_GRANT_RE = /^tests:(read|run|operate):([A-Za-z0-9][A-Za-z0-9_.@-]{0,255})$/;
 const MAX_USERS = 1000;
 const MAX_GRANTS = 1000;
 const MAX_PENDING_REQUESTS = 1000;
@@ -22,6 +23,11 @@ const NO_CHANGE = Symbol('no-change');
 
 export const CONSOLE_GRANT = 'console';
 export const routeGrant = (slug) => `route:${String(slug ?? '').trim().toLowerCase()}`;
+export const testGrant = (repoId, scope) => {
+  const grant = `tests:${String(scope ?? '').trim().toLowerCase()}:${String(repoId ?? '').trim()}`;
+  if (!TEST_GRANT_RE.test(grant)) throw new AccessError(400, 'test grant identity is invalid');
+  return grant;
+};
 
 export class AccessError extends Error {
   constructor(status, message, { retryAfter = null } = {}) {
@@ -88,12 +94,19 @@ export function createAccessStore({
 
   function grantExists(grant) {
     if (grant === CONSOLE_GRANT) return true;
+    // Repository ids are immutable and never reassigned. Keeping an exact
+    // tests grant after a project is archived cannot authorize a successor;
+    // the Console still verifies the id against the live catalog per call.
+    if (TEST_GRANT_RE.test(grant)) return true;
     const match = typeof grant === 'string' ? grant.match(ROUTE_GRANT_RE) : null;
     return Boolean(match && routeStore?.get(match[1]));
   }
 
   function resourceInstance(grant) {
     if (grant === CONSOLE_GRANT) return CONSOLE_INSTANCE;
+    if (TEST_GRANT_RE.test(grant)) {
+      return `repository-tests:v1:${crypto.createHash('sha256').update(grant, 'utf8').digest('hex')}`;
+    }
     const match = typeof grant === 'string' ? grant.match(ROUTE_GRANT_RE) : null;
     if (!match) return null;
     const route = routeStore?.get(match[1]);
@@ -110,8 +123,9 @@ export function createAccessStore({
     const out = new Set();
     for (const value of values) {
       if (typeof value !== 'string') throw new AccessError(400, 'each grant must be a string');
-      const grant = value.trim().toLowerCase();
-      if (grant !== CONSOLE_GRANT && !ROUTE_GRANT_RE.test(grant)) {
+      const trimmed = value.trim();
+      const grant = TEST_GRANT_RE.test(trimmed) ? trimmed : trimmed.toLowerCase();
+      if (grant !== CONSOLE_GRANT && !ROUTE_GRANT_RE.test(grant) && !TEST_GRANT_RE.test(grant)) {
         throw new AccessError(400, `unknown access resource '${grant.slice(0, 100)}'`);
       }
       if (requireCurrent && !grantExists(grant)) {
@@ -178,12 +192,6 @@ export function createAccessStore({
       const stat = await handle.stat();
       if (!stat.isFile()) {
         throw new AccessError(500, 'access policy must be a regular file');
-      }
-      if (typeof process.getuid === 'function' && stat.uid !== process.getuid()) {
-        throw new AccessError(500, 'access policy must be owned by the Console account');
-      }
-      if ((stat.mode & 0o077) !== 0) {
-        throw new AccessError(500, 'access policy must not be group/world accessible');
       }
       return handle;
     } catch (error) {
@@ -285,7 +293,7 @@ export function createAccessStore({
             typeof id === 'string' && /^[0-9a-f-]{16,64}$/i.test(id)
             && typeof raw.subjectHash === 'string' && /^[0-9a-f]{64}$/.test(raw.subjectHash)
             && typeof raw.resource === 'string'
-            && (raw.resource === CONSOLE_GRANT || ROUTE_GRANT_RE.test(raw.resource))
+            && (raw.resource === CONSOLE_GRANT || ROUTE_GRANT_RE.test(raw.resource) || TEST_GRANT_RE.test(raw.resource))
             && typeof raw.resourceInstance === 'string' && raw.resourceInstance.length > 0
             && raw.resourceInstance.length <= 200 && !/[\u0000-\u001f\u007f]/.test(raw.resourceInstance)
             && typeof raw.host === 'string' && raw.host.length > 0 && raw.host.length <= 300

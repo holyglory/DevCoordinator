@@ -7,6 +7,8 @@
     "node": ">=20"
   },
   "scripts": {
+    "acceptance:prepare-session": "node Tools/prepare-production-acceptance-storage-state.mjs",
+    "acceptance:production": "node Tools/production-console-acceptance.mjs",
     "start": "node bin/devops-console.mjs",
     "upstream-auth": "node bin/devops-console-upstream-auth.mjs",
     "test": "node --test test/*.test.mjs"

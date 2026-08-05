@@ -1270,14 +1270,19 @@ def check_devops_board_center_pane_geometry(
         )
 
 
-def check_standalone_skill(skill: Path) -> None:
+def check_standalone_skill(
+    skill: Path, *, skip_normal_unit_pass: bool = False
+) -> None:
     tmp = Path(tempfile.mkdtemp(prefix=f"{skill.name}-standalone-")).resolve(strict=True)
     try:
         copied = tmp / skill.name
         shutil.copytree(skill, copied)
         run([sys.executable, str(copied / "scripts" / "self_test.py")])
         if copied.name == "codex-dev-coordinator":
-            run_normalized_coordinator_tests(copied)
+            run_normalized_coordinator_tests(
+                copied,
+                skip_normal_unit_pass=skip_normal_unit_pass,
+            )
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -1303,7 +1308,9 @@ def run_broker_tests(skill: Path) -> None:
         )
 
 
-def run_normalized_coordinator_tests(skill: Path) -> None:
+def run_normalized_coordinator_tests(
+    skill: Path, *, skip_normal_unit_pass: bool = False
+) -> None:
     scripts = skill / "scripts"
     standalone_suites = [
         "sqlite_store_test.py",
@@ -1341,6 +1348,8 @@ def run_normalized_coordinator_tests(skill: Path) -> None:
     if not tests.is_dir():
         raise SystemExit(f"normalized coordinator unit tests are missing: {tests}")
     for optimization in ([], ["-O"]):
+        if skip_normal_unit_pass and not optimization:
+            continue
         run(
             [
                 sys.executable,
@@ -1355,6 +1364,43 @@ def run_normalized_coordinator_tests(skill: Path) -> None:
                 "-v",
             ]
         )
+
+
+def run_availability_architecture_tests() -> None:
+    """Keep the production isolation/cutover contract in the default gate."""
+
+    suites = (
+        "self_test_availability_schema_check.py",
+        "self_test_check_availability_topology.py",
+        "self_test_systemd_activation.py",
+        "self_test_inventory_projection.py",
+        "self_test_install_availability_release.py",
+        "self_test_server_wide_installer_fence.py",
+        "self_test_browser_lcp_acceptance.py",
+        "self_test_browser_cutover_binding.py",
+        "self_test_install_browser_lcp_runtime.py",
+        "self_test_orchestrate_availability_cutover.py",
+        "self_test_authority_readiness.py",
+        "self_test_authority_repository_repair.py",
+        "self_test_activate_availability_release.py",
+        "self_test_refresh_edge_tls_credential.py",
+        "self_test_background_service_handoff.py",
+        "self_test_project_isolation.py",
+        "self_test_manage_docker_admission.py",
+    )
+    for script_name in suites:
+        script = ROOT / "scripts" / script_name
+        if not script.is_file():
+            raise SystemExit(f"availability architecture test is missing: {script}")
+        run([sys.executable, str(script)])
+        run([sys.executable, "-O", str(script)])
+    run(
+        [
+            sys.executable,
+            str(ROOT / "scripts" / "check_availability_topology.py"),
+            "--json",
+        ]
+    )
 
 
 def menu_source_summary_toggle_errors(source: str) -> list[str]:
@@ -1422,6 +1468,73 @@ struct Next: View {}''',
     errors = menu_source_summary_toggle_errors(source)
     if errors:
         raise SystemExit("DevOpsBoard source-details toggle guard failed: " + "; ".join(errors))
+
+
+def coordinator_api_fast_bind_errors(source: str) -> list[str]:
+    """Validate serve_api's bounded listener construction independent of layout."""
+
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return ["coordinator API source is not valid Python"]
+    serve_api = next(
+        (
+            node
+            for node in tree.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == "serve_api"
+        ),
+        None,
+    )
+    if serve_api is None:
+        return ["coordinator API serve_api function is missing"]
+
+    calls: list[ast.Call] = []
+
+    class FastBindVisitor(ast.NodeVisitor):
+        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+            if node is serve_api:
+                self.generic_visit(node)
+
+        def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+            if node is serve_api:
+                self.generic_visit(node)
+
+        def visit_Assign(self, node: ast.Assign) -> None:
+            if any(
+                isinstance(target, ast.Name) and target.id == "server"
+                for target in node.targets
+            ) and isinstance(node.value, ast.Call):
+                calls.append(node.value)
+            self.generic_visit(node)
+
+    FastBindVisitor().visit(serve_api)
+    for call in calls:
+        if not (
+            isinstance(call.func, ast.Name)
+            and call.func.id == "BoundedThreadingHTTPServer"
+            and len(call.args) == 2
+            and isinstance(call.args[0], ast.Tuple)
+            and len(call.args[0].elts) == 2
+            and all(
+                isinstance(item, ast.Name) and item.id == expected
+                for item, expected in zip(call.args[0].elts, ("host", "port"))
+            )
+            and isinstance(call.args[1], ast.Name)
+            and call.args[1].id == "ApiHandler"
+        ):
+            continue
+        keywords = {keyword.arg: keyword.value for keyword in call.keywords}
+        listener = keywords.get("listener")
+        if (
+            set(keywords) == {"listener"}
+            and isinstance(listener, ast.Name)
+            and listener.id == "listener"
+        ):
+            return []
+    return [
+        "serve_api does not assign the bounded fast-bind server at its validated endpoint"
+    ]
 
 
 def check_ops_console_interaction_guardrails(*, run_macos_app_checks: bool = True) -> None:
@@ -1805,7 +1918,6 @@ def check_ops_console_interaction_guardrails(*, run_macos_app_checks: bool = Tru
         # stalls ~30s in socket.getfqdn between bind() and listen(). The API
         # server must bind without name resolution, and serve_api must use it.
         "coordinator api server skips getfqdn": "socketserver.TCPServer.server_bind(self)",
-        "coordinator api server fast-bind use": "server = BoundedThreadingHTTPServer((host, port), ApiHandler, token=token)",
         "http health timeout classification": "\"classification\": \"timeout\"",
         "project usage model": "struct ProjectUsage",
         "process usage model": "struct ProcessUsage",
@@ -1857,6 +1969,12 @@ def check_ops_console_interaction_guardrails(*, run_macos_app_checks: bool = Tru
     missing = [label for label, needle in required.items() if needle not in haystacks]
     if missing:
         raise SystemExit("DevOpsBoard interaction guardrail failed: " + ", ".join(missing))
+    fast_bind_errors = coordinator_api_fast_bind_errors(coordinator)
+    if fast_bind_errors:
+        raise SystemExit(
+            "DevOpsBoard interaction guardrail failed: "
+            + "; ".join(fast_bind_errors)
+        )
 
     merge_start = store.find("for outcome in outcomes {")
     merge_end = store.find("sourceStates = states", merge_start)
@@ -1935,7 +2053,7 @@ def check_ops_console_interaction_guardrails(*, run_macos_app_checks: bool = Tru
         )
 
 
-def check_devops_console() -> None:
+def check_devops_console(*, run_tests: bool = True) -> None:
     """Deterministic guardrails for the DevOpsConsole web app (apps/DevOpsConsole).
 
     Text anchors are tied to the security invariants in the app's
@@ -2080,10 +2198,13 @@ def check_devops_console() -> None:
 
     for path in [*src_files, console / "src" / "ui" / "app.js"]:
         run(["node", "--check", str(path)])
-    # Exercise the package's public test entry point. The explicit `.test.mjs`
-    # glob in package.json is portable across Node 20-22; Node 22 treats a
-    # bare `test/` directory argument as a missing CommonJS module.
-    run(["npm", "test"], cwd=console)
+    if run_tests:
+        # Exercise the package's public test entry point. The explicit
+        # `.test.mjs` glob in package.json is portable across Node 20-22; Node
+        # 22 treats a bare `test/` directory argument as a missing CommonJS
+        # module. Harness mode delegates this exact pass to the separately
+        # scheduled `console-tests` target instead of running it twice.
+        run(["npm", "test"], cwd=console)
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -2094,6 +2215,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help=(
             "run all skill and static Board checks but skip Swift compilation, XCTest, "
             "native snapshots, and app packaging; use Build macOS Apps for those checks"
+        ),
+    )
+    parser.add_argument(
+        "--harness-mode",
+        action="store_true",
+        help=(
+            "retain every repository gate while delegating the ordinary Console "
+            "and normal Coordinator unit passes to their required harness targets"
         ),
     )
     return parser.parse_args(argv)
@@ -2122,6 +2251,8 @@ def main(argv: list[str] | None = None) -> int:
     run([sys.executable, "-O", str(ROOT / "scripts" / "self_test_cleanup_contract.py")])
     run([sys.executable, str(ROOT / "scripts" / "check_cleanup_contract.py"), "--repo", str(ROOT)])
     run([sys.executable, str(ROOT / "scripts" / "check_repository_freshness_self_test.py")])
+    run([sys.executable, str(ROOT / "scripts" / "self_test_validate_harness_mode.py")])
+    run([sys.executable, "-O", str(ROOT / "scripts" / "self_test_validate_harness_mode.py")])
     run([sys.executable, str(ROOT / "scripts" / "self_test_repository_boundaries.py")])
     run([sys.executable, str(ROOT / "scripts" / "self_test_production_layout.py")])
     run([sys.executable, str(ROOT / "scripts" / "self_test_migrate_legacy_console_runtime.py")])
@@ -2149,9 +2280,10 @@ def main(argv: list[str] | None = None) -> int:
     run([sys.executable, "-O", str(ROOT / "scripts" / "self_test_broker_shutdown_unit.py")])
     run([sys.executable, str(ROOT / "scripts" / "self_test_cutover_helper_cli_contracts.py")])
     run([sys.executable, "-O", str(ROOT / "scripts" / "self_test_cutover_helper_cli_contracts.py")])
+    run_availability_architecture_tests()
     run([sys.executable, str(ROOT / "scripts" / "check_repository_boundaries.py"), "--repo", str(ROOT)])
     check_ops_console_interaction_guardrails(run_macos_app_checks=False)
-    check_devops_console()
+    check_devops_console(run_tests=not args.harness_mode)
     run([sys.executable, str(ROOT / "scripts" / "self_test_manage_skill_links.py")])
     run([sys.executable, str(ROOT / "scripts" / "self_test_public_artifact_guard.py")])
     run([sys.executable, str(ROOT / "scripts" / "public_artifact_guard.py"), "--repo", str(ROOT)])
@@ -2167,8 +2299,16 @@ def main(argv: list[str] | None = None) -> int:
         ]
     )
     for skill in SKILLS:
+        if args.harness_mode and skill.name == "codex-dev-coordinator":
+            # The standalone copy below still runs the Coordinator self-test;
+            # the dedicated harness target owns the ordinary source-tree unit
+            # pass. Keeping both here would execute identical work twice.
+            continue
         run([sys.executable, str(skill.relative_to(ROOT) / "scripts" / "self_test.py")])
-    run_normalized_coordinator_tests(ROOT / "skills" / "codex-dev-coordinator")
+    if not args.harness_mode:
+        run_normalized_coordinator_tests(
+            ROOT / "skills" / "codex-dev-coordinator",
+        )
     run(
         [
             sys.executable,
@@ -2181,7 +2321,12 @@ def main(argv: list[str] | None = None) -> int:
         ]
     )
     for skill in SKILLS:
-        check_standalone_skill(skill)
+        check_standalone_skill(
+            skill,
+            skip_normal_unit_pass=(
+                args.harness_mode and skill.name == "codex-dev-coordinator"
+            ),
+        )
     ops_console = ROOT / "apps" / "DevOpsBoard"
     if ops_console.is_dir():
         # This provenance/tamper suite is deliberately Python-only. Keep it in

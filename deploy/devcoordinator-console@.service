@@ -1,0 +1,52 @@
+[Unit]
+Description=DevCoordinator Console backend slot %i
+After=network-online.target devcoordinator-notifications.service devcoordinator-edge-publication.socket
+Wants=network-online.target devcoordinator-notifications.service devcoordinator-edge-publication.socket
+
+[Service]
+Type=exec
+User=devcoordinator-console
+Group=devcoordinator-console
+Slice=devcoordinator-control.slice
+UMask=0077
+Environment=DEVCOORDINATOR_ROLE=console
+Environment=COORDINATOR_AUTOSTART=0
+Environment=COORDINATOR_REGISTRATION_REQUIRED=0
+Environment=COORDINATOR_RETAINED_INVENTORY=1
+Environment=DEVCOORDINATOR_NOTIFICATION_SOCKET=/run/devcoordinator-notifications/notifications.sock
+Environment=DEVCOORDINATOR_EDGE_PUBLICATION_SOCKET=/run/devcoordinator-edge-publication/publish.sock
+Environment=DEVCOORDINATOR_EDGE_RELEASE_ROOT=/opt/devcoordinator/releases
+Environment=DEVCOORDINATOR_EDGE_PUBLICATION_REQUIRED=1
+Environment=DEVCOORDINATOR_BUG_DIR=/var/lib/devcoordinator-bugs/open
+LoadCredential=session-secret:/etc/devcoordinator/edge/session-secret
+LoadCredential=tls-cert:/etc/letsencrypt/live/vr.ae/fullchain.pem
+LoadCredential=tls-key:/etc/letsencrypt/live/vr.ae/privkey.pem
+Environment=SESSION_SECRET_FILE=%d/session-secret
+Environment=TLS_CERT_FILE=%d/tls-cert
+Environment=TLS_KEY_FILE=%d/tls-key
+EnvironmentFile=/etc/devcoordinator/console.env
+EnvironmentFile=/etc/devcoordinator/console-slots/%i.env
+ExecStartPre=/opt/devcoordinator/releases/%i/bin/devcoordinator-console --check-config --env-file /etc/devcoordinator/console.env
+ExecStart=/opt/devcoordinator/releases/%i/bin/devcoordinator-console-slot --env-file /etc/devcoordinator/console.env
+Restart=always
+RestartSec=2
+TimeoutStopSec=30s
+KillMode=mixed
+StateDirectory=devcoordinator-console
+StateDirectoryMode=0700
+RuntimeDirectory=devcoordinator-console
+RuntimeDirectoryMode=0755
+RuntimeDirectoryPreserve=yes
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=devcoordinator-console
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=/var/lib/devcoordinator-console /var/lib/devcoordinator-bugs /run/devcoordinator-console

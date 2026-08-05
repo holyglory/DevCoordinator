@@ -6,11 +6,13 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+from contextlib import ExitStack
 from pathlib import Path
 import pwd
 import shutil
 import sqlite3
 import stat
+import sys
 import tempfile
 from types import SimpleNamespace
 from unittest import mock
@@ -59,17 +61,18 @@ def exercise_broker_unit_source_controls() -> None:
 
         fixture.write_text(source, encoding="utf-8")
         INSTALLER.validate_broker_unit_source(fixture)
+        writable = INSTALLER.BROKER_UNIT_REQUIRED_SANDBOX["ReadWritePaths"]
         check_rejected(
             source.replace(
-                "ReadWritePaths=/var/lib/devcoordinator /run/devcoordinator",
-                "ReadWritePaths=/var/lib/devcoordinator /run/devcoordinator /etc",
+                writable,
+                f"{writable} /etc",
             ),
             "extra writable path",
         )
         check_rejected(
             source.replace(
-                "ReadWritePaths=/var/lib/devcoordinator /run/devcoordinator",
-                "ReadWritePaths=/home /var/lib/devcoordinator /run/devcoordinator",
+                writable,
+                f"ReadWritePaths=/home {INSTALLER.BASE_READ_WRITE_PATHS}",
             ),
             "ineffective broad home exception",
         )
@@ -93,10 +96,70 @@ def exercise_broker_unit_source_controls() -> None:
             source + "\nBindPaths=/home:/run/devcoordinator/home\n",
             "writable bind alias",
         )
-        writable = "ReadWritePaths=/var/lib/devcoordinator /run/devcoordinator"
         check_rejected(
             source.replace(f"{writable}\n", "", 1) + f"\n{writable}\n",
             "writable path directive outside Service",
+        )
+
+
+def exercise_worker_runner_script_guard() -> None:
+    with tempfile.TemporaryDirectory(prefix="devcoordinator-runner-script-") as raw:
+        script = Path(raw).resolve(strict=True) / "dev_coordinator.py"
+        script.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+        script.chmod(0o755)
+        expect(
+            INSTALLER.worker_runner_script_failure(script) is None,
+            "trusted worker runner script was rejected",
+        )
+        script.chmod(0o775)
+        expect(
+            "group/world writable"
+            in str(INSTALLER.worker_runner_script_failure(script)),
+            "installer verifier missed a group-writable worker runner script",
+        )
+        script.unlink()
+        script.symlink_to("target.py")
+        expect(
+            "regular non-symlink"
+            in str(INSTALLER.worker_runner_script_failure(script)),
+            "installer verifier accepted a symlink worker runner script",
+        )
+
+
+def exercise_systemd_unit_activity_states() -> None:
+    classifications = {
+        "inactive": False,
+        "active": True,
+        "failed": True,
+        "activating": True,
+        "deactivating": True,
+        "reloading": True,
+        "maintenance": True,
+    }
+    for state, expected in classifications.items():
+        with mock.patch.object(
+            INSTALLER,
+            "_systemd_unit_property",
+            return_value=state,
+        ) as property_read:
+            actual = INSTALLER._systemd_unit_active()
+        expect(
+            actual is expected,
+            f"systemd ActiveState={state!r} was misclassified as {actual!r}",
+        )
+        expect(
+            property_read.call_args_list == [mock.call("ActiveState")],
+            f"systemd ActiveState={state!r} used an unexpected property read",
+        )
+
+    with mock.patch.object(
+        INSTALLER,
+        "_systemd_unit_property",
+        return_value="unknown-future-state",
+    ):
+        must_reject(
+            INSTALLER._systemd_unit_active,
+            "unknown systemd active state",
         )
 
 
@@ -271,7 +334,7 @@ def exercise_legacy_docker_dropin_transaction() -> None:
                 "repo_root": str(INSTALLER.ROOT),
                 "system_files": [],
                 "link_transactions": [],
-                "group_members_added": [],
+                "group_members_added": ["legacy-client"],
                 "client_journals": [],
                 "legacy_docker_dropin": entry,
                 "legacy_docker_dropin_removed": True,
@@ -292,7 +355,10 @@ def exercise_legacy_docker_dropin_transaction() -> None:
             INSTALLER.run = lambda *arguments: calls.append(tuple(arguments))
             INSTALLER.command = lambda name: name
             INSTALLER.os.geteuid = lambda: 0
-            result = INSTALLER.rollback_install(transaction)
+            with mock.patch.object(
+                INSTALLER, "_systemd_unit_active", return_value=False
+            ):
+                result = INSTALLER.rollback_install(transaction)
             expect(result["status"] == "rolled_back", "rollback status was not durable")
             expect(
                 dropin.read_bytes() == INSTALLER.LEGACY_DOCKER_DROPIN_CONTENT,
@@ -307,7 +373,11 @@ def exercise_legacy_docker_dropin_transaction() -> None:
                 "rollback changed an unrelated drop-in",
             )
             expect(
-                calls == [("systemctl", "daemon-reload")],
+                calls
+                == [
+                    ("gpasswd", "-d", "legacy-client", "devcoordinator-clients"),
+                    ("systemctl", "daemon-reload"),
+                ],
                 f"rollback invoked unexpected commands: {calls}",
             )
             persisted = json.loads(
@@ -326,6 +396,943 @@ def exercise_legacy_docker_dropin_transaction() -> None:
             INSTALLER.run = original_run
             INSTALLER.command = original_command
             INSTALLER.os.geteuid = original_geteuid
+            INSTALLER.SYSTEM_OWNER_UID = original_owner_uid
+            INSTALLER.SYSTEM_OWNER_GID = original_owner_gid
+
+
+def _activation_transaction(
+    root: Path,
+    *,
+    clients: tuple[str, ...] = ("agent-alpha", "agent-beta"),
+    status: str = "applied",
+    repo_root: str | None = None,
+    restart_precondition: dict[str, object] | None = None,
+) -> tuple[Path, dict[str, object]]:
+    transaction = root / "activation-transaction"
+    private_directory(transaction)
+    precondition = (
+        {
+            "ok": True,
+            "code": "profile_database_enrollment_consistent",
+            "profile_enrollments": 2,
+            "database_enrollments": 2,
+        }
+        if restart_precondition is None
+        else restart_precondition
+    )
+    journal: dict[str, object] = {
+        "version": 1,
+        "status": status,
+        "repo_root": str(INSTALLER.ROOT) if repo_root is None else repo_root,
+        "system_files": [],
+        "link_transactions": [],
+        "skill_link_evidence": [
+            {
+                "user": name,
+                "uid": 4100 + index,
+                "verification": {"ok": True},
+            }
+            for index, name in enumerate(clients)
+        ],
+        "skill_root_directories": [],
+        "group_members_added": [],
+        "client_journals": [],
+        "legacy_docker_dropin": None,
+        "legacy_docker_dropin_removed": False,
+        "test_admission_schema": {"status": "present"},
+        "restart_precondition": precondition,
+        "starts_service": False,
+        "requires_service_restart_for_sandbox_changes": True,
+    }
+    INSTALLER.atomic_json(transaction / INSTALLER.JOURNAL_NAME, journal)
+    return transaction, journal
+
+
+def _activation_patches(
+    *,
+    verify_result: dict[str, object],
+    current_precondition: dict[str, object],
+    state: dict[str, bool],
+    calls: list[tuple[str, ...]],
+    wait_calls: list[int],
+    wait_error: BaseException | None = None,
+    client_readiness: list[dict[str, object]] | BaseException | None = None,
+    journal_path: Path | None = None,
+    verification_calls: list[tuple[str, object]] | None = None,
+    client_readiness_calls: list[list[str]] | None = None,
+    authority_contract: dict[str, object] | BaseException | None = None,
+) -> tuple[object, ...]:
+    def run(*arguments: str) -> None:
+        call = tuple(arguments)
+        calls.append(call)
+        if len(call) >= 2 and call[0] == "systemctl":
+            if call[1] in {"enable", "start"} and journal_path is not None:
+                persisted = json.loads(journal_path.read_text(encoding="utf-8"))
+                activation = persisted.get("activation")
+                if (
+                    not isinstance(activation, dict)
+                    or activation.get("phase") != "starting"
+                ):
+                    raise AssertionError(
+                        "broker lifecycle ran before the activation journal was durable"
+                    )
+            if call[1] == "enable":
+                state["enabled"] = True
+            elif call[1] == "disable":
+                state["enabled"] = False
+            elif call[1] == "start":
+                state["active"] = True
+            elif call[1] == "stop":
+                state["active"] = False
+
+    def wait(wait_seconds: int) -> None:
+        wait_calls.append(wait_seconds)
+        if wait_error is not None:
+            raise wait_error
+        if not state["active"]:
+            raise AssertionError("readiness wait ran before the broker was started")
+
+    def verify(names: list[str]) -> dict[str, object]:
+        if verification_calls is not None:
+            verification_calls.append(("install", list(names)))
+        return verify_result
+
+    def current() -> dict[str, object]:
+        if verification_calls is not None:
+            verification_calls.append(("restart_precondition", None))
+        return current_precondition
+
+    def records(names: list[str]) -> list[tuple[SimpleNamespace, Path]]:
+        return [
+            (
+                SimpleNamespace(
+                    pw_name=name,
+                    pw_uid=4100 + index,
+                    pw_gid=5100 + index,
+                ),
+                Path(f"/home/{name}"),
+            )
+            for index, name in enumerate(names)
+        ]
+
+    def verify_client_readiness(names: list[str]) -> list[dict[str, object]]:
+        expected = ["agent-alpha", "agent-beta"]
+        if names != expected:
+            raise AssertionError(f"client readiness received the wrong client set: {names}")
+        if client_readiness_calls is not None:
+            client_readiness_calls.append(list(names))
+        if isinstance(client_readiness, BaseException):
+            raise client_readiness
+        if client_readiness is not None:
+            return client_readiness
+        return [
+            {
+                "user": name,
+                "uid": 4100 + index,
+                "canary": "broker_profile_inventory",
+            }
+            for index, name in enumerate(names)
+        ]
+
+    def verify_authority_contract() -> dict[str, object]:
+        if isinstance(authority_contract, BaseException):
+            raise authority_contract
+        if authority_contract is not None:
+            return authority_contract
+        return {
+            "ok": True,
+            "code": "activation_authority_contract_ready",
+            "target_broker_schema": 13,
+            "authority_database_schema": 13,
+            "checked_profile_clients": [4100, 4101],
+            "checked_profile_repositories": 2,
+            "issues": [],
+        }
+
+    return (
+        mock.patch.object(INSTALLER.os, "geteuid", return_value=0),
+        mock.patch.object(INSTALLER, "client_records", side_effect=records),
+        mock.patch.object(INSTALLER, "verify_install", side_effect=verify),
+        mock.patch.object(
+            INSTALLER,
+            "require_profile_database_enrollment_consistency",
+            side_effect=current,
+        ),
+        mock.patch.object(
+            INSTALLER,
+            "activation_authority_contract_check",
+            side_effect=verify_authority_contract,
+        ),
+        mock.patch.object(
+            INSTALLER,
+            "_systemd_unit_active",
+            side_effect=lambda: state["active"],
+        ),
+        mock.patch.object(
+            INSTALLER,
+            "_systemd_unit_enabled",
+            side_effect=lambda: state["enabled"],
+        ),
+        mock.patch.object(
+            INSTALLER,
+            "_broker_socket_ready",
+            side_effect=lambda: state["active"],
+        ),
+        mock.patch.object(INSTALLER, "_wait_for_broker_ready", side_effect=wait),
+        mock.patch.object(
+            INSTALLER,
+            "_verify_broker_client_readiness",
+            side_effect=verify_client_readiness,
+        ),
+        mock.patch.object(
+            INSTALLER,
+            "_broker_start_failure_evidence",
+            return_value={
+                "captured_at_epoch": 1,
+                "unit": {"ActiveState": "failed"},
+                "property_errors": {},
+                "journal": {"returncode": 0, "tail": "fixture", "stderr": ""},
+            },
+        ),
+        mock.patch.object(INSTALLER, "command", side_effect=lambda name: name),
+        mock.patch.object(INSTALLER, "run", side_effect=run),
+    )
+
+
+def _activation_profile_document(*, include_second_owner: bool = True) -> dict[str, object]:
+    repositories: dict[str, list[dict[str, object]]] = {}
+    for index, uid in enumerate((4100, 4101)):
+        repository: dict[str, object] = {
+            "canonical_root": f"/home/agent-{index}/project",
+            "repo_id": f"repository-{index}",
+            "generation": index,
+            "owner_uid": uid,
+            "servers": {},
+            "containers": {},
+            "compose_definition_id": None,
+            "compose_container_ids": [],
+            "compose_run_once_services": {},
+            "ephemeral_templates": {},
+            "ephemeral_image_prefetch_templates": [],
+            "ephemeral_secret_policies": {},
+            "account_id": f"account-{uid}",
+            "enabled": True,
+            "issued_at": "2026-07-29T00:00:00Z",
+            "valid_until_epoch": 4_102_444_800,
+        }
+        if uid == 4101 and not include_second_owner:
+            repository.pop("owner_uid")
+        repositories[str(uid)] = [repository]
+    return {
+        "version": 1,
+        "service": {
+            "socket": "/run/devcoordinator-authority.sock",
+            "uid": 0,
+            "gid": 0,
+            "mode": "0666",
+            "database_generation": "activation-database-generation",
+        },
+        "clients": {
+            str(uid): {
+                "account_id": f"account-{uid}",
+                "issued_at": "2026-07-29T00:00:00Z",
+                "valid_until_epoch": 4_102_444_800,
+                "repositories": repositories[str(uid)],
+            }
+            for uid in (4100, 4101)
+        },
+    }
+
+
+def exercise_activation_authority_contract_guard() -> None:
+    original_owner_uid = INSTALLER.SYSTEM_OWNER_UID
+    original_owner_gid = INSTALLER.SYSTEM_OWNER_GID
+    with tempfile.TemporaryDirectory(prefix="devcoordinator-activation-contract-") as raw:
+        root = Path(raw).resolve(strict=True)
+        database = root / "coordinator.sqlite3"
+        profile = root / "client-profiles.json"
+        try:
+            INSTALLER.SYSTEM_OWNER_UID = os.getuid()
+            INSTALLER.SYSTEM_OWNER_GID = os.getgid()
+            connection = sqlite3.connect(database)
+            try:
+                connection.execute(
+                    """
+                    CREATE TABLE schema_metadata(
+                        singleton INTEGER PRIMARY KEY,
+                        schema_version INTEGER NOT NULL
+                    )
+                    """
+                )
+                connection.execute("INSERT INTO schema_metadata VALUES(1, 13)")
+                connection.commit()
+            finally:
+                connection.close()
+            database.chmod(0o600)
+            profile.write_text(
+                json.dumps(_activation_profile_document(), sort_keys=True),
+                encoding="utf-8",
+            )
+            profile.chmod(0o644)
+
+            ready = INSTALLER.activation_authority_contract_check(
+                database_path=database,
+                profile_path=profile,
+            )
+            expect(
+                ready.get("ok") is True
+                and ready.get("target_broker_schema") == 13
+                and ready.get("authority_database_schema") == 13
+                and ready.get("checked_profile_clients") == [4100, 4101]
+                and ready.get("checked_profile_repositories") == 2,
+                f"compatible schema/profile activation contract was rejected: {ready}",
+            )
+
+            connection = sqlite3.connect(database)
+            try:
+                connection.execute(
+                    "UPDATE schema_metadata SET schema_version = 12 WHERE singleton = 1"
+                )
+                connection.commit()
+            finally:
+                connection.close()
+            before_profile = profile.read_bytes()
+            try:
+                INSTALLER.activation_authority_contract_check(
+                    database_path=database,
+                    profile_path=profile,
+                )
+            except INSTALLER.AuthoritySchemaCutoverRequired as error:
+                mismatch = error.evidence
+                expect(
+                    error.code == INSTALLER.AUTHORITY_SCHEMA_CUTOVER_REQUIRED
+                    and error.classification == "cutover_required"
+                    and "sealed offline repository-owner authority migration"
+                    in error.action_required
+                    and mismatch.get("authority_database_schema") == 12
+                    and mismatch.get("target_broker_schema") == 13
+                    and mismatch.get("checked_profile_clients") == [4100, 4101]
+                    and any(
+                        issue.get("reason") == "authority_schema_mismatch"
+                        for issue in mismatch.get("issues", [])
+                    ),
+                    f"schema-12/target-13 refusal was not typed and actionable: {mismatch}",
+                )
+            else:
+                raise AssertionError("activation accepted a schema-12 authority for schema 13")
+            expect(
+                profile.read_bytes() == before_profile,
+                "schema activation preflight mutated the protected profile",
+            )
+
+            connection = sqlite3.connect(database)
+            try:
+                connection.execute(
+                    "UPDATE schema_metadata SET schema_version = 13 WHERE singleton = 1"
+                )
+                connection.commit()
+            finally:
+                connection.close()
+            incomplete_profile = _activation_profile_document(
+                include_second_owner=False
+            )
+            profile.write_text(json.dumps(incomplete_profile, sort_keys=True), encoding="utf-8")
+            profile.chmod(0o644)
+            generation, repositories, _ignored, profile_issues = (
+                INSTALLER._current_profile_repository_enrollments(
+                    incomplete_profile,
+                    now_epoch=1_800_000_000,
+                )
+            )
+            expect(
+                generation == "activation-database-generation"
+                and len(repositories) == 1
+                and any(
+                    issue.get("reason") == "profile_repository_fields_invalid"
+                    and issue.get("uid") == 4101
+                    for issue in profile_issues
+                ),
+                "installer verifier did not reject the incomplete repository contract",
+            )
+            try:
+                INSTALLER.activation_authority_contract_check(
+                    database_path=database,
+                    profile_path=profile,
+                )
+            except INSTALLER.AuthoritySchemaCutoverRequired as error:
+                invalid_profile = error.evidence
+                expect(
+                    invalid_profile.get("checked_profile_clients") == []
+                    and any(
+                        issue.get("reason") == "profile_target_contract_invalid"
+                        and issue.get("uid") == 4100
+                        for issue in invalid_profile.get("issues", [])
+                    )
+                    and any(
+                        issue.get("reason")
+                        == "profile_repository_owner_uid_missing"
+                        and issue.get("uid") == 4101
+                        and issue.get("repository_indexes") == [0]
+                        for issue in invalid_profile.get("issues", [])
+                    ),
+                    "target parser did not reject every profile entry missing owner_uid",
+                )
+            else:
+                raise AssertionError("activation accepted a profile without owner_uid")
+
+            transaction, journal = _activation_transaction(root)
+            precondition = journal["restart_precondition"]
+            assert isinstance(precondition, dict)
+            verify_result: dict[str, object] = {
+                "ok": True,
+                "restart_precondition": precondition,
+                "failures": [],
+            }
+            state = {"active": False, "enabled": False}
+            calls: list[tuple[str, ...]] = []
+            waits: list[int] = []
+            before_journal = (transaction / INSTALLER.JOURNAL_NAME).read_bytes()
+            cutover_error = INSTALLER.AuthoritySchemaCutoverRequired(
+                {
+                    "ok": False,
+                    "code": INSTALLER.AUTHORITY_SCHEMA_CUTOVER_REQUIRED,
+                    "target_broker_schema": 13,
+                    "authority_database_schema": 12,
+                    "issues": [{"reason": "authority_schema_mismatch"}],
+                }
+            )
+            patches = _activation_patches(
+                verify_result=verify_result,
+                current_precondition=precondition,
+                state=state,
+                calls=calls,
+                wait_calls=waits,
+                authority_contract=cutover_error,
+            )
+            with ExitStack() as stack:
+                for patch in patches:
+                    stack.enter_context(patch)
+                try:
+                    INSTALLER.activate_install(
+                        ["agent-alpha", "agent-beta"],
+                        transaction,
+                        "1170c4a3-44aa-4331-8ca2-f178db70a1be",
+                        5,
+                    )
+                except INSTALLER.AuthoritySchemaCutoverRequired as error:
+                    expect(
+                        error.code == INSTALLER.AUTHORITY_SCHEMA_CUTOVER_REQUIRED,
+                        "activate lost the typed cutover refusal",
+                    )
+                else:
+                    raise AssertionError("activate ignored its authority contract refusal")
+            expect(
+                calls == []
+                and waits == []
+                and state == {"active": False, "enabled": False}
+                and (transaction / INSTALLER.JOURNAL_NAME).read_bytes() == before_journal
+                and "activation" not in json.loads(before_journal),
+                "cutover-required activation touched systemd or journaled a start attempt",
+            )
+        finally:
+            INSTALLER.SYSTEM_OWNER_UID = original_owner_uid
+            INSTALLER.SYSTEM_OWNER_GID = original_owner_gid
+
+
+def exercise_installer_activation_transaction() -> None:
+    operation_id = "52c36442-f8fb-4613-94a4-c54eac6eab70"
+    clients = ["agent-alpha", "agent-beta"]
+    parsed = INSTALLER.parse_args(
+        [
+            "activate",
+            "--client-user",
+            clients[0],
+            "--client-user",
+            clients[1],
+            "--transaction-dir",
+            "/var/lib/devcoordinator-installs/fixture",
+            "--operation-id",
+            operation_id,
+            "--wait-seconds",
+            "7",
+        ]
+    )
+    expect(
+        parsed.action == "activate"
+        and parsed.client_user == clients
+        and parsed.transaction_dir
+        == "/var/lib/devcoordinator-installs/fixture"
+        and parsed.operation_id == operation_id
+        and parsed.wait_seconds == 7,
+        "activate CLI did not preserve exact client/transaction/operation/readiness inputs",
+    )
+    original_owner_uid = INSTALLER.SYSTEM_OWNER_UID
+    original_owner_gid = INSTALLER.SYSTEM_OWNER_GID
+    with tempfile.TemporaryDirectory(prefix="devcoordinator-activate-") as raw:
+        root = Path(raw).resolve(strict=True)
+        try:
+            INSTALLER.SYSTEM_OWNER_UID = os.getuid()
+            INSTALLER.SYSTEM_OWNER_GID = os.getgid()
+            transaction, journal = _activation_transaction(root)
+            precondition = journal["restart_precondition"]
+            assert isinstance(precondition, dict)
+            verify_result: dict[str, object] = {
+                "ok": True,
+                "restart_precondition": precondition,
+                "failures": [],
+            }
+            state = {"active": False, "enabled": False}
+            calls: list[tuple[str, ...]] = []
+            wait_calls: list[int] = []
+            verification_calls: list[tuple[str, object]] = []
+            client_readiness_calls: list[list[str]] = []
+            original_atomic_json = INSTALLER.atomic_json
+            snapshots: list[dict[str, object]] = []
+
+            def persist(path: Path, value: dict[str, object]) -> None:
+                snapshots.append(json.loads(json.dumps(value)))
+                original_atomic_json(path, value)
+
+            patches = _activation_patches(
+                verify_result=verify_result,
+                current_precondition=precondition,
+                state=state,
+                calls=calls,
+                wait_calls=wait_calls,
+                journal_path=transaction / INSTALLER.JOURNAL_NAME,
+                verification_calls=verification_calls,
+                client_readiness_calls=client_readiness_calls,
+            )
+            with ExitStack() as stack:
+                for patch in patches:
+                    stack.enter_context(patch)
+                stack.enter_context(
+                    mock.patch.object(INSTALLER, "atomic_json", side_effect=persist)
+                )
+                result = INSTALLER.activate_install(
+                    clients,
+                    transaction,
+                    operation_id,
+                    7,
+                )
+
+            activation = result.get("activation")
+            expect(
+                result.get("status") == "activated" and isinstance(activation, dict),
+                f"successful activation was not durable: {result}",
+            )
+            assert isinstance(activation, dict)
+            expect(
+                activation.get("operation_id") == operation_id
+                and activation.get("clients") == clients
+                and activation.get("initial_active") is False
+                and activation.get("initial_enabled") is False
+                and activation.get("phase") == "ready",
+                f"activation journal omitted exact operation/client/baseline evidence: {activation}",
+            )
+            expect(
+                activation.get("client_readiness")
+                == [
+                    {
+                        "user": name,
+                        "uid": 4100 + index,
+                        "canary": "broker_profile_inventory",
+                    }
+                    for index, name in enumerate(clients)
+                ],
+                f"activation omitted the broker client-readiness canary: {activation}",
+            )
+            expect(
+                wait_calls == [7],
+                f"activation did not use its exact bounded readiness interval: {wait_calls}",
+            )
+            expect(
+                verification_calls
+                == [("install", clients), ("restart_precondition", None)]
+                and client_readiness_calls == [clients],
+                "activation skipped current install, enrollment, or client-readiness verification",
+            )
+            lifecycle = [call[1] for call in calls if call and call[0] == "systemctl"]
+            expect(
+                lifecycle == ["enable", "start"],
+                f"activation did not enable then start from a disabled baseline: {calls}",
+            )
+            starting = [
+                snapshot
+                for snapshot in snapshots
+                if isinstance(snapshot.get("activation"), dict)
+                and snapshot["activation"].get("phase") == "starting"  # type: ignore[union-attr]
+            ]
+            expect(starting, "activation did not journal starting before lifecycle mutation")
+            first_lifecycle_index = next(
+                index
+                for index, call in enumerate(calls)
+                if call and call[0] == "systemctl"
+            )
+            # The persisted file, rather than an in-memory event ordering claim,
+            # is the crash-recovery boundary that must exist before systemd runs.
+            persisted = json.loads(
+                (transaction / INSTALLER.JOURNAL_NAME).read_text(encoding="utf-8")
+            )
+            expect(
+                first_lifecycle_index == 0
+                and persisted["status"] == "activated"
+                and persisted["activation"]["phase"] == "ready",
+                "activation did not finish from a durable starting journal",
+            )
+
+            calls_before_replay = list(calls)
+            replay_patches = _activation_patches(
+                verify_result=verify_result,
+                current_precondition=precondition,
+                state=state,
+                calls=calls,
+                wait_calls=wait_calls,
+                verification_calls=verification_calls,
+                client_readiness_calls=client_readiness_calls,
+            )
+            with ExitStack() as stack:
+                for patch in replay_patches:
+                    stack.enter_context(patch)
+                replay = INSTALLER.activate_install(
+                    clients,
+                    transaction,
+                    operation_id,
+                    7,
+                )
+                must_reject(
+                    lambda: INSTALLER.activate_install(
+                        clients,
+                        transaction,
+                        "3e48de75-d434-4ae0-8a21-d409264a028d",
+                        7,
+                    ),
+                    "different activation operation replay",
+                )
+                must_reject(
+                    lambda: INSTALLER.activate_install(
+                        ["agent-alpha"],
+                        transaction,
+                        operation_id,
+                        7,
+                    ),
+                    "different activation client replay",
+                )
+            expect(
+                replay.get("status") == "activated"
+                and replay.get("activation", {}).get("operation_id") == operation_id,
+                f"same-operation activation replay did not converge: {replay}",
+            )
+            expect(
+                calls == calls_before_replay and wait_calls == [7],
+                "activation replay changed lifecycle state or repeated startup waiting: "
+                f"calls={calls}, before={calls_before_replay}, waits={wait_calls}",
+            )
+            expect(
+                verification_calls
+                == [
+                    ("install", clients),
+                    ("restart_precondition", None),
+                    ("install", clients),
+                    ("restart_precondition", None),
+                ]
+                and client_readiness_calls == [clients, clients],
+                "same-operation replay skipped current install or client-readiness verification",
+            )
+        finally:
+            INSTALLER.SYSTEM_OWNER_UID = original_owner_uid
+            INSTALLER.SYSTEM_OWNER_GID = original_owner_gid
+
+
+def exercise_installer_activation_refusals() -> None:
+    operation_id = "ccb740c1-8c62-44e8-8d1a-544671d07e2a"
+    clients = ["agent-alpha", "agent-beta"]
+    original_owner_uid = INSTALLER.SYSTEM_OWNER_UID
+    original_owner_gid = INSTALLER.SYSTEM_OWNER_GID
+    with tempfile.TemporaryDirectory(prefix="devcoordinator-activate-refuse-") as raw:
+        root = Path(raw).resolve(strict=True)
+        try:
+            INSTALLER.SYSTEM_OWNER_UID = os.getuid()
+            INSTALLER.SYSTEM_OWNER_GID = os.getgid()
+            transaction, journal = _activation_transaction(root)
+            precondition = journal["restart_precondition"]
+            assert isinstance(precondition, dict)
+            verify_result: dict[str, object] = {
+                "ok": True,
+                "restart_precondition": precondition,
+                "failures": [],
+            }
+
+            def invoke(
+                *,
+                names: list[str] = clients,
+                active: bool = False,
+                verified: dict[str, object] = verify_result,
+                current: dict[str, object] = precondition,
+            ) -> tuple[list[tuple[str, ...]], list[int]]:
+                calls: list[tuple[str, ...]] = []
+                waits: list[int] = []
+                state = {"active": active, "enabled": True}
+                patches = _activation_patches(
+                    verify_result=verified,
+                    current_precondition=current,
+                    state=state,
+                    calls=calls,
+                    wait_calls=waits,
+                )
+                with ExitStack() as stack:
+                    for patch in patches:
+                        stack.enter_context(patch)
+                    must_reject(
+                        lambda: INSTALLER.activate_install(
+                            names,
+                            transaction,
+                            operation_id,
+                            5,
+                        ),
+                        "installer activation refusal",
+                    )
+                return calls, waits
+
+            before = (transaction / INSTALLER.JOURNAL_NAME).read_bytes()
+            calls, waits = invoke(names=["agent-alpha"])
+            expect(
+                calls == [] and waits == []
+                and (transaction / INSTALLER.JOURNAL_NAME).read_bytes() == before,
+                "client-mismatched activation changed the journal or service",
+            )
+
+            failing_verify = {
+                "ok": False,
+                "restart_precondition": precondition,
+                "failures": ["installed unit drift"],
+            }
+            calls, waits = invoke(verified=failing_verify)
+            expect(calls == [] and waits == [], "failed install verification reached systemd")
+
+            drifted = {**precondition, "database_enrollments": 1}
+            calls, waits = invoke(current=drifted)
+            expect(calls == [] and waits == [], "restart-precondition drift reached systemd")
+
+            calls, waits = invoke(active=True)
+            expect(
+                calls == [] and waits == [],
+                "unexpected active broker was accepted for first activation",
+            )
+
+            stale_document = json.loads(before)
+            stale_document["status"] = "applying"
+            INSTALLER.atomic_json(transaction / INSTALLER.JOURNAL_NAME, stale_document)
+            calls, waits = invoke()
+            expect(calls == [] and waits == [], "non-applied transaction reached systemd")
+
+            stale_document["status"] = "applied"
+            stale_document["repo_root"] = "/srv/another-coordinator"
+            INSTALLER.atomic_json(transaction / INSTALLER.JOURNAL_NAME, stale_document)
+            calls, waits = invoke()
+            expect(calls == [] and waits == [], "foreign transaction reached systemd")
+        finally:
+            INSTALLER.SYSTEM_OWNER_UID = original_owner_uid
+            INSTALLER.SYSTEM_OWNER_GID = original_owner_gid
+
+
+def exercise_installer_activation_timeout_and_rollback() -> None:
+    operation_id = "98b3ac41-1eb8-40cb-ad58-24f6cf2576b9"
+    clients = ["agent-alpha", "agent-beta"]
+    original_owner_uid = INSTALLER.SYSTEM_OWNER_UID
+    original_owner_gid = INSTALLER.SYSTEM_OWNER_GID
+    with tempfile.TemporaryDirectory(prefix="devcoordinator-activate-timeout-") as raw:
+        root = Path(raw).resolve(strict=True)
+        try:
+            INSTALLER.SYSTEM_OWNER_UID = os.getuid()
+            INSTALLER.SYSTEM_OWNER_GID = os.getgid()
+            transaction, journal = _activation_transaction(root)
+            precondition = journal["restart_precondition"]
+            assert isinstance(precondition, dict)
+            verify_result: dict[str, object] = {
+                "ok": True,
+                "restart_precondition": precondition,
+                "failures": [],
+            }
+            state = {"active": False, "enabled": False}
+            calls: list[tuple[str, ...]] = []
+            waits: list[int] = []
+            patches = _activation_patches(
+                verify_result=verify_result,
+                current_precondition=precondition,
+                state=state,
+                calls=calls,
+                wait_calls=waits,
+                wait_error=INSTALLER.InstallError("bounded readiness expired"),
+            )
+            with ExitStack() as stack:
+                for patch in patches:
+                    stack.enter_context(patch)
+                must_reject(
+                    lambda: INSTALLER.activate_install(
+                        clients,
+                        transaction,
+                        operation_id,
+                        3,
+                    ),
+                    "broker readiness timeout",
+                )
+            failed = json.loads(
+                (transaction / INSTALLER.JOURNAL_NAME).read_text(encoding="utf-8")
+            )
+            expect(
+                waits == [3]
+                and state == {"active": False, "enabled": False}
+                and failed["status"] == "applied"
+                and failed["activation"]["operation_id"] == operation_id
+                and failed["activation"]["phase"] == "failed",
+                f"failed activation did not durably restore its baseline: {failed}; calls={calls}",
+            )
+            lifecycle = [call[1] for call in calls if call and call[0] == "systemctl"]
+            expect(
+                lifecycle == ["enable", "start", "stop", "disable"],
+                f"timeout cleanup did not exactly restore a disabled/inactive baseline: {calls}",
+            )
+
+            # A systemd restart racing after the failed cleanup can be
+            # reconciled only by the same journaled activation operation.  It
+            # must stop the owned unit without rolling back installed files.
+            state["active"] = True
+            calls.clear()
+            reconcile_patches = _activation_patches(
+                verify_result=verify_result,
+                current_precondition=precondition,
+                state=state,
+                calls=calls,
+                wait_calls=waits,
+            )
+            with ExitStack() as stack:
+                for patch in reconcile_patches:
+                    stack.enter_context(patch)
+                reconciled = INSTALLER.restore_activation_baseline(
+                    transaction,
+                    operation_id,
+                )
+            expect(
+                reconciled.get("status") == "applied"
+                and reconciled.get("activation", {}).get("phase") == "failed"
+                and state == {"active": False, "enabled": False},
+                "owned post-failure restart was not reconciled to its baseline",
+            )
+            expect(
+                [call[1] for call in calls if call and call[0] == "systemctl"]
+                == ["stop"],
+                f"activation baseline reconciliation changed unrelated state: {calls}",
+            )
+
+            calls.clear()
+            waits.clear()
+            canary_failure_patches = _activation_patches(
+                verify_result=verify_result,
+                current_precondition=precondition,
+                state=state,
+                calls=calls,
+                wait_calls=waits,
+                client_readiness=INSTALLER.InstallError(
+                    "installed broker profile canary failed"
+                ),
+            )
+            with ExitStack() as stack:
+                for patch in canary_failure_patches:
+                    stack.enter_context(patch)
+                must_reject(
+                    lambda: INSTALLER.activate_install(
+                        clients,
+                        transaction,
+                        operation_id,
+                        3,
+                    ),
+                    "broker client-readiness canary",
+                )
+            canary_failed = json.loads(
+                (transaction / INSTALLER.JOURNAL_NAME).read_text(encoding="utf-8")
+            )
+            expect(
+                waits == [3]
+                and state == {"active": False, "enabled": False}
+                and canary_failed["status"] == "applied"
+                and canary_failed["activation"]["phase"] == "failed",
+                "client-readiness failure did not restore the service baseline",
+            )
+            expect(
+                [call[1] for call in calls if call and call[0] == "systemctl"]
+                == ["enable", "start", "stop", "disable"],
+                f"client-readiness cleanup changed the exact baseline: {calls}",
+            )
+
+            # A later successful exact replay transitions the same operation to
+            # activated; rollback must restore the pre-activation unit baseline
+            # before touching installed files.
+            calls.clear()
+            waits.clear()
+            success_patches = _activation_patches(
+                verify_result=verify_result,
+                current_precondition=precondition,
+                state=state,
+                calls=calls,
+                wait_calls=waits,
+            )
+            with ExitStack() as stack:
+                for patch in success_patches:
+                    stack.enter_context(patch)
+                activated = INSTALLER.activate_install(
+                    clients,
+                    transaction,
+                    operation_id,
+                    3,
+                )
+            expect(activated.get("status") == "activated", "failed activation was not retryable")
+            calls.clear()
+            rollback_patches = (
+                mock.patch.object(INSTALLER.os, "geteuid", return_value=0),
+                mock.patch.object(
+                    INSTALLER,
+                    "_systemd_unit_active",
+                    side_effect=lambda: state["active"],
+                ),
+                mock.patch.object(
+                    INSTALLER,
+                    "_systemd_unit_enabled",
+                    side_effect=lambda: state["enabled"],
+                ),
+                mock.patch.object(INSTALLER, "command", side_effect=lambda name: name),
+                mock.patch.object(
+                    INSTALLER,
+                    "run",
+                    side_effect=lambda *arguments: (
+                        calls.append(tuple(arguments)),
+                        state.__setitem__("active", False)
+                        if len(arguments) > 1 and arguments[1] == "stop"
+                        else None,
+                        state.__setitem__("enabled", False)
+                        if len(arguments) > 1 and arguments[1] == "disable"
+                        else None,
+                    ),
+                ),
+            )
+            with ExitStack() as stack:
+                for patch in rollback_patches:
+                    stack.enter_context(patch)
+                rolled_back = INSTALLER.rollback_install(transaction)
+            expect(
+                rolled_back.get("status") == "rolled_back"
+                and state == {"active": False, "enabled": False},
+                f"activated transaction rollback did not restore service baseline: {rolled_back}",
+            )
+            rollback_lifecycle = [
+                call[1] for call in calls if call and call[0] == "systemctl"
+            ]
+            expect(
+                rollback_lifecycle[:2] == ["stop", "disable"]
+                and rollback_lifecycle[-1:] == ["daemon-reload"],
+                f"rollback did not restore runtime before installed files: {calls}",
+            )
+        finally:
             INSTALLER.SYSTEM_OWNER_UID = original_owner_uid
             INSTALLER.SYSTEM_OWNER_GID = original_owner_gid
 
@@ -565,23 +1572,25 @@ def exercise_source_acl_transaction() -> None:
         return
     original_root = INSTALLER.ROOT
     original_source = INSTALLER.SKILL_SOURCE
-    original_group = INSTALLER.ACCESS_GROUP
     with tempfile.TemporaryDirectory(prefix="devcoordinator-install-acl-") as raw:
         repository = Path(raw) / "repository"
         source = repository / "skills/codex-dev-coordinator"
+        backup_source = repository / "skills/postgres-docker-backup"
         transaction = Path(raw) / "transaction"
         source.mkdir(parents=True)
+        backup_source.mkdir()
         transaction.mkdir()
         skill = source / "SKILL.md"
+        backup_skill = backup_source / "SKILL.md"
         script = source / "scripts/dev_coordinator.py"
         script.parent.mkdir()
         skill.write_text("canonical\n", encoding="utf-8")
+        backup_skill.write_text("canonical backup\n", encoding="utf-8")
         script.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
         script.chmod(0o700)
         try:
             INSTALLER.ROOT = repository
             INSTALLER.SKILL_SOURCE = source
-            INSTALLER.ACCESS_GROUP = "root"
             before = INSTALLER.capture(
                 INSTALLER.command("getfacl"),
                 "--absolute-names",
@@ -593,18 +1602,33 @@ def exercise_source_acl_transaction() -> None:
             skill_acl = INSTALLER.capture(
                 INSTALLER.command("getfacl"), "--omit-header", str(skill)
             ).decode("utf-8")
+            backup_skill_acl = INSTALLER.capture(
+                INSTALLER.command("getfacl"), "--omit-header", str(backup_skill)
+            ).decode("utf-8")
             script_acl = INSTALLER.capture(
                 INSTALLER.command("getfacl"), "--omit-header", str(script)
             ).decode("utf-8")
-            expect("group:root:r--" in skill_acl, "skill ACL did not grant read access")
-            expect("group:root:r-x" in script_acl, "script ACL did not grant execute access")
+            expect(
+                "other::r--" in skill_acl,
+                "skill ACL did not grant read access",
+            )
+            expect(
+                "other::r--" in backup_skill_acl,
+                "backup skill ACL did not grant read access",
+            )
+            expect(
+                "other::r-x" in script_acl,
+                "script ACL did not grant execute access",
+            )
             inherited = source / "future-update.txt"
             inherited.write_text("future\n", encoding="utf-8")
             inherited_acl = INSTALLER.capture(
                 INSTALLER.command("getfacl"), "--omit-header", str(inherited)
             ).decode("utf-8")
-            expect("group:root:r-x" in inherited_acl, "default ACL was not inherited")
-            expect("#effective:r--" in inherited_acl, "inherited file ACL was not read-only")
+            expect(
+                "other::r--" in inherited_acl,
+                "default ACL was not inherited",
+            )
             inherited.unlink()
             INSTALLER.restore_source_acl(backup)
             after = INSTALLER.capture(
@@ -617,7 +1641,6 @@ def exercise_source_acl_transaction() -> None:
         finally:
             INSTALLER.ROOT = original_root
             INSTALLER.SKILL_SOURCE = original_source
-            INSTALLER.ACCESS_GROUP = original_group
 
 
 def exercise_managed_docker_source_policy() -> None:
@@ -844,10 +1867,10 @@ def exercise_profile_database_enrollment_guard() -> None:
                     {
                         "version": 1,
                         "service": {
-                            "socket": "/run/devcoordinator/broker.sock",
+                            "socket": "/run/devcoordinator-authority.sock",
                             "uid": 0,
-                            "gid": 99,
-                            "mode": "0660",
+                            "gid": 0,
+                            "mode": "0666",
                             "database_generation": database_generation,
                         },
                         "clients": {
@@ -860,9 +1883,12 @@ def exercise_profile_database_enrollment_guard() -> None:
                                         "canonical_root": canonical_root,
                                         "repo_id": repo_id,
                                         "generation": 7,
+                                        "owner_uid": uid,
                                         "servers": {},
                                         "containers": {},
                                         "compose_definition_id": None,
+                                        "compose_container_ids": [],
+                                        "compose_run_once_services": {},
                                         "ephemeral_templates": dict(
                                             ephemeral_templates or {}
                                         ),
@@ -886,7 +1912,7 @@ def exercise_profile_database_enrollment_guard() -> None:
                 + "\n",
                 encoding="utf-8",
             )
-            profile.chmod(0o640)
+            profile.chmod(0o644)
 
         connection = sqlite3.connect(database)
         connection.executescript(
@@ -1712,6 +2738,264 @@ def exercise_profile_database_enrollment_guard() -> None:
             INSTALLER.SYSTEM_OWNER_GID = original_owner_gid
 
 
+def exercise_two_account_skill_plan_matrix() -> None:
+    records = [
+        pwd.struct_passwd(
+            (
+                name,
+                "x",
+                4100 + index,
+                5100 + index,
+                "",
+                f"/home/{name}",
+                "/bin/sh",
+            )
+        )
+        for index, name in enumerate(("agent-alpha", "agent-beta"))
+    ]
+    clients = [(record, Path(record.pw_dir)) for record in records]
+    with (
+        mock.patch.object(INSTALLER, "client_records", return_value=clients),
+        mock.patch.object(
+            INSTALLER,
+            "enrolled_home_write_paths",
+            return_value=[home for _record, home in clients],
+        ),
+        mock.patch.object(
+            INSTALLER,
+            "docker_socket_admission_evidence",
+            return_value={"activation_blockers": []},
+        ),
+    ):
+        plan = INSTALLER.desired_plan([record.pw_name for record in records])
+    links = [link for client in plan["clients"] for link in client["skill_links"]]
+    expect(
+        [entry["name"] for entry in plan["managed_skills"]]
+        == list(INSTALLER.MANAGED_SKILLS),
+        "installer plan did not expose the exact canonical skill set",
+    )
+    expect(
+        len(links) == 8,
+        f"two-account Codex/Claude plan did not expose eight exact links: {links}",
+    )
+    expect(
+        {
+            (link["uid"], link["runtime"], link["skill"])
+            for link in links
+        }
+        == {
+            (record.pw_uid, runtime, skill)
+            for record in records
+            for runtime in ("codex", "claude")
+            for skill in INSTALLER.MANAGED_SKILLS
+        },
+        "installer plan duplicated or omitted a per-account/runtime/skill link",
+    )
+
+
+def _skill_fixture_repository(root: Path) -> Path:
+    repository = root / "repository"
+    scripts = repository / "scripts"
+    scripts.mkdir(parents=True)
+    shutil.copyfile(
+        SCRIPT.with_name("manage_skill_links.py"),
+        scripts / "manage_skill_links.py",
+    )
+    for name in INSTALLER.MANAGED_SKILLS:
+        skill = repository / "skills" / name
+        skill.mkdir(parents=True)
+        (skill / "SKILL.md").write_text(
+            f"---\nname: {name}\ndescription: fixture\n---\n",
+            encoding="utf-8",
+        )
+    return repository
+
+
+def _apply_fixture_links(roots: list[Path], transaction: Path) -> dict[str, object]:
+    _returncode, result = INSTALLER.run_json_command(
+        *INSTALLER.skill_manager_arguments(
+            "apply",
+            roots,
+            transaction=transaction,
+        )
+    )
+    return result
+
+
+def _rollback_fixture_links(transaction: Path) -> None:
+    INSTALLER.run_json_command(
+        sys.executable,
+        str(INSTALLER.ROOT / "scripts/manage_skill_links.py"),
+        "rollback",
+        "--transaction-dir",
+        str(transaction),
+        "--json",
+    )
+
+
+def exercise_skill_root_and_link_transactions() -> None:
+    original_root = INSTALLER.ROOT
+    original_source = INSTALLER.SKILL_SOURCE
+    with tempfile.TemporaryDirectory(prefix="devcoordinator-skill-install-") as raw:
+        fixture = Path(raw).resolve(strict=True)
+        repository = _skill_fixture_repository(fixture)
+        home = fixture / "home" / "agent"
+        home.mkdir(parents=True)
+        record = pwd.struct_passwd(
+            (
+                "agent",
+                "x",
+                os.getuid(),
+                os.getgid(),
+                "",
+                str(home),
+                "/bin/sh",
+            )
+        )
+        try:
+            INSTALLER.ROOT = repository
+            INSTALLER.SKILL_SOURCE = repository / "skills/codex-dev-coordinator"
+
+            missing_journal: dict[str, object] = {"skill_root_directories": []}
+            persisted: list[int] = []
+            roots = INSTALLER.install_client_skill_roots(
+                record,
+                home,
+                journal=missing_journal,
+                persist=lambda: persisted.append(1),
+            )
+            expect(
+                len(roots) == 2
+                and all(root.is_dir() and stat.S_IMODE(root.stat().st_mode) == 0o700 for root in roots),
+                "missing explicit Codex/Claude roots were not created securely",
+            )
+            first_transaction = fixture / "link-transaction-missing"
+            _apply_fixture_links(roots, first_transaction)
+            verified = INSTALLER.verify_skill_links(roots)
+            expect(
+                verified["ok"] and len(verified["entries"]) == 4,
+                f"two-skill link publication did not verify exactly: {verified}",
+            )
+            _rollback_fixture_links(first_transaction)
+            INSTALLER.rollback_skill_root_directories(
+                missing_journal["skill_root_directories"]
+            )
+            expect(
+                all(not root.exists() for root in roots)
+                and not (home / ".codex").exists()
+                and not (home / ".claude").exists(),
+                "rollback retained directories created by the installer transaction",
+            )
+            expect(persisted, "skill-root directory mutations were not journaled")
+
+            for relative, root_mode, parent_mode in (
+                (Path(".codex/skills"), 0o775, 0o755),
+                (Path(".claude/skills"), 0o750, 0o711),
+            ):
+                parent = home / relative.parent
+                root = home / relative
+                parent.mkdir(mode=parent_mode)
+                parent.chmod(parent_mode)
+                root.mkdir(mode=root_mode)
+                root.chmod(root_mode)
+                (root / "unrelated-skill").mkdir()
+                (root / "unrelated-skill" / "SKILL.md").write_text(
+                    "unrelated\n", encoding="utf-8"
+                )
+            existing_journal: dict[str, object] = {"skill_root_directories": []}
+            existing_roots = INSTALLER.install_client_skill_roots(
+                record,
+                home,
+                journal=existing_journal,
+                persist=lambda: None,
+            )
+            transaction = fixture / "link-transaction-existing"
+            _apply_fixture_links(existing_roots, transaction)
+            replay_transaction = fixture / "link-transaction-replay"
+            replay = _apply_fixture_links(existing_roots, replay_transaction)
+            expect(
+                replay.get("status") == "applied"
+                and replay.get("entries") == [],
+                f"canonical replay was not an idempotent no-op: {replay}",
+            )
+            _rollback_fixture_links(replay_transaction)
+            expect(
+                INSTALLER.verify_skill_links(existing_roots)["ok"],
+                "replay rollback changed canonical links",
+            )
+            _rollback_fixture_links(transaction)
+            INSTALLER.rollback_skill_root_directories(
+                existing_journal["skill_root_directories"]
+            )
+            restored_modes = {
+                relative: stat.S_IMODE((home / relative).stat().st_mode)
+                for relative in (
+                    ".codex",
+                    ".codex/skills",
+                    ".claude",
+                    ".claude/skills",
+                )
+            }
+            expect(
+                restored_modes
+                == {
+                    ".codex": 0o755,
+                    ".codex/skills": 0o775,
+                    ".claude": 0o711,
+                    ".claude/skills": 0o750,
+                },
+                "rollback did not restore exact pre-existing skill-root metadata: "
+                f"{restored_modes}; journal={existing_journal['skill_root_directories']}",
+            )
+            expect(
+                all(
+                    (root / "unrelated-skill/SKILL.md").read_text(encoding="utf-8")
+                    == "unrelated\n"
+                    for root in existing_roots
+                ),
+                "canonical apply/replay/rollback changed an unrelated skill",
+            )
+        finally:
+            INSTALLER.ROOT = original_root
+            INSTALLER.SKILL_SOURCE = original_source
+
+
+def exercise_noncanonical_skill_refusal() -> None:
+    original_root = INSTALLER.ROOT
+    original_source = INSTALLER.SKILL_SOURCE
+    with tempfile.TemporaryDirectory(prefix="devcoordinator-skill-refusal-") as raw:
+        fixture = Path(raw).resolve(strict=True)
+        repository = _skill_fixture_repository(fixture)
+        roots = [fixture / "codex-skills", fixture / "claude-skills"]
+        for root in roots:
+            root.mkdir()
+        divergent = roots[0] / "codex-dev-coordinator"
+        divergent.mkdir()
+        (divergent / "SKILL.md").write_text("operator copy\n", encoding="utf-8")
+        unrelated = roots[1] / "unrelated-skill"
+        unrelated.mkdir()
+        try:
+            INSTALLER.ROOT = repository
+            INSTALLER.SKILL_SOURCE = repository / "skills/codex-dev-coordinator"
+            transaction = fixture / "must-not-exist"
+            try:
+                _apply_fixture_links(roots, transaction)
+            except INSTALLER.InstallError:
+                pass
+            else:
+                raise AssertionError("installer accepted a noncanonical skill without approval")
+            expect(
+                not transaction.exists()
+                and (divergent / "SKILL.md").read_text(encoding="utf-8")
+                == "operator copy\n"
+                and unrelated.is_dir(),
+                "noncanonical refusal changed installed or unrelated skill state",
+            )
+        finally:
+            INSTALLER.ROOT = original_root
+            INSTALLER.SKILL_SOURCE = original_source
+
+
 def main() -> int:
     user = "devcoordinator-fixture"
     fixture_home = Path("/home/devcoordinator-fixture")
@@ -1740,8 +3024,13 @@ def main() -> int:
         "plan selected the wrong authority database",
     )
     expect(
-        plan["authority"]["socket"] == "/run/devcoordinator/broker.sock",
+        plan["authority"]["socket"] == "/run/devcoordinator-authority.sock",
         "plan selected the wrong broker socket",
+    )
+    expect(
+        plan["authority"]["socket_gid"] == 0
+        and plan["authority"]["socket_mode"] == "0666",
+        "plan retained a group-authorized broker socket",
     )
     expect(plan["starts_service"] is False, "installer plan unexpectedly starts the service")
     expect(
@@ -1789,6 +3078,13 @@ def main() -> int:
         "installer plan omitted an agent skill root",
     )
     expect(
+        [item["name"] for item in plan["managed_skills"]]
+        == list(INSTALLER.MANAGED_SKILLS)
+        and len(plan["clients"][0]["skill_links"])
+        == len(INSTALLER.AGENT_SKILL_ROOTS) * len(INSTALLER.MANAGED_SKILLS),
+        "installer plan omitted exact per-skill/per-root link evidence",
+    )
+    expect(
         plan["system_files"][-1]["source"]
         == INSTALLER.ENROLLED_HOME_DROPIN_SOURCE
         and plan["system_files"][-1]["destination"]
@@ -1815,7 +3111,11 @@ def main() -> int:
         encoding="utf-8"
     )
     expect("User=root" in unit, "broker unit does not use the system authority")
-    expect("Group=devcoordinator-clients" in unit, "broker unit has the wrong access group")
+    expect("Group=root" in unit, "broker unit does not use the root authority group")
+    expect(
+        "Group=devcoordinator-clients" not in unit,
+        "broker unit still treats the shared client group as an authority gate",
+    )
     expect("DEVCOORDINATOR_AUTHORITY=service" in unit, "broker unit omits service authority")
     expect(
         unit.splitlines().count(
@@ -1828,11 +3128,11 @@ def main() -> int:
         "/var/lib/devcoordinator/coordinator.sqlite3" in unit,
         "broker unit selected the wrong database",
     )
-    expect("/run/devcoordinator/broker.sock" in unit, "broker unit selected the wrong socket")
+    expect("/run/devcoordinator-authority.sock" in unit, "broker unit selected the wrong socket")
     expect("%h" not in unit, "system unit uses manager-home expansion")
     expect(
-        unit.splitlines().count("RuntimeDirectoryPreserve=restart") == 1,
-        "broker unit does not preserve volatile run material across a controlled restart",
+        not any(line.startswith("RuntimeDirectory") for line in unit.splitlines()),
+        "direct socket-activated broker must not own an obsolete runtime directory",
     )
     for key, directive in INSTALLER.BROKER_UNIT_REQUIRED_SANDBOX.items():
         expect(
@@ -1874,6 +3174,19 @@ def main() -> int:
     assert "validate_runtime_dependencies.py" in unit
     assert "ExecStart=/usr/bin/python3 -I " in unit
 
+    sysusers = (INSTALLER.ROOT / "deploy/devcoordinator.sysusers.conf").read_text(
+        encoding="utf-8"
+    )
+    expect(
+        'u devcoordinator-testd - "DevCoordinator test scheduler" '
+        "/nonexistent /usr/sbin/nologin" in sysusers,
+        "legacy bootstrap omits the broker's required test-plane identity",
+    )
+    expect(
+        "devcoordinator-clients" not in sysusers,
+        "legacy bootstrap still creates a broad client access group",
+    )
+
     tmpfiles = (INSTALLER.ROOT / "deploy/devcoordinator.tmpfiles.conf").read_text(
         encoding="utf-8"
     )
@@ -1886,31 +3199,60 @@ def main() -> int:
         "tmpfiles omits the client journal parent",
     )
     expect(
-        "d /run/devcoordinator-maintenance 0750 root devcoordinator-clients"
+        "d /run/devcoordinator-maintenance 0755 root root"
         in tmpfiles,
         "tmpfiles omits the broker-independent maintenance directory",
     )
     expect(
-        "d /etc/devcoordinator 0750 root devcoordinator-clients" in tmpfiles,
+        "d /run/devcoordinator 0755 root root" in tmpfiles,
+        "tmpfiles omits the trusted-local runtime directory",
+    )
+    expect(
+        "d /etc/devcoordinator 0755 root root" in tmpfiles,
         "tmpfiles omits the shared profile directory",
     )
 
     installer_source = SCRIPT.read_text(encoding="utf-8")
-    expect('f"g:{ACCESS_GROUP}:rX"' in installer_source, "installer omits source ACL access")
+    expect('"o::rX"' in installer_source, "installer omits trusted-local source ACL access")
     expect(
-        'f"d:g:{ACCESS_GROUP}:rX"' in installer_source,
+        '"d:o::rX"' in installer_source,
         "installer omits default source ACL access",
     )
     expect('f"--restore={backup}"' in installer_source, "installer omits ACL rollback")
     expect(
-        'stat.S_IMODE(metadata.st_mode) != 0o640' in installer_source,
+        'stat.S_IMODE(metadata.st_mode) != 0o644' in installer_source,
         "installer omits profile mode verification",
     )
+    expect(
+        'run(command("usermod")' not in installer_source,
+        "installer still mutates human account groups",
+    )
+    expect(
+        "client is not in the broker access group" not in installer_source,
+        "installer still verifies a human group authorization gate",
+    )
+    expect(
+        'run(command("gpasswd"), "-d", str(user), LEGACY_ACCESS_GROUP)'
+        in installer_source,
+        "installer no longer understands legacy group rollback evidence",
+    )
     expect("shutil.rmtree" not in installer_source, "installer can remove a directory tree")
-    expect(".rmdir(" not in installer_source, "installer can remove a drop-in directory")
+    expect(
+        installer_source.count("os.rmdir(path)") == 1,
+        "installer may remove directories outside the exact skill-root rollback helper",
+    )
     exercise_broker_unit_source_controls()
+    exercise_worker_runner_script_guard()
+    exercise_systemd_unit_activity_states()
+    exercise_two_account_skill_plan_matrix()
+    exercise_skill_root_and_link_transactions()
+    exercise_noncanonical_skill_refusal()
     exercise_enrolled_home_dropin_transaction()
     exercise_legacy_docker_dropin_transaction()
+    exercise_activation_authority_contract_guard()
+    exercise_installer_activation_transaction()
+    exercise_installer_activation_refusals()
+    exercise_installer_activation_timeout_and_rollback()
     exercise_legacy_docker_dropin_controls()
     success_evidence = {
         "ok": True,

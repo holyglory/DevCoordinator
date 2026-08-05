@@ -1,0 +1,14 @@
+[Unit]
+Description=DevCoordinator stable public HTTPS listener
+
+[Socket]
+ListenStream=443
+Accept=no
+Service=devcoordinator-edge.service
+FileDescriptorName=https
+Backlog=1024
+NoDelay=yes
+RemoveOnStop=no
+
+[Install]
+WantedBy=sockets.target

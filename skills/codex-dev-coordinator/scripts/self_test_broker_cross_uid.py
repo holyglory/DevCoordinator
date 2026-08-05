@@ -1171,6 +1171,7 @@ class CrossUIDBrokerAcceptanceTests(unittest.TestCase):
                 profile_path=profile_path,
                 service=service,
                 client_uid=FIRST_UID,
+                repository_owner_uid=FIRST_UID,
                 account_id=FIRST_ACCOUNT_ID,
                 repository={
                     "canonical_root": str(root / "first-second-repository"),
@@ -1269,6 +1270,7 @@ class CrossUIDBrokerAcceptanceTests(unittest.TestCase):
                     socket_path=socket_path,
                     socket_gid=ACCESS_GID,
                     client_uid=FIRST_UID,
+                    repository_owner_uid=FIRST_UID,
                     account_id="cross-uid-account-replacement",
                     canonical_root=str(project_root),
                     servers=(

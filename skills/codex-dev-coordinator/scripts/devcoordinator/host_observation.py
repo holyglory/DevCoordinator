@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 import sqlite3
+import stat
 from typing import Any, Mapping
 
 from .broker_host import EPHEMERAL_DOCKER_LABELS
@@ -25,6 +26,29 @@ def _boolean(value: Any) -> int | None:
     if value is False or value == 0:
         return 0
     return None
+
+
+def is_test_framework_container(labels: Mapping[str, Any]) -> bool:
+    """Return whether Docker labels identify a disposable Testcontainers resource.
+
+    Testcontainers creates a short-lived reaper and one or more dependency
+    containers during an otherwise ordinary test invocation.  They are neither
+    deployable project services nor orphaned user resources.  The framework's
+    own labels are its stable identity; container names are intentionally not
+    used because their random form is not evidence of test ownership.
+    """
+
+    for raw_name, raw_value in labels.items():
+        if not isinstance(raw_name, str) or not isinstance(raw_value, str):
+            continue
+        name = raw_name.lower()
+        if raw_value and (
+            name == "org.testcontainers"
+            or name.startswith("org.testcontainers.")
+            or name.startswith("org.testcontainers-")
+        ):
+            return True
+    return False
 
 
 def _server_sample_unknown(
@@ -90,6 +114,40 @@ def _server_signal(
     return None
 
 
+def _pending_server_lifecycle_operation(
+    connection: sqlite3.Connection,
+    *,
+    definition_id: str,
+) -> tuple[str, str] | None:
+    """Return the exact active start/stop intent for a managed server.
+
+    A lifecycle mutation owns the authoritative observation row from its
+    reservation through its terminal commit.  A host sample is collected
+    outside the commit transaction and can therefore describe the state from
+    immediately before or during that mutation.  It remains useful snapshot
+    evidence, but must not replace the operation-owned launch/stop evidence.
+    """
+
+    row = connection.execute(
+        """
+        SELECT o.operation_id, o.kind
+        FROM operations o
+        JOIN operation_targets t USING(operation_id)
+        WHERE o.status = 'running'
+          AND o.kind IN ('server.start', 'server.stop')
+          AND t.target_kind = 'server'
+          AND t.target_id = ?
+          AND t.status = 'running'
+        ORDER BY o.created_at DESC, o.operation_id
+        LIMIT 1
+        """,
+        (definition_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    return str(row["operation_id"]), str(row["kind"])
+
+
 def _pending_server_stop(
     connection: sqlite3.Connection,
     *,
@@ -104,22 +162,12 @@ def _pending_server_stop(
     as a crash.
     """
 
-    row = connection.execute(
-        """
-        SELECT o.operation_id
-        FROM operations o
-        JOIN operation_targets t USING(operation_id)
-        WHERE o.status = 'running'
-          AND o.kind = 'server.stop'
-          AND t.target_kind = 'server'
-          AND t.target_id = ?
-          AND t.action = 'stop'
-        ORDER BY o.created_at DESC, o.operation_id
-        LIMIT 1
-        """,
-        (definition_id,),
-    ).fetchone()
-    return None if row is None else str(row["operation_id"])
+    operation = _pending_server_lifecycle_operation(
+        connection, definition_id=definition_id
+    )
+    if operation is None or operation[1] != "server.stop":
+        return None
+    return operation[0]
 
 
 def _record_server_transition(
@@ -330,6 +378,45 @@ def _record_docker_transition(
     )
 
 
+def _real_git_worktree_marker(root: Path) -> str:
+    """Return ``valid``, ``missing``, or ``invalid`` for one Git worktree.
+
+    Enrollment accepts only a real directory whose ``.git`` marker is a real
+    directory or regular file. Observation must apply the same proof instead
+    of treating a registered path as ownership authority by itself. ``lstat``
+    is deliberate: a symlinked marker is not repository-controlled evidence,
+    including when its target currently exists.
+    """
+
+    try:
+        root_metadata = root.lstat()
+    except FileNotFoundError:
+        return "missing"
+    except OSError:
+        return "invalid"
+    if stat.S_ISLNK(root_metadata.st_mode) or not stat.S_ISDIR(
+        root_metadata.st_mode
+    ):
+        return "invalid"
+    try:
+        marker_metadata = (root / ".git").lstat()
+    except FileNotFoundError:
+        return "missing"
+    except OSError:
+        return "invalid"
+    if stat.S_ISLNK(marker_metadata.st_mode) or not (
+        stat.S_ISDIR(marker_metadata.st_mode)
+        or stat.S_ISREG(marker_metadata.st_mode)
+    ):
+        return "invalid"
+    return "valid"
+
+
+_SEALED_MEMBERSHIP_PROVENANCE = frozenset(
+    {"operator_attach", "coordinator_ephemeral", "runtime_manifest"}
+)
+
+
 def _repository_resolution(
     connection: sqlite3.Connection,
     host_id: str,
@@ -370,12 +457,17 @@ def _repository_resolution(
         for directory in (candidate, *candidate.parents):
             if directory == registered_root:
                 break
-            if (directory / ".git").exists():
+            marker_state = _real_git_worktree_marker(directory)
+            if marker_state == "valid":
                 root_path = directory
                 break
+            if marker_state == "invalid":
+                return None, str(directory), "not_git"
         if root_path is None:
+            if _real_git_worktree_marker(registered_root) != "valid":
+                return None, str(registered_root), "not_git"
             return registered_id, str(registered_root), ""
-    elif (observed / ".git").exists():
+    elif _real_git_worktree_marker(observed) == "valid":
         # Preserve the existing exact-root discovery behavior, but never claim
         # an arbitrary directory merely because some unregistered ancestor
         # happens to contain a .git marker.
@@ -391,28 +483,15 @@ def _repository_resolution(
     ).fetchone()
     if row is not None:
         return str(row[0]), root, ""
-    # Observation may register a newly installed repository only from the
-    # proved nearest Git root. Resource-name similarity is never sufficient.
-    timestamp = utc_timestamp()
-    repo_id = deterministic_id("repository", host_id, root)
-    connection.execute(
-        """
-        INSERT INTO repositories(
-            repo_id, host_id, canonical_root, display_name, state,
-            generation, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, 'active', 0, ?, ?)
-        """,
-        (repo_id, host_id, root, Path(root).name or root, timestamp, timestamp),
-    )
-    connection.execute(
-        """
-        INSERT INTO repository_installations(
-            repo_id, status, startup_fenced, generation, actor, updated_at
-        ) VALUES (?, 'installed', 0, 0, 'host-observer', ?)
-        """,
-        (repo_id, timestamp),
-    )
-    return repo_id, root, ""
+    # Observation is not ownership authority.  A newly seen Git root remains
+    # explicitly unassigned until an administrator enrolls it with a sealed
+    # repository owner UID; caller identity and inode UID are never promoted
+    # into execution authority here.
+    # Keep the persisted reason inside the long-lived normalized schema
+    # vocabulary.  ``missing_repo`` means there is no enrolled repository row
+    # (and therefore no explicit repository-owner authority); the suggested
+    # root retains the exact Git root an administrator may enroll later.
+    return None, root, "missing_repo"
 
 
 def _repository_id(connection: sqlite3.Connection, host_id: str, project: Any) -> str | None:
@@ -844,7 +923,7 @@ def commit_host_inventory_observation(
         previous_observation = connection.execute(
             """
             SELECT lifecycle, listener_observable, health_classification,
-                   health_ok, stopped_reason
+                   health_ok, stopped_reason, observation_fingerprint
             FROM server_observations WHERE server_definition_id = ?
             """,
             (definition_id,),
@@ -863,58 +942,72 @@ def commit_host_inventory_observation(
             "stopped_reason": server.get("stopped_reason"),
             "sampled_at": timestamp,
         }
-        _record_server_transition(
-            connection,
-            snapshot_id=snapshot_id,
-            definition_id=definition_id,
-            repo_id=str(definition["repo_id"]),
-            name=str(definition["name"]),
-            previous=previous_observation,
-            lifecycle=lifecycle,
-            health=health,
-            timestamp=timestamp,
-            stopped_reason=payload["stopped_reason"],
+        sampled_baseline = server.get("_observation_fingerprint")
+        baseline_changed = bool(
+            isinstance(sampled_baseline, str)
+            and sampled_baseline
+            and (
+                previous_observation is None
+                or str(previous_observation["observation_fingerprint"] or "")
+                != sampled_baseline
+            )
         )
-        connection.execute(
-            """
-            INSERT INTO server_observations(
-                server_definition_id, lifecycle, pid, process_start_time,
-                process_fingerprint, listener_host, listener_port,
-                listener_observable, health_classification, health_ok,
-                stopped_at, stopped_reason, sampled_at, observation_fingerprint
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(server_definition_id) DO UPDATE SET
-                lifecycle = excluded.lifecycle,
-                pid = excluded.pid,
-                process_start_time = excluded.process_start_time,
-                process_fingerprint = excluded.process_fingerprint,
-                listener_host = excluded.listener_host,
-                listener_port = excluded.listener_port,
-                listener_observable = excluded.listener_observable,
-                health_classification = excluded.health_classification,
-                health_ok = excluded.health_ok,
-                stopped_at = excluded.stopped_at,
-                stopped_reason = excluded.stopped_reason,
-                sampled_at = excluded.sampled_at,
-                observation_fingerprint = excluded.observation_fingerprint
-            """,
-            (
-                definition_id,
-                lifecycle,
-                payload["pid"],
-                payload["process_start_time"],
-                payload["process_fingerprint"],
-                payload["listener_host"],
-                payload["listener_port"],
-                _boolean(payload["listener_observable"]),
-                payload["health_classification"],
-                _boolean(payload["health_ok"]),
-                payload["stopped_at"],
-                payload["stopped_reason"],
-                timestamp,
-                fingerprint(payload),
-            ),
+        pending_lifecycle = _pending_server_lifecycle_operation(
+            connection, definition_id=definition_id
         )
+        if pending_lifecycle is None and not baseline_changed:
+            _record_server_transition(
+                connection,
+                snapshot_id=snapshot_id,
+                definition_id=definition_id,
+                repo_id=str(definition["repo_id"]),
+                name=str(definition["name"]),
+                previous=previous_observation,
+                lifecycle=lifecycle,
+                health=health,
+                timestamp=timestamp,
+                stopped_reason=payload["stopped_reason"],
+            )
+            connection.execute(
+                """
+                INSERT INTO server_observations(
+                    server_definition_id, lifecycle, pid, process_start_time,
+                    process_fingerprint, listener_host, listener_port,
+                    listener_observable, health_classification, health_ok,
+                    stopped_at, stopped_reason, sampled_at, observation_fingerprint
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(server_definition_id) DO UPDATE SET
+                    lifecycle = excluded.lifecycle,
+                    pid = excluded.pid,
+                    process_start_time = excluded.process_start_time,
+                    process_fingerprint = excluded.process_fingerprint,
+                    listener_host = excluded.listener_host,
+                    listener_port = excluded.listener_port,
+                    listener_observable = excluded.listener_observable,
+                    health_classification = excluded.health_classification,
+                    health_ok = excluded.health_ok,
+                    stopped_at = excluded.stopped_at,
+                    stopped_reason = excluded.stopped_reason,
+                    sampled_at = excluded.sampled_at,
+                    observation_fingerprint = excluded.observation_fingerprint
+                """,
+                (
+                    definition_id,
+                    lifecycle,
+                    payload["pid"],
+                    payload["process_start_time"],
+                    payload["process_fingerprint"],
+                    payload["listener_host"],
+                    payload["listener_port"],
+                    _boolean(payload["listener_observable"]),
+                    payload["health_classification"],
+                    _boolean(payload["health_ok"]),
+                    payload["stopped_at"],
+                    payload["stopped_reason"],
+                    timestamp,
+                    fingerprint(payload),
+                ),
+            )
         connection.execute(
             """
             INSERT OR REPLACE INTO observation_snapshot_resources(
@@ -1004,6 +1097,7 @@ def commit_host_inventory_observation(
             str(container.get("metadata_source") or "") != "inspection_unavailable"
         )
         labels = container.get("labels") if isinstance(container.get("labels"), Mapping) else {}
+        transient_test = is_test_framework_container(labels)
         compose_project_name = str(
             labels.get("com.docker.compose.project") or ""
         ).strip()
@@ -1222,6 +1316,11 @@ def commit_host_inventory_observation(
                 """,
                 (resource_id,),
             ).fetchone()
+            existing_membership_provenance = (
+                str(existing_membership["provenance"] or "")
+                if existing_membership is not None
+                else ""
+            )
             if (
                 ephemeral_repo_id is not None
                 and existing_membership is not None
@@ -1256,10 +1355,34 @@ def commit_host_inventory_observation(
                     )
                 )
             )
+            weak_membership_revoked = bool(
+                ephemeral_repo_id is None
+                and repo_id is None
+                and unresolved_reason == "not_git"
+                and ownership_observable
+                and existing_membership is not None
+                and existing_membership_provenance
+                not in _SEALED_MEMBERSHIP_PROVENANCE
+            )
             if ownership_conflict:
                 # Only a contradictory exact Git-root claim can invalidate an
                 # existing membership. A pathless observation is absence of new
                 # attribution evidence and must preserve an explicit attach.
+                connection.execute(
+                    """
+                    DELETE FROM repository_memberships
+                    WHERE resource_kind = 'container' AND host_resource_id = ?
+                    """,
+                    (resource_id,),
+                )
+                effective_repo_id = None
+            elif weak_membership_revoked:
+                # A prior path-derived claim is not durable authority once an
+                # exact, inspect-backed observation proves that the registered
+                # root is not a real Git worktree. Preserve explicit operator,
+                # sealed ephemeral, and exact runtime-manifest provenance, but
+                # quarantine legacy/Compose attribution without touching the
+                # native container.
                 connection.execute(
                     """
                     DELETE FROM repository_memberships
@@ -1281,17 +1404,22 @@ def commit_host_inventory_observation(
                 if previous_observation["repo_id"] is not None
                 else None
             )
-        _record_docker_transition(
-            connection,
-            snapshot_id=snapshot_id,
-            resource_id=resource_id,
-            repo_id=event_repo_id,
-            name=name,
-            previous=previous_observation,
-            lifecycle=lifecycle,
-            health=health,
-            timestamp=timestamp,
-        )
+        # A ``docker ps`` row whose matching inspect raced away has no labels,
+        # ownership metadata, or health proof.  It is not sufficient evidence
+        # for a crash or ownership incident; publishing one briefly turns
+        # ordinary disposable test setup/teardown into a Console alert.
+        if inspection_observable and not transient_test:
+            _record_docker_transition(
+                connection,
+                snapshot_id=snapshot_id,
+                resource_id=resource_id,
+                repo_id=event_repo_id,
+                name=name,
+                previous=previous_observation,
+                lifecycle=lifecycle,
+                health=health,
+                timestamp=timestamp,
+            )
         source_resource_id = deterministic_id("source-resource", source_id, "container", full_id)
         if retirement_status not in {"disabling", "retired"}:
             source_repo_id = repo_id if ownership_observable else effective_repo_id
@@ -1317,8 +1445,11 @@ def commit_host_inventory_observation(
                             "metadata_source": (
                                 "coordinator_ephemeral"
                                 if ephemeral_repo_id is not None
+                                else "test_framework_transient"
+                                if transient_test
                                 else container.get("metadata_source") or "none"
                             ),
+                            "transient_test": transient_test,
                             "observed_name": name,
                         }
                     ),
@@ -1349,7 +1480,10 @@ def commit_host_inventory_observation(
                     provenance = CASE
                         WHEN excluded.provenance = 'coordinator_ephemeral'
                         THEN excluded.provenance
-                        WHEN control_bindings.provenance = 'operator_attach'
+                        WHEN control_bindings.provenance IN (
+                            'operator_attach', 'coordinator_ephemeral',
+                            'runtime_manifest'
+                        )
                          AND excluded.authority_state = 'authoritative'
                         THEN control_bindings.provenance
                         WHEN excluded.provenance = 'inspection_unavailable'
@@ -1375,13 +1509,20 @@ def commit_host_inventory_observation(
                     timestamp,
                 ),
             )
-            if ownership_conflict:
+            if ownership_conflict or weak_membership_revoked:
                 connection.execute(
                     """
                     UPDATE startup_policies SET repo_id = NULL,
                         generation = generation + 1, updated_at = ?
                     WHERE resource_kind = 'container' AND resource_id = ?
                       AND repo_id IS NOT NULL
+                    """,
+                    (timestamp, resource_id),
+                )
+                connection.execute(
+                    """
+                    UPDATE database_bindings SET repo_id = NULL, updated_at = ?
+                    WHERE docker_resource_id = ? AND repo_id IS NOT NULL
                     """,
                     (timestamp, resource_id),
                 )
@@ -1416,7 +1557,27 @@ def commit_host_inventory_observation(
                     (timestamp, host_id, resource_id),
                 )
 
-            if effective_repo_id is None:
+            if transient_test:
+                # A test framework owns its own cleanup.  Keep the exact
+                # observation for forensic/debugging use, but do not surface a
+                # disposable dependency as an ownership incident or notify it
+                # as a service crash while a normal test suite is running.
+                connection.execute(
+                    """
+                    UPDATE unassigned_resources SET status = 'attached', updated_at = ?
+                    WHERE host_id = ? AND resource_kind = 'container'
+                      AND resource_id = ? AND status = 'active'
+                    """,
+                    (timestamp, host_id, resource_id),
+                )
+            elif not ownership_observable:
+                # Keep any prior exact ownership classification untouched, but
+                # never manufacture a new one from a row that could not be
+                # inspected.  The next complete observation will either
+                # restore the resource with its labels or classify a real
+                # unassigned container from authoritative evidence.
+                pass
+            elif effective_repo_id is None:
                 previously_classified_unassigned = connection.execute(
                     """
                     SELECT 1 FROM unassigned_resources
@@ -1565,6 +1726,27 @@ def commit_host_inventory_observation(
                             timestamp,
                         ),
                     )
+
+        # Database catalog entries are operational inventory, not forensic
+        # traces.  Never create them for a disposable Testcontainers service
+        # or a row whose inspect race could not prove which service it is.
+        if transient_test or not inspection_observable:
+            if not transient_test:
+                # ``docker ps`` proves that this immutable container is still
+                # present even when the follow-up inspect raced away.  Retain
+                # that presence fact in this completed host sample; only the
+                # enrichment below (database catalog, labels, ports, health)
+                # remains unavailable.  Otherwise the empty latest sample
+                # would incorrectly supersede the prior observed resource.
+                connection.execute(
+                    """
+                    INSERT OR REPLACE INTO observation_snapshot_resources(
+                        snapshot_id, resource_kind, resource_id, observation_fingerprint
+                    ) VALUES (?, 'container', ?, ?)
+                    """,
+                    (snapshot_id, resource_id, observation_fingerprint),
+                )
+            continue
 
         observed_database_names: set[str] = set()
         for database in container.get("databases") or []:

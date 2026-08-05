@@ -249,7 +249,7 @@ class EphemeralContainerCoordinator:
                 run_id=run_id,
             )
             material = self._require_secret_manager().consume_run_secret(
-                peer_uid=authorized.peer.uid,
+                peer_uid=target.owner_uid,
                 account_id=target.account_id,
                 repository_id=target.repo_id,
                 template_id=target.template_id,
@@ -1943,6 +1943,10 @@ class EphemeralContainerCoordinator:
             raise ValueError("request is not ephemeral.start")
         if (expected_image_ref is None) != (expected_template_fingerprint is None):
             raise ValueError("sealed image and template fingerprint must be supplied together")
+        execution_uid = self._persistence.test_repository_execution_authority(
+            repo_id=request.project_id,
+            operation_id=request.operation_id,
+        ).owner_uid
         now_epoch = int(self._clock())
         now = utc_timestamp(now_epoch)
         with self._persistence._store() as store:
@@ -1992,7 +1996,7 @@ class EphemeralContainerCoordinator:
                 self._enforce_start_quotas(
                     connection,
                     template=template,
-                    owner_uid=authorized.peer.uid,
+                    owner_uid=execution_uid,
                     operation_id=request.operation_id,
                 )
                 creation_nonce = str(uuid.uuid4())
@@ -2019,7 +2023,7 @@ class EphemeralContainerCoordinator:
                         request.operation_id,
                         request.resource_id,
                         request.project_id,
-                        authorized.peer.uid,
+                        execution_uid,
                         request.account_id,
                         creation_nonce,
                         container_name,
@@ -3212,7 +3216,16 @@ class EphemeralContainerCoordinator:
                 )
 
     def _recovery_start_permitted(self, target: EphemeralContainerTarget) -> bool:
-        now_epoch = int(self._clock())
+        """Revalidate exact resource availability before starting the container.
+
+        Local principal, enrollment, ACL, and expiry rows are not an
+        authorization boundary on a single-developer server.  The durable run
+        already carries its exact repository/template binding and execution
+        identity.  Revalidation therefore fences only actual resource state;
+        later image, policy-material, and immutable-container checks still
+        protect the host boundary.
+        """
+
         with self._persistence._store() as store:
             with store.read_transaction() as connection:
                 row = connection.execute(
@@ -3220,32 +3233,15 @@ class EphemeralContainerCoordinator:
                     SELECT template.enabled AS template_enabled,
                            repository.state AS repository_state,
                            installation.status AS installation_status,
-                           installation.startup_fenced,
-                           principal.enabled AS principal_enabled,
-                           enrollment.enabled AS enrollment_enabled,
-                           enrollment.valid_until_epoch,
-                           acl.enabled AS acl_enabled
+                           installation.startup_fenced
                     FROM ephemeral_container_templates template
                     JOIN repositories repository USING(repo_id)
                     JOIN repository_installations installation USING(repo_id)
-                    JOIN broker_acl_principals principal ON principal.uid = ?
-                    JOIN broker_repository_enrollments enrollment
-                      ON enrollment.uid = principal.uid
-                     AND enrollment.repo_id = template.repo_id
-                    JOIN broker_ephemeral_acl acl
-                      ON acl.uid = principal.uid
-                     AND acl.repo_id = template.repo_id
-                     AND acl.template_id = template.template_id
-                     AND acl.operation = 'ephemeral.start'
                     WHERE template.template_id = ? AND template.repo_id = ?
-                      AND principal.account_id = ?
-                      AND enrollment.account_id = principal.account_id
                     """,
                     (
-                        target.owner_uid,
                         target.template_id,
                         target.repo_id,
-                        target.account_id,
                     ),
                 ).fetchone()
                 return bool(
@@ -3254,10 +3250,6 @@ class EphemeralContainerCoordinator:
                     and row["repository_state"] == "active"
                     and row["installation_status"] == "installed"
                     and not row["startup_fenced"]
-                    and row["principal_enabled"]
-                    and row["enrollment_enabled"]
-                    and int(row["valid_until_epoch"]) > now_epoch
-                    and row["acl_enabled"]
                 )
 
     @staticmethod
@@ -3276,6 +3268,7 @@ class EphemeralContainerCoordinator:
             environment = (*environment, *secret_mount.environment)
         return EphemeralDockerCreateTarget(
             identity=_identity(target),
+            owner_uid=target.owner_uid,
             container_name=target.container_name,
             image_ref=target.image_ref,
             command=target.command,

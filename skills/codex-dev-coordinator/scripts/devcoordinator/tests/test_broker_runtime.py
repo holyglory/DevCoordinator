@@ -15,6 +15,7 @@ SCRIPTS_ROOT = Path(__file__).resolve().parents[2]
 if str(SCRIPTS_ROOT) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_ROOT))
 
+import dev_coordinator  # noqa: E402
 from devcoordinator.broker import (  # noqa: E402
     BrokerError,
     BrokerOperation,
@@ -167,7 +168,111 @@ class BrokerRuntimeWireTests(unittest.TestCase):
                     **runtime_arguments(action="start"),
                     "keep_alive": True,
                 },
+                )
+
+
+class BrokerRuntimeOperationIdentityTests(unittest.TestCase):
+    operation_id = "44444444-4444-4444-8444-444444444444"
+
+    def request(self) -> dict[str, object]:
+        return {
+            "schema_version": 1,
+            "action": "status",
+            "agent": "runtime-operation-test",
+            "root_repo": "/repositories/alpha",
+            "temporary_repo": None,
+            "target": {"kind": "docker", "id": CONTAINER_ID},
+            "purpose": "development",
+            "ttl_seconds": None,
+            "kill_after_run": False,
+            "options": {},
+        }
+
+    def profile(self) -> mock.Mock:
+        repository = SimpleNamespace(repo_id=PROJECT_ID)
+        profile = mock.Mock()
+        profile.repository.return_value = repository
+        profile.resolve_repository.return_value = repository
+        profile.call.return_value = (
+            self.operation_id,
+            {
+                "schema_version": 1,
+                "ok": True,
+                "action": "status",
+                "repository": {
+                    "root_repo_id": PROJECT_ID,
+                    "effective_repo_id": PROJECT_ID,
+                },
+                "target": {"kind": "docker", "id": CONTAINER_ID},
+            },
+        )
+        return profile
+
+    def test_runtime_threads_one_operation_id_to_broker_and_success_envelope(
+        self,
+    ) -> None:
+        profile = self.profile()
+        with mock.patch.object(
+            dev_coordinator, "state_backend", return_value="sqlite"
+        ), mock.patch.object(
+            dev_coordinator, "authority_mode", return_value="system"
+        ), mock.patch.object(
+            dev_coordinator, "configured_broker_profile", return_value=profile
+        ):
+            result = dev_coordinator.coordinated_runtime_request(
+                self.request(), operation_id=self.operation_id
             )
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["operation_id"], self.operation_id)
+        self.assertEqual(
+            profile.call.call_args.kwargs["operation_id"], self.operation_id
+        )
+        profile.resolve_repository.assert_called_once_with("/repositories/alpha")
+
+    def test_runtime_resolves_authority_repository_newer_than_installed_profile(
+        self,
+    ) -> None:
+        profile = self.profile()
+        profile.repository.side_effect = AssertionError(
+            "runtime request consulted only the stale installed repository map"
+        )
+        with mock.patch.object(
+            dev_coordinator, "state_backend", return_value="sqlite"
+        ), mock.patch.object(
+            dev_coordinator, "authority_mode", return_value="system"
+        ), mock.patch.object(
+            dev_coordinator, "configured_broker_profile", return_value=profile
+        ):
+            result = dev_coordinator.coordinated_runtime_request(
+                self.request(), operation_id=self.operation_id
+            )
+
+        self.assertTrue(result["ok"], result)
+        profile.resolve_repository.assert_called_once_with("/repositories/alpha")
+        profile.repository.assert_not_called()
+
+    def test_broker_failure_envelope_preserves_submitted_operation_id(self) -> None:
+        profile = self.profile()
+        profile.call.side_effect = BrokerError(
+            "broker_unavailable",
+            "Broker reply was unavailable.",
+            operation_id=self.operation_id,
+        )
+        with mock.patch.object(
+            dev_coordinator, "state_backend", return_value="sqlite"
+        ), mock.patch.object(
+            dev_coordinator, "authority_mode", return_value="system"
+        ), mock.patch.object(
+            dev_coordinator, "configured_broker_profile", return_value=profile
+        ):
+            result = dev_coordinator.coordinated_runtime_request(
+                self.request(), operation_id=self.operation_id
+            )
+
+        self.assertFalse(result["ok"], result)
+        self.assertEqual(result["operation_id"], self.operation_id)
+        self.assertEqual(result["evidence"]["operation_id"], self.operation_id)
 
 
 class BrokerWorkerCleanupPreparationTests(unittest.TestCase):
@@ -770,6 +875,23 @@ class BrokerRuntimeAuthorizationTests(unittest.TestCase):
         self.assertTrue(second["ok"], second)
         self.assertEqual(first["result"]["resources"], second["result"]["resources"])
 
+    def test_non_worker_service_status_uses_fresh_broker_observation(self) -> None:
+        self._grant(
+            "status", resource_kind="service", resource_id=SERVER_ID
+        )
+
+        reply = self._reply(
+            action="status", target_kind="service", resource_id=SERVER_ID
+        )
+
+        self.assertTrue(reply["ok"], reply)
+        report = reply["result"]
+        self.assertEqual(report["target"], {"kind": "service", "id": SERVER_ID})
+        self.assertEqual(report["result"]["authority"], "broker")
+        self.assertEqual(report["result"]["state"], "unobserved")
+        self.assertEqual(report["classification"], "observed_not_ready")
+        self.assertEqual(self.actions.calls, [])
+
     def test_service_lifecycle_still_requires_peer_uid_supervisor(self) -> None:
         self._grant(
             "start", resource_kind="service", resource_id=SERVER_ID
@@ -783,7 +905,7 @@ class BrokerRuntimeAuthorizationTests(unittest.TestCase):
         self.assertEqual(reply["error"]["code"], "runtime_supervisor_required")
         self.assertEqual(self.actions.calls, [])
 
-    def test_worker_service_lifecycle_routes_through_peer_uid_controller_and_replays(
+    def test_worker_service_lifecycle_uses_exact_worker_authority_and_replays(
         self,
     ) -> None:
         self._grant("start", resource_kind="service", resource_id=SERVER_ID)
@@ -796,6 +918,12 @@ class BrokerRuntimeAuthorizationTests(unittest.TestCase):
                     (SERVER_ID,),
                 )
                 self._seed_stopped_worker_observation(connection)
+            WorkerSupervision(store).configure_policy(
+                server_definition_id=SERVER_ID,
+                actor="fixture",
+                execution_uid=os.geteuid(),
+                keep_alive=True,
+            )
 
         calls: list[tuple[object, ...]] = []
 
@@ -964,7 +1092,7 @@ class BrokerRuntimeAuthorizationTests(unittest.TestCase):
             ],
         )
 
-    def test_worker_replace_rejects_wrong_uid_path_and_generation_before_control(self) -> None:
+    def test_worker_replace_uses_policy_uid_and_still_checks_path_and_generation(self) -> None:
         repository = self._prepare_worker_replacement(
             execution_uid=os.geteuid() + 1
         )
@@ -972,19 +1100,15 @@ class BrokerRuntimeAuthorizationTests(unittest.TestCase):
             repository,
             operation_id="ad161c28-b685-43a5-b0ac-600b34107630",
         )
-        with mock.patch.object(
-            broker_backend_module,
-            "WorkerController",
-            side_effect=AssertionError("wrong UID crossed control boundary"),
-        ):
-            wrong_uid = self._reply(request=request)
-        self.assertFalse(wrong_uid["ok"], wrong_uid)
         self.assertEqual(
-            wrong_uid["error"]["code"], "worker_execution_uid_mismatch"
+            self.persistence.worker_execution_uid(
+                self.persistence.authorize(peer_for(), request)
+            ),
+            os.geteuid() + 1,
         )
 
-        # Reconfigure the exact policy to the authenticated peer for the
-        # independent path and generation guards.
+        # Reconfigure the enrolled execution owner for the independent path
+        # and generation guards; the caller UID remains attribution only.
         with CoordinatorStore.open(
             self.persistence.database_path, expected_uid=os.geteuid()
         ) as store:
@@ -1171,6 +1295,43 @@ class BrokerRuntimeAuthorizationTests(unittest.TestCase):
         self.assertTrue(
             all(call[2] == "a" * 64 for call in self.actions.calls)
         )
+
+    def test_docker_start_allows_observation_only_binding_generation_refresh(
+        self,
+    ) -> None:
+        self._grant("start")
+        observations = 0
+
+        def refresh_binding_after_action(
+            store: CoordinatorStore,
+        ) -> dict[str, object]:
+            nonlocal observations
+            observations += 1
+            evidence = self._runtime_observer(store)
+            if observations == 2:
+                with store.immediate_transaction(revision_kind="observation") as connection:
+                    connection.execute(
+                        """
+                        UPDATE control_bindings
+                        SET generation = generation + 1
+                        WHERE repo_id = ?
+                        """,
+                        (PROJECT_ID,),
+                    )
+            return evidence
+
+        reply = self._reply(
+            action="start",
+            service=self._service(observer=refresh_binding_after_action),
+        )
+
+        self.assertTrue(reply["ok"], reply)
+        self.assertTrue(reply["result"]["ok"], reply)
+        self.assertEqual(
+            reply["result"]["result"]["terminal_state"]["observed_state"],
+            "running",
+        )
+        self.assertEqual(self.actions.calls, [("start", CONTAINER_ID, "a" * 64)])
 
     def test_database_lifecycle_maps_binding_to_exact_container_and_readiness(
         self,

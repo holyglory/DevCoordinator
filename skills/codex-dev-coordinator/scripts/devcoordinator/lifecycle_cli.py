@@ -189,9 +189,9 @@ def handle_lifecycle_cli(
         if profile is not None:
             removed: dict[str, dict[str, Any]] = {}
             for configured in profile.repositories.values():
-                # repository() is also the expiry gate.  Iterating the raw
-                # mapping must not let an expired root-issued profile bypass
-                # the same validity check used by mutation routes.
+                # Resolve through the current enabled repository contract.
+                # Local profile expiry is informational in the single-server
+                # trust model; exact repository identity remains mandatory.
                 repository = profile.repository(configured.canonical_root)
                 _operation_id, result = profile.call(
                     repository=repository,

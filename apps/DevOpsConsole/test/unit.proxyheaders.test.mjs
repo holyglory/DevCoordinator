@@ -134,8 +134,9 @@ async function startEdge(
     tls = false,
     sessionCookieName = 'dc_session',
     routeAuth = 'google',
+    trustDomain,
     upstreamAuthorization,
-    upstreamIdentityAssertion,
+    localAttribution,
   },
 ) {
   const badGatewayCalls = [];
@@ -162,9 +163,13 @@ async function startEdge(
     slug: 'slug',
     host: '127.0.0.1',
     publicHost,
+    trustDomain,
     route: { slug: 'slug', auth: routeAuth },
     upstreamAuthorization,
-    upstreamIdentityAssertion,
+    localAttribution: localAttribution ?? (trustDomain === 'console' ? undefined : {
+      email: routeAuth === 'public' ? null : 'Owner@Example.COM',
+      routeId: 'fixture-route-instance',
+    }),
   };
   const handler = (req, res) => proxy.forward(req, res, target);
   const server = tls ? https.createServer({ cert: DEV_CERT, key: DEV_KEY }, handler) : http.createServer(handler);
@@ -349,15 +354,13 @@ test('protected routes open only the annotation style surface in an upstream CSP
   );
 });
 
-test('Google-protected routes replace browser Authorization and never expose upstream auth JSON', async (t) => {
+test('Google-protected routes replace browser credentials and inject exact local attribution', async (t) => {
   const upstream = await startUpstream(t);
   const injected = 'Bearer fixture-upstream-credential';
-  const assertion = 'fixture.console.identity.assertion';
   const edge = await startEdge(t, {
     upstreamPort: upstream.port,
     routeAuth: 'google',
     upstreamAuthorization: injected,
-    upstreamIdentityAssertion: assertion,
   });
 
   const echoed = await request({
@@ -369,11 +372,16 @@ test('Google-protected routes replace browser Authorization and never expose ups
       connection: 'close',
       authorization: 'Basic caller-controlled-credential',
       'x-devops-console-assertion': 'caller-controlled-assertion',
+      'x-devops-console-email': 'attacker@example.com',
+      'x-devops-console-route-id': 'caller-route',
     },
   });
   assert.equal(echoed.status, 200);
-  assert.equal(JSON.parse(echoed.body).headers.authorization, injected);
-  assert.equal(JSON.parse(echoed.body).headers['x-devops-console-assertion'], assertion);
+  const protectedHeaders = JSON.parse(echoed.body).headers;
+  assert.equal(protectedHeaders.authorization, injected);
+  assert.equal(protectedHeaders['x-devops-console-assertion'], undefined);
+  assert.equal(protectedHeaders['x-devops-console-email'], 'owner@example.com');
+  assert.equal(protectedHeaders['x-devops-console-route-id'], 'fixture-route-instance');
 
   const challenged = await request({
     port: edge.port,
@@ -426,11 +434,16 @@ test('public routes preserve caller Authorization and upstream login challenges'
       connection: 'close',
       authorization: callerAuthorization,
       'x-devops-console-assertion': 'caller-controlled-assertion',
+      'x-devops-console-email': 'attacker@example.com',
+      'x-devops-console-route-id': 'caller-route',
     },
   });
   assert.equal(echoed.status, 200);
-  assert.equal(JSON.parse(echoed.body).headers.authorization, callerAuthorization);
-  assert.equal(JSON.parse(echoed.body).headers['x-devops-console-assertion'], undefined);
+  const publicHeaders = JSON.parse(echoed.body).headers;
+  assert.equal(publicHeaders.authorization, callerAuthorization);
+  assert.equal(publicHeaders['x-devops-console-assertion'], undefined);
+  assert.equal(publicHeaders['x-devops-console-email'], undefined);
+  assert.equal(publicHeaders['x-devops-console-route-id'], 'fixture-route-instance');
 
   const challenged = await request({
     port: edge.port,
@@ -470,6 +483,27 @@ test('HTTP proxy isolates Console auth cookies while preserving unrelated cookie
     'app_session=keep=with=equals; theme=dark; dc_session_backup=keep-too',
   );
   assert.doesNotMatch(String(echoed.headers.cookie ?? ''), /real-console-session|real-login-flow/);
+  assert.deepEqual(res.headers['set-cookie'], [
+    'app_session=keep-me; Path=/; Expires=Wed, 21 Oct 2030 07:28:00 GMT; HttpOnly',
+    'dc_session_backup=also-keep; Path=/; SameSite=Lax',
+  ]);
+});
+
+test('HTTP Console-trust upstream cannot overwrite edge-owned auth cookies', async (t) => {
+  const upstream = await startUpstream(t);
+  const edge = await startEdge(t, {
+    upstreamPort: upstream.port,
+    trustDomain: 'console',
+  });
+
+  const res = await request({
+    port: edge.port,
+    method: 'GET',
+    path: '/resp-cookies',
+    headers: { host: 'console.vr.ae', connection: 'close' },
+  });
+
+  assert.equal(res.status, 200);
   assert.deepEqual(res.headers['set-cookie'], [
     'app_session=keep-me; Path=/; Expires=Wed, 21 Oct 2030 07:28:00 GMT; HttpOnly',
     'dc_session_backup=also-keep; Path=/; SameSite=Lax',
@@ -523,12 +557,10 @@ test('X-Forwarded-Proto is https when the edge terminates TLS', async (t) => {
 test('upgrade path: Connection: Upgrade preserved, extras stripped, 101 relayed', async (t) => {
   const upstream = await startUpstream(t);
   const injected = 'Bearer fixture-websocket-upstream-credential';
-  const assertion = 'fixture.console.websocket.assertion';
   const edge = await startEdge(t, {
     upstreamPort: upstream.port,
     publicHost: 'slug.vr.ae',
     upstreamAuthorization: injected,
-    upstreamIdentityAssertion: assertion,
   });
 
   const raw = await rawExchange(
@@ -542,6 +574,8 @@ test('upgrade path: Connection: Upgrade preserved, extras stripped, 101 relayed'
       'Sec-WebSocket-Version: 13',
       'Authorization: Basic caller-controlled-websocket-credential',
       'X-DevOps-Console-Assertion: caller-controlled-assertion',
+      'X-DevOps-Console-Email: attacker@example.com',
+      'X-DevOps-Console-Route-ID: caller-route',
       'Cookie: dc_session=real-console-session; dc_flow=real-login-flow; app_session=keep-me; dc_flow_backup=keep-too',
       'X-Hop: sneak',
       '',
@@ -565,7 +599,9 @@ test('upgrade path: Connection: Upgrade preserved, extras stripped, 101 relayed'
   assert.equal(h['sec-websocket-version'], '13');
   assert.equal(h['x-hop'], undefined, 'Connection-named extra must not reach upstream');
   assert.equal(h.authorization, injected);
-  assert.equal(h['x-devops-console-assertion'], assertion);
+  assert.equal(h['x-devops-console-assertion'], undefined);
+  assert.equal(h['x-devops-console-email'], 'owner@example.com');
+  assert.equal(h['x-devops-console-route-id'], 'fixture-route-instance');
   assert.equal(h.cookie, 'app_session=keep-me; dc_flow_backup=keep-too');
   assert.doesNotMatch(String(h.cookie ?? ''), /real-console-session|real-login-flow/);
   assert.equal(h.host, 'slug.vr.ae');
@@ -573,19 +609,51 @@ test('upgrade path: Connection: Upgrade preserved, extras stripped, 101 relayed'
   assert.equal(h['x-forwarded-host'], 'edgehost.vr.ae');
 });
 
+test('WebSocket Console-trust upstream cannot overwrite edge-owned auth cookies', async (t) => {
+  const upstream = await startUpstream(t);
+  const edge = await startEdge(t, {
+    upstreamPort: upstream.port,
+    publicHost: 'console.vr.ae',
+    trustDomain: 'console',
+  });
+
+  const raw = await rawExchange(
+    edge.port,
+    [
+      'GET /ws HTTP/1.1',
+      'Host: console.vr.ae',
+      'Connection: Upgrade',
+      'Upgrade: websocket',
+      'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==',
+      'Sec-WebSocket-Version: 13',
+      '',
+      '',
+    ].join('\r\n'),
+  );
+
+  assert.match(raw, /^HTTP\/1\.1 101 /);
+  assert.doesNotMatch(raw, /Set-Cookie: (?:dc_session|dc_flow)=/i);
+  assert.match(raw, /Set-Cookie: app_session=keep-me;/i);
+  assert.match(raw, /Set-Cookie: dc_flow_backup=also-keep;/i);
+});
+
 test('dead upstream port → onError callback renders the 502 (kind=connect)', async (t) => {
-  // Reserve an ephemeral port the OS just proved free, then close it so
-  // nothing is listening there. No fixed ports involved.
+  // Reserve the future dead port while the edge binds its own ephemeral
+  // listener. Closing it earlier lets the OS immediately recycle that exact
+  // port for the edge, turning the proxy into a self-loop that ends as a
+  // timeout instead of the intended deterministic connection refusal.
   const placeholder = net.createServer();
   const deadPort = await new Promise((resolve, reject) => {
     placeholder.once('error', reject);
     placeholder.listen(0, '127.0.0.1', () => {
-      const p = placeholder.address().port;
-      placeholder.close(() => resolve(p));
+      resolve(placeholder.address().port);
     });
   });
 
   const edge = await startEdge(t, { upstreamPort: deadPort });
+  await new Promise((resolve, reject) => {
+    placeholder.close((error) => (error ? reject(error) : resolve()));
+  });
   const res = await request({
     port: edge.port,
     method: 'GET',

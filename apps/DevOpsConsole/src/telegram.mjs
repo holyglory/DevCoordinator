@@ -417,12 +417,6 @@ export function createTelegramService({
       if (!stat.isFile()) {
         throw new TelegramServiceError(500, 'unsafe_state_file', 'Telegram state must be a regular file');
       }
-      if (typeof process.getuid === 'function' && stat.uid !== process.getuid()) {
-        throw new TelegramServiceError(500, 'unsafe_state_file', 'Telegram state must be owned by the Console account');
-      }
-      if ((stat.mode & 0o077) !== 0) {
-        throw new TelegramServiceError(500, 'unsafe_state_file', 'Telegram state must not be group/world accessible');
-      }
       return handle;
     } catch (error) {
       await handle.close().catch(() => {});

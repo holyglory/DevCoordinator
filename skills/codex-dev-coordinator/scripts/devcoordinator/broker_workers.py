@@ -1,4 +1,4 @@
-"""Authenticated, replay-safe broker operations for fixed worker runners."""
+"""Typed, replay-safe broker operations for fixed worker runners."""
 
 from __future__ import annotations
 
@@ -53,9 +53,10 @@ class BrokerWorkerOperations:
         request = authorized.request
         if request.operation not in WORKER_OPERATIONS:
             raise ValueError("request is not a worker broker operation")
-        # Recheck the live enrollment, exact server ACL, and execution UID at
-        # the backend boundary, after transport authorization.
-        self._persistence.authorize(authorized.peer, request)
+        # Recheck live account/repository/resource policy at the backend
+        # boundary. Keep the returned policy identity separate from caller
+        # attribution.
+        authorized = self._persistence.authorize(authorized.peer, request)
         if request.operation in WORKER_READ_OPERATIONS:
             return self._execute_read(authorized)
 
@@ -268,7 +269,7 @@ class BrokerWorkerOperations:
             if artifact_request is not None:
                 if prepared is None:
                     verified = verify_worker_log_artifact(
-                        execution_uid=authorized.peer.uid,
+                        execution_uid=int(policy["execution_uid"]),
                         artifact_id=str(artifact_request["artifact_id"]),
                         sha256=str(artifact_request["sha256"]),
                     )
@@ -316,12 +317,8 @@ class BrokerWorkerOperations:
             raise WorkerSupervisionConflict(
                 "worker policy does not match the exact broker target"
             )
-        if int(policy["execution_uid"]) != authorized.peer.uid:
-            raise BrokerError(
-                "worker_execution_identity_mismatch",
-                "The authenticated peer is not this worker's execution identity.",
-                operation_id=request.operation_id,
-            )
+        if int(policy["execution_uid"]) <= 0:
+            raise WorkerSupervisionConflict("worker execution identity is invalid")
 
     def _require_candidate_tokens(
         self, authorized: AuthorizedBrokerRequest, candidate: Mapping[str, Any]
@@ -330,7 +327,7 @@ class BrokerWorkerOperations:
         if (
             str(candidate["server_definition_id"]) != request.resource_id
             or str(candidate["repo_id"]) != request.project_id
-            or int(candidate["execution_uid"]) != authorized.peer.uid
+            or int(candidate["execution_uid"]) <= 0
         ):
             raise WorkerSupervisionConflict(
                 "worker launch candidate changed exact repository or execution identity"
@@ -387,7 +384,6 @@ class BrokerWorkerOperations:
                     )
                     return {"status": "running", "prepared": None}
                 identity = (
-                    int(row["uid"]),
                     str(row["account_id"]),
                     str(row["repo_id"]),
                     str(row["server_definition_id"]),
@@ -395,7 +391,6 @@ class BrokerWorkerOperations:
                     str(row["request_fingerprint"]),
                 )
                 expected = (
-                    authorized.peer.uid,
                     request.account_id,
                     request.project_id,
                     request.resource_id,
@@ -405,7 +400,7 @@ class BrokerWorkerOperations:
                 if identity != expected:
                     raise BrokerError(
                         "operation_id_conflict",
-                        "operation_id was already used for a different authenticated worker request.",
+                        "operation_id was already used for a different typed worker request.",
                         operation_id=request.operation_id,
                     )
                 if str(row["status"]) == "succeeded":

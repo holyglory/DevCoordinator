@@ -14,7 +14,7 @@ from .runtime_redaction import redact_runtime_value
 from .store import canonical_json, utc_timestamp
 
 
-RUNTIME_LOG_ARTIFACT_KINDS = frozenset({"docker", "database_stack"})
+RUNTIME_LOG_ARTIFACT_KINDS = frozenset({"service", "docker", "database_stack"})
 RUNTIME_LOG_MAX_BYTES = 1_048_576
 RUNTIME_LOG_MAX_LINES = 2_000
 RUNTIME_LOG_MANIFEST_MAX_BYTES = 32 * 1024
@@ -52,13 +52,9 @@ def _open_private_root(root: Path) -> int:
         flags |= os.O_DIRECTORY
     descriptor = os.open(root, flags)
     metadata = os.fstat(descriptor)
-    if (
-        not stat.S_ISDIR(metadata.st_mode)
-        or metadata.st_uid != os.geteuid()
-        or stat.S_IMODE(metadata.st_mode) != 0o700
-    ):
+    if not stat.S_ISDIR(metadata.st_mode):
         os.close(descriptor)
-        raise OSError("runtime artifact root is not private")
+        raise OSError("runtime artifact root is not a directory")
     return descriptor
 
 
@@ -140,6 +136,8 @@ def persist_runtime_log_artifact(
     """Redact, bound, and atomically publish one exact-container log capture."""
 
     kind = _kind(artifact_kind)
+    if kind == "service":
+        raise ValueError("service logs require the service artifact publisher")
     if not target_resource_id or not docker_resource_id or not full_container_id:
         raise ValueError("runtime log artifact requires exact resource identities")
     root = Path(root)
@@ -206,17 +204,87 @@ def persist_runtime_log_artifact(
     }
 
 
+def persist_service_log_artifact(
+    *,
+    root: Path,
+    target_resource_id: str,
+    definition_fingerprint: str,
+    source_file_identity: str,
+    raw: bytes,
+    request: Mapping[str, Any] | None,
+    input_discarded_bytes: int = 0,
+    captured_at: str | None = None,
+) -> dict[str, Any]:
+    """Publish one bounded service log without exposing its host path."""
+
+    kind = "service"
+    if (
+        not target_resource_id
+        or not definition_fingerprint.startswith("sha256:")
+        or not source_file_identity.startswith("sha256:")
+    ):
+        raise ValueError("service log artifact requires exact source identities")
+    root = Path(root)
+    artifact_id = str(uuid.uuid4())
+    log_name = _basename(kind, artifact_id, "log")
+    manifest_name = _basename(kind, artifact_id, "json")
+    payload, bounds = _bounded_redacted_text(raw, request=request)
+    captured = captured_at or utc_timestamp()
+    manifest = {
+        "schema_version": 1,
+        "artifact_id": artifact_id,
+        "artifact_kind": kind,
+        "target_resource_id": target_resource_id,
+        "definition_fingerprint": definition_fingerprint,
+        "source_file_identity": source_file_identity,
+        "source": "service_log_exact_definition",
+        "captured_at": captured,
+        "filename": log_name,
+        "sha256": hashlib.sha256(payload).hexdigest(),
+        "input_discarded_bytes": max(0, int(input_discarded_bytes)),
+        **bounds,
+    }
+    encoded_manifest = (canonical_json(manifest) + "\n").encode("utf-8")
+    root_fd = _open_private_root(root)
+    try:
+        _write_exclusive(root_fd, log_name, payload)
+        try:
+            _write_exclusive(root_fd, manifest_name, encoded_manifest)
+            os.fsync(root_fd)
+        except BaseException:
+            for name in (manifest_name, log_name):
+                try:
+                    os.unlink(name, dir_fd=root_fd)
+                except OSError:
+                    pass
+            raise
+    finally:
+        os.close(root_fd)
+    return {
+        "availability": "available",
+        "artifact_id": artifact_id,
+        "resource_kind": kind,
+        "target_resource_id": target_resource_id,
+        "path": str(root / log_name),
+        "source": manifest["source"],
+        "captured_at": captured,
+        "bounds": {
+            "tail_lines": bounds["tail_lines"],
+            "max_bytes": bounds["max_bytes"],
+        },
+        "truncated": bool(bounds["truncated"] or input_discarded_bytes),
+    }
+
+
 def _read_private_file(root_fd: int, name: str, *, maximum: int) -> bytes:
     descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=root_fd)
     try:
         before = os.fstat(descriptor)
         if (
             not stat.S_ISREG(before.st_mode)
-            or before.st_uid != os.geteuid()
-            or stat.S_IMODE(before.st_mode) & 0o077
             or before.st_size > maximum
         ):
-            raise OSError("runtime artifact file is not private or bounded")
+            raise OSError("runtime artifact file is not regular or bounded")
         chunks: list[bytes] = []
         remaining = int(before.st_size)
         while remaining:
@@ -243,6 +311,19 @@ def load_runtime_log_artifact(
 ) -> tuple[dict[str, Any], Path]:
     """Load and verify one private typed artifact manifest and payload."""
 
+    manifest, _payload = read_runtime_log_artifact(
+        root=root,
+        artifact_kind=artifact_kind,
+        artifact_id=artifact_id,
+    )
+    return manifest, Path(root) / str(manifest["filename"])
+
+
+def read_runtime_log_artifact(
+    *, root: Path, artifact_kind: str, artifact_id: str
+) -> tuple[dict[str, Any], bytes]:
+    """Descriptor-read and verify one private artifact and return its bytes."""
+
     kind = _kind(artifact_kind)
     canonical_id = _canonical_artifact_id(artifact_id)
     root = Path(root)
@@ -257,16 +338,27 @@ def load_runtime_log_artifact(
         if not isinstance(manifest, dict):
             raise ValueError("runtime artifact manifest is not an object")
         expected_name = _basename(kind, canonical_id, "log")
-        if (
+        common_identity_valid = (
             manifest.get("schema_version") != 1
             or manifest.get("artifact_id") != canonical_id
             or manifest.get("artifact_kind") != kind
             or manifest.get("filename") != expected_name
             or not isinstance(manifest.get("target_resource_id"), str)
-            or not isinstance(manifest.get("docker_resource_id"), str)
-            or not isinstance(manifest.get("full_container_id"), str)
             or not isinstance(manifest.get("sha256"), str)
-        ):
+        )
+        if kind == "service":
+            kind_identity_invalid = (
+                not isinstance(manifest.get("definition_fingerprint"), str)
+                or not str(manifest["definition_fingerprint"]).startswith("sha256:")
+                or not isinstance(manifest.get("source_file_identity"), str)
+                or not str(manifest["source_file_identity"]).startswith("sha256:")
+            )
+        else:
+            kind_identity_invalid = (
+                not isinstance(manifest.get("docker_resource_id"), str)
+                or not isinstance(manifest.get("full_container_id"), str)
+            )
+        if common_identity_valid or kind_identity_invalid:
             raise ValueError("runtime artifact manifest identity is invalid")
         payload = _read_private_file(
             root_fd, expected_name, maximum=RUNTIME_LOG_MAX_BYTES
@@ -275,7 +367,7 @@ def load_runtime_log_artifact(
             raise ValueError("runtime artifact payload does not match its manifest")
     finally:
         os.close(root_fd)
-    return manifest, root / expected_name
+    return manifest, payload
 
 
 def load_latest_runtime_log_artifact(
@@ -289,6 +381,8 @@ def load_latest_runtime_log_artifact(
     """Return the latest retained capture only for the same exact identity."""
 
     kind = _kind(artifact_kind)
+    if kind == "service":
+        raise ValueError("service log artifacts do not use a latest pointer")
     root = Path(root)
     try:
         root_fd = _open_private_root(root)

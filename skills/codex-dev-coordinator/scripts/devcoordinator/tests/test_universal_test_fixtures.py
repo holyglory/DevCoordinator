@@ -1,0 +1,256 @@
+from __future__ import annotations
+
+import json
+import os
+from dataclasses import replace
+from pathlib import Path
+import stat
+import unittest
+
+from devcoordinator.ephemeral_secrets import (
+    POSTGRES_INITDB_PASSWORD_FILE_V1,
+    VolatileRunSecretManager,
+)
+from devcoordinator.universal_test_fixtures import BrokerSealedFixtureProvider
+from devcoordinator.universal_test_runtime import (
+    SystemdTestAttemptManager,
+    TestAttemptDescriptor,
+)
+from devcoordinator.universal_test_store import TestStoreConflict
+from devcoordinator.tests.test_ephemeral_containers import (
+    EphemeralFixture,
+    MultiEphemeralHost,
+    TEMPLATE,
+)
+
+
+class FixtureHost(MultiEphemeralHost):
+    def docker_test_fixture_namespace(self, target):
+        container = self.containers[target.identity.run_id]
+        self.assert_target = target
+        path = Path(f"/proc/{os.getpid()}/ns/net")
+        metadata = path.stat()
+        process_stat = Path(f"/proc/{os.getpid()}/stat").read_text(encoding="utf-8")
+        fields = process_stat[process_stat.rfind(")") + 2 :].split()
+        return {
+            "full_container_id": container["full_container_id"],
+            "pid": os.getpid(),
+            "process_identity": f"linux:{os.getpid()}:{fields[19]}",
+            "namespace_path": str(path),
+            "namespace_device": metadata.st_dev,
+            "namespace_inode": metadata.st_ino,
+        }
+
+
+class UniversalTestFixtureProviderTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.fixture = EphemeralFixture()
+        self.addCleanup(self.fixture.close)
+        self.host = FixtureHost()
+        self.secret_manager = VolatileRunSecretManager(
+            runtime_root=self.fixture.root / "secrets",
+            expected_uid=os.geteuid(),
+            password_factory=lambda: b"fixture-password-never-in-json-1234567890",
+        )
+        self.state_root = self.fixture.root / "test-fixtures"
+        self.credential_root = self.fixture.root / "test-credentials"
+
+    def provider(self) -> BrokerSealedFixtureProvider:
+        return BrokerSealedFixtureProvider(
+            self.fixture.persistence,
+            self.host,
+            secret_manager=self.secret_manager,
+            state_root=self.state_root,
+            credential_root=self.credential_root,
+        )
+
+    def descriptor(self) -> TestAttemptDescriptor:
+        return TestAttemptDescriptor(
+            attempt_id="attempt-sealed-fixture",
+            target_id="target-sealed-fixture",
+            run_id="run-sealed-fixture",
+            repository_id="repo-ephemeral",
+            repository_generation=0,
+            owner_uid=os.geteuid(),
+            generation=1,
+            source_mode="live",
+            snapshot_id=None,
+            original_root=str(self.fixture.root),
+            temporary_root=None,
+            execution_root=str(self.fixture.root),
+            worktree_key=str(self.fixture.root),
+            target_name="integration",
+            shard_index=0,
+            shard_count=1,
+            argv=("/usr/bin/python3", "-c", "pass"),
+            cwd=".",
+            environment={},
+            driver="automation",
+            reporter="automation-events",
+            artifacts=(),
+            fixtures=("postgres",),
+            fixture_bindings=(
+                {
+                    "name": "postgres",
+                    "template": "artifact-postgres",
+                    "network": "loopback",
+                },
+            ),
+            network="loopback",
+            ttl_seconds=300,
+            cpu_millis=1000,
+            memory_mib=128,
+            pids=32,
+        )
+
+    def test_sealed_fixture_lease_recovers_and_cleanup_is_exact(self) -> None:
+        provider = self.provider()
+        descriptor = self.descriptor()
+        runtime_id = "devcoordinator-test-" + "1" * 32
+        lease = provider.provision(descriptor, runtime_id=runtime_id)
+        self.assertEqual(lease.environment, {})
+        self.assertEqual(lease.fixtures, ("postgres",))
+        self.assertIsNotNone(lease.network_namespace)
+        self.assertEqual(
+            {item["name"] for item in lease.credential_files},
+            {"fixtures.json", "fixture-provenance.json"},
+        )
+        journal = self.state_root / f"{runtime_id}.json"
+        self.assertNotIn("fixture-password", journal.read_text(encoding="utf-8"))
+
+        restarted = self.provider()
+        recovered = restarted.recover(runtime_id=runtime_id)
+        self.assertIsNotNone(recovered)
+        self.assertEqual(recovered.descriptor_fingerprint, lease.descriptor_fingerprint)
+        with self.assertRaisesRegex(TestStoreConflict, "stale"):
+            restarted.cleanup(
+                runtime_id=runtime_id,
+                descriptor_fingerprint="0" * 64,
+                reason="forged",
+            )
+        restarted.cleanup(
+            runtime_id=runtime_id,
+            descriptor_fingerprint=lease.descriptor_fingerprint,
+            reason="terminal",
+        )
+        self.assertEqual(self.host.containers, {})
+        self.assertFalse((self.credential_root / runtime_id).exists())
+        restarted.cleanup(
+            runtime_id=runtime_id,
+            descriptor_fingerprint=lease.descriptor_fingerprint,
+            reason="idempotent",
+        )
+
+    def test_secret_is_loadcredential_file_only_and_never_journaled(self) -> None:
+        self.fixture.persistence.provision_ephemeral_template(
+            template_id=TEMPLATE,
+            repo_id="repo-ephemeral",
+            name="artifact-postgres",
+            image_ref="postgres@sha256:" + "a" * 64,
+            command=("postgres", "-c", "fsync=off"),
+            environment={"POSTGRES_INITDB_ARGS": "--auth-host=scram-sha-256"},
+            secret_policy_kind=POSTGRES_INITDB_PASSWORD_FILE_V1,
+            default_ttl_seconds=600,
+            max_ttl_seconds=3600,
+            container_tcp_port=5432,
+            host_port_start=55400,
+            host_port_end=55410,
+            memory_bytes=256 * 1024 * 1024,
+            cpu_millis=750,
+        )
+        provider = self.provider()
+        runtime_id = "devcoordinator-test-" + "2" * 32
+        lease = provider.provision(self.descriptor(), runtime_id=runtime_id)
+        secret = next(
+            item for item in lease.credential_files if str(item["name"]).startswith("fixture-secret-")
+        )
+        path = Path(str(secret["source_path"]))
+        self.assertEqual(stat.S_IMODE(path.lstat().st_mode), 0o400)
+        self.assertEqual(path.read_bytes(), b"fixture-password-never-in-json-1234567890")
+        self.assertNotIn(
+            "fixture-password-never-in-json-1234567890",
+            (self.state_root / f"{runtime_id}.json").read_text(encoding="utf-8"),
+        )
+        config = json.loads((path.parent / "fixtures.json").read_text(encoding="utf-8"))
+        self.assertEqual(config[0]["host"], "127.0.0.1")
+        self.assertEqual(config[0]["port"], 5432)
+        self.assertEqual(config[0]["secret_credential"], secret["name"])
+        provider.cleanup(
+            runtime_id=runtime_id,
+            descriptor_fingerprint=lease.descriptor_fingerprint,
+            reason="terminal",
+        )
+
+    def test_multiple_fixtures_share_only_the_anchor_namespace(self) -> None:
+        descriptor = replace(
+            self.descriptor(),
+            fixtures=("primary", "replica"),
+            fixture_bindings=(
+                {
+                    "name": "primary",
+                    "template": "artifact-postgres",
+                    "network": "loopback",
+                },
+                {
+                    "name": "replica",
+                    "template": "artifact-postgres",
+                    "network": "loopback",
+                },
+            ),
+        )
+        provider = self.provider()
+        runtime_id = "devcoordinator-test-" + "3" * 32
+        lease = provider.provision(descriptor, runtime_id=runtime_id)
+        state = json.loads(
+            (self.state_root / f"{runtime_id}.json").read_text(encoding="utf-8")
+        )
+        anchor, replica = state["fixtures"]
+        self.assertIsNone(anchor["network_container_id"])
+        self.assertEqual(
+            replica["network_container_id"], anchor["full_container_id"]
+        )
+        replica_target = self.host.created_targets[replica["run_uuid"]]
+        self.assertEqual(
+            replica_target.network_container_id, anchor["full_container_id"]
+        )
+        connections = json.loads(
+            next(
+                Path(str(item["source_path"]))
+                for item in lease.credential_files
+                if item["name"] == "fixtures.json"
+            ).read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            [(item["name"], item["host"]) for item in connections],
+            [("primary", "127.0.0.1"), ("replica", "127.0.0.1")],
+        )
+        provider.cleanup(
+            runtime_id=runtime_id,
+            descriptor_fingerprint=lease.descriptor_fingerprint,
+            reason="terminal",
+        )
+        self.assertEqual(self.host.containers, {})
+
+    def test_restart_cleanup_does_not_require_a_live_fixture_namespace(self) -> None:
+        provider = self.provider()
+        descriptor = self.descriptor()
+        runtime_id = "devcoordinator-test-" + "4" * 32
+        provider.provision(descriptor, runtime_id=runtime_id)
+        state = json.loads(
+            (self.state_root / f"{runtime_id}.json").read_text(encoding="utf-8")
+        )
+        anchor = state["fixtures"][0]
+        self.host.containers[anchor["run_uuid"]]["running"] = False
+        self.host.containers[anchor["run_uuid"]]["status"] = "exited"
+
+        restarted = self.provider()
+        with self.assertRaisesRegex(TestStoreConflict, "not running"):
+            restarted.recover(runtime_id=runtime_id)
+        manager = SystemdTestAttemptManager(fixture_provider=restarted)
+        manager._cleanup_fixtures(runtime_id, reason="broker_restart_terminal")
+        self.assertEqual(self.host.containers, {})
+        self.assertFalse((self.credential_root / runtime_id).exists())
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -32,8 +32,8 @@ WorkingDirectory=/home/DevCoordinator
 Environment=DEVCOORDINATOR_AUTHORITY=system CODEX_AGENT_COORDINATOR_HOME=/var/lib/devcoordinator-clients/1000
 AmbientCapabilities=cap_net_bind_service
 CapabilityBoundingSet=cap_chown cap_net_bind_service cap_sys_admin
-ExecStart={ path=/usr/bin/python3 ; argv[]=/usr/bin/python3 /home/DevCoordinator/skills/codex-dev-coordinator/scripts/dev_coordinator.py api serve --host 127.0.0.1 --port 29876 --token-file /home/holyglory/.codex/agent-coordinator/api-token ; ignore_errors=no ; start_time=[n/a] ; }
-ExecStartPost={ path=/usr/bin/python3 ; argv[]=/usr/bin/python3 /home/DevCoordinator/scripts/check_coordinator_auth_boundary.py --token-file /home/holyglory/.codex/agent-coordinator/api-token --host 127.0.0.1 --port 29876 --wait-seconds 10 --poll-interval-seconds 0.1 ; ignore_errors=no ; start_time=[n/a] ; }
+ExecStart={ path=/usr/bin/python3 ; argv[]=/usr/bin/python3 /home/DevCoordinator/skills/codex-dev-coordinator/scripts/dev_coordinator.py api serve --host 127.0.0.1 --port 29876 ; ignore_errors=no ; start_time=[n/a] ; }
+ExecStartPost={ path=/usr/bin/python3 ; argv[]=/usr/bin/python3 /home/DevCoordinator/scripts/check_coordinator_auth_boundary.py --host 127.0.0.1 --port 29876 --wait-seconds 10 --poll-interval-seconds 0.1 ; ignore_errors=no ; start_time=[n/a] ; }
 TimeoutStartUSec=20s
 Requires=system.slice sysinit.target -.mount
 Wants=network-online.target devcoordinator-broker.service
@@ -59,9 +59,9 @@ Environment=
 EnvironmentFiles=/home/holyglory/.config/devops-console/console.env (ignore_errors=no)
 AmbientCapabilities=cap_net_bind_service
 CapabilityBoundingSet=cap_net_bind_service
-ExecStartPre={ path=/usr/bin/python3 ; argv[]=/usr/bin/python3 /home/DevCoordinator/scripts/check_production_layout.py --repo-root /home/DevCoordinator --home /home/holyglory --env-file /home/holyglory/.config/devops-console/console.env --state-dir /home/holyglory/.local/state/devops-console --acme-webroot /home/holyglory/.local/state/devops-console/acme --coordinator-home /home/holyglory/.codex/agent-coordinator --token-file /home/holyglory/.codex/agent-coordinator/api-token --require-token --wait-token-seconds 10 ; ignore_errors=no ; start_time=[n/a] ; }
-ExecStart={ path=/usr/bin/env ; argv[]=/usr/bin/env DEVCOORDINATOR_ROOT=/home/DevCoordinator DEVCOORDINATOR_AUTHORITY=system COORDINATOR_AUTOSTART=0 COORDINATOR_REGISTRATION_REQUIRED=1 COORDINATOR_URL=http://127.0.0.1:29876 COORDINATOR_SCRIPT=/home/DevCoordinator/skills/codex-dev-coordinator/scripts/dev_coordinator.py COORDINATOR_TOKEN_FILE=/home/holyglory/.codex/agent-coordinator/api-token CODEX_AGENT_COORDINATOR_HOME=/var/lib/devcoordinator-clients/1000 STATE_DIR=/home/holyglory/.local/state/devops-console ACME_WEBROOT=/home/holyglory/.local/state/devops-console/acme /usr/bin/node bin/devops-console.mjs --env-file /home/holyglory/.config/devops-console/console.env ; ignore_errors=no ; start_time=[n/a] ; }
-ExecStartPost={ path=/usr/bin/python3 ; argv[]=/usr/bin/python3 /home/DevCoordinator/scripts/check_console_registration_ready.py --unit devops-console.service --main-pid $MAINPID --token-file /home/holyglory/.codex/agent-coordinator/api-token --project /home/DevCoordinator --name devops-console --port 443 --host 127.0.0.1 --coordinator-port 29876 --expected-executable /usr/bin/node --expected-script bin/devops-console.mjs --env-file /home/holyglory/.config/devops-console/console.env --expected-working-directory /home/DevCoordinator/apps/DevOpsConsole --wait-seconds 80 --poll-interval-seconds 0.1 ; ignore_errors=no ; start_time=[n/a] ; }
+ExecStartPre={ path=/usr/bin/python3 ; argv[]=/usr/bin/python3 /home/DevCoordinator/scripts/check_production_layout.py --repo-root /home/DevCoordinator --home /home/holyglory --env-file /home/holyglory/.config/devops-console/console.env --state-dir /home/holyglory/.local/state/devops-console --acme-webroot /home/holyglory/.local/state/devops-console/acme --coordinator-home /home/holyglory/.codex/agent-coordinator ; ignore_errors=no ; start_time=[n/a] ; }
+ExecStart={ path=/usr/bin/env ; argv[]=/usr/bin/env DEVCOORDINATOR_ROOT=/home/DevCoordinator DEVCOORDINATOR_AUTHORITY=system COORDINATOR_AUTOSTART=0 COORDINATOR_REGISTRATION_REQUIRED=1 COORDINATOR_URL=http://127.0.0.1:29876 COORDINATOR_SCRIPT=/home/DevCoordinator/skills/codex-dev-coordinator/scripts/dev_coordinator.py CODEX_AGENT_COORDINATOR_HOME=/var/lib/devcoordinator-clients/1000 STATE_DIR=/home/holyglory/.local/state/devops-console ACME_WEBROOT=/home/holyglory/.local/state/devops-console/acme /usr/bin/node bin/devops-console.mjs --env-file /home/holyglory/.config/devops-console/console.env ; ignore_errors=no ; start_time=[n/a] ; }
+ExecStartPost={ path=/usr/bin/python3 ; argv[]=/usr/bin/python3 /home/DevCoordinator/scripts/check_console_registration_ready.py --unit devops-console.service --main-pid $MAINPID --project /home/DevCoordinator --name devops-console --port 443 --host 127.0.0.1 --coordinator-port 29876 --expected-executable /usr/bin/node --expected-script bin/devops-console.mjs --env-file /home/holyglory/.config/devops-console/console.env --expected-working-directory /home/DevCoordinator/apps/DevOpsConsole --wait-seconds 80 --poll-interval-seconds 0.1 ; ignore_errors=no ; start_time=[n/a] ; }
 TimeoutStartUSec=1min 30s
 Requires=system.slice sysinit.target -.mount
 Wants=network-online.target dev-coordinator.service tmp.mount -.mount
@@ -104,8 +104,8 @@ def main() -> int:
     must_fail(COORDINATOR.replace("CPUWeight=10000", "CPUWeight=100", 1), CONSOLE, "coordinator control-plane CPU priority")
     must_fail(COORDINATOR, CONSOLE.replace("MemoryLow=268435456", "MemoryLow=0", 1), "Console protected working set")
     must_fail(COORDINATOR, CONSOLE.replace("Type=simple", "Type=notify", 1), "wrong Console service type")
-    must_fail(COORDINATOR.replace(f"{home}/.codex", "/root/.codex"), CONSOLE, "resolved manager home")
-    must_fail(COORDINATOR.replace(f"{home}/.codex", "%h/.codex"), CONSOLE, "unresolved manager home")
+    must_fail(COORDINATOR.replace(MODULE.COORDINATOR_JOURNAL, "/root/.codex/agent-coordinator"), CONSOLE, "resolved manager home")
+    must_fail(COORDINATOR.replace(MODULE.COORDINATOR_JOURNAL, "%h/.codex/agent-coordinator"), CONSOLE, "unresolved manager home")
     must_fail(COORDINATOR.replace("/etc/systemd/system", "/run/systemd/transient"), CONSOLE, "wrong coordinator fragment")
     must_fail(COORDINATOR.replace("DropInPaths=", "DropInPaths=/run/systemd/system/dev-coordinator.service.d/override.conf", 1), CONSOLE, "coordinator drop-in")
     must_fail(COORDINATOR + "EnvironmentFiles=/tmp/attacker.env (ignore_errors=no)\n", CONSOLE, "coordinator extra environment file")
@@ -118,6 +118,7 @@ def main() -> int:
     must_fail(COORDINATOR.replace("path=/usr/bin/python3", "path=/tmp/python3"), CONSOLE, "coordinator executable path")
     must_fail(COORDINATOR.replace("ExecStart=", "MissingExecStart=", 1), CONSOLE, "missing coordinator command")
     must_fail(COORDINATOR.replace("ExecStartPost=", "MissingExecStartPost=", 1), CONSOLE, "missing coordinator readiness gate")
+    must_fail(COORDINATOR.replace("--port 29876", "--port 29876 --token-file /tmp/api-token", 1), CONSOLE, "legacy coordinator token argument")
     must_fail(COORDINATOR.replace("--wait-seconds 10", "--wait-seconds 0", 1), CONSOLE, "disabled coordinator readiness wait")
     must_fail(COORDINATOR.replace("TimeoutStartUSec=20s", "TimeoutStartUSec=infinity", 1), CONSOLE, "unbounded coordinator startup")
     must_fail(COORDINATOR.replace("Restart=always", "Restart=on-failure", 1), CONSOLE, "clean API exit is not supervised")
@@ -145,6 +146,7 @@ def main() -> int:
     must_fail(COORDINATOR, CONSOLE.replace("path=/usr/bin/env", "path=/tmp/env"), "Console executable path")
     must_fail(COORDINATOR, CONSOLE.replace("ExecStart=", "MissingExecStart=", 1), "missing Console command")
     must_fail(COORDINATOR, CONSOLE.replace("ExecStartPost=", "MissingExecStartPost=", 1), "missing Console registration readiness gate")
+    must_fail(COORDINATOR, CONSOLE.replace("COORDINATOR_URL=http://127.0.0.1:29876", "COORDINATOR_URL=http://127.0.0.1:29876 COORDINATOR_TOKEN_FILE=/tmp/api-token", 1), "legacy Console token environment")
     must_fail(COORDINATOR, CONSOLE.replace("--main-pid $MAINPID", "--main-pid 4242", 1), "Console readiness is not tied to systemd MainPID")
     must_fail(COORDINATOR, CONSOLE.replace("--wait-seconds 80", "--wait-seconds 60", 1), "Console readiness deadline drift")
     must_fail(COORDINATOR, CONSOLE.replace("/usr/bin/node --expected-script", "/tmp/node --expected-script", 1), "wrong Console runtime executable")

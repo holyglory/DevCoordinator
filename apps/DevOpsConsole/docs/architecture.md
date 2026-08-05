@@ -50,6 +50,14 @@ A single Node process that is the public edge of the VPS `vr.ae`:
    coordinator `repo_id` assignments select events. Private `/start` messages
    enter a per-bot approval queue; approved chats receive coordinator journal
    events through long polling plus a durable cursor/outbox delivery path.
+8. **Out-of-band Coordinator bug intake**: `src/bugs.mjs` reads the shared
+   open-only report directory without calling Coordinator inventory, authority,
+   broker, API, or testd. One bounded `<bug_id>.json` file means open. A
+   configured owner closes an exact report by physical removal; same-fingerprint
+   duplicates disappear together and no closed history/tombstone exists. Bad
+   files are isolated, obvious secrets/private server paths are redacted again
+   on read, and a refresh failure never clears retained rows or raises a global
+   Coordinator banner.
 
 ## Files and ownership (one implementation agent each)
 
@@ -57,7 +65,7 @@ A single Node process that is the public edge of the VPS `vr.ae`:
 |---|---|
 | A core | `package.json`, `bin/devops-console.mjs`, `bin/devops-console-upstream-auth.mjs`, `src/config.mjs`, `src/log.mjs`, `src/certs.mjs`, `src/server.mjs`, `src/router.mjs`, `src/proxy.mjs`, `src/upstream-auth.mjs` |
 | B auth | `src/auth/session.mjs`, `src/auth/oidc.mjs`, `src/auth/guard.mjs`, `src/auth/pages.mjs` |
-| C control | `src/coordinator.mjs`, `src/routes.mjs`, `src/access.mjs`, `src/telegram.mjs`, `src/api.mjs`, `src/metrics.mjs`, `src/prefs.mjs` |
+| C control | `src/coordinator.mjs`, `src/routes.mjs`, `src/access.mjs`, `src/telegram.mjs`, `src/bugs.mjs`, `src/api.mjs`, `src/metrics.mjs`, `src/prefs.mjs` |
 | D ui | `src/static.mjs`, `src/ui/index.html`, `src/ui/app.css`, `src/ui/app.js`, `docs/journeys.md` |
 
 Nobody else touches another agent's files; the integrator reconciles.
@@ -92,10 +100,10 @@ single/double-quoted; no interpolation). **`process.env` wins over the file.**
   coordinatorAutostart,   // COORDINATOR_AUTOSTART default true ('0' disables)
   coordinatorScript,      // default '<repoRoot>/skills/codex-dev-coordinator/scripts/dev_coordinator.py'
   coordinatorHome,        // CODEX_AGENT_COORDINATOR_HOME passthrough or null
-  coordinatorTokenFile,   // absolute private COORDINATOR_TOKEN_FILE
   projectRoot,            // git toplevel containing the app (repo root)
   metricsIntervalMs,      // METRICS_INTERVAL_MS default 10000, floor 2000
   stateDir,               // abs, default '<appRoot>/state'; created on load
+  bugReportDir,           // abs, DEVCOORDINATOR_BUG_DIR or '<stateDir>/bugs/open'
   logLevel,               // 'debug'|'info'|'warn'|'error'
   devInsecureHttp,        // DEV_HTTP === '1': single plain-HTTP listener on httpPort,
                           // no TLS, cookies lose `Secure`. For loopback dev/tests only.
@@ -218,7 +226,8 @@ domain. Invalid → fall back to `/`.
 
 ```js
 export function createProxy({ log, sessionCookieName }) // → { forward(req, res, target), forwardUpgrade(req, socket, head, target), close() }
-// target = { port, slug, host: '127.0.0.1', publicHost, route, upstreamAuthorization? }  (pages via closure? NO —
+// target = { port, slug, host: '127.0.0.1', publicHost, route, upstreamAuthorization?,
+//            localAttribution: { email: string|null, routeId: string } }  (pages via closure? NO —
 // proxy takes an `onError(req,res,kind,target)` callback supplied by router at construction:
 //   createProxy({ log, renderBadGateway(req, res, { kind: 'connect'|'timeout'|'reset', target }) })
 ```
@@ -237,6 +246,11 @@ export function createProxy({ log, sessionCookieName }) // → { forward(req, re
   entry as one field; never comma-split because `Expires` contains a comma.
 - Add `X-Forwarded-For` (append client IP), `X-Forwarded-Proto: https` (or
   http in dev mode), `X-Forwarded-Host: <original host>`.
+- Strip every caller value for the retired assertion header and for
+  `X-DevOps-Console-Email` / `X-DevOps-Console-Route-ID`. Project routes receive
+  only the edge-derived lowercase Google email (protected routes) and immutable
+  route ID. These compact loopback attribution fields replace the former local
+  JWT/JWKS exchange; they are not accepted as public authorization evidence.
 - For `route.auth !== 'public'`, delete caller `Authorization` and set it only
   from `target.upstreamAuthorization` when configured. Remove upstream
   `WWW-Authenticate` and `Authentication-Info` on HTTP responses, 101s, and
@@ -356,13 +370,14 @@ export class CoordError extends Error {} // .status (http), .body
   300s, `/v1/inventory` 60s, docker 60s, rest 15s. Apply/restore reports with
   `ok:false`, `partial:true`, `needs_attention:true`, or an incomplete status
   remain `CoordError` failures even when the HTTP response is 200. The
-  systemd-only readiness gate uses authenticated `GET /v1/inventory/no-docker`
+  systemd-only readiness gate uses trusted-loopback `GET /v1/inventory/no-docker`
   so exact server/assignment/lease observation is not coupled to Docker CLI or
   daemon availability.
 - Error bodies are `{"error": "..."}`; KeyError messages keep quotes
   (`"'agent'"`) — surface `.message` trimmed of surrounding quotes.
-- Every `/v1/*` request reads the private `COORDINATOR_TOKEN_FILE` server-side
-  and sends `Authorization: Bearer …`; `/healthz` is the only anonymous route.
+- Every internal request uses the exact loopback origin. The API rejects a
+  non-loopback `Host` or `Origin`; it does not require or transmit an
+  application bearer credential inside the server.
 - `observeHost` is an explicit `POST /v1/observe` with mutation attribution.
   It commits real server/Docker observation transitions; repeated unchanged
   samples emit nothing, and unavailable/unobservable state never invents a
@@ -372,9 +387,8 @@ export class CoordError extends Error {} // .status (http), .body
   without skipping a later-committed event.
 - `ensureRunning()`: probe; if down and `coordinatorAutostart`, spawn
   `python3 <coordinatorScript> api serve --host 127.0.0.1 --port <from url>`
-  with `--token-file <coordinatorTokenFile>` detached (`stdio` → append
-  `<stateDir>/logs/coordinator-api.log`, pass `CODEX_AGENT_COORDINATOR_HOME`
-  if set), `unref()`, poll probe up to 15s.
+  detached (`stdio` → append `<stateDir>/logs/coordinator-api.log`, pass
+  `CODEX_AGENT_COORDINATOR_HOME` if set), `unref()`, poll probe up to 15s.
   Called at boot and lazily on request failure (max 1 attempt/30s).
 - Attribution: every mutation body gets `agent` (`devops-console:<email>` for
   user-initiated, `devops-console` for boot-time) and `project` filled by the
@@ -450,9 +464,10 @@ export function createUpstreamAuthStore({ file, log })
 
 Schema on disk:
 `{ "version": 1, "routes": { "<slug>": { "scheme": "bearer", "secret": "…" } } }`
-or Basic `{ scheme, username, secret }`. The external file is a real regular
-file with no group/world permissions; writes use a mode-`0600` temporary file
-and atomic rename. Invalid-permission state fails startup. Malformed state is
+or Basic `{ scheme, username, secret }`. The external file must be a bounded,
+real non-symlink regular file with valid content; local UID/GID/mode/ACL
+metadata is not an authorization boundary. Writes use a mode-`0600` temporary
+file and atomic rename as hygiene. Malformed state is
 preserved as `.corrupt-<timestamp>` and disabled, never partially trusted.
 Mutations serialize and publish to the live map only after durable persistence.
 
@@ -527,9 +542,10 @@ export class TelegramServiceError extends Error {} // .status, .code, .retryAfte
 The private `<stateDir>/telegram-control.json` envelope contains registered
 bots, bot ownership, tokens, exact project assignments, durable Telegram
 update offsets, authorization decisions, the opaque coordinator event cursor,
-and recipient outbox deliveries. It must be a real non-symlink file owned by
-the Console account with no group/world permissions. Writes use an exclusive
-mode-`0600` temporary file, fsync, atomic rename, final chmod, and directory
+and recipient outbox deliveries. It must be a bounded real non-symlink file;
+local ownership and mode metadata does not gate access on this single-developer
+host. Writes use an exclusive mode-`0600` temporary file, fsync, atomic rename,
+final chmod, and directory
 fsync. Invalid state is left untouched and fails startup. Bot tokens are
 redacted from exceptions/logs and omitted from every public view (`hasToken`
 is the only presence signal).
@@ -562,7 +578,7 @@ agent as well as crashes/failures discovered by host observation.
 ## Console API (`src/api.mjs`)
 
 ```js
-export function createConsoleApi({ config, log, coordinator, routeStore, upstreamAuthStore, accessStore, guard, certManager, metrics, prefs, telegram })
+export function createConsoleApi({ config, log, coordinator, routeStore, upstreamAuthStore, accessStore, guard, certManager, metrics, prefs, telegram, bugStore })
 // → { handle(req, res, session): Promise<void> }   // only called for /api/*
 ```
 JSON in/out; errors `{ "error": "<message>" }` with
@@ -577,6 +593,8 @@ failures and 5xx surface as 502 with the coordinator's message. Mutations
 
 | Method+Path | Behavior |
 |---|---|
+| `GET /api/bugs` | Any authenticated Console user → `{ schema_version:1, revision, generated_at, bugs }` from the independent open-only registry. Reports include expected/actual behavior, 1–8 ordered reproduction steps, structured argv, safe correlations/release/instance facts, and an explicitly advisory/non-governed local fallback when supplied. Malformed files are skipped without hiding valid reports; a registry read failure returns 503 locally and never contacts or masquerades as Coordinator. |
+| `DELETE /api/bugs/:bugId` | Configured owner plus same-origin mutation only. Idempotently removes the exact displayed report and all open files with its fingerprint, then returns the current collection. It creates no archive, closed row, or tombstone. |
 | `GET /api/overview` | `{ console: { version, domain, consoleHost, now, tls: certManager.info(), devInsecureHttp }, coordinator: coordinator.status(), inventory: Inventory\|null, routes: RouteView[] }`. Inventory from `coordinator.inventory()`; on CoordError → `inventory: null` and `coordinator.ok:false` with error (HTTP still 200 — UI shows degraded state). `RouteView = Route + { url: 'https://<slug>.<domain>', upstreamAuth: { configured, scheme? }, resolved: { port, reason?, serverStatus?, containerStatus? } }` (kind=server resolves via `serversRaw`; kind=docker via the cached `inventory()` — both shared/coalesced). No upstream secret is returned. |
 | `GET /api/access` | Owner-only `{ version, users: [{ email, owner, grants }], resources: [{ id, kind, host, title, auth, target }], invitedCount }`. Configured owners appear locked; only owners may read the full email list. |
 | `GET /api/access/requests?status=pending\|approved\|denied\|stale\|all` | Owner-only `{ version, pendingCount, requests }`. Each request view carries its email, exact resource/host/target, status and decision metadata; private Google-subject hash and immutable resource-instance value remain server-only. Default status is `pending`. |
@@ -584,7 +602,7 @@ failures and 5xx surface as 502 with the coordinator's message. Mutations
 | `POST /api/access/users` | Owner-only `{ email, grants? }` → 201 full access view. Invites an email identity; the invitation becomes usable only when verified Google OIDC returns that exact address. An empty grant list is allowed. |
 | `PATCH /api/access/users/:email` | Owner-only delta `{ resource, allowed: boolean }` → full access view. Configured owners are immutable. |
 | `DELETE /api/access/users/:email` | Owner-only removal → full access view; current sessions become unknown immediately. |
-| `GET /api/telegram` | Any Console-authorized account → `{ version, bots, projects }`. Non-owners see only bots they registered; configured owners see all. Bot views include identity/owner/status, exact assigned `projects`, redacted `hasToken`, and their Telegram authorization records. `projects` comes from fresh coordinator inventory as `{ id:repo_id, name, path }`. |
+| `GET /api/telegram` | Any Console-authorized account → `{ version, bots, projects }`. Non-owners see only bots they registered; configured owners see all. Bot views include identity/owner/status, exact assigned `projects`, redacted `hasToken`, and their Telegram authorization records. `projects` comes from bounded retained Coordinator inventory as `{ id:repo_id, name, path }`; stale-but-usable inventory refreshes in the background, while malformed or duplicate immutable identities fail closed. |
 | `POST /api/telegram/bots` | `{ token, label?, takeOver?:boolean }` → 201 full caller-visible Telegram view. Token is validated, never returned, and an active webhook yields code `telegram_webhook_active` unless `takeOver:true` was explicit. |
 | `DELETE /api/telegram/bots/:botId` | Bot owner or configured owner removes the bot and its queue/outbox state → full caller-visible Telegram view. |
 | `PATCH /api/telegram/bots/:botId/projects` | Bot owner or configured owner `{ projectIds:[repo_id,…] }` → full view. Every ID must exactly match current coordinator inventory; display names/paths are never assignment identity. |
@@ -685,12 +703,15 @@ public/login toggle switch, resolved status dot, delete), **Docker** (status,
 image, ports, live CPU/mem + sparkline, start/stop/restart, logs, subdomain
 control on web-serving containers), **Port leases** (lease
 form: purpose/preferred port/TTL/project; table with countdowns and
-confirmed release), **Performance** (a "Machine" panel first — whole-box
-CPU with cores and load averages, memory used/available, per-disk storage
-and uptime as stat tiles with meters, alarm tint above 90%, plus host
-CPU/memory history charts — then per-entity CPU and memory history
-charts for every sampled server/container + per-project usage bars with
-sparklines), **Access** (the real owner/invited-user collection first; each
+confirmed release), **Performance** (a dense whole-host stacked composition
+with CPU, memory, storage and uptime summary. Repository working sets,
+measured Agent-browser processes, other measured control work, estimated
+system/unclassified memory, and available memory reconcile to the host total
+at a common sample boundary. Stable legend controls emphasize the matching
+chart series; activating a repository opens its retained history and
+contributors, while Agent browsers opens bounded active/idle/protected session
+detail, last observed work, and recent automatic cleanup. Historical browser
+last use is never invented), **Access** (the real owner/invited-user collection first; each
 invited user has exact Console/domain checkboxes; configured owners are locked;
 Add user opens a focused in-viewport dialog; remove names the account and
 immediate revocation consequence), owner-only **Incoming invites** (the pending
@@ -701,6 +722,13 @@ bot-specific `/start` authorization queue stay with each bot). Bot tokens never
 render, and the optional existing-webhook takeover is a separate explicit
 checkbox shown by the registration journey. Docker/Ports lists are grouped by
 repo with project subheaders.
+The **Open Coordinator bugs** page renders its actionable collection first and
+stays usable when every normal Coordinator endpoint is down. Each row discloses
+expected/actual behavior, ordered steps, exact structured arguments,
+correlations, release and instance. Any local fallback is labelled advisory and
+not Coordinator evidence. Its count badge is absent at zero; owner-only Close
+removes the row immediately. Polling preserves open disclosures, focus, scroll,
+and retained rows when a later registry read fails.
 Configured owners see compact **Active / Archived** filters with authoritative
 counts on Projects, Servers, and Docker; other Console operators see only the
 active collections. Active rows expose Archive separately from cosmetic Hide.
@@ -731,8 +759,10 @@ navigation-cursor, transient-disclosure, disclosure-scrollbar, icon-meaning,
 stable-expansion-width, hover-copy, status-summary, message-metadata), plus
 loading/empty/error/disabled/focus-visible states, dark theme, and both
 1440px desktop and 390px mobile layouts with **no horizontal document
-scroll**. No external fonts/CDNs. All API errors surface in a dismissible
-error banner with the coordinator's message verbatim. Asset URLs carry a
+scroll**. No external fonts/CDNs. Normal API errors surface in a dismissible
+error banner with the coordinator's message verbatim. The independent bug
+registry keeps its read/close errors inside the Bugs page so a broken
+Coordinator cannot obscure its own report surface. Asset URLs carry a
 `?v=<version>` query so the 1h immutable cache never serves a stale
 `app.js`/`app.css` against a fresh `index.html`.
 
@@ -743,7 +773,7 @@ prints redacted config and exits 0) → logger → certManager (skip in
 devInsecureHttp) → sessions → oidc → guard → pages → coordinator
 (`ensureRunning()` non-fatal) → metrics (`createMetricsStore` + `start()`) →
 routeStore (`load()`) → upstreamAuthStore (`load()`) → accessStore (`load()`)
-→ Telegram service (`load()`) → consoleApi → static → proxy → router →
+→ Telegram service (`load()`) → independent bug store → consoleApi → static → proxy → router →
 `startServers` → Telegram service (`start()`). SIGHUP → cert reload;
 SIGTERM/SIGINT → graceful close (also `telegram.stop()`, `metrics.stop()` and
 `coordinator.close()`). On listen success, log every
@@ -781,9 +811,10 @@ active lease.
 
 ## Security invariants (review will check these)
 
-1. Coordinator API is loopback-only and bearer-authenticated; the token never
-   enters browser state. The console still refuses proxy routes to its port and
-   exposes only fixed server-side calls behind session + Origin checks.
+1. Coordinator API is trusted loopback-only infrastructure and carries no
+   application bearer token. It rejects foreign `Host`/`Origin`; the Console
+   still refuses proxy routes to its port and exposes only fixed server-side
+   calls behind public session + Origin checks.
 2. Default-deny: new routes default `auth:'google'`; unknown slugs
    indistinguishable from protected ones to anonymous users.
 3. Proxy targets are always `127.0.0.1` — a route can never point elsewhere.
@@ -800,13 +831,14 @@ active lease.
    them to routed HTTP/WebSocket projects or accepts those names from upstream
    `Set-Cookie`; unrelated project cookies remain end-to-end.
 6. Protected routes strip caller `Authorization`, may inject only their
-   private mode-`0600` route credential after exact Google authorization, and
+   stored route credential after exact Google authorization, and
    suppress backend HTTP-auth challenges. Public routes receive no stored
    credential and preserve ordinary HTTP-auth headers. Only configured owners
    may change the credential; route/API/CLI views never expose it.
 7. No secrets in logs; no directory traversal; HTML escaping in every page.
-8. Telegram bot tokens exist only in the Console-owned private mode-`0600`
-   state and outbound Telegram requests. API views/logs/errors redact them.
+8. Telegram bot tokens exist only in Console state and outbound Telegram
+   requests. Mode `0600` is write hygiene, not local-account authorization;
+   API views/logs/errors redact the tokens.
    Bot ownership or configured-owner override gates every bot, assignment, and
    Telegram authorization mutation. Exact `repo_id` assignment and the
    coordinator's durable opaque cursor—not display-name matching or local UI

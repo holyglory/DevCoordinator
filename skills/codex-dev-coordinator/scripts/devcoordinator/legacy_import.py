@@ -21,7 +21,7 @@ import time
 from typing import Any, Callable, Generator, Iterable, Mapping, Sequence
 import uuid
 
-from .schema import invariant_violations
+from .schema import establish_repository_owner_authority, invariant_violations
 from .store import (
     AccountStore,
     canonical_json,
@@ -1491,15 +1491,70 @@ def _write_plan(
     plan: _NormalizedPlan,
     captures: Sequence[LegacySourceCapture],
     *,
+    repository_owner_uid: int,
     record_imports: bool = True,
     upsert: bool = False,
 ) -> tuple[str, ...]:
+    if (
+        isinstance(repository_owner_uid, bool)
+        or not isinstance(repository_owner_uid, int)
+        or repository_owner_uid <= 0
+    ):
+        raise LegacyImportError(
+            "legacy import repository owner UID must be a positive integer"
+        )
     _insert_record(connection, "hosts", plan.host, ignore=not upsert)
     _insert_record(connection, "coordinator_sources", plan.normalized_source, ignore=not upsert)
     for source in plan.sources:
         _insert_record(connection, "coordinator_sources", source, ignore=not upsert)
     for repository in plan.repositories.values():
         _insert_record(connection, "repositories", repository, ignore=not upsert)
+        repository_id = str(repository["repo_id"])
+        generation = int(repository["generation"])
+        owner = connection.execute(
+            """
+            SELECT authority.owner_uid, authority.repository_generation,
+                   catalog.generation
+            FROM repositories catalog
+            LEFT JOIN repository_owners authority USING(repo_id)
+            WHERE catalog.repo_id = ?
+            """,
+            (repository_id,),
+        ).fetchone()
+        if owner is None or int(owner["generation"]) != generation:
+            raise LegacyImportError(
+                "legacy import repository catalog changed before owner enrollment"
+            )
+        if owner["owner_uid"] is None:
+            timestamp = str(repository["updated_at"])
+            establish_repository_owner_authority(
+                connection,
+                repository_id=repository_id,
+                owner_uid=repository_owner_uid,
+                repository_generation=generation,
+                operation_id=deterministic_id(
+                    "legacy-import-repository-owner",
+                    repository_id,
+                    str(repository_owner_uid),
+                ),
+                actor="legacy-import",
+                reason="trusted account-store legacy repository import",
+                timestamp=timestamp,
+                evidence={
+                    "kind": "legacy-import-repository-owner",
+                    "repository_id": repository_id,
+                    "repository_generation": generation,
+                    "owner_uid": repository_owner_uid,
+                    "owner_authority_source": "account-store-expected-uid",
+                },
+            )
+        elif (
+            int(owner["owner_uid"]) != repository_owner_uid
+            or int(owner["repository_generation"]) != generation
+        ):
+            raise LegacyImportError(
+                "legacy import repository owner authority conflicts or is stale"
+            )
     for source_resource in plan.source_resources:
         _insert_record(connection, "source_resources", source_resource, ignore=not upsert)
     for definition in plan.server_definitions.values():
@@ -1699,7 +1754,12 @@ def import_legacy_homes(
         _call_fault(fault_injector, "import.sources_reverified")
         with store.immediate_transaction(max_seconds=30.0) as connection:
             _call_fault(fault_injector, "import.transaction_started")
-            import_ids = _write_plan(connection, plan, captures)
+            import_ids = _write_plan(
+                connection,
+                plan,
+                captures,
+                repository_owner_uid=store.expected_uid,
+            )
             _call_fault(fault_injector, "import.rows_written")
             violations = invariant_violations(connection)
             if violations:
@@ -2710,6 +2770,30 @@ def replace_legacy_state_projection(
                 )
             repo_id = str(repository["repo_id"])
             _insert_record(connection, "repositories", repository, ignore=False)
+            if store.expected_uid <= 0:
+                raise LegacyImportError(
+                    "normalized account adapter cannot establish root as repository execution owner"
+                )
+            establish_repository_owner_authority(
+                connection,
+                repository_id=repo_id,
+                owner_uid=store.expected_uid,
+                repository_generation=int(repository["generation"]),
+                operation_id=deterministic_id(
+                    "normalized-adapter-owner", repo_id, str(current_revision + 1)
+                ),
+                actor="normalized-adapter",
+                reason="account-scoped normalized adapter repository registration",
+                timestamp=now,
+                evidence={
+                    "kind": "normalized-adapter-repository-owner",
+                    "repository_id": repo_id,
+                    "canonical_root": canonical,
+                    "repository_generation": int(repository["generation"]),
+                    "owner_uid": store.expected_uid,
+                    "source_id": source_id,
+                },
+            )
             connection.execute(
                 """
                 INSERT OR IGNORE INTO repository_installations(

@@ -6,11 +6,17 @@
 import { CoordError } from './coordinator.mjs';
 import { PrefsError } from './prefs.mjs';
 import { RouteError, publishedContainerPorts } from './routes.mjs';
-import { AccessError, CONSOLE_GRANT, routeGrant } from './access.mjs';
+import { AccessError, CONSOLE_GRANT, routeGrant, testGrant } from './access.mjs';
 import { TelegramServiceError } from './telegram.mjs';
 import { UpstreamAuthError } from './upstream-auth.mjs';
+import { BugStoreError } from './bugs.mjs';
+import { EdgePublicationProducerError } from '../edge/publication-producer.mjs';
 
 const BODY_LIMIT = 64 * 1024;
+// One transfer may contain the complete bounded open registry (2,048 records
+// at 16 KiB each), plus its envelope. The route-specific limit must therefore
+// accept every bundle that this Console can export.
+const BUG_IMPORT_BODY_LIMIT = 40 * 1024 * 1024;
 const SERVER_ACTIONS = new Set(['stop', 'restart']);
 const WORKER_ACTIONS = new Set(['start', 'stop', 'restart', 'remove']);
 const DOCKER_ACTIONS = new Set(['start', 'stop', 'restart']);
@@ -24,6 +30,16 @@ const RUNTIME_ARTIFACT_KINDS = new Set([
 const RUNTIME_ARTIFACT_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const RUNTIME_ARTIFACT_MAX_BYTES = 1024 * 1024;
 const TAIL_MAX = 5000;
+const TELEGRAM_PROJECT_CATALOG_MAX_AGE_MS = 15_000;
+const TELEGRAM_PROJECT_CATALOG_MAX_STALE_MS = 5 * 60_000;
+const TELEGRAM_PROJECT_CATALOG_COLD_WAIT_MS = 1_000;
+const TELEGRAM_PROJECT_CATALOG_LOG_COOLDOWN_MS = 30_000;
+const TEST_REPO_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_.@-]{0,255}$/;
+const TEST_ENTITY_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_.:@/-]{0,255}$/;
+const TEST_INTENTS = new Set(['change', 'checkpoint', 'handoff', 'release', 'manual']);
+const TEST_WAIT_CODES = new Set(['host_memory']);
+const TEST_WAIT_SOURCES = new Set(['learned_peak', 'cold_start_default']);
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 class ApiError extends Error {
   constructor(status, message) {
@@ -64,8 +80,11 @@ export function coordinatorOverviewView(base, error = null) {
 export function createConsoleApi({
   config, log, coordinator, routeStore, upstreamAuthStore, accessStore, guard, certManager, metrics, prefs,
   telegram = null,
+  bugStore = null,
+  edgePublication = null,
 }) {
   const clog = typeof log?.child === 'function' ? log.child({ mod: 'api' }) : log;
+  let telegramProjectCatalogLastLog = { key: null, at: 0 };
 
   function sendJson(res, status, payload) {
     const body = JSON.stringify(payload);
@@ -92,14 +111,20 @@ export function createConsoleApi({
     res.end(body);
   }
 
-  async function readJsonBody(req) {
+  async function publishMutation(reason, operation) {
+    if (!edgePublication) return operation();
+    const completed = await edgePublication.mutate(operation, { reason });
+    return completed.result;
+  }
+
+  async function readJsonBody(req, { limit = BODY_LIMIT } = {}) {
     const chunks = [];
     let size = 0;
     for await (const chunk of req) {
       size += chunk.length;
-      if (size > BODY_LIMIT) {
+      if (size > limit) {
         // Early exit destroys the request stream via the async iterator.
-        throw new ApiError(400, 'request body exceeds the 64KB limit');
+        throw new ApiError(400, `request body exceeds the ${Math.floor(limit / 1024)}KB limit`);
       }
       chunks.push(chunk);
     }
@@ -121,6 +146,556 @@ export function createConsoleApi({
       throw new ApiError(400, `${field} is required`);
     }
     return value.trim();
+  }
+
+  function requireTestRepoId(value) {
+    const repoId = requireString(value, 'repo_id');
+    if (!TEST_REPO_ID_RE.test(repoId)) throw new ApiError(400, 'repo_id must be an immutable repository id');
+    return repoId;
+  }
+
+  function requireTestEntityId(value, field = 'run_id') {
+    const entityId = requireString(value, field);
+    if (!TEST_ENTITY_ID_RE.test(entityId)) throw new ApiError(400, `${field} is invalid`);
+    return entityId;
+  }
+
+  function googleTestActor(session) {
+    const email = String(session?.email || '').trim().toLowerCase();
+    if (!email || email.length > 240 || /[\u0000-\u001f\u007f]/.test(email)) {
+      throw new ApiError(401, 'authenticated Google identity is invalid');
+    }
+    return `google:${email}`;
+  }
+
+  function runBelongsToSession(session, run) {
+    const expected = googleTestActor(session);
+    return run?.actor === expected;
+  }
+
+  function requireRunOperationAccess(session, repoId, run) {
+    if (accessStore?.isAdmin(session?.email) || runBelongsToSession(session, run)) {
+      requireTestAccess(session, repoId, 'run');
+      return;
+    }
+    requireTestAccess(session, repoId, 'operate');
+  }
+
+  function canReadRepositoryTests(session, repoId) {
+    if (accessStore?.isAdmin(session?.email)) return true;
+    return ['read', 'run', 'operate'].some((scope) => (
+      accessStore?.canAccess(session?.email, testGrant(repoId, scope))
+    ));
+  }
+
+  function canOperateTestRun(session, repoId, run) {
+    if (accessStore?.isAdmin(session?.email)) return true;
+    const scopes = runBelongsToSession(session, run) ? ['run', 'operate'] : ['operate'];
+    return scopes.some((scope) => accessStore?.canAccess(session?.email, testGrant(repoId, scope)));
+  }
+
+  function testRepositoryView(repository) {
+    return {
+      repo_id: repository.repo_id,
+      display_name: repository.display_name || repository.repo_id,
+      setup_status: repository.setup_status || repository.manifest_status || 'unknown',
+    };
+  }
+
+  function optionalTestNumber(value, { integer = false } = {}) {
+    if (value === null) return null;
+    if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) return undefined;
+    if (integer && !Number.isInteger(value)) return undefined;
+    return value;
+  }
+
+  function optionalTestTimestamp(value) {
+    if (value === null) return null;
+    if (typeof value === 'number') {
+      return Number.isFinite(value) && value >= 0 ? value : undefined;
+    }
+    if (typeof value !== 'string' || value.length > 64 || !Number.isFinite(Date.parse(value))) {
+      return undefined;
+    }
+    return value;
+  }
+
+  function testWaitView(wait) {
+    if (!wait || typeof wait !== 'object' || Array.isArray(wait)
+      || !TEST_WAIT_CODES.has(wait.code)) return null;
+    const view = { code: wait.code };
+    for (const field of ['required_mib', 'available_mib', 'reserve_mib']) {
+      const value = optionalTestNumber(wait[field]);
+      if (value !== undefined) view[field] = value;
+    }
+    for (const field of ['since', 'observed_at']) {
+      const value = optionalTestTimestamp(wait[field]);
+      if (value !== undefined) view[field] = value;
+    }
+    if (TEST_WAIT_SOURCES.has(wait.source)) view.source = wait.source;
+    return view;
+  }
+
+  function testUsageView(usage) {
+    if (!usage || typeof usage !== 'object' || Array.isArray(usage)
+      || typeof usage.available !== 'boolean') return null;
+    const view = { available: usage.available };
+    for (const field of ['peak_memory_mib', 'cpu_seconds']) {
+      const value = optionalTestNumber(usage[field]);
+      if (value !== undefined) view[field] = value;
+    }
+    for (const field of ['measured_attempts', 'total_attempts']) {
+      const value = optionalTestNumber(usage[field], { integer: true });
+      if (value !== undefined) view[field] = value;
+    }
+    return view;
+  }
+
+  function testAttemptView(attempt) {
+    const view = {};
+    for (const field of [
+      'attempt_id', 'target_id', 'target_name', 'generation', 'state', 'conclusion',
+      'started_at', 'finished_at', 'duration_seconds',
+    ]) {
+      if (Object.hasOwn(attempt || {}, field)) view[field] = attempt[field];
+    }
+    const usage = testUsageView(attempt?.usage);
+    if (usage) view.usage = usage;
+    return view;
+  }
+
+  function testRunSummaryView(summary) {
+    const view = { ...(summary || {}) };
+    delete view.usage;
+    const usage = testUsageView(summary?.usage);
+    if (usage) view.usage = usage;
+    return view;
+  }
+
+  function testRunView(run, actions = {}) {
+    const view = {};
+    for (const field of [
+      'run_id', 'repository_id', 'repo_id', 'plan_id', 'actor', 'intent',
+      'source_mode', 'source_fingerprint', 'execution_fingerprint', 'state',
+      'conclusion', 'failure_classification', 'priority', 'queued_at',
+      'started_at', 'finished_at', 'cancel_reason', 'created_at', 'updated_at',
+      'target_count', 'completed_target_count', 'queue_seconds', 'wall_seconds',
+      'aggregate_test_seconds', 'passed_count', 'failed_count', 'skipped_count',
+      'error_count', 'failure_record_count', 'artifact_count',
+    ]) {
+      if (Object.hasOwn(run || {}, field)) view[field] = run[field];
+    }
+    const wait = testWaitView(run?.wait);
+    if (wait) view.wait = wait;
+    const usage = testUsageView(run?.usage);
+    if (usage) view.usage = usage;
+    if (Array.isArray(run?.targets)) {
+      view.targets = run.targets.map((target) => {
+        const item = {};
+        for (const field of [
+          'target_id', 'target_name', 'wave_index', 'shard_index', 'shard_count',
+          'state', 'estimated_seconds',
+          'max_attempts', 'queued_at', 'started_at', 'finished_at',
+        ]) {
+          if (Object.hasOwn(target || {}, field)) item[field] = target[field];
+        }
+        const targetWait = testWaitView(target?.wait);
+        if (targetWait) item.wait = targetWait;
+        const targetUsage = testUsageView(target?.usage);
+        if (targetUsage) item.usage = targetUsage;
+        if (Array.isArray(target?.attempts)) {
+          item.attempts = target.attempts.map(testAttemptView);
+        }
+        return item;
+      });
+    }
+    if (Array.isArray(run?.attempts)) view.attempts = run.attempts.map(testAttemptView);
+    return { ...view, ...actions };
+  }
+
+  function testSetupView(setup, repoId) {
+    const view = {
+      schema_version: setup?.schema_version ?? 1,
+      repo_id: repoId,
+      status: setup?.status || setup?.setup_status || 'unknown',
+    };
+    for (const field of ['manifest_schema', 'manifest_fingerprint']) {
+      if (Object.hasOwn(setup || {}, field)) view[field] = setup[field];
+    }
+    if (Array.isArray(setup?.targets)) {
+      view.targets = setup.targets.map((target) => {
+        if (typeof target === 'string') return target;
+        const item = {};
+        for (const field of ['name', 'driver', 'reporter', 'network']) {
+          if (typeof target?.[field] === 'string') item[field] = target[field];
+        }
+        for (const field of ['fixtures', 'depends_on']) {
+          if (Array.isArray(target?.[field])) item[field] = target[field].map(String);
+        }
+        return item;
+      });
+    }
+    for (const field of ['intents', 'evidence_policies']) {
+      if (Array.isArray(setup?.[field])) view[field] = setup[field].map(String);
+    }
+    for (const field of ['issues', 'input_coverage_gaps']) {
+      if (!Array.isArray(setup?.[field])) continue;
+      view[field] = setup[field].map((issue) => {
+        if (typeof issue === 'string') return issue;
+        const item = {};
+        for (const key of ['code', 'message', 'detail']) {
+          if (typeof issue?.[key] === 'string') item[key] = issue[key];
+        }
+        if (typeof issue?.path === 'string' && !issue.path.startsWith('/')) item.path = issue.path;
+        return item;
+      });
+    }
+    if (setup?.target_graph && typeof setup.target_graph === 'object' && !Array.isArray(setup.target_graph)) {
+      view.target_graph = Object.fromEntries(Object.entries(setup.target_graph).map(([name, dependencies]) => [
+        name, Array.isArray(dependencies) ? dependencies.map(String) : [],
+      ]));
+    }
+    if (Array.isArray(setup?.capabilities)) view.capabilities = setup.capabilities.map(String);
+    if (Array.isArray(setup?.network_requirements)) {
+      view.network_requirements = setup.network_requirements.map(String);
+    }
+    if (setup?.isolation && typeof setup.isolation === 'object' && !Array.isArray(setup.isolation)) {
+      view.isolation = {};
+      for (const field of ['network', 'private_scratch', 'kill_after_run']) {
+        if (Object.hasOwn(setup.isolation, field)) view.isolation[field] = setup.isolation[field];
+      }
+    }
+    if (Array.isArray(setup?.fixtures)) view.fixtures = setup.fixtures.map(String);
+    else if (setup?.fixtures && typeof setup.fixtures === 'object') {
+      view.fixtures = Object.keys(setup.fixtures).sort();
+    }
+    if (setup?.capability_policy && typeof setup.capability_policy === 'object'
+      && !Array.isArray(setup.capability_policy)) {
+      const policy = setup.capability_policy;
+      view.capability_policy = {
+        ok: policy.ok === true,
+        repository_grant: policy.repository_grant === true,
+        generation_match: policy.generation_match === true,
+        requested: Array.isArray(policy.requested) ? policy.requested.map(String) : [],
+        missing: Array.isArray(policy.missing) ? policy.missing.map(String) : [],
+      };
+      if (Number.isInteger(policy.repository_generation) && policy.repository_generation >= 0) {
+        view.capability_policy.repository_generation = policy.repository_generation;
+      }
+    }
+    return view;
+  }
+
+  function filterTestFleet(fleet, repositories, { preserveAggregateMetrics = false } = {}) {
+    const byId = new Map((fleet?.repositories || []).map((item) => [item?.repo_id, item]));
+    const visible = repositories.map((repository) => byId.get(repository.repo_id) || {
+      repo_id: repository.repo_id,
+      display_name: repository.display_name || repository.repo_id,
+      setup_status: repository.setup_status || repository.manifest_status || 'unknown',
+      last_activity_at: null,
+      state: 'idle',
+      summary: {
+        run_count: 0, running_count: 0, test_count: 0, test_seconds: 0,
+        wall_seconds: 0, passed_count: 0, failure_count: 0,
+        test_failure_count: 0, infrastructure_failure_count: 0,
+        attempt_count: 0, failed_run_count: 0, infrastructure_count: 0,
+        pass_rate: null, flake_rate: null,
+        parallel_efficiency_ratio: null, p95_queue_wait_seconds: null,
+      },
+      hourly: [],
+    });
+    const allowed = new Set(visible.map((item) => item.repo_id));
+    const additive = [
+      'run_count', 'running_count', 'test_count', 'test_seconds', 'wall_seconds',
+      'passed_count', 'failure_count', 'failed_run_count', 'distinct_test_count',
+      'flaky_test_count', 'infrastructure_count', 'attempt_count',
+    ];
+    const summary = Object.fromEntries(additive.map((key) => [key, 0]));
+    summary.test_failure_count = 0;
+    summary.infrastructure_failure_count = 0;
+    for (const repository of visible) {
+      for (const key of additive) summary[key] += Number(repository.summary?.[key] || 0);
+      // New producers use the explicit failure-kind counters. During a
+      // same-server rolling replacement an older retained payload can still
+      // expose their historical aliases, so aggregate either contract once.
+      summary.test_failure_count += Number(
+        repository.summary?.test_failure_count
+          ?? repository.summary?.failed_run_count
+          ?? 0,
+      );
+      summary.infrastructure_failure_count += Number(
+        repository.summary?.infrastructure_failure_count
+          ?? repository.summary?.infrastructure_count
+          ?? 0,
+      );
+    }
+    // Preserve the historical aggregate names for older Console consumers,
+    // while keeping both pairs semantically identical.
+    summary.failed_run_count = summary.test_failure_count;
+    summary.infrastructure_count = summary.infrastructure_failure_count;
+    summary.repository_count = visible.length;
+    summary.returned_repository_count = visible.length;
+    summary.repositories_with_activity = visible.filter((item) => (
+      Number(item.summary?.test_count || 0) > 0
+      || Number(item.summary?.run_count || 0) > 0
+      || Number(item.summary?.attempt_count || 0) > 0
+      || Number(item.summary?.test_seconds || 0) > 0
+    )).length;
+    summary.parallel_efficiency_ratio = summary.wall_seconds > 0
+      ? summary.test_seconds / summary.wall_seconds : null;
+    const decided = summary.passed_count + summary.failure_count;
+    summary.pass_rate = decided > 0 ? summary.passed_count / decided : null;
+    summary.flake_rate = summary.distinct_test_count > 0
+      ? summary.flaky_test_count / summary.distinct_test_count : null;
+    // Percentiles, avoided-work estimates, and scheduler-capacity fields are
+    // not additive.  Recomputing them from repository rows would be false,
+    // while returning the fleet values to a partially authorized account
+    // would disclose activity outside its grants. Preserve them only when the
+    // caller is authorized for the complete enrolled fleet.
+    summary.p95_queue_wait_seconds = preserveAggregateMetrics
+      ? (fleet?.summary?.p95_queue_wait_seconds ?? null) : null;
+    summary.avoided_work = preserveAggregateMetrics && fleet?.summary?.avoided_work
+      && typeof fleet.summary.avoided_work === 'object'
+      ? { ...fleet.summary.avoided_work }
+      : { available: false, test_count: null, test_seconds: null };
+
+    const hourKeys = Array.isArray(fleet?.hours) ? fleet.hours : [];
+    const sourceCapacity = new Map((fleet?.capacity || []).map((cell) => [
+      String(cell?.hour_start ?? ''), cell,
+    ]));
+    const capacity = hourKeys.map((hour) => {
+      const key = String(hour);
+      let testSeconds = 0;
+      let testCount = 0;
+      let failureCount = 0;
+      let infrastructureCount = 0;
+      let activeRepositoryCount = 0;
+      for (const repository of visible) {
+        const cell = (repository.hourly || []).find((candidate) => (
+          String(candidate?.hour_start ?? candidate?.timestamp ?? '') === key
+        ));
+        if (!cell) continue;
+        testSeconds += Number(cell.test_seconds || 0);
+        testCount += Number(cell.test_count || 0);
+        failureCount += Number(cell.failure_count || 0);
+        infrastructureCount += Number(cell.infrastructure_count || 0);
+        if (Number(cell.test_seconds || 0) > 0) activeRepositoryCount += 1;
+      }
+      const retained = preserveAggregateMetrics && sourceCapacity.get(key)
+        && typeof sourceCapacity.get(key) === 'object'
+        ? sourceCapacity.get(key) : {};
+      return {
+        ...retained,
+        hour_start: key, test_seconds: testSeconds, test_count: testCount,
+        failure_count: failureCount, infrastructure_count: infrastructureCount,
+        active_repository_count: activeRepositoryCount,
+        p95_queue_wait_seconds: preserveAggregateMetrics
+          ? (retained.p95_queue_wait_seconds ?? null) : null,
+      };
+    });
+    return {
+      ...fleet,
+      summary,
+      repositories: visible,
+      capacity,
+      attention: (fleet?.attention || []).filter((item) => allowed.has(item?.repo_id)),
+    };
+  }
+
+  function requireExactFields(value, fields, label) {
+    const expected = new Set(fields);
+    const supplied = Object.keys(value || {});
+    const unexpected = supplied.filter((field) => !expected.has(field));
+    const missing = fields.filter((field) => !Object.hasOwn(value || {}, field));
+    if (unexpected.length || missing.length) {
+      throw new ApiError(400, `${label} fields are invalid`);
+    }
+  }
+
+  function requireFields(value, required, optional, label) {
+    const allowed = new Set([...required, ...optional]);
+    const supplied = Object.keys(value || {});
+    const unexpected = supplied.filter((field) => !allowed.has(field));
+    const missing = required.filter((field) => !Object.hasOwn(value || {}, field));
+    if (unexpected.length || missing.length) {
+      throw new ApiError(400, `${label} fields are invalid`);
+    }
+  }
+
+  function requireTestTargetNames(value) {
+    if (value === undefined) return [];
+    const targets = requireStringArray(value, 'requested_targets', { maxItems: 256 });
+    for (const target of targets) {
+      if (Buffer.byteLength(target, 'utf8') > 128 || /[\u0000-\u001f\u007f]/.test(target)) {
+        throw new ApiError(400, 'requested_targets contains an invalid target name');
+      }
+    }
+    return targets;
+  }
+
+  function requireTestAccess(session, repoId, scope) {
+    if (accessStore?.isAdmin(session?.email)) return;
+    const hierarchy = scope === 'read'
+      ? ['read', 'run', 'operate']
+      : scope === 'run' ? ['run', 'operate'] : ['operate'];
+    if (!hierarchy.some((candidate) => accessStore?.canAccess(session?.email, testGrant(repoId, candidate)))) {
+      throw new ApiError(403, `this account does not have tests:${scope} access to the repository`);
+    }
+  }
+
+  async function requireKnownTestRepository(repoId) {
+    const catalog = await coordinator.testRepositories();
+    const repositories = Array.isArray(catalog?.repositories) ? catalog.repositories : [];
+    const repository = repositories.find((item) => item?.repo_id === repoId);
+    if (!repository) throw new ApiError(404, 'repository is not enrolled for tests');
+    return repository;
+  }
+
+  function requireTestSourceSelector(value, repoId) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      throw new ApiError(400, 'source must be a typed repository source selector');
+    }
+    requireExactFields(
+      value,
+      ['schema_version', 'kind', 'repository_id', 'repository_generation'],
+      'test source',
+    );
+    if (value.schema_version !== 1 || !['original', 'temporary'].includes(value.kind)) {
+      throw new ApiError(400, 'test source selector is unsupported');
+    }
+    const repositoryId = requireTestRepoId(value.repository_id);
+    if (!Number.isInteger(value.repository_generation) || value.repository_generation < 0) {
+      throw new ApiError(400, 'test source repository_generation is invalid');
+    }
+    if (value.kind === 'original' && repositoryId !== repoId) {
+      throw new ApiError(400, 'original test source must identify the selected repository');
+    }
+    return {
+      schema_version: 1,
+      kind: value.kind,
+      repository_id: repositoryId,
+      repository_generation: value.repository_generation,
+    };
+  }
+
+  function boundedSourceLabel(value, fallback) {
+    const label = typeof value === 'string' ? value.trim() : '';
+    if (!label || label.length > 160 || /[\u0000-\u001f\u007f]/.test(label)) return fallback;
+    return label;
+  }
+
+  function authoritativeTestSourceCatalog(inventory, repoId) {
+    if (!inventory || typeof inventory !== 'object' || Array.isArray(inventory)
+      || !Array.isArray(inventory.repository_trees)
+      || !Array.isArray(inventory.repositories)) {
+      throw new ApiError(409, 'test source authority is unavailable');
+    }
+    const trees = inventory.repository_trees.filter(
+      (tree) => tree?.root_repository?.repo_id === repoId,
+    );
+    if (trees.length !== 1) {
+      throw new ApiError(409, 'test source authority is contradictory');
+    }
+    const tree = trees[0];
+    if (typeof tree.family_id !== 'string' || !tree.family_id
+      || !Array.isArray(tree.scopes)) {
+      throw new ApiError(409, 'test source authority is incomplete');
+    }
+    const rootScopes = tree.scopes.filter(
+      (scope) => scope?.kind === 'root' && scope?.repo_id === repoId,
+    );
+    if (rootScopes.length !== 1) {
+      throw new ApiError(409, 'original test source authority is contradictory');
+    }
+    const rootRepository = inventory.repositories.filter(
+      (repository) => repository?.repo_id === repoId,
+    );
+    if (rootRepository.length !== 1
+      || rootRepository[0]?.canonical_root !== rootScopes[0]?.canonical_root) {
+      throw new ApiError(409, 'original test source identity is stale');
+    }
+    const rootGeneration = rootRepository[0]?.generation;
+    if (!Number.isInteger(rootGeneration) || rootGeneration < 0) {
+      throw new ApiError(409, 'original test source generation is unavailable');
+    }
+
+    const sources = [{
+      selector: {
+        schema_version: 1,
+        kind: 'original',
+        repository_id: repoId,
+        repository_generation: rootGeneration,
+      },
+      label: 'Original repository',
+      detail: boundedSourceLabel(tree.root_repository.display_name, repoId),
+      temporaryRoot: null,
+    }];
+    const seen = new Set([repoId]);
+    for (const scope of tree.scopes) {
+      if (scope?.kind !== 'temporary') continue;
+      const sourceRepoId = typeof scope.repo_id === 'string' ? scope.repo_id.trim() : '';
+      if (!TEST_REPO_ID_RE.test(sourceRepoId)) {
+        throw new ApiError(409, 'temporary test source authority is malformed');
+      }
+      if (seen.has(sourceRepoId)) {
+        throw new ApiError(409, 'temporary test source identity is duplicated');
+      }
+      seen.add(sourceRepoId);
+      if (typeof scope.canonical_root !== 'string' || !scope.canonical_root.startsWith('/')
+        || scope.canonical_root === rootScopes[0].canonical_root) {
+        throw new ApiError(409, 'temporary test source authority is incomplete');
+      }
+      const repository = inventory.repositories.filter(
+        (candidate) => candidate?.repo_id === sourceRepoId,
+      );
+      if (repository.length !== 1 || repository[0]?.canonical_root !== scope.canonical_root) {
+        throw new ApiError(409, 'temporary test source identity is stale');
+      }
+      const generation = repository[0]?.generation;
+      if (!Number.isInteger(generation) || generation < 0) {
+        throw new ApiError(409, 'temporary test source generation is unavailable');
+      }
+      sources.push({
+        selector: {
+          schema_version: 1,
+          kind: 'temporary',
+          repository_id: sourceRepoId,
+          repository_generation: generation,
+        },
+        label: boundedSourceLabel(scope.display_name, `Temporary worktree ${sources.length}`),
+        detail: scope.expires_at ? `Expires ${String(scope.expires_at)}` : 'Server-authorized worktree',
+        temporaryRoot: scope.canonical_root,
+      });
+    }
+    return { familyId: tree.family_id, sources };
+  }
+
+  function testSourceCatalogView(repoId, catalog) {
+    return {
+      schema_version: 1,
+      repository_id: repoId,
+      default_source: catalog.sources[0].selector,
+      sources: catalog.sources.map(({ selector, label, detail }) => ({
+        selector, label, detail,
+      })),
+    };
+  }
+
+  async function resolveTestSource(repoId, selector) {
+    // Every source is generation-bound against a fresh server inventory at
+    // the moment of planning. The browser supplies only opaque identities;
+    // host paths never cross the public API boundary.
+    const inventory = await coordinator.inventory({ maxAgeMs: 0 });
+    const catalog = authoritativeTestSourceCatalog(inventory, repoId);
+    const match = catalog.sources.find((source) => (
+      source.selector.kind === selector.kind
+      && source.selector.repository_id === selector.repository_id
+      && source.selector.repository_generation === selector.repository_generation
+    ));
+    if (!match) {
+      throw new ApiError(409, 'test source is stale or no longer authorized');
+    }
+    return match;
   }
 
   function requireContainer(value) {
@@ -182,7 +757,7 @@ export function createConsoleApi({
     return view;
   }
 
-  function accessResources() {
+  async function accessResources() {
     const resources = [{
       id: CONSOLE_GRANT,
       kind: 'console',
@@ -204,6 +779,29 @@ export function createConsoleApi({
         auth: route.auth,
         target,
       });
+    }
+    try {
+      const catalog = await coordinator.testRepositories();
+      for (const repository of catalog?.repositories || []) {
+        if (!repository || !TEST_REPO_ID_RE.test(String(repository.repo_id || ''))) continue;
+        const name = String(repository.display_name || repository.repo_id);
+        for (const [scope, target] of [
+          ['read', 'View test history, evidence and statistics'],
+          ['run', 'Plan and submit repository tests'],
+          ['operate', 'Cancel or retry any repository test run'],
+        ]) {
+          resources.push({
+            id: testGrant(repository.repo_id, scope),
+            kind: 'project-tests',
+            host: config.consoleHost,
+            title: `${name} tests · ${scope}`,
+            auth: 'google',
+            target,
+          });
+        }
+      }
+    } catch (error) {
+      clog?.warn?.('test access resources unavailable', { error: error?.message ?? String(error) });
     }
     return resources;
   }
@@ -374,51 +972,55 @@ export function createConsoleApi({
     sendJson(res, 200, { result });
   }
 
-  function accessView() {
+  async function accessView() {
     const users = accessStore.list();
     return {
       version: 1,
       users,
-      resources: accessResources(),
+      resources: await accessResources(),
       invitedCount: users.filter((user) => !user.owner).length,
     };
   }
 
-  function handleAccessGet(res, session) {
+  async function handleAccessGet(res, session) {
     requireAccessAdmin(session);
-    sendJson(res, 200, accessView());
+    sendJson(res, 200, await accessView());
   }
 
   async function handleAccessAdd(req, res, session) {
     requireAccessAdmin(session);
     const body = await readJsonBody(req);
-    const added = await accessStore.addUser({ email: body.email, grants: body.grants ?? [] });
+    const added = await publishMutation('access-user-added', () => (
+      accessStore.addUser({ email: body.email, grants: body.grants ?? [] })
+    ));
     clog?.info?.('access user added', {
       admin: session.email,
       email: added.email,
       grants: added.grants,
     });
-    sendJson(res, 201, accessView());
+    sendJson(res, 201, await accessView());
   }
 
   async function handleAccessGrant(req, res, session, email) {
     requireAccessAdmin(session);
     const body = await readJsonBody(req);
-    const updated = await accessStore.setGrant(email, body.resource, body.allowed);
+    const updated = await publishMutation('access-grant-changed', () => (
+      accessStore.setGrant(email, body.resource, body.allowed)
+    ));
     clog?.info?.('access grant changed', {
       admin: session.email,
       email: updated.email,
       resource: body.resource,
       allowed: body.allowed,
     });
-    sendJson(res, 200, accessView());
+    sendJson(res, 200, await accessView());
   }
 
   async function handleAccessRemove(res, session, email) {
     requireAccessAdmin(session);
-    const removed = await accessStore.removeUser(email);
+    const removed = await publishMutation('access-user-removed', () => accessStore.removeUser(email));
     clog?.info?.('access user removed', { admin: session.email, email: removed.email });
-    sendJson(res, 200, accessView());
+    sendJson(res, 200, await accessView());
   }
 
   function handleAccessRequestsGet(res, session, searchParams) {
@@ -434,7 +1036,9 @@ export function createConsoleApi({
   async function handleAccessRequestDecision(req, res, session, requestId) {
     requireAccessAdmin(session);
     const body = await readJsonBody(req);
-    const decided = await accessStore.decideRequest(requestId, body.decision, session.email);
+    const decided = await publishMutation('access-request-decided', () => (
+      accessStore.decideRequest(requestId, body.decision, session.email)
+    ));
     clog?.info?.('access request decided', {
       admin: session.email,
       requestId: decided.id,
@@ -445,7 +1049,7 @@ export function createConsoleApi({
     sendJson(res, 200, {
       request: decided,
       pendingCount: accessStore.pendingRequestCount(),
-      access: accessView(),
+      access: await accessView(),
     });
   }
 
@@ -465,16 +1069,116 @@ export function createConsoleApi({
     return telegram;
   }
 
+  function boundedCoordinatorError(error) {
+    const raw = String(error?.message ?? error ?? 'Coordinator inventory unavailable');
+    const message = raw
+      .replace(/[\u0000-\u001f\u007f]+/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, 240);
+    return {
+      code: typeof error?.code === 'string' ? error.code.slice(0, 128) : null,
+      classification: typeof error?.classification === 'string'
+        ? error.classification.slice(0, 64) : null,
+      status: Number.isInteger(error?.status) ? error.status : null,
+      error: message || 'Coordinator inventory unavailable',
+    };
+  }
+
+  function logTelegramProjectCatalog(level, message, fields) {
+    const key = [level, message, fields?.reason, fields?.code, fields?.classification]
+      .map((value) => String(value ?? ''))
+      .join(':');
+    const now = Date.now();
+    if (
+      telegramProjectCatalogLastLog.key === key
+      && now - telegramProjectCatalogLastLog.at < TELEGRAM_PROJECT_CATALOG_LOG_COOLDOWN_MS
+    ) return;
+    telegramProjectCatalogLastLog = { key, at: now };
+    clog?.[level]?.(message, fields);
+  }
+
+  async function telegramProjectInventory() {
+    if (typeof coordinator.inventoryForOverview !== 'function') {
+      return {
+        inventory: await coordinator.inventory({
+          maxAgeMs: TELEGRAM_PROJECT_CATALOG_MAX_AGE_MS,
+        }),
+        state: 'fresh',
+        ageMs: 0,
+        refreshing: false,
+        error: null,
+      };
+    }
+    const snapshot = await coordinator.inventoryForOverview({
+      maxAgeMs: TELEGRAM_PROJECT_CATALOG_MAX_AGE_MS,
+      maxStaleMs: TELEGRAM_PROJECT_CATALOG_MAX_STALE_MS,
+      maxWaitMs: TELEGRAM_PROJECT_CATALOG_COLD_WAIT_MS,
+    });
+    if (!snapshot?.inventory) {
+      if (snapshot?.error) {
+        logTelegramProjectCatalog('error', 'Telegram project catalog inventory unavailable', {
+          reason: 'inventory_refresh_failed',
+          state: snapshot.state ?? null,
+          ageMs: Number.isFinite(snapshot.ageMs) ? snapshot.ageMs : null,
+          ...boundedCoordinatorError(snapshot.error),
+        });
+        throw snapshot.error;
+      }
+      const error = new ApiError(503, 'Coordinator repository catalog is still warming');
+      logTelegramProjectCatalog('warn', 'Telegram project catalog inventory is still warming', {
+        reason: 'cold_inventory_pending',
+        state: snapshot?.state ?? null,
+        ageMs: Number.isFinite(snapshot?.ageMs) ? snapshot.ageMs : null,
+        refreshing: snapshot?.refreshing === true,
+      });
+      throw error;
+    }
+    if (snapshot.error) {
+      logTelegramProjectCatalog('warn', 'Telegram project catalog is using retained inventory', {
+        reason: 'background_refresh_failed',
+        state: snapshot.state ?? null,
+        ageMs: Number.isFinite(snapshot.ageMs) ? snapshot.ageMs : null,
+        refreshing: snapshot.refreshing === true,
+        ...boundedCoordinatorError(snapshot.error),
+      });
+    }
+    return snapshot;
+  }
+
   async function telegramProjects() {
-    const inventory = await coordinator.inventory({ maxAgeMs: 0 });
+    const snapshot = await telegramProjectInventory();
+    const inventory = snapshot.inventory;
     if (!Array.isArray(inventory?.repositories)) {
+      logTelegramProjectCatalog('error', 'Telegram project catalog inventory is malformed', {
+        reason: 'repositories_not_array',
+        state: snapshot.state ?? null,
+        ageMs: Number.isFinite(snapshot.ageMs) ? snapshot.ageMs : null,
+      });
       throw new ApiError(502, 'coordinator returned an invalid repository collection');
     }
-    const projects = inventory.repositories.map((repository) => {
+    const repositoryIds = new Set();
+    const projects = inventory.repositories.map((repository, index) => {
       const id = repository?.repo_id;
-      if (typeof id !== 'string' || !id || /[\u0000-\u001f\u007f]/.test(id)) {
+      if (typeof id !== 'string' || !TEST_REPO_ID_RE.test(id)) {
+        logTelegramProjectCatalog('error', 'Telegram project catalog identity is malformed', {
+          reason: 'repository_identity_invalid',
+          state: snapshot.state ?? null,
+          ageMs: Number.isFinite(snapshot.ageMs) ? snapshot.ageMs : null,
+          repositoryIndex: index,
+        });
         throw new ApiError(502, 'coordinator returned an invalid repository identity');
       }
+      if (repositoryIds.has(id)) {
+        logTelegramProjectCatalog('error', 'Telegram project catalog identity is duplicated', {
+          reason: 'repository_identity_duplicated',
+          state: snapshot.state ?? null,
+          ageMs: Number.isFinite(snapshot.ageMs) ? snapshot.ageMs : null,
+          repositoryIndex: index,
+        });
+        throw new ApiError(502, 'coordinator returned a duplicate repository identity');
+      }
+      repositoryIds.add(id);
       return {
         id,
         name: repository.display_name || repository.name || id,
@@ -680,25 +1384,33 @@ export function createConsoleApi({
 
   async function handleRouteCreate(req, res) {
     const body = await readJsonBody(req);
-    const requestedSlug = typeof body.slug === 'string' ? body.slug.trim().toLowerCase() : '';
-    if (requestedSlug && !routeStore.get(requestedSlug)) {
-      // A deleted hostname must never resurrect grants if the same slug is
-      // assigned to a different server later.
-      await accessStore.clearResource(routeGrant(requestedSlug));
-      await upstreamAuthStore?.remove(requestedSlug);
-    }
-    const route = await routeStore.create({
-      slug: body.slug,
-      kind: body.kind,
-      port: body.port,
-      project: body.project,
-      serverName: body.serverName,
-      containerName: body.containerName,
-      containerPort: body.containerPort,
-      auth: body.auth,
-      title: body.title,
+    const route = await publishMutation('route-created', async () => {
+      const requestedSlug = typeof body.slug === 'string' ? body.slug.trim().toLowerCase() : '';
+      if (requestedSlug && !routeStore.get(requestedSlug)) {
+        // A deleted hostname must never resurrect grants if the same slug is
+        // assigned to a different server later.
+        await accessStore.clearResource(routeGrant(requestedSlug));
+        await upstreamAuthStore?.remove(requestedSlug);
+      }
+      return routeStore.create({
+        slug: body.slug,
+        kind: body.kind,
+        port: body.port,
+        project: body.project,
+        serverName: body.serverName,
+        containerName: body.containerName,
+        containerPort: body.containerPort,
+        auth: body.auth,
+        title: body.title,
+      });
     });
     sendJson(res, 201, toRouteView(route, await resolveSafe(route.slug)));
+  }
+
+  async function handleEdgePublicationReconcile(res) {
+    if (!edgePublication) throw new ApiError(404, 'stable-edge publication is not enabled for this Console');
+    const publication = await edgePublication.reconcile({ reason: 'user-publication-retry' });
+    sendJson(res, 200, { publication });
   }
 
   async function handleRoutePatch(req, res, slug) {
@@ -710,47 +1422,62 @@ export function createConsoleApi({
     if (Object.keys(patch).length === 0) {
       throw new ApiError(400, 'no updatable fields in request body');
     }
-    const route = await routeStore.update(slug, patch);
-    if (route.auth === 'public') await upstreamAuthStore?.remove(route.slug);
+    const route = await publishMutation('route-updated', async () => {
+      const updated = await routeStore.update(slug, patch);
+      if (updated.auth === 'public') await upstreamAuthStore?.remove(updated.slug);
+      return updated;
+    });
     sendJson(res, 200, toRouteView(route, await resolveSafe(route.slug)));
   }
 
   async function handleRouteDelete(res, slug) {
-    const existing = routeStore.get(slug);
-    if (existing) await upstreamAuthStore?.remove(existing.slug);
-    const removed = await routeStore.remove(slug);
-    await accessStore.clearResource(routeGrant(removed.slug));
+    await publishMutation('route-removed', async () => {
+      const existing = routeStore.get(slug);
+      if (existing) await upstreamAuthStore?.remove(existing.slug);
+      const removed = await routeStore.remove(slug);
+      await accessStore.clearResource(routeGrant(removed.slug));
+      return removed;
+    });
     sendJson(res, 200, { ok: true });
   }
 
   async function handleRouteUpstreamAuthSet(req, res, session, slug) {
     requireAccessAdmin(session);
-    const route = routeStore.get(slug);
-    if (!route) throw new ApiError(404, 'route not found');
-    if (route.auth !== 'google') {
-      throw new ApiError(400, 'upstream credentials can be configured only for a Google-protected route');
-    }
     const body = await readJsonBody(req);
-    const upstreamAuth = await upstreamAuthStore.set(route.slug, {
-      scheme: body.scheme,
-      username: body.username,
-      secret: body.secret, // public-artifact-guard: allow text-secret -- runtime request field, never literal credential material
+    const result = await publishMutation('route-upstream-credential-set', async () => {
+      const route = routeStore.get(slug);
+      if (!route) throw new ApiError(404, 'route not found');
+      if (route.auth !== 'google') {
+        throw new ApiError(400, 'upstream credentials can be configured only for a Google-protected route');
+      }
+      const upstreamAuth = await upstreamAuthStore.set(route.slug, {
+        scheme: body.scheme,
+        username: body.username,
+        secret: body.secret, // public-artifact-guard: allow text-secret -- runtime request field, never literal credential material
+      });
+      return { route, upstreamAuth };
     });
     clog?.info?.('route upstream credential configured', {
       admin: session.email,
-      slug: route.slug,
-      scheme: upstreamAuth.scheme,
+      slug: result.route.slug,
+      scheme: result.upstreamAuth.scheme,
     });
-    sendJson(res, 200, { slug: route.slug, upstreamAuth });
+    sendJson(res, 200, { slug: result.route.slug, upstreamAuth: result.upstreamAuth });
   }
 
   async function handleRouteUpstreamAuthRemove(res, session, slug) {
     requireAccessAdmin(session);
-    const route = routeStore.get(slug);
-    if (!route) throw new ApiError(404, 'route not found');
-    const removed = await upstreamAuthStore.remove(route.slug);
-    clog?.info?.('route upstream credential removed', { admin: session.email, slug: route.slug, removed });
-    sendJson(res, 200, { slug: route.slug, upstreamAuth: { configured: false } });
+    const result = await publishMutation('route-upstream-credential-removed', async () => {
+      const route = routeStore.get(slug);
+      if (!route) throw new ApiError(404, 'route not found');
+      return { route, removed: await upstreamAuthStore.remove(route.slug) };
+    });
+    clog?.info?.('route upstream credential removed', {
+      admin: session.email,
+      slug: result.route.slug,
+      removed: result.removed,
+    });
+    sendJson(res, 200, { slug: result.route.slug, upstreamAuth: { configured: false } });
   }
 
   async function handleServerAction(req, res, session) {
@@ -786,7 +1513,7 @@ export function createConsoleApi({
     return body[field];
   }
 
-  function exactWorkerContext(inventory, serverId) {
+  function exactServerRuntimeContext(inventory, serverId, { requireSupervision = false } = {}) {
     if (!Array.isArray(inventory?.repository_trees)) {
       throw new ApiError(409, 'worker actions require an authoritative repository tree');
     }
@@ -831,7 +1558,7 @@ export function createConsoleApi({
       throw new ApiError(409, 'worker repository scope is incomplete or contradictory');
     }
     const server = serverMatches[0];
-    if (!server.supervision || typeof server.supervision !== 'object') {
+    if (requireSupervision && (!server.supervision || typeof server.supervision !== 'object')) {
       throw new ApiError(409, 'this server is not a supervised worker');
     }
     if (typeof server.name !== 'string' || !server.name) {
@@ -839,6 +1566,70 @@ export function createConsoleApi({
     }
     return {
       server,
+      rootRepo,
+      temporaryRepo: scope.kind === 'temporary' ? effectiveRepo : null,
+    };
+  }
+
+  function exactWorkerContext(inventory, serverId) {
+    return exactServerRuntimeContext(inventory, serverId, { requireSupervision: true });
+  }
+
+  function exactDockerRuntimeContext(inventory, resourceId) {
+    if (!Array.isArray(inventory?.repository_trees)) {
+      throw new ApiError(409, 'container logs require an authoritative repository tree');
+    }
+    const containers = Array.isArray(inventory?.docker?.containers)
+      ? inventory.docker.containers : [];
+    const containerMatches = containers.filter((container) => (
+      String(container?.host_resource_id ?? container?.docker_resource_id ?? '') === resourceId
+    ));
+    if (containerMatches.length !== 1) {
+      throw new ApiError(
+        containerMatches.length ? 409 : 404,
+        containerMatches.length
+          ? 'container identity is duplicated in inventory'
+          : 'container not found',
+      );
+    }
+
+    const memberships = [];
+    for (const tree of inventory.repository_trees) {
+      const root = tree?.root_repository;
+      for (const scope of Array.isArray(tree?.scopes) ? tree.scopes : []) {
+        if (!Array.isArray(scope?.container_resource_ids) || !scope.container_resource_ids.some(
+          (id) => String(id) === resourceId,
+        )) continue;
+        memberships.push({ root, scope });
+      }
+    }
+    if (memberships.length !== 1) {
+      throw new ApiError(
+        409,
+        memberships.length
+          ? 'container belongs to more than one repository scope; log read was refused'
+          : 'container has no authoritative repository scope; log read was refused',
+      );
+    }
+    const [{ root, scope }] = memberships;
+    const rootRepo = root?.canonical_root;
+    const effectiveRepo = scope?.canonical_root;
+    const container = containerMatches[0];
+    if (
+      typeof rootRepo !== 'string' || !rootRepo.startsWith('/')
+      || typeof effectiveRepo !== 'string' || !effectiveRepo.startsWith('/')
+      || !['root', 'temporary'].includes(scope?.kind)
+      || (scope.kind === 'root' && effectiveRepo !== rootRepo)
+      || !['docker_labels', 'coordinator_sidecar'].includes(container?.metadata_source)
+      || (typeof container.project === 'string' && container.project !== effectiveRepo)
+    ) {
+      throw new ApiError(409, 'container repository scope is incomplete or contradictory');
+    }
+    if (typeof container.name !== 'string' || !container.name) {
+      throw new ApiError(409, 'container has no canonical display name');
+    }
+    return {
+      container,
       rootRepo,
       temporaryRepo: scope.kind === 'temporary' ? effectiveRepo : null,
     };
@@ -961,54 +1752,66 @@ export function createConsoleApi({
     if (!server.project || !server.name) {
       throw new ApiError(400, 'server is missing project/name and cannot be mapped to a subdomain');
     }
-    const existing = findServerRoute(server);
     const rawSlug = typeof body.slug === 'string' ? body.slug.trim() : '';
-
-    // Unassign: remove the mapped route (idempotent when none exists).
-    if (!rawSlug) {
-      if (existing) {
-        await upstreamAuthStore?.remove(existing.slug);
-        await routeStore.remove(existing.slug);
-        await accessStore.clearResource(routeGrant(existing.slug));
-      }
-      clog?.info?.('server subdomain removed', { server: server.name, slug: existing?.slug ?? null });
-      return sendJson(res, 200, { route: null });
-    }
-
     const authGiven = Object.hasOwn(body, 'auth') ? body.auth : undefined;
+    const outcome = await publishMutation('server-subdomain-changed', async () => {
+      const existing = findServerRoute(server);
 
-    // Same slug already mapped: only the access level (or nothing) can change.
-    if (existing && existing.slug === rawSlug) {
-      const route =
-        authGiven === undefined ? existing : await routeStore.update(existing.slug, { auth: authGiven });
-      if (route.auth === 'public') await upstreamAuthStore?.remove(route.slug);
-      return sendJson(res, 200, { route: toRouteView(route, await resolveSafe(route.slug)) });
-    }
+      // Unassign: remove the mapped route (idempotent when none exists).
+      if (!rawSlug) {
+        if (existing) {
+          await upstreamAuthStore?.remove(existing.slug);
+          await routeStore.remove(existing.slug);
+          await accessStore.clearResource(routeGrant(existing.slug));
+        }
+        return { route: null, status: 200, previousSlug: existing?.slug ?? null };
+      }
 
-    // New or renamed mapping: create the new route (validates + enforces
-    // uniqueness), then drop the old one so a server maps to a single subdomain.
-    const occupied = routeStore.get(rawSlug);
-    if (occupied && rawSlug === occupied.slug) throw new ApiError(409, `route '${rawSlug}' already exists`);
-    if (!occupied) {
-      await accessStore.clearResource(routeGrant(rawSlug));
-      await upstreamAuthStore?.remove(rawSlug);
-    }
-    const route = await routeStore.create({
-      slug: rawSlug,
-      kind: 'server',
-      project: server.project,
-      serverName: server.name,
-      auth: authGiven ?? existing?.auth,
-      title: existing?.title,
+      // Same slug already mapped: only the access level (or nothing) can change.
+      if (existing && existing.slug === rawSlug) {
+        const route = authGiven === undefined
+          ? existing
+          : await routeStore.update(existing.slug, { auth: authGiven });
+        if (route.auth === 'public') await upstreamAuthStore?.remove(route.slug);
+        return { route, status: 200, previousSlug: existing.slug };
+      }
+
+      // New or renamed mapping: create the new route (validates + enforces
+      // uniqueness), then drop the old one so a server maps to a single subdomain.
+      const occupied = routeStore.get(rawSlug);
+      if (occupied && rawSlug === occupied.slug) throw new ApiError(409, `route '${rawSlug}' already exists`);
+      if (!occupied) {
+        await accessStore.clearResource(routeGrant(rawSlug));
+        await upstreamAuthStore?.remove(rawSlug);
+      }
+      const route = await routeStore.create({
+        slug: rawSlug,
+        kind: 'server',
+        project: server.project,
+        serverName: server.name,
+        auth: authGiven ?? existing?.auth,
+        title: existing?.title,
+      });
+      if (existing) {
+        if (route.auth === 'google') await upstreamAuthStore?.move(existing.slug, route.slug);
+        else await upstreamAuthStore?.remove(existing.slug);
+        await accessStore.moveResource(routeGrant(existing.slug), routeGrant(route.slug));
+        await routeStore.remove(existing.slug);
+      }
+      return { route, status: 201, previousSlug: existing?.slug ?? null };
     });
-    if (existing) {
-      if (route.auth === 'google') await upstreamAuthStore?.move(existing.slug, route.slug);
-      else await upstreamAuthStore?.remove(existing.slug);
-      await accessStore.moveResource(routeGrant(existing.slug), routeGrant(route.slug));
-      await routeStore.remove(existing.slug);
+    if (!outcome.route) {
+      clog?.info?.('server subdomain removed', { server: server.name, slug: outcome.previousSlug });
+      return sendJson(res, outcome.status, { route: null });
     }
-    clog?.info?.('server subdomain assigned', { server: server.name, slug: route.slug, auth: route.auth });
-    return sendJson(res, 201, { route: toRouteView(route, await resolveSafe(route.slug)) });
+    clog?.info?.('server subdomain assigned', {
+      server: server.name,
+      slug: outcome.route.slug,
+      auth: outcome.route.auth,
+    });
+    return sendJson(res, outcome.status, {
+      route: toRouteView(outcome.route, await resolveSafe(outcome.route.slug)),
+    });
   }
 
   // The existing kind:'docker' route publishing this container, if any.
@@ -1033,29 +1836,20 @@ export function createConsoleApi({
     const container = (Array.isArray(docker.containers) ? docker.containers : [])
       .find((c) => c?.name === name);
     if (!container) throw new ApiError(404, 'container not found');
-    const existing = findDockerRoute(name);
     const rawSlug = typeof body.slug === 'string' ? body.slug.trim() : '';
 
-    // Unassign: remove the mapped route (idempotent when none exists).
-    if (!rawSlug) {
-      if (existing) {
-        await upstreamAuthStore?.remove(existing.slug);
-        await routeStore.remove(existing.slug);
-        await accessStore.clearResource(routeGrant(existing.slug));
-      }
-      clog?.info?.('docker subdomain removed', { container: name, slug: existing?.slug ?? null });
-      return sendJson(res, 200, { route: null });
-    }
-
-    if (container.metadata_source === 'coordinator_ephemeral') {
+    if (rawSlug && container.metadata_source === 'coordinator_ephemeral') {
       throw new ApiError(
         409,
         'broker-owned ephemeral containers cannot receive durable routes',
       );
     }
     if (
+      rawSlug
+      && (
       !container.project
       || !['docker_labels', 'coordinator_sidecar'].includes(container.metadata_source)
+      )
     ) {
       throw new ApiError(
         400,
@@ -1065,82 +1859,111 @@ export function createConsoleApi({
 
     const authGiven = Object.hasOwn(body, 'auth') ? body.auth : undefined;
     const options = publishedContainerPorts(container.ports);
+    const outcome = await publishMutation('docker-subdomain-changed', async () => {
+      const existing = findDockerRoute(name);
 
-    // An explicit container-side port must be currently published, so a typo
-    // cannot silently create a route that never resolves — EXCEPT when it is
-    // the route's existing port (auth changes and renames must keep working
-    // while the container is stopped or republished elsewhere).
-    let requestedPort;
-    if (body.port !== undefined && body.port !== null && body.port !== '') {
-      const p = Number(body.port);
-      if (!Number.isInteger(p) || p < 1 || p > 65535) {
-        throw new ApiError(400, 'port must be a container port between 1 and 65535');
+      // Unassign: remove the mapped route (idempotent when none exists).
+      if (!rawSlug) {
+        if (existing) {
+          await upstreamAuthStore?.remove(existing.slug);
+          await routeStore.remove(existing.slug);
+          await accessStore.clearResource(routeGrant(existing.slug));
+        }
+        return { route: null, status: 200, previousSlug: existing?.slug ?? null };
       }
-      if (p !== existing?.containerPort && !options.some((o) => o.containerPort === p)) {
-        const published = options.map((o) => o.containerPort).join(', ') || 'none';
-        throw new ApiError(400, `container does not publish port ${p} (published: ${published})`);
-      }
-      requestedPort = p;
-    }
 
-    // Same slug already mapped: only access level / container port can
-    // change, and the port only when explicitly requested — never silently
-    // repointed to whatever happens to be published right now.
-    if (existing && existing.slug === rawSlug) {
-      const patch = {};
-      if (authGiven !== undefined) patch.auth = authGiven;
-      if (requestedPort !== undefined && existing.containerPort !== requestedPort) {
-        patch.containerPort = requestedPort;
+      // An explicit container-side port must be currently published, so a typo
+      // cannot silently create a route that never resolves — EXCEPT when it is
+      // the route's existing port (auth changes and renames must keep working
+      // while the container is stopped or republished elsewhere).
+      let requestedPort;
+      if (body.port !== undefined && body.port !== null && body.port !== '') {
+        const p = Number(body.port);
+        if (!Number.isInteger(p) || p < 1 || p > 65535) {
+          throw new ApiError(400, 'port must be a container port between 1 and 65535');
+        }
+        if (p !== existing?.containerPort && !options.some((o) => o.containerPort === p)) {
+          const published = options.map((o) => o.containerPort).join(', ') || 'none';
+          throw new ApiError(400, `container does not publish port ${p} (published: ${published})`);
+        }
+        requestedPort = p;
       }
-      const route = Object.keys(patch).length
-        ? await routeStore.update(existing.slug, patch)
-        : existing;
-      if (route.auth === 'public') await upstreamAuthStore?.remove(route.slug);
-      return sendJson(res, 200, { route: toRouteView(route, await resolveSafe(route.slug)) });
-    }
 
-    // Renames keep the existing port; a brand-new mapping picks the only
-    // published port or demands an explicit choice.
-    let containerPort = requestedPort ?? existing?.containerPort;
-    if (containerPort === undefined) {
-      if (options.length === 1) {
-        containerPort = options[0].containerPort;
-      } else if (options.length === 0) {
-        throw new ApiError(400, 'container publishes no host ports — publish one (compose "ports:") and start the container, then try again');
-      } else {
-        const published = options.map((o) => o.containerPort).join(', ');
-        throw new ApiError(400, `container publishes several ports (${published}) — pass "port" to choose one`);
+      // Same slug already mapped: only access level / container port can
+      // change, and the port only when explicitly requested — never silently
+      // repointed to whatever happens to be published right now.
+      if (existing && existing.slug === rawSlug) {
+        const patch = {};
+        if (authGiven !== undefined) patch.auth = authGiven;
+        if (requestedPort !== undefined && existing.containerPort !== requestedPort) {
+          patch.containerPort = requestedPort;
+        }
+        const route = Object.keys(patch).length
+          ? await routeStore.update(existing.slug, patch)
+          : existing;
+        if (route.auth === 'public') await upstreamAuthStore?.remove(route.slug);
+        return { route, status: 200, previousSlug: existing.slug };
       }
-    }
 
-    // New or renamed mapping: create the new route (validates + enforces
-    // uniqueness), then drop the old one so a container maps to one subdomain.
-    const occupied = routeStore.get(rawSlug);
-    if (occupied && rawSlug === occupied.slug) throw new ApiError(409, `route '${rawSlug}' already exists`);
-    if (!occupied) {
-      await accessStore.clearResource(routeGrant(rawSlug));
-      await upstreamAuthStore?.remove(rawSlug);
-    }
-    const route = await routeStore.create({
-      slug: rawSlug,
-      kind: 'docker',
-      containerName: name,
-      containerPort,
-      auth: authGiven ?? existing?.auth,
-      title: existing?.title,
+      // Renames keep the existing port; a brand-new mapping picks the only
+      // published port or demands an explicit choice.
+      let containerPort = requestedPort ?? existing?.containerPort;
+      if (containerPort === undefined) {
+        if (options.length === 1) {
+          containerPort = options[0].containerPort;
+        } else if (options.length === 0) {
+          throw new ApiError(400, 'container publishes no host ports — publish one (compose "ports:") and start the container, then try again');
+        } else {
+          const published = options.map((o) => o.containerPort).join(', ');
+          throw new ApiError(400, `container publishes several ports (${published}) — pass "port" to choose one`);
+        }
+      }
+
+      // New or renamed mapping: create the new route (validates + enforces
+      // uniqueness), then drop the old one so a container maps to one subdomain.
+      const occupied = routeStore.get(rawSlug);
+      if (occupied && rawSlug === occupied.slug) throw new ApiError(409, `route '${rawSlug}' already exists`);
+      if (!occupied) {
+        await accessStore.clearResource(routeGrant(rawSlug));
+        await upstreamAuthStore?.remove(rawSlug);
+      }
+      const route = await routeStore.create({
+        slug: rawSlug,
+        kind: 'docker',
+        containerName: name,
+        containerPort,
+        auth: authGiven ?? existing?.auth,
+        title: existing?.title,
+      });
+      if (existing) {
+        if (route.auth === 'google') await upstreamAuthStore?.move(existing.slug, route.slug);
+        else await upstreamAuthStore?.remove(existing.slug);
+        await accessStore.moveResource(routeGrant(existing.slug), routeGrant(route.slug));
+        await routeStore.remove(existing.slug);
+      }
+      return { route, status: 201, previousSlug: existing?.slug ?? null };
     });
-    if (existing) {
-      if (route.auth === 'google') await upstreamAuthStore?.move(existing.slug, route.slug);
-      else await upstreamAuthStore?.remove(existing.slug);
-      await accessStore.moveResource(routeGrant(existing.slug), routeGrant(route.slug));
-      await routeStore.remove(existing.slug);
+    if (!outcome.route) {
+      clog?.info?.('docker subdomain removed', { container: name, slug: outcome.previousSlug });
+      return sendJson(res, outcome.status, { route: null });
     }
-    clog?.info?.('docker subdomain assigned', { container: name, slug: route.slug, auth: route.auth, containerPort });
-    return sendJson(res, 201, { route: toRouteView(route, await resolveSafe(route.slug)) });
+    clog?.info?.('docker subdomain assigned', {
+      container: name,
+      slug: outcome.route.slug,
+      auth: outcome.route.auth,
+      containerPort: outcome.route.containerPort,
+    });
+    return sendJson(res, outcome.status, {
+      route: toRouteView(outcome.route, await resolveSafe(outcome.route.slug)),
+    });
   }
 
   function handleMetricsHistory(res, searchParams) {
-    if (!metrics) return sendJson(res, 200, { entities: [], host: null, sampler: { running: false } });
+    if (!metrics) {
+      return sendJson(res, 200, {
+        entities: [], host: null, performance: null, sampler: { running: false },
+      });
+    }
     const rawLimit = searchParams.get('limit');
     let limit;
     if (rawLimit !== null) {
@@ -1223,12 +2046,48 @@ export function createConsoleApi({
     sendJson(res, 200, { assignment });
   }
 
-  async function handleServerLogs(req, res) {
+  async function handleServerLogs(req, res, session) {
     const body = await readJsonBody(req);
+    const unknown = Object.keys(body).filter((field) => field !== 'id');
+    if (unknown.length) {
+      throw new ApiError(400, `unsupported server log field: ${unknown.join(', ')}`);
+    }
     const id = requireString(body.id, 'id');
-    const tail = clampTail(body.tail, 200);
-    const result = await coordinator.serverLogs({ server_id: id, tail });
-    sendJson(res, 200, result);
+    const inventory = await coordinator.inventory({ maxAgeMs: 0 });
+    const context = exactServerRuntimeContext(inventory, id);
+    const runtime = await coordinator.runtimeAction({
+      schema_version: 1,
+      action: 'capture_logs',
+      agent: `devops-console:${session.email}`,
+      root_repo: context.rootRepo,
+      temporary_repo: context.temporaryRepo,
+      target: { kind: 'service', id, name: context.server.name },
+      purpose: 'development',
+      ttl_seconds: null,
+      kill_after_run: false,
+      options: {},
+    });
+    const artifact = runtime?.artifact;
+    const content = runtime?.artifact_content;
+    if (
+      !runtime || runtime.schema_version !== 1 || runtime.ok !== true
+      || runtime.action !== 'capture_logs'
+      || runtime.target?.kind !== 'service' || String(runtime.target?.id ?? '') !== id
+      || !artifact || typeof artifact !== 'object' || Array.isArray(artifact)
+      || !content || typeof content !== 'object' || Array.isArray(content)
+      || !RUNTIME_ARTIFACT_ID_RE.test(String(artifact.artifact_id ?? ''))
+      || content.artifact_id !== artifact.artifact_id
+      || typeof content.text !== 'string'
+      || Buffer.byteLength(content.text, 'utf8') > RUNTIME_ARTIFACT_MAX_BYTES
+    ) {
+      throw new ApiError(502, 'coordinator returned an invalid exact-service log artifact');
+    }
+    sendJson(res, 200, { text: content.text, artifact: {
+      artifact_id: artifact.artifact_id,
+      captured_at: artifact.captured_at ?? null,
+      retained: false,
+      truncated: artifact.truncated === true,
+    } });
   }
 
   // Whole-project runtime control (starts declared dependencies before web
@@ -1239,6 +2098,12 @@ export function createConsoleApi({
     const project = requireString(body.project, 'project');
     if (!PROJECT_ACTIONS.has(body.action)) {
       throw new ApiError(400, "action must be 'start', 'stop' or 'restart'");
+    }
+    const operationId = body.operation_id == null
+      ? null
+      : requireString(body.operation_id, 'operation_id');
+    if (operationId !== null && (!UUID_RE.test(operationId) || operationId.toLowerCase() !== operationId)) {
+      throw new ApiError(400, 'operation_id must be a canonical UUID');
     }
     // Only repos the coordinator can vouch for may be acted on: either it
     // already tracks them (inventory) or they carry a declared runtime the
@@ -1265,7 +2130,11 @@ export function createConsoleApi({
     const result = await coordinator.projectAction(body.action, {
       agent: `devops-console:${session.email}`,
       project,
+      ...(operationId === null ? {} : { operation_id: operationId }),
     });
+    if (operationId !== null && result?.operation_id !== operationId) {
+      throw new ApiError(502, 'coordinator returned a contradictory project operation ID');
+    }
     sendJson(res, 200, { result });
   }
 
@@ -1307,15 +2176,56 @@ export function createConsoleApi({
     sendJson(res, 200, result);
   }
 
-  async function handleDockerLogs(req, res) {
+  async function handleDockerLogs(req, res, session) {
     const body = await readJsonBody(req);
-    const name = requireContainer(body.name);
-    const tail = clampTail(body.tail, 120);
-    const result = await coordinator.dockerLogs({ container: name, tail });
-    // docker logs writes container output to stdout or stderr depending on
-    // the image — return both, stdout first.
-    const text = `${result?.stdout ?? ''}${result?.stderr ?? ''}`;
-    sendJson(res, 200, { text });
+    const unknown = Object.keys(body).filter((field) => field !== 'resource_id');
+    if (unknown.length) {
+      throw new ApiError(400, `unsupported container log field: ${unknown.join(', ')}`);
+    }
+    const resourceId = requireString(body.resource_id, 'resource_id');
+    if (Buffer.byteLength(resourceId, 'utf8') > 255 || /[\u0000-\u001f\u007f]/.test(resourceId)) {
+      throw new ApiError(400, 'resource_id is invalid');
+    }
+    const inventory = await coordinator.inventory({ maxAgeMs: 0 });
+    const context = exactDockerRuntimeContext(inventory, resourceId);
+    const runtime = await coordinator.runtimeAction({
+      schema_version: 1,
+      action: 'capture_logs',
+      agent: `devops-console:${session.email}`,
+      root_repo: context.rootRepo,
+      temporary_repo: context.temporaryRepo,
+      target: { kind: 'docker', id: resourceId, name: context.container.name },
+      purpose: 'development',
+      ttl_seconds: null,
+      kill_after_run: false,
+      options: {},
+    });
+    const artifact = runtime?.artifact;
+    const content = runtime?.artifact_content;
+    const text = content?.text;
+    if (
+      !runtime || runtime.schema_version !== 1 || runtime.ok !== true
+      || runtime.action !== 'capture_logs'
+      || runtime.target?.kind !== 'docker'
+      || String(runtime.target?.id ?? '') !== resourceId
+      || !artifact || typeof artifact !== 'object' || Array.isArray(artifact)
+      || !content || typeof content !== 'object' || Array.isArray(content)
+      || !RUNTIME_ARTIFACT_ID_RE.test(String(artifact.artifact_id ?? ''))
+      || content.artifact_id !== artifact.artifact_id
+      || typeof text !== 'string'
+      || Buffer.byteLength(text, 'utf8') > RUNTIME_ARTIFACT_MAX_BYTES
+    ) {
+      throw new ApiError(502, 'coordinator returned an invalid exact-container log artifact');
+    }
+    sendJson(res, 200, {
+      text,
+      artifact: {
+        artifact_id: artifact.artifact_id,
+        captured_at: artifact.captured_at ?? null,
+        retained: runtime.classification === 'retained',
+        truncated: artifact.truncated === true,
+      },
+    });
   }
 
   async function handleRuntimeArtifact(res, rawKind, rawId) {
@@ -1347,13 +2257,21 @@ export function createConsoleApi({
   function handleError(res, err) {
     let status = 500;
     let message = 'internal error';
-    if (
+    if (err instanceof EdgePublicationProducerError) {
+      status = 503;
+      message = 'The change was saved, but the public edge could not activate it. Existing public routes remain unchanged.';
+      clog?.warn?.('saved route/access state is awaiting stable-edge publication', {
+        code: err.code,
+        error: err.cause?.message || err.message,
+      });
+    } else if (
       err instanceof ApiError
       || err instanceof RouteError
       || err instanceof PrefsError
       || err instanceof AccessError
       || err instanceof TelegramServiceError
       || err instanceof UpstreamAuthError
+      || err instanceof BugStoreError
     ) {
       status = Number.isInteger(err.status) ? err.status : 500;
       // A 401 from Telegram means the submitted bot token is invalid; it is
@@ -1382,6 +2300,14 @@ export function createConsoleApi({
       return;
     }
     const payload = { error: message };
+    if (err instanceof EdgePublicationProducerError) {
+      payload.code = err.code || 'edge_publication_failed';
+      payload.classification = 'edge_publication';
+      payload.scope = 'local';
+      payload.saved = true;
+      payload.retryable = true;
+      payload.retryPath = '/api/edge-publication/reconcile';
+    }
     if (err instanceof CoordError && err.classification === 'maintenance') {
       payload.code = err.code || 'maintenance_in_progress';
       payload.classification = 'maintenance';
@@ -1422,17 +2348,306 @@ export function createConsoleApi({
         throw new ApiError(403, 'cross-origin request rejected');
       }
 
+      // The open-bug registry is intentionally routed before every
+      // Coordinator-backed endpoint. It remains usable while the system it
+      // diagnoses is unavailable, warming, or in maintenance.
+      if (method === 'GET' && pathname === '/api/bugs') {
+        if (!bugStore) throw new ApiError(503, 'Open Coordinator bugs are temporarily unavailable.');
+        return sendJson(res, 200, await bugStore.listOpen());
+      }
+      if (method === 'GET' && pathname === '/api/bugs/export') {
+        if (!bugStore) throw new ApiError(503, 'Open Coordinator bugs are temporarily unavailable.');
+        return sendJson(res, 200, await bugStore.exportOpen());
+      }
+      if (method === 'POST' && pathname === '/api/bugs/import') {
+        requireAccessAdmin(session);
+        if (!bugStore) throw new ApiError(503, 'Open Coordinator bugs are temporarily unavailable.');
+        const body = await readJsonBody(req, { limit: BUG_IMPORT_BODY_LIMIT });
+        return sendJson(res, 200, await bugStore.importOpen(body));
+      }
+      const bugMatch = pathname.match(/^\/api\/bugs\/([^/]+)$/);
+      if (bugMatch && method === 'DELETE') {
+        requireAccessAdmin(session);
+        if (!bugStore) throw new ApiError(503, 'Open Coordinator bugs are temporarily unavailable.');
+        return sendJson(res, 200, await bugStore.close(safeDecode(bugMatch[1])));
+      }
+
       if (method === 'GET' && pathname === '/api/overview') {
         return await handleOverview(res, { fresh: searchParams.get('fresh') === '1' });
       }
       if (method === 'GET' && pathname === '/api/tests') {
-        const project = requireString(searchParams.get('project'), 'project');
+        const project = requireTestRepoId(searchParams.get('project'));
         const days = boundedInteger(searchParams.get('days'), 30, 1, 3650, 'days');
         const limit = boundedInteger(searchParams.get('limit'), 25, 1, 500, 'limit');
+        await requireKnownTestRepository(project);
+        requireTestAccess(session, project, 'read');
         return sendJson(res, 200, await coordinator.testStats({ project, days, limit }));
       }
+      if (method === 'GET' && pathname === '/api/tests/fleet') {
+        const hours = boundedInteger(searchParams.get('hours'), 24, 1, 168, 'hours');
+        const [catalog, fleet] = await Promise.all([
+          coordinator.testRepositories(),
+          coordinator.testFleet({ hours }),
+        ]);
+        const enrolled = Array.isArray(catalog?.repositories) ? catalog.repositories : [];
+        const validEnrolled = enrolled
+          .filter((repository) => repository && TEST_REPO_ID_RE.test(String(repository.repo_id || '')));
+        const visible = validEnrolled
+          .filter((repository) => canReadRepositoryTests(session, repository.repo_id));
+        const visibleIds = new Set(visible.map((repository) => repository.repo_id));
+        const fullFleetAuthorized = validEnrolled.length === enrolled.length
+          && visibleIds.size === enrolled.length
+          && (fleet?.repositories || []).every((repository) => (
+            repository && TEST_REPO_ID_RE.test(String(repository.repo_id || ''))
+            && visibleIds.has(repository.repo_id)
+          ));
+        return sendJson(res, 200, filterTestFleet(fleet, visible, {
+          preserveAggregateMetrics: fullFleetAuthorized,
+        }));
+      }
       if (method === 'GET' && pathname === '/api/tests/repositories') {
-        return sendJson(res, 200, await coordinator.testRepositories());
+        const catalog = await coordinator.testRepositories();
+        const repositories = (catalog?.repositories || [])
+          .filter((repository) => repository && TEST_REPO_ID_RE.test(String(repository.repo_id || '')))
+          .filter((repository) => canReadRepositoryTests(session, repository.repo_id))
+          .map((repository) => testRepositoryView(repository));
+        return sendJson(res, 200, { schema_version: 1, repositories });
+      }
+      const testSourcesMatch = pathname.match(/^\/api\/tests\/repositories\/([^/]+)\/sources$/);
+      if (method === 'GET' && testSourcesMatch) {
+        const repoId = requireTestRepoId(safeDecode(testSourcesMatch[1]));
+        await requireKnownTestRepository(repoId);
+        requireTestAccess(session, repoId, 'run');
+        const inventory = await coordinator.inventory({ maxAgeMs: 0 });
+        const catalog = authoritativeTestSourceCatalog(inventory, repoId);
+        return sendJson(res, 200, testSourceCatalogView(repoId, catalog));
+      }
+      const testSetupMatch = pathname.match(/^\/api\/tests\/repositories\/([^/]+)\/setup$/);
+      if (method === 'GET' && testSetupMatch) {
+        const repoId = requireTestRepoId(safeDecode(testSetupMatch[1]));
+        await requireKnownTestRepository(repoId);
+        requireTestAccess(session, repoId, 'read');
+        const setup = await coordinator.testRepositorySetup({ repoId });
+        if ((setup?.repository_id ?? setup?.repo_id) !== repoId) {
+          throw new ApiError(502, 'coordinator returned contradictory test setup identity');
+        }
+        return sendJson(res, 200, testSetupView(setup, repoId));
+      }
+      if (method === 'GET' && pathname === '/api/tests/events') {
+        const repoId = requireTestRepoId(searchParams.get('repo_id'));
+        const after = boundedInteger(searchParams.get('after'), 0, 0, Number.MAX_SAFE_INTEGER, 'after');
+        const limit = boundedInteger(searchParams.get('limit'), 200, 1, 500, 'limit');
+        await requireKnownTestRepository(repoId);
+        requireTestAccess(session, repoId, 'read');
+        const events = await coordinator.testEvents({ repoId, after, limit });
+        if ((events?.repository_id ?? events?.repo_id) !== repoId) {
+          throw new ApiError(502, 'coordinator returned contradictory test event identity');
+        }
+        return sendJson(res, 200, events);
+      }
+      if (method === 'POST' && pathname === '/api/tests/plan') {
+        const body = await readJsonBody(req);
+        requireFields(
+          body,
+          ['repo_id', 'intent', 'operation_id', 'source'],
+          ['requested_targets'],
+          'test plan',
+        );
+        const repoId = requireTestRepoId(body.repo_id);
+        const intent = requireString(body.intent, 'intent');
+        const operationId = requireString(body.operation_id, 'operation_id');
+        const sourceSelector = requireTestSourceSelector(body.source, repoId);
+        if (!UUID_RE.test(operationId) || operationId.toLowerCase() !== operationId) {
+          throw new ApiError(400, 'operation_id must be a canonical UUID');
+        }
+        if (!TEST_INTENTS.has(intent)) throw new ApiError(400, 'intent is invalid');
+        const requestedTargets = requireTestTargetNames(body.requested_targets);
+        if (requestedTargets.length && intent !== 'manual') {
+          throw new ApiError(400, 'requested_targets are supported only for manual intent');
+        }
+        await requireKnownTestRepository(repoId);
+        requireTestAccess(session, repoId, 'run');
+        if (intent === 'release' && accessStore?.isAdmin(session?.email) !== true) {
+          throw new ApiError(403, 'release evidence is reserved for Console owners');
+        }
+        const resolvedSource = await resolveTestSource(repoId, sourceSelector);
+        const result = await coordinator.testPlan({
+          repoId,
+          intent,
+          requestedTargets,
+          operationId,
+          source: {
+            schemaVersion: 1,
+            kind: resolvedSource.selector.kind,
+            repositoryId: resolvedSource.selector.repository_id,
+            repositoryGeneration: resolvedSource.selector.repository_generation,
+            temporaryRoot: resolvedSource.temporaryRoot,
+          },
+        });
+        const returnedRepoId = result?.repository_id ?? result?.repo_id;
+        if (
+          returnedRepoId !== repoId
+          || typeof result?.plan_id !== 'string'
+          || !result.plan_id
+          || result?.operation_id !== operationId
+        ) {
+          throw new ApiError(502, 'coordinator returned an invalid repository test plan');
+        }
+        const returnedSource = result?.plan?.source;
+        if (resolvedSource.selector.kind === 'temporary' && (
+          !returnedSource || typeof returnedSource !== 'object'
+          || returnedSource.temporary_root !== resolvedSource.temporaryRoot
+        )) {
+          throw new ApiError(502, 'coordinator returned a contradictory temporary test source');
+        }
+        if (returnedSource && typeof returnedSource === 'object' && (
+          (returnedSource.repository_id !== undefined && returnedSource.repository_id !== repoId)
+          || (resolvedSource.selector.kind === 'original' && returnedSource.temporary_root != null)
+        )) {
+          throw new ApiError(502, 'coordinator returned a contradictory repository test source');
+        }
+        return sendJson(res, 200, {
+          ...result,
+          source_selector: resolvedSource.selector,
+          source_label: resolvedSource.label,
+        });
+      }
+      if (method === 'GET' && pathname === '/api/tests/runs') {
+        const repoId = requireTestRepoId(searchParams.get('repo_id'));
+        const after = searchParams.get('after');
+        const limit = boundedInteger(searchParams.get('limit'), 50, 1, 200, 'limit');
+        const runState = searchParams.get('state');
+        if (after !== null) requireTestEntityId(after, 'after');
+        if (runState !== null && ![
+          'queued', 'running', 'cancelling', 'superseding', 'succeeded', 'failed',
+          'timed_out', 'cancelled', 'incomplete', 'abandoned', 'superseded',
+        ].includes(runState)) {
+          throw new ApiError(400, 'state is invalid');
+        }
+        await requireKnownTestRepository(repoId);
+        requireTestAccess(session, repoId, 'read');
+        const result = await coordinator.testRuns({
+          repoId, after, limit, state: runState,
+        });
+        if ((result?.repository_id ?? result?.repo_id) !== repoId || !Array.isArray(result?.runs)) {
+          throw new ApiError(502, 'coordinator returned contradictory test run history');
+        }
+        const nextCursor = result.next_cursor ?? result.next ?? null;
+        if (nextCursor !== null && (
+          typeof nextCursor !== 'string' || !TEST_ENTITY_ID_RE.test(nextCursor)
+        )) {
+          throw new ApiError(502, 'coordinator returned an invalid test run history cursor');
+        }
+        const activeStates = new Set(['queued', 'running', 'cancelling', 'superseding']);
+        const runs = result.runs.map((run) => {
+          const allowed = canOperateTestRun(session, repoId, run);
+          return testRunView(run, {
+            can_cancel: allowed && activeStates.has(run.state),
+            can_retry: allowed && !activeStates.has(run.state) && run.state !== 'succeeded',
+          });
+        });
+        return sendJson(res, 200, { ...result, runs, next_cursor: nextCursor });
+      }
+      if (method === 'POST' && pathname === '/api/tests/runs') {
+        const body = await readJsonBody(req);
+        requireExactFields(body, ['repo_id', 'plan_id', 'operation_id'], 'test submission');
+        const repoId = requireTestRepoId(body.repo_id);
+        const planId = requireString(body.plan_id, 'plan_id');
+        const operationId = requireString(body.operation_id, 'operation_id');
+        if (planId.length > 255 || /[\u0000-\u001f\u007f]/.test(planId)) {
+          throw new ApiError(400, 'plan_id is invalid');
+        }
+        if (!UUID_RE.test(operationId)) throw new ApiError(400, 'operation_id must be a UUID');
+        await requireKnownTestRepository(repoId);
+        requireTestAccess(session, repoId, 'run');
+        const result = await coordinator.submitTestRun({
+          repoId, planId, operationId, actor: googleTestActor(session),
+        });
+        const returnedRepoId = result?.repository_id ?? result?.repo_id;
+        if (returnedRepoId !== repoId || typeof result?.run_id !== 'string' || !result.run_id) {
+          throw new ApiError(502, 'coordinator returned an invalid repository test submission');
+        }
+        return sendJson(res, 202, result);
+      }
+      const testRunMatch = pathname.match(
+        /^\/api\/tests\/repositories\/([^/]+)\/runs\/([^/]+)(?:\/(summary|failures|artifacts|cases|cancel|retry))?$/,
+      );
+      if (testRunMatch) {
+        const repoId = requireTestRepoId(safeDecode(testRunMatch[1]));
+        const runId = requireTestEntityId(safeDecode(testRunMatch[2]));
+        const action = testRunMatch[3] || 'detail';
+        await requireKnownTestRepository(repoId);
+        requireTestAccess(session, repoId, 'read');
+        const status = await coordinator.testRunStatus({ repoId, runId });
+        if ((status?.repository_id ?? status?.repo_id) !== repoId) {
+          throw new ApiError(404, 'test run does not exist in this repository');
+        }
+        if (method === 'GET' && action === 'detail') {
+          const summary = await coordinator.testRunSummary({ repoId, runId });
+          if ((summary?.repository_id ?? summary?.repo_id) !== repoId) {
+            throw new ApiError(502, 'coordinator returned contradictory test run detail');
+          }
+          return sendJson(res, 200, {
+            ...testRunView(status),
+            summary: testRunSummaryView(summary),
+          });
+        }
+        if (method === 'GET' && action === 'summary') {
+          const summary = await coordinator.testRunSummary({ repoId, runId });
+          if ((summary?.repository_id ?? summary?.repo_id) !== repoId) {
+            throw new ApiError(502, 'coordinator returned contradictory test run summary');
+          }
+          return sendJson(res, 200, testRunSummaryView(summary));
+        }
+        if (method === 'GET' && ['failures', 'artifacts', 'cases'].includes(action)) {
+          const rawAfter = searchParams.get('after');
+          const limit = boundedInteger(searchParams.get('limit'), 50, 1, 50, 'limit');
+          const after = action === 'cases'
+            ? boundedInteger(rawAfter, 0, 0, Number.MAX_SAFE_INTEGER, 'after')
+            : rawAfter;
+          if (action !== 'cases' && after !== null) requireTestEntityId(after, 'after');
+          const operation = {
+            failures: coordinator.testRunFailures,
+            artifacts: coordinator.testRunArtifacts,
+            cases: coordinator.testRunCases,
+          }[action];
+          const evidence = await operation({ repoId, runId, after, limit });
+          if ((evidence?.repository_id ?? evidence?.repo_id) !== repoId) {
+            throw new ApiError(502, 'coordinator returned contradictory test evidence');
+          }
+          return sendJson(res, 200, evidence);
+        }
+        if (method === 'POST' && action === 'cancel') {
+          const body = await readJsonBody(req);
+          requireExactFields(body, ['reason', 'operation_id'], 'test cancellation');
+          const reason = requireString(body.reason, 'reason');
+          const operationId = requireString(body.operation_id, 'operation_id');
+          if (reason.length > 512 || /[\u0000-\u001f\u007f]/.test(reason)) throw new ApiError(400, 'reason is invalid');
+          if (!UUID_RE.test(operationId)) throw new ApiError(400, 'operation_id must be a UUID');
+          requireRunOperationAccess(session, repoId, status);
+          const result = await coordinator.cancelTestRun({
+            repoId, runId, reason, operationId, actor: googleTestActor(session),
+          });
+          if ((result?.repository_id ?? result?.repo_id) !== repoId) {
+            throw new ApiError(502, 'coordinator returned contradictory cancellation identity');
+          }
+          return sendJson(res, 200, result);
+        }
+        if (method === 'POST' && action === 'retry') {
+          const body = await readJsonBody(req);
+          requireExactFields(body, ['failed_only', 'operation_id'], 'test retry');
+          if (typeof body.failed_only !== 'boolean') throw new ApiError(400, 'failed_only must be boolean');
+          const operationId = requireString(body.operation_id, 'operation_id');
+          if (!UUID_RE.test(operationId)) throw new ApiError(400, 'operation_id must be a UUID');
+          requireRunOperationAccess(session, repoId, status);
+          const result = await coordinator.retryTestRun({
+            repoId, runId, failedOnly: body.failed_only, operationId, actor: googleTestActor(session),
+          });
+          if ((result?.repository_id ?? result?.repo_id) !== repoId) {
+            throw new ApiError(502, 'coordinator returned contradictory retry identity');
+          }
+          return sendJson(res, 202, result);
+        }
       }
       if (method === 'GET' && pathname === '/api/metrics/history') {
         return handleMetricsHistory(res, searchParams);
@@ -1458,7 +2673,10 @@ export function createConsoleApi({
         });
       }
       if (method === 'GET' && pathname === '/api/access') {
-        return handleAccessGet(res, session);
+        // Await the async handler inside this try/catch. Returning its promise
+        // directly would let an authorization rejection escape to the outer
+        // HTML router, which converted the intended JSON 403 into a 500 page.
+        return await handleAccessGet(res, session);
       }
       if (method === 'GET' && pathname === '/api/access/requests') {
         return handleAccessRequestsGet(res, session, searchParams);
@@ -1511,6 +2729,9 @@ export function createConsoleApi({
       if (method === 'POST' && pathname === '/api/routes') {
         return await handleRouteCreate(req, res);
       }
+      if (method === 'POST' && pathname === '/api/edge-publication/reconcile') {
+        return await handleEdgePublicationReconcile(res);
+      }
       const routeUpstreamAuthMatch = pathname.match(/^\/api\/routes\/([^/]+)\/upstream-auth$/);
       if (routeUpstreamAuthMatch && method === 'PATCH') {
         return await handleRouteUpstreamAuthSet(
@@ -1544,7 +2765,7 @@ export function createConsoleApi({
         return await handleServerSubdomain(req, res, session);
       }
       if (method === 'POST' && pathname === '/api/servers/logs') {
-        return await handleServerLogs(req, res);
+        return await handleServerLogs(req, res, session);
       }
       if (method === 'POST' && pathname === '/api/ports/lease') {
         return await handlePortLease(req, res, session);
@@ -1562,7 +2783,7 @@ export function createConsoleApi({
         return await handleDockerSubdomain(req, res, session);
       }
       if (method === 'POST' && pathname === '/api/docker/logs') {
-        return await handleDockerLogs(req, res);
+        return await handleDockerLogs(req, res, session);
       }
       if (method === 'POST' && pathname === '/api/projects/action') {
         return await handleProjectAction(req, res, session);

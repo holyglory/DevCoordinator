@@ -1,0 +1,43 @@
+[Unit]
+Description=DevCoordinator root-owned immutable test snapshot authority
+Requires=devcoordinator-test-snapshotd.socket
+After=devcoordinator-test-snapshotd.socket
+
+[Service]
+Type=exec
+User=root
+Group=root
+Slice=devcoordinator-background.slice
+UMask=0077
+Environment=DEVCOORDINATOR_CALL_LOG=/var/log/devcoordinator/calls.jsonl
+Environment=DEVCOORDINATOR_CALL_LOG_MAX_BYTES=4194304
+Environment=DEVCOORDINATOR_CALL_LOG_BACKUPS=4
+ExecStartPre=/opt/devcoordinator/releases/RELEASE_DIGEST/bin/devcoordinator-schema-check --read-only --database /var/lib/devcoordinator/authority.sqlite3 --expected-schema 13
+ExecStart=/opt/devcoordinator/releases/RELEASE_DIGEST/bin/devcoordinator-test-snapshotd --authority-database /var/lib/devcoordinator/authority.sqlite3 --helper /opt/devcoordinator/releases/RELEASE_DIGEST/libexec/universal_test_uid_helper.py --snapshot-root /var/lib/devcoordinator-test-snapshots --catalog-root /var/lib/devcoordinator-test-snapshot-catalog --testd-user devcoordinator-testd
+Restart=always
+RestartSec=2
+TimeoutStopSec=30s
+KillMode=control-group
+StateDirectory=devcoordinator-test-snapshots devcoordinator-test-snapshot-catalog devcoordinator-test-runs
+StateDirectoryMode=0700
+LogsDirectory=devcoordinator
+LogsDirectoryMode=0777
+# This root authority deliberately delegates read-only manifest parsing to the
+# repository owner's UID. NoNewPrivileges blocks that setuid transition.
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX
+# CoordinatorStore's read-only WAL opener may create the SQLite coordination
+# sidecars when snapshotd starts before the authority writer.
+ReadWritePaths=/var/lib/devcoordinator /var/lib/devcoordinator-test-snapshots /var/lib/devcoordinator-test-snapshot-catalog /var/lib/devcoordinator-test-runs /run/devcoordinator-test-snapshotd
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=devcoordinator-test-snapshotd
+
+[Install]
+WantedBy=multi-user.target

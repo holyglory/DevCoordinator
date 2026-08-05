@@ -18,11 +18,13 @@ import os
 from pathlib import Path
 import re
 import shutil
+import signal
 import socket
 import stat
 import subprocess
 import sys
 import tempfile
+import threading
 from typing import Any, Callable, Iterator, Mapping, Optional
 import uuid
 
@@ -43,12 +45,23 @@ from .compose_contract import (
 )
 from .broker_persistence import (
     ComposeMutationTarget,
+    ComposeRunOnceMutationTarget,
     DatabaseMutationTarget,
     DockerMutationTarget,
     EphemeralImageTarget,
     RegisteredDatabaseBackup,
+    RuntimeDockerMutationTarget,
+    RuntimeServiceLogTarget,
+)
+from .runtime_artifacts import RUNTIME_LOG_MAX_BYTES, RUNTIME_LOG_MAX_LINES
+from .compose_run_once import (
+    MAX_COMPOSE_RUN_ONCE_RECEIPT_BYTES,
+    PublishedReceipt,
+    compose_run_once_policies_document,
+    validate_published_receipt,
 )
 from .ephemeral_secrets import EphemeralSecretMount
+from .worker_native import project_repository_slice
 
 
 _LOGGER = logging.getLogger(__name__)
@@ -69,6 +82,75 @@ DOCKER_LOCATIONS = (
     "/Applications/Docker.app/Contents/Resources/bin/docker",
     "/Applications/OrbStack.app/Contents/MacOS/xbin/docker",
 )
+_PROJECT_CONTAINER_MEMORY_LIMIT = "20g"
+_PROJECT_CONTAINER_CPU_LIMIT = "8.0"
+_PROJECT_CONTAINER_PIDS_LIMIT = 4096
+_COMPOSE_RUN_ONCE_LABELS = (
+    "io.devcoordinator.run_once.operation_id",
+    "io.devcoordinator.run_once.repository_id",
+    "io.devcoordinator.run_once.definition_id",
+    "io.devcoordinator.run_once.service",
+    "io.devcoordinator.run_once.policy_fingerprint",
+    "io.devcoordinator.run_once.image_id",
+)
+
+
+def _project_slice(*, owner_uid: int | None, repository_id: str | None) -> str:
+    try:
+        if owner_uid is None or repository_id is None:
+            raise ValueError("project isolation identity is missing")
+        return project_repository_slice(
+            uid=owner_uid,
+            repository_id=repository_id,
+        )
+    except ValueError as error:
+        raise BrokerBackendError(
+            "project_isolation_identity_unavailable",
+            "The repository cannot be attributed to a bounded project cgroup.",
+        ) from error
+
+
+def _compose_isolation_override(
+    target: ComposeMutationTarget,
+    *,
+    services: tuple[str, ...] | None = None,
+    immutable_images: Mapping[str, str] | None = None,
+) -> bytes:
+    cgroup_parent = _project_slice(
+        owner_uid=target.owner_uid,
+        repository_id=target.repo_id,
+    )
+    selected_services = target.services if services is None else services
+    image_overrides = dict(immutable_images or {})
+    return (
+        json.dumps(
+            {
+                "services": {
+                    service: {
+                        "cgroup_parent": cgroup_parent,
+                        "cpus": _PROJECT_CONTAINER_CPU_LIMIT,
+                        "mem_limit": _PROJECT_CONTAINER_MEMORY_LIMIT,
+                        "pids_limit": _PROJECT_CONTAINER_PIDS_LIMIT,
+                        **(
+                            {
+                                "image": image_overrides[service],
+                                "pull_policy": "never",
+                                "restart": "no",
+                                "stdin_open": False,
+                                "tty": False,
+                            }
+                            if service in image_overrides
+                            else {}
+                        ),
+                    }
+                    for service in selected_services
+                }
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        + b"\n"
+    )
 
 
 @dataclass(frozen=True)
@@ -92,6 +174,7 @@ class EphemeralDockerCreateTarget:
     """Sealed, broker-resolved input for one stopped ephemeral container."""
 
     identity: EphemeralDockerIdentity
+    owner_uid: int
     container_name: str
     image_ref: str
     command: tuple[str, ...]
@@ -100,6 +183,7 @@ class EphemeralDockerCreateTarget:
     cpu_limit: str | float
     host_tcp_port: int | None
     container_tcp_port: int | None
+    network_container_id: str | None = None
     secret_mount: EphemeralSecretMount | None = None
 
 
@@ -114,6 +198,7 @@ class EphemeralDockerContainerTarget:
     # Cleanup remains identity-only, but normal profile checks need it to
     # prove image-created anonymous volumes.
     image_ref: str | None = None
+    network_container_id: str | None = None
 
 
 class ComposeMutationOutcomeUncertain(RuntimeError):
@@ -134,6 +219,17 @@ class ComposeMutationOutcomeUncertain(RuntimeError):
         self.failed_phase = failed_phase
         self.completed_phases = completed_phases
         self.cleanup_failed = cleanup_failed
+
+
+@dataclass(frozen=True)
+class ComposeRunOnceOutputEvidence:
+    """Bounded public receipt plus private stream integrity evidence."""
+
+    published_receipt: PublishedReceipt
+    stdout_sha256: str
+    stdout_byte_size: int
+    stderr_sha256: str
+    stderr_byte_size: int
 
 
 def _postgres_backup_tool() -> Path:
@@ -175,26 +271,27 @@ def _require_service_output_root(value: str) -> Path:
     root = Path(value)
     if root.exists():
         metadata = root.lstat()
-        if root.is_symlink() or not root.is_dir():
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
             raise PermissionError(
                 "service PostgreSQL output root must be a real directory"
             )
     else:
         parent = root.parent
         parent_metadata = parent.lstat()
-        if parent.is_symlink() or not parent.is_dir():
+        if stat.S_ISLNK(parent_metadata.st_mode) or not stat.S_ISDIR(
+            parent_metadata.st_mode
+        ):
             raise PermissionError(
                 "service PostgreSQL output parent must be a real directory"
             )
-        if parent_metadata.st_uid != os.geteuid() or parent_metadata.st_mode & 0o077:
-            raise PermissionError(
-                "service PostgreSQL output parent must be private and service-owned"
-            )
-        root.mkdir(mode=0o700)
+        # Every local account belongs to the same developer.  Reachability,
+        # not owner/mode metadata, is the local trust boundary; the backup
+        # tool still owns artifact integrity and verification.
+        root.mkdir(mode=0o755)
         metadata = root.lstat()
-    if metadata.st_uid != os.geteuid() or metadata.st_mode & 0o077:
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
         raise PermissionError(
-            "service PostgreSQL output root must be private and service-owned"
+            "service PostgreSQL output root must be a real directory"
         )
     return root
 
@@ -209,6 +306,10 @@ class LocalBrokerHostMutations:
         docker_timeout_seconds: float = 45.0,
         docker_runner: Callable[
             [tuple[str, ...], float], subprocess.CompletedProcess[str]
+        ]
+        | None = None,
+        docker_log_runner: Callable[
+            [tuple[str, ...], float, int], tuple[bytes, int]
         ]
         | None = None,
         compose_runner: Callable[
@@ -233,6 +334,7 @@ class LocalBrokerHostMutations:
         self._docker_executable = docker_executable
         self._docker_timeout_seconds = float(docker_timeout_seconds)
         self._docker_runner = docker_runner or self._run_docker
+        self._docker_log_runner = docker_log_runner or self._run_bounded_docker_logs
         self._compose_runner = compose_runner or self._run_compose
         self._compose_model_renderer = compose_model_renderer
         self._port_probe = port_probe or _port_available
@@ -269,7 +371,7 @@ class LocalBrokerHostMutations:
         if not isinstance(evidence, Mapping):
             raise BrokerBackendError(
                 "listener_identity_unobservable",
-                "Host listener verifier returned invalid ownership evidence.",
+                "Host listener verifier returned invalid repository evidence.",
             )
         normalized = dict(evidence)
         if (
@@ -293,6 +395,207 @@ class LocalBrokerHostMutations:
 
     def docker_restart(self, target: DockerMutationTarget) -> Mapping[str, Any]:
         return self._docker(target, "restart")
+
+    def docker_capture_logs(
+        self, target: RuntimeDockerMutationTarget
+    ) -> tuple[bytes, int]:
+        """Capture one bounded tail using only an immutable full container ID."""
+
+        full_id = str(target.full_container_id).lower()
+        if re.fullmatch(r"[0-9a-f]{64}", full_id) is None:
+            raise BrokerBackendError(
+                "runtime_log_identity_invalid",
+                "Runtime log capture requires one immutable full container ID.",
+            )
+        executable = self._docker_executable or _resolve_docker_executable()
+        command = (
+            executable,
+            "logs",
+            "--tail",
+            str(RUNTIME_LOG_MAX_LINES),
+            "--timestamps",
+            full_id,
+        )
+        try:
+            return self._docker_log_runner(
+                command,
+                self._docker_timeout_seconds,
+                RUNTIME_LOG_MAX_BYTES + 64 * 1024,
+            )
+        except BrokerBackendError:
+            raise
+        except OSError as error:
+            raise BrokerBackendError(
+                "runtime_docker_log_capture_failed",
+                "Docker log capture could not start for the exact container.",
+            ) from error
+
+    def service_capture_logs(
+        self, target: RuntimeServiceLogTarget
+    ) -> tuple[bytes, int, str]:
+        """Read one bounded log from the exact enrolled service definition."""
+
+        if (
+            not target.server_definition_id
+            or not target.repo_id
+            or not target.definition_fingerprint.startswith("sha256:")
+        ):
+            raise BrokerBackendError(
+                "runtime_log_identity_invalid",
+                "Service log capture requires one exact enrolled definition.",
+            )
+        return self._read_bounded_service_log(
+            target.log_path,
+            maximum_buffer=RUNTIME_LOG_MAX_BYTES + 64 * 1024,
+        )
+
+    @staticmethod
+    def _read_bounded_service_log(
+        raw_path: str, *, maximum_buffer: int
+    ) -> tuple[bytes, int, str]:
+        path = Path(raw_path)
+        if (
+            not path.is_absolute()
+            or path == Path("/")
+            or any(part in {"", ".", ".."} for part in path.parts[1:])
+            or not hasattr(os, "O_NOFOLLOW")
+        ):
+            raise BrokerBackendError(
+                "service_log_unavailable",
+                "The exact service log path is unavailable or unsafe.",
+            )
+        directory_flags = os.O_RDONLY | os.O_NOFOLLOW
+        if hasattr(os, "O_DIRECTORY"):
+            directory_flags |= os.O_DIRECTORY
+        directory_fd = os.open("/", directory_flags)
+        descriptor = -1
+        try:
+            for component in path.parts[1:-1]:
+                next_fd = os.open(component, directory_flags, dir_fd=directory_fd)
+                os.close(directory_fd)
+                directory_fd = next_fd
+            file_flags = os.O_RDONLY | os.O_NOFOLLOW
+            if hasattr(os, "O_NONBLOCK"):
+                file_flags |= os.O_NONBLOCK
+            descriptor = os.open(path.name, file_flags, dir_fd=directory_fd)
+            before = os.fstat(descriptor)
+            if not stat.S_ISREG(before.st_mode):
+                raise BrokerBackendError(
+                    "service_log_unavailable",
+                    "The exact service log is not a regular file.",
+                )
+            amount = min(int(before.st_size), maximum_buffer)
+            offset = int(before.st_size) - amount
+            chunks: list[bytes] = []
+            remaining = amount
+            while remaining:
+                chunk = os.pread(descriptor, min(64 * 1024, remaining), offset)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                offset += len(chunk)
+                remaining -= len(chunk)
+            payload = b"".join(chunks)
+            after = os.fstat(descriptor)
+            if (
+                len(payload) != amount
+                or not stat.S_ISREG(after.st_mode)
+                or (after.st_dev, after.st_ino) != (before.st_dev, before.st_ino)
+                or after.st_size < before.st_size
+            ):
+                raise BrokerBackendError(
+                    "service_log_changed",
+                    "The exact service log was replaced or truncated during capture.",
+                )
+            identity = "sha256:" + hashlib.sha256(
+                (
+                    f"{before.st_dev}:{before.st_ino}:"
+                    f"{before.st_size}:{before.st_mtime_ns}"
+                ).encode("ascii")
+            ).hexdigest()
+            return payload, int(before.st_size) - amount, identity
+        except BrokerBackendError:
+            raise
+        except OSError as error:
+            raise BrokerBackendError(
+                "service_log_unavailable",
+                "The exact service log could not be opened safely.",
+            ) from error
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+            os.close(directory_fd)
+
+    @staticmethod
+    def _run_bounded_docker_logs(
+        command: tuple[str, ...], timeout: float, maximum_buffer: int
+    ) -> tuple[bytes, int]:
+        tail = bytearray()
+        discarded = 0
+        reader_error: list[BaseException] = []
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+
+        def drain() -> None:
+            nonlocal discarded
+            try:
+                assert process.stdout is not None
+                while True:
+                    chunk = process.stdout.read(64 * 1024)
+                    if not chunk:
+                        break
+                    tail.extend(chunk)
+                    overflow = len(tail) - maximum_buffer
+                    if overflow > 0:
+                        del tail[:overflow]
+                        discarded += overflow
+            except BaseException as error:  # pragma: no cover - pipe boundary
+                reader_error.append(error)
+
+        reader = threading.Thread(
+            target=drain,
+            name="broker-docker-log-reader",
+            daemon=True,
+        )
+        reader.start()
+        timed_out = False
+        try:
+            returncode = process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGKILL)
+            returncode = process.wait(timeout=5)
+        finally:
+            reader.join(timeout=5)
+            if process.stdout is not None:
+                process.stdout.close()
+        if reader.is_alive() or reader_error:
+            raise BrokerBackendError(
+                "runtime_docker_log_capture_failed",
+                "Docker log capture did not reach a bounded terminal state.",
+            )
+        if timed_out:
+            raise BrokerBackendError(
+                "runtime_log_capture_timeout",
+                "Docker log capture exceeded its bounded timeout.",
+            )
+        if returncode != 0:
+            _LOGGER.warning(
+                "exact Docker log capture failed returncode=%s target=%s",
+                returncode,
+                command[-1],
+            )
+            raise BrokerBackendError(
+                "runtime_docker_log_capture_failed",
+                "Docker could not capture logs for the exact container.",
+            )
+        return bytes(tail), discarded
 
     def docker_inspect_ephemeral_image(
         self, target: EphemeralImageTarget
@@ -363,11 +666,22 @@ class LocalBrokerHostMutations:
             "--restart",
             "no",
             "--network",
-            "bridge",
+            (
+                "bridge"
+                if target.network_container_id is None
+                else "container:" + target.network_container_id
+            ),
             "--memory",
             str(target.memory_bytes),
             "--cpus",
             normalized["cpu_limit"],
+            "--pids-limit",
+            str(_PROJECT_CONTAINER_PIDS_LIMIT),
+            "--cgroup-parent",
+            _project_slice(
+                owner_uid=target.owner_uid,
+                repository_id=target.identity.repository_id,
+            ),
         ]
         for name, value in normalized["labels"]:
             command.extend(("--label", f"{name}={value}"))
@@ -402,6 +716,7 @@ class LocalBrokerHostMutations:
             full_container_id=full_id,
             secret_mount=target.secret_mount,
             image_ref=target.image_ref,
+            network_container_id=target.network_container_id,
         )
         observed = self.docker_inspect_ephemeral(container_target)
         if observed["running"] is not False or observed["status"] != "created":
@@ -466,6 +781,11 @@ class LocalBrokerHostMutations:
             evidence,
             secret_mount=target.secret_mount,
             image_volume_destinations=image_volume_destinations,
+            expected_network_mode=(
+                "bridge"
+                if target.network_container_id is None
+                else "container:" + target.network_container_id
+            ),
         )
         return _ephemeral_public_observation(evidence)
 
@@ -556,6 +876,52 @@ class LocalBrokerHostMutations:
             "devices": evidence["devices"],
             "network_mode": evidence["network_mode"],
             "pid_mode": evidence["pid_mode"],
+            "state_pid": evidence["state_pid"],
+            "networks": evidence["networks"],
+        }
+
+    def docker_test_fixture_namespace(
+        self, target: EphemeralDockerContainerTarget
+    ) -> Mapping[str, Any]:
+        """Return race-checked namespace evidence for one exact running fixture."""
+
+        evidence = self._docker_inspect_ephemeral_identity(target)
+        pid = evidence["state_pid"]
+        if evidence["running"] is not True or type(pid) is not int or pid <= 1:
+            raise BrokerBackendError(
+                "test_fixture_namespace_unavailable",
+                "The exact test fixture has no running network namespace.",
+            )
+        identity_before = _process_identity(pid)
+        namespace_path = Path(f"/proc/{pid}/ns/net")
+        try:
+            namespace_before = namespace_path.stat()
+        except OSError as error:
+            raise BrokerBackendError(
+                "test_fixture_namespace_unavailable",
+                "The exact test fixture network namespace is unavailable.",
+            ) from error
+        confirmed = self._docker_inspect_ephemeral_identity(target)
+        identity_after = _process_identity(pid)
+        namespace_after = namespace_path.stat()
+        if (
+            confirmed["running"] is not True
+            or confirmed["state_pid"] != pid
+            or identity_before != identity_after
+            or (namespace_before.st_dev, namespace_before.st_ino)
+            != (namespace_after.st_dev, namespace_after.st_ino)
+        ):
+            raise BrokerBackendError(
+                "test_fixture_namespace_changed",
+                "The exact test fixture network namespace changed during proof.",
+            )
+        return {
+            "full_container_id": target.full_container_id,
+            "pid": pid,
+            "process_identity": identity_after,
+            "namespace_path": str(namespace_path),
+            "namespace_device": namespace_after.st_dev,
+            "namespace_inode": namespace_after.st_ino,
         }
 
     def docker_start_ephemeral(
@@ -669,6 +1035,608 @@ class LocalBrokerHostMutations:
 
     def compose_down(self, target: ComposeMutationTarget) -> Mapping[str, Any]:
         return self._compose(target, "down")
+
+    def compose_run_once_bind_image(
+        self, target: ComposeRunOnceMutationTarget
+    ) -> Mapping[str, Any]:
+        _require_compose_run_once_target(target)
+        self._require_current_compose_model(target.compose)
+        image_id = self._inspect_compose_run_once_image(target.service_image_ref)
+        return {
+            "image_ref": target.service_image_ref,
+            "image_id": image_id,
+        }
+
+    def compose_run_once_find_container(
+        self, target: ComposeRunOnceMutationTarget
+    ) -> Mapping[str, Any] | None:
+        _require_compose_run_once_target(target)
+        executable = self._docker_executable or _resolve_docker_executable()
+        command = (
+            executable,
+            "container",
+            "ls",
+            "--all",
+            "--no-trunc",
+            "--filter",
+            f"name=^/{target.container_name}$",
+            "--format",
+            "{{.ID}}",
+        )
+        completed = self._run_compose_run_once_docker(
+            command,
+            phase="container_lookup",
+            timeout_seconds=self._docker_timeout_seconds,
+        )
+        identifiers = tuple(
+            line.strip()
+            for line in str(completed.stdout or "").splitlines()
+            if line.strip()
+        )
+        if not identifiers:
+            return None
+        if (
+            len(identifiers) != 1
+            or re.fullmatch(r"[0-9a-fA-F]{64}", identifiers[0]) is None
+        ):
+            raise BrokerBackendError(
+                "compose_run_once_container_ambiguous",
+                "Compose run-once container name does not resolve to one immutable identity.",
+            )
+        return self.compose_run_once_inspect_container(
+            target,
+            full_container_id=identifiers[0].lower(),
+        )
+
+    def compose_run_once_create_container(
+        self, target: ComposeRunOnceMutationTarget
+    ) -> Mapping[str, Any]:
+        _require_compose_run_once_target(
+            target,
+            require_image_id=True,
+        )
+        existing = self.compose_run_once_find_container(target)
+        if existing is not None:
+            return existing
+        executable = self._docker_executable or _resolve_docker_executable()
+        try:
+            with _validated_compose_target(target.compose) as (
+                compose_payloads,
+                env_payloads,
+                pinned_cwd,
+            ):
+                self._require_current_compose_model(
+                    target.compose,
+                    material=(compose_payloads, env_payloads, pinned_cwd),
+                )
+                current_image_id = self._inspect_compose_run_once_image(
+                    target.service_image_ref
+                )
+                if current_image_id != target.expected_image_id:
+                    raise BrokerBackendError(
+                        "compose_run_once_image_binding_stale",
+                        "Compose run-once image reference changed after immutable binding.",
+                    )
+                with _sealed_compose_input_snapshots(
+                    compose_payloads=(
+                        *compose_payloads,
+                        _compose_isolation_override(
+                            target.compose,
+                            services=(target.service_name,),
+                            immutable_images={
+                                target.service_name: target.expected_image_id
+                            },
+                        ),
+                    ),
+                    env_payloads=env_payloads,
+                    action="run_once_create",
+                ) as (snapshot_compose_files, snapshot_env_files):
+                    command: list[str] = [
+                        executable,
+                        "compose",
+                        "--project-directory",
+                        ".",
+                        "--project-name",
+                        target.compose.project_name,
+                    ]
+                    for env_file in snapshot_env_files:
+                        command.extend(("--env-file", env_file))
+                    for profile in target.compose.profiles:
+                        command.extend(("--profile", profile))
+                    for file_path in snapshot_compose_files:
+                        command.extend(("--file", file_path))
+                    command.extend(
+                        (
+                            "run",
+                            "--no-deps",
+                            "--no-TTY",
+                            "--no-start",
+                            "--name",
+                            target.container_name,
+                        )
+                    )
+                    for name, value in _compose_run_once_labels(target):
+                        command.extend(("--label", f"{name}={value}"))
+                    command.append(target.service_name)
+                    try:
+                        completed = self._compose_runner(
+                            tuple(command),
+                            pinned_cwd,
+                            self._docker_timeout_seconds,
+                            _bounded_compose_environment(executable),
+                        )
+                        if not isinstance(completed, subprocess.CompletedProcess):
+                            raise TypeError(
+                                "Compose runner returned an invalid result"
+                            )
+                        _require_bounded_ephemeral_output(completed.stdout)
+                        _require_bounded_ephemeral_output(completed.stderr)
+                    except Exception as exc:
+                        raise BrokerBackendError(
+                            "compose_run_once_create_unresolved",
+                            "Compose one-shot container creation did not prove an exact outcome.",
+                        ) from exc
+                    if completed.returncode != 0:
+                        raise BrokerBackendError(
+                            "compose_run_once_create_unresolved",
+                            "Compose one-shot container creation did not prove an exact outcome.",
+                        )
+        except ComposeMutationOutcomeUncertain as exc:
+            raise BrokerBackendError(
+                "compose_run_once_create_unresolved",
+                "Compose one-shot input cleanup left container creation unresolved.",
+            ) from exc
+        created = self.compose_run_once_find_container(target)
+        if created is None:
+            raise BrokerBackendError(
+                "compose_run_once_create_unresolved",
+                "Compose reported success without one exact one-shot container.",
+            )
+        return created
+
+    def compose_run_once_inspect_container(
+        self,
+        target: ComposeRunOnceMutationTarget,
+        *,
+        full_container_id: str | None = None,
+    ) -> Mapping[str, Any]:
+        _require_compose_run_once_target(target)
+        container_id = (
+            target.full_container_id
+            if full_container_id is None
+            else str(full_container_id).lower()
+        )
+        if container_id is None or re.fullmatch(
+            r"[0-9a-f]{64}", container_id
+        ) is None:
+            raise ValueError("Compose run-once immutable container ID is invalid")
+        executable = self._docker_executable or _resolve_docker_executable()
+        template = "\n".join(
+            (
+                "{{.Id}}",
+                "{{.Name}}",
+                "{{.Image}}",
+                "{{.State.Status}}",
+                "{{.State.ExitCode}}",
+                "{{.HostConfig.CgroupParent}}",
+                "{{.HostConfig.Memory}}",
+                "{{.HostConfig.NanoCpus}}",
+                "{{.HostConfig.PidsLimit}}",
+                "{{.HostConfig.RestartPolicy.Name}}",
+                "{{.Config.OpenStdin}}",
+                "{{.Config.Tty}}",
+                *(
+                    '{{index .Config.Labels "' + label + '"}}'
+                    for label in _COMPOSE_RUN_ONCE_LABELS
+                ),
+            )
+        )
+        completed = self._run_compose_run_once_docker(
+            (
+                executable,
+                "container",
+                "inspect",
+                "--format",
+                template,
+                container_id,
+            ),
+            phase="container_inspect",
+            timeout_seconds=self._docker_timeout_seconds,
+        )
+        output = str(completed.stdout or "")
+        if len(output.encode("utf-8")) > 16 * 1024:
+            raise BrokerBackendError(
+                "compose_run_once_container_unobservable",
+                "Compose run-once container inspection was oversized.",
+            )
+        lines = output.rstrip("\n").split("\n")
+        if len(lines) != 12 + len(_COMPOSE_RUN_ONCE_LABELS):
+            raise BrokerBackendError(
+                "compose_run_once_container_unobservable",
+                "Compose run-once container inspection was incomplete.",
+            )
+        (
+            observed_id,
+            name,
+            image_id,
+            status,
+            raw_exit_code,
+            cgroup_parent,
+            raw_memory,
+            raw_nano_cpus,
+            raw_pids_limit,
+            restart_policy,
+            raw_open_stdin,
+            raw_tty,
+            *raw_labels,
+        ) = lines
+        expected_labels = dict(_compose_run_once_labels(target))
+        observed_labels = dict(zip(_COMPOSE_RUN_ONCE_LABELS, raw_labels))
+        try:
+            exit_code = int(raw_exit_code)
+            memory_bytes = int(raw_memory)
+            nano_cpus = int(raw_nano_cpus)
+            pids_limit = int(raw_pids_limit)
+        except ValueError as exc:
+            raise BrokerBackendError(
+                "compose_run_once_container_unobservable",
+                "Compose run-once exit state is invalid.",
+            ) from exc
+        if (
+            observed_id.lower() != container_id
+            or name != "/" + target.container_name
+            or re.fullmatch(r"sha256:[0-9a-f]{64}", image_id) is None
+            or status
+            not in {
+                "created",
+                "running",
+                "paused",
+                "restarting",
+                "removing",
+                "exited",
+                "dead",
+            }
+            or observed_labels != expected_labels
+            or cgroup_parent
+            != _project_slice(
+                owner_uid=target.compose.owner_uid,
+                repository_id=target.compose.repo_id,
+            )
+            or memory_bytes != 20 * 1024 * 1024 * 1024
+            or nano_cpus != 8_000_000_000
+            or pids_limit != _PROJECT_CONTAINER_PIDS_LIMIT
+            or restart_policy != "no"
+            or raw_open_stdin != "false"
+            or raw_tty != "false"
+            or (
+                target.expected_image_id is not None
+                and image_id != target.expected_image_id
+            )
+        ):
+            raise BrokerBackendError(
+                "compose_run_once_container_identity_mismatch",
+                "Compose run-once container does not match its sealed identity.",
+            )
+        return {
+            "full_container_id": container_id,
+            "image_id": image_id,
+            "status": status,
+            "exit_code": exit_code,
+        }
+
+    def compose_run_once_start_container(
+        self, target: ComposeRunOnceMutationTarget
+    ) -> Mapping[str, Any]:
+        _require_compose_run_once_target(
+            target,
+            require_image_id=True,
+            require_container_id=True,
+        )
+        before = self.compose_run_once_inspect_container(target)
+        if before["status"] == "created":
+            executable = self._docker_executable or _resolve_docker_executable()
+            self._run_compose_run_once_docker(
+                (executable, "start", str(target.full_container_id)),
+                phase="container_start",
+                timeout_seconds=self._docker_timeout_seconds,
+                outcome_may_have_changed=True,
+            )
+            return self.compose_run_once_inspect_container(target)
+        if before["status"] in {"running", "exited", "dead"}:
+            return before
+        raise BrokerBackendError(
+            "compose_run_once_start_unresolved",
+            "Compose run-once container is in an unsafe start state.",
+        )
+
+    def compose_run_once_wait_container(
+        self,
+        target: ComposeRunOnceMutationTarget,
+        *,
+        timeout_seconds: float,
+    ) -> Mapping[str, Any]:
+        _require_compose_run_once_target(
+            target,
+            require_image_id=True,
+            require_container_id=True,
+        )
+        if (
+            isinstance(timeout_seconds, bool)
+            or not isinstance(timeout_seconds, (int, float))
+            or not 0 < float(timeout_seconds) <= target.timeout_seconds
+        ):
+            raise ValueError("Compose run-once wait timeout is invalid")
+        before = self.compose_run_once_inspect_container(target)
+        if before["status"] in {"exited", "dead"}:
+            return {"timed_out": False, **dict(before)}
+        if before["status"] != "running":
+            raise BrokerBackendError(
+                "compose_run_once_wait_unresolved",
+                "Compose run-once container is not in a waitable state.",
+            )
+        executable = self._docker_executable or _resolve_docker_executable()
+        try:
+            completed = self._docker_runner(
+                (executable, "wait", str(target.full_container_id)),
+                float(timeout_seconds),
+            )
+        except subprocess.TimeoutExpired:
+            current = self.compose_run_once_inspect_container(target)
+            return {"timed_out": True, **dict(current)}
+        except Exception as exc:
+            current = self.compose_run_once_inspect_container(target)
+            if current["status"] in {"exited", "dead"}:
+                return {"timed_out": False, **dict(current)}
+            raise BrokerBackendError(
+                "compose_run_once_wait_unresolved",
+                "Compose run-once wait did not prove a terminal state.",
+            ) from exc
+        if completed.returncode != 0:
+            current = self.compose_run_once_inspect_container(target)
+            if current["status"] in {"exited", "dead"}:
+                return {"timed_out": False, **dict(current)}
+            raise BrokerBackendError(
+                "compose_run_once_wait_unresolved",
+                "Compose run-once wait did not prove a terminal state.",
+            )
+        current = self.compose_run_once_inspect_container(target)
+        if current["status"] not in {"exited", "dead"}:
+            raise BrokerBackendError(
+                "compose_run_once_wait_unresolved",
+                "Docker wait returned before the exact container became terminal.",
+            )
+        return {"timed_out": False, **dict(current)}
+
+    def compose_run_once_stop_container(
+        self, target: ComposeRunOnceMutationTarget
+    ) -> Mapping[str, Any]:
+        _require_compose_run_once_target(
+            target,
+            require_image_id=True,
+            require_container_id=True,
+        )
+        before = self.compose_run_once_inspect_container(target)
+        if before["status"] in {"exited", "dead"}:
+            return before
+        if before["status"] not in {"running", "paused", "restarting"}:
+            raise BrokerBackendError(
+                "compose_run_once_stop_unresolved",
+                "Compose run-once container is not in a stoppable state.",
+            )
+        executable = self._docker_executable or _resolve_docker_executable()
+        try:
+            self._run_compose_run_once_docker(
+                (
+                    executable,
+                    "stop",
+                    "--time",
+                    "10",
+                    str(target.full_container_id),
+                ),
+                phase="container_stop",
+                timeout_seconds=min(self._docker_timeout_seconds, 30.0),
+                outcome_may_have_changed=True,
+            )
+        except BrokerBackendError:
+            current = self.compose_run_once_inspect_container(target)
+            if current["status"] in {"exited", "dead"}:
+                return current
+            raise
+        current = self.compose_run_once_inspect_container(target)
+        if current["status"] not in {"exited", "dead"}:
+            raise BrokerBackendError(
+                "compose_run_once_stop_unresolved",
+                "Compose run-once stop did not prove a terminal state.",
+            )
+        return current
+
+    def compose_run_once_capture_evidence(
+        self, target: ComposeRunOnceMutationTarget
+    ) -> ComposeRunOnceOutputEvidence:
+        _require_compose_run_once_target(
+            target,
+            require_image_id=True,
+            require_container_id=True,
+        )
+        current = self.compose_run_once_inspect_container(target)
+        if current["status"] not in {"exited", "dead"}:
+            raise BrokerBackendError(
+                "compose_run_once_evidence_unavailable",
+                "Compose run-once evidence requires a terminal exact container.",
+            )
+        executable = self._docker_executable or _resolve_docker_executable()
+        return _capture_compose_run_once_logs(
+            (
+                executable,
+                "logs",
+                str(target.full_container_id),
+            ),
+            timeout_seconds=min(self._docker_timeout_seconds, 60.0),
+            contract=target.receipt_contract,
+            environment=_bounded_compose_environment(executable),
+        )
+
+    def compose_run_once_remove_container(
+        self, target: ComposeRunOnceMutationTarget
+    ) -> Mapping[str, Any]:
+        _require_compose_run_once_target(
+            target,
+            require_image_id=True,
+            require_container_id=True,
+        )
+        existing = self.compose_run_once_find_container(target)
+        if existing is None:
+            # Cleanup intent is already durable. Absence is the desired
+            # terminal outcome and must be replayable after a broker crash
+            # between Docker removal and the cleaned phase commit.
+            return {
+                "removed": True,
+                "full_container_id": target.full_container_id,
+            }
+        if existing.get("full_container_id") != target.full_container_id:
+            raise BrokerBackendError(
+                "compose_run_once_remove_unresolved",
+                "Compose run-once cleanup found a different container identity.",
+            )
+        executable = self._docker_executable or _resolve_docker_executable()
+        try:
+            self._run_compose_run_once_docker(
+                (
+                    executable,
+                    "container",
+                    "rm",
+                    "--volumes",
+                    str(target.full_container_id),
+                ),
+                phase="container_remove",
+                timeout_seconds=self._docker_timeout_seconds,
+                outcome_may_have_changed=True,
+            )
+        except BrokerBackendError:
+            if self.compose_run_once_find_container(target) is None:
+                return {
+                    "removed": True,
+                    "full_container_id": target.full_container_id,
+                }
+            raise
+        if self.compose_run_once_find_container(target) is not None:
+            raise BrokerBackendError(
+                "compose_run_once_remove_unresolved",
+                "Compose run-once cleanup did not prove container removal.",
+            )
+        return {
+            "removed": True,
+            "full_container_id": target.full_container_id,
+        }
+
+    def _require_current_compose_model(
+        self,
+        target: ComposeMutationTarget,
+        *,
+        material: tuple[tuple[bytes, ...], tuple[bytes, ...], str] | None = None,
+    ) -> None:
+        executable = self._docker_executable or _resolve_docker_executable()
+        if material is None:
+            with _validated_compose_target(target) as current_material:
+                self._require_current_compose_model(
+                    target,
+                    material=current_material,
+                )
+            return
+        compose_payloads, env_payloads, pinned_cwd = material
+        renderer = self._compose_model_renderer
+        renderer_arguments: dict[str, Any] = {
+            "compose_payloads": compose_payloads,
+            "env_payloads": env_payloads,
+            "profiles": target.profiles,
+            "declared_services": target.model_services,
+            "project_name": target.project_name,
+            "pinned_cwd": pinned_cwd,
+            "docker_executable": executable,
+        }
+        if renderer is None:
+            renderer = render_compose_effective_model
+            renderer_arguments["runner"] = self._compose_runner
+        rendered = renderer(**renderer_arguments)
+        evidence = require_effective_compose_model(
+            rendered,
+            declared_services=target.model_services,
+            declared_profiles=target.profiles,
+            project_name=target.project_name,
+            host_access_approved=target.effective_host_access_approved,
+        )
+        if (
+            evidence.model_sha256 != target.effective_model_sha256
+            or evidence.host_access_risks != target.effective_host_access_risks
+            or evidence.service_replicas != target.model_service_replicas
+            or evidence.service_images != target.model_service_images
+        ):
+            raise BrokerBackendError(
+                "compose_effective_model_drift",
+                "Docker Compose now renders a different effective model; rerun Coordinator skill installation.",
+            )
+
+    def _inspect_compose_run_once_image(self, image_ref: str) -> str:
+        executable = self._docker_executable or _resolve_docker_executable()
+        completed = self._run_compose_run_once_docker(
+            (
+                executable,
+                "image",
+                "inspect",
+                "--format",
+                "{{.Id}}",
+                image_ref,
+            ),
+            phase="image_inspect",
+            timeout_seconds=self._docker_timeout_seconds,
+        )
+        image_id = str(completed.stdout or "").strip()
+        if re.fullmatch(r"sha256:[0-9a-f]{64}", image_id) is None:
+            raise BrokerBackendError(
+                "compose_run_once_image_unobservable",
+                "Compose run-once image reference did not resolve to one immutable image ID.",
+            )
+        return image_id
+
+    def _run_compose_run_once_docker(
+        self,
+        command: tuple[str, ...],
+        *,
+        phase: str,
+        timeout_seconds: float,
+        outcome_may_have_changed: bool = False,
+    ) -> subprocess.CompletedProcess[str]:
+        try:
+            completed = self._docker_runner(command, timeout_seconds)
+        except Exception as exc:
+            suffix = "unresolved" if outcome_may_have_changed else "unavailable"
+            raise BrokerBackendError(
+                f"compose_run_once_{phase}_{suffix}",
+                "Compose run-once Docker operation did not prove its exact outcome.",
+            ) from exc
+        try:
+            if not isinstance(completed, subprocess.CompletedProcess):
+                raise TypeError("Docker runner returned an invalid result")
+            stdout = _require_bounded_ephemeral_output(completed.stdout)
+            stderr = _require_bounded_ephemeral_output(completed.stderr)
+        except (TypeError, ValueError) as exc:
+            suffix = "unresolved" if outcome_may_have_changed else "unavailable"
+            raise BrokerBackendError(
+                f"compose_run_once_{phase}_{suffix}",
+                "Compose run-once Docker operation returned invalid bounded evidence.",
+            ) from exc
+        if completed.returncode != 0:
+            suffix = "unresolved" if outcome_may_have_changed else "unavailable"
+            raise BrokerBackendError(
+                f"compose_run_once_{phase}_{suffix}",
+                "Compose run-once Docker operation did not prove its exact outcome.",
+            )
+        return subprocess.CompletedProcess(
+            completed.args,
+            completed.returncode,
+            stdout,
+            stderr,
+        )
 
     def postgres_backup(
         self, target: DatabaseMutationTarget, *, output_root: str
@@ -793,6 +1761,38 @@ class LocalBrokerHostMutations:
                 "broker Docker target must carry a full immutable container ID"
             )
         executable = self._docker_executable or _resolve_docker_executable()
+        cgroup_parent: str | None = None
+        if action in {"start", "restart"}:
+            cgroup_parent = _project_slice(
+                owner_uid=target.owner_uid,
+                repository_id=target.repo_id,
+            )
+            inspect_command = (
+                executable,
+                "inspect",
+                "--format",
+                "{{json .HostConfig.CgroupParent}}",
+                full_id,
+            )
+            try:
+                inspected = self._docker_runner(
+                    inspect_command, self._docker_timeout_seconds
+                )
+                observed_parent = json.loads(str(inspected.stdout or "").strip())
+            except Exception as exc:
+                raise BrokerBackendError(
+                    "project_isolation_unobservable",
+                    "Docker cgroup attribution could not be proved before start.",
+                ) from exc
+            if (
+                inspected.returncode != 0
+                or not isinstance(observed_parent, str)
+                or observed_parent != cgroup_parent
+            ):
+                raise BrokerBackendError(
+                    "project_isolation_mismatch",
+                    "Docker start was refused because the container is outside its repository cgroup.",
+                )
         command = (executable, action, full_id)
         try:
             completed = self._docker_runner(command, self._docker_timeout_seconds)
@@ -817,6 +1817,7 @@ class LocalBrokerHostMutations:
             "observation_revision": target.observation_revision,
             "control_generation": target.control_generation,
             "stdout": _bounded_output(completed.stdout),
+            "cgroup_parent": cgroup_parent,
         }
 
     def _compose(self, target: ComposeMutationTarget, action: str) -> Mapping[str, Any]:
@@ -834,7 +1835,7 @@ class LocalBrokerHostMutations:
                     "compose_payloads": compose_payloads,
                     "env_payloads": env_payloads,
                     "profiles": target.profiles,
-                    "declared_services": target.services,
+                    "declared_services": target.model_services,
                     "project_name": target.project_name,
                     "pinned_cwd": pinned_cwd,
                     "docker_executable": executable,
@@ -845,7 +1846,7 @@ class LocalBrokerHostMutations:
                 rendered = renderer(**renderer_arguments)
                 runtime_evidence = require_effective_compose_model(
                     rendered,
-                    declared_services=target.services,
+                    declared_services=target.model_services,
                     declared_profiles=target.profiles,
                     project_name=target.project_name,
                     host_access_approved=target.effective_host_access_approved,
@@ -854,7 +1855,10 @@ class LocalBrokerHostMutations:
                     runtime_evidence.model_sha256 != target.effective_model_sha256
                     or runtime_evidence.host_access_risks
                     != target.effective_host_access_risks
-                    or runtime_evidence.service_replicas != target.service_replicas
+                    or runtime_evidence.service_replicas
+                    != target.model_service_replicas
+                    or runtime_evidence.service_images
+                    != target.model_service_images
                 ):
                     raise BrokerBackendError(
                         "compose_effective_model_drift",
@@ -870,7 +1874,10 @@ class LocalBrokerHostMutations:
                 ]
                 environment = _bounded_compose_environment(executable)
                 with _sealed_compose_input_snapshots(
-                    compose_payloads=compose_payloads,
+                    compose_payloads=(
+                        *compose_payloads,
+                        _compose_isolation_override(target),
+                    ),
                     env_payloads=env_payloads,
                     action=action,
                 ) as (snapshot_compose_files, snapshot_env_files):
@@ -896,6 +1903,12 @@ class LocalBrokerHostMutations:
                             )
                         phase_command = [*command, phase]
                         if phase == "up":
+                            # Enrollment may retain ``build:`` as non-executed
+                            # model metadata, but lifecycle control consumes
+                            # only pre-existing images.  Both direct up and
+                            # restart's start phase must therefore suppress
+                            # Compose's implicit build path.
+                            phase_command.append("--no-build")
                             # The persisted service allowlist is the complete
                             # authorized scope.  Compose otherwise expands a
                             # requested service through ``depends_on`` and
@@ -1189,6 +2202,8 @@ _EPHEMERAL_INSPECT_FIELDS = (
     "devices",
     "network_mode",
     "pid_mode",
+    "state_pid",
+    "networks",
 )
 _EPHEMERAL_INSPECT_FORMAT = "\t".join(
     (
@@ -1207,6 +2222,8 @@ _EPHEMERAL_INSPECT_FORMAT = "\t".join(
         "{{json .HostConfig.Devices}}",
         "{{json .HostConfig.NetworkMode}}",
         "{{json .HostConfig.PidMode}}",
+        "{{json .State.Pid}}",
+        "{{json .NetworkSettings.Networks}}",
     )
 )
 
@@ -1402,6 +2419,8 @@ def _validate_ephemeral_create_target(
 ) -> dict[str, Any]:
     if type(target) is not EphemeralDockerCreateTarget:
         raise TypeError("ephemeral Docker create target must be a sealed typed value")
+    if type(target.owner_uid) is not int or target.owner_uid <= 0:
+        raise ValueError("ephemeral Docker owner UID must be a non-root account")
     labels = _validate_ephemeral_identity(target.identity)
     expected_suffix = "-" + uuid.UUID(target.identity.run_id).hex
     if (
@@ -1461,6 +2480,12 @@ def _validate_ephemeral_create_target(
     for value in (target.host_tcp_port, target.container_tcp_port):
         if value is not None and (type(value) is not int or not 1 <= value <= 65535):
             raise ValueError("ephemeral Docker TCP mapping is invalid")
+    if target.network_container_id is not None:
+        if (
+            not _is_full_container_id(target.network_container_id)
+            or target.host_tcp_port is not None
+        ):
+            raise ValueError("ephemeral Docker shared network target is invalid")
     secret_mount = _validate_ephemeral_secret_mount(
         target.secret_mount, require_material=True
     )
@@ -1491,6 +2516,10 @@ def _validate_ephemeral_container_target(
         raise ValueError(
             "ephemeral Docker container target requires a lowercase immutable ID"
         )
+    if target.network_container_id is not None and not _is_full_container_id(
+        target.network_container_id
+    ):
+        raise ValueError("ephemeral Docker shared network identity is invalid")
     return full_id, labels
 
 
@@ -1524,17 +2553,12 @@ def _validate_ephemeral_secret_mount(
     if (
         stat.S_ISLNK(directory.st_mode)
         or not stat.S_ISDIR(directory.st_mode)
-        or directory.st_uid != os.geteuid()
-        or directory.st_mode & 0o077
         or stat.S_ISLNK(password.st_mode)
         or not stat.S_ISREG(password.st_mode)
-        or password.st_uid != os.geteuid()
-        or stat.S_IMODE(password.st_mode) != 0o400
-        or password.st_nlink != 1
     ):
         raise BrokerBackendError(
             "secret_delivery_unavailable",
-            "The broker-owned PostgreSQL credential file is unsafe.",
+            "The local PostgreSQL credential path has an invalid file type.",
         )
     return value
 
@@ -1581,6 +2605,9 @@ def _parse_ephemeral_inspection(value: Any) -> dict[str, Any]:
         or not isinstance(evidence["all_labels"], dict)
         or type(evidence["privileged"]) is not bool
         or not isinstance(evidence["network_mode"], str)
+        or type(evidence["state_pid"]) is not int
+        or evidence["state_pid"] < 0
+        or not isinstance(evidence["networks"], dict)
     ):
         raise BrokerBackendError(
             "ephemeral_docker_inspect_unobservable",
@@ -1594,6 +2621,7 @@ def _require_ephemeral_safe_profile(
     *,
     secret_mount: EphemeralSecretMount | None,
     image_volume_destinations: tuple[str, ...] = (),
+    expected_network_mode: str = "bridge",
 ) -> None:
     mounts_safe = _sealed_ephemeral_mounts_safe(
         evidence["mounts"],
@@ -1607,7 +2635,7 @@ def _require_ephemeral_safe_profile(
         or not mounts_safe
         or evidence["cap_add"] not in (None, [])
         or evidence["devices"] not in (None, [])
-        or evidence["network_mode"] != "bridge"
+        or evidence["network_mode"] != expected_network_mode
         or evidence["pid_mode"] not in ("", None)
     ):
         raise BrokerBackendError(
@@ -1846,6 +2874,211 @@ _COMPOSE_SERVICE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 _COMPOSE_PROFILE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 
 
+def _require_compose_run_once_target(
+    target: ComposeRunOnceMutationTarget,
+    *,
+    require_image_id: bool = False,
+    require_container_id: bool = False,
+) -> None:
+    if not isinstance(target, ComposeRunOnceMutationTarget):
+        raise TypeError("Compose run-once target must be a persisted typed target")
+    try:
+        canonical_operation_id = str(uuid.UUID(target.operation_id))
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise ValueError("Compose run-once operation ID is invalid") from exc
+    expected_name = "devcoordinator-once-" + canonical_operation_id.replace("-", "")
+    policy = next(
+        (
+            item
+            for item in target.compose.run_once_policies
+            if item.name == target.service_name
+        ),
+        None,
+    )
+    if (
+        policy is None
+        or policy.fingerprint != target.policy_fingerprint
+        or policy.receipt != target.receipt_contract
+        or target.timeout_seconds > policy.max_timeout_seconds
+        or target.container_name != expected_name
+        or dict(target.compose.model_service_images).get(target.service_name)
+        != target.service_image_ref
+        or not 1 <= target.timeout_seconds <= 3_600
+        or type(target.deadline_epoch) is not int
+        or target.deadline_epoch <= 0
+    ):
+        raise ValueError("Compose run-once target does not match its sealed policy")
+    if require_image_id and (
+        not isinstance(target.expected_image_id, str)
+        or re.fullmatch(r"sha256:[0-9a-f]{64}", target.expected_image_id) is None
+    ):
+        raise ValueError("Compose run-once target lacks an immutable image ID")
+    if require_container_id and (
+        not isinstance(target.full_container_id, str)
+        or re.fullmatch(r"[0-9a-f]{64}", target.full_container_id) is None
+    ):
+        raise ValueError("Compose run-once target lacks an immutable container ID")
+
+
+def _compose_run_once_labels(
+    target: ComposeRunOnceMutationTarget,
+) -> tuple[tuple[str, str], ...]:
+    _require_compose_run_once_target(target, require_image_id=True)
+    values = (
+        target.operation_id,
+        target.compose.repo_id,
+        target.compose.compose_definition_id,
+        target.service_name,
+        target.policy_fingerprint,
+        str(target.expected_image_id),
+    )
+    if any(
+        not value
+        or "\x00" in value
+        or "\n" in value
+        or len(value.encode("utf-8")) > 512
+        for value in values
+    ):
+        raise ValueError("Compose run-once label value is invalid")
+    return tuple(zip(_COMPOSE_RUN_ONCE_LABELS, values))
+
+
+@dataclass
+class _StreamDigest:
+    digest: Any
+    byte_size: int
+    capture: bytearray
+    capture_limit: int
+    error: BaseException | None = None
+
+
+def _capture_compose_run_once_logs(
+    command: tuple[str, ...],
+    *,
+    timeout_seconds: float,
+    contract: Any,
+    environment: Mapping[str, str],
+) -> ComposeRunOnceOutputEvidence:
+    """Hash complete streams while retaining only a bounded receipt candidate."""
+
+    if (
+        not command
+        or not 0 < timeout_seconds <= 60
+        or not isinstance(environment, Mapping)
+        or any(
+            not isinstance(name, str)
+            or not isinstance(value, str)
+            or "\x00" in name
+            or "\x00" in value
+            for name, value in environment.items()
+        )
+    ):
+        raise ValueError("Compose run-once log capture arguments are invalid")
+    stdout_state = _StreamDigest(
+        hashlib.sha256(),
+        0,
+        bytearray(),
+        MAX_COMPOSE_RUN_ONCE_RECEIPT_BYTES + 1,
+    )
+    stderr_state = _StreamDigest(hashlib.sha256(), 0, bytearray(), 0)
+    try:
+        process = subprocess.Popen(
+            list(command),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=False,
+            close_fds=True,
+            env=dict(environment),
+        )
+    except Exception as exc:
+        raise BrokerBackendError(
+            "compose_run_once_evidence_unavailable",
+            "Compose run-once logs could not be opened for bounded capture.",
+        ) from exc
+    if process.stdout is None or process.stderr is None:
+        process.kill()
+        process.wait()
+        raise BrokerBackendError(
+            "compose_run_once_evidence_unavailable",
+            "Compose run-once log pipes are unavailable.",
+        )
+
+    def drain(stream: Any, state: _StreamDigest) -> None:
+        try:
+            while True:
+                chunk = stream.read(64 * 1024)
+                if not chunk:
+                    return
+                if not isinstance(chunk, bytes):
+                    raise TypeError("log stream returned text")
+                state.digest.update(chunk)
+                state.byte_size += len(chunk)
+                remaining = state.capture_limit - len(state.capture)
+                if remaining > 0:
+                    state.capture.extend(chunk[:remaining])
+        except BaseException as exc:
+            state.error = exc
+        finally:
+            with contextlib.suppress(Exception):
+                stream.close()
+
+    stdout_thread = threading.Thread(
+        target=drain,
+        args=(process.stdout, stdout_state),
+        name="compose-run-once-stdout",
+        daemon=True,
+    )
+    stderr_thread = threading.Thread(
+        target=drain,
+        args=(process.stderr, stderr_state),
+        name="compose-run-once-stderr",
+        daemon=True,
+    )
+    stdout_thread.start()
+    stderr_thread.start()
+    try:
+        return_code = process.wait(timeout=timeout_seconds)
+    except subprocess.TimeoutExpired as exc:
+        process.kill()
+        with contextlib.suppress(Exception):
+            process.wait(timeout=5)
+        stdout_thread.join(timeout=5)
+        stderr_thread.join(timeout=5)
+        raise BrokerBackendError(
+            "compose_run_once_evidence_unavailable",
+            "Compose run-once log capture exceeded its bounded timeout.",
+        ) from exc
+    stdout_thread.join(timeout=5)
+    stderr_thread.join(timeout=5)
+    if (
+        stdout_thread.is_alive()
+        or stderr_thread.is_alive()
+        or stdout_state.error is not None
+        or stderr_state.error is not None
+        or return_code != 0
+    ):
+        raise BrokerBackendError(
+            "compose_run_once_evidence_unavailable",
+            "Compose run-once logs did not produce complete bounded evidence.",
+        )
+    truncated = (
+        stdout_state.byte_size > MAX_COMPOSE_RUN_ONCE_RECEIPT_BYTES
+    )
+    published = validate_published_receipt(
+        bytes(stdout_state.capture),
+        contract=contract,
+        truncated=truncated,
+    )
+    return ComposeRunOnceOutputEvidence(
+        published_receipt=published,
+        stdout_sha256="sha256:" + stdout_state.digest.hexdigest(),
+        stdout_byte_size=stdout_state.byte_size,
+        stderr_sha256="sha256:" + stderr_state.digest.hexdigest(),
+        stderr_byte_size=stderr_state.byte_size,
+    )
+
+
 @contextlib.contextmanager
 def _validated_compose_target(
     target: ComposeMutationTarget,
@@ -1870,6 +3103,29 @@ def _validated_compose_target(
         raise ValueError("Compose target project identity is invalid")
     if any(_COMPOSE_SERVICE_NAME.fullmatch(item) is None for item in target.services):
         raise ValueError("Compose target contains an invalid service identity")
+    expected_model_services = tuple(
+        sorted(
+            (
+                *target.services,
+                *(policy.name for policy in target.run_once_policies),
+            )
+        )
+    )
+    if (
+        target.model_services != expected_model_services
+        or any(
+            _COMPOSE_SERVICE_NAME.fullmatch(item) is None
+            for item in target.model_services
+        )
+        or tuple(name for name, _count in target.model_service_replicas)
+        != target.model_services
+        or not set(dict(target.model_service_images)) <= set(target.model_services)
+        or any(
+            policy.name not in dict(target.model_service_images)
+            for policy in target.run_once_policies
+        )
+    ):
+        raise ValueError("Compose target merged service evidence is invalid")
     if any(_COMPOSE_PROFILE_NAME.fullmatch(item) is None for item in target.profiles):
         raise ValueError("Compose target contains an invalid profile identity")
     if any(
@@ -1964,7 +3220,6 @@ def _validated_compose_target(
                 "compose_definition_drift",
                 "Compose working-directory identity changed after provisioning; rerun Coordinator skill installation.",
             )
-        root_owner_uid = int(os.fstat(root_descriptor).st_uid)
         actual_file_material = tuple(
             read_anchored_compose_file(
                 root_descriptor,
@@ -1986,8 +3241,6 @@ def _validated_compose_target(
                 root_descriptor,
                 parts,
                 maximum_bytes=1024 * 1024,
-                require_private=True,
-                allowed_owner_uids=frozenset({0, root_owner_uid}),
             )
             for parts in env_file_parts
         )
@@ -1998,27 +3251,32 @@ def _validated_compose_target(
                 "Compose environment files changed after service-owned provisioning; "
                 "rerun Coordinator skill installation.",
             )
-        encoded = json.dumps(
-            {
-                "repo_id": target.repo_id,
-                "canonical_root": canonical_root,
-                "root_identity": {
-                    "device": target.root_device,
-                    "inode": target.root_inode,
-                },
-                "cwd": target.cwd,
-                "cwd_identity": {
-                    "device": target.cwd_device,
-                    "inode": target.cwd_inode,
-                },
-                "files": list(canonical_files),
-                "file_evidence": list(expected_evidence),
-                "env_files": list(canonical_env_files),
-                "env_file_evidence": list(expected_env_evidence),
-                "profiles": list(target.profiles),
-                "services": list(target.services),
-                "project_name": target.project_name,
+        fingerprint_document: dict[str, Any] = {
+            "repo_id": target.repo_id,
+            "canonical_root": canonical_root,
+            "root_identity": {
+                "device": target.root_device,
+                "inode": target.root_inode,
             },
+            "cwd": target.cwd,
+            "cwd_identity": {
+                "device": target.cwd_device,
+                "inode": target.cwd_inode,
+            },
+            "files": list(canonical_files),
+            "file_evidence": list(expected_evidence),
+            "env_files": list(canonical_env_files),
+            "env_file_evidence": list(expected_env_evidence),
+            "profiles": list(target.profiles),
+            "services": list(target.services),
+            "project_name": target.project_name,
+        }
+        if target.run_once_policies:
+            fingerprint_document["run_once_services"] = (
+                compose_run_once_policies_document(target.run_once_policies)
+            )
+        encoded = json.dumps(
+            fingerprint_document,
             ensure_ascii=True,
             allow_nan=False,
             sort_keys=True,
@@ -2158,7 +3416,11 @@ def render_compose_effective_model(
             command.extend(("--profile", profile))
         for file_path in compose_files:
             command.extend(("--file", file_path))
-        command.extend(("config", "--format", "json"))
+        # Enrollment needs the effective service graph and host-capability
+        # shape, not project secrets.  Keep variable expressions opaque so a
+        # repository can be enrolled and observed even when role-specific
+        # runtime values are injected only by its actual launcher.
+        command.extend(("config", "--no-interpolate", "--format", "json"))
         try:
             completed = invoke(tuple(command), pinned_cwd, timeout_seconds, environment)
         except Exception as exc:
@@ -2387,12 +3649,12 @@ def _port_available(port: int, protocol: str) -> bool:
 
 
 def _verify_owned_tcp_listener(port: int, canonical_root: str) -> Mapping[str, Any]:
-    """Prove one exact TCP listener belongs to the enrolled worktree.
+    """Prove one exact TCP listener runs from the enrolled worktree.
 
     The broker service—not the client—performs both listener and cwd
-    observation.  A missing tool, permission denial, multiple listeners, PID
-    reuse, zombie, or path ambiguity is an unknown ownership result and fails
-    closed.
+    observation. A missing tool, multiple listeners, PID reuse, zombie, or
+    path ambiguity is an unknown resource identity and fails closed. Unix
+    ownership metadata is deliberately not part of local authorization.
     """
 
     root = _strict_current_path(canonical_root, directory=True, field="repository root")
@@ -2405,7 +3667,6 @@ def _verify_owned_tcp_listener(port: int, canonical_root: str) -> Mapping[str, A
         )
     pid = next(iter(first))
     identity_before = _process_identity(pid)
-    owner_uid_before = _process_owner_uid(pid)
     cwd = _process_cwd(lsof, pid)
     if os.path.commonpath((cwd, root)) != root:
         raise BrokerBackendError(
@@ -2413,20 +3674,14 @@ def _verify_owned_tcp_listener(port: int, canonical_root: str) -> Mapping[str, A
             "The existing listener belongs to another repository.",
         )
     identity_after = _process_identity(pid)
-    owner_uid_after = _process_owner_uid(pid)
     second = _platform_listener_pids(port, lsof=lsof)
-    if (
-        identity_before != identity_after
-        or owner_uid_before != owner_uid_after
-        or second != {pid}
-    ):
+    if identity_before != identity_after or second != {pid}:
         raise BrokerBackendError(
             "listener_identity_changed",
             "The existing listener identity changed during broker verification.",
         )
     return {
         "pid": pid,
-        "owner_uid": owner_uid_after,
         "process_identity": identity_after,
         "cwd": cwd,
         "canonical_root": root,
@@ -2442,7 +3697,7 @@ def _resolve_lsof_executable() -> str:
             return str(Path(raw).absolute())
     raise BrokerBackendError(
         "listener_observer_unavailable",
-        "The broker service cannot observe listener ownership because lsof is unavailable.",
+        "The broker service cannot observe listener identity because lsof is unavailable.",
     )
 
 
@@ -2598,36 +3853,6 @@ def _process_identity(pid: int) -> str:
             "The broker service cannot read the listener process identity.",
         )
     return f"process:{pid}:{started}"
-
-
-def _process_owner_uid(pid: int) -> int:
-    """Read a stable kernel/account owner for the already-identified process."""
-
-    if sys.platform.startswith("linux"):
-        try:
-            metadata = os.stat(f"/proc/{pid}", follow_symlinks=False)
-        except OSError as exc:
-            raise BrokerBackendError(
-                "listener_identity_unobservable",
-                "The broker service cannot read the listener process owner.",
-            ) from exc
-        return int(metadata.st_uid)
-    completed = subprocess.run(
-        ["/bin/ps", "-o", "uid=", "-p", str(pid)],
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        timeout=5.0,
-        check=False,
-    )
-    raw = completed.stdout.strip()
-    if completed.returncode != 0 or not raw.isdigit():
-        raise BrokerBackendError(
-            "listener_identity_unobservable",
-            "The broker service cannot read the listener process owner.",
-        )
-    return int(raw)
 
 
 def _process_cwd(lsof: str | None, pid: int) -> str:

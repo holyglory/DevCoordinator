@@ -1,5 +1,4 @@
 import assert from 'node:assert/strict';
-import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import http from 'node:http';
 import os from 'node:os';
@@ -7,8 +6,6 @@ import path from 'node:path';
 import test from 'node:test';
 
 import { CoordError, coordinatorTimeoutFor, createCoordinator } from '../src/coordinator.mjs';
-
-const TOKEN = 'fixture-coordinator-token-0123456789abcdef';
 
 test('published HTTP contract describes normalized query-only inventory and its legacy projection', async () => {
   const contract = JSON.parse(await fsp.readFile(
@@ -35,6 +32,7 @@ test('published HTTP contract describes normalized query-only inventory and its 
     'observations',
     'control_bindings',
     'test_statistics',
+    'agent_browsers',
   ]);
   assert.equal(contract.inventory_contract.compatibility_projection, 'v1_compatibility');
   assert.match(contract.inventory_contract.ordinary_inventory, /without runtime sampling or persistence/);
@@ -57,7 +55,7 @@ test('test statistics use one bounded repository-scoped coordinator read', async
   };
   const { client, requests } = await fixture(t, { responder });
   assert.deepEqual(await client.testStats({ project: 'repo-1' }), response);
-  assert.equal(requests.at(-1).authorization, `Bearer ${TOKEN}`);
+  assert.equal(requests.at(-1).authorization, null);
   assert.throws(
     () => client.testStats({ project: '', days: 30, limit: 25 }),
     (error) => error instanceof CoordError && error.status === 400,
@@ -66,6 +64,366 @@ test('test statistics use one bounded repository-scoped coordinator read', async
     () => client.testStats({ project: 'repo-1', days: 0, limit: 25 }),
     (error) => error instanceof CoordError && error.status === 400,
   );
+});
+
+test('test plan and submission forward only typed repository-scoped contracts', async (t) => {
+  const operationId = '4d4f45a8-1df0-4d25-a2ae-4f50f77b1bf3';
+  const actor = 'google:operator@example.com';
+  const bodies = [];
+  const responder = async ({ req, res, record }) => {
+    if (!['/v1/test-plan', '/v1/test-runs'].includes(req.url)) return false;
+    bodies.push({ path: req.url, body: JSON.parse(record.body) });
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify(req.url === '/v1/test-runs'
+      ? { repository_id: 'Repo-A', run_id: 'run-1' }
+      : { repository_id: 'Repo-A', intent: 'manual', plan_id: 'plan-1', operation_id: operationId }));
+    return true;
+  };
+  const { client } = await fixture(t, { responder });
+  assert.equal((await client.testPlan({
+    repoId: 'Repo-A', intent: 'manual', requestedTargets: ['unit'], operationId,
+    source: {
+      schemaVersion: 1, kind: 'original', repositoryId: 'Repo-A',
+      repositoryGeneration: 5, temporaryRoot: null,
+    },
+  })).plan_id, 'plan-1');
+  assert.equal((await client.submitTestRun({
+    repoId: 'Repo-A', planId: 'plan-1', operationId, actor,
+  })).run_id, 'run-1');
+  assert.deepEqual(bodies, [
+    { path: '/v1/test-plan', body: {
+      repo_id: 'Repo-A', intent: 'manual', operation_id: operationId,
+      source: {
+        schema_version: 1, kind: 'original', repository_id: 'Repo-A', repository_generation: 5,
+      },
+      requested_targets: ['unit'],
+    } },
+    { path: '/v1/test-runs', body: {
+      repo_id: 'Repo-A', plan_id: 'plan-1', operation_id: operationId, actor,
+    } },
+  ]);
+  assert.throws(
+    () => client.testPlan({ repoId: 'Repo-A', intent: 'arbitrary', operationId }),
+    (error) => error instanceof CoordError && error.status === 400,
+  );
+  assert.throws(
+    () => client.testPlan({
+      repoId: 'Repo-A', intent: 'change', requestedTargets: ['unit'], operationId,
+    }),
+    (error) => error instanceof CoordError && error.status === 400,
+  );
+  assert.throws(
+    () => client.testPlan({ repoId: 'Repo-A', intent: 'manual', operationId: 'NOT-A-UUID' }),
+    (error) => error instanceof CoordError && error.status === 400,
+  );
+  assert.throws(
+    () => client.submitTestRun({ repoId: 'Repo-A', planId: 'plan-1', operationId }),
+    (error) => error instanceof CoordError && error.status === 400,
+  );
+});
+
+test('test run reads and operations use bounded repository-scoped routes', async (t) => {
+  const operationId = '4d4f45a8-1df0-4d25-a2ae-4f50f77b1bf3';
+  const actor = 'google:operator@example.com';
+  const requests = [];
+  const responder = async ({ req, res, record }) => {
+    if (!req.url.startsWith('/v1/test-')) return false;
+    requests.push({ method: req.method, path: req.url, body: record.body ? JSON.parse(record.body) : null });
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end('{}');
+    return true;
+  };
+  const { client } = await fixture(t, { responder });
+
+  await client.testRuns({ repoId: 'Repo-A', after: 'run-0', limit: 25, state: 'running' });
+  await client.testRunStatus({ repoId: 'Repo-A', runId: 'run-1' });
+  await client.testRunSummary({ repoId: 'Repo-A', runId: 'run-1' });
+  await client.testRunFailures({ repoId: 'Repo-A', runId: 'run-1', after: 'failure-11', limit: 20 });
+  await client.testRunArtifacts({ repoId: 'Repo-A', runId: 'run-1' });
+  await client.testRunCases({ repoId: 'Repo-A', runId: 'run-1' });
+  await client.cancelTestRun({ repoId: 'Repo-A', runId: 'run-1', reason: 'operator request', operationId, actor });
+  await client.retryTestRun({ repoId: 'Repo-A', runId: 'run-1', failedOnly: true, operationId, actor });
+  await client.testRepositorySetup({ repoId: 'Repo-A' });
+  await client.testEvents({ repoId: 'Repo-A', after: 13, limit: 50 });
+
+  assert.deepEqual(requests.map(({ method, path }) => ({ method, path })), [
+    { method: 'GET', path: '/v1/test-runs?repo_id=Repo-A&limit=25&after=run-0&state=running' },
+    { method: 'GET', path: '/v1/test-runs/run-1?repo_id=Repo-A' },
+    { method: 'GET', path: '/v1/test-runs/run-1/summary?repo_id=Repo-A' },
+    { method: 'GET', path: '/v1/test-runs/run-1/failures?repo_id=Repo-A&limit=20&after=failure-11' },
+    { method: 'GET', path: '/v1/test-runs/run-1/artifacts?repo_id=Repo-A&limit=50' },
+    { method: 'GET', path: '/v1/test-runs/run-1/cases?repo_id=Repo-A&limit=50' },
+    { method: 'POST', path: '/v1/test-runs/run-1/cancel' },
+    { method: 'POST', path: '/v1/test-runs/run-1/retry' },
+    { method: 'GET', path: '/v1/test-repositories/Repo-A/setup' },
+    { method: 'GET', path: '/v1/test-events?repo_id=Repo-A&after=13&limit=50' },
+  ]);
+  assert.deepEqual(requests[6].body, {
+    repo_id: 'Repo-A', reason: 'operator request', operation_id: operationId, actor,
+  });
+  assert.deepEqual(requests[7].body, {
+    repo_id: 'Repo-A', failed_only: true, operation_id: operationId, actor,
+  });
+});
+
+test('test setup retries each typed cold-activation response exactly once', async (t) => {
+  for (const code of ['test_scheduler_unavailable', 'test_repository_setup_unavailable']) {
+    for (const status of [502, 503]) {
+      let attempts = 0;
+      const entries = [];
+      const retryAfterSeconds = code === 'test_scheduler_unavailable' && status === 503 ? 1 : null;
+      const responder = async ({ req, res }) => {
+        if (req.url !== '/v1/test-repositories/Repo-A/setup') return false;
+        attempts += 1;
+        res.writeHead(attempts === 1 ? status : 200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify(attempts === 1
+          ? {
+              code,
+              classification: 'broker_mutation_failed',
+              error: 'The asynchronous test scheduler is unavailable; retry shortly.',
+              ...(retryAfterSeconds === null ? {} : { retry_after_seconds: retryAfterSeconds }),
+            }
+          : { schema_version: 1, repository_id: 'Repo-A', status: 'ready' }));
+        return true;
+      };
+      const { client } = await fixture(t, { responder, log: recordingLog(entries) });
+      assert.deepEqual(await client.testRepositorySetup({ repoId: 'Repo-A' }), {
+        schema_version: 1,
+        repository_id: 'Repo-A',
+        status: 'ready',
+      });
+      assert.equal(attempts, 2, `${status} ${code}`);
+      assert.deepEqual(entries.map(({ level, message }) => ({ level, message })), [
+        { level: 'warn', message: 'test setup cold activation retry' },
+        { level: 'info', message: 'test setup cold activation recovered' },
+      ]);
+      assert.equal(entries[0].fields.delayMs, retryAfterSeconds === null ? 250 : 1_000);
+      assert.equal(entries[0].fields.attempts, 1);
+      assert.equal(entries[1].fields.attempts, 2);
+    }
+  }
+});
+
+test('test setup does not retry status or error codes outside the cold-activation contract', async (t) => {
+  for (const { status, code } of [
+    { status: 500, code: 'test_scheduler_unavailable' },
+    { status: 503, code: 'test_contract_invalid' },
+    { status: 400, code: 'test_repository_setup_unavailable' },
+  ]) {
+    let attempts = 0;
+    const entries = [];
+    const responder = async ({ req, res }) => {
+      if (req.url !== '/v1/test-repositories/Repo-A/setup') return false;
+      attempts += 1;
+      res.writeHead(status, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ code, error: 'setup failed' }));
+      return true;
+    };
+    const { client } = await fixture(t, { responder, log: recordingLog(entries) });
+    await assert.rejects(
+      () => client.testRepositorySetup({ repoId: 'Repo-A' }),
+      (error) => error instanceof CoordError && error.status === status && error.code === code,
+    );
+    assert.equal(attempts, 1, `${status} ${code}`);
+    assert.deepEqual(entries, []);
+  }
+});
+
+test('test setup preserves and logs the terminal error after one failed retry', async (t) => {
+  let attempts = 0;
+  const entries = [];
+  const responder = async ({ req, res }) => {
+    if (req.url !== '/v1/test-repositories/Repo-A/setup') return false;
+    attempts += 1;
+    const status = attempts === 1 ? 503 : 502;
+    const code = attempts === 1
+      ? 'test_scheduler_unavailable'
+      : 'test_repository_setup_unavailable';
+    res.writeHead(status, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ code, error: `setup attempt ${attempts} failed` }));
+    return true;
+  };
+  const { client } = await fixture(t, { responder, log: recordingLog(entries) });
+  await assert.rejects(
+    () => client.testRepositorySetup({ repoId: 'Repo-A' }),
+    (error) => (
+      error instanceof CoordError
+      && error.status === 502
+      && error.code === 'test_repository_setup_unavailable'
+      && error.message === 'setup attempt 2 failed'
+    ),
+  );
+  assert.equal(attempts, 2);
+  assert.deepEqual(entries.map(({ level, message }) => ({ level, message })), [
+    { level: 'warn', message: 'test setup cold activation retry' },
+    { level: 'error', message: 'test setup cold activation retry failed' },
+  ]);
+  assert.equal(entries[1].fields.initialCode, 'test_scheduler_unavailable');
+  assert.equal(entries[1].fields.finalCode, 'test_repository_setup_unavailable');
+  assert.equal(entries[1].fields.finalStatus, 502);
+  assert.equal(entries[1].fields.attempts, 2);
+});
+
+test('fleet test statistics use one retained bounded host-wide read', async (t) => {
+  const response = {
+    schema_version: 2,
+    window: { hours: 24, start: '2026-07-27T00:00:00Z', end: '2026-07-28T00:00:00Z' },
+    snapshot: {
+      generated_at: '2026-07-28T00:00:00Z',
+      observed_through: '2026-07-27T23:59:00Z',
+      source: 'coordinator-test-store',
+      retention: { eligible: true, max_age_seconds: 86400 },
+    },
+    summary: { repository_count: 1, test_count: 42 },
+    hours: [], repositories: [], capacity: [], attention: [],
+  };
+  let requestsSeen = 0;
+  const responder = async ({ req, res }) => {
+    if (req.url !== '/v1/test-fleet?hours=24') return false;
+    requestsSeen += 1;
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify(response));
+    return true;
+  };
+  const { client, requests, config } = await fixture(t, { responder });
+  const [first, second] = await Promise.all([client.testFleet(), client.testFleet()]);
+
+  assert.equal(first.snapshot.delivery.state, 'fresh');
+  assert.equal(first.snapshot.delivery.refreshing, false);
+  assert.deepEqual(first, second);
+  assert.equal(requestsSeen, 1);
+  assert.equal(requests.at(-1).authorization, null);
+
+  const warm = await client.testFleet();
+  assert.equal(warm.snapshot.delivery.state, 'retained');
+  assert.equal(warm.snapshot.delivery.refreshing, false);
+  assert.equal(requestsSeen, 1, 'a completed warm cache must not start another read');
+  const persisted = JSON.parse(await fsp.readFile(
+    path.join(config.stateDir, 'test-stats-cache-v1.json'),
+    'utf8',
+  ));
+  assert.equal(persisted.version, 1);
+  assert.equal(persisted.semantics_revision, 2,
+    'persisted test projections must bind the renderer semantics that produced them');
+
+  const restarted = createCoordinator({ config, log: null });
+  t.after(() => restarted.close());
+  const retained = await restarted.testFleet();
+  assert.equal(retained.snapshot.delivery.state, 'retained');
+  assert.equal(retained.snapshot.delivery.refreshing, true);
+  assert.throws(
+    () => client.testFleet({ hours: 0 }),
+    (error) => error instanceof CoordError && error.status === 400,
+  );
+});
+
+test('a legacy persisted fleet projection is invalidated before first paint', async (t) => {
+  const fresh = {
+    schema_version: 2,
+    window: { hours: 24, start: '2026-07-30T00:00:00Z', end: '2026-07-31T00:00:00Z' },
+    snapshot: {
+      generated_at: '2026-07-31T00:00:00Z',
+      observed_through: '2026-07-30T23:59:00Z',
+      source: 'fresh-test-store',
+    },
+    summary: { repository_count: 1, test_count: 42 },
+    hours: [], repositories: [], capacity: [], attention: [],
+  };
+  let requestsSeen = 0;
+  const responder = async ({ req, res }) => {
+    if (req.url !== '/v1/test-fleet?hours=24') return false;
+    requestsSeen += 1;
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify(fresh));
+    return true;
+  };
+  const { config } = await fixture(t, { responder });
+  const legacy = {
+    schema_version: 2,
+    window: fresh.window,
+    snapshot: {
+      generated_at: '2026-07-30T00:00:00Z',
+      observed_through: '2026-07-29T23:59:00Z',
+      source: 'legacy-test-store',
+    },
+    summary: { repository_count: 1, test_count: 999 },
+    hours: [], repositories: [], capacity: [], attention: [],
+  };
+  await fsp.writeFile(
+    path.join(config.stateDir, 'test-stats-cache-v1.json'),
+    `${JSON.stringify({
+      version: 1,
+      entries: [{ key: 'fleet:hours=24', at: Date.now(), value: legacy }],
+    })}\n`,
+  );
+
+  const restarted = createCoordinator({ config, log: null });
+  t.after(() => restarted.close());
+  const result = await restarted.testFleet();
+
+  assert.equal(requestsSeen, 1,
+    'an unrevisioned cache must never satisfy a request after semantics change');
+  assert.equal(result.summary.test_count, 42);
+  assert.equal(result.snapshot.delivery.state, 'fresh');
+  const replaced = JSON.parse(await fsp.readFile(
+    path.join(config.stateDir, 'test-stats-cache-v1.json'),
+    'utf8',
+  ));
+  assert.equal(replaced.semantics_revision, 2);
+  assert.equal(replaced.entries[0].value.summary.test_count, 42);
+});
+
+test('repository test statistics distinguish cold, retained, and refreshing delivery', async (t) => {
+  let requestsSeen = 0;
+  let releaseRefresh;
+  const refreshGate = new Promise((resolve) => { releaseRefresh = resolve; });
+  const responder = async ({ req, res }) => {
+    if (req.url !== '/v1/tests?project=repo-1&days=30&limit=25') return false;
+    requestsSeen += 1;
+    const requestNumber = requestsSeen;
+    if (requestNumber === 2) await refreshGate;
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({
+      schema_version: 1,
+      repo_id: 'repo-1',
+      days: 30,
+      snapshot: {
+        generated_at: `2026-07-28T00:00:0${requestNumber}Z`,
+        observed_through: null,
+        source: 'coordinator-test-store',
+        retention: { eligible: true, max_age_seconds: 86400 },
+      },
+      summary: { request_number: requestNumber },
+    }));
+    return true;
+  };
+  const { client } = await fixture(t, { responder });
+
+  const cold = await client.testStats({ project: 'repo-1' });
+  assert.equal(cold.snapshot.delivery.state, 'fresh');
+  assert.equal(cold.snapshot.delivery.refreshing, false);
+
+  const warm = await client.testStats({ project: 'repo-1' });
+  assert.equal(warm.snapshot.delivery.state, 'retained');
+  assert.equal(warm.snapshot.delivery.refreshing, false);
+  assert.equal(requestsSeen, 1);
+
+  const refreshing = await client.testStats({ project: 'repo-1', maxAgeMs: 0 });
+  assert.equal(refreshing.snapshot.delivery.state, 'retained');
+  assert.equal(refreshing.snapshot.delivery.refreshing, true);
+  assert.equal(refreshing.summary.request_number, 1);
+
+  releaseRefresh();
+  let refreshed = null;
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 2));
+    refreshed = await client.testStats({ project: 'repo-1' });
+    if (refreshed.summary.request_number === 2) break;
+  }
+  assert.equal(refreshed.summary.request_number, 2);
+  assert.equal(refreshed.snapshot.delivery.state, 'retained');
+  assert.equal(refreshed.snapshot.delivery.refreshing, false);
+  assert.equal(requestsSeen, 2, 'the retained refresh must remain coalesced');
 });
 
 test('test statistics survive a Console restart and refresh stale data in the background', async (t) => {
@@ -128,7 +486,7 @@ test('test repository discovery is a lightweight cached coordinator read', async
     requests.filter((request) => request.path === '/v1/test-repositories').length,
     1,
   );
-  assert.equal(requests.at(-1).authorization, `Bearer ${TOKEN}`);
+  assert.equal(requests.at(-1).authorization, null);
 });
 
 test('maintenance responses preserve their stable classification and retry interval', async (t) => {
@@ -184,14 +542,19 @@ test('host observation receives a Docker-sized deadline without widening ordinar
   assert.equal(coordinatorTimeoutFor('/v1/lifecycle/apply'), 600_000);
 });
 
-async function fixture(t, { tokenOnDisk = TOKEN, expectedToken = TOKEN, responder = null } = {}) {
+function recordingLog(entries) {
+  const logger = {
+    child: () => logger,
+    warn: (message, fields) => entries.push({ level: 'warn', message, fields }),
+    info: (message, fields) => entries.push({ level: 'info', message, fields }),
+    error: (message, fields) => entries.push({ level: 'error', message, fields }),
+  };
+  return logger;
+}
+
+async function fixture(t, { responder = null, log = null } = {}) {
   const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'devops-console-coordinator-'));
   t.after(() => fsp.rm(dir, { recursive: true, force: true }));
-  const tokenFile = path.join(dir, 'api-token');
-  if (tokenOnDisk !== null) {
-    await fsp.writeFile(tokenFile, `${tokenOnDisk}\n`, { mode: 0o600 });
-    await fsp.chmod(tokenFile, 0o600);
-  }
   const requests = [];
   const server = http.createServer(async (req, res) => {
     const chunks = [];
@@ -206,11 +569,6 @@ async function fixture(t, { tokenOnDisk = TOKEN, expectedToken = TOKEN, responde
     if (req.url === '/healthz') {
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ ok: true, service: 'codex-dev-coordinator', version: 2 }));
-      return;
-    }
-    if (req.headers.authorization !== `Bearer ${expectedToken}`) {
-      res.writeHead(401, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ error: 'unauthorized' }));
       return;
     }
     if (responder && await responder({ req, res, record, requests })) return;
@@ -233,7 +591,6 @@ async function fixture(t, { tokenOnDisk = TOKEN, expectedToken = TOKEN, responde
   const port = server.address().port;
   const config = {
     coordinatorUrl: `http://127.0.0.1:${port}`,
-    coordinatorTokenFile: tokenFile,
     coordinatorAutostart: false,
     coordinatorScript: '/unused/dev_coordinator.py',
     coordinatorHome: dir,
@@ -241,20 +598,20 @@ async function fixture(t, { tokenOnDisk = TOKEN, expectedToken = TOKEN, responde
   };
   const client = createCoordinator({
     config,
-    log: null,
+    log,
   });
   t.after(() => client.close());
-  return { client, requests, tokenFile, config };
+  return { client, requests, config };
 }
 
-test('coordinator probe is anonymous while every protected request uses the private bearer token', async (t) => {
+test('coordinator probe and API calls use the trusted loopback transport without an application credential', async (t) => {
   const { client, requests } = await fixture(t);
   assert.equal(await client.probe(), true);
   await client.inventory({ maxAgeMs: 0 });
   assert.equal(requests[0].path, '/healthz');
   assert.equal(requests[0].authorization, null);
   assert.equal(requests[1].path, '/v1/inventory');
-  assert.equal(requests[1].authorization, `Bearer ${TOKEN}`);
+  assert.equal(requests[1].authorization, null);
 });
 
 test('overview inventory obeys its cold first-byte budget and reuses the completed refresh', async (t) => {
@@ -1020,123 +1377,6 @@ test('schema-v2 inventory without a complete v1 compatibility projection fails c
   );
 });
 
-for (const [label, tokenOnDisk] of [['missing', null], ['wrong', `${TOKEN}-wrong`]]) {
-  test(`${label} coordinator credential fails closed without leaking token material`, async (t) => {
-    const { client } = await fixture(t, { tokenOnDisk });
-    await assert.rejects(
-      () => client.inventory({ maxAgeMs: 0 }),
-      (err) => {
-        assert.ok(err instanceof CoordError);
-        assert.equal(err.status, 401);
-        assert.match(err.message, /authentication failed/);
-        assert.doesNotMatch(err.message, /0123456789abcdef/);
-        return true;
-      },
-    );
-    assert.doesNotMatch(String(client.status().lastError), /0123456789abcdef/);
-  });
-}
-
-for (const mode of [0o644, 0o700]) {
-  test(`token-file mode ${mode.toString(8)} is rejected before a protected request is sent`, async (t) => {
-    const { client, tokenFile, requests } = await fixture(t);
-    fs.chmodSync(tokenFile, mode);
-    await assert.rejects(
-      () => client.inventory({ maxAgeMs: 0 }),
-      (err) => err instanceof CoordError && err.status === 503 && /permissions are unsafe/.test(err.message),
-    );
-    assert.equal(requests.length, 0);
-  });
-}
-
-test('symlink token file is rejected before its target can become an Authorization header', async (t) => {
-  const { client, tokenFile, requests } = await fixture(t);
-  const target = path.join(path.dirname(tokenFile), 'symlink-target-token');
-  const targetToken = 'symlink-target-secret-0123456789abcdef';
-  fs.writeFileSync(target, `${targetToken}\n`, { mode: 0o600 });
-  fs.unlinkSync(tokenFile);
-  fs.symlinkSync(target, tokenFile);
-
-  await assert.rejects(
-    () => client.inventory({ maxAgeMs: 0 }),
-    (err) => {
-      assert.ok(err instanceof CoordError);
-      assert.equal(err.status, 503);
-      assert.match(err.message, /regular non-symlink file/);
-      assert.doesNotMatch(err.message, new RegExp(targetToken));
-      return true;
-    },
-  );
-  assert.equal(requests.length, 0);
-  assert.doesNotMatch(String(client.status().lastError), new RegExp(targetToken));
-});
-
-test('non-regular token file is rejected without attempting to read it', async (t) => {
-  const { client, tokenFile, requests } = await fixture(t);
-  fs.unlinkSync(tokenFile);
-  fs.mkdirSync(tokenFile, { mode: 0o700 });
-
-  await assert.rejects(
-    () => client.inventory({ maxAgeMs: 0 }),
-    (err) => err instanceof CoordError && err.status === 503 && /regular non-symlink file/.test(err.message),
-  );
-  assert.equal(requests.length, 0);
-});
-
-test('oversized token file is rejected before token material is read or sent', async (t) => {
-  const { client, tokenFile, requests } = await fixture(t);
-  const oversizedSecret = `oversized-secret-${'x'.repeat(4097)}`;
-  fs.writeFileSync(tokenFile, oversizedSecret, { mode: 0o600 });
-
-  await assert.rejects(
-    () => client.inventory({ maxAgeMs: 0 }),
-    (err) => {
-      assert.ok(err instanceof CoordError);
-      assert.equal(err.status, 503);
-      assert.match(err.message, /oversized/);
-      assert.doesNotMatch(err.message, /oversized-secret/);
-      return true;
-    },
-  );
-  assert.equal(requests.length, 0);
-  assert.doesNotMatch(String(client.status().lastError), /oversized-secret/);
-});
-
-test('token path replacement at open time fails closed instead of following the replacement', async (t) => {
-  const { client, tokenFile, requests } = await fixture(t);
-  const replacement = path.join(path.dirname(tokenFile), 'replacement-token');
-  const replacementToken = 'replacement-secret-0123456789abcdef';
-  fs.writeFileSync(replacement, `${replacementToken}\n`, { mode: 0o600 });
-
-  const originalOpenSync = fs.openSync;
-  let replacementInjected = false;
-  fs.openSync = function guardedOpenSync(file, flags, ...rest) {
-    if (!replacementInjected && path.resolve(String(file)) === path.resolve(tokenFile)) {
-      replacementInjected = true;
-      fs.unlinkSync(tokenFile);
-      fs.symlinkSync(replacement, tokenFile);
-    }
-    return originalOpenSync.call(this, file, flags, ...rest);
-  };
-  try {
-    await assert.rejects(
-      () => client.inventory({ maxAgeMs: 0 }),
-      (err) => {
-        assert.ok(err instanceof CoordError);
-        assert.equal(err.status, 503);
-        assert.match(err.message, /regular non-symlink file/);
-        assert.doesNotMatch(err.message, new RegExp(replacementToken));
-        return true;
-      },
-    );
-  } finally {
-    fs.openSync = originalOpenSync;
-  }
-  assert.equal(replacementInjected, true, 'fixture must replace the path immediately before the credential open');
-  assert.equal(requests.length, 0);
-  assert.doesNotMatch(String(client.status().lastError), new RegExp(replacementToken));
-});
-
 test('HTTP 200 project reports with ok=false remain failures with structured evidence', async (t) => {
   const { client } = await fixture(t);
   await assert.rejects(
@@ -1208,7 +1448,7 @@ test('lifecycle client uses only fixed coordinator endpoints and preserves exact
     ['POST', '/v1/lifecycle/apply'],
     ['POST', '/v1/lifecycle/restore'],
   ]);
-  assert.equal(requests.every((request) => request.authorization === `Bearer ${TOKEN}`), true);
+  assert.equal(requests.every((request) => request.authorization === null), true);
   assert.deepEqual(JSON.parse(requests[1].body), planBody);
   assert.deepEqual(JSON.parse(requests[2].body), applyBody);
   assert.deepEqual(JSON.parse(requests[3].body), restoreBody);

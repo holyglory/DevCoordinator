@@ -36,8 +36,8 @@ from devcoordinator.ephemeral_containers import EphemeralContainerCoordinator
 from devcoordinator.host_observation import commit_host_inventory_observation
 from devcoordinator.observer import SingleFlightObserver
 from devcoordinator.schema import (
-    SCHEMA_VERSION,
     _upgrade_ephemeral_renewal_journal_to_v8,
+    establish_repository_owner_authority,
     initialize_schema,
 )
 from devcoordinator.store import AccountStore, CoordinatorStore, utc_timestamp
@@ -380,13 +380,13 @@ class DelayedAbsenceHost(FakeEphemeralHost):
         return {"full_container_id": target.full_container_id, "action": "remove"}
 
 
-class RevokingAfterAttributionCoordinator(EphemeralContainerCoordinator):
+class DisablingTemplateAfterAttributionCoordinator(EphemeralContainerCoordinator):
     def _record_container(self, run_id, full_container_id, *, authorized=None):
         target = super()._record_container(
             run_id, full_container_id, authorized=authorized
         )
-        self._persistence.replace_ephemeral_access(
-            uid=os.geteuid(), repo_id=REPO, template_ids=()
+        self._persistence.disable_ephemeral_templates_except(
+            repo_id=REPO, template_ids=()
         )
         return target
 
@@ -449,6 +449,20 @@ class EphemeralFixture:
                     ) VALUES (?, 'installed', 0, 0, 'test', ?)
                     """,
                     (REPO, now),
+                )
+                establish_repository_owner_authority(
+                    connection,
+                    repository_id=REPO,
+                    owner_uid=os.geteuid(),
+                    repository_generation=0,
+                    operation_id=str(uuid.uuid4()),
+                    actor="test",
+                    reason="ephemeral fixture owner",
+                    timestamp=now,
+                    evidence={"kind": "ephemeral-test-fixture"},
+                )
+                connection.execute(
+                    "UPDATE schema_metadata SET migration_state = 'ready' WHERE singleton = 1"
                 )
             self.generation = store.metadata.database_generation
         self.persistence.provision_principal(uid=os.geteuid(), account_id=ACCOUNT)
@@ -2193,7 +2207,7 @@ class EphemeralContainerTests(unittest.TestCase):
 
     def test_post_create_revocation_preserves_exact_start_failure(self) -> None:
         host = FakeEphemeralHost()
-        coordinator = RevokingAfterAttributionCoordinator(
+        coordinator = DisablingTemplateAfterAttributionCoordinator(
             self.fixture.persistence, host
         )
         authorized = self.fixture.request(BrokerOperation.EPHEMERAL_START, TEMPLATE)
@@ -2463,7 +2477,7 @@ class EphemeralContainerTests(unittest.TestCase):
             self._event_counts(started["run_id"]).get("ephemeral.cleaned"), 1
         )
 
-    def test_revoked_owner_retains_status_and_finish_but_cannot_renew(self) -> None:
+    def test_disabled_template_retains_status_and_finish_but_cannot_renew(self) -> None:
         clock = FakeClock()
         host = FakeEphemeralHost()
         coordinator = EphemeralContainerCoordinator(
@@ -2475,8 +2489,8 @@ class EphemeralContainerTests(unittest.TestCase):
         started = coordinator.execute(
             self.fixture.request(BrokerOperation.EPHEMERAL_START, TEMPLATE)
         )
-        self.fixture.persistence.replace_ephemeral_access(
-            uid=os.geteuid(), repo_id=REPO, template_ids=()
+        self.fixture.persistence.disable_ephemeral_templates_except(
+            repo_id=REPO, template_ids=()
         )
         status = coordinator.execute(
             self.fixture.request(BrokerOperation.EPHEMERAL_STATUS, started["run_id"])
@@ -2488,7 +2502,7 @@ class EphemeralContainerTests(unittest.TestCase):
                 started["run_id"],
                 arguments={"ttl_seconds": 60},
             )
-        self.assertEqual(denied.exception.code, "operation_access_denied")
+        self.assertEqual(denied.exception.code, "control_binding_unavailable")
 
         recovered = coordinator.reap_once()
         self.assertEqual(recovered["run_ids"], [started["run_id"]])
@@ -2639,6 +2653,8 @@ class EphemeralContainerTests(unittest.TestCase):
                 [],
                 "bridge",
                 "",
+                0,
+                {},
             )
         )
         calls: list[tuple[str, ...]] = []
@@ -2808,19 +2824,33 @@ class EphemeralContainerTests(unittest.TestCase):
         )
         self.assertEqual(row["owner_uid"], os.geteuid())
 
-    def test_unprovisioned_peer_and_cross_run_access_are_denied(self) -> None:
+    def test_local_peer_uid_is_attribution_but_unknown_run_is_denied(self) -> None:
         host = FakeEphemeralHost()
         coordinator = EphemeralContainerCoordinator(self.fixture.persistence, host)
         started = coordinator.execute(
             self.fixture.request(BrokerOperation.EPHEMERAL_START, TEMPLATE)
         )
+
+        alternate_peer = self.fixture.request(
+            BrokerOperation.EPHEMERAL_STATUS,
+            started["run_id"],
+            uid=os.geteuid() + 10000,
+        )
+        self.assertEqual(
+            coordinator.execute(alternate_peer)["run_id"],
+            started["run_id"],
+        )
+
+        unknown_run_id = str(uuid.uuid4())
         with self.assertRaises(BrokerError) as caught:
-            self.fixture.request(
-                BrokerOperation.EPHEMERAL_STATUS,
-                started["run_id"],
-                uid=os.geteuid() + 10000,
+            coordinator.execute(
+                self.fixture.request(
+                    BrokerOperation.EPHEMERAL_STATUS,
+                    unknown_run_id,
+                    uid=os.geteuid() + 10000,
+                )
             )
-        self.assertEqual(caught.exception.code, "peer_not_authorized")
+        self.assertEqual(caught.exception.code, "resource_access_denied")
 
     def test_template_definition_is_sealed_into_reserved_run(self) -> None:
         host = FakeEphemeralHost()
@@ -3148,7 +3178,7 @@ class EphemeralContainerTests(unittest.TestCase):
             connection.close()
 
 
-    def test_v5_to_v6_schema_migration_seals_quota_defaults(self) -> None:
+    def test_v5_schema_requires_explicit_offline_migration_without_writes(self) -> None:
         connection = sqlite3.connect(":memory:")
         connection.row_factory = sqlite3.Row
         now = utc_timestamp()
@@ -3258,33 +3288,20 @@ class EphemeralContainerTests(unittest.TestCase):
             """,
             (IMAGE, "sha256:" + "e" * 64, now, now),
         )
-        initialize_schema(
-            connection,
-            database_generation="ignored-existing-generation",
-            timestamp=utc_timestamp(),
-        )
+        before = tuple(connection.iterdump())
+        with self.assertRaisesRegex(
+            RuntimeError, "unsupported coordinator database schema 5"
+        ):
+            initialize_schema(
+                connection,
+                database_generation="ignored-existing-generation",
+                timestamp=utc_timestamp(),
+            )
+        self.assertEqual(tuple(connection.iterdump()), before)
         version = connection.execute(
             "SELECT schema_version FROM schema_metadata WHERE singleton = 1"
         ).fetchone()[0]
-        self.assertEqual(version, SCHEMA_VERSION)
-        template = connection.execute(
-            """
-            SELECT max_concurrent_runs, max_concurrent_runs_per_uid,
-                   repo_max_active_runs, repo_memory_budget_bytes,
-                   repo_cpu_budget_millis
-            FROM ephemeral_container_templates WHERE template_id = 'template-v5'
-            """
-        ).fetchone()
-        self.assertEqual(tuple(template), (4, 2, 16, 8 * 1024**3, 16_000))
-        run = connection.execute(
-            """
-            SELECT max_ttl_seconds, next_reconcile_at_epoch,
-                   recovery_failures, create_absence_observations,
-                   cleanup_requested
-            FROM ephemeral_container_runs WHERE run_id = 'run-v5'
-            """
-        ).fetchone()
-        self.assertEqual(tuple(run), (3600, 0, 0, 0, 1))
+        self.assertEqual(version, 5)
         policy_columns = {
             row[1]
             for row in connection.execute(
@@ -3297,31 +3314,20 @@ class EphemeralContainerTests(unittest.TestCase):
                 "PRAGMA table_info(ephemeral_container_runs)"
             )
         }
-        self.assertTrue(
-            {"secret_policy_kind", "secret_binding_id"} <= policy_columns
+        self.assertFalse(
+            {"secret_policy_kind", "secret_binding_id"} & policy_columns
         )
-        self.assertTrue(
-            {"secret_policy_kind", "secret_binding_id"} <= run_policy_columns
+        self.assertFalse(
+            {"secret_policy_kind", "secret_binding_id"} & run_policy_columns
         )
         self.assertNotIn("secret_value", policy_columns | run_policy_columns)
-        self.assertEqual(
-            tuple(
-                connection.execute(
-                    """
-                    SELECT secret_policy_kind, secret_binding_id
-                    FROM ephemeral_container_runs WHERE run_id = 'run-v5'
-                    """
-                ).fetchone()
-            ),
-            (None, None),
-        )
         quota_index = connection.execute(
             """
             SELECT 1 FROM sqlite_master
             WHERE type = 'index' AND name = 'ephemeral_runs_for_quota_admission'
             """
         ).fetchone()
-        self.assertIsNotNone(quota_index)
+        self.assertIsNone(quota_index)
         connection.close()
 
 

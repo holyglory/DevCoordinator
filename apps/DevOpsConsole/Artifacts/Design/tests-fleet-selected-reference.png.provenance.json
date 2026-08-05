@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "artifact_type": "test-fixture-snapshot",
+  "source": "isolated-test-fixture",
+  "fixture_id": "devops-console-tests-fleet-selected-design-v1:1487x1058",
+  "generator": "OpenAI image generation selected-design fixture",
+  "artifact_kind": "selected-product-design-reference",
+  "repository_path": "apps/DevOpsConsole/Artifacts/Design/tests-fleet-selected-reference.png",
+  "sha256": "aac3aa8bb2dcbee323c56cdb410b14601a52e1a2d5182f1d838411f7242a614d",
+  "bytes": 1555095,
+  "width": 1487,
+  "height": 1058,
+  "color_mode": "RGB",
+  "origin": {
+    "kind": "openai-image-generation-result",
+    "session_id": "019f624f-69d2-7893-929b-d8f18000e1e8",
+    "generation_event": "exec-e567da29-e6b5-4cdd-82f0-051f797f1f37",
+    "completed_at": "2026-07-28T12:23:51.708Z",
+    "original_locator": "local Codex generated-image cache (not retained)",
+    "input_sha256": [
+      "81ea20eb9fe54ee3aa2a3ce879e678883e1fef43b20c5ac0ada2ec4c9fa42a84",
+      "0c0a8869e760ef43e221ca43b489eb3d50f6a76e33cd4580b47845aecbd97690"
+    ]
+  },
+  "verification": {
+    "original_file_sha256_match": true,
+    "session_payload_sha256_match": true
+  }
+}

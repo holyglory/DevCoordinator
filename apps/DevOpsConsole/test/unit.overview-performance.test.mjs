@@ -4,6 +4,7 @@ import { promises as fsp } from 'node:fs';
 import test from 'node:test';
 
 import { createConsoleApi } from '../src/api.mjs';
+import { createMetricsStore } from '../src/metrics.mjs';
 
 function responseRecorder() {
   return {
@@ -71,7 +72,7 @@ function makeApi({ snapshot, inventoryError = null } = {}) {
     coordinator,
     routeStore,
     upstreamAuthStore: { describe: () => ({ configured: false }) },
-    accessStore: { isAdmin: () => false },
+    accessStore: { isAdmin: () => true, canAccess: () => false },
     guard: { checkOrigin: () => true },
     certManager: { info: () => null },
     metrics: { ingest: () => {}, history: () => ({ entities: [], host: null }) },
@@ -89,6 +90,10 @@ async function overview(api) {
   const started = performance.now();
   await api.handle(req, res, { email: 'owner@example.test' });
   return { res, elapsedMs: performance.now() - started, json: JSON.parse(res.body) };
+}
+
+function p99(values) {
+  return [...values].sort((left, right) => left - right)[Math.ceil(values.length * 0.99) - 1];
 }
 
 test('overview returns a truthful dependency error within 100ms without a second route-resolution read', async () => {
@@ -121,6 +126,25 @@ test('overview resolves every route from the one bounded inventory snapshot', as
   assert.equal(counts().routeResolves, 1);
   assert.equal(counts().routeSnapshot, snapshot,
     'route resolution must consume the same inventory object returned in the overview');
+});
+
+test('cached healthy Console overview handler p99 remains below 100ms', async () => {
+  const snapshot = {
+    servers: [{ id: 'server-1', project: '/repo', name: 'web', status: 'running', port: 3000 }],
+    docker: { available: true, containers: [] },
+  };
+  const { api } = makeApi({ snapshot });
+  await overview(api);
+  const durations = [];
+  for (let sample = 0; sample < 40; sample += 1) {
+    const result = await overview(api);
+    assert.equal(result.res.status, 200);
+    assert.equal(result.json.routes[0].resolved.port, 3000);
+    durations.push(result.elapsedMs);
+  }
+  const elapsedP99 = p99(durations);
+  assert.ok(elapsedP99 < 100,
+    `cached Console overview handler p99 was ${elapsedP99.toFixed(1)}ms`);
 });
 
 test('test repository catalog does not build the heavyweight overview', async () => {
@@ -158,4 +182,34 @@ test('browser boot renders Performance metrics independently of a slow overview'
   assert.match(source,
     /!data\.inventory[\s\S]{0,120}state\.overview\?\.inventory[\s\S]{0,220}inventoryState === 'loading'[\s\S]{0,160}failureKind[\s\S]{0,500}inventory: state\.overview\.inventory/,
     'a background cold or failed response must retain the last authoritative inventory instead of flashing an empty page');
+});
+
+test('retained inventory sampling never starts a live host observation', async () => {
+  let inventoryReads = 0;
+  let observations = 0;
+  const coordinator = {
+    async inventory() {
+      inventoryReads += 1;
+      return { servers: [], docker: { available: true, containers: [] } };
+    },
+    async observeHost() {
+      observations += 1;
+      throw new Error('the Console must not own observation');
+    },
+  };
+  const store = createMetricsStore({
+    config: { metricsIntervalMs: 2_000, retainedInventory: true, projectRoot: '/repo' },
+    coordinator,
+    host: {
+      async sample() {
+        return { at: Date.now(), cpuPercent: null, mem: null };
+      },
+    },
+  });
+
+  await store.sampleOnce();
+
+  assert.equal(inventoryReads, 1);
+  assert.equal(observations, 0);
+  assert.equal(store.history().sampler.observationFailures, 0);
 });

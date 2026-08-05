@@ -44,10 +44,12 @@ from .repository_lifecycle import (
     TargetProgress,
 )
 from .store import CoordinatorStore, canonical_json, deterministic_id, fingerprint, utc_timestamp
+from .schema import advance_repository_owner_generation
 
 
 REPOSITORY_TARGET_KIND = "repository"
 REPOSITORY_TARGET_ACTION = "fence_and_decommission"
+_ATTACH_PROVENANCE = frozenset({"operator_attach", "runtime_manifest"})
 _RESTORABLE_SYSTEMD_STATES = frozenset(
     {
         "disabled",
@@ -1876,7 +1878,13 @@ class SQLiteLifecyclePersistence:
         *,
         actor: str,
         reason: str,
+        provenance: str = "operator_attach",
+        allow_existing: bool = False,
     ) -> AttachResult:
+        if provenance not in _ATTACH_PROVENANCE:
+            raise ValueError("resource attachment provenance is invalid")
+        if type(allow_existing) is not bool:
+            raise TypeError("allow_existing must be a boolean")
         with self.store.immediate_transaction() as connection:
             installation = _installation_row(connection, repo_id)
             if installation["status"] != "installed" or installation["startup_fenced"]:
@@ -1886,11 +1894,45 @@ class SQLiteLifecyclePersistence:
                 raise PlanDriftError("standalone resource changed before attachment")
             if current.attached_repo_id not in {None, repo_id}:
                 raise OwnershipError("standalone resource belongs to another repository")
+            already_attached = current.attached_repo_id == repo_id
+            if already_attached and not allow_existing:
+                raise OwnershipError("resource is already attached to this repository")
             if current.retirement_status is not None:
                 raise ActionFencedError("retired resource requires an explicit restore")
             if current.authority_state != "authoritative":
                 raise OwnershipError("standalone controller is not authoritative")
+            current_binding = connection.execute(
+                "SELECT provenance FROM control_bindings WHERE binding_id = ?",
+                (resource.control_binding_id,),
+            ).fetchone()
+            if current_binding is None:
+                raise OwnershipError("resource control binding disappeared")
+            if already_attached and str(current_binding["provenance"]) == provenance:
+                return AttachResult(
+                    repo_id,
+                    resource.resource_id,
+                    resource.kind,
+                    False,
+                    False,
+                )
             timestamp = utc_timestamp()
+            owner = connection.execute(
+                """
+                SELECT repository.generation, authority.owner_uid,
+                       authority.repository_generation
+                FROM repositories repository
+                JOIN repository_owners authority USING(repo_id)
+                WHERE repository.repo_id = ?
+                """,
+                (repo_id,),
+            ).fetchone()
+            if (
+                owner is None
+                or int(owner["generation"]) != int(owner["repository_generation"])
+            ):
+                raise OwnershipError("repository owner authority is missing or stale")
+            prior_repository_generation = int(owner["generation"])
+            owner_uid = int(owner["owner_uid"])
             membership_id = deterministic_id(
                 "membership", repo_id, resource.kind.value, resource.resource_id
             )
@@ -1918,10 +1960,10 @@ class SQLiteLifecyclePersistence:
             connection.execute(
                 """
                 UPDATE control_bindings SET repo_id = ?, generation = generation + 1,
-                    provenance = 'operator_attach', updated_at = ?
+                    provenance = ?, updated_at = ?
                 WHERE binding_id = ? AND authority_state = 'authoritative'
                 """,
-                (repo_id, timestamp, resource.control_binding_id),
+                (repo_id, provenance, timestamp, resource.control_binding_id),
             )
             connection.execute(
                 """
@@ -1938,21 +1980,58 @@ class SQLiteLifecyclePersistence:
                 """,
                 (timestamp, resource.kind.value, resource.resource_id),
             ).rowcount
-            if changed < 1:
+            if changed < 1 and not already_attached:
                 raise PlanDriftError("resource is no longer an active unassigned resource")
-            connection.execute(
-                "UPDATE repositories SET generation = generation + 1, updated_at = ? WHERE repo_id = ?",
-                (timestamp, repo_id),
-            )
+            if provenance == "operator_attach":
+                # A human attachment changes the repository's explicit
+                # lifecycle authority, so keep repository and owner
+                # generations in lockstep. Runtime-manifest adoption is an
+                # observation-derived reconstruction of already-declared
+                # membership; advancing the repository generation there would
+                # unnecessarily invalidate every installed client profile.
+                connection.execute(
+                    "UPDATE repositories SET generation = generation + 1, "
+                    "updated_at = ? WHERE repo_id = ?",
+                    (timestamp, repo_id),
+                )
+                advance_repository_owner_generation(
+                    connection,
+                    repository_id=repo_id,
+                    owner_uid=owner_uid,
+                    prior_repository_generation=prior_repository_generation,
+                    repository_generation=prior_repository_generation + 1,
+                    operation_id=deterministic_id(
+                        "repository-owner-resource-attach", membership_id, timestamp
+                    ),
+                    actor=actor,
+                    reason="explicit resource attachment generation advance",
+                    timestamp=timestamp,
+                    evidence={
+                        "kind": "repository-resource-attachment",
+                        "provenance": provenance,
+                        "repository_id": repo_id,
+                        "resource_kind": resource.kind.value,
+                        "resource_id": resource.resource_id,
+                        "immutable_fingerprint": resource.immutable_fingerprint,
+                        "prior_repository_generation": prior_repository_generation,
+                        "repository_generation": prior_repository_generation + 1,
+                        "owner_uid": owner_uid,
+                    },
+                )
             connection.execute(
                 """
                 INSERT INTO events(event_id, repo_id, event_kind, code, message,
                                    diagnostic_json, occurred_at)
-                VALUES (?, ?, 'resource.attached', 'explicit_operator_attachment', ?, ?, ?)
+                VALUES (?, ?, 'resource.attached', ?, ?, ?, ?)
                 """,
                 (
                     deterministic_id("event", membership_id, timestamp),
                     repo_id,
+                    (
+                        "runtime_manifest_attachment"
+                        if provenance == "runtime_manifest"
+                        else "explicit_operator_attachment"
+                    ),
                     "Exact host resource attached to repository",
                     canonical_json(
                         {
@@ -1960,6 +2039,7 @@ class SQLiteLifecyclePersistence:
                             "resource_id": resource.resource_id,
                             "reason": reason,
                             "actor": actor,
+                            "provenance": provenance,
                         }
                     ),
                     timestamp,

@@ -45,17 +45,26 @@ def repository_profile(root: Path, *, generation: int) -> BrokerRepositoryProfil
         canonical_root=str(root),
         repo_id="repo-project",
         generation=generation,
+        owner_uid=1000,
         server_ids={"worker": f"worker-generation-{generation}"},
         container_ids={"postgres": "container-old"},
         compose_definition_id=None,
+        compose_container_ids=frozenset(),
+        compose_run_once_services={},
+        ephemeral_templates={},
+        ephemeral_image_prefetch_template_ids=frozenset(),
+        ephemeral_secret_policies={},
         account_id="account-project",
+        enabled=True,
+        issued_at="2026-07-26T00:00:00Z",
+        valid_until_epoch=int(time.time()) + 3600,
     )
 
 
 def client_profile(repository: BrokerRepositoryProfile) -> BrokerClientProfile:
     return BrokerClientProfile(
         service=BrokerServiceProfile(
-            socket_path=Path("/run/devcoordinator/broker.sock"),
+            socket_path=Path("/run/devcoordinator-authority.sock"),
             service_uid=0,
             socket_gid=62000,
             socket_mode=0o660,
@@ -74,9 +83,15 @@ def profile_document(root: Path) -> dict[str, object]:
         "canonical_root": str(root),
         "repo_id": "repo-project",
         "generation": 7,
+        "owner_uid": 1000,
         "servers": {"worker": "worker-old"},
         "containers": {"postgres": "container-old"},
         "compose_definition_id": None,
+        "compose_container_ids": [],
+        "compose_run_once_services": {},
+        "ephemeral_templates": {},
+        "ephemeral_image_prefetch_templates": [],
+        "ephemeral_secret_policies": {},
         "account_id": "account-project",
         "enabled": True,
         "issued_at": "2026-07-26T00:00:00Z",
@@ -85,7 +100,7 @@ def profile_document(root: Path) -> dict[str, object]:
     return {
         "version": 1,
         "service": {
-            "socket": "/run/devcoordinator/broker.sock",
+            "socket": "/run/devcoordinator-authority.sock",
             "uid": 0,
             "gid": 62000,
             "mode": "0660",
@@ -102,7 +117,9 @@ def profile_document(root: Path) -> dict[str, object]:
                 "account_id": "account-project-two",
                 "issued_at": "2026-07-26T00:00:00Z",
                 "valid_until_epoch": int(time.time()) + 3600,
-                "repositories": [dict(repository)],
+                "repositories": [
+                    {**repository, "account_id": "account-project-two"}
+                ],
             },
             "503": {
                 "account_id": "unrelated",
@@ -113,6 +130,7 @@ def profile_document(root: Path) -> dict[str, object]:
                         **repository,
                         "canonical_root": str(root.parent / "other"),
                         "repo_id": "repo-other",
+                        "account_id": "unrelated",
                     }
                 ],
             },

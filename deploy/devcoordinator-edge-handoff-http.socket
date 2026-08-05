@@ -1,0 +1,12 @@
+[Unit]
+Description=DevCoordinator temporary first-adoption HTTP listener
+
+[Socket]
+ListenStream=DEVCOORDINATOR_HANDOFF_HTTP_PORT
+Accept=no
+Service=devcoordinator-edge-handoff.service
+FileDescriptorName=http
+Backlog=1024
+NoDelay=yes
+RemoveOnStop=no
+

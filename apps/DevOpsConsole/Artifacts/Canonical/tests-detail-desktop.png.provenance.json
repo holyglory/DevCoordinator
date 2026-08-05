@@ -1,0 +1,49 @@
+{
+  "schema_version": 1,
+  "artifact_type": "test-fixture-snapshot",
+  "source": "isolated-test-fixture",
+  "fixture_id": "devops-console-tests-selected-design-detail-open-v1:1486x1059",
+  "generator": "apps/DevOpsConsole/Tools/capture-canonical-artifacts.mjs",
+  "width": 1486,
+  "height": 1059,
+  "sha256": "41246dbece523516760e26469235c5ffab63c05a943fc917196b1b266eed8fae",
+  "viewport": {
+    "width": 1486,
+    "height": 1059
+  },
+  "source_sha256": "e842cb6ef255ae83f0b52b8cc5f051ad80bdd4b3aa21db177483545484830bd7",
+  "source_files": [
+    {
+      "path": "apps/DevOpsConsole/Tools/capture-canonical-artifacts.mjs",
+      "sha256": "b7399b9afb33c391bf1bda68750a7ef94f300bbd15efc099adb992e636fe6d31"
+    },
+    {
+      "path": "apps/DevOpsConsole/src/ui/app.css",
+      "sha256": "e66af898a4bb8b84feabf17769315847a124d8442e5eb69dbb7e6174cf9fe7c2"
+    },
+    {
+      "path": "apps/DevOpsConsole/src/ui/app.js",
+      "sha256": "1babb2380e53203d5e1be51762e0079ef355e68be7bd4336958fbcd51b2968e2"
+    },
+    {
+      "path": "apps/DevOpsConsole/src/ui/index.html",
+      "sha256": "95aba0ed58fd60ad0e0847d1231207c311c544f50d3187d5627bbf5d4b83ad62"
+    },
+    {
+      "path": "apps/DevOpsConsole/test/browser.server-project-disclosures.test.mjs",
+      "sha256": "628a05d7a44f31de3c5b9d24725d52d94502500441ae3e629c50fabbac0fc2dc"
+    },
+    {
+      "path": "apps/DevOpsConsole/test/helpers/stack.mjs",
+      "sha256": "aa9eb44e4d64dba136afa0d9adf43188161c63440425d4b73818ea413a9ee7e1"
+    },
+    {
+      "path": "ci/playwright/package-lock.json",
+      "sha256": "76e70830821318e276ba76742129a4b8a3e3c8811fa7d8771f15e3f5cc1aa58c"
+    },
+    {
+      "path": "ci/playwright/package.json",
+      "sha256": "cbb5d2d262322d7151f47170a77ebe912915d0672d9ec7fa304a6465a7d0733b"
+    }
+  ]
+}

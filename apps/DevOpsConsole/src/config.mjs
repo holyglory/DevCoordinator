@@ -69,7 +69,7 @@ function gitToplevel(startDir) {
   }
 }
 
-export function loadConfig({ envFile, env = process.env } = {}) {
+export function loadConfig({ envFile, env = process.env, initializeRuntimePaths = true } = {}) {
   const problems = [];
   const fail = (key, message) => problems.push(new ConfigError(key, message));
 
@@ -92,6 +92,31 @@ export function loadConfig({ envFile, env = process.env } = {}) {
     const fromEnv = env[key];
     const raw = fromEnv !== undefined ? fromEnv : fileVars[key];
     return typeof raw === 'string' ? raw.trim() : '';
+  };
+
+  // systemd credentials stay out of both the process environment and the
+  // generated non-secret Console configuration.  Only explicitly supported
+  // secrets may use the KEY_FILE convention; the referenced file must be a
+  // bounded, non-replaceable regular file.
+  const getCredential = (key) => {
+    const direct = get(key);
+    if (direct) return direct;
+    const file = get(`${key}_FILE`);
+    if (!file) return '';
+    if (!path.isAbsolute(file)) {
+      fail(`${key}_FILE`, 'must be an absolute systemd credential path');
+      return '';
+    }
+    try {
+      const info = fs.lstatSync(file);
+      if (!info.isFile() || info.isSymbolicLink() || info.size < 1 || info.size > 64 * 1024) {
+        throw new Error('credential must be one bounded regular file');
+      }
+      return fs.readFileSync(file, 'utf8').trim();
+    } catch (error) {
+      fail(`${key}_FILE`, `cannot be read safely: ${error.message}`);
+      return '';
+    }
   };
 
   // --- domain / hosts ------------------------------------------------------
@@ -160,8 +185,8 @@ export function loadConfig({ envFile, env = process.env } = {}) {
   // --- auth ----------------------------------------------------------------
   // Degraded mode: empty clientId/clientSecret is allowed by design.
   const google = {
-    clientId: get('GOOGLE_CLIENT_ID'),
-    clientSecret: get('GOOGLE_CLIENT_SECRET'),
+    clientId: getCredential('GOOGLE_CLIENT_ID'),
+    clientSecret: getCredential('GOOGLE_CLIENT_SECRET'),
   };
 
   let oidcIssuer = get('OIDC_ISSUER') || 'https://accounts.google.com';
@@ -180,7 +205,7 @@ export function loadConfig({ envFile, env = process.env } = {}) {
       .filter(Boolean),
   );
 
-  const rawSecret = get('SESSION_SECRET');
+  const rawSecret = getCredential('SESSION_SECRET');
   let sessionSecret = null;
   if (!rawSecret) {
     fail('SESSION_SECRET', 'is required (64 hex chars; generate with: openssl rand -hex 32)');
@@ -224,6 +249,45 @@ export function loadConfig({ envFile, env = process.env } = {}) {
 
   const rawAutostart = get('COORDINATOR_AUTOSTART');
   const coordinatorAutostart = !(rawAutostart === '0' || rawAutostart.toLowerCase() === 'false');
+  const retainedInventory = get('COORDINATOR_RETAINED_INVENTORY') === '1';
+
+  // Stable-edge publication is enabled only for replaceable production
+  // Console slots. Development/test instances keep serving their own edge
+  // unless an explicit Unix socket is supplied. Production marks the
+  // dependency required so a missing socket cannot silently acknowledge a
+  // route/access mutation that never became live.
+  const rawPublicationRequired = get('DEVCOORDINATOR_EDGE_PUBLICATION_REQUIRED').toLowerCase();
+  let edgePublicationRequired = false;
+  if (rawPublicationRequired === '1' || rawPublicationRequired === 'true') {
+    edgePublicationRequired = true;
+  } else if (
+    rawPublicationRequired
+    && rawPublicationRequired !== '0'
+    && rawPublicationRequired !== 'false'
+  ) {
+    fail('DEVCOORDINATOR_EDGE_PUBLICATION_REQUIRED', 'must be exactly 1, true, 0, or false');
+  }
+  const edgePublicationSocket = get('DEVCOORDINATOR_EDGE_PUBLICATION_SOCKET');
+  if (edgePublicationSocket && (!path.isAbsolute(edgePublicationSocket) || /[\0\r\n]/.test(edgePublicationSocket))) {
+    fail('DEVCOORDINATOR_EDGE_PUBLICATION_SOCKET', 'must be one absolute Unix socket path');
+  }
+  if (edgePublicationRequired && !edgePublicationSocket) {
+    fail('DEVCOORDINATOR_EDGE_PUBLICATION_SOCKET', 'is required when stable-edge publication is required');
+  }
+  const edgeReleaseRoot = get('DEVCOORDINATOR_EDGE_RELEASE_ROOT') || '/opt/devcoordinator/releases';
+  if (!path.isAbsolute(edgeReleaseRoot) || /[\0\r\n]/.test(edgeReleaseRoot)) {
+    fail('DEVCOORDINATOR_EDGE_RELEASE_ROOT', 'must be one absolute directory');
+  }
+  let edgePublicationTimeoutMs = 5_000;
+  const rawEdgePublicationTimeout = get('DEVCOORDINATOR_EDGE_PUBLICATION_TIMEOUT_MS');
+  if (rawEdgePublicationTimeout) {
+    const timeout = Number(rawEdgePublicationTimeout);
+    if (!Number.isInteger(timeout) || timeout < 100 || timeout > 30_000) {
+      fail('DEVCOORDINATOR_EDGE_PUBLICATION_TIMEOUT_MS', 'must be an integer from 100 through 30000');
+    } else {
+      edgePublicationTimeoutMs = timeout;
+    }
+  }
 
   const projectRoot = gitToplevel(APP_ROOT) || APP_ROOT;
   const coordinatorScript = resolveConfiguredPath(
@@ -231,10 +295,6 @@ export function loadConfig({ envFile, env = process.env } = {}) {
       path.join(projectRoot, 'skills', 'codex-dev-coordinator', 'scripts', 'dev_coordinator.py'),
   );
   const coordinatorHome = get('CODEX_AGENT_COORDINATOR_HOME') || null;
-  const coordinatorTokenFile = resolveConfiguredPath(
-    get('COORDINATOR_TOKEN_FILE')
-      || path.join(coordinatorHome || path.join(os.homedir(), '.codex', 'agent-coordinator'), 'api-token'),
-  );
 
   // How often the console samples coordinator inventory for CPU/memory
   // history charts. Every sample can shell out to `docker stats` inside the
@@ -267,6 +327,13 @@ export function loadConfig({ envFile, env = process.env } = {}) {
 
   // --- misc ----------------------------------------------------------------
   const stateDir = resolveConfiguredPath(get('STATE_DIR') || 'state');
+  // Open Coordinator bugs are deliberately outside the Coordinator RPC path,
+  // so the Console can remain a useful diagnosis surface during an outage.
+  // Production supplies the shared server-wide directory explicitly; local
+  // and test instances stay isolated under their own STATE_DIR by default.
+  const bugReportDir = resolveConfiguredPath(
+    get('DEVCOORDINATOR_BUG_DIR') || path.join(stateDir, 'bugs', 'open'),
+  );
 
   // Webroot the plain-HTTP listener serves ACME HTTP-01 challenges from, so a
   // Let's Encrypt client (certbot --webroot) can validate + auto-renew certs
@@ -287,9 +354,30 @@ export function loadConfig({ envFile, env = process.env } = {}) {
   }
 
   const consoleHost = `${consoleSubdomain}.${domain}`;
-  const consoleOrigin = devInsecureHttp
+  let consoleOrigin = devInsecureHttp
     ? `http://${consoleHost}${httpPort === 80 ? '' : `:${httpPort}`}`
     : `https://${consoleHost}${httpsPort === 443 ? '' : `:${httpsPort}`}`;
+  const publishedOrigin = get('PUBLIC_CONSOLE_ORIGIN');
+  if (publishedOrigin) {
+    try {
+      const parsed = new URL(publishedOrigin);
+      if (
+        parsed.protocol !== 'https:'
+        || parsed.hostname !== consoleHost
+        || parsed.username
+        || parsed.password
+        || parsed.search
+        || parsed.hash
+        || (parsed.pathname && parsed.pathname !== '/')
+      ) throw new Error('public origin must be the canonical HTTPS Console origin');
+      consoleOrigin = parsed.origin;
+    } catch {
+      fail(
+        'PUBLIC_CONSOLE_ORIGIN',
+        `must be an HTTPS origin for ${consoleHost} without credentials, path, query, or fragment`,
+      );
+    }
+  }
 
   if (problems.length > 0) {
     throw new AggregateError(
@@ -299,12 +387,14 @@ export function loadConfig({ envFile, env = process.env } = {}) {
     );
   }
 
-  try {
-    fs.mkdirSync(path.join(stateDir, 'logs'), { recursive: true });
-    fs.mkdirSync(path.join(acmeWebroot, '.well-known', 'acme-challenge'), { recursive: true });
-  } catch (err) {
-    const problem = new ConfigError('STATE_DIR', `cannot be created at ${stateDir}: ${err.message}`);
-    throw new AggregateError([problem], `invalid configuration (1 problem):\n  - ${problem.message}`);
+  if (initializeRuntimePaths) {
+    try {
+      fs.mkdirSync(path.join(stateDir, 'logs'), { recursive: true });
+      fs.mkdirSync(path.join(acmeWebroot, '.well-known', 'acme-challenge'), { recursive: true });
+    } catch (err) {
+      const problem = new ConfigError('STATE_DIR', `cannot be created at ${stateDir}: ${err.message}`);
+      throw new AggregateError([problem], `invalid configuration (1 problem):\n  - ${problem.message}`);
+    }
   }
 
   return {
@@ -323,13 +413,20 @@ export function loadConfig({ envFile, env = process.env } = {}) {
     cookieName,
     coordinatorUrl,
     coordinatorAutostart,
+    retainedInventory,
     coordinatorScript,
     coordinatorHome,
-    coordinatorTokenFile,
+    edgePublication: edgePublicationSocket ? {
+      socketPath: edgePublicationSocket,
+      releaseRoot: edgeReleaseRoot,
+      timeoutMs: edgePublicationTimeoutMs,
+      required: edgePublicationRequired,
+    } : null,
     projectRoot,
     metricsIntervalMs,
     lifecycleEnabled,
     stateDir,
+    bugReportDir,
     acmeWebroot,
     logLevel,
     devInsecureHttp,

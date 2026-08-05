@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
-"""Optimized-Python-safe tests for the coordinator auth boundary preflight."""
+"""Optimized-Python-safe tests for the trusted-loopback API preflight."""
 
 from __future__ import annotations
 
 import http.client
 import http.server
 import os
-import signal
 import socket
 import subprocess
 import sys
@@ -18,7 +17,7 @@ from pathlib import Path
 from check_coordinator_auth_boundary import (
     AuthBoundaryError,
     check_boundary,
-    fetch_authenticated_inventory,
+    fetch_local_inventory,
     write_private_inventory,
 )
 
@@ -45,7 +44,6 @@ def unused_loopback_port() -> int:
 
 
 def run_checker(
-    token_file: Path,
     port: int,
     *,
     wait_seconds: float,
@@ -55,8 +53,6 @@ def run_checker(
         [
             sys.executable,
             str(SCRIPT),
-            "--token-file",
-            str(token_file),
             "--host",
             "127.0.0.1",
             "--port",
@@ -76,205 +72,206 @@ def run_checker(
     )
 
 
+def status_for_boundary(
+    path: str,
+    headers: dict[str, str] | None,
+    *,
+    health: int = 200,
+    ready: int = 200,
+) -> int:
+    headers = headers or {}
+    if path == "/healthz":
+        return health
+    if headers.get("Host") == "external.example":
+        return 400
+    if headers.get("Origin") == "https://external.example":
+        return 403
+    return ready
+
+
 def main() -> int:
-    with tempfile.TemporaryDirectory(prefix="coordinator-auth-boundary-") as raw:
-        root = Path(raw).resolve(strict=True)
-        token_file = root / "api-token"
-        token_file.write_text("fixture-secret-token\n", encoding="utf-8")
-        os.chmod(token_file, 0o600)
-        calls: list[tuple[str, str | None]] = []
+    calls: list[tuple[str, dict[str, str] | None]] = []
 
-        def healthy(_host: str, _port: int, _timeout: float, path: str, bearer: str | None) -> int:
-            calls.append((path, bearer))
-            if path == "/healthz" and bearer is None:
-                return 200
-            if path == "/v1/ready" and bearer is None:
-                return 401
-            if path == "/v1/ready" and bearer == "fixture-secret-token":
-                return 200
-            return 500
+    def healthy(
+        _host: str,
+        _port: int,
+        _timeout: float,
+        path: str,
+        headers: dict[str, str] | None,
+    ) -> int:
+        calls.append((path, headers))
+        return status_for_boundary(path, headers)
 
-        observed = check_boundary(token_file=token_file, status_fn=healthy)
-        require(observed["anonymous_ready"] == 401, "anonymous readiness was not proved closed")
-        require(calls[-1] == ("/v1/ready", "fixture-secret-token"), "token was not server-side only")
+    observed = check_boundary(status_fn=healthy)
+    require(
+        observed
+        == {
+            "local_health": 200,
+            "local_ready": 200,
+            "foreign_host_ready": 400,
+            "foreign_origin_ready": 403,
+        },
+        "trusted-loopback status contract drifted",
+    )
+    require(len(calls) == 4, "boundary preflight did not issue exactly four probes")
+    require(
+        all("Authorization" not in (headers or {}) for _path, headers in calls),
+        "boundary preflight sent an application credential",
+    )
 
-        # Reproduce the production Type=simple startup race: systemd reports
-        # the unit active before the Python listener accepts its first
-        # connection. A transient refusal must be retried, while the complete
-        # anonymous/authenticated contract is still checked after readiness.
-        delayed_calls = 0
-        clock = [0.0]
+    # A Type=simple unit may exist briefly before its listener accepts. Retry
+    # a transient transport failure, then prove the complete boundary again.
+    delayed_calls = 0
+    delayed_clock = [0.0]
 
-        def delayed_start(_host: str, _port: int, _timeout: float, path: str, bearer: str | None) -> int:
-            nonlocal delayed_calls
-            delayed_calls += 1
-            if delayed_calls == 1:
-                raise ConnectionRefusedError(111, "Connection refused")
-            return healthy(_host, _port, _timeout, path, bearer)
+    def delayed_start(
+        host: str,
+        port: int,
+        timeout: float,
+        path: str,
+        headers: dict[str, str] | None,
+    ) -> int:
+        nonlocal delayed_calls
+        delayed_calls += 1
+        if delayed_calls == 1:
+            raise ConnectionRefusedError(111, "Connection refused")
+        return healthy(host, port, timeout, path, headers)
 
-        delayed = check_boundary(
-            token_file=token_file,
-            status_fn=delayed_start,
-            wait_seconds=1,
-            poll_interval_seconds=0.1,
-            monotonic_fn=lambda: clock[0],
-            sleep_fn=lambda duration: clock.__setitem__(0, clock[0] + duration),
-        )
-        require(delayed == {"anonymous_health": 200, "anonymous_ready": 401, "authenticated_ready": 200}, "delayed coordinator did not converge")
-        require(delayed_calls == 4, "startup refusal did not restart the full boundary probe")
+    delayed = check_boundary(
+        status_fn=delayed_start,
+        wait_seconds=1,
+        poll_interval_seconds=0.1,
+        monotonic_fn=lambda: delayed_clock[0],
+        sleep_fn=lambda duration: delayed_clock.__setitem__(0, delayed_clock[0] + duration),
+    )
+    require(delayed == observed, "delayed coordinator did not converge")
+    require(delayed_calls == 5, "startup refusal did not restart the full boundary probe")
 
-        # The HTTP listener and authorization middleware can be ready before
-        # the authenticated readiness backend has finished opening. Preserve
-        # the already-proved anonymous boundary while a
-        # bounded authenticated 5xx converges, then require the complete
-        # contract again on every attempt.
-        warming_clock = [0.0]
-        warming_calls: list[tuple[str, str | None]] = []
-        warming_statuses = iter((503, 502, 200))
+    # The HTTP listener can exist before its local readiness backend opens.
+    # Only exact local readiness 5xx with every locality guard intact retries.
+    warming_clock = [0.0]
+    warming_calls = 0
+    warming_statuses = iter((503, 502, 200))
 
-        def warming_inventory(_host: str, _port: int, _timeout: float, path: str, bearer: str | None) -> int:
-            warming_calls.append((path, bearer))
-            if path == "/healthz" and bearer is None:
-                return 200
-            if path == "/v1/ready" and bearer is None:
-                return 401
-            if path == "/v1/ready" and bearer == "fixture-secret-token":
-                return next(warming_statuses)
-            return 418
+    def warming(
+        _host: str,
+        _port: int,
+        _timeout: float,
+        path: str,
+        headers: dict[str, str] | None,
+    ) -> int:
+        nonlocal warming_calls
+        warming_calls += 1
+        if path == "/v1/ready" and not headers:
+            return next(warming_statuses)
+        return status_for_boundary(path, headers)
 
-        warmed = check_boundary(
-            token_file=token_file,
-            status_fn=warming_inventory,
-            wait_seconds=1,
-            poll_interval_seconds=0.1,
-            monotonic_fn=lambda: warming_clock[0],
-            sleep_fn=lambda duration: warming_clock.__setitem__(0, warming_clock[0] + duration),
-        )
-        require(
-            warmed == {"anonymous_health": 200, "anonymous_ready": 401, "authenticated_ready": 200},
-            "authenticated readiness warmup did not converge",
-        )
-        require(len(warming_calls) == 9, "authenticated 5xx did not rerun the full boundary probe")
-        require(warming_clock[0] == 0.2, "authenticated 5xx retry did not respect the poll interval")
+    warmed = check_boundary(
+        status_fn=warming,
+        wait_seconds=1,
+        poll_interval_seconds=0.1,
+        monotonic_fn=lambda: warming_clock[0],
+        sleep_fn=lambda duration: warming_clock.__setitem__(0, warming_clock[0] + duration),
+    )
+    require(warmed == observed, "local readiness warmup did not converge")
+    require(warming_calls == 12, "local readiness 5xx did not rerun every boundary probe")
+    require(warming_clock[0] == 0.2, "local readiness retry ignored the poll interval")
 
-        # A backend that never leaves 5xx remains bounded by the one global
-        # readiness deadline; polling does not create a fresh budget.
-        stalled_clock = [0.0]
-        stalled_calls = 0
+    stalled_clock = [0.0]
+    stalled_calls = 0
 
-        def stalled_inventory(_host: str, _port: int, _timeout: float, path: str, bearer: str | None) -> int:
-            nonlocal stalled_calls
-            stalled_calls += 1
-            if path == "/healthz" and bearer is None:
-                return 200
-            if path == "/v1/ready" and bearer is None:
-                return 401
+    def stalled(
+        _host: str,
+        _port: int,
+        _timeout: float,
+        path: str,
+        headers: dict[str, str] | None,
+    ) -> int:
+        nonlocal stalled_calls
+        stalled_calls += 1
+        if path == "/v1/ready" and not headers:
             return 503
+        return status_for_boundary(path, headers)
 
-        try:
-            check_boundary(
-                token_file=token_file,
-                status_fn=stalled_inventory,
-                wait_seconds=0.25,
-                poll_interval_seconds=0.1,
-                monotonic_fn=lambda: stalled_clock[0],
-                sleep_fn=lambda duration: stalled_clock.__setitem__(0, stalled_clock[0] + duration),
-            )
-        except AuthBoundaryError as error:
-            require("readiness deadline" in str(error), "persistent authenticated 5xx had the wrong failure")
-            require("HTTP 503" in str(error), "persistent authenticated 5xx lost its status evidence")
-            require("fixture-secret-token" not in str(error), "token leaked in authenticated 5xx failure")
-            require(stalled_calls == 9, "authenticated 5xx exceeded the global retry bound")
-            require(0.249 <= stalled_clock[0] <= 0.251, "authenticated 5xx ignored the readiness deadline")
-        else:
-            raise AssertionError("persistent authenticated 5xx was accepted")
+    try:
+        check_boundary(
+            status_fn=stalled,
+            wait_seconds=0.25,
+            poll_interval_seconds=0.1,
+            monotonic_fn=lambda: stalled_clock[0],
+            sleep_fn=lambda duration: stalled_clock.__setitem__(0, stalled_clock[0] + duration),
+        )
+    except AuthBoundaryError as error:
+        require("readiness deadline" in str(error), "persistent readiness 5xx had the wrong failure")
+        require("HTTP 503" in str(error), "persistent readiness 5xx lost status evidence")
+        require(stalled_calls == 12, "persistent readiness exceeded its global retry bound")
+    else:
+        raise AssertionError("persistent readiness 5xx was accepted")
 
-        # Only authenticated 5xx behind the exact anonymous contract is a
-        # readiness state. Authenticated 2xx/4xx mismatches fail immediately.
-        for wrong_authenticated_status in (204, 403):
-            mismatch_calls = 0
-            mismatch_sleeps: list[float] = []
+    for wrong_ready in (204, 403):
+        mismatch_calls = 0
+        mismatch_sleeps: list[float] = []
 
-            def authenticated_mismatch(
-                _host: str,
-                _port: int,
-                _timeout: float,
-                path: str,
-                bearer: str | None,
-            ) -> int:
-                nonlocal mismatch_calls
-                mismatch_calls += 1
-                if path == "/healthz" and bearer is None:
-                    return 200
-                if path == "/v1/ready" and bearer is None:
-                    return 401
-                return wrong_authenticated_status
-
-            try:
-                check_boundary(
-                    token_file=token_file,
-                    status_fn=authenticated_mismatch,
-                    wait_seconds=1,
-                    sleep_fn=mismatch_sleeps.append,
-                )
-            except AuthBoundaryError as error:
-                require("boundary mismatch" in str(error), "authenticated mismatch had the wrong failure")
-                require(mismatch_calls == 3, "authenticated 2xx/4xx mismatch was retried")
-                require(mismatch_sleeps == [], "authenticated 2xx/4xx mismatch entered readiness polling")
-            else:
-                raise AssertionError(f"authenticated HTTP {wrong_authenticated_status} was accepted")
-
-        # Even an authenticated 5xx is not retryable when either anonymous
-        # endpoint violates its exact contract.
-        broken_anonymous_calls = 0
-        broken_anonymous_sleeps: list[float] = []
-
-        def broken_anonymous_contract(
+        def mismatch(
             _host: str,
             _port: int,
             _timeout: float,
             path: str,
-            bearer: str | None,
+            headers: dict[str, str] | None,
         ) -> int:
-            nonlocal broken_anonymous_calls
-            broken_anonymous_calls += 1
-            if path == "/healthz" and bearer is None:
-                return 503
-            if path == "/v1/ready" and bearer is None:
-                return 401
-            return 503
+            nonlocal mismatch_calls
+            mismatch_calls += 1
+            if path == "/v1/ready" and not headers:
+                return wrong_ready
+            return status_for_boundary(path, headers)
 
         try:
-            check_boundary(
-                token_file=token_file,
-                status_fn=broken_anonymous_contract,
-                wait_seconds=1,
-                sleep_fn=broken_anonymous_sleeps.append,
-            )
+            check_boundary(status_fn=mismatch, wait_seconds=1, sleep_fn=mismatch_sleeps.append)
         except AuthBoundaryError as error:
-            require("boundary mismatch" in str(error), "anonymous mismatch had the wrong failure")
-            require(broken_anonymous_calls == 3, "anonymous mismatch plus authenticated 5xx was retried")
-            require(broken_anonymous_sleeps == [], "anonymous mismatch entered readiness polling")
+            require("boundary mismatch" in str(error), "readiness mismatch had the wrong failure")
+            require(mismatch_calls == 4, "non-5xx readiness mismatch was retried")
+            require(mismatch_sleeps == [], "readiness mismatch entered polling")
         else:
-            raise AssertionError("broken anonymous contract plus authenticated 5xx was accepted")
+            raise AssertionError(f"local readiness HTTP {wrong_ready} was accepted")
 
-        # Real-socket/CLI recall fixture for the production failure: invoke the
-        # actual coordinator only after a 300 ms delay, while the checker is
-        # already receiving kernel-level ECONNREFUSED on the final port.
+    broken_calls = 0
+    broken_sleeps: list[float] = []
+
+    def broken_locality(
+        _host: str,
+        _port: int,
+        _timeout: float,
+        path: str,
+        headers: dict[str, str] | None,
+    ) -> int:
+        nonlocal broken_calls
+        broken_calls += 1
+        if path == "/v1/ready" and not headers:
+            return 503
+        if (headers or {}).get("Host") == "external.example":
+            return 200
+        return status_for_boundary(path, headers)
+
+    try:
+        check_boundary(status_fn=broken_locality, wait_seconds=1, sleep_fn=broken_sleeps.append)
+    except AuthBoundaryError as error:
+        require("boundary mismatch" in str(error), "foreign-Host regression had the wrong failure")
+        require(broken_calls == 4, "broken locality plus readiness 5xx was retried")
+        require(broken_sleeps == [], "broken locality entered readiness polling")
+    else:
+        raise AssertionError("foreign Host access plus readiness 5xx was accepted")
+
+    with tempfile.TemporaryDirectory(prefix="coordinator-loopback-boundary-") as raw:
+        root = Path(raw).resolve(strict=True)
         real_port = unused_loopback_port()
         real_home = root / "real-coordinator-home"
         real_home.mkdir(mode=0o700)
-        real_token = root / "real-api-token"
-        real_token.write_text("real-fixture-secret-token-value-0000000001\n", encoding="utf-8")
-        real_token.chmod(0o600)
         wrapper = (
             "import os,sys,time; time.sleep(float(sys.argv[1])); "
             "os.execv(sys.executable, [sys.executable, *sys.argv[2:]])"
         )
         environment = os.environ.copy()
         environment["CODEX_AGENT_COORDINATOR_HOME"] = str(real_home)
-        # Keep the readiness fixture independent of a developer's Docker
-        # daemon latency; Docker inventory is not the behavior under test.
         environment["PATH"] = "/usr/bin:/bin"
         coordinator = subprocess.Popen(
             [
@@ -289,8 +286,6 @@ def main() -> int:
                 "127.0.0.1",
                 "--port",
                 str(real_port),
-                "--token-file",
-                str(real_token),
             ],
             env=environment,
             text=True,
@@ -299,10 +294,10 @@ def main() -> int:
         )
         started = time.monotonic()
         try:
-            real_result = run_checker(real_token, real_port, wait_seconds=5, request_timeout=4)
+            real_result = run_checker(real_port, wait_seconds=5, request_timeout=4)
             require(real_result.returncode == 0, f"real delayed coordinator was rejected: {real_result.stderr}")
-            require(time.monotonic() - started >= 0.2, "real delayed-bind fixture did not exercise startup absence")
-            require('"anonymous_ready": 401' in real_result.stdout, "real CLI did not prove auth closure")
+            require(time.monotonic() - started >= 0.2, "delayed bind fixture did not exercise startup absence")
+            require('"foreign_origin_ready": 403' in real_result.stdout, "real CLI did not prove locality")
         finally:
             coordinator.terminate()
             try:
@@ -311,17 +306,13 @@ def main() -> int:
                 coordinator.kill()
                 coordinator.wait(timeout=3)
 
-        # A real absent listener remains bounded and fails closed.
         absent_port = unused_loopback_port()
         absent_started = time.monotonic()
-        absent_result = run_checker(token_file, absent_port, wait_seconds=0.25)
-        absent_elapsed = time.monotonic() - absent_started
+        absent_result = run_checker(absent_port, wait_seconds=0.25)
         require(absent_result.returncode == 1, "absent real listener was accepted")
-        require("readiness deadline" in absent_result.stderr, "absent listener had the wrong CLI failure")
-        require(0.2 <= absent_elapsed < 2, "absent listener deadline was not bounded")
+        require("readiness deadline" in absent_result.stderr, "absent listener had the wrong failure")
+        require(0.2 <= time.monotonic() - absent_started < 2, "absent listener deadline was not bounded")
 
-        # A reachable real HTTP endpoint with the wrong anonymous contract is
-        # unsafe, not unready, and must fail immediately without retrying.
         class WrongBoundary(http.server.BaseHTTPRequestHandler):
             def do_GET(self) -> None:  # noqa: N802
                 body = b"{}\n"
@@ -339,119 +330,28 @@ def main() -> int:
         wrong_thread.start()
         wrong_started = time.monotonic()
         try:
-            wrong_result = run_checker(token_file, int(wrong_server.server_address[1]), wait_seconds=2)
+            wrong_result = run_checker(int(wrong_server.server_address[1]), wait_seconds=2)
         finally:
             wrong_server.shutdown()
             wrong_server.server_close()
             wrong_thread.join(timeout=2)
-        require(wrong_result.returncode == 1, "reachable anonymous readiness leak was accepted")
+        require(wrong_result.returncode == 1, "reachable foreign-Host leak was accepted")
         require("boundary mismatch" in wrong_result.stderr, "wrong real boundary had the wrong failure")
         require(time.monotonic() - wrong_started < 1.5, "semantic boundary failure was retried")
 
-        # Protocol corruption is likewise reachable-but-invalid and must not
-        # be reclassified as a transient startup race.
-        corrupt_calls = 0
+        inventory_calls = 0
 
-        def corrupt_protocol(*_args: object) -> int:
-            nonlocal corrupt_calls
-            corrupt_calls += 1
-            if corrupt_calls == 1:
-                raise http.client.BadStatusLine("not HTTP")
-            return 200
-
-        try:
-            check_boundary(token_file=token_file, status_fn=corrupt_protocol)
-        except AuthBoundaryError as error:
-            require("non-transient" in str(error), "protocol corruption had the wrong failure")
-            require(corrupt_calls == 1, "protocol corruption was retried")
-        else:
-            raise AssertionError("protocol-corrupt listener was accepted")
-
-        # The deadline covers all three semantic requests, not three separate
-        # timeout budgets.
-        slow_clock = [0.0]
-
-        def slow_but_correct(_host: str, _port: int, _timeout: float, path: str, bearer: str | None) -> int:
-            # Every request begins inside the one-second budget, but the final
-            # correct response completes just after it. Success must still be
-            # rejected rather than treating the request-start time as enough.
-            slow_clock[0] += 0.34
-            return 200 if path == "/healthz" or bearer else 401
-
-        try:
-            check_boundary(
-                token_file=token_file,
-                status_fn=slow_but_correct,
-                wait_seconds=1,
-                monotonic_fn=lambda: slow_clock[0],
-                sleep_fn=lambda duration: slow_clock.__setitem__(0, slow_clock[0] + duration),
-            )
-        except AuthBoundaryError as error:
-            require("readiness deadline" in str(error), "cross-request deadline had the wrong failure")
-        else:
-            raise AssertionError("three requests exceeded one readiness deadline")
-
-        # A genuinely absent final token is also a fresh-host startup race.
-        # The coordinator publishes it atomically, so only ENOENT is retried.
-        missing_token = root / "late-api-token"
-        missing_clock = [0.0]
-
-        def publish_token(duration: float) -> None:
-            missing_clock[0] += duration
-            missing_token.write_text("late-fixture-secret-token-value-0001\n", encoding="utf-8")
-            missing_token.chmod(0o600)
-
-        after_token_publish = check_boundary(
-            token_file=missing_token,
-            status_fn=lambda _host, _port, _timeout, path, bearer: (
-                200 if path == "/healthz" or bearer == "late-fixture-secret-token-value-0001" else 401
-            ),
-            wait_seconds=1,
-            poll_interval_seconds=0.1,
-            monotonic_fn=lambda: missing_clock[0],
-            sleep_fn=publish_token,
-        )
-        require(after_token_publish["authenticated_ready"] == 200, "late token was not retried")
-
-        # A permanently unreachable listener must still fail closed at a
-        # bounded deadline and must not leak the private bearer value.
-        unavailable_clock = [0.0]
-        unavailable_calls = 0
-
-        def unavailable(*_args: object) -> int:
-            nonlocal unavailable_calls
-            unavailable_calls += 1
-            raise ConnectionRefusedError(111, "Connection refused")
-
-        try:
-            check_boundary(
-                token_file=token_file,
-                status_fn=unavailable,
-                wait_seconds=0.3,
-                poll_interval_seconds=0.1,
-                monotonic_fn=lambda: unavailable_clock[0],
-                sleep_fn=lambda duration: unavailable_clock.__setitem__(0, unavailable_clock[0] + duration),
-            )
-        except AuthBoundaryError as error:
-            require("readiness deadline" in str(error), "unreachable coordinator had the wrong failure")
-            require("fixture-secret-token" not in str(error), "token leaked in readiness failure")
-            require(unavailable_calls >= 3, "readiness deadline was not exercised")
-        else:
-            raise AssertionError("permanently unreachable coordinator was accepted")
-
-        fetch_calls: list[str] = []
-
-        def inventory_fetch(_host: str, _port: int, _timeout: float, bearer: str) -> tuple[int, bytes]:
-            fetch_calls.append(bearer)
+        def inventory_fetch(_host: str, _port: int, _timeout: float) -> tuple[int, bytes]:
+            nonlocal inventory_calls
+            inventory_calls += 1
             return 200, b'{"servers":[],"leases":[],"port_assignments":[]}\n'
 
-        inventory = fetch_authenticated_inventory(token_file=token_file, fetch_fn=inventory_fetch)
-        require(inventory["servers"] == [], "authenticated inventory body was not preserved")
-        require(fetch_calls == ["fixture-secret-token"], "inventory fetch did not use the private token once")
+        inventory = fetch_local_inventory(fetch_fn=inventory_fetch)
+        require(inventory["servers"] == [], "trusted-loopback inventory body was not preserved")
+        require(inventory_calls == 1, "inventory fetch was not called exactly once")
         inventory_output = root / "post-cutover-inventory.json"
         write_private_inventory(inventory_output, inventory)
         require((inventory_output.stat().st_mode & 0o777) == 0o600, "inventory evidence is not mode 0600")
-        require("fixture-secret-token" not in inventory_output.read_text(encoding="utf-8"), "token leaked to inventory evidence")
         try:
             write_private_inventory(inventory_output, inventory)
         except FileExistsError:
@@ -460,49 +360,83 @@ def main() -> int:
             raise AssertionError("inventory evidence writer overwrote an existing checkpoint")
 
         try:
-            fetch_authenticated_inventory(
-                token_file=token_file,
-                fetch_fn=lambda *_args: (200, b'[]'),
-            )
+            fetch_local_inventory(fetch_fn=lambda *_args: (200, b"[]"))
         except AuthBoundaryError as error:
             require("root must be an object" in str(error), "wrong inventory shape failure")
         else:
-            raise AssertionError("non-object authenticated inventory was accepted")
+            raise AssertionError("non-object trusted-loopback inventory was accepted")
 
-        # Must catch a coordinator that accidentally leaves /v1 anonymous.
-        def anonymous_leak(_host: str, _port: int, _timeout: float, path: str, bearer: str | None) -> int:
-            if path == "/healthz":
-                return 200
-            if path == "/v1/ready" and bearer is None:
-                return 200
-            return 200
-        try:
-            check_boundary(token_file=token_file, status_fn=anonymous_leak)
-        except AuthBoundaryError as error:
-            require("boundary mismatch" in str(error), "wrong auth failure classification")
-            require("fixture-secret-token" not in str(error), "token leaked in auth failure")
-        else:
-            raise AssertionError("anonymous /v1 access was not detected")
+    corrupt_calls = 0
 
-        fifo = root / "token-fifo"
-        os.mkfifo(fifo, 0o600)
-        previous_handler = signal.signal(
-            signal.SIGALRM,
-            lambda _signum, _frame: (_ for _ in ()).throw(TimeoutError("FIFO open blocked")),
+    def corrupt_protocol(*_args: object) -> int:
+        nonlocal corrupt_calls
+        corrupt_calls += 1
+        if corrupt_calls == 1:
+            raise http.client.BadStatusLine("not HTTP")
+        return 200
+
+    try:
+        check_boundary(status_fn=corrupt_protocol)
+    except AuthBoundaryError as error:
+        require("non-transient" in str(error), "protocol corruption had the wrong failure")
+        require(corrupt_calls == 1, "protocol corruption was retried")
+    else:
+        raise AssertionError("protocol-corrupt listener was accepted")
+
+    slow_clock = [0.0]
+
+    def slow_but_correct(
+        _host: str,
+        _port: int,
+        _timeout: float,
+        path: str,
+        headers: dict[str, str] | None,
+    ) -> int:
+        slow_clock[0] += 0.26
+        return status_for_boundary(path, headers)
+
+    try:
+        check_boundary(
+            status_fn=slow_but_correct,
+            wait_seconds=1,
+            monotonic_fn=lambda: slow_clock[0],
+            sleep_fn=lambda duration: slow_clock.__setitem__(0, slow_clock[0] + duration),
         )
-        signal.alarm(2)
-        try:
-            try:
-                check_boundary(token_file=fifo, status_fn=healthy)
-            except AuthBoundaryError as error:
-                require("regular file" in str(error), "FIFO had the wrong credential failure")
-            else:
-                raise AssertionError("FIFO credential path was accepted")
-        finally:
-            signal.alarm(0)
-            signal.signal(signal.SIGALRM, previous_handler)
+    except AuthBoundaryError as error:
+        require("readiness deadline" in str(error), "cross-request deadline had the wrong failure")
+    else:
+        raise AssertionError("four requests exceeded one readiness deadline")
 
-    print("coordinator auth boundary self-test ok (works with Python optimization)")
+    unavailable_clock = [0.0]
+    unavailable_calls = 0
+
+    def unavailable(*_args: object) -> int:
+        nonlocal unavailable_calls
+        unavailable_calls += 1
+        raise ConnectionRefusedError(111, "Connection refused")
+
+    try:
+        check_boundary(
+            status_fn=unavailable,
+            wait_seconds=0.3,
+            poll_interval_seconds=0.1,
+            monotonic_fn=lambda: unavailable_clock[0],
+            sleep_fn=lambda duration: unavailable_clock.__setitem__(0, unavailable_clock[0] + duration),
+        )
+    except AuthBoundaryError as error:
+        require("readiness deadline" in str(error), "unreachable coordinator had the wrong failure")
+        require(unavailable_calls >= 3, "readiness deadline was not exercised")
+    else:
+        raise AssertionError("permanently unreachable coordinator was accepted")
+
+    try:
+        check_boundary(host="0.0.0.0", status_fn=healthy)
+    except AuthBoundaryError as error:
+        require("restricted to loopback" in str(error), "non-loopback host had the wrong failure")
+    else:
+        raise AssertionError("non-loopback preflight host was accepted")
+
+    print("coordinator trusted-loopback boundary self-test ok (works with Python optimization)")
     return 0
 
 

@@ -1,6 +1,6 @@
-// Loopback client for the codex-dev-coordinator HTTP API (see
-// docs/coordinator-http-api.json). Credentials are read only by this server-side
-// client and are never exposed to browser JavaScript, URLs, or logs.
+// Trusted loopback client for the codex-dev-coordinator HTTP API (see
+// docs/coordinator-http-api.json). The listener and Host/Origin checks form the
+// local boundary; public browser authentication remains in the Console edge.
 
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
@@ -14,10 +14,15 @@ const RUNTIME_ARTIFACT_KINDS = new Set([
 ]);
 const RUNTIME_ARTIFACT_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const RUNTIME_ARTIFACT_MAX_BYTES = 1024 * 1024;
-const TOKEN_MAX_BYTES = 4096;
 const TEST_STATS_CACHE_MAX_BYTES = 8 * 1024 * 1024;
 const TEST_STATS_CACHE_MAX_ENTRIES = 32;
 const TEST_STATS_MAX_STALE_MS = 24 * 60 * 60 * 1000;
+// The envelope remains version 1 so the state-copy validator can safely carry
+// it across Console slots.  This separate revision is intentionally bumped
+// whenever the meaning of a cached test projection changes; entries written by
+// an older renderer are ignored instead of surviving a deploy with stale UI
+// semantics.
+const TEST_STATS_CACHE_SEMANTICS_REVISION = 2;
 const FULL_DOCKER_OBSERVER_DOMAIN = 'host-runtime-v2:full-docker';
 const OPERATIONAL_SERVER_STATES = new Set([
   'running', 'starting', 'unhealthy', 'stopping', 'stopped',
@@ -45,6 +50,12 @@ const RETRYABLE_CODES = new Set([
   'EAI_AGAIN',
   'UND_ERR_CONNECT_TIMEOUT',
 ]);
+const TRANSIENT_TEST_SETUP_CODES = new Set([
+  'test_scheduler_unavailable',
+  'test_repository_setup_unavailable',
+]);
+const TEST_SETUP_RETRY_MIN_DELAY_MS = 250;
+const TEST_SETUP_RETRY_MAX_DELAY_MS = 2_000;
 
 export class CoordError extends Error {
   constructor(message, { status = 0, body = null } = {}) {
@@ -380,7 +391,11 @@ export function createCoordinator({ config, log }) {
       const info = fs.lstatSync(testStatsSnapshotPath);
       if (!info.isFile() || info.isSymbolicLink() || info.size > TEST_STATS_CACHE_MAX_BYTES) return;
       const document = JSON.parse(fs.readFileSync(testStatsSnapshotPath, 'utf8'));
-      if (document?.version !== 1 || !Array.isArray(document.entries)) return;
+      if (
+        document?.version !== 1
+        || document.semantics_revision !== TEST_STATS_CACHE_SEMANTICS_REVISION
+        || !Array.isArray(document.entries)
+      ) return;
       const now = Date.now();
       for (const entry of document.entries.slice(0, TEST_STATS_CACHE_MAX_ENTRIES)) {
         if (
@@ -390,13 +405,14 @@ export function createCoordinator({ config, log }) {
           || !Number.isFinite(entry.at)
           || entry.at > now
           || now - entry.at > TEST_STATS_MAX_STALE_MS
-          || entry.value?.schema_version !== 1
+          || ![1, 2].includes(entry.value?.schema_version)
         ) continue;
         testStatsCaches.set(entry.key, {
           value: entry.value,
           at: entry.at,
           inflight: null,
           generation: 0,
+          retained: true,
         });
       }
     } catch (err) {
@@ -412,14 +428,18 @@ export function createCoordinator({ config, log }) {
     const now = Date.now();
     const entries = [...testStatsCaches.entries()]
       .filter(([, cache]) => (
-        cache.value?.schema_version === 1
+        [1, 2].includes(cache.value?.schema_version)
         && Number.isFinite(cache.at)
         && now - cache.at <= TEST_STATS_MAX_STALE_MS
       ))
       .sort((a, b) => b[1].at - a[1].at)
       .slice(0, TEST_STATS_CACHE_MAX_ENTRIES)
       .map(([key, cache]) => ({ key, at: cache.at, value: cache.value }));
-    const encoded = `${JSON.stringify({ version: 1, entries })}\n`;
+    const encoded = `${JSON.stringify({
+      version: 1,
+      semantics_revision: TEST_STATS_CACHE_SEMANTICS_REVISION,
+      entries,
+    })}\n`;
     if (Buffer.byteLength(encoded) > TEST_STATS_CACHE_MAX_BYTES) return;
     const temporary = `${testStatsSnapshotPath}.${process.pid}.${Date.now()}.tmp`;
     try {
@@ -449,86 +469,6 @@ export function createCoordinator({ config, log }) {
 
   function autostartLogPath() {
     return path.join(config.stateDir, 'logs', 'coordinator-api.log');
-  }
-
-  function readToken() {
-    const tokenFile = String(config.coordinatorTokenFile || '').trim();
-    if (!tokenFile) return null;
-    const noFollow = fs.constants.O_NOFOLLOW;
-    if (!Number.isInteger(noFollow) || noFollow <= 0) {
-      throw new CoordError('coordinator credential cannot be opened safely on this platform', {
-        status: 503,
-      });
-    }
-
-    // Open the caller-named path once and inspect/read that descriptor. A
-    // separate lstat(path) followed by readFile(path) lets the final component
-    // be replaced with a symlink between validation and use. O_NONBLOCK keeps
-    // a malicious FIFO from hanging this server-side request path.
-    const flags = fs.constants.O_RDONLY | noFollow | (fs.constants.O_NONBLOCK ?? 0);
-    let fd = null;
-    try {
-      fd = fs.openSync(tokenFile, flags);
-    } catch (err) {
-      if (err?.code === 'ENOENT') return null;
-      if (err?.code === 'ELOOP') {
-        throw new CoordError('coordinator credential must be a regular non-symlink file', { status: 503 });
-      }
-      throw new CoordError(`coordinator credential cannot be opened: ${err?.code ?? err?.message ?? err}`, {
-        status: 503,
-      });
-    }
-
-    try {
-      const before = fs.fstatSync(fd);
-      if (!before.isFile()) {
-        throw new CoordError('coordinator credential must be a regular non-symlink file', { status: 503 });
-      }
-      if ((before.mode & 0o777) !== 0o600) {
-        throw new CoordError('coordinator credential permissions are unsafe; expected mode 0600', { status: 503 });
-      }
-      if (before.size > TOKEN_MAX_BYTES) {
-        throw new CoordError('coordinator credential file is oversized', { status: 503 });
-      }
-
-      const bytes = Buffer.alloc(TOKEN_MAX_BYTES + 1);
-      let length = 0;
-      while (length < bytes.length) {
-        const count = fs.readSync(fd, bytes, length, bytes.length - length, null);
-        if (count === 0) break;
-        length += count;
-      }
-      if (length > TOKEN_MAX_BYTES) {
-        throw new CoordError('coordinator credential file is oversized', { status: 503 });
-      }
-
-      const after = fs.fstatSync(fd);
-      if (
-        !after.isFile()
-        || after.dev !== before.dev
-        || after.ino !== before.ino
-        || after.size !== before.size
-        || after.size !== length
-      ) {
-        throw new CoordError('coordinator credential changed while being read', { status: 503 });
-      }
-      if ((after.mode & 0o777) !== 0o600) {
-        throw new CoordError('coordinator credential permissions are unsafe; expected mode 0600', { status: 503 });
-      }
-
-      const token = bytes.subarray(0, length).toString('utf8').trim();
-      if (token.length < 32) {
-        throw new CoordError('coordinator credential is empty or too short', { status: 503 });
-      }
-      return token;
-    } catch (err) {
-      if (err instanceof CoordError) throw err;
-      throw new CoordError(`coordinator credential cannot be read: ${err?.code ?? err?.message ?? err}`, {
-        status: 503,
-      });
-    } finally {
-      fs.closeSync(fd);
-    }
   }
 
   async function readBoundedRuntimeArtifact(res) {
@@ -571,10 +511,8 @@ export function createCoordinator({ config, log }) {
     try {
       let res;
       try {
-        const token = apiPath.startsWith('/v1/') ? readToken() : null;
         const headers = {};
         if (body != null) headers['content-type'] = 'application/json';
-        if (token) headers.authorization = `Bearer ${token}`;
         res = await fetch(baseUrl + apiPath, {
           method,
           headers: Object.keys(headers).length ? headers : undefined,
@@ -643,12 +581,9 @@ export function createCoordinator({ config, log }) {
           data && typeof data === 'object' && typeof data.error === 'string'
             ? data.error
             : `coordinator returned HTTP ${res.status}`;
-        const message = res.status === 401
-          ? 'coordinator authentication failed; verify COORDINATOR_TOKEN_FILE'
-          : cleanMessage(raw);
+        const message = cleanMessage(raw);
         const coordErr = new CoordError(message, { status: res.status, body: data });
-        if (res.status === 401) noteDown(coordErr);
-        else noteAlive();
+        noteAlive();
         throw coordErr;
       }
       noteAlive();
@@ -712,7 +647,7 @@ export function createCoordinator({ config, log }) {
     return result;
   }
 
-  // Liveness is intentionally anonymous and independent of credential state.
+  // Liveness uses the same trusted loopback transport as the API namespace.
   async function probe() {
     try {
       const res = await fetch(`${baseUrl}/healthz`, {
@@ -750,7 +685,6 @@ export function createCoordinator({ config, log }) {
         '--port',
         String(port),
       ];
-      if (config.coordinatorTokenFile) args.push('--token-file', config.coordinatorTokenFile);
       child = spawn(
         'python3',
         args,
@@ -834,6 +768,7 @@ export function createCoordinator({ config, log }) {
           cache.value = value;
           cache.at = Date.now();
           cache.dirty = false;
+          cache.retained = false;
           onValue?.(value);
         }
         return value;
@@ -1013,6 +948,301 @@ export function createCoordinator({ config, log }) {
     );
   }
 
+  function testPlan({ repoId, intent, requestedTargets = [], operationId, source } = {}) {
+    if (typeof repoId !== 'string' || !repoId || repoId.length > 256) {
+      throw new CoordError('test planning requires one immutable repository id', { status: 400 });
+    }
+    if (!['change', 'checkpoint', 'handoff', 'release', 'manual'].includes(intent)) {
+      throw new CoordError('test planning intent is invalid', { status: 400 });
+    }
+    if (!Array.isArray(requestedTargets) || requestedTargets.length > 256) {
+      throw new CoordError('test planning targets must be a bounded array', { status: 400 });
+    }
+    const targets = requestedTargets.map((target) => {
+      if (
+        typeof target !== 'string'
+        || !target.trim()
+        || Buffer.byteLength(target.trim(), 'utf8') > 128
+        || /[\u0000-\u001f\u007f]/.test(target)
+      ) {
+        throw new CoordError('test planning target names are invalid', { status: 400 });
+      }
+      return target.trim();
+    });
+    if (new Set(targets).size !== targets.length) {
+      throw new CoordError('test planning targets must be unique', { status: 400 });
+    }
+    if (targets.length && intent !== 'manual') {
+      throw new CoordError('explicit test targets are supported only for manual intent', { status: 400 });
+    }
+    if (
+      typeof operationId !== 'string'
+      || !RUNTIME_ARTIFACT_ID_RE.test(operationId)
+      || operationId.toLowerCase() !== operationId
+    ) {
+      throw new CoordError('test planning requires one canonical operation UUID', { status: 400 });
+    }
+    if (!source || typeof source !== 'object' || Array.isArray(source)
+      || source.schemaVersion !== 1
+      || !['original', 'temporary'].includes(source.kind)
+      || typeof source.repositoryId !== 'string'
+      || !source.repositoryId
+      || source.repositoryId.length > 256
+      || !Number.isInteger(source.repositoryGeneration)
+      || source.repositoryGeneration < 0
+      || (source.kind === 'original' && source.repositoryId !== repoId)) {
+      throw new CoordError('test planning requires one typed repository source', { status: 400 });
+    }
+    const sourceKeys = Object.keys(source).sort();
+    if (sourceKeys.join(',') !== [
+      'kind', 'repositoryGeneration', 'repositoryId', 'schemaVersion', 'temporaryRoot',
+    ].sort().join(',')
+      || (source.temporaryRoot !== null && source.temporaryRoot !== undefined
+        && (typeof source.temporaryRoot !== 'string' || !source.temporaryRoot.startsWith('/')))
+      || (source.kind === 'original' && source.temporaryRoot != null)
+      || (source.kind === 'temporary' && typeof source.temporaryRoot !== 'string')) {
+      throw new CoordError('test planning repository source fields are invalid', { status: 400 });
+    }
+    return request('POST', '/v1/test-plan', {
+      repo_id: repoId,
+      intent,
+      operation_id: operationId,
+      source: {
+        schema_version: 1,
+        kind: source.kind,
+        repository_id: source.repositoryId,
+        repository_generation: source.repositoryGeneration,
+      },
+      ...(targets.length ? { requested_targets: targets } : {}),
+    });
+  }
+
+  function submitTestRun({ repoId, planId, operationId, actor } = {}) {
+    if (typeof repoId !== 'string' || !repoId || repoId.length > 256) {
+      throw new CoordError('test submission requires one immutable repository id', { status: 400 });
+    }
+    if (typeof planId !== 'string' || !planId || planId.length > 255) {
+      throw new CoordError('test submission requires one bounded plan id', { status: 400 });
+    }
+    if (typeof operationId !== 'string' || !operationId || operationId.length > 64) {
+      throw new CoordError('test submission requires one operation id', { status: 400 });
+    }
+    if (typeof actor !== 'string' || !actor || actor.length > 256 || /[\u0000-\u001f\u007f]/.test(actor)) {
+      throw new CoordError('test submission requires one bounded actor', { status: 400 });
+    }
+    return request('POST', '/v1/test-runs', {
+      repo_id: repoId, plan_id: planId, operation_id: operationId, actor,
+    });
+  }
+
+  function testRuns({ repoId, after = null, limit = 50, state = null } = {}) {
+    if (typeof repoId !== 'string' || !repoId || repoId.length > 256) {
+      throw new CoordError('test run history requires one immutable repository id', { status: 400 });
+    }
+    if (!Number.isInteger(limit) || limit < 1 || limit > 200) {
+      throw new CoordError('test run history limit must be 1 through 200', { status: 400 });
+    }
+    if (after !== null && (typeof after !== 'string' || !after || after.length > 256)) {
+      throw new CoordError('test run history cursor is invalid', { status: 400 });
+    }
+    if (state !== null && ![
+      'queued', 'running', 'cancelling', 'superseding', 'succeeded', 'failed',
+      'timed_out', 'cancelled', 'incomplete', 'abandoned', 'superseded',
+    ].includes(state)) {
+      throw new CoordError('test run history state is invalid', { status: 400 });
+    }
+    const query = new URLSearchParams({ repo_id: repoId, limit: String(limit) });
+    if (after !== null) query.set('after', String(after));
+    if (state !== null) query.set('state', String(state));
+    return request('GET', `/v1/test-runs?${query.toString()}`);
+  }
+
+  function validateTestRunIdentity(repoId, runId) {
+    if (typeof repoId !== 'string' || !repoId || repoId.length > 256) {
+      throw new CoordError('test run read requires one immutable repository id', { status: 400 });
+    }
+    if (typeof runId !== 'string' || !runId || runId.length > 256) {
+      throw new CoordError('test run read requires one bounded run id', { status: 400 });
+    }
+  }
+
+  function testRunReadPath(repoId, runId, suffix = '', query = null) {
+    validateTestRunIdentity(repoId, runId);
+    const parameters = new URLSearchParams({ repo_id: repoId });
+    for (const [name, value] of query || []) parameters.append(name, value);
+    return `/v1/test-runs/${encodeURIComponent(runId)}${suffix}?${parameters.toString()}`;
+  }
+
+  function testRunStatus({ repoId, runId } = {}) {
+    return request('GET', testRunReadPath(repoId, runId));
+  }
+
+  function testRunSummary({ repoId, runId } = {}) {
+    return request('GET', testRunReadPath(repoId, runId, '/summary'));
+  }
+
+  function testRunEvidence(kind, { repoId, runId, after = null, limit = 50 } = {}) {
+    if (!['failures', 'artifacts', 'cases'].includes(kind)) {
+      throw new CoordError('test evidence kind is invalid', { status: 400 });
+    }
+    if (!Number.isInteger(limit) || limit < 1 || limit > 50) {
+      throw new CoordError('test evidence limit must be 1 through 50', { status: 400 });
+    }
+    if (kind === 'cases') {
+      if (after !== null && (!Number.isInteger(after) || after < 0)) {
+        throw new CoordError('test case cursor is invalid', { status: 400 });
+      }
+    } else if (after !== null && (typeof after !== 'string' || !after || after.length > 256)) {
+      throw new CoordError('test evidence cursor is invalid', { status: 400 });
+    }
+    const query = new URLSearchParams({ limit: String(limit) });
+    if (after !== null) query.set('after', String(after));
+    return request('GET', testRunReadPath(repoId, runId, `/${kind}`, query));
+  }
+
+  function cancelTestRun({ repoId, runId, reason, operationId, actor } = {}) {
+    validateTestRunIdentity(repoId, runId);
+    if (typeof reason !== 'string' || !reason || reason.length > 512 || /[\u0000-\u001f\u007f]/.test(reason)) {
+      throw new CoordError('test cancellation requires one bounded reason', { status: 400 });
+    }
+    validateTestMutation(operationId, actor);
+    return request('POST', `/v1/test-runs/${encodeURIComponent(runId)}/cancel`, {
+      repo_id: repoId, reason, operation_id: operationId, actor,
+    });
+  }
+
+  function retryTestRun({ repoId, runId, failedOnly = true, operationId, actor } = {}) {
+    validateTestRunIdentity(repoId, runId);
+    if (typeof failedOnly !== 'boolean') {
+      throw new CoordError('test retry failed-only flag is invalid', { status: 400 });
+    }
+    validateTestMutation(operationId, actor);
+    return request('POST', `/v1/test-runs/${encodeURIComponent(runId)}/retry`, {
+      repo_id: repoId, failed_only: failedOnly, operation_id: operationId, actor,
+    });
+  }
+
+  function validateTestMutation(operationId, actor) {
+    if (typeof operationId !== 'string' || !operationId || operationId.length > 64) {
+      throw new CoordError('test mutation requires one operation id', { status: 400 });
+    }
+    if (typeof actor !== 'string' || !actor || actor.length > 256 || /[\u0000-\u001f\u007f]/.test(actor)) {
+      throw new CoordError('test mutation requires one bounded actor', { status: 400 });
+    }
+  }
+
+  async function testRepositorySetup({ repoId } = {}) {
+    if (typeof repoId !== 'string' || !repoId || repoId.length > 256) {
+      throw new CoordError('test setup requires one immutable repository id', { status: 400 });
+    }
+    const apiPath = `/v1/test-repositories/${encodeURIComponent(repoId)}/setup`;
+    try {
+      return await request('GET', apiPath);
+    } catch (error) {
+      if (
+        !(error instanceof CoordError)
+        || !TRANSIENT_TEST_SETUP_CODES.has(error.code)
+        || ![502, 503].includes(error.status)
+      ) throw error;
+      // The first request after a cutover may activate testd and snapshotd at
+      // the same time. This read is idempotent, so hide that one bounded cold
+      // activation race instead of surfacing a global Console error.
+      const hintedDelayMs = Number.isFinite(error.retryAfterSeconds)
+        ? error.retryAfterSeconds * 1_000
+        : TEST_SETUP_RETRY_MIN_DELAY_MS;
+      const delayMs = Math.min(
+        TEST_SETUP_RETRY_MAX_DELAY_MS,
+        Math.max(TEST_SETUP_RETRY_MIN_DELAY_MS, hintedDelayMs),
+      );
+      clog?.warn?.('test setup cold activation retry', {
+        repoId,
+        code: error.code,
+        status: error.status,
+        delayMs,
+        attempts: 1,
+      });
+      await delay(delayMs);
+      try {
+        const value = await request('GET', apiPath);
+        clog?.info?.('test setup cold activation recovered', {
+          repoId,
+          initialCode: error.code,
+          initialStatus: error.status,
+          delayMs,
+          attempts: 2,
+        });
+        return value;
+      } catch (retryError) {
+        clog?.error?.('test setup cold activation retry failed', {
+          repoId,
+          initialCode: error.code,
+          initialStatus: error.status,
+          finalCode: retryError instanceof CoordError ? retryError.code : null,
+          finalStatus: retryError instanceof CoordError ? retryError.status : null,
+          delayMs,
+          attempts: 2,
+          error: String(retryError?.message ?? retryError),
+        });
+        throw retryError;
+      }
+    }
+  }
+
+  function testEvents({ repoId, after = 0, limit = 200 } = {}) {
+    if (typeof repoId !== 'string' || !repoId || repoId.length > 256) {
+      throw new CoordError('test events require one immutable repository id', { status: 400 });
+    }
+    if (!Number.isInteger(after) || after < 0 || !Number.isInteger(limit) || limit < 1 || limit > 500) {
+      throw new CoordError('test event cursor or limit is invalid', { status: 400 });
+    }
+    const query = new URLSearchParams({ repo_id: repoId, after: String(after), limit: String(limit) });
+    return request('GET', `/v1/test-events?${query.toString()}`);
+  }
+
+  function withTestSnapshotDelivery(value, cache, state, refreshing) {
+    if (!value?.snapshot || typeof value.snapshot !== 'object') return value;
+    return {
+      ...value,
+      snapshot: {
+        ...value.snapshot,
+        delivery: {
+          state,
+          age_seconds: Math.max(0, Math.round((Date.now() - cache.at) / 1000)),
+          refreshing,
+        },
+      },
+    };
+  }
+
+  function cachedTestSnapshot({
+    cache,
+    apiPath,
+    maxAgeMs,
+    maxStaleMs,
+    onRefreshError,
+  }) {
+    const ageMs = cache.value === undefined ? Number.POSITIVE_INFINITY : Date.now() - cache.at;
+    if (cache.value !== undefined && ageMs <= maxStaleMs) {
+      if (cache.retained === true || ageMs >= maxAgeMs) {
+        // A usable completed projection must stay on the response path while
+        // its replacement is fetched. startCachedGet coalesces concurrent
+        // refreshes; the live promise is the exact refreshing signal.
+        startCachedGet(cache, apiPath, persistTestStatsSnapshots).catch(onRefreshError);
+      }
+      return Promise.resolve(withTestSnapshotDelivery(
+        cache.value,
+        cache,
+        'retained',
+        cache.inflight !== null,
+      ));
+    }
+
+    // Only callers that had no usable completed projection and therefore
+    // awaited the Coordinator read receive a fresh delivery.
+    return startCachedGet(cache, apiPath, persistTestStatsSnapshots)
+      .then((value) => withTestSnapshotDelivery(value, cache, 'fresh', false));
+  }
+
   function testStats({
     project,
     days = 30,
@@ -1033,25 +1263,55 @@ export function createCoordinator({ config, log }) {
     const key = query.toString();
     let cache = testStatsCaches.get(key);
     if (!cache) {
-      cache = { value: undefined, at: 0, inflight: null, generation: 0 };
+      cache = { value: undefined, at: 0, inflight: null, generation: 0, retained: false };
       testStatsCaches.set(key, cache);
       if (testStatsCaches.size > 128) testStatsCaches.delete(testStatsCaches.keys().next().value);
     }
     const apiPath = `/v1/tests?${key}`;
-    const ageMs = cache.value === undefined ? Number.POSITIVE_INFINITY : Date.now() - cache.at;
-    if (cache.value !== undefined && ageMs > maxAgeMs && ageMs <= maxStaleMs) {
-      // Statistics are observational. Preserve the last completed dashboard
-      // across API restarts and refresh it in the background instead of
-      // making page paint depend on a large repository query.
-      startCachedGet(cache, apiPath, persistTestStatsSnapshots).catch((err) => {
+    return cachedTestSnapshot({
+      cache,
+      apiPath,
+      maxAgeMs,
+      maxStaleMs,
+      onRefreshError: (err) => {
         clog?.warn?.('test statistics refresh failed; serving retained data', {
           project,
           error: String(err?.message ?? err),
         });
+      },
+    });
+  }
+
+  function testFleet({
+    hours = 24,
+    maxAgeMs = 15_000,
+    maxStaleMs = TEST_STATS_MAX_STALE_MS,
+  } = {}) {
+    if (!Number.isInteger(hours) || hours < 1 || hours > 168) {
+      throw new CoordError('fleet test statistics hours must be an integer from 1 through 168', {
+        status: 400,
       });
-      return Promise.resolve(cache.value);
     }
-    return cachedGet(cache, apiPath, maxAgeMs, persistTestStatsSnapshots);
+    const query = new URLSearchParams({ hours: String(hours) });
+    const key = `fleet:${query.toString()}`;
+    let cache = testStatsCaches.get(key);
+    if (!cache) {
+      cache = { value: undefined, at: 0, inflight: null, generation: 0, retained: false };
+      testStatsCaches.set(key, cache);
+      if (testStatsCaches.size > 128) testStatsCaches.delete(testStatsCaches.keys().next().value);
+    }
+    const apiPath = `/v1/test-fleet?${query.toString()}`;
+    return cachedTestSnapshot({
+      cache,
+      apiPath,
+      maxAgeMs,
+      maxStaleMs,
+      onRefreshError: (err) => {
+        clog?.warn?.('fleet test statistics refresh failed; serving retained data', {
+          error: String(err?.message ?? err),
+        });
+      },
+    });
   }
 
   async function dockerAction(name, action, body = {}) {
@@ -1159,7 +1419,20 @@ export function createCoordinator({ config, log }) {
     serversRaw,
     events,
     testRepositories,
+    testPlan,
+    submitTestRun,
+    testRuns,
+    testRunStatus,
+    testRunSummary,
+    testRunFailures: (options = {}) => testRunEvidence('failures', options),
+    testRunArtifacts: (options = {}) => testRunEvidence('artifacts', options),
+    testRunCases: (options = {}) => testRunEvidence('cases', options),
+    cancelTestRun,
+    retryTestRun,
+    testRepositorySetup,
+    testEvents,
     testStats,
+    testFleet,
     observeHost,
     request,
     leasePort: (b = {}) => request('POST', '/v1/ports/lease', b),

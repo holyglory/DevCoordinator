@@ -60,7 +60,6 @@ test('.env parsing: comments, blank lines, CRLF, quotes, export prefix, = in val
       'GOOGLE_CLIENT_SECRET=fixture-abc=def==',
       "LOG_LEVEL='debug'",
       'SESSION_COOKIE_NAME=my_cookie',
-      'COORDINATOR_TOKEN_FILE=~/.codex/test-console-token',
       'this line has no equals sign and is ignored',
     ],
     '\r\n', // CRLF file, as produced by Windows editors
@@ -80,10 +79,26 @@ test('.env parsing: comments, blank lines, CRLF, quotes, export prefix, = in val
   assert.equal(cfg.google.clientId, ''); // untouched by the garbage line
   assert.equal(cfg.logLevel, 'debug');
   assert.equal(cfg.cookieName, 'my_cookie');
-  assert.equal(cfg.coordinatorTokenFile, path.join(os.homedir(), '.codex', 'test-console-token'));
+  assert.equal(Object.hasOwn(cfg, 'coordinatorTokenFile'), false);
   assert.ok(Buffer.isBuffer(cfg.sessionSecret));
   assert.deepEqual(cfg.sessionSecret, Buffer.from(HEX64, 'hex'));
   assert.equal(cfg.stateDir, path.join(dir, 'state'));
+  assert.equal(cfg.bugReportDir, path.join(dir, 'state', 'bugs', 'open'));
+});
+
+test('open bug directory defaults to isolated state and accepts the server-wide production override', async (t) => {
+  const dir = await makeTmp(t);
+  const envFile = await emptyEnvFile(dir);
+  const shared = path.join(dir, 'server-wide-open-bugs');
+
+  const local = loadConfig({ envFile, env: minimalEnv(dir) });
+  const production = loadConfig({
+    envFile,
+    env: minimalEnv(dir, { DEVCOORDINATOR_BUG_DIR: shared }),
+  });
+
+  assert.equal(local.bugReportDir, path.join(dir, 'state', 'bugs', 'open'));
+  assert.equal(production.bugReportDir, shared);
 });
 
 test('process.env wins over the .env file', async (t) => {
@@ -134,6 +149,45 @@ test('cleanup lifecycle is an explicit fail-closed deployment capability', async
       && error.errors.some((item) => item.key === 'LIFECYCLE_ENABLED'),
     'ambiguous truthy strings must not activate destructive lifecycle controls',
   );
+});
+
+test('stable-edge publication is explicit, Unix-only, and required fail-closed in production slots', async (t) => {
+  const dir = await makeTmp(t);
+  const envFile = await emptyEnvFile(dir);
+
+  const local = loadConfig({ envFile, env: minimalEnv(dir) });
+  assert.equal(local.edgePublication, null);
+
+  const production = loadConfig({
+    envFile,
+    env: minimalEnv(dir, {
+      DEVCOORDINATOR_EDGE_PUBLICATION_SOCKET: '/run/devcoordinator-edge-publication/publish.sock',
+      DEVCOORDINATOR_EDGE_RELEASE_ROOT: '/opt/devcoordinator/releases',
+      DEVCOORDINATOR_EDGE_PUBLICATION_REQUIRED: '1',
+      DEVCOORDINATOR_EDGE_PUBLICATION_TIMEOUT_MS: '900',
+    }),
+  });
+  assert.deepEqual(production.edgePublication, {
+    socketPath: '/run/devcoordinator-edge-publication/publish.sock',
+    releaseRoot: '/opt/devcoordinator/releases',
+    timeoutMs: 900,
+    required: true,
+  });
+
+  for (const extra of [
+    { DEVCOORDINATOR_EDGE_PUBLICATION_REQUIRED: '1' },
+    { DEVCOORDINATOR_EDGE_PUBLICATION_SOCKET: 'relative.sock' },
+    {
+      DEVCOORDINATOR_EDGE_PUBLICATION_SOCKET: '/run/edge.sock',
+      DEVCOORDINATOR_EDGE_PUBLICATION_TIMEOUT_MS: '99',
+    },
+  ]) {
+    assert.throws(
+      () => loadConfig({ envFile, env: minimalEnv(dir, extra) }),
+      (error) => error instanceof AggregateError
+        && error.errors.some((item) => item.key?.startsWith('DEVCOORDINATOR_EDGE_')),
+    );
+  }
 });
 
 test('fatal: missing DOMAIN and bad SESSION_SECRET throw one AggregateError listing ALL problems', async (t) => {
@@ -215,6 +269,39 @@ test('HTTP_PORT=0 is valid outside dev mode: plain listener disabled, TLS still 
   assert.equal(cfg.consoleOrigin, 'https://console.vr.ae'); // no :443 suffix
 });
 
+test('PUBLIC_CONSOLE_ORIGIN separates a private slot listener from the stable public origin', async (t) => {
+  const dir = await makeTmp(t);
+  const envFile = await emptyEnvFile(dir);
+  ensureDevCert();
+  const cfg = loadConfig({
+    envFile,
+    env: {
+      DOMAIN: 'vr.ae',
+      SESSION_SECRET: HEX64,
+      HTTP_PORT: '0',
+      HTTPS_PORT: '30444',
+      PUBLIC_CONSOLE_ORIGIN: 'https://console.vr.ae',
+      TLS_CERT_FILE: DEV_CERT,
+      TLS_KEY_FILE: DEV_KEY,
+      STATE_DIR: path.join(dir, 'state'),
+    },
+  });
+  assert.equal(cfg.httpsPort, 30444);
+  assert.equal(cfg.consoleOrigin, 'https://console.vr.ae');
+});
+
+test('PUBLIC_CONSOLE_ORIGIN rejects another trust domain or non-HTTPS origin', async (t) => {
+  const dir = await makeTmp(t);
+  const envFile = await emptyEnvFile(dir);
+  for (const value of ['http://console.vr.ae', 'https://other.vr.ae', 'https://console.vr.ae/path']) {
+    assert.throws(
+      () => loadConfig({ envFile, env: minimalEnv(dir, { PUBLIC_CONSOLE_ORIGIN: value }) }),
+      (error) => error instanceof AggregateError
+        && error.errors.some((entry) => entry.key === 'PUBLIC_CONSOLE_ORIGIN'),
+    );
+  }
+});
+
 test('HTTP_PORT=0 with DEV_HTTP=1 is fatal (it would be the only listener)', async (t) => {
   const dir = await makeTmp(t);
   const envFile = await emptyEnvFile(dir);
@@ -256,7 +343,7 @@ test('invalid ports are each reported', async (t) => {
   );
 });
 
-test('coordinator URL is restricted to a credential-safe loopback origin', async (t) => {
+test('coordinator URL is restricted to the trusted loopback origin', async (t) => {
   const dir = await makeTmp(t);
   const envFile = await emptyEnvFile(dir);
 

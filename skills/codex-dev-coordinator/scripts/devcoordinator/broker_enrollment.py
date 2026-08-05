@@ -20,6 +20,7 @@ import uuid
 from .broker import BrokerOperation
 from .broker_persistence import (
     BrokerPersistence,
+    ComposeEnrollmentContainerScope,
     _default_compose_project_name,
     _normalize_ephemeral_environment,
     _require_ephemeral_secret_policy_environment,
@@ -30,7 +31,11 @@ from .broker_persistence import (
     _require_compose_project_name,
     _require_compose_service_name,
 )
-from .broker_profile import PROFILE_VERSION
+from .broker_profile import (
+    PROFILE_VERSION,
+    REPOSITORY_PROFILE_FIELDS,
+    host_profile_from_document,
+)
 from .ephemeral_secrets import (
     deterministic_secret_binding_id,
     normalize_ephemeral_secret_policy,
@@ -39,6 +44,7 @@ from .compose_contract import (
     require_effective_compose_model,
     require_sealable_compose_payload,
 )
+from .compose_run_once import normalize_compose_run_once_policies
 from .observation_freshness import (
     FULL_DOCKER_OBSERVER_DOMAIN,
     ObservationFreshnessError,
@@ -47,6 +53,10 @@ from .observation_freshness import (
     require_exact_fresh_observation,
 )
 from .repository_lifecycle import LifecycleError, RepositoryLifecycle, ResourceKind
+from .schema import (
+    advance_repository_owner_generation,
+    establish_repository_owner_authority,
+)
 from .sqlite_lifecycle import SQLiteLifecyclePersistence
 from .store import (
     AccountStore,
@@ -61,6 +71,7 @@ from .worker_artifacts import provision_worker_log_directory
 _FULL_DOCKER_OBSERVER_DOMAIN = FULL_DOCKER_OBSERVER_DOMAIN
 _SHA256_FINGERPRINT = re.compile(r"sha256:[0-9a-f]{64}")
 _BARE_SHA256 = re.compile(r"[0-9a-f]{64}")
+_EXACT_CONTAINER_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
 _MAX_SERVER_ENVIRONMENT_ENTRIES = 128
 _MAX_SERVER_ENVIRONMENT_NAME_BYTES = 256
 _MAX_SERVER_ENVIRONMENT_VALUE_BYTES = 8_192
@@ -73,6 +84,7 @@ def enroll_repository(
     socket_path: Path,
     socket_gid: int,
     client_uid: int,
+    repository_owner_uid: int,
     account_id: str,
     canonical_root: str,
     servers: Sequence[Mapping[str, Any]],
@@ -83,12 +95,14 @@ def enroll_repository(
     ephemeral_containers: Sequence[Mapping[str, Any]] = (),
     grant_ephemeral_image_prefetch: bool = False,
     compose: Mapping[str, Any] | None = None,
+    allowed_compose_run_once_services: Sequence[str] = (),
     compose_model_renderer: Callable[..., bytes] | None = None,
     approve_compose_host_access: bool = False,
     observe_host: Callable[[AccountStore], Mapping[str, Any] | None] | None = None,
     explicit_reinstall: bool = False,
     grant_cleanup_capabilities: bool = False,
     validity_seconds: int = 30 * 24 * 60 * 60,
+    socket_mode: int = 0o666,
 ) -> dict[str, Any]:
     """Synchronize trusted definitions/ACLs and atomically install a profile.
 
@@ -98,14 +112,12 @@ def enroll_repository(
     """
 
     service_uid = os.geteuid()
-    if service_uid != 0:
-        raise PermissionError(
-            "broker enrollment must run as the root service administrator"
-        )
     if type(client_uid) is not int or client_uid < 0:
         raise ValueError("client_uid must be a non-negative integer")
     if type(socket_gid) is not int or socket_gid < 0:
         raise ValueError("socket_gid must be a non-negative integer")
+    if socket_mode != 0o666:
+        raise ValueError("new broker profiles require universal local socket mode 0666")
     if not 1 <= port_start <= port_end <= 65535:
         raise ValueError("broker enrollment port range is invalid")
     if not 60 <= validity_seconds <= 365 * 24 * 60 * 60:
@@ -135,6 +147,8 @@ def enroll_repository(
         from .broker_host import render_compose_effective_model
 
         compose_model_renderer = render_compose_effective_model
+    if type(repository_owner_uid) is not int or repository_owner_uid <= 0:
+        raise ValueError("repository owner UID must be a positive integer")
     issued_epoch = int(time.time())
     issued_at = utc_timestamp(issued_epoch)
     valid_until_epoch = issued_epoch + validity_seconds
@@ -163,6 +177,7 @@ def enroll_repository(
     # behind while retaining the prior account's grants.
     persistence.provision_principal(uid=client_uid, account_id=account_id)
     now = utc_timestamp()
+    owner_operation_id = str(uuid.uuid4())
     # Host observation and normalized inventory are intentionally implemented
     # by AccountStore for both account-owned and service-owned databases.  Use
     # that adapter here so the real enrollment observer receives the same
@@ -173,8 +188,11 @@ def enroll_repository(
         with store.immediate_transaction() as connection:
             existing = connection.execute(
                 """
-                SELECT repo_id, state, generation
-                FROM repositories
+                SELECT repository.repo_id, repository.state,
+                       repository.generation, owner.owner_uid,
+                       owner.repository_generation
+                FROM repositories repository
+                LEFT JOIN repository_owners owner USING(repo_id)
                 WHERE host_id = ? AND canonical_root = ?
                 """,
                 (host_id, str(root)),
@@ -193,7 +211,35 @@ def enroll_repository(
                     """,
                     (repo_id, host_id, str(root), root.name or str(root), now, now),
                 )
+                establish_repository_owner_authority(
+                    connection,
+                    repository_id=repo_id,
+                    owner_uid=repository_owner_uid,
+                    repository_generation=0,
+                    operation_id=owner_operation_id,
+                    actor=f"broker-enrollment:{account_id}",
+                    reason="explicit repository enrollment owner authority",
+                    timestamp=now,
+                    evidence={
+                        "kind": "broker-repository-owner-enrollment",
+                        "repository_id": repo_id,
+                        "canonical_root": str(root),
+                        "repository_generation": 0,
+                        "owner_uid": repository_owner_uid,
+                        "authorized_client_uid": client_uid,
+                        "account_id": account_id,
+                    },
+                )
             else:
+                if (
+                    existing["owner_uid"] is None
+                    or int(existing["owner_uid"]) != repository_owner_uid
+                    or int(existing["repository_generation"])
+                    != int(existing["generation"])
+                ):
+                    raise RuntimeError(
+                        "repository execution owner authority is missing, stale, or conflicts with the explicit enrollment owner"
+                    )
                 if str(existing["state"]) == "missing":
                     removed_generation = int(existing["generation"]) - 1
                     revocation = connection.execute(
@@ -230,6 +276,27 @@ def enroll_repository(
                         raise RuntimeError(
                             "repository generation changed during explicit reinstall"
                         )
+                    advance_repository_owner_generation(
+                        connection,
+                        repository_id=repo_id,
+                        owner_uid=repository_owner_uid,
+                        prior_repository_generation=int(existing["generation"]),
+                        repository_generation=int(existing["generation"]) + 1,
+                        operation_id=owner_operation_id,
+                        actor=f"broker-enrollment:{account_id}",
+                        reason="explicit repository reinstall generation advance",
+                        timestamp=now,
+                        evidence={
+                            "kind": "broker-repository-owner-reinstall",
+                            "repository_id": repo_id,
+                            "canonical_root": str(root),
+                            "prior_repository_generation": int(existing["generation"]),
+                            "repository_generation": int(existing["generation"]) + 1,
+                            "owner_uid": repository_owner_uid,
+                            "authorized_client_uid": client_uid,
+                            "account_id": account_id,
+                        },
+                    )
                 elif str(existing["state"]) == "active":
                     connection.execute(
                         """
@@ -308,6 +375,9 @@ def enroll_repository(
                 store,
                 host_id=host_id,
                 observe_host=observe_host,
+                require_complete_compose_assets=bool(
+                    compose and compose.get("declared")
+                ),
             )
         with store.read_transaction() as connection:
             repository_row = connection.execute(
@@ -316,6 +386,14 @@ def enroll_repository(
         if repository_row is None:
             raise RuntimeError("repository disappeared during enrollment")
         repository_generation = int(repository_row["generation"])
+
+    compose_observed_scope = _compose_enrollment_container_scope(
+        persistence,
+        repo_id=repo_id,
+        root=root,
+        compose=compose,
+        enrollment_snapshot_id=enrollment_snapshot_id,
+    )
 
     persistence.grant_repository_read(
         uid=client_uid,
@@ -346,57 +424,39 @@ def enroll_repository(
         max_ttl_seconds=7 * 24 * 60 * 60,
     )
 
-    # Reenrollment must revoke every observation-derived capability before any
-    # exact fresh snapshot is allowed to grant it again. Cleanup resources are
-    # intentionally included in the older canonical ACL set as well.
-    _disable_observed_resource_grants(
-        persistence, repo_id=repo_id, client_uid=client_uid
-    )
+    # Reenrollment commits one fail-closed revocation of every observation-
+    # derived capability before an exact fresh snapshot may replace the set.
     persistence.revoke_observation_derived_access(
         uid=client_uid,
         repo_id=repo_id,
         containers=True,
         databases=True,
         lifecycle_resources=True,
+        cleanup_resources=True,
     )
-    container_ids = (
-        _grant_observed_containers(
-            persistence,
-            repo_id=repo_id,
-            client_uid=client_uid,
-            snapshot_id=enrollment_snapshot_id,
-        )
-        if enrollment_snapshot_id is not None
-        else {}
-    )
+    container_ids: dict[str, str] = {}
     grant_snapshot_id: str | None = None
     if observe_host is not None:
-        with AccountStore.open(database_path, expected_uid=service_uid) as grant_store:
-            grant_host_id = persistence.repository_host_id(repo_id)
-            grant_snapshot_id = _capture_new_enrollment_observation(
-                grant_store,
-                host_id=grant_host_id,
-                observe_host=observe_host,
-            )
-        _grant_observed_databases(
+        # One exact post-boundary host snapshot is sufficient for enrollment,
+        # grants, and Compose collision checks.  Recapturing the entire Docker
+        # host here doubled enrollment latency and could pair an incomplete
+        # transient scan with a later complete one.  Reuse the already fenced
+        # snapshot instead.
+        grant_snapshot_id = enrollment_snapshot_id
+        if grant_snapshot_id is None:
+            raise RuntimeError("enrollment observation disappeared before grants")
+        container_ids = _grant_all_observed_access(
             persistence,
             repo_id=repo_id,
             client_uid=client_uid,
             snapshot_id=grant_snapshot_id,
+            include_cleanup=grant_cleanup_capabilities,
+            excluded_container_ids=(
+                ()
+                if compose_observed_scope is None
+                else compose_observed_scope.non_lifecycle_container_ids
+            ),
         )
-        _grant_observed_lifecycle_resources(
-            persistence,
-            repo_id=repo_id,
-            client_uid=client_uid,
-            snapshot_id=grant_snapshot_id,
-        )
-        if grant_cleanup_capabilities:
-            _grant_observed_cleanup_resources(
-                persistence,
-                repo_id=repo_id,
-                client_uid=client_uid,
-                snapshot_id=grant_snapshot_id,
-            )
 
     for operation in (
         BrokerOperation.ARCHIVES_READ,
@@ -418,14 +478,28 @@ def enroll_repository(
             operation=operation,
             enabled=grant_cleanup_capabilities,
         )
+    compose_run_once_services = _compose_run_once_grant_mapping(
+        compose=compose,
+        allowed_run_once_services=allowed_compose_run_once_services,
+    )
     compose_definition_id = _provision_compose(
         persistence,
         repo_id=repo_id,
         client_uid=client_uid,
         root=root,
         compose=compose,
+        allowed_run_once_services=allowed_compose_run_once_services,
         observation_snapshot_id=enrollment_snapshot_id,
         host_access_approved=approve_compose_host_access,
+    )
+    compose_container_ids = _compose_owned_container_ids_for_profile(
+        persistence,
+        repo_id=repo_id,
+        root=root,
+        compose=compose,
+        compose_definition_id=compose_definition_id,
+        enrollment_snapshot_id=enrollment_snapshot_id,
+        enrolled_container_ids=frozenset(container_ids.values()),
     )
     ephemeral_templates = _provision_ephemeral_templates(
         persistence,
@@ -454,7 +528,7 @@ def enroll_repository(
             "socket": str(socket_path),
             "uid": service_uid,
             "gid": socket_gid,
-            "mode": "0660",
+            "mode": f"{socket_mode:04o}",
             "database_generation": database_generation,
         },
         client_uid=client_uid,
@@ -463,9 +537,12 @@ def enroll_repository(
             "canonical_root": str(root),
             "repo_id": repo_id,
             "generation": repository_generation,
+            "owner_uid": repository_owner_uid,
             "servers": granted_server_ids,
             "containers": container_ids,
             "compose_definition_id": compose_definition_id,
+            "compose_container_ids": list(compose_container_ids),
+            "compose_run_once_services": compose_run_once_services,
             "ephemeral_templates": ephemeral_templates,
             "ephemeral_image_prefetch_templates": (
                 sorted(ephemeral_templates.values())
@@ -482,10 +559,13 @@ def enroll_repository(
         "client_uid": client_uid,
         "account_id": account_id,
         "repo_id": repo_id,
+        "repository_owner_uid": repository_owner_uid,
         "server_ids": granted_server_ids,
         "defined_server_ids": server_ids,
         "container_ids": container_ids,
         "compose_definition_id": compose_definition_id,
+        "compose_container_ids": list(compose_container_ids),
+        "compose_run_once_services": compose_run_once_services,
         "ephemeral_templates": ephemeral_templates,
         "ephemeral_image_prefetch_templates": (
             sorted(ephemeral_templates.values())
@@ -925,14 +1005,25 @@ def _disable_observed_resource_grants(
                 )
 
 
-def _grant_observed_containers(
+def _collect_observed_containers(
     persistence: BrokerPersistence,
     *,
     repo_id: str,
     client_uid: int,
     snapshot_id: str,
-) -> dict[str, str]:
+    excluded_container_ids: Sequence[str] = (),
+) -> tuple[
+    dict[str, str],
+    tuple[tuple[str, str, str, bool], ...],
+    tuple[tuple[str, str, str], ...],
+    tuple[tuple[str, str, BrokerOperation], ...],
+]:
     result: dict[str, str] = {}
+    if isinstance(excluded_container_ids, (str, bytes, bytearray)):
+        raise ValueError("excluded container IDs must be a sequence")
+    excluded_ids = frozenset(str(item) for item in excluded_container_ids)
+    if any(not item for item in excluded_ids):
+        raise ValueError("excluded container IDs must be non-empty")
     with CoordinatorStore.open(
         persistence.database_path, expected_uid=persistence.expected_uid
     ) as store:
@@ -949,7 +1040,8 @@ def _grant_observed_containers(
                            observed.full_container_id AS observed_full_container_id,
                            observed.ownership_state,
                            observed.authoritative_owner_repo_id,
-                           d.full_container_id, d.current_name
+                           d.full_container_id, d.current_name,
+                           1 AS compose_scoped
                     FROM broker_observed_compose_containers observed
                     JOIN docker_resources d
                       ON d.docker_resource_id = observed.docker_resource_id
@@ -971,45 +1063,70 @@ def _grant_observed_containers(
                     (snapshot_id, repo_id, repo_id),
                 )
             )
-            compose_scope = connection.execute(
-                "SELECT 1 FROM broker_observation_compose_scope WHERE snapshot_id = ?",
-                (snapshot_id,),
-            ).fetchone()
-            if not rows and compose_scope is None:
-                # Compatibility for canonical full-Docker snapshots recorded
-                # before exhaustive Compose-scope evidence existed. Never use
-                # this path for a new Compose-scoped snapshot: those must carry
-                # the stronger per-container ownership and full-ID proof above.
-                rows = list(
-                    connection.execute(
-                        """
-                        SELECT d.docker_resource_id,
-                               d.full_container_id AS observed_full_container_id,
-                               'exclusive' AS ownership_state,
-                               membership.repo_id AS authoritative_owner_repo_id,
-                               d.full_container_id, d.current_name
-                        FROM repository_memberships membership
-                        JOIN control_bindings binding
-                          ON binding.binding_id = membership.control_binding_id
-                        JOIN docker_resources d
-                          ON d.docker_resource_id = membership.host_resource_id
-                        JOIN docker_engines engine USING(engine_id)
-                        JOIN repositories repository
-                          ON repository.repo_id = membership.repo_id
-                         AND repository.host_id = engine.host_id
-                        JOIN observation_snapshot_resources observed
-                          ON observed.snapshot_id = ?
-                         AND observed.resource_kind = 'container'
-                         AND observed.resource_id = d.docker_resource_id
-                        WHERE membership.repo_id = ?
-                          AND membership.resource_kind = 'container'
-                          AND binding.authority_state = 'authoritative'
-                          AND binding.provenance != 'coordinator_ephemeral'
-                        ORDER BY d.current_name, d.full_container_id
-                        """,
-                        (snapshot_id, repo_id),
-                    )
+            # Compose scope is exhaustive only for Compose-labelled resources.
+            # An exact operator/runtime-manifest membership can deliberately
+            # own a standalone container in the same full-Docker snapshot. It
+            # needs the same runtime grants, but its identity proof must remain
+            # snapshot-scoped rather than pretending it was Compose evidence.
+            rows.extend(
+                connection.execute(
+                    """
+                    SELECT d.docker_resource_id,
+                           d.full_container_id AS observed_full_container_id,
+                           'exclusive' AS ownership_state,
+                           membership.repo_id AS authoritative_owner_repo_id,
+                           d.full_container_id, d.current_name,
+                           0 AS compose_scoped
+                    FROM repository_memberships membership
+                    JOIN control_bindings binding
+                      ON binding.binding_id = membership.control_binding_id
+                    JOIN docker_resources d
+                      ON d.docker_resource_id = membership.host_resource_id
+                    JOIN docker_engines engine USING(engine_id)
+                    JOIN repositories repository
+                      ON repository.repo_id = membership.repo_id
+                     AND repository.host_id = engine.host_id
+                    JOIN observation_snapshot_resources observed
+                      ON observed.snapshot_id = ?
+                     AND observed.resource_kind = 'container'
+                     AND observed.resource_id = d.docker_resource_id
+                    WHERE membership.repo_id = ?
+                      AND membership.resource_kind = 'container'
+                      AND binding.authority_state = 'authoritative'
+                      AND binding.provenance != 'coordinator_ephemeral'
+                      AND (
+                          binding.provenance IN (
+                              'operator_attach', 'runtime_manifest'
+                          )
+                          OR NOT EXISTS (
+                              SELECT 1
+                              FROM broker_observation_compose_scope scope
+                              WHERE scope.snapshot_id = ?
+                          )
+                      )
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM broker_observed_compose_containers compose_observed
+                          WHERE compose_observed.snapshot_id = ?
+                            AND compose_observed.docker_resource_id =
+                                d.docker_resource_id
+                      )
+                    ORDER BY d.current_name, d.full_container_id
+                    """,
+                    (snapshot_id, repo_id, snapshot_id, snapshot_id),
                 )
+            )
+            rows.sort(
+                key=lambda row: (
+                    str(row["current_name"]),
+                    str(row["full_container_id"]),
+                )
+            )
+            rows = [
+                row
+                for row in rows
+                if str(row["docker_resource_id"]) not in excluded_ids
+            ]
             for row in rows:
                 if (
                     str(row["ownership_state"]) != "exclusive"
@@ -1040,40 +1157,74 @@ def _grant_observed_containers(
                     raise RuntimeError(
                         "exact enrollment container membership is absent, stale, or conflicting"
                     )
-    for row in rows:
-        resource_id = str(row["docker_resource_id"])
-        for runtime_action in ("status", "start", "stop", "restart"):
-            persistence.grant_runtime(
-                uid=client_uid,
-                repo_id=repo_id,
-                resource_kind="docker",
-                resource_id=resource_id,
-                action=runtime_action,
-            )
+    runtime_grants = tuple(
+        ("docker", str(row["docker_resource_id"]), action)
+        for row in rows
+        for action in ("status", "start", "stop", "restart")
+    )
+    resource_grants = tuple(
+        ("container", str(row["docker_resource_id"]), operation)
+        for row in rows
         for operation in (
             BrokerOperation.DOCKER_START,
             BrokerOperation.DOCKER_STOP,
             BrokerOperation.DOCKER_RESTART,
-        ):
-            persistence.grant_resource(
-                uid=client_uid,
-                repo_id=repo_id,
-                resource_kind="container",
-                resource_id=resource_id,
-                operation=operation,
-            )
+        )
+    )
+    for row in rows:
+        resource_id = str(row["docker_resource_id"])
         result[str(row["current_name"])] = resource_id
         result[str(row["full_container_id"])] = resource_id
-    return result
+    identity_grants = tuple(
+        (
+            snapshot_id,
+            str(row["docker_resource_id"]),
+            str(row["full_container_id"]),
+            bool(row["compose_scoped"]),
+        )
+        for row in rows
+    )
+    return result, identity_grants, runtime_grants, resource_grants
 
 
-def _grant_observed_databases(
+def _grant_observed_containers(
     persistence: BrokerPersistence,
     *,
     repo_id: str,
     client_uid: int,
     snapshot_id: str,
-) -> None:
+) -> dict[str, str]:
+    (
+        aliases,
+        identity_grants,
+        runtime_grants,
+        resource_grants,
+    ) = _collect_observed_containers(
+        persistence,
+        repo_id=repo_id,
+        client_uid=client_uid,
+        snapshot_id=snapshot_id,
+    )
+    persistence.grant_observation_derived_access_batch(
+        uid=client_uid,
+        repo_id=repo_id,
+        container_identity_grants=identity_grants,
+        runtime_grants=runtime_grants,
+        resource_grants=resource_grants,
+    )
+    return aliases
+
+
+def _collect_observed_databases(
+    persistence: BrokerPersistence,
+    *,
+    repo_id: str,
+    client_uid: int,
+    snapshot_id: str,
+) -> tuple[
+    tuple[tuple[str, str, str], ...],
+    tuple[tuple[str, BrokerOperation], ...],
+]:
     with CoordinatorStore.open(
         persistence.database_path, expected_uid=persistence.expected_uid
     ) as store:
@@ -1137,34 +1288,51 @@ def _grant_observed_databases(
                         (snapshot_id, repo_id),
                     )
                 )
-    for binding_id in binding_ids:
-        for runtime_action in ("status", "start", "stop", "restart"):
-            persistence.grant_runtime(
-                uid=client_uid,
-                repo_id=repo_id,
-                resource_kind="database_stack",
-                resource_id=binding_id,
-                action=runtime_action,
+    return (
+        tuple(
+            ("database_stack", binding_id, action)
+            for binding_id in binding_ids
+            for action in ("status", "start", "stop", "restart")
+        ),
+        tuple(
+            (binding_id, operation)
+            for binding_id in binding_ids
+            for operation in (
+                BrokerOperation.DATABASE_BACKUP,
+                BrokerOperation.DATABASE_RESTORE,
             )
-        for operation in (
-            BrokerOperation.DATABASE_BACKUP,
-            BrokerOperation.DATABASE_RESTORE,
-        ):
-            persistence.grant_database(
-                uid=client_uid,
-                repo_id=repo_id,
-                database_binding_id=binding_id,
-                operation=operation,
-            )
+        ),
+    )
 
 
-def _grant_observed_lifecycle_resources(
+def _grant_observed_databases(
     persistence: BrokerPersistence,
     *,
     repo_id: str,
     client_uid: int,
     snapshot_id: str,
 ) -> None:
+    runtime_grants, database_grants = _collect_observed_databases(
+        persistence,
+        repo_id=repo_id,
+        client_uid=client_uid,
+        snapshot_id=snapshot_id,
+    )
+    persistence.grant_observation_derived_access_batch(
+        uid=client_uid,
+        repo_id=repo_id,
+        runtime_grants=runtime_grants,
+        database_grants=database_grants,
+    )
+
+
+def _collect_observed_lifecycle_resources(
+    persistence: BrokerPersistence,
+    *,
+    repo_id: str,
+    client_uid: int,
+    snapshot_id: str,
+) -> tuple[tuple[str, str, str, str, str, BrokerOperation], ...]:
     exact_resources = []
     with CoordinatorStore.open(
         persistence.database_path, expected_uid=persistence.expected_uid
@@ -1269,31 +1437,51 @@ def _grant_observed_lifecycle_resources(
                 # converted into an authorization grant. A later administrator
                 # enrollment after a clean observation can provision them.
                 continue
-    for exact in exact_resources:
+    return tuple(
+        (
+            exact.kind.value,
+            exact.resource_id,
+            exact.control_binding_id,
+            exact.immutable_fingerprint,
+            exact.ownership_fingerprint,
+            operation,
+        )
+        for exact in exact_resources
         for operation in (
             BrokerOperation.RESOURCE_ATTACH,
             BrokerOperation.RESOURCE_PLAN_RETIRE,
             BrokerOperation.RESOURCE_RETIRE,
-        ):
-            persistence.grant_lifecycle_resource(
-                uid=client_uid,
-                repo_id=repo_id,
-                resource_kind=exact.kind.value,
-                resource_id=exact.resource_id,
-                control_binding_id=exact.control_binding_id,
-                immutable_fingerprint=exact.immutable_fingerprint,
-                ownership_fingerprint=exact.ownership_fingerprint,
-                operation=operation,
-            )
+        )
+    )
 
 
-def _grant_observed_cleanup_resources(
+def _grant_observed_lifecycle_resources(
     persistence: BrokerPersistence,
     *,
     repo_id: str,
     client_uid: int,
     snapshot_id: str,
 ) -> None:
+    grants = _collect_observed_lifecycle_resources(
+        persistence,
+        repo_id=repo_id,
+        client_uid=client_uid,
+        snapshot_id=snapshot_id,
+    )
+    persistence.grant_observation_derived_access_batch(
+        uid=client_uid,
+        repo_id=repo_id,
+        lifecycle_resource_grants=grants,
+    )
+
+
+def _collect_observed_cleanup_resources(
+    persistence: BrokerPersistence,
+    *,
+    repo_id: str,
+    client_uid: int,
+    snapshot_id: str,
+) -> tuple[tuple[str, str, str, str, str, BrokerOperation], ...]:
     with CoordinatorStore.open(
         persistence.database_path, expected_uid=persistence.expected_uid
     ) as store:
@@ -1326,33 +1514,108 @@ def _grant_observed_cleanup_resources(
             for target in snapshot.targets
             if (target.kind.value, target.resource_id) in observed_resources
         )
-    for exact in exact_resources:
+    return tuple(
+        (
+            exact.kind.value,
+            exact.resource_id,
+            exact.control_binding_id,
+            exact.immutable_fingerprint,
+            (
+                exact.control_contract_fingerprint
+                if operation
+                in {
+                    BrokerOperation.CLEANUP_PLAN,
+                    BrokerOperation.CLEANUP_APPLY,
+                    BrokerOperation.RESOURCE_RESTORE,
+                }
+                else exact.ownership_fingerprint
+            ),
+            operation,
+        )
+        for exact in exact_resources
         for operation in (
             BrokerOperation.CLEANUP_PLAN,
             BrokerOperation.CLEANUP_APPLY,
             BrokerOperation.RESOURCE_PLAN_ARCHIVE,
             BrokerOperation.RESOURCE_ARCHIVE,
             BrokerOperation.RESOURCE_RESTORE,
-        ):
-            persistence.grant_cleanup_resource(
-                uid=client_uid,
-                repo_id=repo_id,
-                resource_kind=exact.kind.value,
-                resource_id=exact.resource_id,
-                control_binding_id=exact.control_binding_id,
-                immutable_fingerprint=exact.immutable_fingerprint,
-                ownership_fingerprint=(
-                    exact.control_contract_fingerprint
-                    if operation
-                    in {
-                        BrokerOperation.CLEANUP_PLAN,
-                        BrokerOperation.CLEANUP_APPLY,
-                        BrokerOperation.RESOURCE_RESTORE,
-                    }
-                    else exact.ownership_fingerprint
-                ),
-                operation=operation,
-            )
+        )
+    )
+
+
+def _grant_observed_cleanup_resources(
+    persistence: BrokerPersistence,
+    *,
+    repo_id: str,
+    client_uid: int,
+    snapshot_id: str,
+) -> None:
+    grants = _collect_observed_cleanup_resources(
+        persistence,
+        repo_id=repo_id,
+        client_uid=client_uid,
+        snapshot_id=snapshot_id,
+    )
+    persistence.grant_observation_derived_access_batch(
+        uid=client_uid,
+        repo_id=repo_id,
+        cleanup_resource_grants=grants,
+    )
+
+
+def _grant_all_observed_access(
+    persistence: BrokerPersistence,
+    *,
+    repo_id: str,
+    client_uid: int,
+    snapshot_id: str,
+    include_cleanup: bool,
+    excluded_container_ids: Sequence[str] = (),
+) -> dict[str, str]:
+    """Derive one exact replacement set and publish it in one transaction."""
+
+    aliases, container_identities, container_runtime, container_resources = (
+        _collect_observed_containers(
+            persistence,
+            repo_id=repo_id,
+            client_uid=client_uid,
+            snapshot_id=snapshot_id,
+            excluded_container_ids=excluded_container_ids,
+        )
+    )
+    database_runtime, database_grants = _collect_observed_databases(
+        persistence,
+        repo_id=repo_id,
+        client_uid=client_uid,
+        snapshot_id=snapshot_id,
+    )
+    lifecycle_grants = _collect_observed_lifecycle_resources(
+        persistence,
+        repo_id=repo_id,
+        client_uid=client_uid,
+        snapshot_id=snapshot_id,
+    )
+    cleanup_grants = (
+        _collect_observed_cleanup_resources(
+            persistence,
+            repo_id=repo_id,
+            client_uid=client_uid,
+            snapshot_id=snapshot_id,
+        )
+        if include_cleanup
+        else ()
+    )
+    persistence.grant_observation_derived_access_batch(
+        uid=client_uid,
+        repo_id=repo_id,
+        container_identity_grants=container_identities,
+        runtime_grants=(*container_runtime, *database_runtime),
+        resource_grants=container_resources,
+        database_grants=database_grants,
+        lifecycle_resource_grants=lifecycle_grants,
+        cleanup_resource_grants=cleanup_grants,
+    )
+    return aliases
 
 
 def _require_exact_grant_snapshot(
@@ -1384,6 +1647,345 @@ def _require_exact_grant_snapshot(
         raise RuntimeError(
             "enrollment grant derivation requires its exact completed full-Docker snapshot"
         )
+
+
+def _declared_container_names(
+    runtime_file: Path,
+    *,
+    candidates: frozenset[str],
+) -> tuple[str, ...]:
+    """Read explicit Docker dependency names from one enrolled runtime manifest.
+
+    Only the exact ``container`` field is authority. Dependency labels, images,
+    repository names, and fuzzy container-name similarity are deliberately not
+    considered. The observer calls this only while an exact currently
+    unassigned container with the same name exists.
+    """
+
+    if not candidates:
+        return ()
+    try:
+        metadata = runtime_file.lstat()
+    except FileNotFoundError:
+        return ()
+    except OSError as error:
+        raise ValueError("runtime manifest metadata cannot be read") from error
+    if (
+        stat.S_ISLNK(metadata.st_mode)
+        or not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_size < 2
+        or metadata.st_size > 2 * 1024 * 1024
+    ):
+        raise ValueError("runtime manifest is not one bounded regular file")
+    try:
+        document = json.loads(runtime_file.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError, RecursionError) as error:
+        raise ValueError("runtime manifest cannot be decoded") from error
+    if not isinstance(document, Mapping):
+        raise ValueError("runtime manifest must be an object")
+    docker = document.get("docker")
+    sections: list[object] = [document.get("dependencies", [])]
+    if isinstance(docker, Mapping):
+        sections.append(docker.get("containers", []))
+    declared: list[str] = []
+    for section in sections:
+        if section is None:
+            continue
+        if not isinstance(section, list):
+            raise ValueError("runtime Docker dependencies must be lists")
+        for raw in section:
+            if not isinstance(raw, Mapping):
+                raise ValueError("runtime Docker dependency must be an object")
+            if str(raw.get("type") or "docker") != "docker":
+                continue
+            container = raw.get("container")
+            if container is None:
+                continue
+            if (
+                not isinstance(container, str)
+                or _EXACT_CONTAINER_NAME.fullmatch(container) is None
+            ):
+                raise ValueError("runtime Docker dependency container is invalid")
+            if container in candidates and container not in declared:
+                declared.append(container)
+    return tuple(declared)
+
+
+def reconcile_enrolled_runtime_container_declarations(
+    store: AccountStore,
+    *,
+    snapshot_id: str,
+) -> dict[str, Any]:
+    """Rebuild lost ownership from exact enrolled runtime declarations.
+
+    Fresh-store adoption intentionally discards historical membership rows.
+    This reconciliation makes the checked-in runtime manifest the durable
+    reconstruction source without guessing from project or image names. It is
+    bounded to exact containers that are both present in ``snapshot_id`` and
+    currently unassigned for a repairable attribution reason.
+
+    A dependency may be shared by several repositories. The first enrolled
+    repository owns lifecycle control (``created_at``, then canonical root as a
+    deterministic tie-break); later declarations are references only. An
+    existing owner is never replaced.
+    """
+
+    if not isinstance(snapshot_id, str) or not snapshot_id:
+        raise ValueError("declaration reconciliation requires a snapshot ID")
+    with store.read_transaction() as connection:
+        snapshot = connection.execute(
+            """
+            SELECT snapshot.host_id, snapshot.status, snapshot.observer_domain,
+                   capability.docker_available
+            FROM observation_snapshots snapshot
+            JOIN observation_capabilities capability USING(snapshot_id)
+            WHERE snapshot.snapshot_id = ?
+            """,
+            (snapshot_id,),
+        ).fetchone()
+        if (
+            snapshot is None
+            or str(snapshot["status"]) != "completed"
+            or str(snapshot["observer_domain"]) != _FULL_DOCKER_OBSERVER_DOMAIN
+            or not bool(snapshot["docker_available"])
+        ):
+            return {
+                "checked": 0,
+                "changed": 0,
+                "bindings": [],
+                "invalid_manifests": [],
+                "skipped": "full_docker_snapshot_unavailable",
+            }
+        rows = list(
+            connection.execute(
+                """
+                SELECT resource.docker_resource_id, resource.full_container_id,
+                       resource.current_name, binding.binding_id,
+                       binding.authority_state, binding.provenance,
+                       membership.repo_id AS attached_repo_id,
+                       membership.control_binding_id AS membership_binding_id
+                FROM observation_snapshot_resources present
+                JOIN docker_resources resource
+                  ON resource.docker_resource_id = present.resource_id
+                JOIN docker_engines engine USING(engine_id)
+                JOIN control_bindings binding
+                  ON binding.binding_id = (
+                      SELECT candidate.binding_id
+                      FROM control_bindings candidate
+                      WHERE candidate.resource_kind = 'container'
+                        AND candidate.resource_id = resource.docker_resource_id
+                      ORDER BY candidate.priority DESC, candidate.binding_id
+                      LIMIT 1
+                  )
+                LEFT JOIN repository_memberships membership
+                  ON membership.resource_kind = 'container'
+                 AND membership.host_resource_id = resource.docker_resource_id
+                WHERE present.snapshot_id = ?
+                  AND present.resource_kind = 'container'
+                  AND engine.host_id = ?
+                  AND EXISTS (
+                      SELECT 1 FROM unassigned_resources unassigned
+                      WHERE unassigned.host_id = engine.host_id
+                        AND unassigned.resource_kind = 'container'
+                        AND unassigned.resource_id = resource.docker_resource_id
+                        AND unassigned.status = 'active'
+                        AND unassigned.reason_code IN (
+                            'name_only', 'not_git', 'missing_repo'
+                        )
+                  )
+                ORDER BY resource.current_name, resource.full_container_id
+                """,
+                (snapshot_id, str(snapshot["host_id"])),
+            )
+        )
+        repositories = list(
+            connection.execute(
+                """
+                SELECT repository.repo_id, repository.canonical_root,
+                       repository.created_at
+                FROM repositories repository
+                JOIN repository_installations installation USING(repo_id)
+                WHERE repository.host_id = ?
+                  AND repository.state = 'active'
+                  AND installation.status = 'installed'
+                  AND installation.startup_fenced = 0
+                ORDER BY repository.created_at, repository.canonical_root,
+                         repository.repo_id
+                """,
+                (str(snapshot["host_id"]),),
+            )
+        )
+    if not rows:
+        return {
+            "checked": 0,
+            "changed": 0,
+            "bindings": [],
+            "invalid_manifests": [],
+        }
+
+    by_name: dict[str, list[Mapping[str, Any]]] = {}
+    for row in rows:
+        by_name.setdefault(str(row["current_name"]), []).append(row)
+    candidates = frozenset(by_name)
+    declarations: dict[str, list[dict[str, str]]] = {}
+    invalid_manifests: list[dict[str, str]] = []
+    for repository in repositories:
+        canonical_root = str(repository["canonical_root"])
+        runtime_file = Path(canonical_root) / ".codex/dev-runtime.json"
+        try:
+            names = _declared_container_names(runtime_file, candidates=candidates)
+        except ValueError as error:
+            invalid_manifests.append(
+                {
+                    "repo_id": str(repository["repo_id"]),
+                    "canonical_root": canonical_root,
+                    "error": str(error),
+                }
+            )
+            continue
+        for name in names:
+            declarations.setdefault(name, []).append(
+                {
+                    "repo_id": str(repository["repo_id"]),
+                    "canonical_root": canonical_root,
+                }
+            )
+
+    if invalid_manifests:
+        # Primary ownership is ordered across every enrolled repository. If
+        # even one manifest is temporarily unreadable or mid-edit, it may be
+        # the earlier declaration for any candidate. Keep the observer healthy
+        # but defer every adoption from this snapshot; otherwise a later shared
+        # declaration could win permanently under the never-steal rule.
+        return {
+            "checked": len(rows),
+            "changed": 0,
+            "bindings": [
+                {
+                    "container": name,
+                    "status": "reconciliation_deferred_invalid_manifest",
+                    "declared_by": declarations.get(name, []),
+                }
+                for name in sorted(by_name)
+            ],
+            "invalid_manifests": invalid_manifests,
+            "skipped": "enrolled_runtime_manifest_invalid",
+        }
+
+    lifecycle = SQLiteLifecyclePersistence(store)
+    bindings: list[dict[str, Any]] = []
+    changed = 0
+    for name in sorted(by_name):
+        observed = by_name[name]
+        declared_by = declarations.get(name, [])
+        if not declared_by:
+            continue
+        if len(observed) != 1:
+            bindings.append(
+                {
+                    "container": name,
+                    "status": "ambiguous_observed_identity",
+                    "observed_count": len(observed),
+                    "declared_by": declared_by,
+                }
+            )
+            continue
+        row = observed[0]
+        primary = declared_by[0]
+        attached_repo_id = (
+            None
+            if row["attached_repo_id"] is None
+            else str(row["attached_repo_id"])
+        )
+        if attached_repo_id not in {None, primary["repo_id"]}:
+            bindings.append(
+                {
+                    "container": name,
+                    "resource_id": str(row["docker_resource_id"]),
+                    "status": "retained_existing_owner",
+                    "owner_repo_id": attached_repo_id,
+                    "primary_declaration": primary,
+                    "shared_references": declared_by[1:],
+                }
+            )
+            continue
+        if (
+            str(row["authority_state"]) != "authoritative"
+            or not isinstance(row["binding_id"], str)
+            or not row["binding_id"]
+            or (
+                attached_repo_id is not None
+                and str(row["membership_binding_id"] or "")
+                != str(row["binding_id"])
+            )
+        ):
+            bindings.append(
+                {
+                    "container": name,
+                    "resource_id": str(row["docker_resource_id"]),
+                    "status": "control_binding_unavailable",
+                    "primary_declaration": primary,
+                    "shared_references": declared_by[1:],
+                }
+            )
+            continue
+        try:
+            if attached_repo_id is None:
+                exact = lifecycle.resolve_standalone_resource(
+                    ResourceKind.CONTAINER,
+                    str(row["docker_resource_id"]),
+                    str(row["binding_id"]),
+                )
+            else:
+                exact, resolved_repo_id = lifecycle.resolve_resource(
+                    ResourceKind.CONTAINER,
+                    str(row["docker_resource_id"]),
+                    str(row["binding_id"]),
+                )
+                if resolved_repo_id != primary["repo_id"]:
+                    raise LifecycleError(
+                        "declared container owner changed during reconciliation"
+                    )
+            result = lifecycle.attach_resource(
+                primary["repo_id"],
+                exact,
+                actor="runtime-manifest-reconciler",
+                reason=(
+                    "exact checked-in runtime dependency declaration"
+                ),
+                provenance="runtime_manifest",
+                allow_existing=True,
+            )
+        except (LifecycleError, ValueError) as error:
+            bindings.append(
+                {
+                    "container": name,
+                    "resource_id": str(row["docker_resource_id"]),
+                    "status": "reconciliation_deferred",
+                    "error": str(error),
+                    "primary_declaration": primary,
+                    "shared_references": declared_by[1:],
+                }
+            )
+            continue
+        changed += int(result.attached)
+        bindings.append(
+            {
+                "container": name,
+                "resource_id": str(row["docker_resource_id"]),
+                "full_container_id": str(row["full_container_id"]),
+                "status": "attached" if result.attached else "already_attached",
+                "owner_repo_id": primary["repo_id"],
+                "owner_root": primary["canonical_root"],
+                "shared_references": declared_by[1:],
+            }
+        )
+    return {
+        "checked": len(rows),
+        "changed": changed,
+        "bindings": bindings,
+        "invalid_manifests": invalid_manifests,
+    }
 
 
 def _normalize_ephemeral_templates(
@@ -1678,12 +2280,26 @@ def _provision_compose(
     client_uid: int,
     root: Path,
     compose: Mapping[str, Any] | None,
+    allowed_run_once_services: Sequence[str] = (),
     observation_snapshot_id: str | None = None,
     host_access_approved: bool = False,
 ) -> str | None:
     if not compose or not compose.get("declared"):
         persistence.disable_repository_compose(repo_id=repo_id)
+        if allowed_run_once_services:
+            raise ValueError(
+                "Compose run-once grants require a declared Compose definition"
+            )
         return None
+    run_once_policies = normalize_compose_run_once_policies(
+        compose.get("run_once_services", ())
+    )
+    granted_run_once_names = tuple(
+        _compose_run_once_grant_mapping(
+            compose=compose,
+            allowed_run_once_services=allowed_run_once_services,
+        )
+    )
     files: list[str] = []
     for raw in compose.get("files") or []:
         path = _canonical_repository_file(
@@ -1726,6 +2342,9 @@ def _provision_compose(
         env_files=tuple(env_files),
         profiles=tuple(str(item) for item in compose.get("profiles") or []),
         services=services,
+        run_once_services=tuple(
+            policy.to_document() for policy in run_once_policies
+        ),
         project_name=(
             None
             if compose.get("project_name") is None
@@ -1744,7 +2363,136 @@ def _provision_compose(
         repo_id=repo_id,
         compose_definition_id=compose_id,
     )
+    persistence.replace_compose_run_once_access(
+        uid=client_uid,
+        repo_id=repo_id,
+        compose_definition_id=compose_id,
+        service_names=granted_run_once_names,
+    )
     return compose_id
+
+
+def _compose_enrollment_container_scope(
+    persistence: BrokerPersistence,
+    *,
+    repo_id: str,
+    root: Path,
+    compose: Mapping[str, Any] | None,
+    enrollment_snapshot_id: str | None,
+) -> ComposeEnrollmentContainerScope | None:
+    """Validate the complete same-project scope from the enrollment snapshot."""
+
+    if not compose or not compose.get("declared"):
+        return None
+    if enrollment_snapshot_id is None:
+        raise RuntimeError("declared Compose enrollment lacks snapshot authority")
+    services = tuple(
+        _require_compose_service_name(str(item))
+        for item in compose.get("services") or ()
+    )
+    if not services:
+        raise RuntimeError("declared Compose enrollment has no lifecycle services")
+    run_once_services = tuple(
+        policy.name
+        for policy in normalize_compose_run_once_policies(
+            compose.get("run_once_services", ())
+        )
+    )
+    project_name = _require_compose_project_name(
+        str(compose["project_name"])
+        if compose.get("project_name") is not None
+        else _default_compose_project_name(root.name)
+    )
+    return persistence.compose_enrollment_container_scope(
+        repo_id=repo_id,
+        snapshot_id=enrollment_snapshot_id,
+        project_name=project_name,
+        service_names=services,
+        run_once_service_names=run_once_services,
+    )
+
+
+def _compose_owned_container_ids_for_profile(
+    persistence: BrokerPersistence,
+    *,
+    repo_id: str,
+    root: Path,
+    compose: Mapping[str, Any] | None,
+    compose_definition_id: str | None,
+    enrollment_snapshot_id: str | None,
+    enrolled_container_ids: frozenset[str],
+) -> tuple[str, ...]:
+    """Publish the exact existing container subset controlled by Compose."""
+
+    if not compose or not compose.get("declared"):
+        if compose_definition_id is not None:
+            raise RuntimeError(
+                "undeclared Compose enrollment returned a contradictory definition"
+            )
+        return ()
+    if compose_definition_id is None or enrollment_snapshot_id is None:
+        raise RuntimeError(
+            "declared Compose enrollment lacks definition or snapshot authority"
+        )
+    observed_scope = _compose_enrollment_container_scope(
+        persistence,
+        repo_id=repo_id,
+        root=root,
+        compose=compose,
+        enrollment_snapshot_id=enrollment_snapshot_id,
+    )
+    if observed_scope is None:
+        raise RuntimeError("declared Compose enrollment has no observed scope")
+    resource_ids = observed_scope.lifecycle_container_ids
+    if len(set(resource_ids)) != len(resource_ids):
+        raise RuntimeError("Compose-owned enrollment resource IDs are duplicated")
+    if not set(resource_ids) <= enrolled_container_ids:
+        raise RuntimeError(
+            "Compose-owned enrollment resource is absent from client container grants"
+        )
+    return tuple(sorted(resource_ids))
+
+
+def _compose_run_once_grant_mapping(
+    *,
+    compose: Mapping[str, Any] | None,
+    allowed_run_once_services: Sequence[str],
+) -> dict[str, int]:
+    """Validate an explicit enrollment grant and publish only timeout ceilings."""
+
+    if isinstance(allowed_run_once_services, (str, bytes, bytearray)):
+        raise ValueError(
+            "allowed Compose run-once services must be a sequence of exact names"
+        )
+    supplied = tuple(allowed_run_once_services)
+    if not compose or not compose.get("declared"):
+        if supplied:
+            raise ValueError(
+                "Compose run-once grants require a declared Compose definition"
+            )
+        return {}
+    policies = normalize_compose_run_once_policies(
+        compose.get("run_once_services", ())
+    )
+    policy_by_name = {policy.name: policy for policy in policies}
+    names: list[str] = []
+    for item in supplied:
+        if not isinstance(item, str) or not item:
+            raise ValueError(
+                "allowed Compose run-once service names must be non-empty strings"
+            )
+        if item not in names:
+            names.append(item)
+    unknown = sorted(set(names) - set(policy_by_name))
+    if unknown:
+        raise ValueError(
+            "Compose run-once grant names are absent from the sealed manifest: "
+            + ", ".join(unknown)
+        )
+    return {
+        name: policy_by_name[name].max_timeout_seconds
+        for name in names
+    }
 
 
 def _preflight_compose_definition(
@@ -1785,9 +2533,6 @@ def _preflight_compose_definition(
         compose_payloads.append(payload)
     env_payloads: list[bytes] = []
     for path in env_paths:
-        metadata = path.stat()
-        if stat.S_IMODE(metadata.st_mode) & 0o077:
-            raise ValueError("Compose environment file grants group or other access")
         payload = path.read_bytes()
         if len(payload) > 1024 * 1024:
             raise ValueError("Compose environment file exceeds its bounded size limit")
@@ -1798,6 +2543,15 @@ def _preflight_compose_definition(
     )
     if not services or len(set(services)) != len(services):
         raise ValueError("declared Compose enrollment requires unique exact services")
+    run_once_policies = normalize_compose_run_once_policies(
+        compose.get("run_once_services", ())
+    )
+    run_once_names = tuple(policy.name for policy in run_once_policies)
+    if set(services) & set(run_once_names):
+        raise ValueError(
+            "Compose lifecycle and run-once service scopes must be disjoint"
+        )
+    model_services = tuple((*services, *run_once_names))
     profiles = tuple(
         _require_compose_profile_name(str(item))
         for item in compose.get("profiles") or ()
@@ -1813,17 +2567,25 @@ def _preflight_compose_definition(
         compose_payloads=tuple(compose_payloads),
         env_payloads=tuple(env_payloads),
         profiles=profiles,
-        declared_services=services,
+        declared_services=model_services,
         project_name=project_name,
         pinned_cwd=str(root),
     )
-    require_effective_compose_model(
+    evidence = require_effective_compose_model(
         rendered,
-        declared_services=services,
+        declared_services=model_services,
         declared_profiles=profiles,
         project_name=project_name,
         host_access_approved=host_access_approved,
     )
+    missing_images = sorted(
+        set(run_once_names) - set(dict(evidence.service_images))
+    )
+    if missing_images:
+        raise ValueError(
+            "Compose run-once services require explicit image references: "
+            + ", ".join(missing_images)
+        )
 
 
 def revoke_server_from_protected_profile(
@@ -1841,8 +2603,6 @@ def revoke_server_from_protected_profile(
     remains safely fenced and cleanup retry can repeat this idempotently.
     """
 
-    if os.geteuid() != 0:
-        raise PermissionError("protected broker profile revocation requires root")
     path = profile_path.expanduser()
     if not path.is_absolute() or ".." in path.parts:
         raise ValueError("broker profile path must be absolute without traversal")
@@ -1897,8 +2657,6 @@ def revoke_repository_from_protected_profile(
 ) -> dict[str, Any]:
     """Remove one permanently revoked repository generation from all clients."""
 
-    if os.geteuid() != 0:
-        raise PermissionError("protected broker profile revocation requires root")
     path = profile_path.expanduser()
     if not path.is_absolute() or ".." in path.parts:
         raise ValueError("broker profile path must be absolute without traversal")
@@ -1948,12 +2706,8 @@ def _read_protected_profile_for_revocation(
     if (
         stat.S_ISLNK(metadata.st_mode)
         or not stat.S_ISREG(metadata.st_mode)
-        or metadata.st_uid != 0
-        or stat.S_IMODE(metadata.st_mode) & (stat.S_IWGRP | stat.S_IWOTH)
     ):
-        raise PermissionError(
-            "broker profile revocation requires a protected root-owned regular file"
-        )
+        raise PermissionError("broker profile revocation requires a regular file")
     try:
         document = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as error:
@@ -2092,20 +2846,19 @@ def _merge_profile(
             if (
                 stat.S_ISLNK(metadata.st_mode)
                 or not stat.S_ISREG(metadata.st_mode)
-                or metadata.st_uid != 0
-                or stat.S_IMODE(metadata.st_mode) & (stat.S_IWGRP | stat.S_IWOTH)
             ):
-                raise PermissionError(
-                    "existing broker profile is not a protected root-owned file"
-                )
+                raise PermissionError("existing broker profile is not a regular file")
             document = json.loads(path.read_text(encoding="utf-8"))
             if (
-                document.get("version") != PROFILE_VERSION
+                not isinstance(document, dict)
+                or set(document) != {"version", "service", "clients"}
+                or document.get("version") != PROFILE_VERSION
                 or document.get("service") != service
             ):
                 raise RuntimeError(
                     "existing broker profile belongs to another service authority"
                 )
+            host_profile_from_document(document, effective_uid=client_uid)
         else:
             document = {
                 "version": PROFILE_VERSION,
@@ -2126,13 +2879,6 @@ def _merge_profile(
             raise RuntimeError(
                 "authenticated UID already has a protected profile for a different account; implicit authority transfer is forbidden"
             )
-        current_issued_at = str(current.get("issued_at") or issued_at)
-        current_expiry = current.get("valid_until_epoch")
-        legacy_expiry = (
-            int(current_expiry)
-            if type(current_expiry) is int and current_expiry > 0
-            else valid_until_epoch
-        )
         repositories: list[dict[str, Any]] = []
         current_repositories = current.get("repositories", [])
         if not isinstance(current_repositories, list):
@@ -2140,21 +2886,20 @@ def _merge_profile(
                 "existing broker profile has an invalid repository enrollment list"
             )
         for item in current_repositories:
-            if not isinstance(item, dict):
+            if (
+                not isinstance(item, dict)
+                or set(item) != REPOSITORY_PROFILE_FIELDS
+            ):
                 raise RuntimeError(
                     "existing broker profile has an invalid repository enrollment"
                 )
             if item.get("canonical_root") == repository["canonical_root"]:
                 continue
             preserved = dict(item)
-            preserved.setdefault("account_id", account_id)
             if str(preserved["account_id"]) != account_id:
                 raise RuntimeError(
                     "protected repository profile belongs to a different account"
                 )
-            preserved.setdefault("enabled", True)
-            preserved.setdefault("issued_at", current_issued_at)
-            preserved.setdefault("valid_until_epoch", legacy_expiry)
             repositories.append(preserved)
         enrolled_repository = dict(repository)
         enrolled_repository.update(
@@ -2165,6 +2910,10 @@ def _merge_profile(
                 "valid_until_epoch": valid_until_epoch,
             }
         )
+        if set(enrolled_repository) != REPOSITORY_PROFILE_FIELDS:
+            raise RuntimeError(
+                "new broker profile has an invalid repository enrollment"
+            )
         repositories.append(enrolled_repository)
         repositories.sort(key=lambda item: str(item["canonical_root"]))
         clients[key] = {
@@ -2199,14 +2948,10 @@ def _locked_root_profile(
         path_metadata = lock_path.lstat()
         if (
             not stat.S_ISREG(metadata.st_mode)
-            or metadata.st_uid != 0
-            or stat.S_IMODE(metadata.st_mode) & (stat.S_IWGRP | stat.S_IWOTH)
             or (metadata.st_dev, metadata.st_ino)
             != (path_metadata.st_dev, path_metadata.st_ino)
         ):
-            raise PermissionError(
-                "broker profile lock is not a protected root-owned regular file"
-            )
+            raise PermissionError("broker profile lock is not a stable regular file")
         os.fchown(descriptor, 0, access_gid)
         os.fchmod(descriptor, 0o640)
         fcntl.flock(descriptor, fcntl.LOCK_EX)
@@ -2219,8 +2964,6 @@ def _locked_root_profile(
 
 
 def _ensure_root_profile_parent(path: Path, *, access_gid: int) -> None:
-    if os.geteuid() != 0:
-        raise PermissionError("broker profile installation requires root")
     if (
         not path.is_absolute()
         or ".." in path.parts
@@ -2242,14 +2985,10 @@ def _ensure_root_profile_parent(path: Path, *, access_gid: int) -> None:
         if (
             stat.S_ISLNK(metadata.st_mode)
             or not stat.S_ISDIR(metadata.st_mode)
-            or metadata.st_uid != 0
-            or stat.S_IMODE(metadata.st_mode) & (stat.S_IWGRP | stat.S_IWOTH)
         ):
-            raise PermissionError(
-                "every broker profile directory ancestor must be protected and root-owned"
-            )
+            raise PermissionError("broker profile directory ancestor is not a real directory")
     os.chown(path, 0, access_gid)
-    os.chmod(path, 0o750)
+    os.chmod(path, 0o755)
 
 
 def _atomic_write_root_json(
@@ -2265,14 +3004,14 @@ def _atomic_write_root_json(
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
-    descriptor = os.open(temporary, flags, 0o640)
+    descriptor = os.open(temporary, flags, 0o644)
     try:
         with os.fdopen(descriptor, "wb", closefd=True) as handle:
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
         os.chown(temporary, 0, access_gid)
-        os.chmod(temporary, 0o640)
+        os.chmod(temporary, 0o644)
         os.replace(temporary, path)
         directory = os.open(path.parent, os.O_RDONLY)
         try:
@@ -2332,6 +3071,7 @@ def _capture_new_enrollment_observation(
     *,
     host_id: str,
     observe_host: Callable[[CoordinatorStore], Mapping[str, Any] | None],
+    require_complete_compose_assets: bool = False,
 ) -> str:
     """Capture evidence created strictly after the enrollment boundary.
 
@@ -2340,7 +3080,9 @@ def _capture_new_enrollment_observation(
     more so authority is never derived from pre-boundary state.
     """
 
-    for attempt in range(2):
+    if type(require_complete_compose_assets) is not bool:
+        raise TypeError("require_complete_compose_assets must be a boolean")
+    for attempt in range(3):
         fence = capture_observation_freshness_fence(store, host_id=host_id)
         evidence = observe_host(store)
         snapshot_id = (
@@ -2352,15 +3094,32 @@ def _capture_new_enrollment_observation(
             snapshot_id is not None and snapshot_id in fence.joinable_snapshot_ids
         )
         try:
-            return _require_exact_enrollment_observation(
+            accepted = _require_exact_enrollment_observation(
                 store,
                 evidence=evidence,
                 fence=fence,
             )
         except RuntimeError:
-            if attempt == 0 and joined_pre_boundary_ticket:
+            if attempt < 2 and joined_pre_boundary_ticket:
                 continue
             raise
+        if require_complete_compose_assets:
+            with store.read_transaction() as connection:
+                compose_scope = connection.execute(
+                    """
+                    SELECT assets_complete
+                    FROM broker_observation_compose_scope
+                    WHERE snapshot_id = ?
+                    """,
+                    (accepted,),
+                ).fetchone()
+            if compose_scope is None or not bool(compose_scope["assets_complete"]):
+                if attempt < 2:
+                    continue
+                raise RuntimeError(
+                    "Compose enrollment could not obtain a complete local Docker asset snapshot"
+                )
+        return accepted
     raise RuntimeError(
         "Enrollment requires an observation created after its freshness boundary"
     )

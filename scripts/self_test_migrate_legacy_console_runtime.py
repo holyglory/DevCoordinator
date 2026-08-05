@@ -67,6 +67,7 @@ def fixture(root: Path) -> dict[str, Path]:
         f"{google_secret_key}={secret}\n"
         f"{session_secret_key}={session}\n"
         "STATE_DIR=./state\n"
+        "COORDINATOR_TOKEN_FILE=/legacy/internal-api-token\n"
         "TLS_CERT_FILE=/etc/letsencrypt/live/vr.ae/fullchain.pem\n",
         0o644,
     )
@@ -133,7 +134,7 @@ def main() -> int:
         check(f"{'SESSION_' + 'SECRET'}={'ab' * 32}\n" in env_text, "session secret changed")
         check(f"STATE_DIR={paths['state_dir']}\n" in env_text, "legacy relative state path survived")
         check(f"ACME_WEBROOT={paths['state_dir'] / 'acme'}\n" in env_text, "ACME path missing")
-        check(f"COORDINATOR_TOKEN_FILE={paths['coordinator'] / 'api-token'}\n" in env_text, "token path missing")
+        check("COORDINATOR_TOKEN_FILE" not in env_text, "obsolete internal API token path survived")
         check("COORDINATOR_AUTOSTART=0\n" in env_text, "production autostart was not disabled")
         check(secret not in json.dumps(report), "migration report leaked an OAuth secret")
         check(stat.S_IMODE(paths["env_file"].stat().st_mode) == 0o600, "environment mode is not 0600")

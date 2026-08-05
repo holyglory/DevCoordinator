@@ -57,15 +57,12 @@ def main() -> int:
         for directory in (config, state, acme, coordinator):
             mkdir(directory)
         env = config / "console.env"
-        token = coordinator / "api-token"
         write(
             env,
             "STATE_DIR=~/.local/state/devops-console\n"
-            "ACME_WEBROOT=~/.local/state/devops-console/acme\n"
-            "COORDINATOR_TOKEN_FILE=~/.codex/agent-coordinator/api-token\n",
+            "ACME_WEBROOT=~/.local/state/devops-console/acme\n",
             0o600,
         )
-        write(token, "fixture-private-token-value\n", 0o600)
 
         def check(**overrides):
             values = {
@@ -75,13 +72,13 @@ def main() -> int:
                 "state_dir": state,
                 "acme_webroot": acme,
                 "coordinator_home": coordinator,
-                "token_file": token,
-                "require_token": True,
                 **overrides,
             }
             return guard.check_layout(**values)
 
-        assert check()["ok"] is True
+        report = check()
+        assert report["ok"] is True
+        assert "token" not in report["paths"]
 
         # Model the macOS /var -> /private/var shape deterministically.  A
         # lexical platform alias is still rejected by the production guard,
@@ -97,11 +94,6 @@ def main() -> int:
             "symlink component",
         )
         guard.no_symlink_components(lexical_platform_temp.resolve(strict=True))
-
-        token.unlink()
-        assert check(require_token=False)["ok"] is True
-        expect_error(lambda: check(require_token=True), "token file is missing")
-        write(token, "fixture-private-token-value\n", 0o600)
 
         env.chmod(0o644)
         expect_error(check, "mode must be 0600")

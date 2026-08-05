@@ -67,7 +67,6 @@ export function createRouter(deps) {
     routeStore,
     accessStore,
     upstreamAuthStore,
-    identitySigner,
     coordinator,
     proxy,
   } = deps;
@@ -360,10 +359,6 @@ export function createRouter(deps) {
   async function handleConsole(req, res, pathname, rawUrl, hostPort) {
     const proto = config.devInsecureHttp ? 'http' : 'https';
     const requestOrigin = `${proto}://${hostPort}`;
-    if (pathname === '/.well-known/devops-console-identity.jwks') {
-      if (req.method !== 'GET') return methodNotAllowed(res, 'GET');
-      return sendJson(res, 200, identitySigner.publicJwks());
-    }
     if (pathname === '/auth' || pathname.startsWith('/auth/')) {
       const searchParams = new URL(rawUrl, config.consoleOrigin).searchParams;
       return handleAuth(req, res, pathname, searchParams, requestOrigin, hostPort);
@@ -444,14 +439,10 @@ export function createRouter(deps) {
       publicHost: hostPort,
       route,
       upstreamAuthorization: upstreamAuthorizationFor(route),
-      upstreamIdentityAssertion: session
-        ? identitySigner.sign({
-            subject: session.email,
-            audience: hostPort,
-            resource: routeGrant(slug),
-            method: req.method || 'GET',
-          })
-        : null,
+      localAttribution: {
+        email: session?.email ?? null,
+        routeId: route.instanceId,
+      },
     });
   }
 
@@ -576,14 +567,10 @@ export function createRouter(deps) {
       publicHost: hostPort,
       route,
       upstreamAuthorization: upstreamAuthorizationFor(route),
-      upstreamIdentityAssertion: session
-        ? identitySigner.sign({
-            subject: session.email,
-            audience: hostPort,
-            resource: routeGrant(slug),
-            method: req.method || 'GET',
-          })
-        : null,
+      localAttribution: {
+        email: session?.email ?? null,
+        routeId: route.instanceId,
+      },
     });
   }
 

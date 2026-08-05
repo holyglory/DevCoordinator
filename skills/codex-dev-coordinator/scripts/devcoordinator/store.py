@@ -20,6 +20,7 @@ from typing import Any, Callable, Generator, Iterable
 import uuid
 
 from .schema import SCHEMA_VERSION, initialize_schema, invariant_violations
+from .authority_retention import prune_bounded_authority_state
 
 
 DEFAULT_DATABASE_NAME = "coordinator.sqlite3"
@@ -423,6 +424,7 @@ def _repository_trees_projection(
     project_usage: list[dict[str, Any]],
     current_server_resource_ids: frozenset[str],
     current_database_binding_ids: frozenset[str],
+    ownership_problem_keys: frozenset[tuple[str, str]],
 ) -> list[dict[str, Any]]:
     """Build the authoritative primary/temporary repository hierarchy."""
 
@@ -436,17 +438,26 @@ def _repository_trees_projection(
         """
     ):
         server_id = str(row["server_definition_id"])
-        if server_id in current_server_resource_ids:
+        if (
+            server_id in current_server_resource_ids
+            and ("server", server_id) not in ownership_problem_keys
+        ):
             servers_by_repo.setdefault(str(row["repo_id"]), []).append(server_id)
     databases_by_repo: dict[str, list[str]] = {}
     for row in connection.execute(
         """
-        SELECT repo_id, database_binding_id FROM database_bindings
+        SELECT repo_id, database_binding_id, docker_resource_id
+        FROM database_bindings
         WHERE repo_id IS NOT NULL ORDER BY repo_id, database_binding_id
         """
     ):
         binding_id = str(row["database_binding_id"])
-        if binding_id in current_database_binding_ids:
+        container_id = str(row["docker_resource_id"])
+        if (
+            binding_id in current_database_binding_ids
+            and ("database", binding_id) not in ownership_problem_keys
+            and ("container", container_id) not in ownership_problem_keys
+        ):
             databases_by_repo.setdefault(str(row["repo_id"]), []).append(binding_id)
 
     active_session_by_repo: dict[str, dict[str, Any]] = {}
@@ -511,15 +522,23 @@ def _repository_trees_projection(
                     None if session is None else bool(session["kill_after_run"])
                 ),
                 "usage": usage,
-                # The normalized repository tree classifies every current
-                # definition exactly once. Compatibility project usage stays
-                # lifecycle-only, so this must not be derived from its
-                # server_ids or control-only definitions disappear from the
-                # authoritative graph and make the contract contradictory.
+                # The normalized repository tree classifies every healthy
+                # current definition exactly once. Explicit ownership problems
+                # form the other side of the exhaustive partition. Compatibility
+                # project usage stays lifecycle-only, so server membership must
+                # still come from normalized definitions rather than its
+                # running-only server_ids.
                 "server_ids": servers_by_repo.get(str(row["repo_id"]), []),
-                "container_resource_ids": list(
-                    projected_usage.get("container_resource_ids") or []
-                ),
+                "container_resource_ids": [
+                    str(resource_id)
+                    for resource_id in projected_usage.get("container_resource_ids")
+                    or []
+                    if (
+                        "container",
+                        str(resource_id),
+                    )
+                    not in ownership_problem_keys
+                ],
                 "database_binding_ids": databases_by_repo.get(
                     str(row["repo_id"]), []
                 ),
@@ -545,6 +564,134 @@ def _repository_trees_projection(
         )
     )
     return result
+
+
+def _unclassified_database_problems_projection(
+    *,
+    database_resources: Iterable[dict[str, Any]],
+    repository_trees: Iterable[dict[str, Any]],
+    docker_resources: Iterable[dict[str, Any]],
+    unassigned_resources: Iterable[dict[str, Any]],
+    lifecycle_violations: Iterable[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Describe every current database omitted from the repository tree.
+
+    A database binding follows its backing container's repository ownership.
+    When that container is unassigned, ``database_bindings.repo_id`` is
+    intentionally NULL and the binding cannot appear in a repository scope.
+    The binding is still a current normalized resource/observation, however,
+    so consumers need an explicit database-kind ownership problem for the
+    tree-plus-problems partition to remain exhaustive.
+
+    These rows are a read-only projection of the parent problem.  Attaching or
+    retiring the parent container remains the single repair action; the next
+    successful observation updates all child database bindings automatically.
+    """
+
+    classified_ids = {
+        str(binding_id)
+        for tree in repository_trees
+        for scope in tree.get("scopes") or []
+        for binding_id in scope.get("database_binding_ids") or []
+    }
+    problem_rows = [*unassigned_resources, *lifecycle_violations]
+    existing_database_problem_ids = {
+        str(item.get("resource_id"))
+        for item in problem_rows
+        if str(item.get("resource_kind") or "") == "database"
+        and item.get("resource_id") is not None
+    }
+    parent_problems = {
+        str(item.get("resource_id")): item
+        for item in problem_rows
+        if str(item.get("resource_kind") or "") == "container"
+        and item.get("resource_id") is not None
+    }
+    containers_by_id = {
+        str(item.get("docker_resource_id")): item
+        for item in docker_resources
+        if item.get("docker_resource_id") is not None
+    }
+
+    projected: list[dict[str, Any]] = []
+    for database in database_resources:
+        binding_id = str(database.get("database_binding_id") or "")
+        if (
+            not binding_id
+            or binding_id in classified_ids
+            or binding_id in existing_database_problem_ids
+        ):
+            continue
+        container_id = str(database.get("docker_resource_id") or "")
+        parent = parent_problems.get(container_id)
+        # Only cascade already-proved parent ownership failure. Inventing a
+        # fallback problem here would hide a novel producer/tree bug; leave it
+        # uncovered so the publication validator retains last-known-good.
+        if parent is None:
+            continue
+        container = containers_by_id.get(container_id, {})
+        container_name = str(
+            parent.get("display_name")
+            or container.get("current_name")
+            or container_id
+            or "container"
+        )
+        database_name = str(database.get("database_name") or binding_id)
+        reason_code = str(parent.get("reason_code") or "ambiguous_control")
+        parent_explanation = str(parent.get("explanation") or "").strip()
+        explanation = (
+            f"The database belongs to unassigned container {container_name}. "
+            f"{parent_explanation}"
+        ).strip()
+        host_id = str(parent.get("host_id") or "")
+        projected.append(
+            {
+                "unassigned_id": deterministic_id(
+                    "unassigned-database-binding", host_id, binding_id
+                ),
+                "host_id": host_id,
+                "source_resource_id": parent.get("source_resource_id"),
+                "resource_kind": "database",
+                "resource_id": binding_id,
+                "host_resource_id": binding_id,
+                "display_name": database_name,
+                "reason_code": reason_code,
+                "suggested_root": parent.get("suggested_root"),
+                "status": "active",
+                "explanation": explanation,
+                "observed_by": list(parent.get("observed_by") or []),
+                "controller": parent.get("controller"),
+                "immutable_fingerprint": "sha256:"
+                + fingerprint(
+                    {
+                        "database_binding_id": binding_id,
+                        "docker_resource_id": container_id,
+                        "database_name": database_name,
+                    }
+                ),
+                "ownership_fingerprint": "sha256:"
+                + fingerprint(
+                    {
+                        "database_binding_id": binding_id,
+                        "parent_resource_id": container_id,
+                        "parent_ownership_fingerprint": parent.get(
+                            "ownership_fingerprint"
+                        ),
+                    }
+                ),
+                "control_binding_id": parent.get("control_binding_id"),
+                "can_attach": False,
+                "can_retire": False,
+                "parent_resource_kind": "container",
+                "parent_resource_id": container_id,
+                "parent_display_name": container_name,
+                "recommended_next_step": (
+                    f"Resolve repository ownership for container {container_name}; "
+                    "the Coordinator will bind this database on the next observation."
+                ),
+            }
+        )
+    return projected
 
 
 def _latest_available_docker_evidence(
@@ -800,7 +947,8 @@ def _current_server_resource_ids(
             JOIN repositories r USING(repo_id)
             JOIN repository_installations i USING(repo_id)
             LEFT JOIN server_observations o USING(server_definition_id)
-            WHERE o.lifecycle IN ('running', 'starting', 'unhealthy', 'stopping')
+            WHERE (
+               o.lifecycle IN ('running', 'starting', 'unhealthy', 'stopping')
                OR (
                     r.state = 'active'
                     AND i.status != 'disabled'
@@ -858,9 +1006,49 @@ def _current_server_resource_ids(
                         OR {broker_management}
                     )
                )
+            )
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM runtime_session_resources expired_resource
+                  JOIN runtime_sessions expired_session USING(session_id)
+                  WHERE expired_resource.resource_kind = 'service'
+                    AND expired_resource.resource_id = d.server_definition_id
+                    AND expired_session.purpose = 'temporary'
+                    AND expired_session.expires_at IS NOT NULL
+                    AND expired_session.expires_at <= ?
+                    -- Expired-but-unresolved cleanup remains actionable.  It
+                    -- must stay in the repository tree until cleanup reaches
+                    -- a terminal disposition; otherwise the only resource a
+                    -- user can retry disappears from the control surface.
+                    AND expired_session.status NOT IN (
+                        'cleanup_pending', 'cleaning'
+                    )
+                    AND expired_resource.cleanup_state NOT IN (
+                        'cleanup_pending', 'failed', 'cleaning'
+                    )
+                    AND NOT EXISTS (
+                        SELECT 1
+                        FROM runtime_session_resources later_resource
+                        JOIN runtime_sessions later_session USING(session_id)
+                        WHERE later_resource.resource_kind = 'service'
+                          AND later_resource.resource_id =
+                              expired_resource.resource_id
+                          AND later_session.purpose = 'temporary'
+                          AND (
+                              later_resource.linked_at >
+                                  expired_resource.linked_at
+                              OR (
+                                  later_resource.linked_at =
+                                      expired_resource.linked_at
+                                  AND later_session.session_id >
+                                      expired_session.session_id
+                              )
+                          )
+                    )
+              )
             ORDER BY d.server_definition_id
             """,
-            (observed_at,),
+            (observed_at, observed_at),
         )
     )
 
@@ -936,23 +1124,25 @@ def refuse_symlink_components(path: Path, *, allow_missing_leaf: bool = False) -
 
 
 def _validate_owned_directory(path: Path, expected_uid: int, *, require_private: bool) -> None:
+    """Validate only the filesystem shape needed by SQLite.
+
+    ``expected_uid`` and ``require_private`` remain compatibility inputs for
+    callers compiled against the former multi-tenant trust model.  Local Unix
+    ownership and mode are not authorization boundaries on a single-developer
+    server.
+    """
+
+    del expected_uid, require_private
     metadata = path.lstat()
     if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
         raise PermissionError(f"coordinator store directory must be a real directory: {path}")
-    if metadata.st_uid != expected_uid:
-        raise PermissionError(
-            f"coordinator store directory is owned by uid {metadata.st_uid}, "
-            f"not expected uid {expected_uid}: {path}"
-        )
-    if require_private and stat.S_IMODE(metadata.st_mode) != 0o700:
-        raise PermissionError(
-            f"coordinator store directory must be mode 0700, got "
-            f"{stat.S_IMODE(metadata.st_mode):04o}: {path}"
-        )
 
 
 def ensure_private_store_directory(path: Path, *, expected_uid: int) -> None:
-    """Create missing final directories without changing any existing directory."""
+    """Create missing directories with an operational 0700 default.
+
+    Existing real directories are accepted regardless of Unix account or mode.
+    """
 
     absolute = _absolute_path(path)
     missing: list[Path] = []
@@ -971,63 +1161,46 @@ def ensure_private_store_directory(path: Path, *, expected_uid: int) -> None:
         try:
             directory.mkdir(mode=0o700)
         except FileExistsError:
-            # A concurrent same-UID process may win creation after discovery.
-            # Accept only the exact private directory that we would have made.
+            # Another local Coordinator client may win creation after discovery.
+            # Accept the real non-symlink directory it published.
             pass
         _validate_owned_directory(directory, expected_uid, require_private=True)
     _validate_owned_directory(absolute, expected_uid, require_private=True)
 
 
 def _validate_private_file(path: Path, expected_uid: int) -> os.stat_result:
+    del expected_uid
     metadata = path.lstat()
     if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
         raise PermissionError(f"coordinator database must be a real regular file: {path}")
-    if metadata.st_uid != expected_uid:
-        raise PermissionError(
-            f"coordinator database is owned by uid {metadata.st_uid}, "
-            f"not expected uid {expected_uid}: {path}"
-        )
-    if stat.S_IMODE(metadata.st_mode) != 0o600:
-        raise PermissionError(
-            f"coordinator database must be mode 0600, got "
-            f"{stat.S_IMODE(metadata.st_mode):04o}: {path}"
-        )
     return metadata
 
 
 def _validate_private_maintenance_lock(path: Path, expected_uid: int) -> os.stat_result:
+    del expected_uid
     metadata = path.lstat()
     if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
         raise PermissionError(f"coordinator maintenance lock must be a real regular file: {path}")
-    if metadata.st_uid != expected_uid:
-        raise PermissionError(
-            f"coordinator maintenance lock is owned by uid {metadata.st_uid}, "
-            f"not expected uid {expected_uid}: {path}"
-        )
-    if stat.S_IMODE(metadata.st_mode) != 0o600:
-        raise PermissionError(
-            f"coordinator maintenance lock must be mode 0600, got "
-            f"{stat.S_IMODE(metadata.st_mode):04o}: {path}"
-        )
     return metadata
 
 
 def _validate_private_sqlite_sidecars(database_path: Path, expected_uid: int) -> None:
+    del expected_uid
     for suffix in ("-wal", "-shm"):
         sidecar = Path(f"{database_path}{suffix}")
         if not sidecar.exists() and not sidecar.is_symlink():
             continue
-        refuse_symlink_components(sidecar)
-        metadata = sidecar.lstat()
+        try:
+            refuse_symlink_components(sidecar)
+            metadata = sidecar.lstat()
+        except FileNotFoundError:
+            # SQLite removes WAL/SHM files when the last connection closes.
+            # A sidecar that disappears after the presence check is therefore
+            # a valid terminal state, not an unsafe coordinator path. Existing
+            # sidecars still pass the real-file/non-symlink validation.
+            continue
         if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
             raise PermissionError(f"SQLite sidecar must be a regular file: {sidecar}")
-        if metadata.st_uid != expected_uid:
-            raise PermissionError(f"SQLite sidecar has foreign ownership: {sidecar}")
-        if stat.S_IMODE(metadata.st_mode) != 0o600:
-            raise PermissionError(
-                f"SQLite sidecar must be mode 0600, got "
-                f"{stat.S_IMODE(metadata.st_mode):04o}: {sidecar}"
-            )
 
 
 def _sqlite_sidecars_exist(database_path: Path) -> bool:
@@ -1074,8 +1247,8 @@ def _precreate_private_file(path: Path, expected_uid: int) -> os.stat_result:
     try:
         os.fchmod(descriptor, 0o600)
         metadata = os.fstat(descriptor)
-        if metadata.st_uid != expected_uid or not stat.S_ISREG(metadata.st_mode):
-            raise PermissionError(f"new coordinator database has unsafe ownership/type: {path}")
+        if not stat.S_ISREG(metadata.st_mode):
+            raise PermissionError(f"new coordinator database is not a regular file: {path}")
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
@@ -1092,8 +1265,8 @@ def _acquire_maintenance_descriptor(
 ) -> int:
     """Acquire the normalized store-maintenance lock, never legacy ``state.lock``.
 
-    This lock serializes SQLite open/backup/restore maintenance and is retained
-    as a private 0600 inode beside the normalized database.  Runtime mutation
+    This lock serializes SQLite open/backup/restore maintenance and is created
+    with a 0600 operational default beside the normalized database. Runtime mutation
     authority remains in SQLite transactions; the retired JSON backend's
     ``state.lock`` must not be created by normalized workflows.
     """
@@ -1113,11 +1286,9 @@ def _acquire_maintenance_descriptor(
         opened = os.fstat(descriptor)
         if (
             (before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino)
-            or opened.st_uid != expected_uid
             or not stat.S_ISREG(opened.st_mode)
-            or stat.S_IMODE(opened.st_mode) != 0o600
         ):
-            raise PermissionError("coordinator maintenance lock identity is unsafe")
+            raise PermissionError("coordinator maintenance lock identity changed")
         operation = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
         deadline = time.monotonic() + float(timeout_seconds)
         while True:
@@ -1133,9 +1304,7 @@ def _acquire_maintenance_descriptor(
         after = lock_path.lstat()
         if (
             (after.st_dev, after.st_ino) != (opened.st_dev, opened.st_ino)
-            or after.st_uid != expected_uid
             or not stat.S_ISREG(after.st_mode)
-            or stat.S_IMODE(after.st_mode) != 0o600
         ):
             raise PermissionError("coordinator maintenance lock changed while opening")
         return descriptor
@@ -1230,8 +1399,6 @@ def exclusive_maintenance_lock(
 
     path = _absolute_path(database_path)
     uid = os.geteuid() if expected_uid is None else int(expected_uid)
-    if uid != os.geteuid():
-        raise PermissionError("maintenance lock expected uid differs from effective uid")
     if not 0 < float(timeout_seconds) <= 60:
         raise ValueError("maintenance timeout must be greater than 0 and at most 60")
     ensure_private_store_directory(path.parent, expected_uid=uid)
@@ -1249,7 +1416,7 @@ def exclusive_maintenance_lock(
 
 
 class CoordinatorStore:
-    """One connection to a private normalized account database.
+    """One connection to a normalized local account database.
 
     A store owns transaction boundaries. Callbacks may execute SQL on the raw
     connection yielded by the context managers, but they may not commit,
@@ -1290,10 +1457,6 @@ class CoordinatorStore:
     ) -> "CoordinatorStore":
         database_path = _absolute_path(path)
         uid = os.geteuid() if expected_uid is None else int(expected_uid)
-        if uid != os.geteuid():
-            raise PermissionError(
-                f"coordinator store expected uid {uid} does not match effective uid {os.geteuid()}"
-            )
         if not 1 <= int(busy_timeout_ms) <= 60_000:
             raise ValueError("busy_timeout_ms must be between 1 and 60000")
         ensure_private_store_directory(database_path.parent, expected_uid=uid)
@@ -1379,15 +1542,11 @@ class CoordinatorStore:
         ``mode=rw`` connection lets SQLite create its coordination sidecars,
         establishes the real read-only connection, and closes before inventory
         code can run. ``query_only`` is the first SQL statement on both, and
-        sidecars retain the writable opener's private security boundaries.
+        sidecars retain the writable opener's operational defaults.
         """
 
         database_path = _absolute_path(path)
         uid = os.geteuid() if expected_uid is None else int(expected_uid)
-        if uid != os.geteuid():
-            raise PermissionError(
-                f"coordinator store expected uid {uid} does not match effective uid {os.geteuid()}"
-            )
         if not 1 <= int(busy_timeout_ms) <= 60_000:
             raise ValueError("busy_timeout_ms must be between 1 and 60000")
         refuse_symlink_components(database_path)
@@ -1614,6 +1773,12 @@ class CoordinatorStore:
             self.connection.set_authorizer(allow_authorizer)
             if not self.connection.in_transaction:
                 raise TransactionBoundaryError("caller escaped the store-owned transaction")
+            # Tests and retained inventory have independent stores, but a
+            # bounded current-state compatibility set remains in authority for
+            # lifecycle admission and single-flight observation.  Enforce the
+            # bound in the same transaction as every mutation so no writer can
+            # silently regrow historical telemetry, snapshots, or events.
+            prune_bounded_authority_state(self.connection)
             if time.monotonic() > deadline:
                 raise MutationTimeout(
                     f"coordinator mutation exceeded {float(max_seconds):.3f} seconds"
@@ -1820,6 +1985,66 @@ class AccountStore(CoordinatorStore):
                 for host_id, evidence in latest_docker_evidence.items()
             }
             removed_runtime_resources = _latest_removed_runtime_resources(connection)
+            # Testcontainers labels identify framework-owned dependency and
+            # reaper containers. They are retained in raw observation history
+            # but deliberately excluded from the project-inventory contract:
+            # a normal test run must not look like an unowned production
+            # service while it is setting up or cleaning up.
+            transient_test_docker_resource_ids = frozenset(
+                str(row["docker_resource_id"])
+                for row in connection.execute(
+                    """
+                    SELECT DISTINCT docker_resource_id
+                    FROM docker_labels
+                    WHERE name = 'org.testcontainers'
+                       OR name LIKE 'org.testcontainers.%'
+                       OR name LIKE 'org.testcontainers-%'
+                    ORDER BY docker_resource_id
+                    """
+                )
+            )
+            # ``docker ps`` can retain a row for a container that disappears
+            # before the subsequent bulk inspect.  Its source record records
+            # that the row was uninspectable.  Suppress that one observation
+            # from the operational projection until a complete snapshot
+            # proves its identity, rather than briefly inventing an ownership
+            # problem (and a cascade of PostgreSQL database problems).
+            uninspectable_docker_resource_ids = frozenset(
+                str(row["docker_resource_id"])
+                for row in connection.execute(
+                    """
+                    SELECT d.docker_resource_id
+                    FROM docker_resources d
+                    JOIN source_resources source
+                      ON source.resource_kind = 'container'
+                     AND source.native_id = d.full_container_id
+                    WHERE json_extract(source.provenance_json,
+                                       '$.metadata_source') = 'inspection_unavailable'
+                    ORDER BY d.docker_resource_id
+                    """
+                )
+            )
+            # A previous complete observation can already have attached the
+            # exact immutable Docker identity to one repository.  A later
+            # ps/inspect race is not contrary evidence, so preserve that
+            # durable classification while suppressing only new, unowned
+            # uninspectable rows.
+            classified_docker_resource_ids = frozenset(
+                str(row["host_resource_id"])
+                for row in connection.execute(
+                    """
+                    SELECT DISTINCT membership.host_resource_id
+                    FROM repository_memberships membership
+                    JOIN docker_resources docker
+                      ON docker.docker_resource_id = membership.host_resource_id
+                    WHERE membership.resource_kind = 'container'
+                    ORDER BY membership.host_resource_id
+                    """
+                )
+            )
+            uninspectable_unowned_docker_resource_ids = (
+                uninspectable_docker_resource_ids - classified_docker_resource_ids
+            )
 
             def docker_resource_is_present(host_id: Any, resource_id: Any) -> bool:
                 """Preserve legacy visibility until this host has proved presence."""
@@ -1839,6 +2064,10 @@ class AccountStore(CoordinatorStore):
                 if docker_resource_is_present(
                     row["host_id"], row["docker_resource_id"]
                 )
+                and str(row["docker_resource_id"])
+                not in transient_test_docker_resource_ids
+                and str(row["docker_resource_id"])
+                not in uninspectable_unowned_docker_resource_ids
                 and ("docker", str(row["docker_resource_id"]))
                 not in removed_runtime_resources
             )
@@ -2156,6 +2385,15 @@ class AccountStore(CoordinatorStore):
                        observed.canonical_home AS observed_home,
                        m.immutable_fingerprint AS membership_fingerprint,
                        d.engine_id, d.full_container_id,
+                       EXISTS(
+                           SELECT 1 FROM docker_labels label
+                           WHERE label.docker_resource_id = u.resource_id
+                             AND (
+                                 label.name = 'org.testcontainers'
+                                 OR label.name LIKE 'org.testcontainers.%'
+                                 OR label.name LIKE 'org.testcontainers-%'
+                             )
+                       ) AS transient_test,
                        rr.status AS retirement_status
                 FROM unassigned_resources u
                 LEFT JOIN source_resources sr USING(source_resource_id)
@@ -2170,6 +2408,14 @@ class AccountStore(CoordinatorStore):
                 ORDER BY u.resource_kind, u.display_name, u.resource_id
                 """
             ):
+                if bool(row["transient_test"]):
+                    continue
+                if (
+                    row["resource_kind"] == "container"
+                    and str(row["resource_id"])
+                    in uninspectable_unowned_docker_resource_ids
+                ):
+                    continue
                 if (
                     row["resource_kind"] == "container"
                     and not docker_resource_is_present(
@@ -2337,12 +2583,14 @@ class AccountStore(CoordinatorStore):
                     "affected_canonical_root": row["canonical_root"],
                 }
                 lifecycle_violations.append(item)
-                projected = _active_lifecycle_projection(
-                    {**item, "lifecycle_state": "archived"}
-                )
-                if projected is not None:
-                    projected.pop("lifecycle_state", None)
-                    unassigned.append(projected)
+
+                # A start-fence violation is one explicit ownership-problem
+                # claim, carried by ``lifecycle_violations``.  Publishing the
+                # same immutable resource in ``unassigned_resources`` as well
+                # made the repository tree + problems partition contradictory
+                # and caused the retained-inventory validator to reject every
+                # running archived resource.  Consumers that need one combined
+                # view already concatenate the two typed problem lists.
 
             for row in connection.execute(
                 """
@@ -2581,6 +2829,15 @@ class AccountStore(CoordinatorStore):
                 (str(item["resource_kind"]), str(item["resource_id"])): item
                 for item in lifecycle_violations
             }
+            ownership_problem_keys = frozenset(
+                (
+                    str(item.get("resource_kind") or ""),
+                    str(item.get("resource_id") or ""),
+                )
+                for item in [*unassigned, *lifecycle_violations]
+                if item.get("resource_kind") is not None
+                and item.get("resource_id") is not None
+            )
             compatibility_servers: list[dict[str, Any]] = []
             for row in connection.execute(
                 """
@@ -2851,7 +3108,16 @@ class AccountStore(CoordinatorStore):
                        d.full_container_id,
                        d.current_name AS name, d.image, r.canonical_root AS project,
                        o.lifecycle AS status, o.health, o.restart_policy, o.sampled_at,
-                       cb.provenance AS metadata_source
+                       cb.provenance AS metadata_source,
+                       EXISTS(
+                           SELECT 1 FROM docker_labels label
+                           WHERE label.docker_resource_id = d.docker_resource_id
+                             AND (
+                                 label.name = 'org.testcontainers'
+                                 OR label.name LIKE 'org.testcontainers.%'
+                                 OR label.name LIKE 'org.testcontainers-%'
+                             )
+                       ) AS transient_test
                 FROM docker_resources d
                 JOIN docker_engines e USING(engine_id)
                 LEFT JOIN docker_observations o USING(docker_resource_id)
@@ -2952,6 +3218,7 @@ class AccountStore(CoordinatorStore):
                     "restart_policy": row["restart_policy"],
                     "sampled_at": row["sampled_at"],
                     "metadata_source": row["metadata_source"] or "none",
+                    "transient_test": bool(row["transient_test"]),
                     "attribution": violation or unassigned_by_resource.get(resource_id),
                 }
                 item = project_ephemeral_recovery_fence(item, lifecycle_key="status")
@@ -3079,7 +3346,9 @@ class AccountStore(CoordinatorStore):
                         (repo_id,),
                     )
                     if str(row[0]) in compatibility_server_ids
+                    and ("server", str(row[0])) not in ownership_problem_keys
                 ]
+                healthy_server_ids = frozenset(server_ids)
                 container_memberships = list(
                     connection.execute(
                         """
@@ -3122,6 +3391,8 @@ class AccountStore(CoordinatorStore):
                     in active_docker_resource_ids
                     and str(row["docker_resource_id"])
                     not in suppressed_alias_ids
+                    and ("container", str(row["docker_resource_id"]))
+                    not in ownership_problem_keys
                 ]
                 container_names = [str(row["current_name"]) for row in container_memberships]
                 container_resource_ids = [
@@ -3179,7 +3450,7 @@ class AccountStore(CoordinatorStore):
                     row
                     for row in server_usage_rows
                     if str(row["server_definition_id"])
-                    in current_server_resource_ids
+                    in healthy_server_ids
                 ]
                 docker_usage_rows = [
                     project_docker_stats[resource_id]
@@ -3198,7 +3469,7 @@ class AccountStore(CoordinatorStore):
                         (repo_id,),
                     )
                     if str(row["server_definition_id"])
-                    in current_server_resource_ids
+                    in healthy_server_ids
                 )
                 docker_running_count = sum(
                     1
@@ -3472,6 +3743,16 @@ class AccountStore(CoordinatorStore):
                 project_usage=compatibility_usage,
                 current_server_resource_ids=current_server_resource_ids,
                 current_database_binding_ids=current_database_binding_ids,
+                ownership_problem_keys=ownership_problem_keys,
+            )
+            unassigned.extend(
+                _unclassified_database_problems_projection(
+                    database_resources=database_resources,
+                    repository_trees=repository_trees,
+                    docker_resources=docker_resources,
+                    unassigned_resources=unassigned,
+                    lifecycle_violations=lifecycle_violations,
+                )
             )
             graph = {
                 "schema_version": 2,

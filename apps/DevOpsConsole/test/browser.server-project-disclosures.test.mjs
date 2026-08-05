@@ -114,6 +114,7 @@ function server(project, index) {
     url: `http://127.0.0.1:${10_000 + index}`,
     url_is_current: true,
     missing_command: false,
+    log_path: `/var/log/devcoordinator/${name}.log`,
     health: { ok: true, classification: 'healthy', status: 200 },
     process_usage: { cpu_percent: 1.5, memory_bytes: 16_777_216 },
   };
@@ -134,9 +135,11 @@ function container(project, repoId, name, index) {
   };
 }
 
-function unassignedContainer() {
+function unassignedContainer(resourceId = 'fixture-container-202') {
   return {
     ...container('/fixtures/unassigned', null, 'gnt-artifact-pg', 202),
+    id: resourceId,
+    host_resource_id: resourceId,
     project: null,
     compose_project: null,
     metadata_source: 'none',
@@ -154,14 +157,25 @@ function unassignedContainer() {
 function fixtureOverview(revision, {
   archivedServerIds = new Set(), removedServerIds = new Set(),
   restoredServerIds = new Set(), includeUnassigned = false,
+  unassignedResourceId = 'fixture-container-202',
+  includeDatabaseOwnershipProblem = false, databaseContainerVerified = false,
+  activeRoutes = [], activeLeases = [],
 } = {}) {
   const overview = structuredClone(CANONICAL_OVERVIEW);
   const alphaProject = '/fixtures/projects/alpha';
   const betaProject = '/fixtures/projects/beta';
+  const idleProject = '/fixtures/projects/idle';
   const alpha = Array.from({ length: 82 }, (_, index) => server(alphaProject, index + 1))
     .filter((item) => !archivedServerIds.has(item.id) && !removedServerIds.has(item.id));
   const beta = [server(betaProject, 1)];
   beta[0].name = 'smoke-caddy-http';
+  beta[0].log_path = null;
+  beta[0].supervision = {
+    desired_state: 'running',
+    state: 'running',
+    keep_alive: true,
+    breaker: { state: 'armed', crash_count_in_window: 0, window_seconds: 300 },
+  };
   for (const item of [...alpha, ...beta]) {
     if (!restoredServerIds.has(item.id)) continue;
     item.status = 'stopped';
@@ -175,10 +189,10 @@ function fixtureOverview(revision, {
   // the project value gives the replacement node an observable revision.
   beta[0].process_usage.cpu_percent = revision === 0 ? 1.5 : 2.5;
 
-  overview.routes = [];
+  overview.routes = structuredClone(activeRoutes);
   overview.inventory.servers = [...alpha, ...beta];
   overview.inventory.port_assignments = [];
-  overview.inventory.leases = [];
+  overview.inventory.leases = structuredClone(activeLeases);
   const globalFinanceProject = '/fixtures/projects/global-finance';
   const xfoilProject = '/fixtures/projects/xfoil';
   const globalFinance = Array.from({ length: 85 }, (_, index) => container(
@@ -194,8 +208,33 @@ function fixtureOverview(revision, {
     repo_id: 'repo-db',
     project: '/fixtures/projects/db',
     compose_project: 'sample-api',
+    metadata_source: databaseContainerVerified ? 'docker_labels' : 'none',
   };
-  const unassigned = includeUnassigned ? unassignedContainer() : null;
+  const unassigned = includeUnassigned ? unassignedContainer(unassignedResourceId) : null;
+  const databaseResources = includeDatabaseOwnershipProblem
+    ? [
+        {
+          database_binding_id: 'fixture-database-binding',
+          docker_resource_id: unassigned.host_resource_id,
+          repo_id: null,
+          database_name: 'sample_api',
+          lifecycle: 'running',
+        },
+        {
+          database_binding_id: 'fixture-database-binding-audit',
+          docker_resource_id: unassigned.host_resource_id,
+          repo_id: null,
+          database_name: 'sample_audit',
+          lifecycle: 'running',
+        },
+      ]
+    : [{
+        database_binding_id: 'fixture-database-binding',
+        docker_resource_id: dockerContainer.host_resource_id,
+        repo_id: 'repo-db',
+        database_name: 'sample_api',
+        lifecycle: 'running',
+      }];
   const dockerResources = [
     ...globalFinance, ...xfoil, dockerContainer, ...(unassigned ? [unassigned] : []),
   ];
@@ -203,7 +242,11 @@ function fixtureOverview(revision, {
     available: true,
     error: null,
     stats_error: null,
-    postgres: [{ database_binding_id: 'fixture-database-binding', name: dockerContainer.name }],
+    observation_revision: revision,
+    postgres: databaseResources.map((database) => ({
+      database_binding_id: database.database_binding_id,
+      name: includeDatabaseOwnershipProblem ? unassigned.name : dockerContainer.name,
+    })),
     containers: dockerResources,
   };
   overview.inventory.repositories = [
@@ -216,6 +259,10 @@ function fixtureOverview(revision, {
     {
       repo_id: 'repo-db', host_id: 'fixture-host', canonical_root: '/fixtures/projects/db',
       display_name: 'Database',
+    },
+    {
+      repo_id: 'repo-idle', host_id: 'fixture-host', canonical_root: idleProject,
+      display_name: 'Idle prototype',
     },
     {
       repo_id: 'repo-global-finance', host_id: 'fixture-host',
@@ -248,27 +295,37 @@ function fixtureOverview(revision, {
     docker: dockerResources.map((item) => ({
       docker_resource_id: item.host_resource_id,
     })),
-    databases: [{
-      database_binding_id: 'fixture-database-binding',
-      docker_resource_id: dockerContainer.host_resource_id,
-      repo_id: 'repo-db',
-      database_name: 'sample_api',
-      lifecycle: 'running',
-    }],
+    databases: databaseResources,
   };
   overview.inventory.observations = {
     docker: dockerResources.map((item) => ({
       docker_resource_id: item.host_resource_id,
     })),
-    databases: [{ database_binding_id: 'fixture-database-binding' }],
+    databases: databaseResources.map((database) => ({
+      database_binding_id: database.database_binding_id,
+    })),
   };
-  overview.inventory.unassigned_resources = unassigned ? [{
-    resource_kind: 'container', resource_id: unassigned.host_resource_id,
-    display_name: unassigned.name,
-    reason_code: unassigned.attribution.reason_code,
-    explanation: unassigned.attribution.explanation,
-    recommended_next_step: 'Attach this exact container to its original root repository, or retire it.',
-  }] : [];
+  overview.inventory.unassigned_resources = [
+    ...(unassigned ? [{
+      resource_kind: 'container', resource_id: unassigned.host_resource_id,
+      display_name: unassigned.name,
+      reason_code: unassigned.attribution.reason_code,
+      explanation: unassigned.attribution.explanation,
+      recommended_next_step: 'Attach this exact container to its original root repository, or retire it.',
+    }] : []),
+    ...(includeDatabaseOwnershipProblem ? databaseResources.map((database) => ({
+      resource_kind: 'database', resource_id: database.database_binding_id,
+      display_name: database.database_name,
+      reason_code: unassigned.attribution.reason_code,
+      explanation: `The database belongs to unassigned container ${unassigned.name}. ${unassigned.attribution.explanation}`,
+      parent_resource_kind: 'container',
+      parent_resource_id: unassigned.host_resource_id,
+      parent_display_name: unassigned.name,
+      can_attach: false,
+      can_retire: false,
+      recommended_next_step: `Resolve repository ownership for container ${unassigned.name}; the Coordinator will bind this database on the next observation.`,
+    })) : []),
+  ];
   overview.inventory.lifecycle_violations = [];
   overview.inventory.project_usage = [
     {
@@ -383,6 +440,19 @@ function fixtureOverview(revision, {
       ],
     },
     {
+      family_id: `path:${idleProject}`,
+      root_repository: {
+        repo_id: 'repo-idle', canonical_root: idleProject, display_name: 'Idle prototype',
+      },
+      usage: { cpu_percent: 0, memory_bytes: 0, process_count: 0 },
+      scopes: [{
+        repo_id: 'repo-idle', kind: 'root', canonical_root: idleProject,
+        display_name: 'Idle prototype', run_id: null, expires_at: null, kill_after_run: false,
+        usage: { cpu_percent: 0, memory_bytes: 0, process_count: 0 },
+        server_ids: [], container_resource_ids: [], database_binding_ids: [],
+      }],
+    },
+    {
       family_id: `path:${globalFinanceProject}`,
       root_repository: {
         repo_id: 'repo-global-finance', canonical_root: globalFinanceProject,
@@ -441,7 +511,7 @@ function fixtureOverview(revision, {
           process_count: 1,
         },
         server_ids: [], container_resource_ids: [dockerContainer.host_resource_id],
-        database_binding_ids: ['fixture-database-binding'],
+        database_binding_ids: includeDatabaseOwnershipProblem ? [] : ['fixture-database-binding'],
       }],
     },
   ];
@@ -460,6 +530,22 @@ function fixtureMetrics() {
       {
         key: 'proj:path:/fixtures/projects/global-finance',
         kind: 'project',
+        name: 'GlobalFinance',
+        project: '/fixtures/projects/global-finance',
+        points,
+      },
+      {
+        key: 'repo:repo-global-finance',
+        kind: 'repository',
+        id: 'repo-global-finance',
+        name: 'GlobalFinance',
+        project: '/fixtures/projects/global-finance',
+        points,
+      },
+      {
+        key: 'family:path:/fixtures/projects/global-finance',
+        kind: 'project-family',
+        id: 'path:/fixtures/projects/global-finance',
         name: 'GlobalFinance',
         project: '/fixtures/projects/global-finance',
         points,
@@ -487,6 +573,60 @@ async function assertElementsDoNotOverlap(first, second, message) {
   const overlapsX = a.x < b.x + b.width && b.x < a.x + a.width;
   const overlapsY = a.y < b.y + b.height && b.y < a.y + a.height;
   assert.equal(overlapsX && overlapsY, false, message);
+}
+
+async function projectKindEvidence(trigger) {
+  return trigger.evaluate((node) => {
+    const rect = node.getBoundingClientRect();
+    const hiddenLabel = node.querySelector('.visually-hidden');
+    const hiddenRect = hiddenLabel?.getBoundingClientRect();
+    return {
+      tag: node.tagName,
+      kind: node.dataset.resourceKind,
+      accessibleName: node.getAttribute('aria-label'),
+      describedBy: node.getAttribute('aria-describedby'),
+      pressed: node.getAttribute('aria-pressed'),
+      directText: [...node.childNodes]
+        .filter((child) => child.nodeType === Node.TEXT_NODE)
+        .map((child) => child.textContent.trim())
+        .filter(Boolean),
+      hiddenLabel: hiddenLabel?.textContent?.trim() || '',
+      hiddenLabelWidth: hiddenRect?.width ?? null,
+      hiddenLabelHeight: hiddenRect?.height ?? null,
+      iconMarkup: node.querySelector('svg')?.outerHTML || '',
+      width: rect.width,
+      height: rect.height,
+    };
+  });
+}
+
+async function assertResourceKindTooltip(page, expectedLabel, expectedHint, message) {
+  const tooltip = page.locator('#resource-kind-tooltip');
+  await tooltip.waitFor({ state: 'visible' });
+  const evidence = await tooltip.evaluate((node) => {
+    const rect = node.getBoundingClientRect();
+    return {
+      role: node.getAttribute('role'),
+      parent: node.parentElement?.tagName,
+      label: node.querySelector('.resource-kind-tooltip-label')?.textContent?.trim() || '',
+      hint: node.querySelector('.resource-kind-tooltip-copy')?.textContent?.trim() || '',
+      left: rect.left,
+      right: rect.right,
+      top: rect.top,
+      bottom: rect.bottom,
+      viewportWidth: window.innerWidth,
+      viewportHeight: window.innerHeight,
+    };
+  });
+  assert.equal(evidence.role, 'tooltip', `${message}: the shared hint must keep tooltip semantics`);
+  assert.equal(evidence.parent, 'BODY', `${message}: the hint must overlay the page rather than resize a row`);
+  assert.equal(evidence.label, expectedLabel, `${message}: the hint must identify the exact resource kind`);
+  assert.equal(evidence.hint, expectedHint, `${message}: the hint must explain the exact resource kind`);
+  assert.ok(evidence.left >= 7 && evidence.right <= evidence.viewportWidth - 7,
+    `${message}: the hint must remain horizontally viewport-bounded: ${JSON.stringify(evidence)}`);
+  assert.ok(evidence.top >= 7 && evidence.bottom <= evidence.viewportHeight - 7,
+    `${message}: the hint must remain vertically viewport-bounded: ${JSON.stringify(evidence)}`);
+  return evidence;
 }
 
 async function expandedCount(page) {
@@ -549,10 +689,36 @@ test('real Servers and Docker UI keep project disclosures exclusive, focused, an
       let overviewRevision = 0;
       let overviewRequests = 0;
       let includeUnassigned = false;
+      let unassignedResourceId = 'fixture-container-202';
+      let includeDatabaseOwnershipProblem = false;
+      let databaseContainerVerified = false;
+      let structuralInventoryContradiction = false;
       let maintenanceMode = false;
+      let dockerLogAttempts = 0;
+      let serverLogAttempts = 0;
       const archivedServerIds = new Set();
       const removedServerIds = new Set();
       const restoredServerIds = new Set();
+      const activeLeases = Array.from({ length: 32 }, (_, index) => ({
+        id: `fixture-lease-${index + 1}`,
+        port: 3100 + index,
+        purpose: `Fixture service ${index + 1}`,
+        project: '/fixtures/projects/alpha',
+        agent: 'browser-fixture',
+        expires_at: null,
+        expires_at_iso: null,
+      }));
+      const activeRoutes = Array.from({ length: 32 }, (_, index) => ({
+        slug: `fixture-route-${String(index + 1).padStart(2, '0')}`,
+        kind: 'port',
+        port: 4100 + index,
+        auth: index === 0 ? 'public' : 'google',
+        title: `Fixture route ${index + 1}`,
+        url: `https://fixture-route-${String(index + 1).padStart(2, '0')}.vr.ae`,
+        resolved: { port: 4100 + index },
+        createdAt: '2026-01-15T12:00:00.000Z',
+        updatedAt: '2026-01-15T12:00:00.000Z',
+      }));
       let archives = [];
       const plans = new Map();
       const telegramBots = [{
@@ -607,12 +773,18 @@ test('real Servers and Docker UI keep project disclosures exclusive, focused, an
         else if (request.method() === 'GET' && pathname === '/api/telegram') {
           body = { version: 1, bots: telegramBots, projects: [] };
         }
+        else if (request.method() === 'GET' && pathname === '/api/bugs') {
+          body = { schema_version: 1, revision: 'fixture-empty-bugs', bugs: [] };
+        }
         else if (request.method() === 'GET' && pathname === '/api/prefs') body = CANONICAL_PREFS;
         else if (request.method() === 'GET' && pathname === '/api/overview') {
           overviewRequests += 1;
           if (maintenanceMode) {
             body = fixtureOverview(overviewRevision, {
               archivedServerIds, removedServerIds, restoredServerIds, includeUnassigned,
+              unassignedResourceId,
+              includeDatabaseOwnershipProblem, databaseContainerVerified,
+              activeRoutes, activeLeases,
             });
             body.coordinator = {
               ...body.coordinator,
@@ -627,13 +799,75 @@ test('real Servers and Docker UI keep project disclosures exclusive, focused, an
           } else {
             body = fixtureOverview(overviewRevision, {
               archivedServerIds, removedServerIds, restoredServerIds, includeUnassigned,
+              unassignedResourceId,
+              includeDatabaseOwnershipProblem, databaseContainerVerified,
+              activeRoutes, activeLeases,
             });
+            if (structuralInventoryContradiction) {
+              const xfoilScope = body.inventory.repository_trees
+                .find((tree) => tree.root_repository.repo_id === 'repo-xfoil').scopes[0];
+              xfoilScope.container_resource_ids.push('fixture-container-sample-api-db');
+            }
           }
         } else if (request.method() === 'GET' && pathname === '/api/metrics/history') {
           body = fixtureMetrics();
         } else if (request.method() === 'POST' && pathname === '/api/docker/logs') {
-          assert.equal(request.postDataJSON().name, 'gnt-artifact-pg');
+          assert.equal(typeof request.postDataJSON()?.resource_id, 'string');
+          dockerLogAttempts += 1;
+          if (dockerLogAttempts === 1) {
+            await route.fulfill({
+              status: 409,
+              contentType: 'application/json',
+              body: JSON.stringify({ error: 'The exact container log is temporarily unavailable.' }),
+            });
+            return;
+          }
           body = { text: '2026-07-21T06:55:05Z validation failed safely' };
+        } else if (request.method() === 'POST' && pathname === '/api/servers/logs') {
+          assert.equal(typeof request.postDataJSON()?.id, 'string');
+          serverLogAttempts += 1;
+          if (serverLogAttempts === 1) {
+            await route.fulfill({
+              status: 409,
+              contentType: 'application/json',
+              body: JSON.stringify({ error: 'The exact server log is temporarily unavailable.' }),
+            });
+            return;
+          }
+          body = { text: '2026-07-21T06:56:05Z server recovered safely' };
+        } else if (request.method() === 'POST' && pathname === '/api/routes') {
+          const requestBody = request.postDataJSON();
+          const created = {
+            ...requestBody,
+            title: requestBody.title || '',
+            url: `https://${requestBody.slug}.vr.ae`,
+            resolved: { port: requestBody.port || 10_001 },
+            createdAt: '2026-01-15T12:10:00.000Z',
+            updatedAt: '2026-01-15T12:10:00.000Z',
+          };
+          activeRoutes.push(created);
+          body = created;
+        } else if (request.method() === 'PATCH' && pathname.startsWith('/api/routes/')) {
+          const slug = decodeURIComponent(pathname.slice('/api/routes/'.length));
+          const existing = activeRoutes.find((candidate) => candidate.slug === slug);
+          assert.ok(existing, `route fixture ${slug} must exist before it is managed`);
+          Object.assign(existing, request.postDataJSON(), {
+            updatedAt: '2026-01-15T12:11:00.000Z',
+          });
+          body = existing;
+        } else if (request.method() === 'POST' && pathname === '/api/ports/lease') {
+          const requestBody = request.postDataJSON();
+          const lease = {
+            id: 'fixture-lease-created',
+            port: requestBody.preferred || 3456,
+            purpose: requestBody.purpose || 'manual',
+            project: requestBody.project || '/fixtures/projects/alpha',
+            agent: 'browser-fixture',
+            expires_at: 4_102_444_800,
+            expires_at_iso: '2100-01-01T00:00:00Z',
+          };
+          activeLeases.push(lease);
+          body = { lease };
         } else if (request.method() === 'GET' && pathname === '/api/lifecycle/list') {
           body = { archives };
         } else if (request.method() === 'POST' && pathname === '/api/lifecycle/plan') {
@@ -746,6 +980,273 @@ test('real Servers and Docker UI keep project disclosures exclusive, focused, an
         1,
         'one authoritative root repo must render as one top-level project',
       );
+      assert.equal(await page.locator('#projects-body .tree-head .kind-tag.k-root').count(), 0,
+        'Projects must not repeat an internal ROOT hierarchy label on every repository');
+      assert.equal(
+        (await page.locator('#projects-body .tree-head').allTextContents())
+          .some((text) => /\bROOT\b/.test(text)),
+        false,
+        'the redundant ROOT label must not reappear under a different presentation class',
+      );
+      const activeProjectBlock = page.locator('.tree-node').filter({
+        has: page.locator('[data-fk="tree-x:path:/fixtures/projects/alpha"]'),
+      });
+      const idleProjectBlock = page.locator('.tree-node').filter({
+        has: page.locator('[data-fk="tree-x:path:/fixtures/projects/idle"]'),
+      });
+      assert.equal(await activeProjectBlock.locator('[data-fk^="hide:projects:"]').count(), 0,
+        'a running project must not expose the idle-only visibility action');
+      assert.equal(await idleProjectBlock.locator('[data-fk^="hide:projects:"]').count(), 1,
+        'an idle project retains the actionable visibility control');
+      const activeVisibilityPlaceholder = activeProjectBlock.locator('.project-actions > .ghost');
+      assert.equal(await activeVisibilityPlaceholder.count(), 1,
+        'a running project retains one inert visibility-layout placeholder');
+      assert.deepEqual(await activeVisibilityPlaceholder.evaluate((node) => ({
+        tag: node.tagName, hiddenFromAccessibility: node.getAttribute('aria-hidden'),
+        tabIndex: node.getAttribute('tabindex'),
+      })), { tag: 'SPAN', hiddenFromAccessibility: 'true', tabIndex: null },
+      'the layout placeholder must never become a focusable or announced fake control');
+      for (const width of [1135, 763, 390, 320]) {
+        await page.setViewportSize({ width, height: 919 });
+        await page.waitForFunction((expected) => window.innerWidth === expected, width);
+        const actionGeometry = await page.evaluate(() => {
+          const rowFor = (key) => document.querySelector(`[data-fk="tree-x:${key}"]`)
+            ?.closest('.tree-head');
+          const positions = (row) => [
+            '[data-fk^="proj-start:"]',
+            '[data-fk^="proj-restart:"]',
+            '[data-fk^="proj-stop:"]',
+            '[data-fk^="archive:project:"]',
+          ].map((selector) => {
+            const rect = row.querySelector(selector).getBoundingClientRect();
+            return { left: rect.left, width: rect.width };
+          });
+          const active = rowFor('path:/fixtures/projects/alpha');
+          const idle = rowFor('path:/fixtures/projects/idle');
+          const activeActions = active.querySelector('.project-actions');
+          const activeActionStyle = getComputedStyle(activeActions);
+          return {
+            viewport: window.innerWidth,
+            documentWidth: document.documentElement.scrollWidth,
+            actions: {
+              width: activeActions.getBoundingClientRect().width,
+              scrollWidth: activeActions.scrollWidth,
+              display: activeActionStyle.display,
+              columns: activeActionStyle.gridTemplateColumns,
+              gap: activeActionStyle.columnGap,
+            },
+            active: positions(active),
+            idle: positions(idle),
+          };
+        });
+        assert.ok(actionGeometry.documentWidth <= actionGeometry.viewport,
+          `${width}px project controls must not create document overflow: ${JSON.stringify(actionGeometry)}`);
+        for (let index = 0; index < actionGeometry.active.length; index += 1) {
+          assert.ok(Math.abs(actionGeometry.active[index].left - actionGeometry.idle[index].left) <= 1,
+            `${width}px lifecycle action ${index + 1} must align with and without the visibility control: ${JSON.stringify(actionGeometry)}`);
+          assert.ok(Math.abs(actionGeometry.active[index].width - actionGeometry.idle[index].width) <= 1,
+            `${width}px lifecycle action ${index + 1} must retain equal width: ${JSON.stringify(actionGeometry)}`);
+        }
+      }
+      await page.setViewportSize({ width: 1135, height: 919 });
+      const kindIconMarkup = new Map();
+      const kindExpectations = {
+        server: ['Server', 'A host process registered to this repository.'],
+        worker: ['Worker', 'A supervised host process that the Coordinator can keep alive.'],
+        container: ['Container', 'A Docker container attributed to this repository.'],
+        database: ['Database', 'A database service running in an attributed Docker container.'],
+        temporary: ['Temporary repository', 'An isolated repository scope with its own expiry and cleanup policy.'],
+      };
+      const recordKind = async (trigger, kind) => {
+        const evidence = await projectKindEvidence(trigger);
+        const [label, hint] = kindExpectations[kind];
+        assert.deepEqual({
+          tag: evidence.tag,
+          kind: evidence.kind,
+          accessibleName: evidence.accessibleName,
+          describedBy: evidence.describedBy,
+          pressed: evidence.pressed,
+          directText: evidence.directText,
+          hiddenLabel: evidence.hiddenLabel,
+        }, {
+          tag: 'BUTTON',
+          kind,
+          accessibleName: `${label}: ${hint}`,
+          describedBy: 'resource-kind-tooltip',
+          pressed: 'false',
+          directText: [],
+          hiddenLabel: label,
+        }, `${kind} must be an icon-only button with an exact accessible explanation`);
+        assert.ok(evidence.iconMarkup.startsWith('<svg'), `${kind} must render a real icon`);
+        assert.ok(evidence.hiddenLabelWidth <= 1.1 && evidence.hiddenLabelHeight <= 1.1,
+          `${kind} text must remain available to assistive technology without becoming a visible pill`);
+        assert.ok(evidence.width <= 44.5 && evidence.height <= 44.5,
+          `${kind} must retain a compact bounded identity track`);
+        kindIconMarkup.set(kind, evidence.iconMarkup);
+        return evidence;
+      };
+
+      const activeProjectToggle = activeProjectBlock.locator(
+        '[data-fk="tree-x:path:/fixtures/projects/alpha"]',
+      );
+      await activeProjectToggle.click();
+      const serverKindTrigger = activeProjectBlock.locator(
+        '.tree-children > .tree-item .resource-kind-trigger[data-resource-kind="server"]',
+      ).first();
+      await serverKindTrigger.waitFor();
+      await recordKind(serverKindTrigger, 'server');
+      assert.equal(await activeProjectBlock.locator('.tree-children .kind-tag').count(), 0,
+        'Projects server rows must not retain visible uppercase kind pills');
+
+      await serverKindTrigger.hover();
+      await assertResourceKindTooltip(page, ...kindExpectations.server,
+        'hovering a server kind icon');
+      await page.mouse.move(1125, 10);
+      await page.waitForFunction(() => document.querySelector('#resource-kind-tooltip')?.hidden === true);
+
+      await serverKindTrigger.focus();
+      await assertResourceKindTooltip(page, ...kindExpectations.server,
+        'focusing a server kind icon');
+      await page.keyboard.press('Escape');
+      await page.waitForFunction(() => document.querySelector('#resource-kind-tooltip')?.hidden === true);
+      assert.equal(await serverKindTrigger.evaluate((node) => document.activeElement === node), true,
+        'Escape must dismiss the hint without stealing focus from its kind icon');
+
+      await serverKindTrigger.click();
+      assert.equal(await serverKindTrigger.getAttribute('aria-pressed'), 'true',
+        'clicking a kind icon must expose a pinned hint for mouse and touch users');
+      await page.evaluate(() => {
+        const heading = document.querySelector('#projects-h');
+        heading.tabIndex = -1;
+        heading.focus({ preventScroll: true });
+      });
+      await assertResourceKindTooltip(page, ...kindExpectations.server,
+        'a pinned server kind hint after its trigger loses focus');
+      await page.keyboard.press('Escape');
+      await page.waitForFunction(() => document.querySelector('#resource-kind-tooltip')?.hidden === true);
+      assert.equal(await serverKindTrigger.getAttribute('aria-pressed'), 'false',
+        'Escape must also clear the pinned state');
+      await serverKindTrigger.click();
+      await page.locator('#projects-h').click();
+      await page.waitForFunction(() => document.querySelector('#resource-kind-tooltip')?.hidden === true);
+      assert.equal(await serverKindTrigger.getAttribute('aria-pressed'), 'false',
+        'outside activation must dismiss a pinned hint');
+
+      const globalFinanceProjectToggle = page.locator(
+        '[data-fk="tree-x:path:/fixtures/projects/global-finance"]',
+      );
+      const globalFinanceProjectBlock = page.locator('.tree-node').filter({ has: globalFinanceProjectToggle });
+      await globalFinanceProjectToggle.click();
+      const containerKindTrigger = globalFinanceProjectBlock.locator(
+        '.tree-children > .tree-item .resource-kind-trigger[data-resource-kind="container"]',
+      ).first();
+      await containerKindTrigger.waitFor();
+      await recordKind(containerKindTrigger, 'container');
+      assert.equal(await globalFinanceProjectBlock.locator('.tree-children .kind-tag').count(), 0,
+        'Projects container rows must not retain visible uppercase kind pills');
+
+      for (const width of [1135, 763, 390, 320]) {
+        await page.setViewportSize({ width, height: 919 });
+        await page.waitForFunction((expected) => window.innerWidth === expected, width);
+        const geometry = await page.evaluate((focusKey) => {
+          const toggle = document.querySelector(`[data-fk="${CSS.escape(focusKey)}"]`);
+          const block = toggle?.closest('.tree-node');
+          const body = document.querySelector('#projects-body');
+          const section = document.querySelector('#sec-projects');
+          const rows = [...(block?.querySelectorAll('.tree-children > .tree-item') || [])].slice(0, 6);
+          const bodyRect = body.getBoundingClientRect();
+          return {
+            viewportWidth: window.innerWidth,
+            documentWidth: document.documentElement.scrollWidth,
+            bodyClientWidth: body.clientWidth,
+            bodyScrollWidth: body.scrollWidth,
+            sectionClientWidth: section.clientWidth,
+            sectionScrollWidth: section.scrollWidth,
+            rows: rows.map((row) => {
+              const rowRect = row.getBoundingClientRect();
+              const actions = row.querySelector(':scope > .actions');
+              const actionsRect = actions.getBoundingClientRect();
+              const actionStyle = getComputedStyle(actions);
+              return {
+                clientWidth: row.clientWidth,
+                scrollWidth: row.scrollWidth,
+                left: rowRect.left,
+                right: rowRect.right,
+                bodyLeft: bodyRect.left,
+                bodyRight: bodyRect.right,
+                actionDisplay: actionStyle.display,
+                actionColumns: actionStyle.gridTemplateColumns,
+                actionWidth: actionsRect.width,
+                actionScrollWidth: actions.scrollWidth,
+                slots: [...actions.children].map((child) => {
+                  const rect = child.getBoundingClientRect();
+                  const style = getComputedStyle(child);
+                  return {
+                    left: Math.round((rect.left - actionsRect.left) * 10) / 10,
+                    top: Math.round((rect.top - actionsRect.top) * 10) / 10,
+                    width: Math.round(rect.width * 10) / 10,
+                    display: style.display,
+                    visibility: style.visibility,
+                  };
+                }),
+              };
+            }),
+          };
+        }, 'tree-x:path:/fixtures/projects/global-finance');
+        assert.equal(geometry.rows.length, 6,
+          `${width}px regression must compare several real child rows`);
+        assert.ok(geometry.documentWidth <= geometry.viewportWidth + 1,
+          `${width}px Projects children must not create document overflow: ${JSON.stringify(geometry)}`);
+        assert.ok(geometry.bodyScrollWidth <= geometry.bodyClientWidth + 1,
+          `${width}px Projects body must not overflow its collection`);
+        assert.ok(geometry.sectionScrollWidth <= geometry.sectionClientWidth + 1,
+          `${width}px Projects section must not overflow its card`);
+        const reference = geometry.rows[0];
+        assert.equal(reference.slots.length, 5,
+          `${width}px every resource row must reserve three lifecycle and two utility slots`);
+        for (const [rowIndex, row] of geometry.rows.entries()) {
+          assert.ok(row.scrollWidth <= row.clientWidth + 1,
+            `${width}px child row ${rowIndex + 1} must not hide content horizontally`);
+          assert.ok(row.left >= row.bodyLeft - 1 && row.right <= row.bodyRight + 1,
+            `${width}px child row ${rowIndex + 1} must stay inside Projects`);
+          assert.equal(row.actionDisplay, 'grid');
+          assert.equal(row.actionColumns, reference.actionColumns,
+            `${width}px child row ${rowIndex + 1} must use the shared action grid`);
+          assert.ok(row.actionScrollWidth <= row.actionWidth + 1,
+            `${width}px child row ${rowIndex + 1} action rail must remain bounded`);
+          assert.equal(row.slots.length, 5,
+            `${width}px child row ${rowIndex + 1} must preserve every fixed slot`);
+          for (let slotIndex = 0; slotIndex < reference.slots.length; slotIndex += 1) {
+            assert.ok(Math.abs(row.slots[slotIndex].left - reference.slots[slotIndex].left) <= 1,
+              `${width}px child action ${slotIndex + 1} must snap to one shared track: ${JSON.stringify(geometry)}`);
+            assert.ok(Math.abs(row.slots[slotIndex].width - reference.slots[slotIndex].width) <= 1,
+              `${width}px child action ${slotIndex + 1} must retain one shared width: ${JSON.stringify(geometry)}`);
+          }
+        }
+        if (width === 320) {
+          const narrowContainerKind = globalFinanceProjectBlock.locator(
+            '.tree-children > .tree-item .resource-kind-trigger[data-resource-kind="container"]',
+          ).first();
+          await narrowContainerKind.focus();
+          await assertResourceKindTooltip(page, ...kindExpectations.container,
+            'focusing a container kind icon at 320px');
+          await page.keyboard.press('Escape');
+        }
+      }
+      await page.setViewportSize({ width: 1135, height: 919 });
+      const globalFinanceUsage = globalFinanceProjectBlock.locator('.tree-head .usage-btn');
+      await globalFinanceUsage.click();
+      const usageHistory = page.locator('#popover');
+      await usageHistory.waitFor();
+      assert.equal(await usageHistory.getAttribute('hidden'), null,
+        'a root repository with sampled metrics must open its usage history');
+      assert.equal(await usageHistory.locator('.chart-block').count(), 2,
+        'root repository usage must resolve both CPU and memory chart series');
+      assert.doesNotMatch(String(await usageHistory.textContent()), /No history yet/,
+        'the usage popover must not lose authoritative root metrics to a key mismatch');
+      await globalFinanceUsage.click();
+      assert.equal(await usageHistory.getAttribute('hidden'), '',
+        'the history control remains a conventional toggle after rendering the chart');
       const betaProjectToggle = page.locator('[data-fk="tree-x:path:/fixtures/projects/beta"]');
       const betaProjectBlock = page.locator('.tree-node').filter({ has: betaProjectToggle });
       assert.match(await betaProjectBlock.locator('.tree-head .tree-count').textContent(),
@@ -757,7 +1258,9 @@ test('real Servers and Docker UI keep project disclosures exclusive, focused, an
       assert.match(await betaProjectBlock.locator('[data-fk^="proj-stop:"]').getAttribute('title'),
         /root repository runtime only.*temporary repository runs stay separate/i,
         'project controls must state their exact root-only action scope');
-      await betaProjectToggle.click();
+      await betaProjectBlock.locator('.tree-head .proj-name').click();
+      assert.equal(await betaProjectToggle.getAttribute('aria-expanded'), 'true',
+        'the project name area must be part of the disclosure hit target');
       assert.equal(
         await betaProjectBlock.getByText('No services registered directly under this root repo.').count(),
         1,
@@ -767,6 +1270,10 @@ test('real Servers and Docker UI keep project disclosures exclusive, focused, an
         '[data-fk="temporary-scope:path:/fixtures/projects/beta:repo-beta-run"]',
       );
       await temporaryToggle.waitFor();
+      const temporaryKindTrigger = betaProjectBlock.locator(
+        '.temporary-scope-head > .resource-kind-trigger[data-resource-kind="temporary"]',
+      );
+      await recordKind(temporaryKindTrigger, 'temporary');
       assert.equal(await temporaryToggle.getAttribute('aria-expanded'), 'false');
       assert.match(await temporaryToggle.textContent(), /Beta browser run/);
       assert.match(await temporaryToggle.textContent(), /cleanup after run/);
@@ -777,6 +1284,312 @@ test('real Servers and Docker UI keep project disclosures exclusive, focused, an
         1,
         'the temporary repo disclosure must reveal only its exact-ID service membership',
       );
+      const workerRow = betaProjectBlock.locator('.temporary-scope-items .tree-item').filter({
+        has: page.locator('strong', { hasText: 'smoke-caddy-http' }),
+      });
+      await recordKind(workerRow.locator(
+        '.resource-kind-trigger[data-resource-kind="worker"]',
+      ), 'worker');
+      assert.equal(await betaProjectBlock.locator('.kind-tag').count(), 0,
+        'temporary repository and worker kinds must remain icon-only');
+      assert.equal(await workerRow.locator('.tree-act').count(), 3,
+        'a supervised worker must retain fixed Start, Restart and Stop slots');
+      assert.equal(await workerRow.locator('[data-fk^="tree-worker-start:"]').isDisabled(), true);
+      assert.equal(await workerRow.locator('[data-fk^="tree-worker-restart:"]').isEnabled(), true);
+      assert.equal(await workerRow.locator('[data-fk^="tree-worker-stop:"]').isEnabled(), true);
+
+      // The Projects destination must remain decision-readable at the exact
+      // 320px supported minimum, and an ownership explanation must not be
+      // squeezed into a one-word-wide identity cell at ordinary phone width.
+      const databaseProjectToggle = page.locator('[data-fk="tree-x:path:/fixtures/projects/db"]');
+      const databaseProjectBlock = page.locator('.tree-node').filter({ has: databaseProjectToggle });
+      await databaseProjectToggle.click();
+      const unverifiedProjectRow = databaseProjectBlock.locator('.tree-item.ownership-unverified');
+      await unverifiedProjectRow.waitFor();
+      await recordKind(unverifiedProjectRow.locator(
+        '.resource-kind-trigger[data-resource-kind="database"]',
+      ), 'database');
+      assert.equal(await databaseProjectBlock.locator('.kind-tag').count(), 0,
+        'database rows must not retain visible uppercase kind pills');
+      assert.equal(kindIconMarkup.size, 5,
+        'the real Projects fixture must exercise every disclosed resource kind');
+      assert.equal(new Set(kindIconMarkup.values()).size, 5,
+        'server, worker, container, database and temporary repository must use distinct icon shapes');
+      for (const width of [390, 320]) {
+        await page.setViewportSize({ width, height: 844 });
+        await page.waitForFunction((expected) => window.innerWidth === expected, width);
+        const geometry = await page.evaluate(() => {
+          const projectBody = document.querySelector('#projects-body');
+          const projectBodyRect = projectBody.getBoundingClientRect();
+          const unverifiedRow = projectBody.querySelector('.tree-item.ownership-unverified');
+          const warning = unverifiedRow.querySelector('.ownership-warning');
+          const warningCopy = warning.querySelector('.ownership-warning-copy');
+          const warningTitle = warning.querySelector('.ownership-warning-title');
+          const projectName = projectBody.querySelector('.tree-head .proj-name');
+          const projectNameStyle = getComputedStyle(projectName);
+          const projectNameLineHeight = Number.parseFloat(projectNameStyle.lineHeight)
+            || Number.parseFloat(projectNameStyle.fontSize) * 1.2;
+          const actionCells = [...projectBody.querySelectorAll('.tree-grid > .actions')];
+          const projectActions = projectBody.querySelector('.tree-head > .project-actions');
+          const projectActionStyle = getComputedStyle(projectActions);
+          return {
+            viewportWidth: window.innerWidth,
+            documentWidth: document.documentElement.scrollWidth,
+            projectBodyClientWidth: projectBody.clientWidth,
+            projectBodyScrollWidth: projectBody.scrollWidth,
+            rowClientWidth: unverifiedRow.clientWidth,
+            rowScrollWidth: unverifiedRow.scrollWidth,
+            warningWidth: warning.getBoundingClientRect().width,
+            warningCopyWidth: warningCopy.getBoundingClientRect().width,
+            warningTitleWidth: warningTitle.getBoundingClientRect().width,
+            projectNameLines: projectName.getBoundingClientRect().height / projectNameLineHeight,
+            projectActionDisplay: projectActionStyle.display,
+            projectActionColumns: projectActionStyle.gridTemplateColumns,
+            projectActionGap: projectActionStyle.columnGap,
+            projectActionChildren: [...projectActions.children].map((child) => ({
+              display: getComputedStyle(child).display,
+              width: child.getBoundingClientRect().width,
+              scrollWidth: child.scrollWidth,
+            })),
+            escapingActions: actionCells.filter((cell) => {
+              const rect = cell.getBoundingClientRect();
+              return rect.left < 0 || rect.right > window.innerWidth + 1;
+            }).length,
+            overflowingElements: [...document.querySelectorAll('body *')]
+              .map((node) => {
+                const rect = node.getBoundingClientRect();
+                return {
+                  selector: node.id ? `#${node.id}` : `${node.tagName.toLowerCase()}.${node.className}`,
+                  left: Math.round(rect.left),
+                  right: Math.round(rect.right),
+                  width: Math.round(rect.width),
+                };
+              })
+              .filter((item) => item.width > 0 && (item.left < -1 || item.right > window.innerWidth + 1))
+              .slice(0, 12),
+            escapingProjectBody: [...projectBody.querySelectorAll('*')]
+              .map((node) => {
+                const rect = node.getBoundingClientRect();
+                return {
+                  selector: node.id ? `#${node.id}` : `${node.tagName.toLowerCase()}.${node.className}`,
+                  left: Math.round(rect.left),
+                  right: Math.round(rect.right),
+                  width: Math.round(rect.width),
+                  scrollWidth: node.scrollWidth,
+                  clientWidth: node.clientWidth,
+                };
+              })
+              .filter((item) => item.width > 0 && (
+                item.left < projectBodyRect.left - 1
+                || item.right > projectBodyRect.right + 1
+                || item.scrollWidth > item.clientWidth + 1
+              ))
+              .slice(0, 20),
+          };
+        });
+        assert.ok(geometry.documentWidth <= geometry.viewportWidth,
+          `${width}px Projects must not create document-level horizontal overflow: ${JSON.stringify(geometry)}`);
+        assert.ok(geometry.projectBodyScrollWidth <= geometry.projectBodyClientWidth,
+          `${width}px Projects content must stay inside its collection`);
+        assert.ok(geometry.rowScrollWidth <= geometry.rowClientWidth,
+          `${width}px ownership rows must not hide content horizontally`);
+        assert.ok(geometry.warningWidth >= Math.min(180, geometry.rowClientWidth * .7),
+          `${width}px ownership explanations must retain a readable content width: ${JSON.stringify(geometry)}`);
+        assert.ok(geometry.warningCopyWidth >= 140 && geometry.warningTitleWidth >= 140,
+          `${width}px ownership copy must not collapse into one-word lines: ${JSON.stringify(geometry)}`);
+        assert.ok(geometry.projectNameLines <= 2.1,
+          `${width}px project names must remain readable rather than vertically clipped`);
+        assert.equal(geometry.escapingActions, 0,
+          `${width}px project action groups must remain inside the viewport`);
+      }
+      await page.setViewportSize({ width: 1135, height: 919 });
+      // The preceding Projects check intentionally exercises the warning for
+      // an unverified container. Subsequent journeys use the same repository
+      // as a healthy unrelated control, so publish the verified Docker-label
+      // evidence before navigating away. This keeps the two assertions about
+      // distinct producer states instead of asking one fixture row to be both.
+      databaseContainerVerified = true;
+      overviewRevision += 1;
+
+      await page.goto(`${origin}/#/routes`, { waitUntil: 'networkidle' });
+      await page.locator('#routes-body [data-route-slug]').first().waitFor();
+      assert.equal(await page.locator('#routes-body [data-route-slug]').count(), 32,
+        'Routes must lead with the complete real collection');
+      assert.equal(await page.locator('#route-dialog').getAttribute('open'), null);
+
+      await page.locator('#route-add').click();
+      assert.equal(await page.locator('#route-dialog').getAttribute('open'), '');
+      await page.waitForFunction(() => document.activeElement?.id === 'rf-slug');
+      const wideRouteDialogGeometry = await page.locator('#route-dialog').evaluate((node) => {
+        const rect = node.getBoundingClientRect();
+        return {
+          left: rect.left, right: rect.right, top: rect.top, bottom: rect.bottom,
+          viewportWidth: window.innerWidth, viewportHeight: window.innerHeight,
+        };
+      });
+      assert.ok(wideRouteDialogGeometry.left >= 0
+        && wideRouteDialogGeometry.right <= wideRouteDialogGeometry.viewportWidth
+        && wideRouteDialogGeometry.top >= 0
+        && wideRouteDialogGeometry.bottom <= wideRouteDialogGeometry.viewportHeight,
+      'the route form must open inside the current desktop viewport');
+      await page.locator('input[name="rf-kind"][value="server"]').check();
+      assert.equal(await page.locator('#rf-server-wrap').isVisible(), true,
+        'managed-server creation must remain available in the dialog');
+      assert.ok(await page.locator('#rf-server option').count() > 1,
+        'managed-server creation must retain the current coordinator targets');
+      await page.locator('input[name="rf-kind"][value="docker"]').check();
+      assert.equal(await page.locator('#rf-container-wrap').isVisible(), true,
+        'container creation must remain available in the dialog');
+      await page.locator('input[name="rf-kind"][value="port"]').check();
+      assert.equal(await page.locator('#rf-port-wrap').isVisible(), true,
+        'fixed-port creation must remain available in the dialog');
+      await page.locator('#route-cancel').click();
+      await page.waitForFunction(() => document.activeElement?.id === 'route-add');
+
+      const managedRoute = page.locator('[data-route-slug="fixture-route-01"]');
+      const managedAccess = managedRoute.locator('[data-fk="route-auth:fixture-route-01"]');
+      assert.equal(await managedAccess.getAttribute('aria-checked'), 'false');
+      await managedAccess.click();
+      await page.waitForFunction(() => (
+        document.querySelector('[data-fk="route-auth:fixture-route-01"]')
+          ?.getAttribute('aria-checked') === 'true'
+      ));
+      assert.match(await managedAccess.textContent(), /Login/,
+        'an existing route must remain manageable from the collection');
+
+      for (const width of [676, 390, 320]) {
+        await page.setViewportSize({ width, height: 844 });
+        await page.waitForFunction((expected) => window.innerWidth === expected, width);
+        const routeGeometry = await managedRoute.locator('.row.routes-grid').evaluate((row) => {
+          const cells = [...row.children];
+          const boxes = cells.map((cell) => {
+            const rect = cell.getBoundingClientRect();
+            return { left: rect.left, right: rect.right, top: rect.top, bottom: rect.bottom };
+          });
+          const rowRect = row.getBoundingClientRect();
+          return {
+            viewportWidth: window.innerWidth,
+            documentWidth: document.documentElement.scrollWidth,
+            rowClientWidth: row.clientWidth,
+            rowScrollWidth: row.scrollWidth,
+            rowLeft: rowRect.left,
+            rowRight: rowRect.right,
+            rowHeight: rowRect.height,
+            boxes,
+            labelDisplay: getComputedStyle(cells[0], '::before').display,
+          };
+        });
+        assert.ok(routeGeometry.documentWidth <= routeGeometry.viewportWidth + 1,
+          `${width}px Routes must not create document-level horizontal overflow: ${JSON.stringify(routeGeometry)}`);
+        assert.ok(routeGeometry.rowScrollWidth <= routeGeometry.rowClientWidth + 1,
+          `${width}px route card content must remain reachable without horizontal scrolling`);
+        assert.ok(routeGeometry.boxes.every((box) => (
+          box.left >= routeGeometry.rowLeft - 1 && box.right <= routeGeometry.rowRight + 1
+        )), `${width}px route controls must remain inside their card: ${JSON.stringify(routeGeometry)}`);
+        assert.ok(routeGeometry.rowHeight <= 140,
+          `${width}px route cards must stay compact instead of stacking five labeled rows: ${JSON.stringify(routeGeometry)}`);
+        assert.equal(routeGeometry.labelDisplay, 'none',
+          `${width}px route cards must not repeat desktop column labels`);
+        assert.ok(Math.abs(routeGeometry.boxes[0].top - routeGeometry.boxes[4].top) <= 8,
+          `${width}px route identity and remove action must share the first band`);
+        assert.ok(Math.abs(routeGeometry.boxes[2].top - routeGeometry.boxes[3].top) <= 8,
+          `${width}px route health and access must share the final band`);
+      }
+
+      await page.setViewportSize({ width: 390, height: 844 });
+      await page.waitForFunction(() => window.innerWidth === 390);
+      await page.locator('#route-add').click();
+      await page.waitForFunction(() => document.activeElement?.id === 'rf-slug');
+      const mobileRouteDialogGeometry = await page.locator('#route-dialog').evaluate((node) => {
+        const rect = node.getBoundingClientRect();
+        return {
+          left: rect.left, right: rect.right, top: rect.top, bottom: rect.bottom,
+          viewportWidth: window.innerWidth, viewportHeight: window.innerHeight,
+        };
+      });
+      assert.ok(mobileRouteDialogGeometry.left >= 0
+        && mobileRouteDialogGeometry.right <= mobileRouteDialogGeometry.viewportWidth
+        && mobileRouteDialogGeometry.top >= 0
+        && mobileRouteDialogGeometry.bottom <= mobileRouteDialogGeometry.viewportHeight,
+      'the route form must open inside the current mobile viewport');
+      await page.locator('#rf-slug').fill('created-after-long-list');
+      await page.locator('#rf-port').fill('4567');
+      await page.locator('#rf-title').fill('Created after a long route list');
+      await page.locator('#rf-submit').click();
+      const createdRouteRow = page.locator('[data-route-slug="created-after-long-list"]');
+      await createdRouteRow.waitFor();
+      await page.waitForTimeout(1_000);
+      const routeFocusState = await page.evaluate(() => ({
+        activeRouteSlug: document.activeElement?.dataset?.routeSlug || null,
+        activeTag: document.activeElement?.tagName || null,
+        dialogOpen: document.querySelector('#route-dialog')?.open === true,
+        rowTabIndex: document.querySelector('[data-route-slug="created-after-long-list"]')?.tabIndex,
+      }));
+      assert.equal(routeFocusState.activeRouteSlug, 'created-after-long-list',
+        `successful creation must focus the new route row: ${JSON.stringify(routeFocusState)}`);
+      assert.equal(await page.locator('#route-dialog').getAttribute('open'), null);
+      const createdRouteGeometry = await createdRouteRow.evaluate((node) => {
+        const rect = node.getBoundingClientRect();
+        return { top: rect.top, bottom: rect.bottom, viewportHeight: window.innerHeight };
+      });
+      assert.ok(createdRouteGeometry.top >= 0
+        && createdRouteGeometry.bottom <= createdRouteGeometry.viewportHeight,
+      `successful creation must reveal the new route in collection context: ${JSON.stringify(createdRouteGeometry)}`);
+      await page.locator('#route-add').click();
+      await page.locator('#route-cancel').click();
+      await page.waitForFunction(() => document.activeElement?.id === 'route-add');
+      await page.setViewportSize({ width: 1135, height: 919 });
+
+      await page.goto(`${origin}/#/ports`, { waitUntil: 'networkidle' });
+      await page.locator('#leases-body [data-lease-id]').first().waitFor();
+      assert.equal(await page.locator('#leases-body [data-lease-id]').count(), 32,
+        'Port leases must lead with the real collection');
+      assert.equal(await page.locator('#lease-dialog').getAttribute('open'), null);
+      await page.setViewportSize({ width: 390, height: 844 });
+      await page.waitForFunction(() => window.innerWidth === 390);
+      await page.locator('#lease-add').click();
+      assert.equal(await page.locator('#lease-dialog').getAttribute('open'), '');
+      await page.waitForFunction(() => document.activeElement?.id === 'lf-purpose');
+      const leaseDialogGeometry = await page.locator('#lease-dialog').evaluate((node) => {
+        const rect = node.getBoundingClientRect();
+        return {
+          left: rect.left, right: rect.right, top: rect.top, bottom: rect.bottom,
+          viewportWidth: window.innerWidth, viewportHeight: window.innerHeight,
+        };
+      });
+      assert.ok(leaseDialogGeometry.left >= 0
+        && leaseDialogGeometry.right <= leaseDialogGeometry.viewportWidth
+        && leaseDialogGeometry.top >= 0
+        && leaseDialogGeometry.bottom <= leaseDialogGeometry.viewportHeight,
+      'the lease form must open inside the current mobile viewport');
+      await page.locator('#lf-purpose').fill('Created after a long list');
+      await page.locator('#lf-preferred').fill('3456');
+      await page.locator('#lf-project').fill('/fixtures/projects/alpha');
+      await page.locator('#lf-submit').click();
+      const createdLeaseRow = page.locator('[data-lease-id="fixture-lease-created"]');
+      await createdLeaseRow.waitFor();
+      await page.waitForTimeout(1_000);
+      const leaseFocusState = await page.evaluate(() => ({
+        activeId: document.activeElement?.id || null,
+        activeLeaseId: document.activeElement?.dataset?.leaseId || null,
+        activeTag: document.activeElement?.tagName || null,
+        dialogOpen: document.querySelector('#lease-dialog')?.open === true,
+        rowTabIndex: document.querySelector('[data-lease-id="fixture-lease-created"]')?.tabIndex,
+      }));
+      assert.equal(leaseFocusState.activeLeaseId, 'fixture-lease-created',
+        `successful creation must focus the new lease row: ${JSON.stringify(leaseFocusState)}`);
+      assert.equal(await page.locator('#lease-dialog').getAttribute('open'), null);
+      const createdLeaseGeometry = await createdLeaseRow.evaluate((node) => {
+        const rect = node.getBoundingClientRect();
+        return { top: rect.top, bottom: rect.bottom, viewportHeight: window.innerHeight };
+      });
+      assert.ok(createdLeaseGeometry.top >= 0
+        && createdLeaseGeometry.bottom <= createdLeaseGeometry.viewportHeight,
+      `successful creation must reveal the new lease in collection context: ${JSON.stringify(createdLeaseGeometry)}`);
+      await page.locator('#lease-add').click();
+      await page.locator('#lease-cancel').click();
+      await page.waitForFunction(() => document.activeElement?.id === 'lease-add');
+      await page.setViewportSize({ width: 1135, height: 919 });
 
       await page.goto(`${origin}/#/docker`, { waitUntil: 'networkidle' });
       await page.waitForFunction(() => (
@@ -810,35 +1623,91 @@ test('real Servers and Docker UI keep project disclosures exclusive, focused, an
       assert.equal(await globalFinanceBlock.locator('.docker-group-items > .item').count(), 75,
         'only the first bounded page of the 85-container project may be mounted');
 
-      const dockerRow = globalFinanceBlock.locator('.row.dock-grid.expandable')
-        .filter({ hasText: LONG_DOCKER_NAME });
-      await dockerRow.waitFor();
-      const nameCell = dockerRow.locator('[data-label="Container"]');
-      const nameBox = await nameCell.boundingBox();
-      assert.ok(nameBox && nameBox.width >= 220,
-        'the reported intermediate viewport must reserve at least 220px for container names');
-      const nameGeometry = await nameCell.locator('strong').evaluate((node) => {
-        const style = getComputedStyle(node);
-        const lineHeight = Number.parseFloat(style.lineHeight)
-          || Number.parseFloat(style.fontSize) * 1.2;
-        return { height: node.getBoundingClientRect().height, lineHeight };
-      });
-      assert.ok(nameGeometry.height <= nameGeometry.lineHeight * 5,
+      const dockerLogToggle = globalFinanceBlock.locator('[data-fk^="dock-logs:"]').first();
+      const dockerPanelId = await dockerLogToggle.getAttribute('aria-controls');
+      const dockerPanel = page.locator(`[id="${dockerPanelId}"]`);
+      const dockerScrollBefore = await page.evaluate(() => window.scrollY);
+      await dockerLogToggle.click();
+      await dockerPanel.locator('.log-empty.err').waitFor();
+      assert.match(await dockerPanel.textContent(), /exact container log is temporarily unavailable/i);
+      assert.equal(await dockerLogToggle.getAttribute('aria-expanded'), 'true');
+      assert.equal(await page.locator('#banner-slot .banner').count(), 0,
+        'a resource-local Docker log failure must not create a global banner');
+      assert.ok(Math.abs(await page.evaluate(() => window.scrollY) - dockerScrollBefore) <= 1,
+        'a Docker log error must preserve document scroll context');
+      const dockerRefresh = dockerPanel.locator('[data-fk^="dock-logs-refresh:"]');
+      await dockerRefresh.click();
+      await dockerPanel.getByText('validation failed safely', { exact: false }).waitFor();
+      assert.equal(await dockerPanel.locator('.log-empty.err').count(), 0);
+      assert.equal(await dockerRefresh.evaluate((node) => document.activeElement === node), true,
+        'successful Docker log refresh must retain focus on Refresh');
+      assert.equal(dockerLogAttempts, 2);
+      await dockerLogToggle.click();
+
+      // Archive polling can replace the whole Docker section between separate
+      // locator reads. Resolve the active disclosure, row, geometry and usage
+      // evidence from one connected DOM snapshot so a detached row cannot
+      // masquerade as a responsive-layout failure.
+      const intermediateRowHandle = await page.waitForFunction(({ focusKey, containerName }) => {
+        const toggleNode = document.querySelector(
+          `[data-fk="${CSS.escape(focusKey)}"]`,
+        );
+        if (!toggleNode?.isConnected || toggleNode.getAttribute('aria-expanded') !== 'true') {
+          return false;
+        }
+        const blockNode = toggleNode.closest('.docker-project-block');
+        if (!blockNode?.isConnected) return false;
+        const rowNode = [...blockNode.querySelectorAll('.row.dock-grid.expandable')]
+          .find((candidate) => (
+            candidate.querySelector('[data-label="Container"] strong')?.textContent?.trim()
+            === containerName
+          ));
+        if (!rowNode?.isConnected) return false;
+        const nameCell = rowNode.querySelector('[data-label="Container"]');
+        const name = nameCell?.querySelector('strong');
+        const ports = rowNode.querySelector('[data-label="Ports"]');
+        const actions = rowNode.querySelector('.actions');
+        const usage = rowNode.querySelector('[data-label="CPU / Mem"] button');
+        if (![nameCell, name, ports, actions, usage].every((node) => node?.isConnected)) {
+          return false;
+        }
+        const nameCellRect = nameCell.getBoundingClientRect();
+        const nameRect = name.getBoundingClientRect();
+        const portsRect = ports.getBoundingClientRect();
+        const actionsRect = actions.getBoundingClientRect();
+        const nameStyle = getComputedStyle(name);
+        const lineHeight = Number.parseFloat(nameStyle.lineHeight)
+          || Number.parseFloat(nameStyle.fontSize) * 1.2;
+        if (nameCellRect.width <= 0 || nameRect.height <= 0 || lineHeight <= 0) return false;
+        return {
+          nameWidth: nameCellRect.width,
+          nameLines: nameRect.height / lineHeight,
+          portsActionsOverlap: !(
+            portsRect.right <= actionsRect.left
+            || actionsRect.right <= portsRect.left
+            || portsRect.bottom <= actionsRect.top
+            || actionsRect.bottom <= portsRect.top
+          ),
+          blockClientWidth: blockNode.clientWidth,
+          blockScrollWidth: blockNode.scrollWidth,
+          usageLabel: usage.getAttribute('aria-label'),
+        };
+      }, {
+        focusKey: globalFinanceKey,
+        containerName: LONG_DOCKER_NAME,
+      }, { timeout: 5_000 });
+      const intermediateRow = await intermediateRowHandle.jsonValue();
+      await intermediateRowHandle.dispose();
+      assert.ok(intermediateRow.nameWidth >= 220,
+        `the reported intermediate viewport must reserve at least 220px for container names: ${JSON.stringify(intermediateRow)}`);
+      assert.ok(intermediateRow.nameLines <= 5,
         'the long container name must not collapse into one character per line');
-      await assertElementsDoNotOverlap(
-        dockerRow.locator('[data-label="Ports"]'), dockerRow.locator('.actions'),
-        'Docker port mappings must not be covered by lifecycle and runtime actions',
-      );
-      assert.equal(
-        await globalFinanceBlock.evaluate((node) => node.scrollWidth <= node.clientWidth),
-        true,
-        'the intermediate Docker layout must remain inside its project block',
-      );
-      assert.match(
-        await dockerRow.locator('[data-label="CPU / Mem"] button').getAttribute('aria-label'),
-        /CPU 1\.1%, memory 46\.0 MiB/,
-        'a running Docker row must expose its observed CPU and memory utilization',
-      );
+      assert.equal(intermediateRow.portsActionsOverlap, false,
+        'Docker port mappings must not be covered by lifecycle and runtime actions');
+      assert.ok(intermediateRow.blockScrollWidth <= intermediateRow.blockClientWidth,
+        'the intermediate Docker layout must remain inside its project block');
+      assert.match(intermediateRow.usageLabel, /CPU 1\.1%, memory 46\.0 MiB/,
+        'a running Docker row must expose its observed CPU and memory utilization');
 
       // Exercise the exact reported 319px width with real SVG history
       // sparklines. The previous 390px/empty-metrics fixture could not detect
@@ -847,11 +1716,24 @@ test('real Servers and Docker UI keep project disclosures exclusive, focused, an
         await page.setViewportSize({ width, height: width === 319 ? 1804 : 844 });
         await page.waitForFunction(() => matchMedia('(max-width: 719px)').matches);
 
-        const headerGeometry = await globalFinanceToggle.evaluate((toggleNode) => {
+        // Inventory polling can replace the whole Docker section between
+        // locator resolution and evaluate(). A detached button has an all-zero
+        // DOMRect, which is not evidence of the rendered 390px layout. Measure
+        // one current, connected header atomically; a genuinely hidden header
+        // remains a timeout/failure instead of becoming a false pass.
+        const headerGeometryHandle = await page.waitForFunction((focusKey) => {
+          const toggleNode = document.querySelector(
+            `[data-fk="${CSS.escape(focusKey)}"]`,
+          );
+          if (!toggleNode?.isConnected) return false;
           const tolerance = 1;
           const outer = toggleNode.getBoundingClientRect();
           const name = toggleNode.querySelector('.proj-name');
+          if (!name?.isConnected) return false;
           const nameRect = name.getBoundingClientRect();
+          if (outer.width <= 0 || outer.height <= 0 || nameRect.width <= 0 || nameRect.height <= 0) {
+            return false;
+          }
           const style = getComputedStyle(name);
           const lineHeight = Number.parseFloat(style.lineHeight)
             || Number.parseFloat(style.fontSize) * 1.2;
@@ -875,27 +1757,52 @@ test('real Servers and Docker UI keep project disclosures exclusive, focused, an
           return {
             clientWidth: toggleNode.clientWidth,
             scrollWidth: toggleNode.scrollWidth,
+            outerLeft: outer.left,
+            outerRight: outer.right,
+            parentLeft: toggleNode.parentElement.getBoundingClientRect().left,
+            parentRight: toggleNode.parentElement.getBoundingClientRect().right,
+            gridTemplateColumns: getComputedStyle(toggleNode).gridTemplateColumns,
+            paddingInline: `${getComputedStyle(toggleNode).paddingLeft} ${getComputedStyle(toggleNode).paddingRight}`,
             nameWidth: nameRect.width,
             nameLines: nameRect.height / lineHeight,
             escaping,
             visibleHeaderSparks: visibleParts.filter((node) => node.matches('.spark')).length,
           };
-        });
+        }, globalFinanceKey, { timeout: 5_000 });
+        const headerGeometry = await headerGeometryHandle.jsonValue();
+        await headerGeometryHandle.dispose();
         assert.ok(headerGeometry.nameWidth >= 96,
-          `${width}px Docker project names must retain a readable track`);
+          `${width}px Docker project names must retain a readable track: ${JSON.stringify(headerGeometry)}`);
         assert.ok(headerGeometry.nameLines <= 2.1,
           `${width}px Docker project names must not collapse into one character per line`);
         assert.deepEqual(headerGeometry.escaping, [],
-          `${width}px Docker project summary content must stay inside its disclosure`);
+          `${width}px Docker project summary content must stay inside its disclosure: ${JSON.stringify(headerGeometry)}`);
         assert.ok(headerGeometry.scrollWidth <= headerGeometry.clientWidth,
           `${width}px Docker project disclosures must not overflow horizontally`);
         assert.equal(headerGeometry.visibleHeaderSparks, 0,
           `${width}px Docker project summaries must hide the redundant inline sparkline`);
 
-        const rowGeometry = await dockerRow.evaluate((rowNode) => {
+        // Resolve the current row and measure it atomically. Inventory polling
+        // may replace the section between separate locator/evaluate calls; an
+        // all-zero detached or temporarily hidden DOMRect is not layout
+        // evidence. A genuinely collapsed/missing row still times out here.
+        const rowGeometryHandle = await page.waitForFunction(({ focusKey, containerName }) => {
+          const toggleNode = document.querySelector(
+            `[data-fk="${CSS.escape(focusKey)}"]`,
+          );
+          if (!toggleNode?.isConnected || toggleNode.getAttribute('aria-expanded') !== 'true') {
+            return false;
+          }
+          const blockNode = toggleNode.closest('.docker-project-block');
+          if (!blockNode?.isConnected) return false;
+          const rowNode = [...blockNode.querySelectorAll('.row.dock-grid.expandable')]
+            .find((candidate) => (
+              candidate.querySelector('[data-label="Container"] strong')?.textContent?.trim()
+              === containerName
+            ));
+          if (!rowNode?.isConnected) return false;
           const tolerance = 1;
           const row = rowNode.getBoundingClientRect();
-          const blockNode = rowNode.closest('.docker-project-block');
           const block = blockNode.getBoundingClientRect();
           const selectors = [
             '[data-label="CPU / Mem"]',
@@ -916,19 +1823,34 @@ test('real Servers and Docker UI keep project disclosures exclusive, focused, an
             ))
           ));
           const name = rowNode.querySelector('[data-label="Container"] strong');
+          if (!name?.isConnected) return false;
           const nameStyle = getComputedStyle(name);
           const nameLineHeight = Number.parseFloat(nameStyle.lineHeight)
             || Number.parseFloat(nameStyle.fontSize) * 1.2;
           const nameRect = name.getBoundingClientRect();
-          return {
+          const geometry = {
             rowClientWidth: rowNode.clientWidth,
             rowScrollWidth: rowNode.scrollWidth,
             blockClientWidth: blockNode.clientWidth,
             blockScrollWidth: blockNode.scrollWidth,
+            nameWidth: nameRect.width,
             nameLines: nameRect.height / nameLineHeight,
             escaping,
           };
-        });
+          return geometry.rowClientWidth > 0
+            && geometry.blockClientWidth > 0
+            && geometry.nameWidth > 0
+            ? geometry : false;
+        }, {
+          focusKey: globalFinanceKey,
+          containerName: LONG_DOCKER_NAME,
+        }, { timeout: 5_000 });
+        const rowGeometry = await rowGeometryHandle.jsonValue();
+        await rowGeometryHandle.dispose();
+        assert.ok(rowGeometry.rowClientWidth > 0
+          && rowGeometry.blockClientWidth > 0
+          && rowGeometry.nameWidth > 0,
+        `${width}px Docker row must be rendered while its geometry is verified: ${JSON.stringify(rowGeometry)}`);
         assert.deepEqual(rowGeometry.escaping, [],
           `${width}px Docker row controls and chart must stay inside the card`);
         assert.ok(rowGeometry.rowScrollWidth <= rowGeometry.rowClientWidth,
@@ -949,23 +1871,131 @@ test('real Servers and Docker UI keep project disclosures exclusive, focused, an
       assert.equal(await activeFocusKey(page), xfoilKey,
         'the keyboard-activated Docker disclosure must retain focus after rerender');
 
-      // A producer-reported ownership problem is a global lifecycle fence,
-      // not another actionable pseudo-project. The exact diagnosis and repair
-      // replace every stale control, then normal rendering recovers after the
-      // authoritative inventory is corrected.
+      // Producer-reported ownership problems stay contained: healthy repository
+      // groups and controls remain available, while only the exact affected
+      // resource is mutation-blocked. A database problem also fences its exact
+      // backing container without disabling the containing repository.
       includeUnassigned = true;
+      includeDatabaseOwnershipProblem = true;
       overviewRevision += 1;
+      await page.reload({ waitUntil: 'networkidle' });
+      const ownershipDiagnostics = page.locator('#docker-body .inventory-diagnostics');
+      await ownershipDiagnostics.waitFor();
+      assert.match(await ownershipDiagnostics.textContent(),
+        /1 ownership issue needs attention.*1 actionable issue affects 3 resources.*gnt-artifact-pg.*2 databases affected.*only its name—not a repository path—was observed.*sample_api.*sample_audit/is);
+      assert.equal(await page.locator('#docker-body .repository-inventory-error').count(), 0,
+        'explicit ownership problems must not masquerade as a malformed inventory contract');
+      assert.equal(await page.locator('#docker-body .inventory-diagnostic-group').count(), 1,
+        'database children must roll up under their one actionable parent-container issue');
+      assert.equal(await page.locator('#docker-body .docker-project-block').count(), 3,
+        'all healthy repository groups must remain visible beside ownership diagnostics');
+
+      // Inventory is polled continuously. A changed observation rebuilds the
+      // section, but it must not collapse the native disclosure that the user
+      // opened, steal focus from its summary, or jump the document while they
+      // are reading the evidence.
+      const parentDisclosureKey = 'inventory-diagnostic:container:fixture-container-202';
+      const databaseDisclosureKey = `${parentDisclosureKey}:children`;
+      const parentDiagnostics = page.locator(
+        `#docker-body [data-section-disclosure="${parentDisclosureKey}"]`,
+      );
+      await parentDiagnostics.locator(`[data-fk="${parentDisclosureKey}"]`).click();
+      const databaseDiagnostics = page.locator(
+        `#docker-body [data-section-disclosure="${databaseDisclosureKey}"]`,
+      );
+      const databaseDiagnosticsSummary = databaseDiagnostics.locator(
+        `[data-fk="${databaseDisclosureKey}"]`,
+      );
+      await databaseDiagnosticsSummary.click();
+      assert.equal(await databaseDiagnostics.getAttribute('open'), '',
+        'the exact projected database evidence must open normally');
+      assert.equal(await databaseDiagnostics.locator('li').count(), 2,
+        'every projected child binding must remain available behind the disclosure');
+      await databaseDiagnosticsSummary.evaluate((summary) => {
+        summary.focus({ preventScroll: true });
+        window.scrollTo(0, 120);
+      });
+      const scrollBeforeDiagnosticPoll = await page.evaluate(() => window.scrollY);
+      const oldDatabaseDiagnostics = await databaseDiagnostics.elementHandle();
+      const requestsBeforeDiagnosticPoll = overviewRequests;
+      // The observer may replace an opaque host-resource ID while retaining
+      // the same name-only ownership finding. This previously made the
+      // disclosure key change, so a live refresh collapsed the evidence the
+      // user was reading despite no meaningful diagnosis changing.
+      unassignedResourceId = 'fixture-container-202-reobserved';
+      overviewRevision += 1;
+      await page.waitForFunction(
+        (node) => !node.isConnected,
+        oldDatabaseDiagnostics,
+        { timeout: 9_000 },
+      );
+      await oldDatabaseDiagnostics.dispose();
+      assert.ok(overviewRequests > requestsBeforeDiagnosticPoll,
+        'the six-second inventory poll must have rebuilt the diagnostic fixture');
+      const refreshedParentDisclosureKey = 'inventory-diagnostic:container:fixture-container-202-reobserved';
+      const refreshedDatabaseDisclosureKey = `${refreshedParentDisclosureKey}:children`;
+      const refreshedParentDiagnostics = page.locator(
+        `#docker-body [data-section-disclosure="${refreshedParentDisclosureKey}"]`,
+      );
+      const refreshedDatabaseDiagnostics = page.locator(
+        `#docker-body [data-section-disclosure="${refreshedDatabaseDisclosureKey}"]`,
+      );
+      assert.equal(await refreshedParentDiagnostics.getAttribute('open'), '',
+        'the parent ownership issue must survive a polling rerender that replaces its opaque ID');
+      assert.equal(await refreshedDatabaseDiagnostics.getAttribute('open'), '',
+        'expanded exact database evidence must survive a polling rerender that replaces its opaque ID');
+      assert.equal(await activeFocusKey(page), refreshedDatabaseDisclosureKey,
+        'the focused child-evidence summary must regain focus through its stable diagnostic match');
+      const scrollAfterDiagnosticPoll = await page.evaluate(() => window.scrollY);
+      assert.ok(Math.abs(scrollAfterDiagnosticPoll - scrollBeforeDiagnosticPoll) <= 1,
+        'polling must preserve the document scroll position while ownership evidence is open');
+
+      const healthyDockerToggle = page.locator(
+        '[data-fk="dock-group:path:/fixtures/projects/global-finance"]',
+      );
+      assert.equal(await healthyDockerToggle.isEnabled(), true,
+        'an unrelated healthy repository disclosure must remain operable');
+      await healthyDockerToggle.click();
+      const healthyDockerRow = page.locator('#docker-body .docker-project-block')
+        .filter({ has: healthyDockerToggle })
+        .locator('[data-lifecycle-target^="container:"]').first();
+      await healthyDockerRow.waitFor();
+      assert.equal(await healthyDockerRow.locator('button[data-fk^="dock-restart:"]').isEnabled(), true,
+        'an unrelated healthy container restart must remain enabled');
+      assert.equal(await healthyDockerRow.locator('button[data-fk^="dock-stop:"]').isEnabled(), true,
+        'an unrelated healthy container stop must remain enabled');
+
+      const databaseDockerToggle = page.locator(
+        '[data-fk="dock-group:path:/fixtures/projects/db"]',
+      );
+      assert.equal(await databaseDockerToggle.isEnabled(), true,
+        'an unrelated database repository must remain navigable');
+      await databaseDockerToggle.click();
+      const unaffectedDockerRow = page.locator('#docker-body .docker-project-block')
+        .filter({ has: databaseDockerToggle })
+        .locator('.row.dock-grid').first();
+      await unaffectedDockerRow.waitFor();
+      assert.equal(await unaffectedDockerRow.locator('button[data-fk^="dock-restart:"]').isEnabled(), true,
+        'a projected child problem must not disable restart on an unrelated container');
+      assert.equal(await unaffectedDockerRow.locator('button[data-fk^="dock-stop:"]').isEnabled(), true,
+        'a projected child problem must not disable stop on an unrelated container');
+
+      // Contradictory structural evidence remains a global fail-closed boundary:
+      // this exact container is deliberately assigned to two repository scopes.
+      includeUnassigned = false;
+      includeDatabaseOwnershipProblem = false;
+      structuralInventoryContradiction = true;
       await page.reload({ waitUntil: 'networkidle' });
       const assignmentError = page.locator('#docker-body .repository-inventory-error');
       await assignmentError.waitFor();
       assert.match(await assignmentError.textContent(),
-        /Repository assignment is incomplete.*gnt-artifact-pg.*only its name—not a repository path—was observed.*Attach this exact container to its original root repository, or retire it/is);
+        /Repository inventory contract is invalid.*container is missing, duplicated, or assigned to the wrong repository scope/is);
       assert.equal(await page.locator('#docker-body .docker-project-block').count(), 0,
-        'no repository lifecycle target may survive an ownership error');
+        'contradictory repository membership must remove every lifecycle target');
       assert.equal(await page.locator('#docker-body button').count(), 0,
-        'the blocking diagnosis must expose no stale lifecycle mutation');
+        'a structural contradiction must expose no stale lifecycle mutation');
 
-      includeUnassigned = false;
+      structuralInventoryContradiction = false;
       overviewRevision = 0;
       await page.reload({ waitUntil: 'networkidle' });
       await page.waitForFunction(() => (
@@ -1014,6 +2044,33 @@ test('real Servers and Docker UI keep project disclosures exclusive, focused, an
       assert.equal(await activeFocusKey(page), alphaKey,
         'the replacement disclosure button must retain focus after mouse-triggered rerender');
 
+      await page.setViewportSize({ width: 390, height: 844 });
+      const serverLogToggle = alphaBlock.locator('[data-fk^="srv-x:"]').first();
+      const serverPanelId = await serverLogToggle.getAttribute('aria-controls');
+      const serverPanel = page.locator(`[id="${serverPanelId}"]`);
+      await serverLogToggle.scrollIntoViewIfNeeded();
+      const serverScrollBefore = await page.evaluate(() => window.scrollY);
+      await serverLogToggle.click();
+      await serverPanel.locator('.log-empty.err').waitFor();
+      assert.match(await serverPanel.textContent(), /exact server log is temporarily unavailable/i);
+      assert.equal(await serverLogToggle.getAttribute('aria-expanded'), 'true');
+      assert.equal(await page.locator('#banner-slot .banner').count(), 0,
+        'a resource-local server log failure must not create a global banner');
+      assert.ok(Math.abs(await page.evaluate(() => window.scrollY) - serverScrollBefore) <= 1,
+        'a server log error must preserve document scroll context');
+      const serverRefresh = serverPanel.locator('[data-fk^="srv-logs-refresh:"]');
+      await serverRefresh.click();
+      await serverPanel.getByText('server recovered safely', { exact: false }).waitFor();
+      assert.equal(await serverPanel.locator('.log-empty.err').count(), 0);
+      assert.equal(await serverRefresh.evaluate((node) => document.activeElement === node), true,
+        'successful server log refresh must retain focus on Refresh');
+      assert.equal(serverLogAttempts, 2);
+      await serverLogToggle.click();
+      assert.ok(browserErrors.every((message) => /409 \(Conflict\)/.test(message)),
+        `only the two intentional resource-local 409 responses may reach browser diagnostics: ${JSON.stringify(browserErrors)}`);
+      browserErrors.length = 0;
+      await page.setViewportSize({ width: 1135, height: 919 });
+
       await betaToggle.focus();
       await betaToggle.press('Enter');
       assert.equal(await alphaToggle.getAttribute('aria-expanded'), 'false');
@@ -1029,6 +2086,20 @@ test('real Servers and Docker UI keep project disclosures exclusive, focused, an
       const betaRow = page.locator('.server-project-block').filter({ has: betaToggle })
         .locator('.row.srv-grid.expandable').filter({ hasText: 'smoke-caddy-http' });
       await betaRow.waitFor();
+      const betaDetailsToggle = betaRow.locator('[data-fk^="srv-x:"]');
+      assert.equal(await betaDetailsToggle.getAttribute('data-log-capable'), null,
+        'a service without an authoritative log source must not advertise log capability');
+      const noLogPanelId = await betaDetailsToggle.getAttribute('aria-controls');
+      const noLogAttemptsBefore = serverLogAttempts;
+      await betaDetailsToggle.click();
+      const noLogPanel = page.locator(`[id="${noLogPanelId}"]`);
+      await noLogPanel.getByText('No authoritative log source is registered', { exact: false }).waitFor();
+      assert.equal(await noLogPanel.locator('[data-fk^="srv-logs-refresh:"]').count(), 0,
+        'details without a log source must expose no doomed Refresh action');
+      assert.equal(serverLogAttempts, noLogAttemptsBefore,
+        'opening useful server details must not request a nonexistent log artifact');
+      await betaDetailsToggle.click();
+      await betaToggle.focus();
       const betaGeometry = await betaRow.evaluate((rowNode) => {
         const tolerance = 1;
         const row = rowNode.getBoundingClientRect();
@@ -1040,6 +2111,8 @@ test('real Servers and Docker UI keep project disclosures exclusive, focused, an
         const lineHeight = Number.parseFloat(nameStyle.lineHeight)
           || Number.parseFloat(nameStyle.fontSize) * 1.2;
         const nameRect = name.getBoundingClientRect();
+        const status = rowNode.querySelector('.srv-status')?.getBoundingClientRect();
+        const actions = rowNode.querySelector('.srv-actions')?.getBoundingClientRect();
         const selectors = [
           '[data-label="Port"]',
           '[data-label="CPU / Mem"]',
@@ -1064,6 +2137,11 @@ test('real Servers and Docker UI keep project disclosures exclusive, focused, an
           blockScrollWidth: blockNode.scrollWidth,
           nameTrackWidth: nameTrack.width,
           nameLines: nameRect.height / lineHeight,
+          statusTop: status?.top ?? null,
+          actionsTop: actions?.top ?? null,
+          serverHeaderDisplay: getComputedStyle(
+            document.querySelector('#servers-body .grid-head.srv-grid'),
+          ).display,
           escaping,
         };
       });
@@ -1071,6 +2149,10 @@ test('real Servers and Docker UI keep project disclosures exclusive, focused, an
         '787px Servers rows must reserve at least 180px for the server identity');
       assert.ok(betaGeometry.nameLines <= 2.1,
         'the server name must not collapse into one character per line');
+      assert.equal(betaGeometry.serverHeaderDisplay, 'none',
+        'tablet server cards must not render a detached desktop column header');
+      assert.ok(Math.abs(betaGeometry.statusTop - betaGeometry.actionsTop) <= 2,
+        'tablet server controls must stay next to the status they affect');
       assert.deepEqual(betaGeometry.escaping, [],
         '787px server controls and utilization must remain inside the project block');
       assert.ok(betaGeometry.rowScrollWidth <= betaGeometry.rowClientWidth,
@@ -1109,6 +2191,8 @@ test('real Servers and Docker UI keep project disclosures exclusive, focused, an
           ));
           const labelDisplays = [...rowNode.querySelectorAll('.cell[data-label]')]
             .map((node) => getComputedStyle(node, '::before').display);
+          const status = rowNode.querySelector('.srv-status')?.getBoundingClientRect();
+          const actions = rowNode.querySelector('.srv-actions')?.getBoundingClientRect();
           return {
             height: row.height,
             rowClientWidth: rowNode.clientWidth,
@@ -1116,6 +2200,8 @@ test('real Servers and Docker UI keep project disclosures exclusive, focused, an
             blockClientWidth: blockNode.clientWidth,
             blockScrollWidth: blockNode.scrollWidth,
             labelDisplays,
+            statusTop: status?.top ?? null,
+            actionsTop: actions?.top ?? null,
             escaping,
           };
         });
@@ -1129,6 +2215,13 @@ test('real Servers and Docker UI keep project disclosures exclusive, focused, an
           `${width}px compact project blocks must contain every server control`);
         assert.equal(compactGeometry.labelDisplays.every((display) => display === 'none'), true,
           `${width}px server facts must not regain redundant stacked labels`);
+        if (width === 620) {
+          assert.ok(Math.abs(compactGeometry.statusTop - compactGeometry.actionsTop) <= 2,
+            '620px server cards must keep status beside its controls');
+        } else {
+          assert.ok(compactGeometry.actionsTop >= compactGeometry.statusTop,
+            'phone cards may use a final action band, but it must follow the status');
+        }
       }
       await page.setViewportSize({ width: 1135, height: 919 });
 
@@ -1386,6 +2479,8 @@ test('lifecycle-disabled admin sessions never request archives or surface an aut
           body = { version: 1, pendingCount: 0, requests: [] };
         } else if (request.method() === 'GET' && pathname === '/api/telegram') {
           body = { version: 1, bots: [], projects: [] };
+        } else if (request.method() === 'GET' && pathname === '/api/bugs') {
+          body = { schema_version: 1, revision: 'fixture-empty-bugs', bugs: [] };
         } else if (request.method() === 'GET' && pathname === '/api/prefs') {
           body = CANONICAL_PREFS;
         } else if (request.method() === 'GET' && pathname === '/api/overview') {
@@ -1516,6 +2611,8 @@ test('Performance paints retained metrics within one second while current invent
         } else if (pathname === '/api/prefs') body = CANONICAL_PREFS;
         else if (pathname === '/api/telegram') {
           body = { bots: [], pendingAuthorizations: [], authorizedChats: [] };
+        } else if (pathname === '/api/bugs') {
+          body = { schema_version: 1, revision: 'fixture-empty-bugs', bugs: [] };
         } else {
           unexpectedRequests.push(`${request.method()} ${pathname}`);
           body = {};
@@ -1527,7 +2624,8 @@ test('Performance paints retained metrics within one second while current invent
       await page.goto(`https://${stack.consoleHost}:${stack.httpsPort}/#/performance`, {
         waitUntil: 'domcontentloaded',
       });
-      await page.locator('#perf-body .perf-card').first().waitFor({ state: 'visible' });
+      await page.locator('#perf-body .performance-dashboard').waitFor({ state: 'visible' });
+      await page.locator('#perf-memory-chart').waitFor({ state: 'visible' });
       const meaningfulPaintMs = Date.now() - startedAt;
       await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))));
       const timing = await page.evaluate(() => ({
@@ -1551,7 +2649,7 @@ test('Performance paints retained metrics within one second while current invent
     }
   });
 
-test('Tests loads repository data within one second while current inventory is slow',
+test('Tests loads fleet awareness within one second and reveals repository detail on demand',
   { timeout: 120_000 }, async () => {
     const { chromium } = loadLockedPlaywright();
     const fakeDockerDir = await canonicalTempDir('devops-console-browser-tests-performance-');
@@ -1579,6 +2677,7 @@ test('Tests loads repository data within one second while current inventory is s
         ignoreHTTPSErrors: true,
         colorScheme: 'dark',
         reducedMotion: 'reduce',
+        timezoneId: 'Asia/Dubai',
       });
       await context.addCookies([{
         name: sessionCookie.name,
@@ -1591,9 +2690,14 @@ test('Tests loads repository data within one second while current inventory is s
       }]);
 
       const page = await context.newPage();
+      const browserErrors = [];
       let overviewCompleted = false;
-      let testsStartedBeforeOverview = false;
+      let fleetStartedBeforeOverview = false;
       let testsMaintenance = false;
+      page.on('pageerror', (error) => browserErrors.push(`pageerror: ${error.message}`));
+      page.on('console', (message) => {
+        if (message.type() === 'error') browserErrors.push(`console: ${message.text()}`);
+      });
       const utcDay = (offset) => {
         const date = new Date();
         date.setUTCHours(0, 0, 0, 0);
@@ -1613,27 +2717,148 @@ test('Tests loads repository data within one second while current inventory is s
       const daily = Array.from({ length: 30 }, (_, index) => ({
         day: utcDay(index - 29),
         test_seconds: 7_200 + ((index * 2_137) % 18_000),
+        run_seconds: 2_400 + ((index * 173) % 1_800),
+        passed_count: 4_800 + ((index * 137) % 900),
+        failure_count: index % 7 === 0 ? 9 : index % 3,
+        flake_rate: (index % 5) / 1_000,
       }));
       const previousDaily = Array.from({ length: 30 }, (_, index) => ({
         day: utcDay(index - 59),
         test_seconds: 6_400 + ((index * 1_743) % 14_000),
+        run_seconds: 2_500 + ((index * 149) % 1_600),
+        passed_count: 4_500 + ((index * 113) % 800),
+        failure_count: index % 9 === 0 ? 7 : index % 2,
+        flake_rate: (index % 4) / 1_000,
       }));
+      const hourStarts = Array.from({ length: 24 }, (_, index) => {
+        const date = new Date();
+        date.setUTCMinutes(0, 0, 0);
+        date.setUTCHours(date.getUTCHours() - (23 - index));
+        return date.toISOString();
+      });
+      const fleetRepositories = [
+        ['repo-devcoordinator', 'DevCoordinator', 'healthy'],
+        ['repo-global-finance', 'GlobalFinance', 'failing'],
+        ['repo-news', 'GlobalNewsTracker', 'healthy'],
+        ['repo-skydive', 'SkydiveLive', 'stale'],
+        ['repo-toolkit', 'InfraToolkit', 'idle'],
+        ['repo-billing', 'BillingCore', 'failing'],
+        ['repo-data', 'DataPipeline', 'stale'],
+        ['repo-search', 'SearchService', 'healthy'],
+        ['repo-auth', 'AuthGateway', 'healthy'],
+        ['repo-checkout', 'Checkout', 'healthy'],
+        ['repo-marketplace', 'Marketplace', 'idle'],
+        ['repo-mobile', 'MobileApps', 'healthy'],
+        ['repo-notifications', 'Notifications', 'healthy'],
+        ['repo-ops', 'OpsConsole', 'healthy'],
+        ['repo-payments', 'Payments', 'healthy'],
+        ['repo-reporting', 'Reporting', 'healthy'],
+        ['repo-web', 'WebPortal', 'healthy'],
+        ['repo-infrastructure', 'Infrastructure', 'infrastructure'],
+      ].map(([repo_id, display_name, state], repositoryIndex) => ({
+        repo_id,
+        display_name,
+        // Preserve one pre-semantics-revision payload: infrastructure-only
+        // attempts used to be mislabeled as a generic failing repository.
+        state: repo_id === 'repo-infrastructure' ? 'failing' : state,
+        state_detail: repo_id === 'repo-infrastructure' ? {
+          code: 'recent_test_failures',
+          title: 'Recent test failures',
+          detail: 'Tests failed during the selected window',
+        } : null,
+        last_activity_at: new Date(Date.now() - repositoryIndex * 90_000).toISOString(),
+        summary: {
+          test_count: repo_id === 'repo-infrastructure' ? 0 : 1_200 + repositoryIndex * 110,
+          test_seconds: repo_id === 'repo-infrastructure' ? 0 : 32_400 + repositoryIndex * 3_600,
+          wall_seconds: repo_id === 'repo-infrastructure' ? 0 : 3_600,
+          parallel_efficiency_ratio: repo_id === 'repo-infrastructure' ? null : 9 + repositoryIndex,
+          pass_rate: repo_id === 'repo-infrastructure' ? null : state === 'failing' ? .941 : .998,
+          attempt_count: repo_id === 'repo-infrastructure' ? 3 : 24,
+          ...(repo_id === 'repo-infrastructure'
+            ? { failure_count: 0, failed_run_count: 0, infrastructure_count: 3 }
+            : {
+                test_failure_count: state === 'failing' ? 2 : 0,
+                infrastructure_failure_count: 0,
+              }),
+          p95_queue_wait_seconds: state === 'stale' ? 420 : 28,
+        },
+        hourly: hourStarts.map((hour_start, hourIndex) => ({
+          hour_start,
+          test_seconds: repo_id === 'repo-infrastructure' ? 0 : [0, 1_800, 3_600, 7_200, 10_800][(repositoryIndex + hourIndex) % 5],
+          test_count: repo_id === 'repo-infrastructure' ? 0 : 12 + hourIndex,
+          failure_count: state === 'failing' && repo_id !== 'repo-infrastructure' && hourIndex === 7 ? 2 : 0,
+          infrastructure_count: hourIndex === 7
+            ? repo_id === 'repo-infrastructure' ? 3 : repo_id === 'repo-global-finance' ? 1 : 0
+            : 0,
+        })),
+      }));
+      const testFleet = {
+        schema_version: 2,
+        window: { hours: 24, start: hourStarts[0], end: hourStarts.at(-1), timezone: 'UTC' },
+        snapshot: { generated_at: new Date().toISOString(), observed_through: new Date().toISOString(), source: 'fixture-test-store' },
+        summary: {
+          repository_count: fleetRepositories.length,
+          repositories_with_activity: 17,
+          run_count: 714,
+          running_count: 0,
+          test_count: 28_515,
+          test_seconds: 238_800,
+          wall_seconds: 21_600,
+          parallel_efficiency_ratio: 11.1,
+          p95_queue_wait_seconds: 38,
+          passed_count: 28_430,
+          failure_count: 68,
+          pass_rate: .997,
+          flaky_test_count: 17,
+          flake_rate: .006,
+          avoided_work: { available: true, test_count: 13_200, test_seconds: 98_000 },
+        },
+        hours: hourStarts,
+        repositories: fleetRepositories,
+        capacity: hourStarts.map((hour_start, index) => ({
+          hour_start,
+          test_seconds: 5_000 + index * 650,
+          test_count: 100 + index * 7,
+          failure_count: index === 7 ? 2 : 0,
+          active_repository_count: 4,
+          p95_queue_wait_seconds: 10 + (index % 5) * 8,
+        })),
+        attention: [
+          { repo_id: 'repo-global-finance', severity: 'critical', code: 'failure_rate', title: 'Failure rate increased', detail: '2.1% in the last hour', observed_at: new Date().toISOString() },
+          { repo_id: 'repo-infrastructure', severity: 'error', code: 'recent_test_failures', title: 'Recent test failures', detail: 'Tests failed during the selected window', observed_at: new Date().toISOString() },
+        ],
+      };
       const testStats = {
         schema_version: 1,
         repo_id: 'repo-tests',
         days: 30,
         summary: {
-          test_count: 12,
-          run_count: 2,
-          run_seconds: 4,
-          test_seconds: 10_800,
-          passed_count: 10,
-          failed_count: 2,
+          test_count: 4_200,
+          run_count: 126,
+          run_seconds: 5_400,
+          test_seconds: 1_044_000,
+          passed_count: 4_170,
+          failed_count: 30,
           error_count: 0,
           running_count: 0,
-          failed_run_count: 1,
+          failed_run_count: 3,
         },
-        comparison_summary: { test_seconds: 7_200 },
+        comparison_summary: { test_seconds: 932_000 },
+        efficiency: {
+          test_seconds: 1_044_000,
+          wall_seconds: 5_400,
+          parallel_efficiency_ratio: 193.3,
+          p95_queue_wait_seconds: 38,
+        },
+        health: {
+          passed_count: 4_170,
+          failure_count: 30,
+          pass_rate: .9929,
+          distinct_test_count: 3_940,
+          flaky_test_count: 14,
+          flake_rate: .00355,
+        },
+        avoided_work: { available: true, test_count: 13_200, test_seconds: 98_000 },
         hourly,
         daily,
         previous_daily: previousDaily,
@@ -1650,9 +2875,22 @@ test('Tests loads repository data within one second while current inventory is s
           failure_count,
           last_run: `${utcDay(-1)}T11:30:00Z`,
         })),
+        top_actionable_regression: {
+          kind: 'test_failure',
+          name: 'CheckoutServiceIntegrationTest.testTotalCalculation',
+          failure_count: 8,
+          current_failure_count: 8,
+          previous_failure_count: 1,
+          current_average_seconds: 12.4,
+          previous_average_seconds: 11.8,
+          duration_change_percent: 5.1,
+          last_run: `${utcDay(-1)}T18:24:00Z`,
+          detail: '8 failures in the current period; 1 in the previous period',
+        },
       };
       await page.route('**/api/**', async (route) => {
-        const pathname = new URL(route.request().url()).pathname;
+        const requestUrl = new URL(route.request().url());
+        const pathname = requestUrl.pathname;
         let body;
         let status = 200;
         if (pathname === '/api/overview') {
@@ -1664,8 +2902,10 @@ test('Tests loads repository data within one second while current inventory is s
           // running Console process before its new backend endpoint is active.
           status = 404;
           body = { error: 'not found' };
+        } else if (pathname === '/api/tests/fleet') {
+          fleetStartedBeforeOverview = !overviewCompleted;
+          body = testFleet;
         } else if (pathname === '/api/tests') {
-          testsStartedBeforeOverview = !overviewCompleted;
           if (testsMaintenance) {
             status = 503;
             body = {
@@ -1675,7 +2915,13 @@ test('Tests loads repository data within one second while current inventory is s
               retry_after_seconds: 30,
             };
           } else {
-            body = testStats;
+            // Preserve the exact repository identity selected by the fleet
+            // row.  A fixed unrelated fixture ID correctly fails closed in
+            // the UI and would leave the detail panel in its error state.
+            body = {
+              ...testStats,
+              repo_id: requestUrl.searchParams.get('project'),
+            };
           }
         } else if (pathname === '/api/metrics/history') body = CANONICAL_METRICS;
         else if (pathname === '/api/session') {
@@ -1691,23 +2937,121 @@ test('Tests loads repository data within one second while current inventory is s
       await page.goto(`https://${stack.consoleHost}:${stack.httpsPort}/#/tests`, {
         waitUntil: 'domcontentloaded',
       });
-      await page.getByRole('heading', { name: 'Testing time by hour' }).waitFor({ state: 'visible' });
+      await page.getByRole('heading', { name: 'Testing time by repository' }).waitFor({ state: 'visible' });
       const meaningfulPaintMs = Date.now() - startedAt;
 
       assert.ok(meaningfulPaintMs < 1000,
         `Tests data became visible after ${meaningfulPaintMs}ms`);
-      assert.equal(testsStartedBeforeOverview, true,
-        'Tests must request repository statistics before heavyweight inventory completes');
-      assert.equal(await page.locator('#tests-project option').count(), 1);
-      assert.equal(await page.locator('#tests-pass-rate').textContent(), '83.3%');
-      assert.equal(await page.locator('#tests-failed-runs').textContent(), '1');
-      assert.ok(await page.locator('.test-heat-cell.has-failure').count() > 0);
-      assert.match(await page.locator('.test-heat-cell').nth(6).getAttribute('title'), /180\.0 aggregate test-minutes/);
-      await page.locator('.test-heat-cell').nth(6).hover();
+      assert.equal(fleetStartedBeforeOverview, true,
+        'Tests must request fleet statistics before heavyweight inventory completes');
+      assert.equal(await page.locator('.test-fleet-row').count(), 18);
+      assert.match(await page.locator('.test-fleet-summary').textContent(), /17 of 18/);
+      assert.match(await page.locator('.test-fleet-summary').textContent(), /11\.1×/);
+      assert.equal(await page.locator('.test-fleet-cell .icon').count(), 0,
+        'the intensity grid must not be decorated with failure or infrastructure icons');
+      assert.doesNotMatch(await page.locator('.test-fleet-legend').textContent(), /symbols|infrastructure|setup failures/i,
+        'the legend must describe intensity rather than diagnostic status');
+      const infrastructureRow = page.locator('.test-fleet-row').filter({
+        has: page.getByRole('button', { name: /Open Infrastructure test details/ }),
+      });
+      assert.equal(await infrastructureRow.locator('.test-fleet-total').textContent(), '3 attempts');
+      assert.match(await infrastructureRow.getAttribute('title'), /Could not run.*infrastructure.*no test assertion failures/i);
+      const infrastructureCell = infrastructureRow.locator('.test-fleet-cell[data-test-infrastructure="3"]');
+      assert.equal(await infrastructureCell.count(), 1);
+      assert.match(
+        await infrastructureCell.getAttribute('aria-label'),
+        /0 tests; 0 test failures; 3 infrastructure failures/,
+      );
+      assert.match(await page.locator('.test-fleet-attention').textContent(), /Recent test infrastructure failures/,
+        'legacy misleading attention copy must be normalized with its repository state');
+      const failingRow = page.locator('.test-fleet-row').filter({
+        has: page.getByRole('button', { name: /Open GlobalFinance test details/ }),
+      });
+      assert.match(await failingRow.getAttribute('title'), /Tests failed/,
+        'a genuine assertion failure must remain a red test failure');
+      assert.doesNotMatch(await failingRow.getAttribute('title'), /Could not run/);
+      const mixedFailureCell = failingRow.locator(
+        '.test-fleet-cell[data-test-failures="2"][data-test-infrastructure="1"]',
+      );
+      assert.equal(await mixedFailureCell.count(), 1,
+        'one hour must retain both assertion and infrastructure evidence for its popup');
+      const mixedFailureAppearance = await mixedFailureCell.evaluate((node) => {
+        return {
+          className: node.className,
+          iconCount: node.querySelectorAll('.icon').length,
+          boxShadow: getComputedStyle(node).boxShadow,
+        };
+      });
+      assert.doesNotMatch(mixedFailureAppearance.className, /has-(?:failure|infrastructure)/);
+      assert.equal(mixedFailureAppearance.iconCount, 0,
+        'mixed failure metadata must not add a warning icon to an intensity cell');
+      assert.equal(mixedFailureAppearance.boxShadow, 'none',
+        'mixed failure metadata must not add an infrastructure outline to an intensity cell');
+      assert.deepEqual(
+        await page.locator('.test-fleet-hour').allTextContents(),
+        Array.from({ length: 24 }, (_, hour) => `${String(hour).padStart(2, '0')}:00`),
+        'fleet heatmap columns must run from local 00:00 through 23:00',
+      );
+      assert.equal(
+        await page.locator('.test-fleet-hour').first().getAttribute('aria-label'),
+        '00:00 local time',
+      );
+      // Attention sorting intentionally puts the failing GlobalFinance row
+      // first. Bind the exact-value assertion to the named repository rather
+      // than whichever row currently sorts first.
+      const devCoordinatorRow = page.locator('.test-fleet-row').filter({
+        has: page.getByRole('button', { name: 'Open DevCoordinator test details' }),
+      });
+      const localMidnightCell = devCoordinatorRow.locator(
+        '.test-fleet-cell[data-test-local-hour="00:00"]',
+      );
+      const localMidnightSources = String(
+        await localMidnightCell.getAttribute('data-test-source-hours'),
+      ).split(',').filter(Boolean);
+      assert.ok(localMidnightSources.length > 0);
+      assert.ok(localMidnightSources.every((value) => new Date(value).getUTCHours() === 20),
+        'Asia/Dubai 00:00 must contain the source UTC 20:00 bucket');
+      assert.doesNotMatch(await localMidnightCell.getAttribute('title'), /UTC/,
+        'fleet exact-value text must describe browser-local time');
+      const populatedCell = devCoordinatorRow.locator(
+        '.test-fleet-cell[data-test-seconds="10800"]',
+      ).first();
+      assert.match(await populatedCell.getAttribute('title'), /180\.0 aggregate test-minutes/);
+      const capacityBar = page.locator('.test-capacity-bar').first();
+      const capacityPeriod = await capacityBar.evaluate((node) => {
+        const source = node.dataset.testSourceHour;
+        return {
+          source,
+          expected: new Date(source).toLocaleString([], {
+            month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit',
+            hourCycle: 'h23', timeZoneName: 'short',
+          }),
+          label: node.getAttribute('aria-label'),
+        };
+      });
+      assert.ok(capacityPeriod.source);
+      assert.ok(capacityPeriod.label.startsWith(capacityPeriod.expected),
+        'fleet capacity bars must expose the browser-local timestamp');
+      assert.doesNotMatch(capacityPeriod.label, /UTC/);
+      const fleetData = page.locator('.test-fleet-capacity .test-chart-data');
+      assert.equal(await fleetData.locator('th').first().textContent(), 'Hour (local)');
+      assert.equal(await fleetData.locator('tbody tr').first().locator('td').first().textContent(),
+        capacityPeriod.expected);
+      assert.doesNotMatch(await fleetData.textContent(), /UTC/,
+        'fleet capacity disclosure must not expose UTC as if it were user-local time');
+      await populatedCell.hover();
       const desktopTooltip = page.locator('#test-heat-tooltip');
       await desktopTooltip.waitFor({ state: 'visible' });
       assert.match(await desktopTooltip.textContent(), /180\.0 test-min/);
       assert.match(await desktopTooltip.textContent(), /10800 aggregate seconds/);
+      assert.deepEqual(await desktopTooltip.locator('.test-heat-tooltip-facts dt').allTextContents(), [
+        'Tests', 'Test failures', 'Infrastructure',
+      ]);
+      assert.ok((await desktopTooltip.locator('.test-heat-tooltip-facts dd').allTextContents()).every((value) => /^\d+$/.test(value)),
+        'the exact-value popup keeps diagnostic context available on demand');
+      await infrastructureCell.hover();
+      assert.deepEqual(await desktopTooltip.locator('.test-heat-tooltip-facts dd').allTextContents(), ['0', '0', '3']);
+      await populatedCell.hover();
       const desktopTooltipGeometry = await desktopTooltip.evaluate((node) => {
         const rect = node.getBoundingClientRect();
         return { left: rect.left, right: rect.right, top: rect.top, bottom: rect.bottom };
@@ -1717,6 +3061,13 @@ test('Tests loads repository data within one second while current inventory is s
         && desktopTooltipGeometry.top >= 0
         && desktopTooltipGeometry.bottom <= 1059,
       'the exact-value hover badge must stay inside the desktop viewport');
+      await page.mouse.move(0, 0);
+      await desktopTooltip.waitFor({ state: 'hidden' });
+      await populatedCell.focus();
+      await desktopTooltip.waitFor({ state: 'visible' });
+      assert.match(await desktopTooltip.textContent(), /180\.0 test-min/,
+        'keyboard focus must expose the same exact chart value as hover');
+      await populatedCell.blur();
       const desktopGeometry = await page.evaluate(() => ({
         viewportWidth: window.innerWidth,
         documentWidth: document.documentElement.scrollWidth,
@@ -1739,117 +3090,188 @@ test('Tests loads repository data within one second while current inventory is s
       assert.ok(desktopGeometry.sections.every((section) => (
         section.left >= 0 && section.right <= desktopGeometry.viewportWidth
       )), 'every Tests panel must stay inside the desktop viewport');
+      const firstViewportDensity = await page.locator('.test-fleet-attention').evaluate((node) => ({
+        bottom: node.getBoundingClientRect().bottom,
+        viewportHeight: window.innerHeight,
+      }));
+      assert.ok(firstViewportDensity.bottom <= firstViewportDensity.viewportHeight,
+        `18 repositories, fleet capacity, and Needs attention must fit the first desktop viewport (${JSON.stringify(firstViewportDensity)})`);
+
+      await page.getByRole('button', { name: 'Open GlobalFinance test details' }).click();
+      await page.getByRole('heading', { name: 'Throughput & efficiency' }).waitFor({ state: 'visible' });
+      assert.deepEqual(
+        await page.locator('.test-detail-day-cell > span:first-child').allTextContents(),
+        Array.from({ length: 24 }, (_, hour) => `${String(hour).padStart(2, '0')}:00`),
+        'repository day detail must use the same local 00:00 through 23:00 order',
+      );
+      const repositoryMidnight = page.locator(
+        '.test-detail-day-cell[data-test-local-hour="00:00"]',
+      );
+      const repositoryMidnightSources = String(
+        await repositoryMidnight.getAttribute('data-test-source-hours'),
+      ).split(',').filter(Boolean);
+      assert.ok(repositoryMidnightSources.length > 0);
+      assert.ok(repositoryMidnightSources.every((value) => new Date(value).getUTCHours() === 20));
+      assert.doesNotMatch(await repositoryMidnight.getAttribute('aria-label'), /UTC/,
+        'repository day detail accessible names must use browser-local time');
+      assert.equal(await page.locator('.test-detail-day-cell .icon').count(), 0,
+        'repository day detail must preserve the same intensity-only heatmap rule');
+      assert.equal(await page.locator('#test-detail-dialog').getAttribute('open'), '');
+      assert.match(await page.locator('.test-detail-facts').textContent(), /99\.3%/);
+      assert.match(await page.locator('.test-detail-health-trends').textContent(), /Failure & flake trend/);
+      assert.match(await page.locator('.test-detail-regression-facts').textContent(), /1 → 8 failures/);
+      const detailGeometry = await page.locator('#test-detail-dialog').evaluate((node) => {
+        const rect = node.getBoundingClientRect();
+        const fleet = document.querySelector('#sec-tests').getBoundingClientRect();
+        return {
+          modal: node.matches(':modal'),
+          left: rect.left,
+          top: rect.top,
+          width: rect.width,
+          fleetRight: fleet.right,
+          viewportWidth: window.innerWidth,
+        };
+      });
+      assert.equal(detailGeometry.modal, false,
+        'desktop repository detail must preserve the live fleet instead of making it inert');
+      assert.ok(detailGeometry.width >= 500 && detailGeometry.width <= 540,
+        `desktop repository detail must retain the selected narrow-sheet proportion: ${JSON.stringify(detailGeometry)}`);
+      assert.ok(detailGeometry.top >= 48,
+        'desktop repository detail must begin below the global Console navigation');
+      assert.ok(detailGeometry.fleetRight <= detailGeometry.left + 1,
+        'the fleet must reflow beside the repository sheet instead of being obscured');
+      await populatedCell.hover();
+      await desktopTooltip.waitFor({ state: 'visible' });
+      assert.match(await desktopTooltip.textContent(), /180\.0 test-min/,
+        'exact fleet values must remain available while repository detail is open');
+      if (process.env.TESTS_DESIGN_DETAIL_SCREENSHOT) {
+        await page.screenshot({ path: process.env.TESTS_DESIGN_DETAIL_SCREENSHOT, fullPage: false });
+      }
+      await page.locator('#test-detail-close').click();
+
+      for (const viewport of [
+        { width: 1440, height: 1000, label: '1440px desktop' },
+        { width: 768, height: 1024, label: '768px compact desktop' },
+      ]) {
+        await page.setViewportSize({ width: viewport.width, height: viewport.height });
+        await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+        const geometry = await page.evaluate(() => {
+          const matrix = document.querySelector('.test-fleet-matrix-wrap');
+          return {
+            viewportWidth: window.innerWidth,
+            documentWidth: document.documentElement.scrollWidth,
+            matrixClientWidth: matrix?.clientWidth,
+            matrixScrollWidth: matrix?.scrollWidth,
+          };
+        });
+        assert.ok(geometry.documentWidth <= geometry.viewportWidth,
+          `${viewport.label} Tests layout must not overflow the document`);
+        assert.ok(geometry.matrixScrollWidth <= geometry.matrixClientWidth,
+          `${viewport.label} fleet matrix must not scroll horizontally`);
+      }
 
       await page.setViewportSize({ width: 981, height: 964 });
       await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))));
       const narrowGeometry = await page.evaluate(() => {
-        const heatScroll = document.querySelector('.test-heat-scroll');
+        const matrix = document.querySelector('.test-fleet-matrix-wrap');
         return {
           documentWidth: document.documentElement.scrollWidth,
           viewportWidth: window.innerWidth,
-          heatClientWidth: heatScroll?.clientWidth,
-          heatScrollWidth: heatScroll?.scrollWidth,
-          summaryDisplay: getComputedStyle(document.querySelector('.test-summary')).display,
-          compactSummaryDisplay: getComputedStyle(document.querySelector('.test-summary-compact')).display,
+          matrixClientWidth: matrix?.clientWidth,
+          matrixScrollWidth: matrix?.scrollWidth,
+          mobileDisplay: getComputedStyle(document.querySelector('.test-fleet-mobile')).display,
         };
       });
       assert.ok(narrowGeometry.documentWidth <= narrowGeometry.viewportWidth,
         'the annotated 981px Tests layout must not overflow');
-      assert.ok(narrowGeometry.heatScrollWidth <= narrowGeometry.heatClientWidth,
-        'the annotated 981px heatmap must not have a horizontal scrollbar');
-      assert.equal(narrowGeometry.summaryDisplay, 'none',
-        'the right summary panel must not consume narrow-screen space');
-      assert.notEqual(narrowGeometry.compactSummaryDisplay, 'none',
-        'the narrow-screen heatmap must preserve its summary facts');
+      assert.ok(narrowGeometry.matrixScrollWidth <= narrowGeometry.matrixClientWidth,
+        'the annotated 981px fleet matrix must not have a horizontal scrollbar');
+      assert.equal(narrowGeometry.mobileDisplay, 'none',
+        'the fleet matrix should remain the primary desktop view at 981px');
       if (process.env.TESTS_DESIGN_NARROW_SCREENSHOT) {
         await page.screenshot({ path: process.env.TESTS_DESIGN_NARROW_SCREENSHOT, fullPage: true });
       }
 
       await page.setViewportSize({ width: 390, height: 844 });
-      await page.waitForFunction(() => window.innerWidth === 390 && (
-        [...document.querySelectorAll('.test-heat-hour')]
-          .filter((node) => getComputedStyle(node).visibility === 'visible').length === 12
-      ));
+      await page.waitForFunction(() => window.innerWidth === 390
+        && getComputedStyle(document.querySelector('.test-fleet-mobile')).display !== 'none');
       const mobileGeometry = await page.evaluate(() => {
-        const heatScroll = document.querySelector('.test-heat-scroll');
-        const heatRect = heatScroll?.getBoundingClientRect();
+        const list = document.querySelector('.test-fleet-mobile');
+        const listRect = list?.getBoundingClientRect();
         return {
           viewportWidth: window.innerWidth,
           documentWidth: document.documentElement.scrollWidth,
-          heatScroll: heatScroll ? {
-            left: heatRect.left,
-            right: heatRect.right,
-            clientWidth: heatScroll.clientWidth,
-            scrollWidth: heatScroll.scrollWidth,
+          list: list ? {
+            left: listRect.left,
+            right: listRect.right,
+            clientWidth: list.clientWidth,
+            scrollWidth: list.scrollWidth,
           } : null,
-          heatmap: document.querySelector('.test-heatmap')?.getBoundingClientRect().toJSON(),
-          summaryDisplay: getComputedStyle(document.querySelector('.test-summary')).display,
-          compactSummaryDisplay: getComputedStyle(document.querySelector('.test-summary-compact')).display,
-          visibleHourLabels: [...document.querySelectorAll('.test-heat-hour')]
-            .filter((node) => getComputedStyle(node).visibility === 'visible').length,
+          matrixDisplay: getComputedStyle(document.querySelector('.test-fleet-matrix-panel')).display,
         };
       });
       assert.ok(mobileGeometry.documentWidth <= mobileGeometry.viewportWidth,
         `Tests dashboard overflowed mobile by ${mobileGeometry.documentWidth - mobileGeometry.viewportWidth}px`);
-      assert.ok(mobileGeometry.heatScroll);
-      assert.ok(mobileGeometry.heatScroll.left >= 0
-        && mobileGeometry.heatScroll.right <= mobileGeometry.viewportWidth,
-      'the heatmap viewport must stay on screen');
-      assert.ok(mobileGeometry.heatScroll.scrollWidth <= mobileGeometry.heatScroll.clientWidth,
-        'the 24-hour heatmap must fit without a nested horizontal scrollbar');
-      assert.ok(mobileGeometry.heatmap.left >= mobileGeometry.heatScroll.left
-        && mobileGeometry.heatmap.right <= mobileGeometry.heatScroll.right + 1,
-      'the heatmap table must fit inside its panel');
-      assert.equal(mobileGeometry.summaryDisplay, 'none',
-        'the separate summary panel must be removed on narrow screens');
-      assert.notEqual(mobileGeometry.compactSummaryDisplay, 'none',
-        'narrow screens must retain summary facts in a compact strip');
-      assert.equal(mobileGeometry.visibleHourLabels, 12,
-        'mobile should label every other hour while retaining all 24 data cells');
-      await page.locator('.test-heat-cell').nth(23).hover();
-      const mobileTooltipGeometry = await page.locator('#test-heat-tooltip').evaluate((node) => {
+      assert.ok(mobileGeometry.list);
+      assert.ok(mobileGeometry.list.left >= 0
+        && mobileGeometry.list.right <= mobileGeometry.viewportWidth,
+      'the repository summary list must stay on screen');
+      assert.ok(mobileGeometry.list.scrollWidth <= mobileGeometry.list.clientWidth,
+        'the mobile repository list must not scroll horizontally');
+      assert.equal(mobileGeometry.matrixDisplay, 'none',
+        'the 24-column matrix must be replaced by repository summaries on mobile');
+      assert.equal(await page.locator('.test-fleet-mobile-row').count(), 18);
+      const infrastructureCard = page.locator('.test-fleet-mobile-row').filter({ hasText: 'Infrastructure' });
+      assert.match(await infrastructureCard.textContent(), /Could not run/);
+      assert.match(await infrastructureCard.textContent(), /3 attempts/);
+      assert.match(await infrastructureCard.textContent(), /No tests started/);
+      assert.match(await infrastructureCard.textContent(), /3 infrastructure failures/);
+      const assertionFailureCard = page.locator('.test-fleet-mobile-row').filter({ hasText: 'GlobalFinance' });
+      assert.match(await assertionFailureCard.textContent(), /Tests failed/,
+        'mobile must preserve genuine assertion failures while normalizing legacy infrastructure rows');
+      assert.match(await assertionFailureCard.textContent(), /2 test failures/);
+
+      await assertionFailureCard.click();
+      const mobileDrawer = await page.locator('#test-detail-dialog').evaluate((node) => {
         const rect = node.getBoundingClientRect();
-        return {
-          hidden: node.hidden,
-          left: rect.left,
-          right: rect.right,
-          top: rect.top,
-          bottom: rect.bottom,
-          text: node.textContent,
-        };
+        return { left: rect.left, right: rect.right, width: rect.width, viewportWidth: window.innerWidth };
       });
-      assert.equal(mobileTooltipGeometry.hidden, false);
-      assert.match(mobileTooltipGeometry.text, /aggregate seconds/);
-      assert.ok(mobileTooltipGeometry.left >= 0
-        && mobileTooltipGeometry.right <= 390
-        && mobileTooltipGeometry.top >= 0
-        && mobileTooltipGeometry.bottom <= 844,
-      'the right-edge hover badge must clamp inside the mobile viewport');
+      assert.equal(mobileDrawer.left, 0);
+      assert.equal(mobileDrawer.right, mobileDrawer.viewportWidth);
+      const touchHour = page.locator('.test-detail-day-cell').first();
+      await touchHour.click();
+      const touchTooltip = page.locator('#test-heat-tooltip');
+      await touchTooltip.waitFor({ state: 'visible' });
+      assert.equal(await touchHour.getAttribute('aria-pressed'), 'true');
+      assert.equal(await touchHour.getAttribute('aria-describedby'), 'test-heat-tooltip');
+      assert.match(await touchTooltip.textContent(), /test-min/);
+      assert.deepEqual(await touchTooltip.locator('.test-heat-tooltip-facts dt').allTextContents(), [
+        'Tests', 'Test failures', 'Infrastructure',
+      ],
+        'touch receives the same diagnostic summary as hover and keyboard focus');
+      await page.keyboard.press('Escape');
+      await touchTooltip.waitFor({ state: 'hidden' });
+      assert.equal(await touchHour.getAttribute('aria-pressed'), 'false',
+        'Escape must clear the pinned exact-value state');
+      await page.locator('#test-detail-close').click();
 
       await page.setViewportSize({ width: 320, height: 844 });
       await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))));
-      const smallMobileGeometry = await page.evaluate(() => {
-        const heatScroll = document.querySelector('.test-heat-scroll');
-        return {
-          viewportWidth: window.innerWidth,
-          documentWidth: document.documentElement.scrollWidth,
-          heatClientWidth: heatScroll?.clientWidth,
-          heatScrollWidth: heatScroll?.scrollWidth,
-          visibleHourLabels: [...document.querySelectorAll('.test-heat-hour')]
-            .filter((node) => getComputedStyle(node).visibility === 'visible').length,
-        };
-      });
+      const smallMobileGeometry = await page.evaluate(() => ({
+        viewportWidth: window.innerWidth,
+        documentWidth: document.documentElement.scrollWidth,
+        fleetWidth: document.querySelector('.test-fleet-mobile')?.getBoundingClientRect().width,
+      }));
       assert.ok(smallMobileGeometry.documentWidth <= smallMobileGeometry.viewportWidth,
         'the Tests dashboard must fit a 320px mobile viewport');
-      assert.ok(smallMobileGeometry.heatScrollWidth <= smallMobileGeometry.heatClientWidth,
-        'the heatmap must not scroll at 320px');
-      assert.equal(smallMobileGeometry.visibleHourLabels, 4,
-        'small mobile should label six-hour intervals while retaining all 24 data cells');
+      assert.ok(smallMobileGeometry.fleetWidth <= smallMobileGeometry.viewportWidth,
+        'the repository summary list must fit a 320px viewport');
       if (process.env.TESTS_DESIGN_MOBILE_SCREENSHOT) {
         await page.screenshot({ path: process.env.TESTS_DESIGN_MOBILE_SCREENSHOT, fullPage: true });
       }
 
       testsMaintenance = true;
+      await page.locator('.test-fleet-mobile-row').filter({ hasText: 'GlobalFinance' }).click();
       const maintenanceResponse = page.waitForResponse((response) => (
         new URL(response.url()).pathname === '/api/tests' && response.status() === 503
       ));
@@ -1859,6 +3281,9 @@ test('Tests loads repository data within one second while current inventory is s
         'planned test-data maintenance must not create a non-actionable text badge');
       assert.doesNotMatch(await page.locator('body').innerText(),
         /No action needed|nothing is required from (?:the )?user|running services stay online/i);
+      assert.ok(browserErrors.every(
+        (message) => /status of (?:404 \(Not Found\)|503 \(Service Unavailable\))/.test(message),
+      ), `the Tests journey produced unexpected browser errors: ${JSON.stringify(browserErrors)}`);
     } finally {
       await context?.close();
       await browser?.close();

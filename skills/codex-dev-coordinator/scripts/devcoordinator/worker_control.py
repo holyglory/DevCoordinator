@@ -25,6 +25,8 @@ from .store import (
 from .worker_native import (
     LaunchdWorkerManager,
     NativeWorkerState,
+    SystemdWorkerManager,
+    WorkerNativeError,
     native_worker_manager,
 )
 from .worker_supervision import (
@@ -108,9 +110,15 @@ class WorkerController:
         native_error = None
         if policy is not None:
             try:
-                native = self._native_status(
+                native_state = self._native_status(
                     worker_id=worker_id, uid=int(policy["execution_uid"])
-                ).to_dict()
+                )
+                native = native_state.to_dict()
+                self._require_native_isolation(
+                    context=context,
+                    uid=int(policy["execution_uid"]),
+                    native=native_state,
+                )
             except BaseException as error:
                 native_error = f"{type(error).__name__}: {error}"
         return self._payload(
@@ -145,7 +153,7 @@ class WorkerController:
             )
         if before is None and self._observed_process_active(context):
             raise WorkerControlError(
-                "the worker is already running outside supervision; use restart with an explicit keep_alive flag so it can be stopped before the fixed runner is installed"
+                "the worker is already running outside supervision; stop the exact service through the Coordinator server lifecycle before installing the fixed worker runner"
             )
         operation_id = self._begin_operation(
             context=context,
@@ -179,11 +187,23 @@ class WorkerController:
             native_before = self._native_status(
                 worker_id=worker_id, uid=int(policy["execution_uid"])
             )
+            try:
+                self._require_native_isolation(
+                    context=context,
+                    uid=int(policy["execution_uid"]),
+                    native=native_before,
+                )
+            except WorkerNativeError:
+                native_before = self._native_remove(
+                    worker_id=worker_id,
+                    uid=int(policy["execution_uid"]),
+                )
             if not native_before.active:
                 native = self._manager_instance().start(
                     worker_id=worker_id,
                     uid=int(policy["execution_uid"]),
                     gid=int(context["execution_gid"]),
+                    repository_id=str(context["repo_id"]),
                 )
             else:
                 native = native_before
@@ -422,6 +442,7 @@ class WorkerController:
                 worker_id=worker_id,
                 uid=int(policy["execution_uid"]),
                 gid=int(context["execution_gid"]),
+                repository_id=str(context["repo_id"]),
             )
             policy = self._wait_for_policy_state(
                 worker_id,
@@ -563,7 +584,7 @@ class WorkerController:
     def reconcile_startup(self, *, supervisor_epoch: str) -> dict[str, Any]:
         """Fence the old authority generation, then start safe keep-alive workers."""
 
-        active: list[tuple[str, int, str]] = []
+        registrations: list[tuple[str, int, str | None]] = []
         with self.store.read_transaction() as connection:
             for row in connection.execute(
                 """
@@ -572,25 +593,33 @@ class WorkerController:
                 FROM worker_policies policy
                 JOIN worker_supervisor_states supervisor
                   USING(server_definition_id)
-                WHERE supervisor.current_attempt_id IS NOT NULL
                 """
             ):
-                active.append(
+                registrations.append(
                     (
                         str(row["server_definition_id"]),
                         int(row["execution_uid"]),
-                        str(row["current_attempt_id"]),
+                        (
+                            None
+                            if row["current_attempt_id"] is None
+                            else str(row["current_attempt_id"])
+                        ),
                     )
                 )
         self.supervision.fence_startup(supervisor_epoch=supervisor_epoch)
         stopped_old: list[str] = []
         errors: list[dict[str, str]] = []
-        for worker_id, uid, _attempt_id in active:
+        for worker_id, uid, attempt_id in registrations:
             try:
-                self._native_stop(worker_id=worker_id, uid=uid)
-                self._settle_stopped_runner(
-                    worker_id=worker_id, evidence_key=supervisor_epoch
-                )
+                removed = self._native_remove(worker_id=worker_id, uid=uid)
+                if removed.loaded or removed.active:
+                    raise WorkerControlError(
+                        "native worker registration remained after startup fencing"
+                    )
+                if attempt_id is not None:
+                    self._settle_stopped_runner(
+                        worker_id=worker_id, evidence_key=supervisor_epoch
+                    )
                 stopped_old.append(worker_id)
             except BaseException as error:
                 errors.append(
@@ -612,6 +641,7 @@ class WorkerController:
                     worker_id=worker_id,
                     uid=int(candidate["execution_uid"]),
                     gid=int(user.pw_gid),
+                    repository_id=str(candidate["repo_id"]),
                 )
                 started.append(native.to_dict())
             except BaseException as error:
@@ -1008,6 +1038,7 @@ class WorkerController:
                     worker_id=worker_id,
                     uid=int(restored_policy["execution_uid"]),
                     gid=int(context["execution_gid"]),
+                    repository_id=str(context["repo_id"]),
                 )
                 restored_policy = self._wait_for_policy_state(
                     worker_id,
@@ -1293,6 +1324,24 @@ class WorkerController:
             return manager.status(worker_id=worker_id, uid=uid)
         return manager.status(worker_id=worker_id, allow_missing=True)
 
+    def _require_native_isolation(
+        self,
+        *,
+        context: Mapping[str, Any],
+        uid: int,
+        native: NativeWorkerState,
+    ) -> None:
+        manager = self._manager_instance()
+        if (
+            isinstance(manager, SystemdWorkerManager)
+            and native.loaded
+        ):
+            manager.require_project_isolation(
+                worker_id=str(context["server_definition_id"]),
+                uid=uid,
+                repository_id=str(context["repo_id"]),
+            )
+
     def _native_stop(self, *, worker_id: str, uid: int) -> NativeWorkerState:
         manager = self._manager_instance()
         if isinstance(manager, LaunchdWorkerManager):
@@ -1481,9 +1530,15 @@ class WorkerController:
 
     @staticmethod
     def _observed_process_active(context: Mapping[str, Any]) -> bool:
-        return context.get("observed_pid") is not None or str(
-            context.get("observed_lifecycle") or ""
-        ) in {"starting", "running", "unhealthy", "stopping"}
+        lifecycle = str(context.get("observed_lifecycle") or "")
+        if lifecycle == "stopped":
+            return False
+        return lifecycle in {
+            "starting",
+            "running",
+            "unhealthy",
+            "stopping",
+        } or context.get("observed_pid") is not None
 
     def _begin_operation(
         self,

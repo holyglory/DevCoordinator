@@ -1,197 +1,312 @@
 ---
 name: codex-dev-coordinator
-description: Use when coding agents in one or multiple apps, sessions, or OS accounts need attributed local service, Docker/Compose, database-stack, port, health, log, telemetry, test, or temporary-runtime lifecycle control.
+description: Manage attributed local services, Docker or Compose resources, database stacks, ports, health, logs, telemetry, temporary runtimes, and evidence-producing asynchronous tests through the server-wide DevCoordinator. Use when work must observe or change host runtime state across repositories or accounts, including when a coding sandbox cannot bind a development port or a valid Git repository is not yet enrolled. Do not use for ordinary source inspection or editing, Git review, local static checks, or isolated unit tests that do not touch a shared runtime.
 ---
 
-# Codex Dev Coordinator
+# DevCoordinator
 
-Use this skill before inspecting or changing a local development runtime.
-Python owns discovery, ownership, ports, lifecycle, telemetry, crash evidence,
-and cleanup; do not reproduce those decisions in shell or helper scripts.
+Use DevCoordinator only for host-visible runtime work or durable shared test
+evidence. Keep ordinary source work local and direct.
 
-## Required entrypoint
+## Start with the intent client
 
-Resolve the canonical script from this skill directory:
-
-```bash
-COORDINATOR="scripts/dev_coordinator.py"
-python3 scripts/dev_coordinator.py runtime --help
-python3 "$COORDINATOR" runtime status \
-  --agent "$AGENT" --root-repo "$ROOT_REPO" --no-temporary-repo \
-  --target-kind service --target-id "$RESOURCE_ID" --target-name web \
-  --purpose development --no-ttl --kill-after-run false
-python3 "$COORDINATOR" runtime --request-file /absolute/request.json
-```
-
-Use flags for ordinary existing-target status/start/stop/restart/remove work.
-Use a request file only for a structured definition, replacement, or bounded
-`run`; never hand-build JSON in routine Python or shell wrappers. Both forms
-enter the same validator. Every request includes:
-
-- `schema_version: 1` and the current agent/session identity;
-- the canonical original `root_repo` and explicit nullable `temporary_repo`;
-- purpose plus target kind and immutable target ID;
-- explicit `kill_after_run`, and a positive bounded TTL for test/temporary
-  start-like work. Status and explicit stop use no TTL.
-
-Docker and database-stack replacement currently fails before host access with
-`unsupported_safe_replace`. Do not emulate it with lower-level commands.
-
-For a persistent worker, first start sets `--keep-alive true|false`. Keep Alive
-restarts traced crashes. Ten crashes in an inclusive 300-second window trip
-the default non-expiring breaker; after fixing the worker, explicitly start
-with `--rearm-crash-loop true`.
-
-Worker `remove` is staged: obtain and then apply the Archive plan, then obtain
-and apply the distinct permanent-cleanup plan with its exact ID, fingerprint,
-and confirmation phrase. Removal unregisters native startup and active
-catalog/policy/ACL state while retaining tombstone, crash, operation, and log
-evidence. Only `broker enroll --explicit-reinstall` creates a new incarnation.
-
-## Interpret the result
-
-The compact response reports `ok`, classification, readiness, operation and
-repository context, immutable resources, ports/domains, CPU/memory breakdowns
-and family totals, stale processes, crashes, cleanup, and typed log links.
-Treat `ok=false` as failure even when a URL answers. Preserve its blocker,
-operation ID, cleanup state, and artifacts.
-
-An unclassified active family resource is a pre-mutation error. Unknown
-listener ownership, stale fingerprints, partial mutation, and incomplete
-cleanup also fail closed.
-
-## Rules agents retain
-
-- One canonical Git worktree is one project. Python proves and publishes the
-  original-root -> temporary-worktree -> service hierarchy.
-- Use immutable IDs. Names, images, ports, remotes, and path resemblance are
-  not ownership evidence.
-- Never try the default port and silently move after a collision. Durable
-  assignment and leasing belong to the Coordinator.
-- Register an already-running, provably owned resource rather than launching a
-  duplicate. Use `server register` or `docker register` only when exact
-  ownership evidence permits it.
-- Do not run package-manager servers, Docker/Compose, or local database stacks
-  directly. Use a lower-level Coordinator command only when the runtime result
-  identifies that repair and its `--help` confirms the authority.
-- The shared maintenance marker is reserved exclusively for a reviewed
-  server-wide authority/schema upgrade. Project builds, captures, tests,
-  profile enrollment, Docker/Compose work, runtime publication, and ordinary
-  `broker publish-image` planning must never activate it. The activation CLI
-  requires the exact `server-wide-authority-upgrade` scope and publishes only
-  fixed public copy; never put a project name or task description in it.
-- For root-only `broker publish-image` apply/rollback that actually replaces
-  the server-wide broker implementation, activate the shared maintenance
-  marker first and stop **only** `devcoordinator-broker.service`.
-  Keep `dev-coordinator.service` and `devops-console.service` running so every
-  Console and agent receives the bounded maintenance response. Always restart
-  the broker and clear the exact maintenance deployment ID in a `finally`
-  path. The command rejects mutation when either safeguard is absent.
-- Before destructive PostgreSQL-in-Docker work, invoke
-  `postgres-docker-backup` against the verified immutable container ID.
-
-## Shared authority and profile reload
-
-Managed hosts use one service-owned SQLite/WAL authority through an
-OS-peer-authenticated Unix socket. Clients never open its database; private
-per-user journals hold launch/log/reconciliation evidence only. Explicit
-account authority is isolated compatibility/test scope, never host-global
-evidence.
-
-The broker rechecks peer UID, protected profile, repository generation and
-family, exact membership, and action grants. Worker-role services support
-peer-UID lifecycle and generation-checked replacement through the fixed
-runner. Enrolled Docker/database targets support exact-ID status/start/stop/
-restart. Unsupported service roles and shared TTL/`run` work fail closed; do
-not switch authority modes as a workaround.
-
-In system mode the API validates the protected profile before binding and
-watches only its publication identity. After a stable atomic replacement it
-logs one `api.profile_reloaded` event and keeps its listener available; each
-broker-backed request opens and validates the current protected profile, so no
-process restart is needed to reload authorization. It never logs profile
-contents or restarts the broker/Public Console; malformed replacements fail
-the supervised startup gate. Authorization/schema drift must be repaired
-offline through the installer's documented plan/verify workflow before
-restarting the broker.
-
-During an administrator-owned offline upgrade, every new client call first
-checks the protected broker-independent maintenance marker. A trusted active
-marker returns classification `maintenance`, code `maintenance_in_progress`,
-and a bounded retry interval before any socket connection. Invalid marker
-identity, mode, or content fails closed as `maintenance_state_invalid`. Wait
-and retry through this skill; never bypass the fence with direct state, Docker,
-database, process, or socket access. The marker remains available when systemd
-removes the broker's separate runtime directory and only its deployment owner
-may clear it after service and registration verification or healthy rollback.
-
-Project failures are data-plane state, not Coordinator availability. They may
-change only their attributed resource rows and events. Console and Board keep
-their last committed inventory while a refresh is unavailable; the loopback
-API and public Console listener remain supervised independently. A project
-operation must never restart, stop, replace, fence, or publish progress through
-the Coordinator API, broker, Console, Board, or their global maintenance state.
-
-Inventory is a pure read. Runtime performs any required bounded observation
-before action and returns committed evidence. Board and Console consume
-Python-produced `repository_trees`; they never infer grouping.
-
-## Broker-owned ephemeral containers
-
-Server-wide temporary containers use administrator-sealed
-`.codex/dev-runtime.json` `ephemeral_containers` templates. Templates pin the
-image digest, argv/non-secret environment, TTL, loopback port range, CPU,
-memory, and repository/per-UID concurrency budgets. Agents cannot supply
-images, commands, mounts, privileges, secrets, or arbitrary Docker flags.
+Run `devcoordinator` from the active Git worktree. It derives the canonical
+root/temporary-worktree context and attribution, validates the installed client
+against the active authority, resolves a unique selector to an immutable target
+ID, and returns bounded JSON.
 
 ```bash
-python3 "$COORDINATOR" ephemeral start \
-  --agent "$AGENT" --project "$ROOT_REPO" --template artifact-db \
-  --ttl-seconds 1800 --operation-id "$OPERATION_UUID"
-python3 "$COORDINATOR" ephemeral status \
-  --project "$ROOT_REPO" --run-id "$RUN_ID"
-python3 "$COORDINATOR" ephemeral renew \
-  --agent "$AGENT" --project "$ROOT_REPO" --run-id "$RUN_ID" \
-  --ttl-seconds 1800 --operation-id "$OPERATION_UUID"
-python3 "$COORDINATOR" ephemeral finish \
-  --agent "$AGENT" --project "$ROOT_REPO" --run-id "$RUN_ID" \
-  --reason "validation complete" --operation-id "$OPERATION_UUID"
+devcoordinator capabilities
+devcoordinator targets web --kind service
+devcoordinator runtime status web --kind service
+devcoordinator runtime ensure web --kind service --desired ready
 ```
 
-Retain one operation UUID per mutation and replay uncertain outcomes with the
-same inputs. Status/finish retain exact owner cleanup access after ordinary
-enrollment revocation; they never revive a template or broaden authority.
-Creation is precommitted and recovered only from the full sealed label set and
-immutable container identity. The optional PostgreSQL password-file policy is
-the only broker-owned secret capability; credential bytes never enter argv,
-ordinary environment, SQLite, profiles, logs, or replies.
+Use command-scoped `--project /absolute/worktree` only when the process is not
+running inside the intended worktree. The intent client accepts no separate
+root-repository, temporary-repository, or attribution override; Python derives
+them. Supply `--operation-id` only to replay the exact prior mutation UUID after
+an uncertain reply; never mint a new UUID for the retry.
 
-## Universal test harness
+### First use and development servers
 
-When a repository declares `.codex/tests.json`, use its structured harness
-instead of invoking the underlying framework directly:
+Discovery never changes repository or host state. In a valid new Git worktree,
+`devcoordinator capabilities` and `devcoordinator targets` report
+`repository.state=unenrolled` and explain that first-use adoption is supported.
+Do not ask an administrator to enroll it, enable local fallback, or try to bind
+the port inside the coding sandbox.
+
+If a direct `npm`, Vite, Python, or similar command reports `EACCES`, `EPERM`,
+or that it cannot bind a host port in the coding sandbox, stop that direct
+launch attempt. This is the expected sandbox boundary, not an application-port
+defect and not evidence that the broker is down. No Coordinator call occurred.
+Use the single `runtime serve` call below. Likewise, “local fallback is
+disabled” describes an intentional boundary; it is never an instruction to
+enable fallback. For a valid unenrolled Git root, use `runtime serve` so the
+broker adopts and launches it in one operation.
+
+Start a new bounded development server with one structured call:
 
 ```bash
-python3 "$COORDINATOR" test run \
-  --agent "$AGENT" --project "$ROOT_REPO" --profile all
-python3 "$COORDINATOR" test stats \
-  --project "$ROOT_REPO" --days 30 --limit 25
+devcoordinator runtime serve prototype \
+  --cwd . --port 4173 --ttl-seconds 3600 \
+  --kill-after-run false --launch-timeout-seconds 30 -- \
+  npm run dev -- --host 0.0.0.0 --port 4173 --strictPort
 ```
 
-Profiles select declared groups; a single pytest group may receive exact
-`--select` node IDs. The non-root client runner executes structured argv
-without a shell. The broker owns admission, attribution, idempotency, durable
-session/group/case records, and statistics; raw commands, environment values,
-child output, credentials, and failure payloads stay out of the service log.
+Use `--project /absolute/worktree` when outside that worktree. `--cwd` is
+repository-relative; `--port` is the exact requested port and never silently
+hops; argv after `--` is executed without a shell. A positive TTL is mandatory,
+and `kill-after-run` must be explicit. This single caller command owns the
+idempotent adoption-and-launch workflow, starts the service as the attributed
+local account, and returns operation/session/service handles, URL, PID, expiry,
+and cleanup ownership. If adoption succeeds but launch is rejected, the error
+truthfully reports that durable mutation instead of pretending the whole call
+was unchanged. Python generates the operation ID; pass `--operation-id` only
+when replaying the exact same request after an uncertain reply.
+
+Every rejected call states its phase, whether the broker was contacted, whether
+mutation occurred, whether an exact retry is useful, and the next command or
+corrective action. Do not infer a broker outage from a client-side validation
+failure. Follow an uncertain operation handle; correct a certain invalid request
+before retrying it.
+
+Interpret the envelope literally:
+
+- `broker_contacted=false` and `mutation_performed=false`: context or command
+  validation failed locally. Run the returned help command, correct the call,
+  and retry; do not change enrollment, fallback, or host permissions.
+- `broker_contacted=true`: the broker returned the typed cause. For
+  `port_in_use`, keep the exact port, stop or wait for its known owner, then use
+  a fresh operation. On first use, `mutation_performed=true` may truthfully mean
+  repository adoption succeeded even though service launch did not.
+- `test_execution_owner_unavailable`: authorization succeeded, but durable
+  Coordinator repository-owner state is missing, stale, fenced, or internally
+  inconsistent. It is not a project code, dependency, port, or sandbox error.
+  Preserve the operation ID, file the structured report below, and do not
+  launch host-visible work directly.
+- A `null` contact or mutation outcome is uncertain. Run the exact returned
+  `devcoordinator operation follow dc1:operation:…` command; never invent a new
+  operation ID.
+
+For a malformed serve call, run `devcoordinator runtime serve --help`. Required
+inputs are a lowercase name, repository-relative `--cwd`, one exact `--port`, a
+positive `--ttl-seconds`, explicit `--kill-after-run true|false`, bounded
+`--launch-timeout-seconds`, and structured argv after `--`.
+
+`runtime ensure` owns fresh observation, exact target binding, no-op detection,
+the safe start/stop choice, convergence, and terminal proof. It returns
+attention instead of guessing when identity, health, ownership, or the final
+state is uncertain. Use explicit `runtime start|stop|restart` only when that
+transition itself is the requested semantic action. Use `runtime capture_logs`
+for one exact target rather than reading host logs directly.
+
+If a mutation reply is lost or uncertain, follow its returned handle:
+
+```bash
+devcoordinator operation follow dc1:operation:00000000-0000-4000-8000-000000000000
+```
+
+The installed client fails before dependent work when its release, authority
+generation, broker protocol, result schema, or required 8 KiB result envelope
+disagrees with the active authority. Do not bypass a mismatch through another
+interface.
+
+## Enqueue shared tests
+
+When `.codex/tests.json` exists and the result must become shared evidence,
+enqueue the policy-derived workflow in one call:
+
+```bash
+devcoordinator test enqueue --intent change
+devcoordinator test follow dc1:run:RUN_ID --wait-seconds 30
+```
+
+`change`, `checkpoint`, and `manual` plan and submit in one caller invocation.
+For `manual`, repeat `--target NAME` to select declared targets. `handoff` and
+`release` intentionally stop after immutable plan creation; review the returned
+plan, then execute its exact `next_command`:
+
+```bash
+devcoordinator test enqueue --intent release
+devcoordinator test submit dc1:plan:PLAN_ID
+```
+
+Submission is asynchronous. Follow only the returned run handle. A bounded wait
+controls caller patience; it neither changes nor cancels the run. Python owns
+manifest validation, prerequisite and plan selection, routine submission,
+bounded follow projection, durable launch reconciliation, and the manifest's
+safe retry policy. Manifest schema 3 is the only accepted schema and requires
+an explicit retry policy per target. Automatic retry is limited to an expired
+lease before launch; test failures are never retried as infrastructure.
+
+## Report Coordinator failures without blocking source work
+
+An ordinary measured assertion failure is a project bug, not a Coordinator
+bug. Fix the project or its test and use the returned governed evidence; do not
+file a Coordinator report merely because a test failed.
+
+On any Coordinator infrastructure or tool failure, first create one structured
+open report through the broker-independent launcher. Include a concise summary,
+expected behavior, the exact typed actual failure, ordered reproduction steps,
+the original argv as repeated structured arguments, and every correlation the
+failure made available:
+
+```bash
+devcoordinator-bug report \
+  --component test-harness \
+  --summary "governed tests failed before any measured attempt" \
+  --expected "enqueue starts the selected governed targets" \
+  --actual "infrastructure_failure: snapshot service unavailable" \
+  --step "Run from the affected repository root." \
+  --step "Invoke the command once and follow the returned run." \
+  --command-arg=devcoordinator --command-arg=test \
+  --command-arg=enqueue --command-arg=--intent --command-arg=change \
+  --classification infrastructure_failure --stage launch \
+  --call-id CALL_ID --operation-id OPERATION_ID --run-id RUN_ID
+```
+
+Omit correlation flags that were not returned; add `--attempt-id` when one was.
+`devcoordinator bug report ...` is the equivalent integrated form. Intake does
+not require repository discovery, a profile, broker, API, authority, testd, or
+call-journal availability. Do not auto-message another Codex task or guess
+which task owns the affected repository; return the report ID and a copyable
+notice to the user instead.
+
+Write every report so another Coordinator server can reproduce it without the
+original repository checkout. Use `$REPOSITORY` in ordered steps and structured
+argv instead of private absolute paths, name the required project state and
+tool versions in plain text, and include the typed failure plus every returned
+correlation. Do not refer only to a local log file, temporary path, task, or
+agent memory. Console exports preserve the source server and bug identity;
+imports remain visibly remote and never merge with a matching local report.
+
+In a Codex filesystem sandbox, invoke the installed launcher through the
+already-approved actual-caller/host execution path. `EACCES` or `EROFS` for
+`/var/lib/devcoordinator-bugs` means the exact command was run in the wrong
+execution context; retry the same structured argv as the actual caller. Do not
+relocate the registry, weaken its contract, or turn that retry into a repeated
+user approval.
+
+Report only a typed Coordinator tool or infrastructure behavior failure. An
+invalid caller argument rejected before Coordinator contact, or a direct
+sandbox bind/probe that produced no Coordinator result, is caller misuse—not
+automatically a Coordinator bug. Correct the invocation instead of filing a
+report merely because the direct probe failed.
+
+The registry contains current open reports only:
+
+```bash
+devcoordinator-bug list --limit 20
+devcoordinator-bug close BUG_ID
+```
+
+Closing physically removes the report; there is no closed-report history,
+tombstone, or hidden archive. A later recurrence receives a new identity.
+
+A Coordinator test-harness failure blocks governed evidence, not source
+development. After filing the report, continue repository-native isolated unit
+and static checks when they need no host-visible or shared state. Label every
+such result exactly `local/advisory — non-governed; not Coordinator evidence`,
+keep it out of Coordinator statistics, never claim handoff or release
+readiness from it, and rerun the governed workflow after repair. If useful,
+record that advisory check with `--local-fallback-status`, repeated
+`--local-test-command-arg`, and `--local-fallback-summary` on the report.
+
+This fallback never permits tests or runtime work requiring host listeners,
+Docker or Compose, databases, shared processes, or any host mutation. Those
+remain Coordinator-owned and wait for repair. The boundary follows
+[DC-2026-08-04-BUG-INTAKE-01](../../DecisionDetails/DC-2026-08-04-BUG-INTAKE-01.md),
+[security-assumptions.md](../../security-assumptions.md),
+`UIL-DOCUMENTATION-002`, and `UIL-TESTING-006`.
+
+## Optional MCP surface
+
+When the calling environment supports MCP stdio, `devcoordinator-mcp` exposes
+the path-free runtime/test tools `capabilities`, `targets`, `runtime_status`,
+`runtime_ensure`, `operation_follow`, `test_enqueue`, `test_submit`, and
+`test_follow`. It also exposes the outage-independent `bug_report`, `bug_list`,
+and `bug_close` tools. Those bug tools use the same open-only registry as
+`devcoordinator-bug`; they do not load repository context, profiles, or
+Coordinator services, and `bug_close` physically removes the exact report.
+
+The server accepts MCP protocol `2025-11-25` only and rejects every other
+requested version. Prefer the interface already integrated with the calling
+environment. Runtime/test CLI and MCP share context discovery, contract fences,
+target resolution, operation identity, and result bounds; bug CLI and MCP share
+the independent bounded report/list/close contract.
+
+## Agent decisions versus Python execution
+
+The agent or user chooses the goal, desired state, test intent, material target
+selection, semantic deadlines, and every destructive, handoff, or release
+approval. Python owns mechanical discovery, exact IDs, validation, planning,
+routine execution/following, supported cleanup/recovery/supersession, and
+desired-state convergence. Do not recreate that machinery in shell, prose, or
+model-authored JSON.
+
+Advanced `dev_coordinator.py`, `devcoordinator-test`, and lower-level project,
+server, Docker, port, broker, archive, backup, and recovery commands are
+separate current capabilities for structured definitions, replacement, bounded
+run, removal, manifest authoring/doctoring, exact artifact drill-down, or
+administrator work outside the intent client. Read the relevant `--help` and
+[references/admin-operations.md](references/admin-operations.md) only when one
+of those cases is actually required.
+
+The advanced structured executable contract is
+`python3 skills/codex-dev-coordinator/scripts/dev_coordinator.py runtime --help`;
+its structured lifecycle schema explicitly carries `root_repo`,
+`temporary_repo`, `kill_after_run`, and `status/start/stop/restart/remove`.
+
+## Safety and evidence
+
+- Never use `ps`, `systemctl`, Docker/Compose, port probes, or direct database
+  inspection as a parallel lifecycle authority.
+- One canonical Git worktree is one project. Python owns the root repository →
+  temporary repository → resource hierarchy. Names, paths, ports, images, and
+  UI grouping are not ownership evidence.
+- Treat `ok=false`, typed attention, unknown ownership, stale identity,
+  unclassified resources, or incomplete cleanup as unresolved.
+- Register a provably owned running resource rather than launching a duplicate.
+  Do not change ports after a collision unless the user changes the assignment.
+- A tripped persistent-worker crash loop stays stopped until the worker is
+  repaired and an explicit action re-arms it.
+- Before destructive PostgreSQL-in-Docker work, use `postgres-docker-backup`
+  against the verified immutable container ID.
+- On this confirmed single-developer host, local Unix identity is attribution,
+  not a new authorization gate. Do not preflight UID/GID/mode/ACL, path
+  traversal, local executable visibility, or socket ownership. Attempt the
+  typed call and use its evidence.
+
+For a failed or apparently absent call, correlate the operation/run through the
+bounded shared call journal instead of inferring from caller-side filesystem
+state:
+
+```bash
+devcoordinator-call-log --operation-id OPERATION_UUID --limit 20
+devcoordinator-call-log --run-id RUN_ID --limit 20
+```
+
+Report the outcome, immutable handle/ID, one relevant URL or artifact, and one
+next command. Do not paste raw logs or large case lists into model context.
+
+## Deliver DevCoordinator changes
+
+For this repository, run the repository-owned workflow once after the complete
+edit batch:
+
+```bash
+python3 scripts/software_owned_delivery.py run --help
+```
+
+It owns source verification, immutable packaging, deployment, acceptance,
+durable evidence, and concise reporting. Do not reconstruct that flow manually.
 
 ## Further help
 
-- Runtime contract: [references/runtime-api.md](references/runtime-api.md)
-- Skill overview: [README.md](README.md)
-- Current schemas and operations: `python3 scripts/dev_coordinator.py --help`
-  and the relevant subcommand `--help`
-- Installation: `python3 scripts/install_server_wide_coordinator.py --help`
-- Validation: `python3 scripts/validate.py --skip-macos-app`
-
-Keep this file below 300 lines. Put evolving detail in executable help,
-focused tests, or the linked reference.
+- Intent-client contract, bounds, calls, and ownership:
+  [references/agent-client.md](references/agent-client.md)
+- Advanced runtime schema and lifecycle details:
+  [references/runtime-api.md](references/runtime-api.md)
+- Rare server-wide procedures:
+  [references/admin-operations.md](references/admin-operations.md)

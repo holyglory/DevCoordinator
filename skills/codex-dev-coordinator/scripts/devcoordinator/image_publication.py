@@ -291,7 +291,7 @@ def plan_publication(
     if operation_directory.exists():
         raise ImagePublicationError("publication operation ID already exists")
     operation_directory.mkdir(mode=0o700)
-    _require_private_directory(operation_directory, expected_uid=service_uid)
+    _require_real_directory(operation_directory)
 
     try:
         snapshot_directory = operation_directory / "context"
@@ -367,7 +367,7 @@ def apply_publication(
     run_docker = docker_runner or _run_docker
     environment = _docker_environment()
     snapshot_directory = directory / "context"
-    _require_private_directory(snapshot_directory, expected_uid=service_uid)
+    _require_real_directory(snapshot_directory)
     _require_snapshot_integrity(manifest, snapshot_directory, specification)
 
     manifest["status"] = "building"
@@ -581,7 +581,7 @@ def capture_compose_material(
     for payload in compose_payloads:
         require_sealable_compose_payload(payload)
     env_payloads = tuple(
-        _read_private_environment_file(specification.project / relative)
+        _read_environment_file(specification.project / relative)
         for relative in specification.compose_env_files
     )
     with _pinned_project_directory(specification.project) as pinned:
@@ -664,7 +664,7 @@ def require_enrolled_compose_approval(
     """
 
     database = Path(database_path)
-    _require_private_regular_file(database, expected_uid=0)
+    _require_regular_file(database)
     try:
         connection = sqlite3.connect(
             f"file:{database}?mode=ro",
@@ -893,9 +893,9 @@ def load_manifest(
     _require_canonical_operation_id(operation_id)
     root = _ensure_artifact_root(artifact_root, expected_uid=expected_uid)
     directory = root / operation_id
-    _require_private_directory(directory, expected_uid=expected_uid)
+    _require_real_directory(directory)
     path = directory / "manifest.json"
-    metadata = _require_private_regular_file(path, expected_uid=expected_uid)
+    metadata = _require_regular_file(path)
     if metadata.st_size > 1024 * 1024:
         raise ImagePublicationError("publication manifest exceeds its bounded size")
     try:
@@ -913,7 +913,7 @@ def load_manifest(
 
 
 def write_manifest(directory: Path, manifest: Mapping[str, Any], *, expected_uid: int) -> None:
-    _require_private_directory(directory, expected_uid=expected_uid)
+    _require_real_directory(directory)
     payload = _canonical_json(manifest).encode("utf-8") + b"\n"
     if len(payload) > 1024 * 1024:
         raise ImagePublicationError("publication manifest exceeds its bounded size")
@@ -1196,7 +1196,7 @@ def running_container_image_id(
 def _copy_context_snapshot(
     specification: PublicationSpec, snapshot_root: Path, *, expected_uid: int
 ) -> dict[str, Any]:
-    _require_private_directory(snapshot_root, expected_uid=expected_uid)
+    _require_real_directory(snapshot_root)
     total_bytes = 0
     total_files = 0
     root_fd = _open_directory_no_follow(specification.project)
@@ -1686,7 +1686,9 @@ def _require_path_beneath(root: Path, relative: str, *, directory: bool | None, 
     return resolved
 
 
-def _require_real_directory(path: Path, *, field: str) -> Path:
+def _require_real_directory(
+    path: Path, *, field: str = "publication artifact directory"
+) -> Path:
     absolute = Path(os.path.abspath(path))
     try:
         resolved = path.resolve(strict=True)
@@ -1705,33 +1707,19 @@ def _ensure_artifact_root(path: Path, *, expected_uid: int) -> Path:
     if not root.is_absolute():
         raise ImagePublicationError("publication artifact root must be absolute")
     if root.exists():
-        _require_private_directory(root, expected_uid=expected_uid)
+        _require_real_directory(root)
         return root
     parent = root.parent
-    _require_private_directory(parent, expected_uid=expected_uid)
+    _require_real_directory(parent)
     try:
         root.mkdir(mode=0o700)
     except OSError as exc:
         raise ImagePublicationError("publication artifact root could not be created") from exc
-    _require_private_directory(root, expected_uid=expected_uid)
+    _require_real_directory(root)
     return root
 
 
-def _require_private_directory(path: Path, *, expected_uid: int) -> None:
-    try:
-        metadata = path.lstat()
-    except OSError as exc:
-        raise ImagePublicationError("publication artifact directory is unavailable") from exc
-    if (
-        stat.S_ISLNK(metadata.st_mode)
-        or not stat.S_ISDIR(metadata.st_mode)
-        or metadata.st_uid != expected_uid
-        or stat.S_IMODE(metadata.st_mode) & 0o077
-    ):
-        raise ImagePublicationError("publication artifact directory is not private and service-owned")
-
-
-def _require_private_regular_file(path: Path, *, expected_uid: int) -> os.stat_result:
+def _require_regular_file(path: Path) -> os.stat_result:
     try:
         metadata = path.lstat()
     except OSError as exc:
@@ -1739,10 +1727,8 @@ def _require_private_regular_file(path: Path, *, expected_uid: int) -> os.stat_r
     if (
         stat.S_ISLNK(metadata.st_mode)
         or not stat.S_ISREG(metadata.st_mode)
-        or metadata.st_uid != expected_uid
-        or stat.S_IMODE(metadata.st_mode) & 0o077
     ):
-        raise ImagePublicationError("publication artifact file is not private and service-owned")
+        raise ImagePublicationError("publication artifact path is not a regular file")
     return metadata
 
 
@@ -1829,13 +1815,7 @@ def _read_bounded_regular_file(path: Path, maximum: int) -> bytes:
             os.close(descriptor)
 
 
-def _read_private_environment_file(path: Path) -> bytes:
-    try:
-        metadata = path.lstat()
-    except OSError as exc:
-        raise ImagePublicationError("Compose environment file is unavailable") from exc
-    if stat.S_IMODE(metadata.st_mode) & 0o077:
-        raise ImagePublicationError("Compose environment file grants group or other access")
+def _read_environment_file(path: Path) -> bytes:
     return _read_bounded_regular_file(path, 1024 * 1024)
 
 

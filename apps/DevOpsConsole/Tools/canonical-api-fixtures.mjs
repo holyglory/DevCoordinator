@@ -38,6 +38,11 @@ export const CANONICAL_TELEGRAM = Object.freeze({
 export const CANONICAL_ACCESS = Object.freeze({ users: [], resources: [] });
 export const CANONICAL_INVITES = Object.freeze({ requests: [] });
 export const CANONICAL_ARCHIVES = Object.freeze({ archives: [] });
+export const CANONICAL_BUGS = Object.freeze({
+  schema_version: 1,
+  revision: 'fixture-empty-bugs',
+  bugs: [],
+});
 
 export const CANONICAL_OVERVIEW = Object.freeze({
   console: {
@@ -285,5 +290,6 @@ export function canonicalApiResponse(url, method = 'GET') {
   if (parsed.pathname === '/api/access') return CANONICAL_ACCESS;
   if (parsed.pathname === '/api/access/requests') return CANONICAL_INVITES;
   if (parsed.pathname === '/api/lifecycle/list') return CANONICAL_ARCHIVES;
+  if (parsed.pathname === '/api/bugs') return CANONICAL_BUGS;
   return null;
 }

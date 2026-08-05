@@ -1,0 +1,14 @@
+[Unit]
+Description=DevCoordinator aggregate project data-plane slice
+Before=slices.target
+
+[Slice]
+CPUAccounting=yes
+MemoryAccounting=yes
+IOAccounting=yes
+TasksAccounting=yes
+CPUWeight=100
+IOWeight=100
+MemoryHigh=DEVCOORDINATOR_PROJECT_MEMORY_HIGH_BYTES
+MemoryMax=DEVCOORDINATOR_PROJECT_MEMORY_MAX_BYTES
+TasksMax=16384

@@ -37,6 +37,7 @@ from devcoordinator.broker_profile import (  # noqa: E402
     BrokerServiceProfile,
 )
 from devcoordinator.store import CoordinatorStore, utc_timestamp  # noqa: E402
+from devcoordinator.schema import establish_repository_owner_authority  # noqa: E402
 from devcoordinator.worker_supervision import WorkerSupervision  # noqa: E402
 import devcoordinator.worker_artifacts as worker_artifacts  # noqa: E402
 from devcoordinator.tests.test_broker import (  # noqa: E402
@@ -133,13 +134,23 @@ class WorkerBrokerWireTests(unittest.TestCase):
             canonical_root="/repos/alpha",
             repo_id=PROJECT_ID,
             generation=0,
+            owner_uid=1000,
             server_ids={"web": SERVER_ID},
             container_ids={},
             compose_definition_id=None,
+            compose_container_ids=frozenset(),
+            compose_run_once_services={},
+            ephemeral_templates={},
+            ephemeral_image_prefetch_template_ids=frozenset(),
+            ephemeral_secret_policies={},
+            account_id=ACCOUNT_ID,
+            enabled=True,
+            issued_at="2026-07-26T00:00:00Z",
+            valid_until_epoch=int(time.time()) + 3600,
         )
         profile = BrokerClientProfile(
             service=BrokerServiceProfile(
-                socket_path=Path("/run/devcoordinator/broker.sock"),
+                socket_path=Path("/run/devcoordinator-authority.sock"),
                 service_uid=0,
                 socket_gid=100,
                 socket_mode=0o660,
@@ -189,9 +200,19 @@ class WorkerBrokerWireTests(unittest.TestCase):
             canonical_root="/repos/beta",
             repo_id="repo-beta",
             generation=0,
+            owner_uid=1000,
             server_ids={"worker": SERVER_ID},
             container_ids={},
             compose_definition_id=None,
+            compose_container_ids=frozenset(),
+            compose_run_once_services={},
+            ephemeral_templates={},
+            ephemeral_image_prefetch_template_ids=frozenset(),
+            ephemeral_secret_policies={},
+            account_id=profile.account_id,
+            enabled=True,
+            issued_at=profile.issued_at,
+            valid_until_epoch=profile.valid_until_epoch,
         )
         ambiguous = BrokerClientProfile(
             service=profile.service,
@@ -354,6 +375,22 @@ class WorkerBrokerMigrationTests(unittest.TestCase):
                     ) VALUES (?, 'installed', 0, 0, 'fixture', ?)
                     """,
                     (self.wrong_repo, now),
+                )
+                establish_repository_owner_authority(
+                    connection,
+                    repository_id=self.wrong_repo,
+                    owner_uid=self.uid,
+                    repository_generation=0,
+                    operation_id="worker-broker-wrong-repo-owner-fixture",
+                    actor="worker-broker-migration-fixture",
+                    reason="explicit migration fixture owner",
+                    timestamp=now,
+                    evidence={
+                        "kind": "worker-broker-migration-owner-fixture",
+                        "repository_id": self.wrong_repo,
+                        "repository_generation": 0,
+                        "owner_uid": self.uid,
+                    },
                 )
             supervision = WorkerSupervision(store)
             for server_id in (
@@ -856,7 +893,7 @@ class WorkerBrokerBackendTests(unittest.TestCase):
             recovered["result"]["attempt"]["log_artifact"]["path"], str(path)
         )
 
-    def test_wrong_peer_and_cross_worker_attempt_fail_closed(self) -> None:
+    def test_local_peer_is_attribution_while_cross_worker_attempt_fails(self) -> None:
         service = self._service()
         request = self._ticket_request()
         wrong_uid = os.geteuid() + 10_000
@@ -877,14 +914,12 @@ class WorkerBrokerBackendTests(unittest.TestCase):
         wrong_peer = PeerCredentials(
             uid=wrong_uid, gid=os.getegid(), pid=os.getpid()
         )
-        denied = self._reply(service, wrong_peer, request)
-        self.assertFalse(denied["ok"])
-        self.assertEqual(
-            denied["error"]["code"], "worker_execution_identity_mismatch"
-        )
+        local = self._reply(service, wrong_peer, request)
+        self.assertTrue(local["ok"], local)
 
         peer = PeerCredentials(uid=os.geteuid(), gid=os.getegid(), pid=os.getpid())
         ticket = self._reply(service, peer, request)["result"]
+        self.assertEqual(ticket, local["result"])
         other_server = str(uuid.uuid4())
         now = utc_timestamp()
         with CoordinatorStore.open(
@@ -920,9 +955,9 @@ class WorkerBrokerBackendTests(unittest.TestCase):
         )
         denied = self._reply(service, peer, cross)
         self.assertFalse(denied["ok"])
-        self.assertEqual(denied["error"]["code"], "worker_attempt_access_denied")
+        self.assertEqual(denied["error"]["code"], "operation_access_denied")
 
-    def test_artifact_id_path_digest_and_permissions_are_broker_verified(self) -> None:
+    def test_artifact_id_path_and_digest_are_verified_without_mode_authorization(self) -> None:
         service = self._service()
         peer = PeerCredentials(uid=os.geteuid(), gid=os.getegid(), pid=os.getpid())
         ticket = self._reply(service, peer, self._ticket_request())["result"]
@@ -963,9 +998,12 @@ class WorkerBrokerBackendTests(unittest.TestCase):
                 "occurred_at_epoch": None,
             },
         )
-        denied = self._reply(service, peer, exit_request)
-        self.assertFalse(denied["ok"])
-        self.assertEqual(denied["error"]["code"], "worker_log_artifact_invalid")
+        accepted = self._reply(service, peer, exit_request)
+        self.assertTrue(accepted["ok"], accepted)
+        self.assertEqual(
+            accepted["result"]["attempt"]["log_artifact"]["path"],
+            str(path),
+        )
 
 
 if __name__ == "__main__":

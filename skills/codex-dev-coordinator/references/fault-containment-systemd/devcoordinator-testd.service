@@ -1,0 +1,42 @@
+[Unit]
+Description=DevCoordinator asynchronous test scheduler
+Requires=devcoordinator-testd.socket devcoordinator-test-snapshotd.socket
+Wants=devcoordinator-authority.socket
+After=devcoordinator-testd.socket devcoordinator-test-snapshotd.socket devcoordinator-authority.socket
+
+[Service]
+Type=exec
+User=devcoordinator-testd
+Group=devcoordinator-testd
+Slice=devcoordinator-background.slice
+UMask=0077
+Environment=DEVCOORDINATOR_ROLE=testd
+Environment=DEVCOORDINATOR_CALL_LOG=/var/log/devcoordinator/calls.jsonl
+Environment=DEVCOORDINATOR_CALL_LOG_MAX_BYTES=4194304
+Environment=DEVCOORDINATOR_CALL_LOG_BACKUPS=4
+ExecStartPre=/opt/devcoordinator/releases/RELEASE_DIGEST/bin/devcoordinator-testd --database /var/lib/devcoordinator-testd/tests.sqlite3 --spool /var/lib/devcoordinator-testd/spool --check
+ExecStart=/opt/devcoordinator/releases/RELEASE_DIGEST/bin/devcoordinator-testd --database /var/lib/devcoordinator-testd/tests.sqlite3 --broker-socket /run/devcoordinator-authority.sock --snapshot-socket /run/devcoordinator-test-snapshotd/snapshot.sock --spool /var/lib/devcoordinator-testd/spool
+Restart=always
+RestartSec=3
+TimeoutStopSec=30s
+KillMode=control-group
+StateDirectory=devcoordinator-testd
+StateDirectoryMode=0700
+LogsDirectory=devcoordinator
+LogsDirectoryMode=0777
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=devcoordinator-testd
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=full
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX
+ReadWritePaths=/var/lib/devcoordinator-testd /run/devcoordinator-testd
+
+[Install]
+WantedBy=multi-user.target

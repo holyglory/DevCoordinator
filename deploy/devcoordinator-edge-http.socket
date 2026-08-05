@@ -1,0 +1,14 @@
+[Unit]
+Description=DevCoordinator stable public HTTP listener
+
+[Socket]
+ListenStream=80
+Accept=no
+Service=devcoordinator-edge.service
+FileDescriptorName=http
+Backlog=1024
+NoDelay=yes
+RemoveOnStop=no
+
+[Install]
+WantedBy=sockets.target

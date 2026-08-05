@@ -146,8 +146,8 @@ Documentation=file://%h/app/README.md
 User = app
 EnvironmentFile=%h/.config/app/env
 Environment=STATE_HOME=%h/.local/state/app
-ExecStartPre=/usr/bin/test -r %h/.config/app/token
-ExecStart=/usr/bin/app --token-file %h/.config/app/token
+ExecStartPre=/usr/bin/test -r %h/.config/app/config
+ExecStart=/usr/bin/app --config-file %h/.config/app/config
 ReadWritePaths=%h/.local/state/app
 """
         unsafe_home_findings = module.unsafe_system_unit_home_findings(
@@ -165,7 +165,7 @@ User=fixture
 # Documentation may mention %h without becoming a directive.
 Environment=STATE_HOME=/home/fixture/.local/state/app
 Environment=LITERAL_SPECIFIER=%%h
-ExecStart=/usr/bin/app --token-file /home/fixture/.config/app/token
+ExecStart=/usr/bin/app --config-file /home/fixture/.config/app/config
 """
         check(
             not module.unsafe_system_unit_home_findings("deploy/app.service", safe_system_unit),
@@ -207,6 +207,81 @@ Environment=ROOT_STATE=%h/.local/state/root-app
         check(
             module.forbidden_history_path("apps/DevOpsConsole/Artifacts/Canonical/projects.png") is None,
             "canonical fixture was flagged",
+        )
+
+        # Codex persists private editor checkpoints as direct-tree refs.  Keep
+        # those tool-owned snapshots outside the public-history contract while
+        # proving the same secret is still caught through every publishable
+        # branch, remote-tracking, and tag namespace.
+        private_key_label = "PRIVATE KEY"
+        private_turn_diff_payload = (
+            f"-----BEGIN {private_key_label}-----\n"
+            "private editor checkpoint fixture\n"
+            f"-----END {private_key_label}-----\n"
+        )
+        private_turn_diff_blob = subprocess.run(
+            ["git", "hash-object", "-w", "--stdin"],
+            cwd=repo,
+            input=private_turn_diff_payload,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=True,
+        ).stdout.strip()
+        private_turn_diff_tree = subprocess.run(
+            ["git", "mktree"],
+            cwd=repo,
+            input=f"100644 blob {private_turn_diff_blob}\tprivate-checkpoint.txt\n",
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=True,
+        ).stdout.strip()
+        public_secret_commit = subprocess.run(
+            [
+                "git",
+                "commit-tree",
+                private_turn_diff_tree,
+                "-p",
+                "HEAD",
+                "-m",
+                "public history secret fixture",
+            ],
+            cwd=repo,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=True,
+        ).stdout.strip()
+        public_secret_refs = (
+            "refs/heads/boundary-public-secret",
+            "refs/remotes/boundary/public-secret",
+            "refs/tags/boundary-public-secret",
+        )
+        for public_ref in public_secret_refs:
+            git(repo, "update-ref", public_ref, public_secret_commit)
+        revisions_with_public_secret = module.public_history_revisions(repo)
+        check(
+            all(public_ref in revisions_with_public_secret for public_ref in public_secret_refs),
+            "a branch, remote-tracking ref, or tag escaped the public-history revision set",
+        )
+        public_secret_findings = module.scan_history(repo)
+        check(
+            any(
+                item.rule == "unsafe-history-secret"
+                and private_turn_diff_blob in item.detail
+                for item in public_secret_findings
+            ),
+            "credential-shaped content reachable from public refs was not caught",
+        )
+        for public_ref in public_secret_refs:
+            git(repo, "update-ref", "-d", public_ref)
+
+        private_turn_diff_ref = "refs/codex/turn-diffs/checkpoints/boundary-self-test"
+        git(repo, "update-ref", private_turn_diff_ref, private_turn_diff_tree)
+        check(
+            private_turn_diff_ref not in module.public_history_revisions(repo),
+            "private Codex turn-diff ref entered the public-history revision set",
         )
         baseline_history = module.scan_history(repo)
         check(not baseline_history, f"clean history false positive: {baseline_history}")
@@ -473,7 +548,7 @@ Environment=ROOT_STATE=%h/.local/state/root-app
             any(
                 item.rule == "required-contract-marker"
                 and item.path == "scripts/self_test_cutover_helper_cli_contracts.py"
-                and "authenticated inventory evidence argv" in item.detail
+                and "trusted-loopback inventory evidence argv" in item.detail
                 for item in drift_findings
             ),
             "cutover helper CLI option drift was not caught by the repository boundary guard",

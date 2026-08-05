@@ -1,0 +1,5 @@
+# User Issue Ledger: Automation
+
+| ID | Applies to | Mistake pattern | Required behavior | Prevention and verification |
+| --- | --- | --- | --- | --- |
+| UIL-AUTOMATION-001 | Cross-task coordination and safe-to-retry notices | A repair task sent a deployment/retry notice to a remembered GlobalFinance task ID without proving that it was the active task which reported the blocker, so the actual agent continued against stale information. | Never guess or reuse a task destination from memory. Resolve the exact active task from current task metadata or a user-provided delegation ID, verify its repository and most recent blocker, and only then send one notice. If the destination cannot be proven, do not message any task; give the user a copyable notice and say why routing is uncertain. | Before sending, list candidate tasks without mutation and require an exact match on repository, current blocker text, and active status. Record the selected task ID and evidence in the local operation result. Add a coordination regression or helper that rejects zero or multiple matches, and verify no message is sent in ambiguous fixtures. |

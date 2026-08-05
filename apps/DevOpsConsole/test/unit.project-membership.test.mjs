@@ -28,6 +28,8 @@ async function loadProjectGroupsOf() {
   const contractSource = extractFunction(appJs, 'function repositoryTreeContractProblemsOf(inv)');
   const source = extractFunction(appJs, 'function projectGroupsOf(o)');
   const problemsSource = extractFunction(appJs, 'function authoritativeInventoryProblemsOf(o)');
+  const targetMatchSource = extractFunction(appJs, 'function inventoryProblemMatchesTarget(o, problem, target)');
+  const mutationProblemSource = extractFunction(appJs, 'function inventoryMutationProblemOf(o, targets = [])');
   // eslint-disable-next-line no-new-func
   const repositoryTreeContractProblemsOf = new Function(
     `${contractSource}; return repositoryTreeContractProblemsOf;`,
@@ -54,8 +56,23 @@ async function loadProjectGroupsOf() {
     (container) => !/^\s*(exited|created|dead|stopped)\b/i.test(String(container.status || '')),
     repositoryTreeContractProblemsOf,
   );
+  // eslint-disable-next-line no-new-func
+  const inventoryProblemMatchesTarget = new Function(
+    `${targetMatchSource}; return inventoryProblemMatchesTarget;`,
+  )();
+  // eslint-disable-next-line no-new-func
+  const inventoryMutationProblemOf = new Function(
+    'repositoryTreeContractProblemsOf', 'authoritativeInventoryProblemsOf',
+    'inventoryProblemMatchesTarget',
+    `${mutationProblemSource}; return inventoryMutationProblemOf;`,
+  )(
+    repositoryTreeContractProblemsOf,
+    authoritativeInventoryProblemsOf,
+    inventoryProblemMatchesTarget,
+  );
   return {
     appJs, projectGroupsOf, authoritativeInventoryProblemsOf, repositoryTreeContractProblemsOf,
+    inventoryMutationProblemOf,
   };
 }
 
@@ -86,6 +103,33 @@ function minimalAuthoritativeInventory() {
     }],
   };
 }
+
+function initializedRetainedInventory() {
+  return {
+    schema_version: 1,
+    projection_status: 'initialized',
+    repositories: [],
+    repository_trees: [],
+    memberships: [],
+    resources: { servers: [], docker: [], docker_ports: [], databases: [] },
+    observations: { servers: [], docker: [], databases: [], snapshots: [], telemetry: [] },
+    unassigned_resources: [],
+    lifecycle_violations: [],
+    servers: [],
+    docker: { available: false, containers: [], postgres: [] },
+    postgres: [],
+    backups: [],
+    project_usage: [],
+  };
+}
+
+test('fresh retained inventory is an authoritative empty graph, not a malformed contract', async () => {
+  const { projectGroupsOf, repositoryTreeContractProblemsOf } = await loadProjectGroupsOf();
+  const inventory = initializedRetainedInventory();
+
+  assert.deepEqual(repositoryTreeContractProblemsOf(inventory), []);
+  assert.deepEqual(projectGroupsOf({ inventory }), []);
+});
 
 test('repository trees group one root repo with exact nested temporary scopes', async () => {
   const { projectGroupsOf } = await loadProjectGroupsOf();
@@ -212,9 +256,10 @@ test('an authoritative empty repository tree does not fall back to flat project 
   assert.deepEqual(groups, [], 'field presence, including an empty array, selects the authoritative contract');
 });
 
-test('unassigned active authoritative resources block lifecycle rendering', async () => {
+test('unassigned resources stay contained while exact affected mutations remain blocked', async () => {
   const {
     appJs, projectGroupsOf, authoritativeInventoryProblemsOf, repositoryTreeContractProblemsOf,
+    inventoryMutationProblemOf,
   } = await loadProjectGroupsOf();
   const inventory = {
     repositories: [{
@@ -273,11 +318,14 @@ test('unassigned active authoritative resources block lifecycle rendering', asyn
       {
         resource_kind: 'container', resource_id: 'unclaimed-container', display_name: 'orphan cache',
         reason_code: 'name_only', explanation: 'Only a container name was observed.',
+        can_attach: true, can_retire: true,
         recommended_next_step: 'Attach or retire this exact container.',
       },
       {
         resource_kind: 'database', resource_id: 'unclaimed-db', display_name: 'orphan database',
         reason_code: 'missing_repo', explanation: 'Its database binding has no repository.',
+        parent_resource_kind: 'container', parent_resource_id: 'unclaimed-container',
+        parent_display_name: 'orphan cache', can_attach: false, can_retire: false,
         recommended_next_step: 'Bind the database stack to its root repository.',
       },
     ],
@@ -301,44 +349,82 @@ test('unassigned active authoritative resources block lifecycle rendering', asyn
   assert.equal(groups.some((group) => group.name === 'Unassigned Resources'), false);
   assert.deepEqual(authoritativeInventoryProblemsOf({ inventory }), [
     {
-      kind: 'server', name: 'orphan web', reason: 'Its recorded repository no longer exists.',
+      kind: 'server', resourceId: 'unclaimed-server', repoId: null, reasonCode: 'missing_repo',
+      parentResourceKind: null, parentResourceId: null, parentDisplayName: null,
+      canAttach: null, canRetire: null,
+      name: 'orphan web', reason: 'Its recorded repository no longer exists.',
       nextStep: 'Register the server from its current root repository.',
     },
     {
-      kind: 'container', name: 'orphan cache', reason: 'Only a container name was observed.',
+      kind: 'container', resourceId: 'unclaimed-container', repoId: null, reasonCode: 'name_only',
+      parentResourceKind: null, parentResourceId: null, parentDisplayName: null,
+      canAttach: true, canRetire: true,
+      name: 'orphan cache', reason: 'Only a container name was observed.',
       nextStep: 'Attach or retire this exact container.',
     },
     {
-      kind: 'database', name: 'orphan database', reason: 'Its database binding has no repository.',
+      kind: 'database', resourceId: 'unclaimed-db', repoId: null, reasonCode: 'missing_repo',
+      parentResourceKind: 'container', parentResourceId: 'unclaimed-container',
+      parentDisplayName: 'orphan cache', canAttach: false, canRetire: false,
+      name: 'orphan database', reason: 'Its database binding has no repository.',
       nextStep: 'Bind the database stack to its root repository.',
     },
   ]);
+  assert.equal(inventoryMutationProblemOf({ inventory }, {
+    target_kind: 'server', target_id: 'claimed-server',
+  }), null, 'an unrelated healthy server must remain actionable');
+  assert.equal(inventoryMutationProblemOf({ inventory }, {
+    target_kind: 'project', target_id: 'repo',
+  }), null, 'an unrelated healthy repository must remain actionable');
+  assert.equal(inventoryMutationProblemOf({ inventory }, {
+    target_kind: 'server', target_id: 'unclaimed-server',
+  })?.resourceId, 'unclaimed-server', 'the exact orphan server remains blocked');
+  assert.equal(inventoryMutationProblemOf({ inventory }, {
+    target_kind: 'container', target_id: 'unclaimed-container',
+  })?.resourceId, 'unclaimed-container', 'the exact orphan container remains blocked');
   const errorPanel = extractFunction(appJs, 'function authoritativeInventoryErrorPanel(o)');
-  assert.doesNotMatch(errorPanel, /h\('button'/,
-    'the blocking inventory state must not expose lifecycle controls');
-  for (const builder of ['buildProjects', 'buildServers', 'buildDocker', 'buildUsage']) {
+  assert.match(errorPanel, /repositoryTreeContractProblemsOf/,
+    'only a malformed or contradictory tree is a page-wide blocker');
+  assert.doesNotMatch(errorPanel, /authoritativeInventoryProblemsOf/,
+    'explicit ownership problems must not replace healthy repository pages');
+  const diagnostics = extractFunction(appJs, 'function authoritativeInventoryDiagnosticPanel(o)');
+  assert.match(diagnostics, /h\('details'/,
+    'explicit ownership problems must be grouped into contained disclosures');
+  assert.match(diagnostics, /childrenByParent/,
+    'projected child problems must roll up under their actionable parent resource');
+  assert.match(diagnostics, /children\.map/,
+    'the nested disclosure must preserve every exact projected child as evidence');
+  for (const builder of ['buildProjects', 'buildServers', 'buildDocker']) {
     const source = extractFunction(appJs, `function ${builder}(o)`);
     assert.match(source, /authoritativeInventoryErrorPanel\(o\)/,
-      `${builder} must stop before rendering lifecycle controls`);
+      `${builder} must still fail closed on a structurally invalid tree`);
+    assert.match(source, /authoritativeInventoryDiagnosticPanel\(o\)/,
+      `${builder} must keep healthy content beside scoped ownership diagnostics`);
   }
+  const performance = extractFunction(appJs, 'function buildPerf(o)');
+  assert.doesNotMatch(performance,
+    /authoritativeInventory(?:Error|Diagnostic)Panel\(o\)/,
+    'Performance must remain available from retained metrics when repository inventory is unavailable');
   for (const guard of [
     'function buildArchivedCollection(page)',
     'function openLifecycleDialog(action, target, trigger)',
     'async function submitLifecycleDialog()',
   ]) {
     const source = extractFunction(appJs, guard);
-    assert.match(source, /authoritativeInventoryProblemsOf|authoritativeInventoryErrorPanel/,
-      `${guard} must fail closed if a stale surface survives an inventory error`);
+    assert.match(source, /inventoryMutationProblemOf|authoritativeInventoryErrorPanel/,
+      `${guard} must block only a stale exact target or a structural inventory error`);
   }
   assert.match(appJs,
-    /async function runAction\(busyKey, fn,[\s\S]{0,180}authoritativeInventoryProblemsOf\(state\.overview\)/,
-    'the shared mutation runner must fail closed if stale controls survive an inventory error');
+    /async function runAction\(busyKey, fn,[\s\S]{0,220}inventoryMutationProblemOf\(state\.overview, inventoryTargets\)/,
+    'the shared mutation runner must gate only exact resource targets while retaining structural fail-closed behavior');
   assert.match(appJs, /Rerun Coordinator installation for the original root repository/,
     'ownership diagnostics without a producer next step must still tell the user how to resolve them');
 });
 
 test('malformed authoritative repository trees fail closed instead of rendering duplicate controls', async () => {
-  const { projectGroupsOf, repositoryTreeContractProblemsOf } = await loadProjectGroupsOf();
+  const {
+    projectGroupsOf, repositoryTreeContractProblemsOf, inventoryMutationProblemOf,
+  } = await loadProjectGroupsOf();
   const cases = [
     ['missing repository tree', (inventory) => { delete inventory.repository_trees; }],
     ['null repository tree', (inventory) => { inventory.repository_trees = null; }],
@@ -365,16 +451,28 @@ test('malformed authoritative repository trees fail closed instead of rendering 
     mutate(inventory);
     assert.equal(repositoryTreeContractProblemsOf(inventory)[0]?.kind, 'inventory', label);
     assert.deepEqual(projectGroupsOf({ inventory }), [], `${label} must not render action targets`);
+    assert.equal(inventoryMutationProblemOf({ inventory }, {
+      target_kind: 'server', target_id: 'server',
+    })?.kind, 'inventory', `${label} must block even a previously healthy stale control`);
   }
 });
 
 test('authoritative root rows label root-only actions and show family totals separately', async () => {
   const { appJs } = await loadProjectGroupsOf();
   const source = extractFunction(appJs, 'function projectNode(o, group, hiddenProject, revealing, hiddenServers, hiddenDocker)');
+  assert.doesNotMatch(source, /kind-tag k-root|>root</,
+    'a collection containing only root repositories must not repeat the internal hierarchy kind');
+  assert.match(source, /class: 'cell actions project-actions'/,
+    'project lifecycle and optional controls must use the stable project-header action geometry');
   assert.match(source, /root services running/);
   assert.match(source, /Root repository/);
   assert.match(source, /Family total/);
   assert.match(source, /temporary repo/);
+  assert.match(source, /const toggleProject = \(\) =>/);
+  assert.match(source, /event\.target\.closest\?\.\('button, a, input, select, textarea, \[role="button"\]'\)/,
+    'the non-control project header surface must toggle the disclosure');
+  assert.match(source, /onclick: toggleProject/,
+    'the chevron must retain its dedicated keyboard-accessible disclosure control');
 });
 
 test('flat project usage and names never synthesize a repository hierarchy', async () => {

@@ -137,7 +137,7 @@ test('invalid credentials fail before persistence', async (t) => {
   await assert.rejects(fsp.stat(file), { code: 'ENOENT' });
 });
 
-test('permissive credential files fail closed and are not read', async (t) => {
+test('same-server credential state is accepted regardless of permission metadata', async (t) => {
   const { file } = await makeStore(t);
   const secret = 'fixture-permission-token';
   await fsp.writeFile(file, JSON.stringify({
@@ -147,7 +147,8 @@ test('permissive credential files fail closed and are not read', async (t) => {
   await fsp.chmod(file, 0o644);
 
   const store = createUpstreamAuthStore({ file });
-  await assert.rejects(store.load(), /must not be group\/world accessible/);
+  await store.load();
+  assert.deepEqual(store.describe('app'), { configured: true, scheme: 'bearer' });
 });
 
 test('credential state symlinks are rejected instead of followed', async (t) => {

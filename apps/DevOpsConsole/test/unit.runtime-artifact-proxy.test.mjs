@@ -8,19 +8,15 @@ import test from 'node:test';
 import { createConsoleApi } from '../src/api.mjs';
 import { CoordError, createCoordinator } from '../src/coordinator.mjs';
 
-const TOKEN = 'fixture-runtime-artifact-token-0123456789abcdef';
 const SERVICE_ID = '11111111-1111-4111-8111-111111111111';
 const RUN_ID = '22222222-2222-4222-8222-222222222222';
 const EXACT_LIMIT_ID = '33333333-3333-4333-8333-333333333333';
 const OVERSIZED_ID = '44444444-4444-4444-8444-444444444444';
 const ARTIFACT_LIMIT = 1024 * 1024;
 
-test('coordinator artifact reads use the private bearer and a fixed typed UUID path', async (t) => {
+test('coordinator artifact reads use trusted loopback without an application credential and a fixed typed UUID path', async (t) => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'console-runtime-artifact-'));
   t.after(() => fs.rm(directory, { recursive: true, force: true }));
-  const tokenFile = path.join(directory, 'api-token');
-  await fs.writeFile(tokenFile, `${TOKEN}\n`, { mode: 0o600 });
-  await fs.chmod(tokenFile, 0o600);
   const requests = [];
   const upstream = http.createServer((req, res) => {
     requests.push({ path: req.url, authorization: req.headers.authorization });
@@ -39,7 +35,6 @@ test('coordinator artifact reads use the private bearer and a fixed typed UUID p
   const client = createCoordinator({
     config: {
       coordinatorUrl: `http://127.0.0.1:${upstream.address().port}`,
-      coordinatorTokenFile: tokenFile,
       coordinatorAutostart: false,
       coordinatorScript: '/unused/dev_coordinator.py',
       coordinatorHome: directory,
@@ -53,7 +48,7 @@ test('coordinator artifact reads use the private bearer and a fixed typed UUID p
   assert.equal(artifact.text, 'fixture log');
   assert.deepEqual(requests, [{
     path: `/v1/runtime/artifacts/service/${SERVICE_ID}`,
-    authorization: `Bearer ${TOKEN}`,
+    authorization: undefined,
   }]);
   assert.throws(
     () => client.runtimeArtifact('service', '../etc/passwd'),
@@ -70,7 +65,7 @@ test('coordinator artifact reads use the private bearer and a fixed typed UUID p
     requests[1].path,
     `/v1/runtime/artifacts/diagnostic/${RUN_ID}`,
   );
-  assert.equal(requests[1].authorization, `Bearer ${TOKEN}`);
+  assert.equal(requests[1].authorization, undefined);
 
   await client.runtimeArtifact('worker_attempt', RUN_ID);
   assert.equal(

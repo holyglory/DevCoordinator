@@ -640,12 +640,8 @@ def _copy_private_source(
 ) -> None:
     refuse_symlink_components(source)
     before = source.lstat()
-    if (
-        not stat.S_ISREG(before.st_mode)
-        or before.st_uid != expected_uid
-        or stat.S_IMODE(before.st_mode) != 0o600
-    ):
-        raise PermissionError("store backup source is not an expected-UID private file")
+    if not stat.S_ISREG(before.st_mode) or stat.S_ISLNK(before.st_mode):
+        raise PermissionError("store backup source is not a real regular file")
     source_flags = os.O_RDONLY
     destination_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
     if hasattr(os, "O_NOFOLLOW"):
@@ -837,10 +833,6 @@ def _validate_restore_target(database: Path, *, expected_uid: int) -> os.stat_re
     metadata = database.lstat()
     if not stat.S_ISREG(metadata.st_mode):
         raise PermissionError("coordinator restore target must be a regular file")
-    if metadata.st_uid != expected_uid:
-        raise PermissionError("coordinator restore target has an unexpected owner")
-    if stat.S_IMODE(metadata.st_mode) != 0o600:
-        raise PermissionError("coordinator restore target must have mode 0600")
     return metadata
 
 
@@ -933,11 +925,10 @@ def _create_forensic_store_snapshot(
         item = source.lstat()
         if (
             not stat.S_ISREG(item.st_mode)
-            or item.st_uid != expected_uid
-            or stat.S_IMODE(item.st_mode) != 0o600
+            or stat.S_ISLNK(item.st_mode)
         ):
             raise PermissionError(
-                "corrupt-store forensic source must be an expected-UID mode-0600 regular file"
+                "corrupt-store forensic source must be a real regular file"
             )
         metadata[str(source)] = item
     if database not in sources:

@@ -84,12 +84,6 @@ export function createUpstreamAuthStore({ file, log } = {}) {
     if (!stat.isFile() || stat.isSymbolicLink()) {
       throw new Error(`upstream credential state must be a regular file: ${file}`);
     }
-    if (typeof process.getuid === 'function' && stat.uid !== process.getuid()) {
-      throw new Error(`upstream credential state must be owned by the Console account: ${file}`);
-    }
-    if ((stat.mode & 0o077) !== 0) {
-      throw new Error(`upstream credential state must not be group/world accessible: ${file}`);
-    }
   }
 
   async function load() {

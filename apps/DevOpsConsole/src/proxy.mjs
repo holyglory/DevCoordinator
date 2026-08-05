@@ -4,11 +4,17 @@
 // never point the edge anywhere else (security invariant #3).
 
 import http from 'node:http';
+import https from 'node:https';
 
 const LOOPBACK = '127.0.0.1';
 const CONNECT_TIMEOUT_MS = 5_000;
 const FLOW_COOKIE_NAME = 'dc_flow';
-const IDENTITY_ASSERTION_HEADER = 'x-devops-console-assertion';
+const LEGACY_IDENTITY_ASSERTION_HEADER = 'x-devops-console-assertion';
+const LOCAL_ATTRIBUTION_HEADERS = Object.freeze({
+  email: 'x-devops-console-email',
+  routeId: 'x-devops-console-route-id',
+});
+const EMAIL_RE = /^[a-z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?$/;
 
 const HOP_BY_HOP = new Set([
   'connection',
@@ -142,6 +148,37 @@ function appendSafeRawHeaders(lines, rawHeaders, protectedNames, excludedNames =
   }
 }
 
+function localAttributionHeaders(target) {
+  if (target?.trustDomain === 'console') return null;
+  const attribution = target?.localAttribution;
+  if (!attribution || typeof attribution !== 'object' || Array.isArray(attribution)) {
+    throw new TypeError('project proxy target requires local attribution');
+  }
+  const routeId = attribution.routeId;
+  if (
+    typeof routeId !== 'string'
+    || routeId.length < 8
+    || routeId.length > 256
+    || /[\u0000-\u001f\u007f]/.test(routeId)
+  ) {
+    throw new TypeError('project proxy route identity is invalid');
+  }
+  let email = null;
+  if (attribution.email !== null && attribution.email !== undefined) {
+    email = typeof attribution.email === 'string' ? attribution.email.trim().toLowerCase() : '';
+    if (email.length > 254 || !EMAIL_RE.test(email)) {
+      throw new TypeError('project proxy email attribution is invalid');
+    }
+  }
+  if (target?.route?.auth !== 'public' && email === null) {
+    throw new TypeError('protected project proxy target requires email attribution');
+  }
+  return {
+    [LOCAL_ATTRIBUTION_HEADERS.routeId]: routeId,
+    ...(email === null ? {} : { [LOCAL_ATTRIBUTION_HEADERS.email]: email }),
+  };
+}
+
 export function createProxy({
   log,
   renderBadGateway,
@@ -154,17 +191,43 @@ export function createProxy({
   // The edge consumes these credentials for access control. Routed projects
   // are separate trust domains and must never receive or mutate them.
   const protectedCookieNames = new Set([sessionCookieName, FLOW_COOKIE_NAME]);
-  const agent = new http.Agent({ keepAlive: true, maxSockets: 256 });
+  const httpAgent = new http.Agent({ keepAlive: true, maxSockets: 256 });
+  const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 256 });
+
+  function upstreamClient(target) {
+    const scheme = target?.upstreamScheme ?? 'http';
+    if (scheme === 'http') return { client: http, agent: httpAgent, tls: {} };
+    if (scheme !== 'https') throw new TypeError(`unsupported upstream scheme: ${scheme}`);
+    const servername = target?.upstreamServerName;
+    if (typeof servername !== 'string' || servername === '') {
+      throw new TypeError('HTTPS upstream requires one verified server name');
+    }
+    return {
+      client: https,
+      agent: httpsAgent,
+      tls: {
+        servername,
+        rejectUnauthorized: target?.upstreamTlsVerify !== false,
+      },
+    };
+  }
 
   function buildRequestHeaders(req, target, { upgrade }) {
     const headers = stripHopByHop(req.headers);
-    // The browser can never select an upstream identity. Public routes also
-    // strip this Console-owned header so an upstream cannot accidentally trust
-    // a caller-shaped assertion merely because its route policy later changes.
-    delete headers[IDENTITY_ASSERTION_HEADER];
-    const safeCookie = filterRequestCookieHeader(headers.cookie, protectedCookieNames);
-    if (safeCookie === undefined) delete headers.cookie;
-    else headers.cookie = safeCookie;
+    const consoleTrustDomain = target?.trustDomain === 'console';
+    // These values are local request context, never authorization evidence.
+    // Strip browser-shaped copies on every path before the edge injects exact
+    // route attribution for project upstreams. The retired signed-assertion
+    // header is also stripped so no application can accidentally keep trusting
+    // a stale client-supplied token after the local transport cutover.
+    delete headers[LEGACY_IDENTITY_ASSERTION_HEADER];
+    for (const name of Object.values(LOCAL_ATTRIBUTION_HEADERS)) delete headers[name];
+    if (!consoleTrustDomain) {
+      const safeCookie = filterRequestCookieHeader(headers.cookie, protectedCookieNames);
+      if (safeCookie === undefined) delete headers.cookie;
+      else headers.cookie = safeCookie;
+      Object.assign(headers, localAttributionHeaders(target));
+    }
     // Host preserved: dev servers see the real vhost (Vite server.allowedHosts).
     headers.host = target.publicHost;
     const clientIp = req.socket.remoteAddress || '';
@@ -181,9 +244,6 @@ export function createProxy({
       if (target.upstreamAuthorization) {
         headers.authorization = target.upstreamAuthorization;
       }
-      if (target.upstreamIdentityAssertion) {
-        headers[IDENTITY_ASSERTION_HEADER] = target.upstreamIdentityAssertion;
-      }
     }
     if (upgrade) {
       // Re-add the one hop we intentionally carry across: the upgrade itself.
@@ -195,7 +255,8 @@ export function createProxy({
   }
 
   function forward(req, res, target) {
-    const upstreamReq = http.request({
+    const { client, agent, tls } = upstreamClient(target);
+    const upstreamReq = client.request({
       host: LOOPBACK,
       port: target.port,
       method: req.method,
@@ -203,6 +264,7 @@ export function createProxy({
       headers: buildRequestHeaders(req, target, { upgrade: false }),
       agent,
       setHost: false,
+      ...tls,
     });
 
     let upstreamRes = null;
@@ -322,7 +384,8 @@ export function createProxy({
 
   function forwardUpgrade(req, socket, head, target) {
     socket.setNoDelay(true);
-    const upstreamReq = http.request({
+    const { client, tls } = upstreamClient(target);
+    const upstreamReq = client.request({
       host: LOOPBACK,
       port: target.port,
       method: req.method || 'GET',
@@ -330,6 +393,7 @@ export function createProxy({
       headers: buildRequestHeaders(req, target, { upgrade: true }),
       agent: false, // hijacked sockets must not enter the keep-alive pool
       setHost: false,
+      ...tls,
     });
 
     let done = false;
@@ -458,6 +522,9 @@ export function createProxy({
   return {
     forward,
     forwardUpgrade,
-    close: () => agent.destroy(),
+    close: () => {
+      httpAgent.destroy();
+      httpsAgent.destroy();
+    },
   };
 }

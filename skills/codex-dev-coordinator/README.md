@@ -1,80 +1,95 @@
-# Codex Dev Coordinator
+# Codex DevCoordinator
 
-This skill routes local runtime and test work through one attributed Python
-authority. It coordinates repository/worktree identity, ports, supported
-process and Docker/database lifecycle, telemetry, crash/log evidence, bounded
-temporary work, tests, and cleanup across agents and OS accounts.
+DevCoordinator is the single attributed Python authority for host-visible local
+runtimes and durable asynchronous tests across repositories, agents, and local
+accounts.
 
-## Agent entrypoint
+## Routine agents
 
-```bash
-COORDINATOR="skills/codex-dev-coordinator/scripts/dev_coordinator.py"
-python3 "$COORDINATOR" runtime --help
-python3 "$COORDINATOR" runtime status \
-  --agent "$AGENT" --root-repo "$ROOT_REPO" --no-temporary-repo \
-  --target-kind service --target-id "$RESOURCE_ID" --target-name web \
-  --purpose development --no-ttl --kill-after-run false
-```
-
-Use flags for normal status/start/stop/restart/remove calls. Use a request file
-only for a structured definition, replacement, or bounded `run`. Requests
-always identify the agent, original root repository, explicit nullable
-temporary repository, immutable target, KillAfterRun policy, and—when test or
-temporary work starts—a positive TTL.
-
-The compact response includes state/readiness, immutable IDs, ports/domains,
-resource and repository-family CPU/memory totals, stale processes, crashes,
-cleanup, and typed log links. Treat `ok=false` as failure.
-
-Worker removal stages Archive then exact permanent cleanup, unregisters native
-startup and active projections, and retains audit/crash/log evidence. Explicit
-reinstall creates a new immutable incarnation. Persistent Keep Alive workers
-record every crash and stop behind a manually re-armed crash-loop breaker.
-
-See [the runtime API reference](references/runtime-api.md). Current lower-level
-and administrative contracts live in each command's `--help`.
-
-## Authority and hierarchy
-
-Managed hosts use one service-owned SQLite/WAL database behind a
-peer-authenticated Unix socket. Client journals are evidence, not another
-inventory authority. One canonical worktree is one project; Python proves
-root/temporary relationships and publishes the `repository_trees` model used
-by Board and Console. Names and UI heuristics never establish ownership.
-
-System API authorization loads the protected client profile before binding. A
-stable atomic replacement logs `api.profile_reloaded` without dropping the
-listener; each protected request validates the current profile. Malformed
-startup state fails without exposing contents. Profile/database drift blocks
-broker restart until exact offline reconciliation passes.
-
-Offline upgrades publish `/run/devcoordinator-maintenance/maintenance.json` before
-quiescing the broker. Clients check this broker-independent path before
-socket access and receive a typed wait/retry response; malformed state fails closed.
-One foreground rollback transaction clears its ID only after readiness or verified rollback.
-
-## Temporary containers and tests
-
-Server-wide ephemeral containers come only from administrator-sealed,
-digest-pinned `.codex/dev-runtime.json` templates with explicit TTL, port,
-CPU/memory, and concurrency limits. The broker precommits creation, uses an
-operation UUID for idempotent recovery, and retains owner-scoped status/finish
-cleanup access after ordinary enrollment revocation.
-
-Repositories declare structured test commands in `.codex/tests.json`. The
-non-root runner executes argv without a shell; the broker owns admission,
-repository attribution, idempotency, and durable session/group/case results.
-Use `ephemeral --help` and `test --help` for the short-lived container and test
-interfaces.
-
-## Installation and verification
-
-Install canonical links only through the repository tooling:
+Run the immutable client in the active Git worktree:
 
 ```bash
-python3 scripts/manage_skill_links.py --help
-python3 scripts/install_server_wide_coordinator.py --help
+devcoordinator capabilities
+devcoordinator targets web --kind service
+devcoordinator runtime status web --kind service
+devcoordinator runtime ensure web --kind service --desired ready
+devcoordinator test enqueue --intent change
 ```
 
-Run focused tests in normal and optimized Python, repository boundaries, and
-the applicable validation gate. Build macOS Apps owns native Board validation.
+For a development server in a valid repository that has never used the host
+authority, discovery is pure and reports `repository.state=unenrolled`. The
+first bounded start adopts and starts it in one broker-owned operation:
+
+```bash
+devcoordinator runtime serve prototype --cwd . --port 4173 \
+  --ttl-seconds 3600 --kill-after-run false --launch-timeout-seconds 30 -- \
+  npm run dev -- --host 0.0.0.0 --port 4173 --strictPort
+```
+
+The cwd is repository-relative, the port is exact, and argv is never a shell
+string. Do not substitute a coding-sandbox bind, administrator enrollment, or
+local fallback. Failures say whether validation or broker execution failed,
+whether anything changed, whether retrying helps, and what to do next.
+
+It derives root/temporary-worktree context and attribution, validates the one
+active release/generation/protocol contract, resolves the exact target, creates
+mutation operation IDs, and emits a bounded decision. Use command-scoped
+`--project /absolute/worktree` only from arbitrary cwd. Supply an operation ID
+only to replay the exact prior mutation after an uncertain reply.
+
+```bash
+devcoordinator operation follow dc1:operation:OPERATION_UUID
+devcoordinator test follow dc1:run:RUN_ID --wait-seconds 30
+```
+
+Routine change/checkpoint/manual tests plan and submit in one call. Handoff and
+release return an immutable plan for review and require a separate exact
+`devcoordinator test submit dc1:plan:…` decision. `devcoordinator-mcp` stdio
+tools expose the same contract and accept only MCP protocol `2025-11-25`.
+
+See [the agent-client reference](references/agent-client.md) for call counts,
+bounds, timing/token-proxy evidence, outcomes, MCP, and ownership.
+
+## Authority
+
+One service-owned SQLite/WAL authority behind a peer-authenticated Unix socket
+owns repository/resource identity, runtime/test admission, lifecycle, replay,
+cleanup, and evidence. One canonical worktree is one project; Python proves the
+root → temporary → resource tree. Names, paths, ports, images, and UI heuristics
+never establish ownership.
+
+On the confirmed single-developer host, local accounts are attribution and
+failure domains, not mutually distrusting principals. Exact identities,
+generation fencing, bounds, containment, idempotent operation IDs, public
+authorization, and separate secret transports remain enforced.
+
+Python owns mechanical context/target resolution, validation, runtime no-op and
+convergence, schema-3-only test planning/submission/follow, safe pre-launch
+retry, supported durable cleanup/recovery/supersession, and
+`scripts/software_owned_delivery.py`. The agent or user retains semantic goals,
+material test choices/deadlines, attention remediation, destructive/data work,
+handoff/release review, and publication.
+
+## Advanced work
+
+Lower-level commands are separate current capabilities for structured
+definitions, replacement, bounded run, staged removal, manifest
+authoring/doctoring, exact artifact drill-down, Compose run-once, ephemeral
+containers, enrollment, migration, backup, and recovery:
+
+```bash
+python3 skills/codex-dev-coordinator/scripts/dev_coordinator.py runtime --help
+devcoordinator-test --help
+```
+
+For correlated failures and source-side efficiency evidence:
+
+```bash
+devcoordinator-call-log --operation-id OPERATION_UUID --limit 20
+python3 scripts/check_agent_client_efficiency.py
+python3 scripts/self_test_agent_client_efficiency.py
+```
+
+See [the runtime API](references/runtime-api.md) and
+[admin operations](references/admin-operations.md). Install source links with
+`scripts/manage_skill_links.py`; deliver with `software_owned_delivery.py`.

@@ -2,21 +2,31 @@
 
 The wire protocol never carries commands or filesystem paths.  Docker work is
 delegated through an exact typed host-action interface after the store resolves
-an immutable container ID and revalidates live ACL, membership, control, and
-repository-fence state.
+an immutable container ID and revalidates live policy, membership, control,
+and repository-fence state.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 import logging
 import os
 from pathlib import Path
+import re
+import sqlite3
 import threading
 import time
-from typing import Any, Callable, Mapping, Optional, Protocol
+from typing import Any, Callable, Mapping, NoReturn, Optional, Protocol
 import uuid
 
+from .call_journal import (
+    DEFAULT_CALL_JOURNAL_BACKUPS,
+    DEFAULT_CALL_JOURNAL_MAX_BYTES,
+    RollingCallJournal,
+    sanitized_bounded_text,
+)
+from .capabilities import broker_capabilities, release_digest
 from .broker import (
     AuthorizedBrokerRequest,
     BrokerBackendError,
@@ -25,17 +35,41 @@ from .broker import (
     BrokerRequest,
     BrokerService,
     BROKER_SHUTDOWN_DRAIN_TIMEOUT_SECONDS,
+    PROTOCOL_VERSION,
     SerializedMutationWriter,
     UnixBrokerServer,
+    TESTD_INTERNAL_OPERATIONS,
 )
 from .broker_persistence import (
     BrokerPersistence,
     ComposeMutationTarget,
+    ComposeRunOnceMutationTarget,
     DatabaseMutationTarget,
     DockerMutationTarget,
     EphemeralImageTarget,
     RegisteredDatabaseBackup,
+    RuntimeDockerMutationTarget,
+    RuntimeServiceLogTarget,
     StoreBackedAuthorizer,
+)
+from .universal_test_runtime import (
+    BrokerTestAttemptCoordinator,
+    NativeTestAttemptManager,
+    SystemdTestAttemptManager,
+    TestAttemptDescriptor,
+    TestAttemptLaunchUncertain,
+)
+from .universal_test_fixtures import BrokerSealedFixtureProvider
+from .universal_test_credentials import (
+    BrokerOperationalCredentialProvider,
+    DEFAULT_TEST_CREDENTIAL_MATERIAL_ROOT,
+    DEFAULT_TEST_CREDENTIAL_REGISTRY_PATH,
+    DEFAULT_TEST_CREDENTIAL_RUNTIME_ROOT,
+)
+from .universal_test_admission import TestSubmissionAdmissionGate
+from .universal_test_capabilities import (
+    DEFAULT_TEST_CAPABILITY_PATH,
+    SealedTestCapabilityRegistry,
 )
 from .broker_enrollment import (
     revoke_repository_from_protected_profile,
@@ -48,19 +82,40 @@ from .broker_runtime import (
     load_broker_runtime_snapshot,
     unclassified_broker_runtime_report,
 )
+from .runtime_ensure import (
+    RuntimeEnsureDecision,
+    build_runtime_ensure_result,
+    decide_runtime_ensure,
+    worker_result_observation,
+)
 from .broker_workers import BrokerWorkerOperations, WORKER_OPERATIONS
 from .worker_control import WorkerControlError, WorkerController, WorkerReplaceError
 from .worker_cleanup import unregister_workers_for_plan
 from .runtime_api import validate_runtime_terminal_state
+from .temporary_dev_service import (
+    TemporaryDevServiceError,
+    TemporaryDevServiceManager,
+    TemporaryDevServiceRequest,
+    public_temporary_dev_service_error,
+)
+from .schema import SCHEMA_VERSION
+from .runtime_artifacts import (
+    load_latest_runtime_log_artifact,
+    persist_runtime_log_artifact,
+    persist_service_log_artifact,
+    read_runtime_log_artifact,
+)
 from .host_lifecycle import CoordinatorHostLifecycleAdapter
 from .cleanup_lifecycle import CleanupLifecycle
 from .observer import observation_owner_scope
 from .broker_host import (
     ComposeMutationOutcomeUncertain,
+    ComposeRunOnceOutputEvidence,
     EphemeralDockerContainerTarget,
     EphemeralDockerCreateTarget,
     EphemeralDockerIdentity,
 )
+from .compose_run_once import PublishedReceipt
 from .ephemeral_containers import (
     EphemeralContainerCoordinator,
     EphemeralSecretDeliveryLease,
@@ -103,8 +158,57 @@ from .repository_lifecycle import (
     StandaloneRetirementPlan,
 )
 from .sqlite_lifecycle import SQLiteLifecyclePersistence
-from .store import AccountStore, CoordinatorStore
+from .store import (
+    AccountStore,
+    CoordinatorStore,
+    StoreError,
+    StoreInvariantError,
+)
 from .test_records import CoordinatorTestRecords
+from .universal_test_contract import (
+    ManifestContractError,
+    SourceMode,
+    manifest_to_document,
+    parse_test_manifest,
+    safe_history_shard_ceiling,
+)
+from .universal_test_planner import TestPlanError, create_test_plan
+from .universal_test_snapshot import public_snapshot_source_diagnostic
+from .universal_test_service import (
+    TestPlanPreviewUnavailable,
+    TestPlaneClient,
+    decode_test_plan_document,
+)
+from .universal_test_transport import TestPlaneTransportError
+from .universal_test_store import (
+    TargetResources,
+    TestStoreConflict,
+    TestStoreContractError,
+    TestStoreNotFound,
+)
+
+
+def _test_target_resources(
+    value: object, *, selected_targets: tuple[str, ...]
+) -> Mapping[str, TargetResources]:
+    if not isinstance(value, Mapping) or set(value) != set(selected_targets):
+        raise TestStoreContractError("test target resources are incomplete")
+    expected = set(TargetResources.__dataclass_fields__)
+    result: dict[str, TargetResources] = {}
+    for name, raw in value.items():
+        if not isinstance(name, str) or not isinstance(raw, Mapping) or set(raw) != expected:
+            raise TestStoreContractError("test target resource fields are invalid")
+        result[name] = TargetResources(
+            cpu_millis=raw["cpu_millis"],
+            memory_mib=raw["memory_mib"],
+            pids=raw["pids"],
+            estimated_seconds=raw["estimated_seconds"],
+            shard_count=raw["shard_count"],
+            max_attempts=raw["max_attempts"],
+            worktree_key=raw["worktree_key"],
+            exclusive_resources=tuple(raw["exclusive_resources"]),
+        )
+    return result
 
 
 _LIFECYCLE_OPERATIONS = frozenset(
@@ -146,7 +250,155 @@ _EPHEMERAL_OPERATIONS = frozenset(
     }
 )
 _FULL_DOCKER_OBSERVER_DOMAIN = FULL_DOCKER_OBSERVER_DOMAIN
+_ASYNC_TEST_OPERATIONS = frozenset(
+    {
+        BrokerOperation.TEST_STATS_READ,
+        BrokerOperation.TEST_HEALTH,
+        BrokerOperation.TEST_FLEET_STATS_READ,
+        BrokerOperation.TEST_PLAN_PREVIEW,
+        BrokerOperation.TEST_PLAN_REGISTER,
+        BrokerOperation.TEST_RUN_SUBMIT,
+        BrokerOperation.TEST_RUN_LIST,
+        BrokerOperation.TEST_RUN_STATUS,
+        BrokerOperation.TEST_RUN_SUMMARY,
+        BrokerOperation.TEST_RUN_FAILURES,
+        BrokerOperation.TEST_RUN_ARTIFACTS,
+        BrokerOperation.TEST_ARTIFACT_RESOLVE,
+        BrokerOperation.TEST_RUN_CASES,
+        BrokerOperation.TEST_RUN_CANCEL,
+        BrokerOperation.TEST_RUN_RETRY,
+        BrokerOperation.TEST_EVENTS_READ,
+        BrokerOperation.TEST_REPOSITORY_SETUP,
+        BrokerOperation.TEST_REPOSITORY_CATALOG,
+        BrokerOperation.TEST_EVIDENCE_CHECK,
+        BrokerOperation.TEST_EVIDENCE_CONSUME,
+    }
+)
 _LOGGER = logging.getLogger(__name__)
+_REPOSITORY_ADOPTION_MESSAGE_LIMIT = 512
+
+
+def _repository_adoption_message(
+    summary: str,
+    action: str,
+    *,
+    cause: BaseException | None = None,
+) -> str:
+    """Return one bounded, path/credential-redacted adoption diagnostic.
+
+    Recovery precedes the variable cause so truncation can never turn this
+    back into the former unhelpful "inspect logs" response.
+    """
+
+    message = f"{summary} {action}"
+    if cause is not None:
+        detail = sanitized_bounded_text(cause, limit=256)
+        message += f" Concrete cause: {detail}"
+    return sanitized_bounded_text(
+        message,
+        limit=_REPOSITORY_ADOPTION_MESSAGE_LIMIT,
+    )
+
+
+def _test_contract_diagnostic(error: Exception) -> str:
+    """Return one bounded line suitable for agents and operation logs."""
+
+    detail = " ".join(str(error).split()) or type(error).__name__
+    return detail[:512]
+_TEST_ACTOR_DELEGATION_ACCOUNT = "devcoordinator-api"
+
+
+def _test_run_actor(authorized: AuthorizedBrokerRequest) -> str:
+    """Resolve a durable run actor without treating it as authorization.
+
+    The current mutation contract accepts one canonical local ``codex:``
+    attribution from any same-developer account. Only the dedicated Console API
+    account may forward the ``google:`` identity it already authenticated.
+    Broker authorization still derives from exact repository and operation
+    identity; this value is display/audit ownership, never an access claim.
+    """
+
+    request = authorized.request
+    broker_actor = f"broker:{request.account_id}:uid:{authorized.peer.uid}"
+    if request.operation not in {
+        BrokerOperation.TEST_RUN_SUBMIT,
+        BrokerOperation.TEST_RUN_CANCEL,
+        BrokerOperation.TEST_RUN_RETRY,
+    }:
+        return broker_actor
+    requested = request.arguments.get("actor")
+    if requested is None:
+        raise BrokerBackendError(
+            "test_actor_invalid",
+            "The governed test mutation omitted its canonical actor.",
+            operation_id=request.operation_id,
+        )
+    from .test_actor import TestActorContractError, canonical_test_actor
+
+    try:
+        namespace, canonical = canonical_test_actor(requested)
+    except TestActorContractError as error:
+        raise BrokerBackendError(
+            "test_actor_invalid",
+            "The test actor is not a canonical codex or delegated Google identity.",
+            operation_id=request.operation_id,
+        ) from error
+    if namespace == "codex":
+        return canonical
+    if request.account_id != _TEST_ACTOR_DELEGATION_ACCOUNT:
+        raise BrokerBackendError(
+            "test_google_actor_delegation_denied",
+            "Only the protected Console API identity may delegate a test run actor.",
+            operation_id=request.operation_id,
+        )
+    return canonical
+
+
+def _require_preview_source_policy(
+    plan: Any, *, allow_temporary: bool = False
+) -> None:
+    """Fail closed unless a server-produced preview matches its intent policy."""
+
+    intent = plan.intent
+    source = plan.source
+    if intent in {"change", "checkpoint"}:
+        if (
+            source.mode is not SourceMode.LIVE
+            or source.temporary_root is not None
+            or source.snapshot_id is not None
+        ):
+            raise TestStoreContractError(
+                "change and checkpoint previews must use the canonical live root"
+            )
+        return
+    if intent in {"handoff", "release", "manual"}:
+        if source.mode is not SourceMode.IMMUTABLE:
+            raise TestStoreContractError(
+                "handoff, release, and manual previews must use an immutable snapshot"
+            )
+    else:
+        raise TestStoreContractError("test preview intent is invalid")
+    if source.mode is SourceMode.LIVE:
+        if (
+            source.snapshot_id is not None
+            or (source.temporary_root is not None and not allow_temporary)
+        ):
+            raise TestStoreContractError(
+                "live preview source identity is invalid"
+            )
+        return
+    if (
+        (source.temporary_root is not None and not allow_temporary)
+        or
+        not isinstance(source.snapshot_id, str)
+        or not source.snapshot_id.startswith("snapshot-")
+        or len(source.snapshot_id) != 41
+        or any(
+            character not in "0123456789abcdef"
+            for character in source.snapshot_id[9:]
+        )
+    ):
+        raise TestStoreContractError("immutable preview snapshot identity is invalid")
 
 
 class TypedHostMutationAPI(Protocol):
@@ -165,6 +417,14 @@ class TypedHostMutationAPI(Protocol):
     def docker_stop(self, target: DockerMutationTarget) -> Mapping[str, Any]: ...
 
     def docker_restart(self, target: DockerMutationTarget) -> Mapping[str, Any]: ...
+
+    def docker_capture_logs(
+        self, target: RuntimeDockerMutationTarget
+    ) -> tuple[bytes, int]: ...
+
+    def service_capture_logs(
+        self, target: RuntimeServiceLogTarget
+    ) -> tuple[bytes, int, str]: ...
 
     def docker_inspect_ephemeral_image(
         self, target: EphemeralImageTarget
@@ -206,6 +466,48 @@ class TypedHostMutationAPI(Protocol):
 
     def compose_down(self, target: ComposeMutationTarget) -> Mapping[str, Any]: ...
 
+    def compose_run_once_bind_image(
+        self, target: ComposeRunOnceMutationTarget
+    ) -> Mapping[str, Any]: ...
+
+    def compose_run_once_find_container(
+        self, target: ComposeRunOnceMutationTarget
+    ) -> Mapping[str, Any] | None: ...
+
+    def compose_run_once_create_container(
+        self, target: ComposeRunOnceMutationTarget
+    ) -> Mapping[str, Any]: ...
+
+    def compose_run_once_inspect_container(
+        self,
+        target: ComposeRunOnceMutationTarget,
+        *,
+        full_container_id: str | None = None,
+    ) -> Mapping[str, Any]: ...
+
+    def compose_run_once_start_container(
+        self, target: ComposeRunOnceMutationTarget
+    ) -> Mapping[str, Any]: ...
+
+    def compose_run_once_wait_container(
+        self,
+        target: ComposeRunOnceMutationTarget,
+        *,
+        timeout_seconds: float,
+    ) -> Mapping[str, Any]: ...
+
+    def compose_run_once_stop_container(
+        self, target: ComposeRunOnceMutationTarget
+    ) -> Mapping[str, Any]: ...
+
+    def compose_run_once_capture_evidence(
+        self, target: ComposeRunOnceMutationTarget
+    ) -> ComposeRunOnceOutputEvidence: ...
+
+    def compose_run_once_remove_container(
+        self, target: ComposeRunOnceMutationTarget
+    ) -> Mapping[str, Any]: ...
+
     def postgres_backup(
         self, target: DatabaseMutationTarget, *, output_root: str
     ) -> Mapping[str, Any]: ...
@@ -231,6 +533,11 @@ class StoreBackedMutationBackend:
         ]
         | None = None,
         secret_manager: VolatileRunSecretManager | None = None,
+        test_plane: TestPlaneClient | None = None,
+        test_attempt_manager: NativeTestAttemptManager | None = None,
+        test_submission_gate: TestSubmissionAdmissionGate | None = None,
+        test_capabilities: SealedTestCapabilityRegistry | None = None,
+        temporary_dev_services: TemporaryDevServiceManager | None = None,
     ) -> None:
         self._persistence = persistence
         self._host_mutations = host_mutations
@@ -245,7 +552,33 @@ class StoreBackedMutationBackend:
             persistence, host_mutations, secret_manager=self._secret_manager
         )
         self._worker_operations = BrokerWorkerOperations(persistence)
+        self._test_plane = test_plane
+        self._test_submission_gate = (
+            test_submission_gate or TestSubmissionAdmissionGate()
+        )
+        self._test_capabilities = (
+            test_capabilities or SealedTestCapabilityRegistry()
+        )
+        self._temporary_dev_services = (
+            temporary_dev_services or TemporaryDevServiceManager()
+        )
+        self._test_attempts = (
+            None
+            if test_attempt_manager is None
+            else BrokerTestAttemptCoordinator(test_attempt_manager)
+        )
+        provider = (
+            getattr(test_attempt_manager, "fixture_provider", None)
+            if test_attempt_manager is not None
+            else None
+        )
+        self._test_fixture_provider = (
+            provider if isinstance(provider, BrokerSealedFixtureProvider) else None
+        )
         self._postgres_backup_root = _private_postgres_backup_root(
+            persistence.database_path, expected_uid=persistence.expected_uid
+        )
+        self._runtime_log_root = _private_runtime_log_root(
             persistence.database_path, expected_uid=persistence.expected_uid
         )
         self._test_records = CoordinatorTestRecords(
@@ -254,20 +587,1349 @@ class StoreBackedMutationBackend:
             busy_timeout_ms=persistence.busy_timeout_ms,
         )
 
+    def _execute_test_admission_admin(
+        self, authorized: AuthorizedBrokerRequest
+    ) -> Mapping[str, Any]:
+        request = authorized.request
+        try:
+            if request.operation is BrokerOperation.TEST_ADMISSION_DRAIN_STATUS:
+                proof = self._persistence.active_test_admission_proof()
+                return {
+                    "state": "drained" if proof is not None else "open",
+                    "proof": None if proof is None else dict(proof),
+                }
+            if request.operation is BrokerOperation.TEST_ADMISSION_DRAIN_BEGIN:
+                timing = self._test_submission_gate.begin_drain(
+                    timeout_seconds=0.0
+                )
+                proof = self._persistence.activate_test_admission_drain(
+                    activated_at_epoch=int(timing["activated_at_epoch"]),
+                    activated_by_uid=authorized.peer.uid,
+                    drained_at_epoch=int(timing["drained_at_epoch"]),
+                    broker_instance_id=self._broker_instance_id,
+                )
+                return {"state": "drained", "proof": dict(proof)}
+            if request.operation is BrokerOperation.TEST_ADMISSION_DRAIN_CLEAR:
+                proof = self._persistence.clear_test_admission_drain(
+                    drain_id=str(request.arguments["drain_id"]),
+                    proof_sha256=str(request.arguments["proof_sha256"]),
+                )
+                return {
+                    "state": "open",
+                    "cleared_proof": dict(proof),
+                }
+        except TestStoreContractError as error:
+            raise BrokerBackendError(
+                "test_admission_fence_conflict",
+                str(error),
+                operation_id=request.operation_id,
+            ) from error
+        raise BrokerBackendError(
+            "unsupported_operation",
+            "Unsupported test admission administration operation.",
+            operation_id=request.operation_id,
+        )
+
+    def _execute_async_test(
+        self, authorized: AuthorizedBrokerRequest
+    ) -> Mapping[str, Any]:
+        """Route one authorized test-plane call without exposing its store."""
+
+        plane = self._test_plane
+        request = authorized.request
+        if plane is None:
+            raise BrokerBackendError(
+                "test_scheduler_unavailable",
+                "The asynchronous test scheduler is not connected; retry after testd is healthy.",
+                operation_id=request.operation_id,
+            )
+        actor = _test_run_actor(authorized)
+        resolving_run_id: str | None = None
+        try:
+            if request.operation is BrokerOperation.TEST_HEALTH:
+                result = dict(plane.health())
+                if (
+                    result.get("schema_version") != 1
+                    or result.get("status") != "ok"
+                    or type(result.get("test_store_schema_version")) is not int
+                    or not isinstance(result.get("store_generation"), str)
+                    or not result["store_generation"]
+                ):
+                    raise TestStoreContractError(
+                        "testd health returned contradictory store identity"
+                    )
+                result["repository_id"] = request.project_id
+                return result
+
+            if request.operation is BrokerOperation.TEST_STATS_READ:
+                result = dict(
+                    plane.dashboard_stats(
+                        repository_id=request.project_id,
+                        days=int(request.arguments["days"]),
+                        limit=int(request.arguments["limit"]),
+                    )
+                )
+                self._require_test_repository(result, request.project_id)
+                return result
+
+            if request.operation is BrokerOperation.TEST_FLEET_STATS_READ:
+                authority_rows = self._persistence.current_test_repositories(
+                    authorized
+                )
+                if not authority_rows:
+                    raise TestStoreContractError(
+                        "test fleet requires at least one current repository"
+                    )
+                if len(authority_rows) > 50:
+                    raise BrokerBackendError(
+                        "test_fleet_scope_too_large",
+                        "The current test fleet exceeds the bounded dashboard scope.",
+                        operation_id=request.operation_id,
+                    )
+                repository_ids = tuple(
+                    str(row["repo_id"]) for row in authority_rows
+                )
+                result = dict(
+                    plane.dashboard_fleet(
+                        repository_ids=repository_ids,
+                        hours=int(request.arguments["hours"]),
+                    )
+                )
+                raw_repositories = result.get("repositories")
+                if not isinstance(raw_repositories, list):
+                    raise TestStoreContractError(
+                        "testd fleet projection is malformed"
+                    )
+                by_id: dict[str, dict[str, object]] = {}
+                for item in raw_repositories:
+                    if not isinstance(item, Mapping):
+                        raise TestStoreContractError(
+                            "testd fleet repository is malformed"
+                        )
+                    repository_id = str(
+                        item.get("repo_id") or item.get("repository_id") or ""
+                    )
+                    if repository_id not in repository_ids or repository_id in by_id:
+                        raise TestStoreContractError(
+                            "testd fleet repository identity is contradictory"
+                        )
+                    by_id[repository_id] = dict(item)
+                if set(by_id) != set(repository_ids):
+                    raise TestStoreContractError(
+                        "testd fleet projection does not cover the authority scope"
+                    )
+                enriched = []
+                for authority in authority_rows:
+                    repository_id = str(authority["repo_id"])
+                    enriched.append(
+                        {
+                            **by_id[repository_id],
+                            "repo_id": repository_id,
+                            "repository_id": repository_id,
+                            "display_name": authority["display_name"],
+                        }
+                    )
+                result["repositories"] = enriched
+                return result
+
+            if request.operation is BrokerOperation.TEST_PLAN_PREVIEW:
+                execution_authority = (
+                    self._persistence.test_repository_execution_authority(
+                        repo_id=request.project_id,
+                        operation_id=request.operation_id,
+                    )
+                )
+                result = dict(
+                    plane.preview(
+                        repository_id=request.project_id,
+                        intent=str(request.arguments["intent"]),
+                        actor=actor,
+                        owner_uid=execution_authority.owner_uid,
+                        access_uid=(
+                            authorized.peer.uid
+                            if authorized.peer.uid > 0
+                            else execution_authority.owner_uid
+                        ),
+                        temporary_root=request.arguments.get("temporary_root"),
+                        requested_targets=tuple(
+                            request.arguments.get("requested_targets", ())
+                        ),
+                        execution_timeout_seconds=request.arguments[
+                            "execution_timeout_seconds"
+                        ],
+                        launch_timeout_seconds=int(
+                            request.arguments["launch_timeout_seconds"]
+                        ),
+                    )
+                )
+                self._require_test_repository(result, request.project_id)
+                preview_plan = decode_test_plan_document(
+                    result.get("plan")  # type: ignore[arg-type]
+                )
+                if (
+                    result.get("intent") != request.arguments["intent"]
+                    or preview_plan.repository_id != request.project_id
+                    or preview_plan.intent != request.arguments["intent"]
+                    or preview_plan.timeouts.execution_seconds
+                    != request.arguments["execution_timeout_seconds"]
+                    or preview_plan.timeouts.launch_seconds
+                    != request.arguments["launch_timeout_seconds"]
+                ):
+                    raise TestStoreContractError(
+                        "testd returned a plan with contradictory identity or timeouts"
+                    )
+                requested_targets = tuple(
+                    request.arguments.get("requested_targets", ())
+                )
+                planned_requests = tuple(
+                    target
+                    for target, selection in preview_plan.selection.items()
+                    if "requested" in selection.reasons
+                )
+                if set(planned_requests) != set(requested_targets):
+                    raise TestStoreContractError(
+                        "testd returned a plan with contradictory requested targets"
+                    )
+                requested_temporary_root = request.arguments.get("temporary_root")
+                if preview_plan.source.temporary_root != requested_temporary_root:
+                    raise TestStoreContractError(
+                        "testd returned a plan with contradictory temporary source"
+                    )
+                _require_preview_source_policy(
+                    preview_plan,
+                    allow_temporary=requested_temporary_root is not None,
+                )
+                self._require_test_plan_source(
+                    authorized,
+                    preview_plan.source.to_document(),
+                )
+                capability_requests = result.get("capability_requests")
+                if (
+                    not isinstance(capability_requests, Mapping)
+                    or set(capability_requests)
+                    != {"networks", "fixtures", "credentials"}
+                    or not isinstance(capability_requests["networks"], list)
+                    or not isinstance(capability_requests["fixtures"], list)
+                    or not isinstance(capability_requests["credentials"], list)
+                ):
+                    raise TestStoreContractError(
+                        "testd omitted selected-target capability requests"
+                    )
+                result["capability_policy"] = self._test_capability_preflight(
+                    authorized,
+                    networks=tuple(capability_requests["networks"]),
+                    fixtures=tuple(capability_requests["fixtures"]),
+                    credentials=tuple(capability_requests["credentials"]),
+                    required=True,
+                )
+                preview_resources = _test_target_resources(
+                    result.get("target_resources"),
+                    selected_targets=preview_plan.selected_targets,
+                )
+                registration = dict(
+                    plane.register_plan(
+                        preview_plan.to_document(),
+                        target_resources=preview_resources,
+                    )
+                )
+                self._require_test_repository(registration, request.project_id)
+                if registration.get("plan_id") != preview_plan.plan_id:
+                    raise TestStoreContractError(
+                        "testd registered a plan with contradictory identity"
+                    )
+                result["plan_id"] = preview_plan.plan_id
+                result["snapshot_id"] = preview_plan.source.snapshot_id
+                result["registered"] = bool(registration.get("registered"))
+                return result
+
+            if request.operation is BrokerOperation.TEST_PLAN_REGISTER:
+                plan = decode_test_plan_document(request.arguments["plan"])
+                manifest = parse_test_manifest(request.arguments["manifest"])
+                if manifest.fingerprint != plan.manifest_fingerprint:
+                    raise TestStoreContractError(
+                        "plan manifest fingerprint does not match the validated manifest"
+                    )
+                requested_targets = tuple(
+                    target
+                    for target, selection in plan.selection.items()
+                    if "requested" in selection.reasons
+                )
+                expected = create_test_plan(
+                    manifest,
+                    intent=plan.intent,
+                    source=plan.source,
+                    changes=plan.changes,
+                    requested_targets=requested_targets,
+                    execution_timeout_seconds=plan.timeouts.execution_seconds,
+                    launch_timeout_seconds=plan.timeouts.launch_seconds,
+                )
+                if expected.to_document() != plan.to_document():
+                    raise TestStoreContractError(
+                        "plan selection does not match the validated manifest"
+                    )
+                self._require_test_plan_source(authorized, plan.source.to_document())
+                if plan.source.mode is SourceMode.IMMUTABLE:
+                    raise TestStoreContractError(
+                        "immutable plans must be produced by repository-owned preview"
+                    )
+                capability_policy = self._test_capability_preflight(
+                    authorized,
+                    networks=tuple(
+                        sorted(
+                            {
+                                manifest.targets[name].network
+                                for name in plan.selected_targets
+                            }
+                        )
+                    ),
+                    fixtures=tuple(
+                        sorted(
+                            {
+                                fixture
+                                for name in plan.selected_targets
+                                for fixture in manifest.targets[name].fixtures
+                            }
+                        )
+                    ),
+                    credentials=tuple(
+                        sorted(
+                            {
+                                manifest.credentials[credential].binding
+                                for name in plan.selected_targets
+                                for credential in manifest.targets[name].credentials
+                            }
+                        )
+                    ),
+                    required=True,
+                )
+                worktree_key = plan.source.temporary_root or plan.source.original_root
+                resources = {
+                    name: TargetResources(
+                        cpu_millis=manifest.targets[name].resources.cpu_millis,
+                        memory_mib=manifest.targets[name].resources.memory_mib,
+                        pids=manifest.targets[name].resources.pids,
+                        estimated_seconds=float(
+                            manifest.targets[name].timeout_seconds
+                            if plan.timeouts.execution_seconds is None
+                            else plan.timeouts.execution_seconds
+                        ),
+                        shard_count=safe_history_shard_ceiling(
+                            manifest.targets[name]
+                        ),
+                        max_attempts=manifest.targets[name].retry.max_attempts,
+                        worktree_key=worktree_key,
+                        exclusive_resources=manifest.targets[
+                            name
+                        ].exclusive_resources,
+                    )
+                    for name in plan.selected_targets
+                }
+                result = dict(
+                    plane.register_plan(
+                        plan.to_document(), target_resources=resources
+                    )
+                )
+                self._require_test_repository(result, request.project_id)
+                # Client-supplied agent text is diagnostic only; the kernel UID
+                # and account remain the durable actor.
+                result["actor"] = actor
+                result["capability_policy"] = capability_policy
+                return result
+
+            if request.operation is BrokerOperation.TEST_RUN_SUBMIT:
+                expected_repository_id = request.arguments.get(
+                    "expected_repository_id"
+                )
+                if expected_repository_id != request.project_id:
+                    raise BrokerBackendError(
+                        "test_repository_mismatch",
+                        "The test plan does not belong to the requested repository.",
+                        operation_id=request.operation_id,
+                    )
+                repository_id = str(
+                    plane.plan_repository(
+                        plan_id=str(request.arguments["plan_id"]),
+                        repository_id=request.project_id,
+                    )
+                )
+                if expected_repository_id != repository_id:
+                    raise BrokerBackendError(
+                        "test_repository_mismatch",
+                        "The test plan does not belong to the requested repository.",
+                        operation_id=request.operation_id,
+                    )
+                self._persistence.reauthorize_test_repository(
+                    authorized, repo_id=repository_id
+                )
+                execution_authority = (
+                    self._persistence.test_repository_execution_authority(
+                        repo_id=repository_id,
+                        operation_id=request.operation_id,
+                    )
+                )
+                result = dict(
+                    plane.submit(
+                        plan_id=str(request.arguments["plan_id"]),
+                        repository_id=repository_id,
+                        operation_id=request.operation_id,
+                        actor=actor,
+                        owner_uid=execution_authority.owner_uid,
+                    )
+                )
+                self._require_test_repository(result, repository_id)
+                return result
+
+            if request.operation is BrokerOperation.TEST_RUN_LIST:
+                result = dict(
+                    plane.runs(
+                        repository_id=request.project_id,
+                        after=request.arguments.get("after"),
+                        limit=int(request.arguments["limit"]),
+                        state=request.arguments.get("state"),
+                    )
+                )
+                self._require_test_repository(result, request.project_id)
+                self._require_test_run_page(
+                    result,
+                    expected_repo_id=request.project_id,
+                    maximum_items=int(request.arguments["limit"]),
+                )
+                return result
+
+            if request.operation is BrokerOperation.TEST_EVENTS_READ:
+                result = dict(
+                    plane.events(
+                        repository_id=request.project_id,
+                        after_event_id=int(request.arguments["after_event_id"]),
+                        limit=int(request.arguments["limit"]),
+                    )
+                )
+                self._require_test_repository(result, request.project_id)
+                self._require_test_event_page(
+                    result,
+                    expected_repo_id=request.project_id,
+                    after_event_id=int(request.arguments["after_event_id"]),
+                    maximum_items=int(request.arguments["limit"]),
+                )
+                return result
+
+            if request.operation is BrokerOperation.TEST_REPOSITORY_CATALOG:
+                authority_rows = self._persistence.current_test_repositories(
+                    authorized
+                )
+                repository_ids = tuple(
+                    str(row["repo_id"]) for row in authority_rows
+                )
+                retained = dict(
+                    plane.repository_catalog(repository_ids=repository_ids)
+                )
+                raw_rows = retained.get("repositories")
+                if not isinstance(raw_rows, list):
+                    raise TestStoreContractError(
+                        "testd repository catalog is malformed"
+                    )
+                by_id: dict[str, Mapping[str, object]] = {}
+                for item in raw_rows:
+                    if not isinstance(item, Mapping):
+                        raise TestStoreContractError(
+                            "testd repository catalog entry is malformed"
+                        )
+                    repository_id = str(item.get("repository_id") or "")
+                    if (
+                        repository_id not in repository_ids
+                        or repository_id in by_id
+                        or item.get("setup_status")
+                        not in {"ready", "missing", "invalid"}
+                    ):
+                        raise TestStoreContractError(
+                            "testd repository catalog identity is contradictory"
+                        )
+                    by_id[repository_id] = item
+                if set(by_id) != set(repository_ids):
+                    raise TestStoreContractError(
+                        "testd repository catalog does not cover the authority scope"
+                    )
+                return {
+                    "schema_version": 1,
+                    "repositories": [
+                        {
+                            "repo_id": row["repo_id"],
+                            "display_name": row["display_name"],
+                            "setup_status": by_id[str(row["repo_id"])][
+                                "setup_status"
+                            ],
+                            "setup_observed_at": by_id[str(row["repo_id"])].get(
+                                "setup_observed_at"
+                            ),
+                            "setup_retained": bool(
+                                by_id[str(row["repo_id"])].get("retained")
+                            ),
+                            "manifest_fingerprint": by_id[
+                                str(row["repo_id"])
+                            ].get("manifest_fingerprint"),
+                        }
+                        for row in authority_rows
+                    ],
+                }
+
+            if request.operation is BrokerOperation.TEST_REPOSITORY_SETUP:
+                execution_authority = (
+                    self._persistence.test_repository_execution_authority(
+                        repo_id=request.project_id,
+                        operation_id=request.operation_id,
+                    )
+                )
+                result = dict(
+                    plane.setup(
+                        repository_id=request.project_id,
+                        owner_uid=execution_authority.owner_uid,
+                    )
+                )
+                self._require_test_repository(result, request.project_id)
+                result["capability_policy"] = self._test_capability_preflight(
+                    authorized,
+                    networks=tuple(result.get("network_requirements", ())),
+                    fixtures=tuple(result.get("fixtures", ())),
+                    credentials=tuple(result.get("credentials", ())),
+                    required=False,
+                )
+                return result
+
+            run_id = str(request.arguments.get("run_id") or "")
+            if run_id:
+                # Opaque run identifiers never supply authority. Resolve the
+                # protected binding and require it to match the repository the
+                # caller supplied before returning data or mutating state.
+                resolving_run_id = run_id
+                status = dict(
+                    plane.status(
+                        run_id=run_id,
+                        repository_id=request.project_id,
+                    )
+                )
+                resolving_run_id = None
+                repository_id = self._require_test_run_result(
+                    status,
+                    expected_run_id=run_id,
+                    expected_repo_id=request.project_id,
+                )
+                if repository_id != request.project_id:
+                    raise BrokerBackendError(
+                        "test_repository_mismatch",
+                        "The test run does not belong to the requested repository.",
+                        operation_id=request.operation_id,
+                    )
+                self._persistence.reauthorize_test_repository(
+                    authorized, repo_id=repository_id
+                )
+            if request.operation is BrokerOperation.TEST_RUN_STATUS:
+                return status
+            if request.operation is BrokerOperation.TEST_RUN_SUMMARY:
+                result = dict(
+                    plane.summary(
+                        run_id=run_id,
+                        repository_id=repository_id,
+                    )
+                )
+                # Agent summaries intentionally omit repository path details;
+                # authorization was proved by the status read above.
+                self._require_test_run_result(
+                    result,
+                    expected_run_id=run_id,
+                    expected_repo_id=repository_id,
+                )
+                return result
+            if request.operation is BrokerOperation.TEST_RUN_FAILURES:
+                result = dict(
+                    plane.failures(
+                        run_id=run_id,
+                        repository_id=repository_id,
+                        after=request.arguments.get("after"),
+                        limit=int(request.arguments["limit"]),
+                    )
+                )
+                self._require_test_run_result(
+                    result,
+                    expected_run_id=run_id,
+                    expected_repo_id=repository_id,
+                )
+                return result
+            if request.operation is BrokerOperation.TEST_RUN_ARTIFACTS:
+                result = dict(
+                    plane.artifacts(
+                        run_id=run_id,
+                        repository_id=repository_id,
+                        after=request.arguments.get("after"),
+                        limit=int(request.arguments["limit"]),
+                    )
+                )
+                self._require_test_run_result(
+                    result,
+                    expected_run_id=run_id,
+                    expected_repo_id=repository_id,
+                )
+                return result
+            if request.operation is BrokerOperation.TEST_ARTIFACT_RESOLVE:
+                artifact_id = str(request.arguments["artifact_id"])
+                result = dict(
+                    plane.artifact(
+                        run_id=run_id,
+                        repository_id=repository_id,
+                        artifact_id=artifact_id,
+                    )
+                )
+                self._require_test_run_result(
+                    result,
+                    expected_run_id=run_id,
+                    expected_repo_id=repository_id,
+                )
+                artifact = result.get("artifact")
+                if (
+                    not isinstance(artifact, Mapping)
+                    or artifact.get("artifact_id") != artifact_id
+                    or artifact.get("verified") not in {1, True}
+                    or not isinstance(artifact.get("storage_handle"), str)
+                    or not isinstance(artifact.get("sha256"), str)
+                    or artifact["storage_handle"]
+                    != f"test-artifact://{artifact_id}/{artifact['sha256']}"
+                ):
+                    raise TestStoreContractError(
+                        "testd returned a contradictory artifact identity"
+                    )
+                return result
+            if request.operation is BrokerOperation.TEST_RUN_CASES:
+                result = dict(
+                    plane.cases(
+                        run_id=run_id,
+                        repository_id=repository_id,
+                        after=int(request.arguments["after"]),
+                        limit=int(request.arguments["limit"]),
+                    )
+                )
+                self._require_test_run_result(
+                    result,
+                    expected_run_id=run_id,
+                    expected_repo_id=repository_id,
+                )
+                return result
+            if request.operation is BrokerOperation.TEST_RUN_CANCEL:
+                result = dict(
+                    plane.cancel(
+                        run_id=run_id,
+                        repository_id=repository_id,
+                        actor=actor,
+                        reason=str(request.arguments["reason"]),
+                        operation_id=request.operation_id,
+                    )
+                )
+                self._require_test_run_result(
+                    result,
+                    expected_run_id=run_id,
+                    expected_repo_id=repository_id,
+                )
+                return result
+            if request.operation is BrokerOperation.TEST_RUN_RETRY:
+                result = dict(
+                    plane.retry(
+                        run_id=run_id,
+                        repository_id=repository_id,
+                        actor=actor,
+                        failed_only=bool(request.arguments["failed_only"]),
+                        operation_id=request.operation_id,
+                    )
+                )
+                retry_run_id = str(result.get("run_id") or "")
+                if not retry_run_id:
+                    raise BrokerBackendError(
+                        "test_run_mismatch",
+                        "The test-plane retry result omitted its exact run identity.",
+                        operation_id=request.operation_id,
+                    )
+                retry_status = dict(
+                    plane.status(
+                        run_id=retry_run_id,
+                        repository_id=repository_id,
+                    )
+                )
+                self._require_test_run_result(
+                    retry_status,
+                    expected_run_id=retry_run_id,
+                    expected_repo_id=repository_id,
+                )
+                self._require_test_run_result(
+                    result,
+                    expected_run_id=retry_run_id,
+                    expected_repo_id=repository_id,
+                )
+                return result
+            if request.operation is BrokerOperation.TEST_EVIDENCE_CHECK:
+                result = dict(
+                    plane.policy_check(
+                        repository_id=request.project_id,
+                        snapshot_id=str(request.arguments["snapshot_id"]),
+                        policy_name=str(request.arguments["policy_name"]),
+                    )
+                )
+                self._require_test_repository(result, request.project_id)
+                return result
+            if request.operation is BrokerOperation.TEST_EVIDENCE_CONSUME:
+                snapshot_id = str(request.arguments["snapshot_id"])
+                policy_name = str(request.arguments["policy_name"])
+                result = dict(
+                    plane.policy_consume(
+                        repository_id=request.project_id,
+                        snapshot_id=snapshot_id,
+                        policy_name=policy_name,
+                        operation_id=request.operation_id,
+                    )
+                )
+                self._require_test_repository(result, request.project_id)
+                if (
+                    result.get("operation_id") != request.operation_id
+                    or result.get("snapshot_id") != snapshot_id
+                    or result.get("policy_name") != policy_name
+                    or result.get("satisfied") is not True
+                    or result.get("consumed") is not True
+                    or result.get("reusable") is not False
+                    or result.get("requires_consumption") is not True
+                    or not isinstance(result.get("attestation_id"), str)
+                    or not result["attestation_id"]
+                    or not isinstance(result.get("consumption_id"), str)
+                    or not result["consumption_id"]
+                    or not isinstance(result.get("run_id"), str)
+                    or not result["run_id"]
+                ):
+                    raise BrokerBackendError(
+                        "test_evidence_consumption_mismatch",
+                        "The test plane returned contradictory evidence-consumption identity.",
+                        operation_id=request.operation_id,
+                    )
+                return result
+        except TestPlanPreviewUnavailable as error:
+            unavailable_code = getattr(error, "code", "test_plan_preview_unavailable")
+            raise BrokerBackendError(
+                unavailable_code,
+                (
+                    "Repository-owned test setup inspection is not connected; retry after testd is healthy."
+                    if unavailable_code == "test_repository_setup_unavailable"
+                    else "Repository-owned test planning is not connected; retry after testd is healthy."
+                ),
+                operation_id=request.operation_id,
+                retry_after_seconds=2,
+            ) from error
+        except TestPlaneTransportError as error:
+            _LOGGER.warning(
+                "test-plane transport failure operation=%s code=%s detail=%s",
+                request.operation.value,
+                error.code,
+                " ".join(str(error.message).split())[:1024],
+            )
+            snapshot_transport_failure = error.code in {
+                "snapshot_transport_unavailable",
+                "snapshot_transport_timeout",
+                "snapshot_response_invalid",
+            }
+            snapshot_source_failure = (
+                error.code.startswith("snapshot_") and not snapshot_transport_failure
+            )
+            preview_unavailable = error.code in {
+                "test_plan_preview_unavailable",
+                "test_repository_setup_unavailable",
+                "test_plan_source_invalid",
+            } or snapshot_transport_failure or snapshot_source_failure
+            if error.code == "not_found":
+                if resolving_run_id is not None:
+                    raise BrokerBackendError(
+                        "test_run_not_found",
+                        "The exact test run does not exist.",
+                        operation_id=request.operation_id,
+                    ) from error
+                if request.operation is BrokerOperation.TEST_ARTIFACT_RESOLVE:
+                    raise BrokerBackendError(
+                        "test_artifact_not_found",
+                        "The exact test artifact does not exist.",
+                        operation_id=request.operation_id,
+                    ) from error
+                raise BrokerBackendError(
+                    "test_result_not_found",
+                    "The requested test result does not exist.",
+                    operation_id=request.operation_id,
+                ) from error
+            public_code = (
+                "test_plan_source_invalid"
+                if snapshot_source_failure
+                else "test_plan_preview_unavailable"
+                if snapshot_transport_failure
+                else error.code
+                if preview_unavailable
+                else "test_scheduler_unavailable"
+            )
+            raise BrokerBackendError(
+                public_code,
+                (
+                    "Repository-owned test setup inspection is not connected; retry after testd is healthy."
+                    if error.code == "test_repository_setup_unavailable"
+                    else public_snapshot_source_diagnostic(error.message)
+                    if error.code == "test_plan_source_invalid" or snapshot_source_failure
+                    else "Repository source snapshot inspection is temporarily unavailable; retry shortly."
+                    if snapshot_transport_failure
+                    else "Repository-owned test planning is not connected; retry after testd is healthy."
+                )
+                if preview_unavailable
+                else "The asynchronous test scheduler is unavailable; retry shortly.",
+                operation_id=request.operation_id,
+                retry_after_seconds=None
+                if public_code == "test_plan_source_invalid"
+                else 2,
+            ) from error
+        except (ManifestContractError, TestPlanError, TestStoreContractError) as error:
+            detail = _test_contract_diagnostic(error)
+            _LOGGER.warning(
+                "test contract failure operation_id=%s operation=%s type=%s detail=%s",
+                request.operation_id,
+                request.operation.value,
+                type(error).__name__,
+                detail,
+            )
+            raise BrokerBackendError(
+                "test_contract_invalid",
+                "The test manifest or plan contract is invalid: " + detail,
+                operation_id=request.operation_id,
+            ) from error
+        except TestStoreNotFound as error:
+            raise BrokerBackendError(
+                "test_run_not_found",
+                "The exact test run does not exist.",
+                operation_id=request.operation_id,
+            ) from error
+        except TestStoreConflict as error:
+            raise BrokerBackendError(
+                "test_state_conflict",
+                "The test request conflicts with current scheduler state.",
+                operation_id=request.operation_id,
+            ) from error
+        raise BrokerBackendError(
+            "unsupported_operation",
+            "The asynchronous test operation is not supported.",
+            operation_id=request.operation_id,
+        )
+
+    def _execute_test_attempt(
+        self, authorized: AuthorizedBrokerRequest
+    ) -> Mapping[str, Any]:
+        """Execute one fixed-identity testd request at the root launch boundary."""
+
+        request = authorized.request
+        coordinator = self._test_attempts
+        if coordinator is None:
+            raise BrokerBackendError(
+                "test_attempt_runtime_unavailable",
+                "The protected test-attempt runtime is not configured.",
+                operation_id=request.operation_id,
+            )
+        try:
+            if request.operation is BrokerOperation.TEST_ATTEMPT_TICKET:
+                raw = request.arguments["descriptor"]
+                if not isinstance(raw, Mapping):
+                    raise TestStoreContractError("test attempt descriptor is invalid")
+                owner_uid = raw.get("owner_uid")
+                if type(owner_uid) is not int:
+                    raise TestStoreContractError("test attempt owner UID is invalid")
+                authority = self._persistence.test_attempt_repository_authority(
+                    repo_id=request.project_id,
+                    owner_uid=owner_uid,
+                    operation_id=request.operation_id,
+                )
+                descriptor = TestAttemptDescriptor.from_document(
+                    raw, repository_generation=authority.generation
+                )
+                if (
+                    descriptor.repository_id != request.project_id
+                    or descriptor.attempt_id != request.resource_id
+                    or descriptor.original_root != authority.canonical_root
+                    or descriptor.owner_uid != authority.owner_uid
+                ):
+                    raise TestStoreConflict(
+                        "test attempt descriptor contradicts broker repository authority"
+                    )
+                if descriptor.source_mode == "live":
+                    if descriptor.temporary_root is not None:
+                        self._persistence.require_test_temporary_root(
+                            root_repo_id=request.project_id,
+                            temporary_root=descriptor.temporary_root,
+                            operation_id=request.operation_id,
+                        )
+                elif (
+                    descriptor.snapshot_id is None
+                    or Path(descriptor.execution_root).name != "root"
+                    or Path(descriptor.execution_root).parent.name
+                    != descriptor.snapshot_id
+                ):
+                    raise TestStoreConflict(
+                        "immutable test attempt does not target an exact snapshot root"
+                    )
+                capability_fingerprint = self._test_capabilities.authorize(
+                    descriptor
+                )
+                _LOGGER.info(
+                    "test attempt capability authorized repo=%s generation=%s policy=%s",
+                    descriptor.repository_id,
+                    descriptor.repository_generation,
+                    capability_fingerprint[:16],
+                )
+                return coordinator.issue(
+                    descriptor,
+                    launch_timeout_seconds=int(
+                        request.arguments["launch_timeout_seconds"]
+                    ),
+                )
+
+            if request.operation is BrokerOperation.TEST_ATTEMPT_LAUNCH:
+                return coordinator.launch(
+                    ticket_id=str(request.arguments["ticket_id"]),
+                    attempt_id=str(request.arguments["attempt_id"]),
+                    generation=int(request.arguments["generation"]),
+                    expected_repository_id=request.project_id,
+                    expected_repository_generation=request.repository_generation,
+                )
+
+            if request.operation is BrokerOperation.TEST_ATTEMPT_CANCEL:
+                # Cancellation can race a lost launch reply. Bind the exact
+                # deterministic runtime to the broker request before asking
+                # the coordinator for either a stopped-runtime result or a
+                # typed native absence proof. Generic descriptor failures stay
+                # errors and can never be interpreted as successful cleanup.
+                return coordinator.cancel(
+                    str(request.arguments["runtime_id"]),
+                    reason=str(request.arguments["reason"]),
+                    expected_attempt_id=request.resource_id,
+                    expected_repository_id=request.project_id,
+                    expected_repository_generation=request.repository_generation,
+                )
+
+            descriptor = coordinator.runtime_descriptor(
+                str(request.arguments["runtime_id"])
+            )
+            self._require_internal_attempt_binding(request, descriptor)
+            if request.operation is BrokerOperation.TEST_ATTEMPT_STATUS:
+                return coordinator.observe(
+                    str(request.arguments["runtime_id"]),
+                    result_chunk_index=int(
+                        request.arguments["result_chunk_index"]
+                    ),
+                )
+            raise TestStoreContractError("unsupported internal test attempt operation")
+        except TestAttemptLaunchUncertain as error:
+            raise BrokerBackendError(
+                "test_attempt_launch_uncertain",
+                str(error),
+                operation_id=request.operation_id,
+            ) from error
+        except OSError as error:
+            raise BrokerBackendError(
+                "test_attempt_runtime_unavailable",
+                "The protected test-attempt runtime could not access its local "
+                "state; retry after the authority runtime is healthy.",
+                operation_id=request.operation_id,
+            ) from error
+        except (TestStoreConflict, TestStoreContractError) as error:
+            raise BrokerBackendError(
+                "test_attempt_contract_invalid",
+                str(error),
+                operation_id=request.operation_id,
+            ) from error
+
+    @staticmethod
+    def _require_internal_attempt_binding(
+        request: BrokerRequest, descriptor: TestAttemptDescriptor
+    ) -> None:
+        if (
+            descriptor.repository_id != request.project_id
+            or descriptor.repository_generation != request.repository_generation
+            or descriptor.attempt_id != request.resource_id
+        ):
+            raise TestStoreConflict(
+                "test attempt request does not belong to the exact ticketed resource"
+            )
+
+    @staticmethod
+    def _require_test_repository(
+        result: Mapping[str, Any], expected_repo_id: str
+    ) -> None:
+        if not expected_repo_id or str(result.get("repository_id") or "") != expected_repo_id:
+            raise BrokerBackendError(
+                "test_repository_mismatch",
+                "The test-plane result does not belong to the authorized repository.",
+            )
+
+    @staticmethod
+    def _require_test_run_result(
+        result: Mapping[str, Any],
+        *,
+        expected_run_id: str,
+        expected_repo_id: str,
+    ) -> str:
+        """Bind one testd result to the broker-authorized run and repository.
+
+        Testd owns the high-volume store but it is not an authorization
+        authority.  A malformed response must therefore fail at the broker
+        boundary instead of allowing an exact run lookup to be cross-wired to
+        another repository's evidence.
+        """
+
+        returned_run_id = result.get("run_id")
+        if (
+            not expected_run_id
+            or not isinstance(returned_run_id, str)
+            or returned_run_id != expected_run_id
+        ):
+            raise BrokerBackendError(
+                "test_run_mismatch",
+                "The test-plane result does not belong to the requested run.",
+            )
+        returned_repo_id = result.get("repository_id")
+        if (
+            not isinstance(returned_repo_id, str)
+            or not returned_repo_id
+            or returned_repo_id != expected_repo_id
+        ):
+            raise BrokerBackendError(
+                "test_repository_mismatch",
+                "The test-plane result does not belong to the authorized repository.",
+            )
+        return returned_repo_id
+
+    @classmethod
+    def _require_test_run_page(
+        cls,
+        result: Mapping[str, Any],
+        *,
+        expected_repo_id: str,
+        maximum_items: int,
+    ) -> None:
+        raw_runs = result.get("runs")
+        if not isinstance(raw_runs, list) or len(raw_runs) > maximum_items:
+            raise BrokerBackendError(
+                "test_result_malformed",
+                "The test-plane run page is malformed or exceeds its bound.",
+            )
+        seen: set[str] = set()
+        for item in raw_runs:
+            if not isinstance(item, Mapping):
+                raise BrokerBackendError(
+                    "test_result_malformed",
+                    "The test-plane run page contains a malformed item.",
+                )
+            run_id = item.get("run_id")
+            if not isinstance(run_id, str) or not run_id or run_id in seen:
+                raise BrokerBackendError(
+                    "test_result_malformed",
+                    "The test-plane run page contains a contradictory run identity.",
+                )
+            seen.add(run_id)
+            cls._require_test_run_result(
+                item,
+                expected_run_id=run_id,
+                expected_repo_id=expected_repo_id,
+            )
+
+    @staticmethod
+    def _require_test_event_page(
+        result: Mapping[str, Any],
+        *,
+        expected_repo_id: str,
+        after_event_id: int,
+        maximum_items: int,
+    ) -> None:
+        raw_events = result.get("events")
+        if not isinstance(raw_events, list) or len(raw_events) > maximum_items:
+            raise BrokerBackendError(
+                "test_result_malformed",
+                "The test-plane event page is malformed or exceeds its bound.",
+            )
+        previous = after_event_id
+        for item in raw_events:
+            if not isinstance(item, Mapping):
+                raise BrokerBackendError(
+                    "test_result_malformed",
+                    "The test-plane event page contains a malformed item.",
+                )
+            event_id = item.get("event_id")
+            if type(event_id) is not int or event_id <= previous:
+                raise BrokerBackendError(
+                    "test_result_malformed",
+                    "The test-plane event page contains a contradictory cursor.",
+                )
+            previous = event_id
+            if item.get("repository_id") != expected_repo_id:
+                raise BrokerBackendError(
+                    "test_repository_mismatch",
+                    "The test-plane event does not belong to the authorized repository.",
+                )
+
+    def _test_capability_preflight(
+        self,
+        authorized: AuthorizedBrokerRequest,
+        *,
+        networks: tuple[str, ...],
+        fixtures: tuple[str, ...],
+        credentials: tuple[str, ...],
+        required: bool,
+    ) -> dict[str, object]:
+        request = authorized.request
+        authority = self._persistence.test_attempt_repository_authority(
+            repo_id=request.project_id,
+            owner_uid=None,
+            operation_id=request.operation_id,
+        )
+        result = dict(
+            self._test_capabilities.check_requests(
+                repository_id=request.project_id,
+                repository_generation=authority.generation,
+                networks=networks,
+                fixtures=fixtures,
+                credentials=credentials,
+            )
+        )
+        if required and result.get("ok") is not True:
+            missing = result.get("missing")
+            detail = ", ".join(missing) if isinstance(missing, list) else "unknown"
+            raise BrokerBackendError(
+                "test_capability_policy_missing",
+                "The sealed test capability policy does not authorize this plan: "
+                + detail,
+                operation_id=request.operation_id,
+            )
+        return result
+
+    def _require_test_plan_source(
+        self,
+        authorized: AuthorizedBrokerRequest,
+        source: Mapping[str, Any],
+    ) -> None:
+        """Prove original/temporary roots from authority, never path inference."""
+
+        request = authorized.request
+        original_root = str(source.get("original_root") or "")
+        temporary_root = source.get("temporary_root")
+        with CoordinatorStore.open(
+            self._persistence.database_path,
+            expected_uid=self._persistence.expected_uid,
+            busy_timeout_ms=self._persistence.busy_timeout_ms,
+        ) as store:
+            with store.read_transaction() as connection:
+                root = connection.execute(
+                    "SELECT canonical_root, state FROM repositories WHERE repo_id = ?",
+                    (request.project_id,),
+                ).fetchone()
+                if (
+                    root is None
+                    or str(root["state"]) != "active"
+                    or str(root["canonical_root"]) != original_root
+                ):
+                    raise TestStoreContractError(
+                        "plan source is not the exact authorized root repository"
+                    )
+                if temporary_root is None:
+                    return
+                temporary = connection.execute(
+                    """
+                    SELECT repository.state
+                    FROM repository_families AS family
+                    JOIN repository_scopes AS scope
+                      ON scope.family_id = family.family_id
+                    JOIN repositories AS repository
+                      ON repository.repo_id = scope.repo_id
+                    WHERE family.root_repo_id = ?
+                      AND scope.project_kind = 'temporary'
+                      AND repository.canonical_root = ?
+                    """,
+                    (request.project_id, str(temporary_root)),
+                ).fetchone()
+                if temporary is None or str(temporary["state"]) != "active":
+                    raise TestStoreContractError(
+                        "temporary test source is not an authoritative member of the root repository family"
+                    )
+
+    def _finish_repository_ensure_failure(
+        self,
+        *,
+        operation_id: str,
+        code: str,
+        message: str,
+    ) -> None:
+        """Best-effort terminalize a reserved adoption without hiding its cause."""
+
+        try:
+            self._persistence.finish_operation(
+                operation_id,
+                error_code=code,
+                error_message=message,
+            )
+        except Exception:
+            # Context validation can fail before reserve_operation, and a
+            # damaged/unavailable store may also reject the terminal write.
+            # The original typed public failure remains more useful than a
+            # secondary operation-state error; retain that secondary evidence
+            # only in the protected service log.
+            _LOGGER.exception(
+                "repository adoption diagnostic could not be persisted operation_id=%s code=%s",
+                operation_id,
+                code,
+            )
+
+    def _raise_repository_ensure_failure(
+        self,
+        *,
+        request: BrokerRequest,
+        code: str,
+        message: str,
+        cause: BaseException,
+        terminalize: bool = True,
+    ) -> NoReturn:
+        if terminalize:
+            self._finish_repository_ensure_failure(
+                operation_id=request.operation_id,
+                code=code,
+                message=message,
+            )
+        raise BrokerBackendError(
+            code,
+            message,
+            operation_id=request.operation_id,
+        ) from cause
+
+    def _execute_repository_ensure(
+        self, authorized: AuthorizedBrokerRequest
+    ) -> Mapping[str, Any]:
+        """Adopt one repository while preserving safe, actionable failures."""
+
+        from .repository_context import (
+            RepositoryContextError,
+            resolve_effective_repository_context,
+        )
+
+        request = authorized.request
+        try:
+            context = resolve_effective_repository_context(
+                project=str(request.arguments["canonical_root"])
+            )
+        except (OSError, RepositoryContextError, ValueError) as error:
+            message = _repository_adoption_message(
+                "Repository adoption could not prove one stable Git worktree.",
+                "Correct the reported repository/context condition, then rerun the original structured runtime serve command; do not enable local fallback or bind the port directly.",
+                cause=error,
+            )
+            self._raise_repository_ensure_failure(
+                request=request,
+                code="repository_context_invalid",
+                message=message,
+                cause=error,
+                terminalize=False,
+            )
+
+        try:
+            return self._persistence.ensure_repository_enrollment(
+                authorized,
+                context=context,
+            )
+        except BrokerError:
+            # Deliberately typed policy/state failures already carry an exact
+            # operation identity and must not be relabelled as storage faults.
+            raise
+        except StoreInvariantError as error:
+            failure_cause: BaseException = error
+            code = "repository_adoption_invariant_failed"
+            message = _repository_adoption_message(
+                "Repository adoption was rejected by a Coordinator authority invariant.",
+                "Correct the conflicting authority state named below, then rerun the original structured runtime serve command with a fresh operation ID.",
+                cause=error,
+            )
+        except sqlite3.IntegrityError as error:
+            failure_cause = error
+            code = "repository_adoption_constraint_failed"
+            message = _repository_adoption_message(
+                "Repository adoption was rejected by an authority database constraint.",
+                "Correct the conflicting repository/enrollment identity named below, then rerun the original structured runtime serve command with a fresh operation ID.",
+                cause=error,
+            )
+        except (StoreError, sqlite3.DatabaseError, OSError) as error:
+            failure_cause = error
+            code = "repository_adoption_store_failed"
+            message = _repository_adoption_message(
+                "Repository adoption could not commit to the Coordinator authority store.",
+                "Correct the reported store condition (or let its current writer finish), then rerun the original structured runtime serve command with a fresh operation ID.",
+                cause=error,
+            )
+        except (ValueError, RuntimeError) as error:
+            failure_cause = error
+            # Owner-authority establishment uses bounded ValueError/RuntimeError
+            # invariants. They are expected adoption rejections, not an opaque
+            # broker outage.
+            code = "repository_owner_authority_failed"
+            message = _repository_adoption_message(
+                "Repository adoption could not establish its execution-owner authority.",
+                "Correct the owner-authority conflict named below, then rerun the original structured runtime serve command with a fresh operation ID.",
+                cause=error,
+            )
+        except Exception as error:
+            failure_cause = error
+            code = "repository_adoption_internal_error"
+            message = _repository_adoption_message(
+                "Repository adoption failed unexpectedly before it could complete.",
+                "Do not retry blindly, enable local fallback, bind the port directly, or choose another port; report this operation ID and error code to the Coordinator task.",
+            )
+            _LOGGER.exception(
+                "repository adoption failed unexpectedly operation_id=%s exception_type=%s",
+                request.operation_id,
+                type(error).__name__,
+            )
+        self._raise_repository_ensure_failure(
+            request=request,
+            code=code,
+            message=message,
+            cause=failure_cause,
+        )
+
     def execute(self, authorized: AuthorizedBrokerRequest) -> Mapping[str, Any]:
         request = authorized.request
+        if request.operation in {
+            BrokerOperation.TEST_ADMISSION_DRAIN_BEGIN,
+            BrokerOperation.TEST_ADMISSION_DRAIN_STATUS,
+            BrokerOperation.TEST_ADMISSION_DRAIN_CLEAR,
+        }:
+            return self._execute_test_admission_admin(authorized)
+        if request.operation in TESTD_INTERNAL_OPERATIONS:
+            return self._execute_test_attempt(authorized)
+        if request.operation in _ASYNC_TEST_OPERATIONS:
+            return self._execute_async_test(authorized)
         if request.operation in _EPHEMERAL_OPERATIONS:
             return self._ephemeral.execute(authorized)
+        if request.operation == BrokerOperation.CAPABILITIES_READ:
+            return broker_capabilities(
+                protocol_version=PROTOCOL_VERSION,
+                authority_schema_version=SCHEMA_VERSION,
+                authority_generation=request.authority_generation,
+                active_release_digest=release_digest(Path(__file__)),
+            )
+        if request.operation == BrokerOperation.REPOSITORY_RESOLVE:
+            return self._persistence.resolve_repository_enrollment(authorized)
+        if request.operation == BrokerOperation.REPOSITORY_ENSURE:
+            return self._execute_repository_ensure(authorized)
+        if request.operation == BrokerOperation.OPERATION_FOLLOW:
+            return self._persistence.operation_follow(authorized)
         if request.operation == BrokerOperation.INVENTORY_READ:
             return self._persistence.inventory(authorized)
         if request.operation == BrokerOperation.EVENTS_READ:
             return self._persistence.events(authorized)
-        if request.operation == BrokerOperation.TEST_STATS_READ:
-            return self._test_records.stats(authorized)
         if request.operation == BrokerOperation.HOST_OBSERVE:
             return self._observe_committed_host(request.operation_id)
+        if request.operation == BrokerOperation.RUNTIME_ENSURE:
+            return self._execute_runtime_ensure(authorized)
         if request.operation == BrokerOperation.RUNTIME_REQUEST:
             return self._execute_runtime_request(authorized)
+        if request.operation == BrokerOperation.COMPOSE_RUN_ONCE:
+            return self._execute_compose_run_once(authorized)
         if request.operation in WORKER_OPERATIONS:
             return self._worker_operations.execute(authorized)
         if request.operation == BrokerOperation.REPOSITORY_LIST_REMOVED:
@@ -706,15 +2368,6 @@ class StoreBackedMutationBackend:
                         port=int(target["port"]),
                         canonical_root=str(target["canonical_root"]),
                     )
-                    if (
-                        type(listener_evidence.get("owner_uid")) is not int
-                        or int(listener_evidence["owner_uid"]) != authorized.peer.uid
-                    ):
-                        raise BrokerBackendError(
-                            "listener_peer_mismatch",
-                            "The exact listener is not owned by the authenticated operating-system account.",
-                            operation_id=request.operation_id,
-                        )
                     if int(listener_evidence.get("pid") or 0) != int(
                         request.arguments["pid"]
                     ):
@@ -917,16 +2570,64 @@ class StoreBackedMutationBackend:
                     ) from exc
         except ComposeMutationOutcomeUncertain as exc:
             reconciliation_observation: Mapping[str, Any] | None = None
+            # An action may be completed by observation only when exactly one
+            # host command was invoked and no sealed-input cleanup or input
+            # identity check failed.  A partial restart, a cleanup failure, or
+            # a source-path drift may happen to leave the desired containers
+            # running but is not evidence that the requested transaction was
+            # safely completed.
+            can_settle_by_observation = (
+                exc.action in {"up", "stop", "down"}
+                and exc.failed_phase == exc.action
+                and not exc.completed_phases
+                and not exc.cleanup_failed
+            )
             try:
                 reconciliation_observation = self._observe_fresh_full_docker(
                     request.operation_id,
                     project_id=request.project_id,
                 )
             except Exception:
-                # The host outcome remains uncertain either way.  Persist only
+                # The host outcome remains uncertain either way. Persist only
                 # the bounded fact that reconciliation observation failed; no
                 # subprocess or observer diagnostics can enter the journal.
                 reconciliation_observation = None
+            if can_settle_by_observation and reconciliation_observation is not None:
+                try:
+                    proof = self._persistence.compose_observation_result(
+                        authorized,
+                        evidence=reconciliation_observation,
+                    )
+                except Exception:
+                    # The authoritative state did not prove the requested
+                    # result. Preserve the existing reconciliation fence.
+                    pass
+                else:
+                    # Keep the wrapper uncertainty as audit metadata, but do
+                    # not make a user retry a stop that has already reached
+                    # its exact requested state.
+                    reconciled_result = {
+                        "action": exc.action,
+                        "status": "completed_by_observation",
+                        "phases": list(exc.completed_phases),
+                        "host_invocation_uncertain": True,
+                        "failed_phase": exc.failed_phase,
+                        "cleanup_failed": exc.cleanup_failed,
+                        "broker_observation": dict(reconciliation_observation),
+                        "compose_observation": proof,
+                    }
+                    try:
+                        self._persistence.finish_operation(
+                            request.operation_id,
+                            result=reconciled_result,
+                        )
+                    except Exception:
+                        # The externally proved state remains real, but the
+                        # durable journal did not accept it. Keep the normal
+                        # reconciliation path rather than claiming success.
+                        pass
+                    else:
+                        return reconciled_result
             try:
                 self._persistence.mark_compose_operation_reconciliation_required(
                     request.operation_id,
@@ -1005,6 +2706,687 @@ class StoreBackedMutationBackend:
             ) from exc
         return result
 
+    def _execute_compose_run_once(
+        self, authorized: AuthorizedBrokerRequest
+    ) -> Mapping[str, Any]:
+        """Execute or resume one broker-owned, manifest-sealed Compose service."""
+
+        request = authorized.request
+        existing = self._persistence.existing_operation_disposition(authorized)
+        if existing is None:
+            self._persistence.require_no_active_compose_operation(authorized)
+            preflight = self._observe_fresh_full_docker(
+                request.operation_id,
+                project_id=request.project_id,
+            )
+            self._persistence.require_compose_mutation_safe(
+                authorized,
+                snapshot_id=str(preflight["snapshot_id"]),
+            )
+            disposition = self._persistence.reserve_operation(
+                authorized,
+                compose_preflight=preflight,
+            )
+        else:
+            disposition = existing
+        if disposition.state == "completed":
+            return dict(disposition.result or {})
+        if disposition.state == "failed":
+            raise BrokerBackendError(
+                disposition.error_code or "mutation_failed",
+                disposition.error_message or "Broker mutation failed.",
+                operation_id=request.operation_id,
+            )
+        if disposition.state not in {"execute", "pending"}:
+            raise BrokerBackendError(
+                "operation_state_conflict",
+                "Compose run-once operation has an unsupported durable state.",
+                operation_id=request.operation_id,
+            )
+
+        fresh_create_intent = False
+        empty_digest = "sha256:" + hashlib.sha256(b"").hexdigest()
+        for _transition in range(32):
+            target = self._persistence.compose_run_once_target(authorized)
+            phase = target.phase
+            if phase == "reserved":
+                self._persistence.mark_compose_run_once_image_bind_intent(
+                    authorized
+                )
+                continue
+            if phase == "image_bind_intent":
+                try:
+                    raw_image = self._host_mutations.compose_run_once_bind_image(
+                        target
+                    )
+                    image_id = _validated_compose_run_once_image(
+                        raw_image,
+                        image_ref=target.service_image_ref,
+                    )
+                except BrokerError as exc:
+                    self._persistence.finish_operation(
+                        request.operation_id,
+                        error_code=exc.code,
+                        error_message=exc.message,
+                    )
+                    raise
+                except Exception as exc:
+                    self._persistence.finish_operation(
+                        request.operation_id,
+                        error_code="compose_run_once_image_unavailable",
+                        error_message=(
+                            "Compose run-once image binding could not be proved."
+                        ),
+                    )
+                    raise BrokerBackendError(
+                        "compose_run_once_image_unavailable",
+                        "Compose run-once image binding could not be proved.",
+                        operation_id=request.operation_id,
+                    ) from exc
+                self._persistence.bind_compose_run_once_image(
+                    authorized,
+                    image_id=image_id,
+                )
+                continue
+            if phase == "image_bound":
+                self._persistence.mark_compose_run_once_create_intent(authorized)
+                fresh_create_intent = True
+                continue
+            if phase == "create_intent":
+                observed = self._host_mutations.compose_run_once_find_container(
+                    target
+                )
+                if observed is None and fresh_create_intent:
+                    try:
+                        observed = (
+                            self._host_mutations.compose_run_once_create_container(
+                                target
+                            )
+                        )
+                    except Exception:
+                        # A successful exact lookup after a caller/CLI failure
+                        # resolves the creation side effect. A proved absence
+                        # fails closed; it is never recreated under the same ID.
+                        observed = (
+                            self._host_mutations.compose_run_once_find_container(
+                                target
+                            )
+                        )
+                        if observed is None:
+                            self._persistence.record_compose_run_once_terminal(
+                                authorized,
+                                exit_code=None,
+                                timed_out=False,
+                                error_code=(
+                                    "compose_run_once_creation_unresolved"
+                                ),
+                            )
+                            fresh_create_intent = False
+                            continue
+                elif observed is None:
+                    self._persistence.record_compose_run_once_terminal(
+                        authorized,
+                        exit_code=None,
+                        timed_out=False,
+                        error_code="compose_run_once_creation_ambiguous",
+                    )
+                    continue
+                observation = _validated_compose_run_once_container(
+                    observed,
+                    expected_image_id=str(target.expected_image_id),
+                )
+                self._persistence.bind_compose_run_once_container(
+                    authorized,
+                    full_container_id=observation["full_container_id"],
+                    image_id=observation["image_id"],
+                )
+                fresh_create_intent = False
+                continue
+            if phase == "container_bound":
+                self._persistence.mark_compose_run_once_start_intent(authorized)
+                continue
+            if phase == "start_intent":
+                try:
+                    raw_observation = (
+                        self._host_mutations.compose_run_once_start_container(
+                            target
+                        )
+                    )
+                    observation = _validated_compose_run_once_container(
+                        raw_observation,
+                        expected_image_id=str(target.expected_image_id),
+                        expected_container_id=str(target.full_container_id),
+                    )
+                except Exception as exc:
+                    raise BrokerBackendError(
+                        "operation_outcome_uncertain",
+                        "Compose run-once start remains resumable by its exact operation ID.",
+                        operation_id=request.operation_id,
+                    ) from exc
+                if observation["status"] == "running":
+                    self._persistence.mark_compose_run_once_started(authorized)
+                    continue
+                if observation["status"] in {"exited", "dead"}:
+                    self._persistence.record_compose_run_once_terminal(
+                        authorized,
+                        exit_code=observation["exit_code"],
+                        timed_out=False,
+                    )
+                    continue
+                raise BrokerBackendError(
+                    "operation_outcome_uncertain",
+                    "Compose run-once start has not reached a safe resumable state.",
+                    operation_id=request.operation_id,
+                )
+            if phase == "started":
+                self._persistence.mark_compose_run_once_wait_intent(authorized)
+                continue
+            if phase == "wait_intent":
+                remaining_seconds = target.deadline_epoch - time.time()
+                if remaining_seconds <= 0:
+                    self._persistence.mark_compose_run_once_stop_intent(
+                        authorized
+                    )
+                    continue
+                try:
+                    raw_wait = (
+                        self._host_mutations.compose_run_once_wait_container(
+                            target,
+                            timeout_seconds=min(
+                                float(target.timeout_seconds),
+                                max(0.001, remaining_seconds),
+                            ),
+                        )
+                    )
+                    observation = _validated_compose_run_once_container(
+                        raw_wait,
+                        expected_image_id=str(target.expected_image_id),
+                        expected_container_id=str(target.full_container_id),
+                        allow_timed_out=True,
+                    )
+                except Exception as exc:
+                    raise BrokerBackendError(
+                        "operation_outcome_uncertain",
+                        "Compose run-once wait remains resumable by its exact operation ID.",
+                        operation_id=request.operation_id,
+                    ) from exc
+                if observation["status"] in {"exited", "dead"}:
+                    self._persistence.record_compose_run_once_terminal(
+                        authorized,
+                        exit_code=observation["exit_code"],
+                        timed_out=False,
+                    )
+                    continue
+                if observation.get("timed_out") is True:
+                    self._persistence.mark_compose_run_once_stop_intent(
+                        authorized
+                    )
+                    continue
+                raise BrokerBackendError(
+                    "operation_outcome_uncertain",
+                    "Compose run-once wait returned a non-terminal state.",
+                    operation_id=request.operation_id,
+                )
+            if phase == "stop_intent":
+                try:
+                    raw_observation = (
+                        self._host_mutations.compose_run_once_stop_container(
+                            target
+                        )
+                    )
+                    observation = _validated_compose_run_once_container(
+                        raw_observation,
+                        expected_image_id=str(target.expected_image_id),
+                        expected_container_id=str(target.full_container_id),
+                    )
+                except Exception as exc:
+                    raise BrokerBackendError(
+                        "operation_outcome_uncertain",
+                        "Timed-out Compose run-once stop remains resumable by its exact operation ID.",
+                        operation_id=request.operation_id,
+                    ) from exc
+                if observation["status"] not in {"exited", "dead"}:
+                    raise BrokerBackendError(
+                        "operation_outcome_uncertain",
+                        "Timed-out Compose run-once container is not terminal.",
+                        operation_id=request.operation_id,
+                    )
+                self._persistence.record_compose_run_once_terminal(
+                    authorized,
+                    exit_code=observation["exit_code"],
+                    timed_out=True,
+                )
+                continue
+            if phase == "terminal":
+                self._persistence.mark_compose_run_once_evidence_intent(
+                    authorized
+                )
+                continue
+            if phase == "evidence_intent":
+                if target.full_container_id is None:
+                    evidence = ComposeRunOnceOutputEvidence(
+                        published_receipt=PublishedReceipt(
+                            "empty",
+                            None,
+                            None,
+                            "receipt_empty",
+                        ),
+                        stdout_sha256=empty_digest,
+                        stdout_byte_size=0,
+                        stderr_sha256=empty_digest,
+                        stderr_byte_size=0,
+                    )
+                else:
+                    try:
+                        evidence = (
+                            self._host_mutations.compose_run_once_capture_evidence(
+                                target
+                            )
+                        )
+                    except Exception as exc:
+                        raise BrokerBackendError(
+                            "operation_outcome_uncertain",
+                            "Compose run-once evidence capture remains resumable by its exact operation ID.",
+                            operation_id=request.operation_id,
+                        ) from exc
+                if not isinstance(evidence, ComposeRunOnceOutputEvidence):
+                    raise BrokerBackendError(
+                        "invalid_backend_result",
+                        "Compose run-once evidence result is invalid.",
+                        operation_id=request.operation_id,
+                    )
+                self._persistence.record_compose_run_once_evidence(
+                    authorized,
+                    published_receipt=evidence.published_receipt,
+                    stdout_sha256=evidence.stdout_sha256,
+                    stdout_byte_size=evidence.stdout_byte_size,
+                    stderr_sha256=evidence.stderr_sha256,
+                    stderr_byte_size=evidence.stderr_byte_size,
+                )
+                continue
+            if phase == "evidence_captured":
+                self._persistence.mark_compose_run_once_cleanup_intent(
+                    authorized
+                )
+                continue
+            if phase == "cleanup_intent":
+                if target.full_container_id is None:
+                    cleanup_status = "not_created"
+                else:
+                    try:
+                        cleanup = (
+                            self._host_mutations.compose_run_once_remove_container(
+                                target
+                            )
+                        )
+                    except Exception as exc:
+                        raise BrokerBackendError(
+                            "operation_outcome_uncertain",
+                            "Compose run-once cleanup remains resumable by its exact operation ID.",
+                            operation_id=request.operation_id,
+                        ) from exc
+                    if (
+                        not isinstance(cleanup, Mapping)
+                        or cleanup.get("removed") is not True
+                        or cleanup.get("full_container_id")
+                        != target.full_container_id
+                    ):
+                        raise BrokerBackendError(
+                            "invalid_backend_result",
+                            "Compose run-once cleanup omitted exact removal proof.",
+                            operation_id=request.operation_id,
+                        )
+                    cleanup_status = "removed"
+                self._persistence.mark_compose_run_once_cleaned(
+                    authorized,
+                    cleanup_status=cleanup_status,
+                )
+                continue
+            if phase == "cleaned":
+                result = self._persistence.compose_run_once_public_result(
+                    authorized
+                )
+                try:
+                    self._persistence.finish_operation(
+                        request.operation_id,
+                        result=result,
+                    )
+                except Exception as exc:
+                    raise BrokerBackendError(
+                        "operation_outcome_uncertain",
+                        "Compose run-once completed but its public receipt remains resumable for durable commit.",
+                        operation_id=request.operation_id,
+                    ) from exc
+                return result
+            raise BrokerBackendError(
+                "compose_run_once_state_invalid",
+                "Compose run-once operation reached an unknown durable phase.",
+                operation_id=request.operation_id,
+            )
+        raise BrokerBackendError(
+            "compose_run_once_state_invalid",
+            "Compose run-once operation exceeded its bounded transition count.",
+            operation_id=request.operation_id,
+        )
+
+    def _execute_runtime_ensure(
+        self, authorized: AuthorizedBrokerRequest
+    ) -> Mapping[str, Any]:
+        """Ensure one enrolled target state without delegating decisions."""
+
+        request = authorized.request
+        desired_state = str(request.arguments["desired_state"])
+        target_kind = str(request.arguments["target_kind"])
+
+        existing = self._persistence.existing_operation_disposition(authorized)
+        if existing is not None:
+            if existing.state == "completed":
+                return dict(existing.result or {})
+            if existing.state == "failed":
+                raise BrokerBackendError(
+                    existing.error_code or "runtime_ensure_failed",
+                    existing.error_message or "Runtime ensure did not complete.",
+                    operation_id=request.operation_id,
+                )
+            raise BrokerBackendError(
+                "operation_in_progress",
+                "This durable runtime ensure is pending or needs attention; "
+                "it was not executed again.",
+                operation_id=request.operation_id,
+            )
+
+        # Observation precedes reservation so an unavailable observer cannot
+        # strand a durable mutation. The target state is then re-read and its
+        # immutable identity rechecked inside the reserved root operation.
+        host_evidence = self._observe_committed_host(request.operation_id)
+        disposition = self._persistence.reserve_operation(authorized)
+        if disposition.state == "completed":
+            return dict(disposition.result or {})
+        if disposition.state == "failed":
+            raise BrokerBackendError(
+                disposition.error_code or "runtime_ensure_failed",
+                disposition.error_message or "Runtime ensure did not complete.",
+                operation_id=request.operation_id,
+            )
+        if disposition.state not in {"execute", "pending", "reconcile"}:
+            raise BrokerBackendError(
+                "operation_in_progress",
+                "This durable runtime ensure is pending or needs attention; "
+                "it was not executed again.",
+                operation_id=request.operation_id,
+            )
+
+        try:
+            context, _inventory, classification_evidence = (
+                self._persistence.runtime_snapshot(authorized)
+            )
+            before = self._persistence.runtime_ensure_observation(
+                authorized, require_reserved=True
+            )
+        except BrokerError as error:
+            self._persistence.finish_operation(
+                request.operation_id,
+                error_code=error.code,
+                error_message=error.message,
+            )
+            raise BrokerBackendError(
+                error.code, error.message, operation_id=request.operation_id
+            ) from None
+
+        family_classified = not classification_evidence
+        decision = decide_runtime_ensure(
+            before,
+            desired_state=desired_state,
+            family_classified=family_classified,
+        )
+        if target_kind in {"docker", "database_stack"} and (
+            host_evidence.get("docker_available") is not True
+        ):
+            decision = RuntimeEnsureDecision(
+                desired_state,
+                decision.observed_state,
+                None,
+                "attention_required",
+                "docker_observer_unavailable",
+            )
+
+        if decision.action is None:
+            result = build_runtime_ensure_result(
+                operation_id=request.operation_id,
+                repository_id=request.project_id,
+                repository_generation=request.repository_generation,
+                resource_kind=target_kind,
+                resource_id=request.resource_id,
+                desired_state=desired_state,
+                decision=decision,
+                mutation_performed=False,
+                terminal_observation=before,
+                snapshot_id=str(host_evidence["snapshot_id"]),
+                proof_source="broker_host_observation",
+                family_classified=family_classified,
+            )
+            return self._finish_runtime_ensure_result(request, result)
+
+        if target_kind == "service":
+            if str(before.get("role") or "").lower() != "worker":
+                blocked = RuntimeEnsureDecision(
+                    desired_state,
+                    decision.observed_state,
+                    None,
+                    "attention_required",
+                    "runtime_supervisor_required",
+                )
+                result = build_runtime_ensure_result(
+                    operation_id=request.operation_id,
+                    repository_id=request.project_id,
+                    repository_generation=request.repository_generation,
+                    resource_kind=target_kind,
+                    resource_id=request.resource_id,
+                    desired_state=desired_state,
+                    decision=blocked,
+                    mutation_performed=False,
+                    terminal_observation=before,
+                    snapshot_id=str(host_evidence["snapshot_id"]),
+                    proof_source="broker_host_observation",
+                    family_classified=family_classified,
+                )
+                return self._finish_runtime_ensure_result(request, result)
+            return self._execute_worker_runtime_ensure(
+                authorized,
+                context=context,
+                before=before,
+                decision=decision,
+                family_classified=family_classified,
+            )
+
+        invoked = False
+        try:
+            target = self._persistence.runtime_docker_target(authorized)
+            invoked = True
+            if decision.action == "start":
+                self._host_mutations.docker_start(target)
+            else:
+                self._host_mutations.docker_stop(target)
+            final_host_evidence = self._observe_committed_host(
+                request.operation_id
+            )
+            _context, _inventory, final_classification = (
+                self._persistence.runtime_snapshot(authorized)
+            )
+            terminal = self._persistence.runtime_ensure_observation(
+                authorized, require_reserved=True
+            )
+            terminal_certain = (
+                final_host_evidence.get("docker_available") is True
+            )
+        except Exception:
+            failure_decision = decision
+            if not invoked:
+                failure_decision = RuntimeEnsureDecision(
+                    desired_state,
+                    decision.observed_state,
+                    None,
+                    "attention_required",
+                    "mutation_preflight_failed",
+                )
+            uncertain = build_runtime_ensure_result(
+                operation_id=request.operation_id,
+                repository_id=request.project_id,
+                repository_generation=request.repository_generation,
+                resource_kind=target_kind,
+                resource_id=request.resource_id,
+                desired_state=desired_state,
+                decision=failure_decision,
+                mutation_performed=invoked,
+                terminal_observation=before,
+                snapshot_id=str(host_evidence["snapshot_id"]),
+                proof_source="broker_host_observation",
+                certain=not invoked,
+                family_classified=family_classified,
+            )
+            return self._finish_runtime_ensure_result(request, uncertain)
+
+        result = build_runtime_ensure_result(
+            operation_id=request.operation_id,
+            repository_id=request.project_id,
+            repository_generation=request.repository_generation,
+            resource_kind=target_kind,
+            resource_id=request.resource_id,
+            desired_state=desired_state,
+            decision=decision,
+            mutation_performed=True,
+            terminal_observation=terminal,
+            snapshot_id=str(final_host_evidence["snapshot_id"]),
+            proof_source="broker_host_observation",
+            certain=terminal_certain,
+            family_classified=not final_classification,
+        )
+        return self._finish_runtime_ensure_result(request, result)
+
+    def _execute_worker_runtime_ensure(
+        self,
+        authorized: AuthorizedBrokerRequest,
+        *,
+        context: Mapping[str, Any],
+        before: Mapping[str, Any],
+        decision: RuntimeEnsureDecision,
+        family_classified: bool,
+    ) -> Mapping[str, Any]:
+        """Invoke only fixed start/stop on an exact supervised worker."""
+
+        request = authorized.request
+        desired_state = str(request.arguments["desired_state"])
+        canonical_repository = (
+            context["temporary_repo"]
+            if context["temporary_repo"] is not None
+            else context["root_repo"]
+        )
+        name = before.get("name")
+        invoked = False
+        try:
+            if not isinstance(canonical_repository, str) or not canonical_repository:
+                raise WorkerControlError("worker repository context is unavailable")
+            if not isinstance(name, str) or not name:
+                raise WorkerControlError("worker name is unavailable")
+            self._persistence.require_worker_runtime_operation_current(authorized)
+            execution_uid = self._persistence.worker_execution_uid(authorized)
+            with AccountStore.open(
+                self._persistence.database_path,
+                expected_uid=self._persistence.expected_uid,
+                busy_timeout_ms=self._persistence.busy_timeout_ms,
+            ) as store:
+                controller = WorkerController(
+                    store,
+                    coordinator_script=(
+                        Path(__file__).resolve().parent.parent
+                        / "dev_coordinator.py"
+                    ),
+                    execution_uid=execution_uid,
+                )
+                identity = {
+                    "worker_id": request.resource_id,
+                    "canonical_repository": canonical_repository,
+                    "name": name,
+                }
+                invoked = True
+                if decision.action == "start":
+                    controlled = controller.start(
+                        **identity,
+                        actor=str(request.arguments["agent"]),
+                        keep_alive=None,
+                        crash_limit=None,
+                        crash_window_seconds=None,
+                        rearm=False,
+                    )
+                else:
+                    controlled = controller.stop(
+                        **identity,
+                        actor=str(request.arguments["agent"]),
+                    )
+            self._persistence.require_worker_runtime_operation_current(authorized)
+            terminal = worker_result_observation(
+                resource_id=request.resource_id,
+                controlled=controlled,
+            )
+        except Exception:
+            failure_decision = decision
+            if not invoked:
+                failure_decision = RuntimeEnsureDecision(
+                    desired_state,
+                    decision.observed_state,
+                    None,
+                    "attention_required",
+                    "mutation_preflight_failed",
+                )
+            uncertain = build_runtime_ensure_result(
+                operation_id=request.operation_id,
+                repository_id=request.project_id,
+                repository_generation=request.repository_generation,
+                resource_kind="service",
+                resource_id=request.resource_id,
+                desired_state=desired_state,
+                decision=failure_decision,
+                mutation_performed=invoked,
+                terminal_observation=before,
+                snapshot_id=None,
+                proof_source="broker_worker_supervisor",
+                certain=not invoked,
+                family_classified=family_classified,
+            )
+            return self._finish_runtime_ensure_result(request, uncertain)
+
+        result = build_runtime_ensure_result(
+            operation_id=request.operation_id,
+            repository_id=request.project_id,
+            repository_generation=request.repository_generation,
+            resource_kind="service",
+            resource_id=request.resource_id,
+            desired_state=desired_state,
+            decision=decision,
+            mutation_performed=True,
+            terminal_observation=terminal,
+            snapshot_id=None,
+            proof_source="broker_worker_supervisor",
+            family_classified=family_classified,
+        )
+        return self._finish_runtime_ensure_result(request, result)
+
+    def _finish_runtime_ensure_result(
+        self, request: BrokerRequest, result: Mapping[str, Any]
+    ) -> Mapping[str, Any]:
+        try:
+            self._persistence.finish_runtime_ensure(
+                request.operation_id, result=result
+            )
+        except Exception as error:
+            raise BrokerBackendError(
+                "operation_outcome_uncertain",
+                "Runtime ensure reached a terminal broker result but its durable "
+                "journal commit is uncertain; retry only this operation ID.",
+                operation_id=request.operation_id,
+            ) from error
+        return result
+
     def _execute_runtime_request(
         self, authorized: AuthorizedBrokerRequest
     ) -> Mapping[str, Any]:
@@ -1013,6 +3395,73 @@ class StoreBackedMutationBackend:
         request = authorized.request
         action = str(request.arguments["action"])
         target_kind = str(request.arguments["target_kind"])
+        if action == "temporary_start":
+            return self._execute_temporary_dev_service(authorized)
+        if action == "capture_logs":
+            if target_kind == "service":
+                return self._execute_runtime_service_log_capture(authorized)
+            return self._execute_runtime_log_capture(authorized)
+        if action == "status":
+            if target_kind == "service":
+                temporary = self._persistence.temporary_service_status(
+                    authorized
+                )
+                if temporary is not None:
+                    observed = self._temporary_dev_services.status(
+                        unit=str(temporary["unit"]),
+                        port=int(temporary["port"]),
+                    )
+                    expired = bool(temporary["expired"])
+                    observed_state = str(observed["state"])
+                    if expired:
+                        state = (
+                            "expired"
+                            if observed_state == "stopped"
+                            else "cleanup_pending"
+                        )
+                    else:
+                        state = observed_state
+                    ready = state == "running"
+                    snapshot = load_broker_runtime_snapshot(
+                        authorized, persistence=self._persistence
+                    )
+                    return build_broker_runtime_snapshot_report(
+                        authorized,
+                        snapshot=snapshot,
+                        action_result={
+                            "ok": True,
+                            "classification": (
+                                "ready"
+                                if ready
+                                else "expired"
+                                if state == "expired"
+                                else "cleanup_pending"
+                                if state == "cleanup_pending"
+                                else "observed_not_ready"
+                            ),
+                            "ready": ready,
+                            "authority": "broker_temporary_service",
+                            "operation_id": request.operation_id,
+                            "state": state,
+                            "resource_id": request.resource_id,
+                            "name": temporary["name"],
+                            "url": temporary["url"],
+                            "expires_at": temporary["expires_at"],
+                            "cleanup": temporary["cleanup"],
+                            "session_id": temporary["session_id"],
+                            "main_pid": observed["main_pid"],
+                        },
+                    )
+            # Status is an authority-owned observation for every enrolled
+            # runtime kind.  Service-role supervision is a mutation boundary;
+            # it must not block this read-only path for ordinary web services.
+            observation = self._observe_committed_host(request.operation_id)
+            return execute_broker_runtime_request(
+                authorized,
+                persistence=self._persistence,
+                observation=observation,
+            )
+
         if target_kind == "service":
             role = self._persistence.runtime_service_role(authorized)
             if isinstance(role, str) and role.lower() == "worker":
@@ -1021,15 +3470,6 @@ class StoreBackedMutationBackend:
                 "runtime_supervisor_required",
                 "Service lifecycle requires an installed worker-role definition and broker-owned peer-UID supervisor.",
                 operation_id=request.operation_id,
-            )
-        if action == "status":
-            # Status remains a fresh observation rather than a catalog-only
-            # read. Clients cannot provide host evidence or paths.
-            observation = self._observe_committed_host(request.operation_id)
-            return execute_broker_runtime_request(
-                authorized,
-                persistence=self._persistence,
-                observation=observation,
             )
         if request.arguments["ttl_seconds"] is not None:
             raise BrokerBackendError(
@@ -1168,7 +3608,6 @@ class StoreBackedMutationBackend:
             target.full_container_id,
             target.database_binding_id,
             target.database_name,
-            target.control_generation,
             target.immutable_fingerprint,
         )
         stable_final_target = (
@@ -1178,7 +3617,6 @@ class StoreBackedMutationBackend:
             final_target.full_container_id,
             final_target.database_binding_id,
             final_target.database_name,
-            final_target.control_generation,
             final_target.immutable_fingerprint,
         )
         if stable_final_target != stable_target:
@@ -1266,10 +3704,299 @@ class StoreBackedMutationBackend:
             )
         return report
 
+    def _execute_temporary_dev_service(
+        self, authorized: AuthorizedBrokerRequest
+    ) -> Mapping[str, Any]:
+        """Start one repository-owned transient service with TTL cleanup."""
+
+        request = authorized.request
+        existing = self._persistence.existing_operation_disposition(authorized)
+        if existing is not None:
+            if existing.state == "completed":
+                return dict(existing.result or {})
+            if existing.state == "failed":
+                raise BrokerBackendError(
+                    existing.error_code or "mutation_failed",
+                    existing.error_message or "Temporary service launch failed.",
+                    operation_id=request.operation_id,
+                )
+            if existing.state not in {"pending", "reconcile"}:
+                raise BrokerBackendError(
+                    "operation_in_progress",
+                    "This exact temporary-service operation is already in progress; follow its operation handle.",
+                    operation_id=request.operation_id,
+                )
+
+        disposition = (
+            existing
+            if existing is not None
+            else self._persistence.reserve_operation(authorized)
+        )
+        if disposition.state == "completed":
+            return dict(disposition.result or {})
+        if disposition.state == "failed":
+            raise BrokerBackendError(
+                disposition.error_code or "mutation_failed",
+                disposition.error_message or "Temporary service launch failed.",
+                operation_id=request.operation_id,
+            )
+        # A retry after the client lost the launch reply must converge through
+        # the deterministic systemd unit.  ``TemporaryDevServiceManager.start``
+        # proves and reuses that exact unit; returning operation_in_progress
+        # here would strand the durable operation forever after any uncertain
+        # transport outcome.
+        if disposition.state not in {"execute", "pending", "reconcile"}:
+            raise BrokerBackendError(
+                "operation_in_progress",
+                "This exact temporary-service operation is already in progress; follow its operation handle.",
+                operation_id=request.operation_id,
+            )
+
+        try:
+            expires_at, remaining_ttl_seconds = (
+                self._persistence.temporary_service_launch_deadline(authorized)
+            )
+            predecessor = self._persistence.temporary_service_predecessor(
+                authorized
+            )
+            if predecessor is not None:
+                predecessor_state = self._temporary_dev_services.status(
+                    unit=str(predecessor["unit"]),
+                    port=int(predecessor["port"]),
+                )
+                if predecessor_state["state"] in {"running", "starting"}:
+                    raise TemporaryDevServiceError(
+                        "temporary_service_name_active",
+                        "a temporary service with this repository/name identity is still active; use its exact status or wait for its TTL",
+                    )
+            execution = self._persistence.temporary_service_execution_context(
+                authorized
+            )
+            if execution.generation != request.repository_generation:
+                raise TemporaryDevServiceError(
+                    "project_generation_stale",
+                    "repository generation changed before temporary service launch",
+                )
+            descriptor = TemporaryDevServiceRequest(
+                operation_id=request.operation_id,
+                repository_id=request.project_id,
+                repository_root=execution.canonical_root,
+                repository_generation=execution.generation,
+                execution_uid=execution.execution_uid,
+                agent=str(request.arguments["agent"]),
+                name=str(request.arguments["name"]),
+                argv=tuple(str(item) for item in request.arguments["argv"]),
+                cwd=str(request.arguments["cwd"]),
+                port=int(request.arguments["port"]),
+                ttl_seconds=remaining_ttl_seconds,
+                kill_after_run=bool(request.arguments["kill_after_run"]),
+                launch_timeout_seconds=int(
+                    request.arguments["launch_timeout_seconds"]
+                ),
+            )
+            result = dict(self._temporary_dev_services.start(descriptor))
+            result["expires_at"] = expires_at
+            result["cleanup"] = {
+                **dict(result.get("cleanup") or {}),
+                "ttl_seconds": int(request.arguments["ttl_seconds"]),
+                "kill_after_run": bool(request.arguments["kill_after_run"]),
+            }
+            result["schema_version"] = 1
+            result = self._persistence.finish_temporary_dev_service(
+                authorized, result=result
+            )
+            return result
+        except TemporaryDevServiceError as error:
+            public_message = public_temporary_dev_service_error(error)
+            self._record_failure(
+                request.operation_id, code=error.code, message=public_message
+            )
+            raise BrokerBackendError(
+                error.code,
+                public_message,
+                operation_id=request.operation_id,
+            ) from error
+        except BrokerError as error:
+            self._record_failure(
+                request.operation_id, code=error.code, message=error.message
+            )
+            raise BrokerBackendError(
+                error.code,
+                error.message,
+                operation_id=request.operation_id,
+            ) from error
+        except Exception as error:
+            raise BrokerBackendError(
+                "operation_outcome_uncertain",
+                "The temporary service launch or its durable result commit is uncertain; follow only this operation ID.",
+                operation_id=request.operation_id,
+            ) from error
+
+    def _execute_runtime_log_capture(
+        self, authorized: AuthorizedBrokerRequest
+    ) -> Mapping[str, Any]:
+        """Capture and descriptor-verify one exact Docker-backed log artifact."""
+
+        request = authorized.request
+        before = self._persistence.runtime_docker_read_target(authorized)
+        try:
+            raw, discarded = self._host_mutations.docker_capture_logs(before)
+            after = self._persistence.runtime_docker_read_target(authorized)
+            if after.immutable_fingerprint != before.immutable_fingerprint:
+                raise BrokerBackendError(
+                    "runtime_resource_identity_changed",
+                    "The exact runtime identity changed during log capture; no artifact was published.",
+                    operation_id=request.operation_id,
+                )
+            capture = persist_runtime_log_artifact(
+                root=self._runtime_log_root,
+                artifact_kind=before.resource_kind,
+                target_resource_id=before.resource_id,
+                docker_resource_id=before.docker_resource_id,
+                full_container_id=before.full_container_id,
+                raw=raw,
+                request=dict(request.arguments),
+                input_discarded_bytes=discarded,
+            )
+        except BrokerBackendError as error:
+            after = self._persistence.runtime_docker_read_target(authorized)
+            if (
+                after.immutable_fingerprint != before.immutable_fingerprint
+                or error.code == "runtime_resource_identity_changed"
+            ):
+                raise BrokerBackendError(
+                    "runtime_resource_identity_changed",
+                    "The exact runtime identity changed during log capture; no retained artifact was returned.",
+                    operation_id=request.operation_id,
+                ) from error
+            retained = load_latest_runtime_log_artifact(
+                root=self._runtime_log_root,
+                artifact_kind=before.resource_kind,
+                target_resource_id=before.resource_id,
+                docker_resource_id=before.docker_resource_id,
+                full_container_id=before.full_container_id,
+            )
+            if retained is None:
+                raise
+            capture = retained
+
+        manifest, payload = read_runtime_log_artifact(
+            root=self._runtime_log_root,
+            artifact_kind=before.resource_kind,
+            artifact_id=str(capture["artifact_id"]),
+        )
+        if (
+            manifest.get("target_resource_id") != before.resource_id
+            or manifest.get("docker_resource_id") != before.docker_resource_id
+            or str(manifest.get("full_container_id") or "").lower()
+            != before.full_container_id
+        ):
+            raise BrokerBackendError(
+                "runtime_log_artifact_identity_mismatch",
+                "The runtime log artifact does not match the exact authorized target.",
+                operation_id=request.operation_id,
+            )
+        public_artifact = {
+            key: value for key, value in capture.items() if key != "path"
+        }
+        return {
+            "schema_version": 1,
+            "ok": True,
+            "action": "capture_logs",
+            "classification": (
+                "retained" if capture.get("retained") is True else "available"
+            ),
+            "repository": {
+                "root_repo_id": request.arguments["root_repo_id"],
+                "effective_repo_id": request.project_id,
+                "kind": (
+                    "temporary"
+                    if request.arguments["temporary_repo_id"] is not None
+                    else "root"
+                ),
+            },
+            "target": {
+                "kind": before.resource_kind,
+                "id": before.resource_id,
+            },
+            "artifact": public_artifact,
+            "artifact_content": {
+                "artifact_id": manifest["artifact_id"],
+                "text": payload.decode("utf-8", errors="strict"),
+            },
+        }
+
+    def _execute_runtime_service_log_capture(
+        self, authorized: AuthorizedBrokerRequest
+    ) -> Mapping[str, Any]:
+        """Capture one service-definition log through root broker authority."""
+
+        request = authorized.request
+        before = self._persistence.runtime_service_log_target(authorized)
+        raw, discarded, source_identity = self._host_mutations.service_capture_logs(
+            before
+        )
+        after = self._persistence.runtime_service_log_target(authorized)
+        if after != before:
+            raise BrokerBackendError(
+                "runtime_resource_identity_changed",
+                "The exact service definition changed during log capture; no artifact was published.",
+                operation_id=request.operation_id,
+            )
+        capture = persist_service_log_artifact(
+            root=self._runtime_log_root,
+            target_resource_id=before.server_definition_id,
+            definition_fingerprint=before.definition_fingerprint,
+            source_file_identity=source_identity,
+            raw=raw,
+            request=dict(request.arguments),
+            input_discarded_bytes=discarded,
+        )
+        manifest, payload = read_runtime_log_artifact(
+            root=self._runtime_log_root,
+            artifact_kind="service",
+            artifact_id=str(capture["artifact_id"]),
+        )
+        if (
+            manifest.get("target_resource_id") != before.server_definition_id
+            or manifest.get("definition_fingerprint")
+            != before.definition_fingerprint
+            or manifest.get("source_file_identity") != source_identity
+        ):
+            raise BrokerBackendError(
+                "runtime_log_artifact_identity_mismatch",
+                "The service log artifact does not match the exact authorized definition.",
+                operation_id=request.operation_id,
+            )
+        public_artifact = {
+            key: value for key, value in capture.items() if key != "path"
+        }
+        return {
+            "schema_version": 1,
+            "ok": True,
+            "action": "capture_logs",
+            "classification": "available",
+            "repository": {
+                "root_repo_id": request.arguments["root_repo_id"],
+                "effective_repo_id": request.project_id,
+                "kind": (
+                    "temporary"
+                    if request.arguments["temporary_repo_id"] is not None
+                    else "root"
+                ),
+            },
+            "target": {"kind": "service", "id": before.server_definition_id},
+            "artifact": public_artifact,
+            "artifact_content": {
+                "artifact_id": manifest["artifact_id"],
+                "text": payload.decode("utf-8", errors="strict"),
+            },
+        }
+
     def _execute_worker_runtime_request(
         self, authorized: AuthorizedBrokerRequest
     ) -> Mapping[str, Any]:
-        """Control one exact installed worker under its authenticated peer UID."""
+        """Control one exact worker under its enrolled execution owner."""
 
         request = authorized.request
         action = str(request.arguments["action"])
@@ -1316,11 +4043,12 @@ class StoreBackedMutationBackend:
                 "The exact worker repository path is unavailable to system authority.",
                 operation_id=request.operation_id,
             )
+        execution_uid = self._persistence.worker_execution_uid(authorized)
         replacement_definition: dict[str, Any] | None = None
         if action == "replace":
             replacement_definition = _validated_broker_worker_replacement(
                 canonical_repository=canonical_repository,
-                peer_uid=authorized.peer.uid,
+                execution_uid=execution_uid,
                 arguments=request.arguments,
                 operation_id=request.operation_id,
             )
@@ -1384,7 +4112,7 @@ class StoreBackedMutationBackend:
                         Path(__file__).resolve().parent.parent
                         / "dev_coordinator.py"
                     ),
-                    execution_uid=authorized.peer.uid,
+                    execution_uid=execution_uid,
                 )
                 identity = {
                     "worker_id": request.resource_id,
@@ -1952,21 +4680,32 @@ class StoreBackedMutationBackend:
             ) from exc
 
     def recover_ephemeral_runs(self) -> Mapping[str, Any]:
-        return self._ephemeral.recover_startup()
+        ephemeral = self._ephemeral.recover_startup()
+        if self._test_fixture_provider is None:
+            return ephemeral
+        fixtures = self._test_fixture_provider.recover_startup()
+        return {**ephemeral, "test_fixtures": dict(fixtures)}
 
     def start_ephemeral_reaper(self) -> None:
         self._ephemeral.start_reaper()
+        if self._test_fixture_provider is not None:
+            self._test_fixture_provider.start_reaper()
 
     def request_ephemeral_reaper_stop(self) -> None:
         self._ephemeral.request_reaper_stop()
+        if self._test_fixture_provider is not None:
+            self._test_fixture_provider.request_reaper_stop()
 
     def wait_ephemeral_reaper_stopped(self, timeout_seconds: float) -> None:
         self._ephemeral.wait_reaper_stopped(timeout_seconds)
+        if self._test_fixture_provider is not None:
+            self._test_fixture_provider.wait_reaper_stopped(timeout_seconds)
 
     def stop_ephemeral_reaper(self, timeout_seconds: float = 10.0) -> None:
         """Compatibility helper; production shutdown owns a shared deadline."""
 
-        self._ephemeral.stop_reaper(timeout_seconds)
+        self.request_ephemeral_reaper_stop()
+        self.wait_ephemeral_reaper_stopped(timeout_seconds)
 
     @staticmethod
     def _archive_plan_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
@@ -2153,13 +4892,13 @@ class StoreBackedMutationBackend:
             )
         else:
             raise LifecycleError("linked worktrees cannot be archived")
-        synthetic = AuthorizedBrokerRequest(
-            peer=authorized.peer, request=synthetic_request
-        )
         # The generic browser route never carries exact controller identity.
         # Resolve it above and require the corresponding exact archive grant
         # before committing even an observation for this plan.
-        self._persistence.authorize(authorized.peer, synthetic_request)
+        synthetic = self._persistence.authorize(
+            authorized.peer,
+            synthetic_request,
+        )
         observation = self._observe_fresh_full_docker(
             request.operation_id,
             project_id=request.project_id,
@@ -2298,12 +5037,12 @@ class StoreBackedMutationBackend:
             )
         else:
             raise LifecycleError("durable plan is not an HTTP archive or purge plan")
-        synthetic = AuthorizedBrokerRequest(
-            peer=authorized.peer, request=synthetic_request
-        )
         # Re-authorize the archive-specific project/resource capability using
         # only the durable plan identity resolved by the service authority.
-        self._persistence.authorize(authorized.peer, synthetic_request)
+        synthetic = self._persistence.authorize(
+            authorized.peer,
+            synthetic_request,
+        )
         observation = self._observe_fresh_full_docker(
             request.operation_id,
             project_id=request.project_id,
@@ -2632,6 +5371,13 @@ class StoreBackedMutationBackend:
     ) -> dict[str, Any]:
         """Deregister exact workers after plan validation, before retirement."""
 
+        def execution_uid_for_worker(worker_id: str, repo_id: str) -> int:
+            return self._persistence.worker_execution_uid_for_resource(
+                repo_id=repo_id,
+                server_definition_id=worker_id,
+                operation_id=str(plan.plan_id),
+            )
+
         if (
             getattr(plan, "action", None) == "forget"
             and getattr(plan, "target_kind", None) == "project"
@@ -2664,7 +5410,7 @@ class StoreBackedMutationBackend:
                 coordinator_script=(
                     Path(__file__).resolve().parent.parent / "dev_coordinator.py"
                 ),
-                execution_uid=authorized.peer.uid,
+                execution_uid_for_worker=execution_uid_for_worker,
             )
             removed_servers = (
                 self._persistence.remove_revoked_repository_server_definitions(
@@ -2738,7 +5484,7 @@ class StoreBackedMutationBackend:
             coordinator_script=(
                 Path(__file__).resolve().parent.parent / "dev_coordinator.py"
             ),
-            execution_uid=authorized.peer.uid,
+            execution_uid_for_worker=execution_uid_for_worker,
             revoke=revoke,
         )
 
@@ -2862,6 +5608,7 @@ def build_store_backed_broker_runtime(
     host_mutations: TypedHostMutationAPI,
     service_uid: Optional[int] = None,
     access_gid: Optional[int] = None,
+    socket_mode: int = 0o660,
     max_clients: int = 32,
     shutdown_timeout_seconds: float = BROKER_SHUTDOWN_DRAIN_TIMEOUT_SECONDS,
     lifecycle_adapter: CoordinatorHostLifecycleAdapter | None = None,
@@ -2869,32 +5616,94 @@ def build_store_backed_broker_runtime(
         [AccountStore], Mapping[str, Any]
     ]
     | None = None,
+    test_plane: TestPlaneClient | None = None,
+    internal_testd_uid: int | None = None,
+    test_attempt_manager: NativeTestAttemptManager | None = None,
+    test_capability_path: str | os.PathLike[str] = DEFAULT_TEST_CAPABILITY_PATH,
+    test_credential_registry_path: str | os.PathLike[str] = (
+        DEFAULT_TEST_CREDENTIAL_REGISTRY_PATH
+    ),
+    test_credential_material_root: str | os.PathLike[str] = (
+        DEFAULT_TEST_CREDENTIAL_MATERIAL_ROOT
+    ),
+    test_credential_runtime_root: str | os.PathLike[str] = (
+        DEFAULT_TEST_CREDENTIAL_RUNTIME_ROOT
+    ),
+    call_journal_path: str | os.PathLike[str] | None = None,
+    call_journal_max_bytes: int = DEFAULT_CALL_JOURNAL_MAX_BYTES,
+    call_journal_backups: int = DEFAULT_CALL_JOURNAL_BACKUPS,
 ) -> StoreBackedBrokerRuntime:
     """Construct the production service without exposing storage to clients."""
 
+    # Compatibility-only input retained for older service command lines. The
+    # harness is a product capability, not something enabled by a special Unix
+    # caller UID; exact test operations and repository generations remain the
+    # authorization boundary.
+    del internal_testd_uid
     uid = os.geteuid() if service_uid is None else service_uid
     gid = os.getegid() if access_gid is None else access_gid
     persistence = BrokerPersistence(database_path, expected_uid=uid)
+    active_test_admission_proof = persistence.active_test_admission_proof()
+    test_submission_gate = TestSubmissionAdmissionGate(
+        initially_fenced=active_test_admission_proof is not None
+    )
+    secret_manager = VolatileRunSecretManager(expected_uid=uid)
+    if test_attempt_manager is None:
+        fixture_provider = BrokerSealedFixtureProvider(
+            persistence,
+            host_mutations,
+            secret_manager=secret_manager,
+        )
+        credential_provider = BrokerOperationalCredentialProvider(
+            registry_path=Path(test_credential_registry_path),
+            material_root=Path(test_credential_material_root),
+            runtime_root=Path(test_credential_runtime_root),
+            expected_authority_uid=uid,
+        )
+        test_attempt_manager = SystemdTestAttemptManager(
+            fixture_provider=fixture_provider,
+            credential_provider=credential_provider,
+        )
+    test_capabilities = SealedTestCapabilityRegistry.load(
+        Path(test_capability_path), expected_uid=uid, allow_missing=True
+    )
     backend = StoreBackedMutationBackend(
         persistence,
         host_mutations,
         lifecycle_adapter=lifecycle_adapter,
         observe_before_lifecycle_plan=observe_before_lifecycle_plan,
+        test_plane=test_plane,
+        test_attempt_manager=test_attempt_manager,
+        test_submission_gate=test_submission_gate,
+        test_capabilities=test_capabilities,
+        secret_manager=secret_manager,
     )
     writer = SerializedMutationWriter(
         backend,
         max_concurrent_host_observations=max(0, min(4, max_clients - 1)),
+        test_submission_gate=test_submission_gate,
+    )
+    call_journal = (
+        None
+        if call_journal_path is None
+        else RollingCallJournal(
+            Path(call_journal_path),
+            max_bytes=call_journal_max_bytes,
+            backups=call_journal_backups,
+        )
     )
     service = BrokerService(
         StoreBackedAuthorizer(persistence),
         writer,
         secret_fd_retriever=backend,
+        call_journal=call_journal,
     )
     server = UnixBrokerServer(
         Path(socket_path),
         service,
         expected_uid=uid,
         expected_gid=gid,
+        socket_mode=socket_mode,
         max_clients=max_clients,
         shutdown_timeout_seconds=shutdown_timeout_seconds,
     )
@@ -2906,6 +5715,71 @@ def build_store_backed_broker_runtime(
         server=server,
         shutdown_timeout_seconds=shutdown_timeout_seconds,
     )
+
+
+def _validated_compose_run_once_image(
+    value: Any,
+    *,
+    image_ref: str,
+) -> str:
+    if (
+        not isinstance(value, Mapping)
+        or set(value) != {"image_ref", "image_id"}
+        or value.get("image_ref") != image_ref
+        or not isinstance(value.get("image_id"), str)
+        or re.fullmatch(r"sha256:[0-9a-f]{64}", str(value["image_id"])) is None
+    ):
+        raise BrokerBackendError(
+            "invalid_backend_result",
+            "Compose run-once image binding result is invalid.",
+        )
+    return str(value["image_id"])
+
+
+def _validated_compose_run_once_container(
+    value: Any,
+    *,
+    expected_image_id: str,
+    expected_container_id: str | None = None,
+    allow_timed_out: bool = False,
+) -> dict[str, Any]:
+    required = {"full_container_id", "image_id", "status", "exit_code"}
+    allowed = required | ({"timed_out"} if allow_timed_out else set())
+    keys = set(value) if isinstance(value, Mapping) else set()
+    if (
+        not isinstance(value, Mapping)
+        or (keys != required and keys != allowed)
+        or not isinstance(value.get("full_container_id"), str)
+        or re.fullmatch(
+            r"[0-9a-f]{64}", str(value["full_container_id"])
+        )
+        is None
+        or value.get("image_id") != expected_image_id
+        or value.get("status")
+        not in {
+            "created",
+            "running",
+            "paused",
+            "restarting",
+            "removing",
+            "exited",
+            "dead",
+        }
+        or type(value.get("exit_code")) is not int
+        or (
+            expected_container_id is not None
+            and value.get("full_container_id") != expected_container_id
+        )
+        or (
+            "timed_out" in value
+            and type(value.get("timed_out")) is not bool
+        )
+    ):
+        raise BrokerBackendError(
+            "invalid_backend_result",
+            "Compose run-once container observation is invalid.",
+        )
+    return dict(value)
 
 
 def _json_safe_mapping(value: Any) -> dict[str, Any]:
@@ -2922,19 +5796,19 @@ def _json_safe_mapping(value: Any) -> dict[str, Any]:
 def _validated_broker_worker_replacement(
     *,
     canonical_repository: str,
-    peer_uid: int,
+    execution_uid: int,
     arguments: Mapping[str, Any],
     operation_id: str,
 ) -> dict[str, Any]:
-    """Anchor one structured replacement inside the peer-owned enrolled repo."""
+    """Anchor one structured replacement inside the enrolled repository."""
+
+    del execution_uid
 
     try:
         repository = Path(canonical_repository).resolve(strict=True)
         requested_cwd = Path(str(arguments["cwd"]))
         cwd = requested_cwd.resolve(strict=True)
         cwd.relative_to(repository)
-        repository_metadata = repository.stat()
-        cwd_metadata = cwd.stat()
     except (KeyError, OSError, RuntimeError, ValueError) as error:
         raise BrokerBackendError(
             "worker_replacement_path_denied",
@@ -2944,12 +5818,10 @@ def _validated_broker_worker_replacement(
     if (
         not repository.is_dir()
         or not cwd.is_dir()
-        or repository_metadata.st_uid != peer_uid
-        or cwd_metadata.st_uid != peer_uid
     ):
         raise BrokerBackendError(
             "worker_replacement_path_denied",
-            "Worker replacement repository and cwd must be directories owned by the authenticated execution account.",
+            "Worker replacement repository and cwd must be existing directories.",
             operation_id=operation_id,
         )
     argv = arguments.get("argv")
@@ -2968,15 +5840,22 @@ def _validated_broker_worker_replacement(
 
 
 def _private_postgres_backup_root(database_path: Path, *, expected_uid: int) -> Path:
+    del expected_uid
     root = database_path.expanduser().absolute().parent / "postgres-backups"
     if root.exists():
-        metadata = root.lstat()
         if root.is_symlink() or not root.is_dir():
             raise PermissionError("service PostgreSQL backup root must be a real directory")
-        if metadata.st_uid != expected_uid:
-            raise PermissionError("service PostgreSQL backup root has an unexpected owner")
-        if metadata.st_mode & 0o077:
-            raise PermissionError("service PostgreSQL backup root must not allow group or other access")
+    else:
+        root.mkdir(mode=0o700)
+    return root
+
+
+def _private_runtime_log_root(database_path: Path, *, expected_uid: int) -> Path:
+    del expected_uid
+    root = database_path.expanduser().absolute().parent / "runtime-logs"
+    if root.exists():
+        if root.is_symlink() or not root.is_dir():
+            raise PermissionError("service runtime log root must be a real directory")
     else:
         root.mkdir(mode=0o700)
     return root

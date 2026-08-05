@@ -22,7 +22,6 @@ import os
 import platform
 import pwd
 import re
-import secrets
 import shlex
 import shutil
 import signal
@@ -40,14 +39,17 @@ from decimal import Decimal
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 SCRIPT_DIRECTORY = Path(__file__).resolve().parent
 if str(SCRIPT_DIRECTORY) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIRECTORY))
 
 from devcoordinator.observer import ObservationOutcome, SingleFlightObserver
-from devcoordinator.host_observation import commit_host_inventory_observation
+from devcoordinator.host_observation import (
+    commit_host_inventory_observation,
+    is_test_framework_container,
+)
 from devcoordinator.host_lifecycle import CoordinatorHostLifecycleAdapter
 from devcoordinator.cleanup_lifecycle import CleanupLifecycle
 from devcoordinator.events import (
@@ -63,9 +65,23 @@ from devcoordinator.broker_cli import (
     serve_broker,
 )
 from devcoordinator.broker import BrokerError, BrokerOperation
+from devcoordinator.browser_lifecycle import (
+    BrowserLifecycleError,
+    observe_browser_lifecycle,
+)
+from devcoordinator.call_journal import (
+    configured_call_journal,
+    diagnostic_for_exception,
+    event_record,
+)
 from devcoordinator.broker_enrollment import (
     _normalize_ephemeral_templates,
     enroll_repository,
+    reconcile_enrolled_runtime_container_declarations,
+)
+from devcoordinator.compose_run_once import (
+    DEFAULT_COMPOSE_RUN_ONCE_TIMEOUT_SECONDS,
+    normalize_compose_run_once_policies,
 )
 from devcoordinator.image_publication import (
     ImagePublicationError,
@@ -76,10 +92,12 @@ from devcoordinator.image_publication import (
     rollback_publication,
 )
 from devcoordinator.maintenance import (
+    MAX_RETRY_AFTER_SECONDS,
     MaintenanceMarkerError,
     PUBLIC_MAINTENANCE_MESSAGE,
     load_maintenance_state,
 )
+from devcoordinator.inventory_projection import read_projection
 from devcoordinator.broker_persistence import BrokerPersistence
 from devcoordinator.broker_links import BrokerLink, BrokerLinkStore
 from devcoordinator.broker_profile import (
@@ -87,11 +105,13 @@ from devcoordinator.broker_profile import (
     BrokerProfileError,
     BrokerRepositoryProfile,
     BrokerServiceProfile,
+    PROFILE_PATH_ENV,
     SYSTEM_PROFILE_PATH,
     call_broker,
     configured_profile_path,
     load_broker_profile,
 )
+from devcoordinator.systemd_activation import take_systemd_listener
 from devcoordinator.lifecycle_cli import (
     add_lifecycle_parsers,
     handle_lifecycle_cli,
@@ -118,6 +138,7 @@ from devcoordinator.repository_lifecycle import (
     StandaloneRetirementPlan,
 )
 from devcoordinator.sqlite_lifecycle import SQLiteLifecyclePersistence
+from devcoordinator.schema import establish_repository_owner_authority
 from devcoordinator.store import (
     AccountStore,
     deterministic_id,
@@ -126,9 +147,11 @@ from devcoordinator.store import (
     utc_timestamp,
 )
 from devcoordinator.test_runner import (
-    TestHarnessError,
-    UniversalTestRunner,
     test_statistics,
+)
+from devcoordinator.universal_test_cli import (
+    add_universal_test_cli_parser,
+    handle_universal_test_cli,
 )
 from devcoordinator.test_records import CoordinatorTestRecords
 from devcoordinator.observation_freshness import (
@@ -154,13 +177,16 @@ from devcoordinator.runtime_api import (
 )
 from devcoordinator.runtime_cli import (
     add_runtime_cli_arguments,
+    canonical_runtime_operation_id,
     load_runtime_cli_request,
     runtime_cli_error_context,
+    runtime_cli_operation_id,
 )
 from devcoordinator.runtime_sessions import (
     next_runtime_cleanup_at,
     reap_expired_runtime_sessions,
 )
+
 from devcoordinator.runtime_redaction import (
     redact_runtime_value,
     runtime_secret_values,
@@ -190,12 +216,14 @@ from devcoordinator.worker_cleanup import unregister_workers_for_plan
 
 
 VERSION = 2
+COORDINATOR_CALL_JOURNAL = configured_call_journal()
 NORMALIZED_SCHEMA_VERSION = 2
 NORMALIZED_DATABASE_NAME = "coordinator.sqlite3"
 RUNTIME_REAPER_WAKE = threading.Event()
 RUNTIME_CLEANUP_AGENT = "runtime-session-cleanup"
 STATE_BACKEND_ENV = "DEVCOORDINATOR_STATE_BACKEND"
 AUTHORITY_ENV = "DEVCOORDINATOR_AUTHORITY"
+TEST_READ_AUTHORITY_ENV = "DEVCOORDINATOR_TEST_READ_AUTHORITY"
 SYSTEM_AUTHORITY_ROOT = Path(
     "/Library/Application Support/DevCoordinator"
     if sys.platform == "darwin"
@@ -217,9 +245,24 @@ RUNTIME_ARTIFACT_MAX_BYTES = 1024 * 1024
 API_MAX_CONCURRENT_REQUESTS = 16
 API_RESERVED_CONTROL_REQUESTS = 4
 API_REQUEST_TIMEOUT_SECONDS = 10
-API_TOKEN_MAX_BYTES = 4096
 API_PROFILE_RELOAD_POLL_SECONDS = 0.5
 API_PROFILE_RELOAD_STABLE_OBSERVATIONS = 2
+OPAQUE_IDENTIFIER_CHARS = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.:@-"
+)
+
+
+def _record_call_best_effort(journal: object, record: Mapping[str, object]) -> None:
+    """Keep observability failures outside the Coordinator call path."""
+
+    if journal is None:
+        return
+    try:
+        journal.record(record)  # type: ignore[attr-defined]
+    except Exception:
+        return
+
+
 GRACE_SECONDS = 5
 # A server that fails its health check but was created within this window is
 # reported as "starting" rather than "unhealthy" so slow-booting servers do not
@@ -400,7 +443,7 @@ def coordinator_exception_payload(exc: BaseException) -> dict[str, Any]:
                 "retry_after_seconds": exc.retry_after_seconds or 60,
                 "action_required": "Wait for the maintenance window to finish, then retry through the Coordinator skill.",
             }
-        return {
+        payload = {
             "error": exc.message,
             "code": exc.code,
             "classification": "broker_mutation_failed",
@@ -410,7 +453,42 @@ def coordinator_exception_payload(exc: BaseException) -> dict[str, Any]:
                 "do not bypass the configured host broker."
             ),
         }
+        retry_after_seconds = exc.retry_after_seconds
+        if (
+            type(retry_after_seconds) is int
+            and 1 <= retry_after_seconds <= MAX_RETRY_AFTER_SECONDS
+        ):
+            payload["retry_after_seconds"] = retry_after_seconds
+        return payload
     if isinstance(exc, BrokerProfileError):
+        # A planned offline authority transaction must remain understandable
+        # even when the checked-out client has already advanced beyond the
+        # installed profile contract.  The maintenance marker is deliberately
+        # broker- and database-independent, so prefer its typed wait response
+        # while (and only while) an exact trusted marker is active.
+        try:
+            maintenance = load_maintenance_state(
+                expected_uid=0,
+            )
+        except (MaintenanceMarkerError, OSError):
+            return {
+                "error": (
+                    "Coordinator maintenance state cannot be verified; wait for "
+                    "the administrator before retrying."
+                ),
+                "code": "maintenance_state_invalid",
+                "classification": "maintenance",
+                "retry_after_seconds": 60,
+                "action_required": "Wait for the maintenance window to finish, then retry through the Coordinator skill.",
+            }
+        if maintenance is not None:
+            return {
+                "error": maintenance.message,
+                "code": "maintenance_in_progress",
+                "classification": "maintenance",
+                "retry_after_seconds": maintenance.retry_after_seconds,
+                "action_required": "Wait for the maintenance window to finish, then retry through the Coordinator skill.",
+            }
         return {
             "error": str(exc),
             "code": "broker_profile_invalid",
@@ -740,13 +818,6 @@ def logs_dir() -> Path:
     return coordinator_home() / "logs"
 
 
-def api_token_path() -> Path:
-    configured = os.environ.get("CODEX_AGENT_COORDINATOR_TOKEN_FILE")
-    if configured:
-        return Path(configured).expanduser().absolute()
-    return coordinator_home() / "api-token"
-
-
 def validate_private_directory(
     path: Path,
     *,
@@ -818,135 +889,6 @@ def atomic_write_private(path: Path, content: str) -> None:
                 primary_error=primary_error,
                 cleanup_error=cleanup_error,
             ) from primary_error
-
-
-def read_private_api_token(token_file: Path) -> str:
-    """Read one regular private token without following its final symlink."""
-
-    if not hasattr(os, "O_NOFOLLOW"):
-        raise RuntimeError("API token safety requires O_NOFOLLOW support")
-    try:
-        fd = os.open(token_file, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-    except OSError as exc:
-        if exc.errno == errno.ELOOP or token_file.is_symlink():
-            raise PermissionError(
-                f"API token file must not be a symbolic link: {token_file}"
-            ) from exc
-        raise
-    try:
-        metadata = os.fstat(fd)
-        if not stat.S_ISREG(metadata.st_mode):
-            raise PermissionError(
-                f"API token file must be a regular file: {token_file}"
-            )
-        if stat.S_IMODE(metadata.st_mode) & 0o077:
-            raise PermissionError(
-                f"API token file must not be accessible by group or others: {token_file}"
-            )
-        if metadata.st_size > API_TOKEN_MAX_BYTES:
-            raise ValueError(
-                f"API token file exceeds {API_TOKEN_MAX_BYTES} bytes: {token_file}"
-            )
-        with os.fdopen(fd, "r", encoding="utf-8") as handle:
-            fd = -1
-            token = handle.read(API_TOKEN_MAX_BYTES + 1).strip()
-    finally:
-        if fd >= 0:
-            os.close(fd)
-    if len(token) < 32:
-        raise ValueError(f"API token file is empty or too short: {token_file}")
-    return token
-
-
-def open_api_token_initialization_lock(token_file: Path) -> int:
-    """Open the persistent token-specific creation lock without following it."""
-
-    lock_file = token_file.with_name(f".{token_file.name}.initialization.lock")
-    try:
-        fd = os.open(
-            lock_file,
-            os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK,
-            0o600,
-        )
-    except OSError as exc:
-        if exc.errno == errno.ELOOP or lock_file.is_symlink():
-            raise PermissionError(
-                f"API token initialization lock must not be a symbolic link: {lock_file}"
-            ) from exc
-        raise
-    metadata = os.fstat(fd)
-    if not stat.S_ISREG(metadata.st_mode):
-        os.close(fd)
-        raise PermissionError(
-            f"API token initialization lock must be a regular file: {lock_file}"
-        )
-    os.fchmod(fd, 0o600)
-    return fd
-
-
-def load_or_create_api_token(path: Path | None = None) -> str:
-    """Load the shared credential or win its exclusive first creation.
-
-    Multiple API processes can start at the same time. Exactly one caller may
-    create the token; every loser reopens and returns that winner's credential.
-    The final path is never pre-resolved or followed as a symbolic link.
-    """
-
-    token_file = (path or api_token_path()).expanduser().absolute()
-    # Create a missing dedicated parent privately, but never chmod an existing
-    # caller-supplied parent such as /tmp or a shared workspace directory.
-    token_file.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    if not hasattr(os, "O_NOFOLLOW"):
-        raise RuntimeError("API token safety requires O_NOFOLLOW support")
-    lock_fd = open_api_token_initialization_lock(token_file)
-    try:
-        fcntl.flock(lock_fd, fcntl.LOCK_EX)
-        try:
-            try:
-                return read_private_api_token(token_file)
-            except FileNotFoundError:
-                pass
-
-            token = secrets.token_urlsafe(48)
-            try:
-                fd = os.open(
-                    token_file,
-                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-                    0o600,
-                )
-            except FileExistsError:
-                # A creator outside this process may not use our lock. Reopen
-                # the complete credential under the same no-follow checks.
-                return read_private_api_token(token_file)
-            except OSError as exc:
-                if exc.errno == errno.ELOOP or token_file.is_symlink():
-                    raise PermissionError(
-                        f"API token file must not be a symbolic link: {token_file}"
-                    ) from exc
-                raise
-            try:
-                os.fchmod(fd, 0o600)
-                with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                    fd = -1
-                    handle.write(token + "\n")
-                    handle.flush()
-                    os.fsync(handle.fileno())
-                directory_fd = os.open(token_file.parent, os.O_RDONLY)
-                try:
-                    os.fsync(directory_fd)
-                finally:
-                    os.close(directory_fd)
-            except BaseException:
-                if fd >= 0:
-                    os.close(fd)
-                with contextlib.suppress(OSError):
-                    token_file.unlink()
-                raise
-            return token
-        finally:
-            fcntl.flock(lock_fd, fcntl.LOCK_UN)
-    finally:
-        os.close(lock_fd)
 
 
 def default_state() -> dict[str, Any]:
@@ -3006,6 +2948,29 @@ def resolve_or_install_repository_for_action(
             """,
             (repo_id, host_id, str(root), root.name or str(root), timestamp, timestamp),
         )
+        if scope.root_owner_uid <= 0 or scope.root_owner_uid != store.expected_uid:
+            raise RuntimeError(
+                "account-scoped repository registration requires the exact positive store owner UID"
+            )
+        establish_repository_owner_authority(
+            connection,
+            repository_id=repo_id,
+            owner_uid=scope.root_owner_uid,
+            repository_generation=0,
+            operation_id=str(uuid.uuid4()),
+            actor="coordinator-skill",
+            reason="first account-scoped coordinator use",
+            timestamp=timestamp,
+            evidence={
+                "kind": "account-scoped-repository-owner-registration",
+                "repository_id": repo_id,
+                "canonical_root": str(root),
+                "repository_generation": 0,
+                "owner_uid": scope.root_owner_uid,
+                "repository_identity_fingerprint": scope.identity_fingerprint,
+                "git_identity_fingerprint": scope.git_identity_fingerprint,
+            },
+        )
         connection.execute(
             """
             INSERT INTO repository_installations(
@@ -3484,7 +3449,21 @@ def normalized_guarded_action(
     def decorate(function: Any) -> Any:
         @functools.wraps(function)
         def guarded(options: dict[str, Any], *args: Any, **kwargs: Any) -> Any:
+            if command.startswith("project ") and authority_mode() == "system":
+                # Project lifecycle is an orchestration of already-enrolled
+                # opaque resources. The broker owns its repository fence and
+                # journal; opening a per-UID compatibility store here creates
+                # split authority and prevents the dedicated API account from
+                # acting on private-home repositories.
+                return function(options, *args, **kwargs)
             agent, project = require_identity(options, command)
+            if command in {"port lease", "port assign"} and authority_mode() == "system":
+                # The host broker owns both admission and persistence in
+                # server-wide mode.  Opening the compatibility account store
+                # here would recreate split authority before the broker call
+                # and makes a cleanly re-enrolled client depend on stale
+                # per-UID database state.
+                return function(options, *args, **kwargs)
             if (
                 command == "server register"
                 and configured_broker_context(project) is not None
@@ -4738,6 +4717,19 @@ def start_process(
     launch: LaunchSpec,
     server_id: str,
 ) -> tuple[int, str]:
+    service_role = str(os.environ.get("DEVCOORDINATOR_ROLE") or "").strip().lower()
+    if service_role in {
+        "api",
+        "authority",
+        "console",
+        "edge",
+        "observer",
+        "testd",
+    }:
+        raise RuntimeError(
+            "project process launch is forbidden from a control/background service; "
+            "use an attributed project runner below devcoordinator-projects.slice"
+        )
     ensure_private_directory(logs_dir())
     log_path = logs_dir() / f"{server_id}.log"
     log_fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
@@ -6117,8 +6109,21 @@ def normalize_server_definition(raw: dict[str, Any], project: str) -> dict[str, 
         environment: dict[str, str] = {}
     elif isinstance(raw_environment, Mapping):
         environment = dict(raw_environment)
+    elif isinstance(raw_environment, (list, tuple)):
+        # Older checked-in runtime manifests use the process-manager-friendly
+        # ["KEY=value", ...] form.  Normalize it once at the manifest boundary;
+        # broker enrollment applies the same bounded string-map contract to the
+        # result before anything can be launched.
+        environment = {}
+        for item in raw_environment:
+            if not isinstance(item, str) or "=" not in item or "\x00" in item:
+                raise ValueError("server env entries must be KEY=VALUE strings")
+            key, value = item.split("=", 1)
+            if not key or key in environment or "\x00" in key:
+                raise ValueError("server env entries must have unique non-empty keys")
+            environment[key] = value
     else:
-        raise ValueError("server env must be a key/value map")
+        raise ValueError("server env must be a key/value map or KEY=VALUE list")
     return {
         "type": "server",
         "name": name,
@@ -6509,9 +6514,23 @@ def build_project_runtime_spec(
     compose_services = runtime_string_list(
         docker_config.get("services"), field="docker.services", maximum=128
     )
+    compose_run_once_policies = normalize_compose_run_once_policies(
+        docker_config.get("run_once_services", ())
+    )
+    compose_run_once_names = tuple(
+        policy.name for policy in compose_run_once_policies
+    )
     if compose_declared and not compose_services:
         raise ValueError(
             "declared Compose runtime requires at least one exact docker.services entry"
+        )
+    if compose_run_once_policies and not compose_declared:
+        raise ValueError(
+            "docker.run_once_services requires explicit docker.compose_files"
+        )
+    if set(compose_services) & set(compose_run_once_names):
+        raise ValueError(
+            "docker.services and docker.run_once_services must be disjoint"
         )
     compose_env_files = [
         resolve_runtime_path(resolved_project, item, reject_symlinks=True)
@@ -6547,6 +6566,9 @@ def build_project_runtime_spec(
             "env_files": compose_env_files,
             "profiles": compose_profiles,
             "services": compose_services,
+            "run_once_services": [
+                policy.to_document() for policy in compose_run_once_policies
+            ],
             "project_name": (
                 None
                 if docker_config.get("project_name") is None
@@ -9661,13 +9683,69 @@ def _coordinated_start_server_normalized(options: dict[str, Any]) -> dict[str, A
                 "cleanup_errors": cleanup_errors,
             },
         )
-    with AccountStore.open_default(coordinator_home()) as store:
-        committed = NormalizedServerLifecycle(store).commit_start_health(
-            operation_id=str(reservation["operation_id"]),
-            server_definition_id=str(reservation["id"]),
-            definition_generation=int(reservation["_definition_generation"]),
-            health=health,
-        )
+    try:
+        with AccountStore.open_default(coordinator_home()) as store:
+            committed = NormalizedServerLifecycle(store).commit_start_health(
+                operation_id=str(reservation["operation_id"]),
+                server_definition_id=str(reservation["id"]),
+                definition_generation=int(reservation["_definition_generation"]),
+                health=health,
+            )
+    except BaseException as commit_error:
+        # The process is already running on the host, so an optimistic
+        # authority conflict at the final health commit is a cleanup boundary,
+        # not an ordinary request failure.  Never leave its lease and running
+        # operation behind for a retry to collide with.
+        cleanup_errors: list[str] = []
+        try:
+            stop_pid(int(pid))
+        except BaseException as cleanup_error:
+            cleanup_errors.append(
+                f"{type(cleanup_error).__name__}: {cleanup_error}"
+            )
+        try:
+            process_active = pid_alive(int(pid)) or not port_available(
+                reserved_port, host
+            )
+        except BaseException as observation_error:
+            process_active = True
+            cleanup_errors.append(
+                "cleanup observation failed: "
+                f"{type(observation_error).__name__}: {observation_error}"
+            )
+        try:
+            with AccountStore.open_default(coordinator_home()) as store:
+                failed = NormalizedServerLifecycle(store).fail_start(
+                    operation_id=str(reservation["operation_id"]),
+                    server_definition_id=str(reservation["id"]),
+                    error=f"server health commit failed: {commit_error}",
+                    process_launched=True,
+                    process_active=process_active,
+                    manual_lease=bool(reservation.get("_manual_lease")),
+                    pid=int(pid),
+                    log_path=str(log_path),
+                    health=health,
+                    cleanup_errors=cleanup_errors,
+                )
+        except BaseException as finalization_error:
+            cleanup_errors.append(
+                "start failure finalization failed: "
+                f"{type(finalization_error).__name__}: {finalization_error}"
+            )
+            failed = launched
+        if cleanup_errors or process_active:
+            raise StructuredCoordinatorError(
+                "server reached host launch but health commit cleanup is uncertain",
+                {
+                    "code": "server_start_cleanup_uncertain",
+                    "server": normalized_public_server(failed),
+                    "primary_error": (
+                        f"{type(commit_error).__name__}: {commit_error}"
+                    ),
+                    "cleanup_errors": cleanup_errors,
+                },
+            ) from commit_error
+        raise
     return normalized_public_server(committed)
 
 
@@ -10066,16 +10144,43 @@ def _coordinated_stop_server_normalized(options: dict[str, Any]) -> dict[str, An
         else str(prepared.get("reason") or "Stopped by coordinator")
     )
     final_identity_wrong = (final_health.get("identity") or {}).get("ok") is False
-    with AccountStore.open_default(coordinator_home()) as store:
-        committed = NormalizedServerLifecycle(store).commit_stop(
-            operation_id=str(reservation["operation_id"]),
-            server_definition_id=str(snapshot["id"]),
-            agent=agent,
-            reason=reason,
-            release_port=requested_release and broker_link is None,
-            stale_lease=identity_wrong or final_identity_wrong,
-            final_health=final_health,
-        )
+    try:
+        with AccountStore.open_default(coordinator_home()) as store:
+            committed = NormalizedServerLifecycle(store).commit_stop(
+                operation_id=str(reservation["operation_id"]),
+                server_definition_id=str(snapshot["id"]),
+                agent=agent,
+                reason=reason,
+                release_port=requested_release and broker_link is None,
+                stale_lease=identity_wrong or final_identity_wrong,
+                final_health=final_health,
+            )
+    except BaseException as commit_error:
+        cleanup_errors: list[str] = []
+        try:
+            with AccountStore.open_default(coordinator_home()) as store:
+                failed = NormalizedServerLifecycle(store).fail_stop(
+                    operation_id=str(reservation["operation_id"]),
+                    server_definition_id=str(snapshot["id"]),
+                    error=f"server stop commit failed: {commit_error}",
+                    cleanup_errors=cleanup_errors,
+                )
+        except BaseException as finalization_error:
+            cleanup_errors.append(
+                "stop failure finalization failed: "
+                f"{type(finalization_error).__name__}: {finalization_error}"
+            )
+            failed = reservation
+        raise StructuredCoordinatorError(
+            "server reached a stopped host boundary but authority commit needs reconciliation",
+            {
+                "code": "server_stop_outcome_uncertain",
+                "server": normalized_public_server(failed),
+                "process_still_alive": False,
+                "primary_error": f"{type(commit_error).__name__}: {commit_error}",
+                "cleanup_errors": cleanup_errors,
+            },
+        ) from commit_error
     if broker_link is None:
         return normalized_public_server(committed)
     broker_context = configured_broker_context(project)
@@ -10449,6 +10554,51 @@ def commit_runtime_observations(
 
 
 def coordinated_status_server(options: dict[str, Any]) -> dict[str, Any]:
+    if authority_mode() == "system":
+        requested_project = str(options.get("project") or "").strip()
+        if not requested_project:
+            raise ValueError("server status requires --project")
+        project = canonical_project(requested_project)
+        name = str(options.get("name") or "").strip()
+        if not name:
+            raise ValueError("server status requires --name")
+        profile = configured_broker_profile()
+        if profile is None:  # pragma: no cover - system mode requires a profile
+            raise BrokerProfileError("server-wide broker authority is not configured")
+        repository = profile.repository(project)
+        server_definition_id = repository.server_id(name)
+        requested_id = options.get("server_id")
+        if requested_id is not None and str(requested_id) != server_definition_id:
+            raise StructuredCoordinatorError(
+                "server status target does not match the enrolled repository profile",
+                {
+                    "code": "broker_runtime_target_mismatch",
+                    "classification": "invalid_request",
+                    "resource_id": str(requested_id),
+                },
+            )
+        return coordinated_broker_runtime_request(
+            {
+                "schema_version": 1,
+                "agent": str(
+                    options.get("agent")
+                    or os.environ.get("USER")
+                    or "codex-agent"
+                ),
+                "root_repo": project,
+                "temporary_repo": None,
+                "target": {
+                    "kind": "service",
+                    "id": server_definition_id,
+                    "name": name,
+                },
+                "action": "status",
+                "purpose": "development",
+                "ttl_seconds": None,
+                "kill_after_run": False,
+                "options": {},
+            }
+        )
     if state_backend() != LEGACY_JSON_BACKEND:
         return _coordinated_status_server_normalized(options)
     prepared = dict(options)
@@ -10462,6 +10612,14 @@ def coordinated_status_server(options: dict[str, Any]) -> dict[str, Any]:
 
 
 def coordinated_server_logs(options: dict[str, Any]) -> dict[str, Any]:
+    if authority_mode() == "system":
+        # The system authority does not yet expose bounded service-log handles.
+        # Reuse the runtime artifact contract so this fails with a stable typed
+        # response instead of opening the per-user compatibility database.
+        return coordinated_runtime_artifact(
+            resource_kind="service",
+            resource_id=str(options.get("server_id") or ""),
+        )
     if state_backend() != LEGACY_JSON_BACKEND:
         return _coordinated_server_logs_normalized(options)
     prepared = dict(options)
@@ -11011,6 +11169,24 @@ def coordinated_build_inventory(
     return result
 
 
+def coordinated_retained_inventory() -> dict[str, Any]:
+    """Read the bounded observer publication without authority sampling."""
+
+    configured = str(os.environ.get("DEVCOORDINATOR_INVENTORY_PUBLICATION") or "").strip()
+    if not configured:
+        # Compatibility and account-mode test scope. The immutable production
+        # API unit always configures the retained publication explicitly.
+        return coordinated_build_inventory()
+    publication = read_projection(Path(configured).expanduser().absolute())
+    inventory = dict(publication["inventory"])
+    inventory["retained_projection"] = {
+        "schema_version": 1,
+        "generation": publication["generation"],
+        "published_at": publication["published_at"],
+    }
+    return inventory
+
+
 def coordinated_list_events(
     *, after: str | None = None, limit: int = DEFAULT_EVENT_PAGE_SIZE
 ) -> dict[str, Any]:
@@ -11407,12 +11583,56 @@ def filter_normalized_inventory_project(
         return inventory
     resolved = canonical_project(project)
     result = copy.deepcopy(inventory)
-    repositories = [
+    all_repositories = list(result.get("repositories", []))
+    requested_repositories = [
         row
-        for row in result.get("repositories", [])
+        for row in all_repositories
         if row.get("canonical_root") == resolved
     ]
-    repo_ids = {str(row.get("repo_id")) for row in repositories if row.get("repo_id")}
+    requested_repo_ids = {
+        str(row.get("repo_id"))
+        for row in requested_repositories
+        if row.get("repo_id")
+    }
+    repository_trees = [
+        row
+        for row in result.get("repository_trees", [])
+        if isinstance(row, dict)
+        and (
+            str((row.get("root_repository") or {}).get("repo_id"))
+            in requested_repo_ids
+            or any(
+                str(scope.get("repo_id")) in requested_repo_ids
+                for scope in row.get("scopes", [])
+                if isinstance(scope, dict)
+            )
+        )
+    ]
+    family_repo_ids = {
+        str(scope.get("repo_id"))
+        for tree in repository_trees
+        for scope in tree.get("scopes", [])
+        if isinstance(scope, dict) and scope.get("repo_id")
+    }
+    family_repo_ids.update(
+        str((tree.get("root_repository") or {}).get("repo_id"))
+        for tree in repository_trees
+        if (tree.get("root_repository") or {}).get("repo_id")
+    )
+    if not family_repo_ids:
+        family_repo_ids = set(requested_repo_ids)
+    repositories = [
+        row
+        for row in all_repositories
+        if str(row.get("repo_id")) in family_repo_ids
+    ]
+    family_roots = {
+        str(row.get("canonical_root"))
+        for row in repositories
+        if row.get("canonical_root")
+    }
+    family_roots.add(resolved)
+    repo_ids = set(family_repo_ids)
     root_matched_violations = [
         row
         for row in result.get("lifecycle_violations", [])
@@ -11440,6 +11660,12 @@ def filter_normalized_inventory_project(
         if row.get("resource_kind") == "container" and row.get("resource_id")
     }
     result["repositories"] = repositories
+    result["repository_trees"] = repository_trees
+    result["test_statistics"] = [
+        row
+        for row in result.get("test_statistics", [])
+        if str(row.get("repo_id")) in family_repo_ids
+    ]
     result["memberships"] = [
         row
         for row in result.get("memberships", [])
@@ -11640,7 +11866,9 @@ def filter_normalized_inventory_project(
         "project_usage",
     ):
         compatibility[key] = [
-            row for row in compatibility.get(key, []) if row.get("project") == resolved
+            row
+            for row in compatibility.get(key, [])
+            if row.get("project") in family_roots
         ]
     compatibility["servers"] = [
         row
@@ -11648,7 +11876,7 @@ def filter_normalized_inventory_project(
         if (
             str(row.get("id")) in server_ids
             if row.get("id")
-            else row.get("project") == resolved
+            else row.get("project") in family_roots
         )
     ]
     compatibility["project"] = resolved
@@ -11665,7 +11893,7 @@ def filter_normalized_inventory_project(
     compatibility["urls"] = [
         row
         for row in compatibility.get("urls", [])
-        if row.get("project") == resolved
+        if row.get("project") in family_roots
         or (
             row.get("name"),
             row.get("url"),
@@ -11680,7 +11908,7 @@ def filter_normalized_inventory_project(
         if (
             str(row.get("host_resource_id")) in docker_ids
             if row.get("host_resource_id")
-            else row.get("project") == resolved
+            else row.get("project") in family_roots
         )
     ]
     postgres = [
@@ -11692,7 +11920,7 @@ def filter_normalized_inventory_project(
             else (
                 str(row.get("host_resource_id")) in docker_ids
                 if row.get("host_resource_id")
-                else row.get("project") == resolved
+                else row.get("project") in family_roots
             )
         )
     ]
@@ -11966,6 +12194,20 @@ def sample_host_inventory_for_normalized_store(
                 identity = str(container.get("full_id") or container.get("id") or "")
                 if identity not in postgres_ids:
                     continue
+                labels = (
+                    container.get("labels")
+                    if isinstance(container.get("labels"), Mapping)
+                    else {}
+                )
+                # Do not spend the bounded observation budget querying an
+                # uninspectable container or a disposable test dependency.
+                # Neither represents a user-visible database service.
+                if (
+                    container.get("inspection_observable") is not True
+                    or is_test_framework_container(labels)
+                ):
+                    container["databases"] = []
+                    continue
                 remaining = remaining_host_observation_seconds()
                 if remaining is not None and remaining <= 0:
                     container["databases"] = []
@@ -12190,24 +12432,113 @@ def observe_broker_service_store_for_enrollment(
         join_timeout=HOST_OBSERVATION_JOIN_TIMEOUT_SECONDS,
         stale_after=timedelta(seconds=HOST_OBSERVATION_STALE_AFTER_SECONDS),
     )
-    outcome = observer.observe(
-        host_id=host_id,
-        observer_domain=OBSERVER_DOMAIN_FULL_DOCKER,
-        sampler=lambda: sample_host_inventory_for_normalized_store(
-            store,
-            include_docker=True,
-            backup_dirs=None,
-        ),
-        commit=lambda connection, snapshot_id, sample: (
-            commit_host_inventory_observation(
-                connection,
-                snapshot_id,
-                sample,
-                host_id=host_id,
-                coordinator_home=str(store.database_path.parent),
-            )
-        ),
+    def observe_once() -> Any:
+        return observer.observe(
+            host_id=host_id,
+            observer_domain=OBSERVER_DOMAIN_FULL_DOCKER,
+            sampler=lambda: sample_host_inventory_for_normalized_store(
+                store,
+                include_docker=True,
+                backup_dirs=None,
+            ),
+            commit=lambda connection, snapshot_id, sample: (
+                commit_host_inventory_observation(
+                    connection,
+                    snapshot_id,
+                    sample,
+                    host_id=host_id,
+                    coordinator_home=str(store.database_path.parent),
+                )
+            ),
+        )
+
+    outcome = observe_once()
+    reconciliation = reconcile_enrolled_runtime_container_declarations(
+        store,
+        snapshot_id=outcome.snapshot_id,
     )
+    if reconciliation["changed"]:
+        # Runtime-manifest adoption reconstructs observation-derived
+        # membership without advancing repository/profile generations. Capture
+        # one new exact snapshot so database children, grants, and the public
+        # projection all refer to the repaired parent in the same observer
+        # cycle. This path runs only when a declaration actually repaired a
+        # binding; steady-state observations remain one host scan.
+        outcome = observe_once()
+
+    browser_lifecycle: dict[str, Any] | None = None
+    browser_state = str(
+        os.environ.get("DEVCOORDINATOR_BROWSER_LIFECYCLE_STATE") or ""
+    ).strip()
+    if browser_state:
+        try:
+            idle_seconds = int(
+                str(
+                    os.environ.get("DEVCOORDINATOR_BROWSER_IDLE_SECONDS")
+                    or 15 * 60
+                )
+            )
+            observed_browsers = observe_browser_lifecycle(
+                Path(browser_state).expanduser().absolute(),
+                reap_idle=True,
+                idle_seconds=idle_seconds,
+            )
+            idle_reap = observed_browsers.get("idle_reap")
+            idle_reap = idle_reap if isinstance(idle_reap, Mapping) else {}
+            browser_lifecycle = {
+                "ok": observed_browsers.get("ok") is True,
+                "sampled_at": observed_browsers.get("sampled_at"),
+                "active_session_count": observed_browsers.get(
+                    "active_session_count"
+                ),
+                "accounted_session_count": observed_browsers.get(
+                    "accounted_session_count"
+                ),
+                "protected_session_count": observed_browsers.get(
+                    "protected_session_count"
+                ),
+                "reaped_session_count": idle_reap.get(
+                    "reaped_session_count", 0
+                ),
+                "failure_count": len(idle_reap.get("failures") or ()),
+            }
+            if (
+                browser_lifecycle["ok"] is not True
+                or browser_lifecycle["reaped_session_count"]
+                or browser_lifecycle["failure_count"]
+            ):
+                print(
+                    json.dumps(
+                        {
+                            "event": "browser.lifecycle_observed",
+                            **browser_lifecycle,
+                        },
+                        sort_keys=True,
+                    ),
+                    file=sys.stderr,
+                    flush=True,
+                )
+        except (BrowserLifecycleError, OSError, TypeError, ValueError) as error:
+            # Browser accounting is deliberately outside the authority and
+            # repository databases. A malformed or temporarily unreadable
+            # sidecar must never make inventory, Console, or project routes
+            # unavailable; retain the prior bounded sample and log the fault.
+            browser_lifecycle = {
+                "ok": False,
+                "error_type": type(error).__name__,
+                "message": " ".join(str(error).split())[:512],
+            }
+            print(
+                json.dumps(
+                    {
+                        "event": "browser.lifecycle_observation_failed",
+                        **browser_lifecycle,
+                    },
+                    sort_keys=True,
+                ),
+                file=sys.stderr,
+                flush=True,
+            )
     with store.read_transaction() as connection:
         capability = connection.execute(
             """
@@ -12231,7 +12562,46 @@ def observe_broker_service_store_for_enrollment(
         "docker_available": bool(capability["docker_available"]),
         "capability_fingerprint": str(capability["capability_fingerprint"]),
         "capability_committed_at": str(capability["committed_at"]),
+        "runtime_manifest_reconciliation": reconciliation,
+        "browser_lifecycle": browser_lifecycle,
     }
+
+
+def materialize_enrolled_servers(
+    servers: list[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Resolve each declared server command into the fixed worker argv contract."""
+
+    materialized: list[dict[str, Any]] = []
+    for raw in servers:
+        server = dict(raw)
+        name = str(server.get("name") or "").strip() or "unnamed"
+        try:
+            argv_template = command_argv(server)
+        except ValueError as error:
+            raise ValueError(
+                f"server {name!r} has an invalid launch command: {error}"
+            ) from error
+        port = server.get("port")
+        host = str(server.get("host") or "127.0.0.1")
+        requires_port = any("{port}" in argument for argument in argv_template)
+        if port is None:
+            if requires_port:
+                raise ValueError(
+                    f"server {name!r} uses {{port}} but has no declared port"
+                )
+            argv = [argument.replace("{host}", host) for argument in argv_template]
+        else:
+            if type(port) is not int or not 1 <= port <= 65535:
+                raise ValueError(f"server {name!r} has an invalid declared port")
+            argv = format_argv(argv_template, port=port, host=host)
+        if any("{port}" in argument or "{host}" in argument for argument in argv):
+            raise ValueError(
+                f"server {name!r} has unresolved launch-command placeholders"
+            )
+        server["argv"] = argv
+        materialized.append(server)
+    return materialized
 
 
 def coordinated_broker_enroll(args: argparse.Namespace) -> dict[str, Any]:
@@ -12250,17 +12620,12 @@ def coordinated_broker_enroll(args: argparse.Namespace) -> dict[str, Any]:
         runtime_file=args.runtime_file,
         include_docker=False,
     )
-    servers = list(specification.get("servers") or [])
+    servers = materialize_enrolled_servers(list(specification.get("servers") or []))
     compose = specification.get("compose")
-    if args.access_group:
-        try:
-            socket_gid = int(grp.getgrnam(str(args.access_group)).gr_gid)
-        except KeyError as error:
-            raise RuntimeError(
-                f"broker access group does not exist: {args.access_group}"
-            ) from error
-    else:
-        socket_gid = int(args.access_gid)
+    # The profile schema still carries a numeric GID for compatibility, but it
+    # is not an authorization input on a single-developer host.  Missing or
+    # stale local group definitions therefore cannot block enrollment.
+    socket_gid = int(args.access_gid) if args.access_gid is not None else 0
     allowed_server_names = None if args.all_servers else tuple(args.server or ())
     database_path = Path(str(args.database)).expanduser().absolute()
     with exclusive_broker_service_lock(database_path):
@@ -12269,6 +12634,7 @@ def coordinated_broker_enroll(args: argparse.Namespace) -> dict[str, Any]:
             socket_path=Path(str(args.socket)).expanduser().absolute(),
             socket_gid=socket_gid,
             client_uid=int(args.client_uid),
+            repository_owner_uid=int(args.repository_owner_uid),
             account_id=str(args.account_id),
             canonical_root=project,
             servers=servers,
@@ -12283,11 +12649,15 @@ def coordinated_broker_enroll(args: argparse.Namespace) -> dict[str, Any]:
                 getattr(args, "grant_ephemeral_image_prefetch", False)
             ),
             compose=compose if isinstance(compose, dict) else None,
+            allowed_compose_run_once_services=tuple(
+                getattr(args, "compose_run_once_service", None) or ()
+            ),
             approve_compose_host_access=bool(args.approve_compose_host_access),
             observe_host=observe_broker_service_store_for_enrollment,
             explicit_reinstall=bool(args.explicit_reinstall),
             grant_cleanup_capabilities=bool(args.grant_cleanup),
             validity_seconds=int(args.profile_valid_days) * 24 * 60 * 60,
+            socket_mode=int(getattr(args, "socket_mode", 0o666)),
         )
     result["observation"] = {
         "scope": OBSERVER_DOMAIN_FULL_DOCKER,
@@ -12295,6 +12665,11 @@ def coordinated_broker_enroll(args: argparse.Namespace) -> dict[str, Any]:
     }
     result["runtime_file"] = specification.get("runtime_file")
     result["agent"] = str(args.agent)
+    # Enrollment is consumed by the same strict JSON command boundary as the
+    # other activation helpers.  Make successful enrollment explicit so a
+    # clean adoption cannot mistake a valid ``status=enrolled`` response for a
+    # failed command.
+    result["ok"] = True
     return result
 
 
@@ -12406,12 +12781,8 @@ def _require_live_image_publication_maintenance_boundary() -> None:
     """Fail closed unless offline publication preserves the public control plane."""
 
     try:
-        access_gid = grp.getgrnam("devcoordinator-clients").gr_gid
-        maintenance = load_maintenance_state(
-            expected_uid=0,
-            expected_gid=access_gid,
-        )
-    except (KeyError, MaintenanceMarkerError, OSError, ValueError) as exc:
+        maintenance = load_maintenance_state(expected_uid=0)
+    except (MaintenanceMarkerError, OSError, ValueError) as exc:
         raise RuntimeError(
             "image publication could not verify server-wide maintenance mode"
         ) from exc
@@ -12942,9 +13313,633 @@ def record_project_status_evidence(report: dict[str, Any]) -> None:
 
 
 def coordinated_project_runtime_status(options: dict[str, Any]) -> dict[str, Any]:
+    if authority_mode() == "system":
+        return coordinated_broker_project_runtime_action(options, action="status")
     _spec, report = observe_project_runtime(options, action="status")
     record_project_status_evidence(report)
     return report
+
+
+def _exact_broker_project_context(
+    options: Mapping[str, Any],
+) -> tuple[BrokerClientProfile, BrokerRepositoryProfile, str]:
+    """Resolve one installed project without traversing its private home.
+
+    The protected profile is the canonical repository authority.  This path
+    is used by the dedicated loopback API account, which deliberately has no
+    ambient access to developer home directories.
+    """
+
+    raw_project = str(options.get("project") or "").strip()
+    if not raw_project or not Path(raw_project).is_absolute():
+        raise ValueError("project action requires an absolute enrolled project")
+    lexical_project = os.path.normpath(raw_project)
+    profile = configured_broker_profile()
+    if profile is None:  # pragma: no cover - system mode requires a profile
+        raise BrokerProfileError("server-wide broker authority is not configured")
+    repository = profile.repository(lexical_project)
+    agent = str(options.get("agent") or "").strip()
+    if not agent:
+        raise ValueError("project action requires --agent for attribution")
+    return profile, repository, agent
+
+
+def _broker_project_runtime_arguments(
+    *, repository: BrokerRepositoryProfile, agent: str, action: str
+) -> dict[str, Any]:
+    return {
+        "action": action,
+        "agent": agent,
+        "root_repo_id": repository.repo_id,
+        "temporary_repo_id": None,
+        "target_kind": "service",
+        "purpose": "development",
+        "ttl_seconds": None,
+        "kill_after_run": False,
+        "keep_alive": None,
+        "rearm_crash_loop": False,
+        "restart_limit": None,
+        "restart_window_seconds": None,
+    }
+
+
+def _canonical_project_action_operation_id(options: Mapping[str, Any]) -> str:
+    raw = options.get("operation_id")
+    if raw is None or raw == "":
+        return str(uuid.uuid4())
+    candidate = str(raw)
+    try:
+        canonical = str(uuid.UUID(candidate))
+    except (ValueError, AttributeError):
+        raise ValueError("project action operation_id must be a canonical UUID") from None
+    if canonical != candidate:
+        raise ValueError("project action operation_id must be a canonical UUID")
+    return canonical
+
+
+def _project_action_child_operation_id(
+    *, parent_id: str, repository_id: str, action: str,
+    operation: BrokerOperation, resource_id: str
+) -> str:
+    return str(
+        uuid.uuid5(
+            uuid.UUID(parent_id),
+            "\0".join(
+                (
+                    "devcoordinator-project-action-v1",
+                    repository_id,
+                    action,
+                    operation.value,
+                    resource_id,
+                )
+            ),
+        )
+    )
+
+
+def _deduplicated_profile_resource_names(
+    values: Mapping[str, str],
+) -> dict[str, str]:
+    names: dict[str, str] = {}
+    for raw_name, raw_resource_id in sorted(values.items()):
+        resource_id = str(raw_resource_id)
+        name = str(raw_name)
+        prior = names.get(resource_id)
+        if prior is None or (len(name), name) < (len(prior), prior):
+            names[resource_id] = name
+    return names
+
+
+def _unique_inventory_rows(
+    rows: Any, *, identity: str, label: str
+) -> dict[str, Mapping[str, Any]]:
+    if not isinstance(rows, list):
+        raise BrokerError("invalid_reply", f"Broker inventory {label} is malformed.")
+    result: dict[str, Mapping[str, Any]] = {}
+    for row in rows:
+        if not isinstance(row, Mapping):
+            raise BrokerError(
+                "invalid_reply", f"Broker inventory {label} contains a malformed row."
+            )
+        raw_id = row.get(identity)
+        if raw_id is None:
+            continue
+        resource_id = str(raw_id)
+        if resource_id in result:
+            raise BrokerError(
+                "invalid_reply", f"Broker inventory {label} duplicates an immutable ID."
+            )
+        result[resource_id] = row
+    return result
+
+
+def _broker_project_inventory_scope(
+    inventory: Mapping[str, Any], *, repository: BrokerRepositoryProfile
+) -> dict[str, Any]:
+    """Select one exact enrolled repository without resolving its filesystem."""
+
+    resources = inventory.get("resources")
+    observations = inventory.get("observations")
+    compatibility = inventory.get("v1_compatibility")
+    memberships = inventory.get("memberships")
+    if (
+        not isinstance(resources, Mapping)
+        or not isinstance(observations, Mapping)
+        or not isinstance(compatibility, Mapping)
+        or not isinstance(memberships, list)
+    ):
+        raise BrokerError("invalid_reply", "Broker project inventory is malformed.")
+    docker_compatibility = compatibility.get("docker")
+    if not isinstance(docker_compatibility, Mapping):
+        raise BrokerError("invalid_reply", "Broker project Docker inventory is malformed.")
+
+    enrolled_server_ids = frozenset(repository.server_ids.values())
+    enrolled_container_ids = frozenset(repository.container_ids.values())
+    server_resources = {
+        resource_id: row
+        for resource_id, row in _unique_inventory_rows(
+            resources.get("servers"),
+            identity="server_definition_id",
+            label="server resources",
+        ).items()
+        if resource_id in enrolled_server_ids
+        and str(row.get("repo_id") or "") == repository.repo_id
+    }
+    member_container_ids: set[str] = set()
+    for row in memberships:
+        if not isinstance(row, Mapping):
+            raise BrokerError(
+                "invalid_reply", "Broker project inventory has a malformed membership."
+            )
+        if (
+            str(row.get("repo_id") or "") == repository.repo_id
+            and str(row.get("resource_kind") or "") == "container"
+            and str(row.get("host_resource_id") or "") in enrolled_container_ids
+        ):
+            member_container_ids.add(str(row["host_resource_id"]))
+    docker_resources = {
+        resource_id: row
+        for resource_id, row in _unique_inventory_rows(
+            resources.get("docker"),
+            identity="docker_resource_id",
+            label="Docker resources",
+        ).items()
+        if resource_id in member_container_ids
+    }
+    server_observations = {
+        resource_id: row
+        for resource_id, row in _unique_inventory_rows(
+            observations.get("servers"),
+            identity="server_definition_id",
+            label="server observations",
+        ).items()
+        if resource_id in enrolled_server_ids
+    }
+    docker_observations = {
+        resource_id: row
+        for resource_id, row in _unique_inventory_rows(
+            observations.get("docker"),
+            identity="docker_resource_id",
+            label="Docker observations",
+        ).items()
+        if resource_id in member_container_ids
+    }
+    compatibility_servers = {
+        resource_id: row
+        for resource_id, row in _unique_inventory_rows(
+            compatibility.get("servers"), identity="id", label="compatibility servers"
+        ).items()
+        if resource_id in enrolled_server_ids
+    }
+    compatibility_containers = {
+        resource_id: row
+        for resource_id, row in _unique_inventory_rows(
+            docker_compatibility.get("containers"),
+            identity="host_resource_id",
+            label="compatibility containers",
+        ).items()
+        if resource_id in member_container_ids
+    }
+    isolation_rows: dict[str, Mapping[str, Any]] = {}
+    for key in ("project_runtime_isolation", "isolation_audit", "isolation"):
+        evidence = inventory.get(key)
+        candidates = evidence.get("resources") if isinstance(evidence, Mapping) else None
+        if not isinstance(candidates, list):
+            continue
+        for row in candidates:
+            if not isinstance(row, Mapping):
+                continue
+            resource_id = str(row.get("resource_id") or "")
+            if resource_id in enrolled_server_ids | enrolled_container_ids:
+                isolation_rows[resource_id] = row
+    return {
+        "server_resources": server_resources,
+        "docker_resources": docker_resources,
+        "server_observations": server_observations,
+        "docker_observations": docker_observations,
+        "compatibility_servers": compatibility_servers,
+        "compatibility_containers": compatibility_containers,
+        "member_container_ids": frozenset(member_container_ids),
+        "isolation_rows": isolation_rows,
+    }
+
+
+def _project_resource_lifecycle(
+    scope: Mapping[str, Any], *, resource_kind: str, resource_id: str
+) -> str:
+    if resource_kind == "server":
+        compatibility = scope["compatibility_servers"].get(resource_id, {})
+        observation = scope["server_observations"].get(resource_id, {})
+    else:
+        compatibility = scope["compatibility_containers"].get(resource_id, {})
+        observation = scope["docker_observations"].get(resource_id, {})
+    return str(
+        compatibility.get("status")
+        or observation.get("lifecycle")
+        or "unobserved"
+    ).lower()
+
+
+def _project_resource_isolation_readiness(
+    scope: Mapping[str, Any], *, resource_kind: str, resource_id: str
+) -> dict[str, Any]:
+    candidates: list[Mapping[str, Any]] = []
+    for source in (
+        scope["isolation_rows"].get(resource_id),
+        scope["server_resources"].get(resource_id)
+        if resource_kind == "server"
+        else scope["docker_resources"].get(resource_id),
+        scope["server_observations"].get(resource_id)
+        if resource_kind == "server"
+        else scope["docker_observations"].get(resource_id),
+    ):
+        if isinstance(source, Mapping):
+            candidates.append(source)
+    for evidence in candidates:
+        classification = str(
+            evidence.get("isolation_classification")
+            or evidence.get("classification")
+            or ""
+        )
+        expected = evidence.get("expected_cgroup_parent")
+        observed = evidence.get("observed_cgroup")
+        if observed is None:
+            observed = evidence.get("cgroup_parent")
+        if classification == "compliant" or (
+            isinstance(expected, str)
+            and expected
+            and isinstance(observed, str)
+            and observed == expected
+        ):
+            return {
+                "status": "verified",
+                "classification": "compliant",
+                "expected_cgroup_parent": expected,
+                "observed_cgroup": observed,
+            }
+        if classification == "legacy_requires_recreation" or (
+            isinstance(expected, str)
+            and expected
+            and isinstance(observed, str)
+            and observed != expected
+        ):
+            return {
+                "status": "failed",
+                "classification": "legacy_requires_recreation",
+                "expected_cgroup_parent": expected,
+                "observed_cgroup": observed,
+            }
+    return {
+        "status": "unverified",
+        "classification": "isolation_evidence_unavailable",
+    }
+
+
+def _broker_project_services(
+    scope: Mapping[str, Any], *, repository: BrokerRepositoryProfile
+) -> list[dict[str, Any]]:
+    services: list[dict[str, Any]] = []
+    for resource_id, name in _deduplicated_profile_resource_names(
+        repository.server_ids
+    ).items():
+        status = _project_resource_lifecycle(
+            scope, resource_kind="server", resource_id=resource_id
+        )
+        resource = scope["server_resources"].get(resource_id, {})
+        services.append(
+            {
+                "name": name,
+                "resource_id": resource_id,
+                "type": "server",
+                "role": resource.get("role"),
+                "status": status,
+                "ok": status in {"running", "starting"},
+            }
+        )
+    for resource_id, name in _deduplicated_profile_resource_names(
+        repository.container_ids
+    ).items():
+        status = _project_resource_lifecycle(
+            scope, resource_kind="docker", resource_id=resource_id
+        )
+        services.append(
+            {
+                "name": name,
+                "resource_id": resource_id,
+                "type": "docker",
+                "status": status,
+                "ok": status in {"running", "starting", "up", "healthy"},
+                "compose_owned": resource_id in repository.compose_container_ids,
+            }
+        )
+    return services
+
+
+def coordinated_broker_project_runtime_action(
+    options: Mapping[str, Any], *, action: str
+) -> dict[str, Any]:
+    """Apply a whole-project action using only enrolled opaque resources.
+
+    The broker is the sole persistence and lifecycle authority.  The API does
+    not parse repository files, open a per-account database, or require Unix
+    group access to the checkout.  Independent resource failures are batched
+    so one response contains the complete action ledger.
+    """
+
+    if action not in {"status", "start", "restart", "stop"}:
+        raise ValueError("unsupported project runtime action")
+    prepared_options = dict(options)
+    if action == "status" and not str(prepared_options.get("agent") or "").strip():
+        prepared_options["agent"] = "coordinator-status"
+    profile, repository, agent = _exact_broker_project_context(prepared_options)
+    dry_run = bool(options.get("dry_run"))
+    parent_operation_id = _canonical_project_action_operation_id(options)
+    before_inventory = profile.inventory(canonical_root=repository.canonical_root)
+    before_scope = _broker_project_inventory_scope(
+        before_inventory, repository=repository
+    )
+    planned: list[dict[str, Any]] = []
+    compose_id = repository.compose_definition_id
+    compose_operations = {
+        "start": BrokerOperation.COMPOSE_UP,
+        "restart": BrokerOperation.COMPOSE_RESTART,
+        "stop": BrokerOperation.COMPOSE_STOP,
+    }
+    resource_operations = {
+        "start": BrokerOperation.DOCKER_START,
+        "restart": BrokerOperation.DOCKER_RESTART,
+        "stop": BrokerOperation.DOCKER_STOP,
+    }
+    if action != "status":
+        if compose_id is not None:
+            planned.append(
+                {
+                    "kind": "compose",
+                    "name": "compose",
+                    "resource_id": compose_id,
+                    "operation": compose_operations[action],
+                    "arguments": None,
+                    "readiness": {"status": "profile_authorized"},
+                }
+            )
+        container_names = _deduplicated_profile_resource_names(
+            repository.container_ids
+        )
+        standalone_ids = set(container_names)
+        if compose_id is not None:
+            standalone_ids -= set(repository.compose_container_ids)
+        for resource_id in sorted(standalone_ids):
+            readiness = _project_resource_isolation_readiness(
+                before_scope, resource_kind="docker", resource_id=resource_id
+            )
+            planned.append(
+                {
+                    "kind": "docker",
+                    "name": container_names[resource_id],
+                    "resource_id": resource_id,
+                    "operation": resource_operations[action],
+                    "arguments": None,
+                    "readiness": readiness,
+                }
+            )
+        server_names = _deduplicated_profile_resource_names(repository.server_ids)
+        for resource_id, name in sorted(server_names.items()):
+            resource = before_scope["server_resources"].get(resource_id)
+            if not isinstance(resource, Mapping) or str(
+                resource.get("role") or ""
+            ).lower() != "worker":
+                continue
+            planned.append(
+                {
+                    "kind": "server",
+                    "name": name,
+                    "resource_id": resource_id,
+                    "operation": BrokerOperation.RUNTIME_REQUEST,
+                    "arguments": _broker_project_runtime_arguments(
+                        repository=repository, agent=agent, action=action
+                    ),
+                    "readiness": _project_resource_isolation_readiness(
+                        before_scope,
+                        resource_kind="server",
+                        resource_id=resource_id,
+                    ),
+                }
+            )
+
+    actions: list[dict[str, Any]] = []
+    action_errors: list[dict[str, Any]] = []
+    executable_plan = planned
+    for item in executable_plan:
+        name = str(item["name"])
+        resource_id = str(item["resource_id"])
+        operation = item["operation"]
+        arguments = item["arguments"]
+        child_operation_id = _project_action_child_operation_id(
+            parent_id=parent_operation_id,
+            repository_id=repository.repo_id,
+            action=action,
+            operation=operation,
+            resource_id=resource_id,
+        )
+        if dry_run:
+            actions.append(
+                {
+                    "dry_run": True,
+                    "name": name,
+                    "resource_id": resource_id,
+                    "operation": operation.value,
+                    "operation_id": child_operation_id,
+                    "readiness": item["readiness"],
+                }
+            )
+            readiness_status = str(item["readiness"].get("status") or "")
+            if readiness_status in {"failed", "unverified"}:
+                action_errors.append(
+                    {
+                        "name": name,
+                        "resource_id": resource_id,
+                        "operation": operation.value,
+                        "classification": (
+                            "project_isolation_mismatch"
+                            if readiness_status == "failed"
+                            else "project_action_readiness_unverified"
+                        ),
+                        "code": str(
+                            item["readiness"].get("classification")
+                            or "isolation_evidence_unavailable"
+                        ),
+                        "error": (
+                            "Existing runtime isolation does not match the repository slice."
+                            if readiness_status == "failed"
+                            else "Runtime isolation readiness has no exact current evidence."
+                        ),
+                    }
+                )
+            continue
+        try:
+            returned_operation_id, result = profile.call(
+                repository=repository,
+                resource_id=resource_id,
+                operation=operation,
+                arguments=arguments,
+                operation_id=child_operation_id,
+            )
+            if returned_operation_id != child_operation_id:
+                raise BrokerError(
+                    "invalid_reply", "Broker returned a contradictory operation ID."
+                )
+            actions.append(
+                {
+                    "name": name,
+                    "resource_id": resource_id,
+                    "operation": operation.value,
+                    "operation_id": returned_operation_id,
+                    "result": result,
+                }
+            )
+        except Exception as error:
+            failure = project_action_error_from_exception(error, name=name)
+            failure["resource_id"] = resource_id
+            failure["operation"] = operation.value
+            action_errors.append(failure)
+
+    post_scope = before_scope
+    if not dry_run and action != "status":
+        try:
+            post_inventory = profile.inventory(canonical_root=repository.canonical_root)
+            post_scope = _broker_project_inventory_scope(
+                post_inventory, repository=repository
+            )
+        except Exception as error:
+            action_errors.append(
+                project_action_error_from_exception(
+                    error,
+                    name="post-action inventory",
+                    fallback_classification="post_action_inventory_failed",
+                )
+            )
+        else:
+            expected = (
+                {"stopped", "exited", "dead", "created"}
+                if action == "stop"
+                else {"running", "starting", "up", "healthy"}
+            )
+            action_by_id = {
+                str(item["resource_id"]): item for item in actions
+            }
+            for item in planned:
+                resource_id = str(item["resource_id"])
+                kind = str(item["kind"])
+                if kind == "compose":
+                    result = action_by_id.get(resource_id, {}).get("result")
+                    verified = isinstance(result, Mapping) and isinstance(
+                        result.get("compose_observation"), Mapping
+                    ) and result["compose_observation"].get(
+                        "desired_state_observed"
+                    ) is True
+                    observed = "broker-compose-observation"
+                else:
+                    observed = _project_resource_lifecycle(
+                        post_scope,
+                        resource_kind=("server" if kind == "server" else "docker"),
+                        resource_id=resource_id,
+                    )
+                    verified = observed in expected
+                target_action = action_by_id.get(resource_id)
+                if target_action is not None:
+                    target_action["postcondition"] = {
+                        "verified": verified,
+                        "observed": observed,
+                        "expected": sorted(expected) if kind != "compose" else ["desired_state_observed"],
+                    }
+                if not verified and target_action is not None:
+                    action_errors.append(
+                        {
+                            "name": str(item["name"]),
+                            "resource_id": resource_id,
+                            "operation": item["operation"].value,
+                            "classification": "project_action_postcondition_failed",
+                            "code": "postcondition_unverified",
+                            "error": "Post-action inventory did not prove the requested lifecycle state.",
+                        }
+                    )
+
+    services = _broker_project_services(post_scope, repository=repository)
+    ok = not action_errors
+    classifications = sorted(
+        {
+            str(item.get("classification") or "action_failed")
+            for item in action_errors
+        }
+    )
+    if action == "status" and not services:
+        classification = "empty"
+    elif action_errors:
+        classification = classifications[0]
+    elif action == "stop":
+        classification = "stopped"
+    elif services and all(item["ok"] for item in services):
+        classification = "running"
+    else:
+        classification = "observed"
+    return {
+        "project": repository.canonical_root,
+        "repository_id": repository.repo_id,
+        "action": action,
+        "operation_id": parent_operation_id,
+        "ok": ok,
+        "classification": classification,
+        "classifications": classifications,
+        "services": services,
+        "actions": actions,
+        "action_errors": action_errors,
+        "partial": bool(actions and action_errors),
+        "preflight_failed": bool(dry_run and action_errors),
+        "preflight": {
+            "required": bool(planned),
+            "capability": "host_broker",
+            "repository_id": repository.repo_id,
+            "dry_run": dry_run,
+            "profile_authorized_scope": {
+                "compose_definition_id": compose_id,
+                "compose_container_ids": sorted(repository.compose_container_ids),
+                "standalone_container_ids": sorted(
+                    str(item["resource_id"])
+                    for item in planned
+                    if item["kind"] == "docker"
+                ),
+                "worker_server_ids": sorted(
+                    str(item["resource_id"])
+                    for item in planned
+                    if item["kind"] == "server"
+                ),
+            },
+        },
+        "authority": {
+            "scope": "server-wide",
+            "transport": "authenticated-unix-socket",
+        },
+    }
 
 
 def coordinated_reclaim_runtime_port(
@@ -13763,6 +14758,8 @@ def execute_project_start(
     preflight_listener=True,
 )
 def coordinated_project_runtime_start(options: dict[str, Any]) -> dict[str, Any]:
+    if authority_mode() == "system":
+        return coordinated_broker_project_runtime_action(options, action="start")
     prepared, operation = begin_project_operation(options, "start")
     try:
         with delegated_project_operation(operation):
@@ -13793,6 +14790,8 @@ def coordinated_project_runtime_start(options: dict[str, Any]) -> dict[str, Any]
     preflight_listener=True,
 )
 def coordinated_project_runtime_restart(options: dict[str, Any]) -> dict[str, Any]:
+    if authority_mode() == "system":
+        return coordinated_broker_project_runtime_action(options, action="restart")
     prepared, operation = begin_project_operation(options, "restart")
     delegation = delegated_project_operation(operation)
     delegation.__enter__()
@@ -13947,6 +14946,8 @@ def coordinated_project_runtime_restart(options: dict[str, Any]) -> dict[str, An
     preflight_listener=True,
 )
 def coordinated_project_runtime_stop(options: dict[str, Any]) -> dict[str, Any]:
+    if authority_mode() == "system":
+        return coordinated_broker_project_runtime_action(options, action="stop")
     prepared, operation = begin_project_operation(options, "stop")
     delegation = delegated_project_operation(operation)
     delegation.__enter__()
@@ -14898,21 +15899,11 @@ def configured_broker_context(
     return profile, profile.repository(canonical_project(project))
 
 
-def configured_broker_profile(
-    *, allow_expired_for_ephemeral_cleanup: bool = False
-) -> BrokerClientProfile | None:
+def configured_broker_profile() -> BrokerClientProfile | None:
     mode = authority_mode()
     if mode in {"account", "service"}:
         return None
-    # Keep ordinary profile resolution on the established one-argument call
-    # path.  The relaxed expiry mode is deliberately opt-in and is used only
-    # by the exact retained-owner status/finish cleanup journey.
-    if not allow_expired_for_ephemeral_cleanup:
-        return load_broker_profile(required=mode == "system")
-    return load_broker_profile(
-        required=mode == "system",
-        allow_expired_for_ephemeral_cleanup=True,
-    )
+    return load_broker_profile(required=mode == "system")
 
 
 def _ephemeral_repository(
@@ -14956,14 +15947,64 @@ def _canonical_ephemeral_operation_id(value: str) -> str:
     return normalized
 
 
+def _canonical_compose_run_once_operation_id(value: str) -> str:
+    try:
+        parsed = uuid.UUID(str(value))
+    except (AttributeError, TypeError, ValueError) as error:
+        raise argparse.ArgumentTypeError(
+            "Compose run-once operation ID must be a canonical UUID"
+        ) from error
+    normalized = str(parsed)
+    if value != normalized:
+        raise argparse.ArgumentTypeError(
+            "Compose run-once operation ID must be a lowercase canonical UUID"
+        )
+    return normalized
+
+
+def coordinated_compose_run_once(args: argparse.Namespace) -> dict[str, Any]:
+    """Route one manifest-sealed service only through broker authority."""
+
+    profile = configured_broker_profile()
+    if profile is None:
+        raise BrokerProfileError(
+            "Compose run-once requires the server-wide root-provisioned broker; "
+            "direct Docker fallback is disabled"
+        )
+    agent, project = require_identity(
+        vars(args),
+        "docker compose-run-once",
+    )
+    repository = profile.repository(canonical_project(project))
+    service = str(args.service)
+    timeout_seconds = repository.compose_run_once_timeout(
+        service,
+        timeout_seconds=int(args.timeout_seconds),
+    )
+    operation_id, result = profile.call(
+        repository=repository,
+        resource_id=repository.compose_id(),
+        operation=BrokerOperation.COMPOSE_RUN_ONCE,
+        arguments={
+            "agent": agent,
+            "service": service,
+            "timeout_seconds": timeout_seconds,
+        },
+        operation_id=getattr(args, "operation_id", None),
+    )
+    return {
+        "operation_id": operation_id,
+        **result,
+        "agent": agent,
+    }
+
+
 def coordinated_ephemeral_action(args: argparse.Namespace) -> dict[str, Any]:
     """Route ephemeral lifecycle only through the root-provisioned broker."""
 
     action = str(args.action)
     retained_owner_access = action in {"status", "finish"}
-    profile = configured_broker_profile(
-        allow_expired_for_ephemeral_cleanup=retained_owner_access
-    )
+    profile = configured_broker_profile()
     if profile is None:
         raise BrokerProfileError(
             "ephemeral containers require the server-wide root-provisioned broker; "
@@ -15114,6 +16155,56 @@ def _validated_broker_lease_result(
         )
     expires_at = None if result.get("expires_at") is None else str(result["expires_at"])
     return lease_id, port, protocol, expires_at
+
+
+def _broker_port_rows(
+    *, project: str | None = None
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Read leases and assignments from the sole server-wide authority."""
+
+    inventory = broker_authority_inventory(
+        project=project,
+        include_docker=False,
+        stats_history_limit=0,
+    )
+    compatibility = inventory.get("v1_compatibility")
+    if not isinstance(compatibility, Mapping):
+        raise BrokerError(
+            "invalid_reply", "Broker inventory omitted its port compatibility view."
+        )
+    leases = compatibility.get("leases")
+    assignments = compatibility.get("port_assignments")
+    if not isinstance(leases, list) or not isinstance(assignments, list):
+        raise BrokerError(
+            "invalid_reply", "Broker inventory returned malformed port collections."
+        )
+    if any(not isinstance(item, dict) for item in leases + assignments):
+        raise BrokerError(
+            "invalid_reply", "Broker inventory returned a malformed port record."
+        )
+    return copy.deepcopy(leases), copy.deepcopy(assignments)
+
+
+def _broker_server_rows() -> list[dict[str, Any]]:
+    """Read operational server rows from the sole server-wide authority."""
+
+    inventory = broker_authority_inventory(
+        include_docker=False,
+        stats_history_limit=0,
+    )
+    compatibility = inventory.get("v1_compatibility")
+    if not isinstance(compatibility, Mapping):
+        raise BrokerError(
+            "invalid_reply", "Broker inventory omitted its server compatibility view."
+        )
+    servers = compatibility.get("servers")
+    if not isinstance(servers, list) or any(
+        not isinstance(item, dict) for item in servers
+    ):
+        raise BrokerError(
+            "invalid_reply", "Broker inventory returned a malformed server collection."
+        )
+    return copy.deepcopy(servers)
 
 
 def _release_broker_only_port_lease(
@@ -15503,6 +16594,42 @@ def coordinated_lease_port(options: dict[str, Any]) -> dict[str, Any]:
             raise BrokerProfileError(
                 "broker-backed port lease requires the enrolled server name (--name)"
             )
+        if authority_mode() == "system":
+            ttl_seconds = int(options.get("ttl") or DEFAULT_TTL_SECONDS)
+            arguments: dict[str, Any] = {
+                "protocol": "tcp",
+                "ttl_seconds": ttl_seconds,
+            }
+            if options.get("preferred") is not None:
+                arguments["requested_port"] = int(options["preferred"])
+            operation_id, broker_result = profile.call(
+                repository=repository,
+                resource_id=repository.server_id(server_name),
+                operation=BrokerOperation.PORT_LEASE,
+                arguments=arguments,
+            )
+            lease_id, port, protocol, expires_at = _validated_broker_lease_result(
+                broker_result
+            )
+            return {
+                "id": lease_id,
+                "port": port,
+                "project": project,
+                "agent": agent,
+                "owner": None,
+                "purpose": str(options.get("purpose") or "manual"),
+                "server_id": repository.server_id(server_name),
+                "status": "active",
+                "protocol": protocol,
+                "expires_at": expires_at,
+                "released_at": None,
+                "broker": {
+                    "lease_id": lease_id,
+                    "operation_id": operation_id,
+                    "status": "active",
+                    "result": broker_result,
+                },
+            }
         link, broker_result = acquire_broker_lease_link(
             profile=profile,
             repository=repository,
@@ -15619,6 +16746,34 @@ def coordinated_lease_port(options: dict[str, Any]) -> dict[str, Any]:
 def coordinated_release_port(options: dict[str, Any]) -> dict[str, Any]:
     agent, project = require_identity(options, "port release")
     prime_git_head_identity(project)
+    if authority_mode() == "system":
+        lease_id = str(options.get("lease_id") or "").strip()
+        requested_port = options.get("port")
+        if not lease_id:
+            if requested_port is None:
+                raise ValueError("port release requires --lease-id or --port")
+            leases, _assignments = _broker_port_rows(project=project)
+            matches = [
+                item
+                for item in leases
+                if item.get("status") == "active"
+                and int(item.get("port") or 0) == int(requested_port)
+                and canonical_project(str(item.get("project") or "")) == project
+            ]
+            if len(matches) != 1 or not str(matches[0].get("id") or ""):
+                raise KeyError("matching lease not found")
+            lease_id = str(matches[0]["id"])
+        released = _release_broker_only_port_lease(
+            agent=agent,
+            project=project,
+            broker_lease_id=lease_id,
+        )
+        if requested_port is not None and int(released["port"]) != int(requested_port):
+            raise BrokerError(
+                "invalid_reply",
+                "Broker released a lease that does not match the requested port.",
+            )
+        return released
     if state_backend() == LEGACY_JSON_BACKEND:
         with locked_state() as state:
             lease_id = options.get("lease_id")
@@ -15730,7 +16885,36 @@ def coordinated_assign_port(options: dict[str, Any]) -> dict[str, Any]:
     if broker_context is not None:
         profile, repository = broker_context
         name = str(options.get("name") or "").strip()
+        if not name:
+            raise ValueError("port assign requires --name")
         port = int(options["port"])
+        if authority_mode() == "system":
+            server_definition_id = repository.server_id(name)
+            operation_id, broker_result = profile.call(
+                repository=repository,
+                resource_id=server_definition_id,
+                operation=BrokerOperation.PORT_ASSIGN,
+                arguments={"port": port},
+            )
+            assignment_id, assigned_port = _validated_broker_assignment_result(
+                broker_result, expected_port=port
+            )
+            return {
+                "id": assignment_id,
+                "key": f"{project}::{name}",
+                "project": project,
+                "name": name,
+                "port": assigned_port,
+                "status": "active",
+                "server_status": "unregistered",
+                "generation": int(broker_result.get("generation") or 0),
+                "broker": {
+                    "assignment_id": assignment_id,
+                    "operation_id": operation_id,
+                    "status": "active",
+                    "result": broker_result,
+                },
+            }
         link, broker_result = acquire_broker_assignment_link(
             profile=profile,
             repository=repository,
@@ -15833,6 +17017,80 @@ def coordinated_assign_port(options: dict[str, Any]) -> dict[str, Any]:
 
 def coordinated_unassign_port(options: dict[str, Any]) -> dict[str, Any]:
     agent, requested_project = require_identity(options, "port unassign")
+    if authority_mode() == "system":
+        broker_context = configured_broker_context(requested_project)
+        if broker_context is None:  # pragma: no cover - system mode requires a profile
+            raise BrokerProfileError("server-wide broker authority is not configured")
+        profile, repository = broker_context
+        _leases, assignments = _broker_port_rows(project=requested_project)
+        requested_name = (
+            None
+            if options.get("name") is None
+            else str(options.get("name") or "").strip()
+        )
+        requested_port = options.get("port")
+        if not requested_name and requested_port is None:
+            raise ValueError("port unassign requires --name or --port")
+        matches = [
+            item
+            for item in assignments
+            if item.get("status") == "active"
+            and canonical_project(str(item.get("project") or ""))
+            == requested_project
+            and (
+                requested_name is None
+                or str(item.get("name") or "") == requested_name
+            )
+            and (
+                requested_port is None
+                or int(item.get("port") or 0) == int(requested_port)
+            )
+        ]
+        if len(matches) != 1:
+            raise KeyError("matching port assignment not found")
+        matching = matches[0]
+        name = str(matching.get("name") or "")
+        assignment_id = str(matching.get("id") or "")
+        port = int(matching.get("port") or 0)
+        if not name or not assignment_id or not 1 <= port <= 65535:
+            raise BrokerError(
+                "invalid_reply", "Broker inventory returned invalid assignment evidence."
+            )
+        server_definition_id = repository.server_id(name)
+        operation_id, broker_result = profile.call(
+            repository=repository,
+            resource_id=server_definition_id,
+            operation=BrokerOperation.PORT_UNASSIGN,
+        )
+        if (
+            broker_result.get("status") != "released"
+            or str(broker_result.get("assignment_id") or "") != assignment_id
+            or str(broker_result.get("repo_id") or "") != repository.repo_id
+            or str(broker_result.get("server_definition_id") or "")
+            != server_definition_id
+            or int(broker_result.get("port") or 0) != port
+        ):
+            raise BrokerError(
+                "invalid_reply",
+                "Broker port unassignment did not match the selected assignment.",
+                operation_id=operation_id,
+            )
+        return {
+            "id": assignment_id,
+            "key": f"{requested_project}::{name}",
+            "project": requested_project,
+            "name": name,
+            "port": port,
+            "status": "unassigned",
+            "server_status": str(matching.get("server_status") or "unregistered"),
+            "generation": int(broker_result.get("generation") or 0),
+            "broker": {
+                "assignment_id": assignment_id,
+                "operation_id": operation_id,
+                "status": "released",
+                "result": broker_result,
+            },
+        }
     if state_backend() == LEGACY_JSON_BACKEND:
         with locked_state() as state:
             matching = None
@@ -15946,6 +17204,23 @@ def coordinated_relocate_port_assignment(options: dict[str, Any]) -> dict[str, A
         raise ValueError("port relocate requires --agent")
     old_project = canonical_project(str(options.get("old_project") or ""))
     new_project = canonical_project(str(options.get("new_project") or ""))
+    if authority_mode() == "system":
+        profile = configured_broker_profile()
+        if profile is None:  # pragma: no cover - system mode requires a profile
+            raise BrokerProfileError("server-wide broker authority is not configured")
+        profile.repository(old_project)
+        profile.repository(new_project)
+        raise StructuredCoordinatorError(
+            "Atomic port relocation is not available through the host broker.",
+            {
+                "code": "broker_port_relocation_unsupported",
+                "classification": "unsupported_safe_lifecycle",
+                "action_required": (
+                    "Unassign the enrolled server from its current repository and "
+                    "assign the destination server through separate broker-authorized commands."
+                ),
+            },
+        )
     with normalized_repository_action_guard(
         project=new_project, agent=agent, action=RepositoryAction.LEASE
     ):
@@ -17491,10 +18766,17 @@ def coordinated_runtime_cleanup(
 
 
 def _runtime_error_envelope(
-    payload: Any, error: BaseException
+    payload: Any,
+    error: BaseException,
+    *,
+    operation_id: str | None = None,
 ) -> dict[str, Any]:
     request = payload if isinstance(payload, dict) else {}
     evidence = getattr(error, "payload", None)
+    if operation_id is None and isinstance(evidence, Mapping):
+        evidence_operation_id = evidence.get("operation_id")
+        if isinstance(evidence_operation_id, str):
+            operation_id = evidence_operation_id
     envelope = {
         "schema_version": 1,
         "ok": False,
@@ -17515,12 +18797,27 @@ def _runtime_error_envelope(
         },
         "target": request.get("target"),
     }
+    if operation_id is not None:
+        envelope["operation_id"] = operation_id
     redacted = redact_runtime_value(
         envelope, request=request if isinstance(request, Mapping) else None
     )
     if not isinstance(redacted, dict):  # pragma: no cover - envelope is an object
         raise RuntimeError("runtime error redaction returned a non-object")
     return redacted
+
+
+def _runtime_result_operation_envelope(
+    result: dict[str, Any], operation_id: str | None
+) -> dict[str, Any]:
+    """Correlate a runtime result with its outer broker transport identity."""
+
+    if operation_id is None:
+        return result
+    existing = result.get("operation_id")
+    if existing is not None and existing != operation_id:
+        raise RuntimeError("runtime result operation_id does not match its request")
+    return {**result, "operation_id": operation_id}
 
 
 def _runtime_repository_tree_identity(
@@ -17568,6 +18865,18 @@ def _runtime_repository_tree_identity(
 
 def coordinated_runtime_remove(request: dict[str, Any]) -> dict[str, Any]:
     """Plan or apply exact worker archive/permanent cleanup through one API action."""
+
+    if authority_mode() == "system":
+        raise StructuredCoordinatorError(
+            "Unified runtime removal is not available through the host broker.",
+            {
+                "code": "broker_runtime_remove_unsupported",
+                "classification": "unsupported_safe_lifecycle",
+                "action_required": (
+                    "Use the broker-authorized archive and permanent-cleanup lifecycle commands."
+                ),
+            },
+        )
 
     pre_action_inventory = coordinated_build_inventory()
     family_id, root_repo_id, effective_repo_id, project_kind = (
@@ -17682,21 +18991,35 @@ def coordinated_runtime_remove(request: dict[str, Any]) -> dict[str, Any]:
 
 
 def coordinated_runtime_request(
-    payload: Any, *, cleanup_owner_available: bool = False
+    payload: Any,
+    *,
+    cleanup_owner_available: bool = False,
+    operation_id: str | None = None,
 ) -> dict[str, Any]:
+    if operation_id is not None:
+        try:
+            operation_id = canonical_runtime_operation_id(operation_id)
+        except RuntimeRequestError as error:
+            return _runtime_error_envelope(payload, error)
     if state_backend() == LEGACY_JSON_BACKEND:
         return _runtime_error_envelope(
             payload,
             RuntimeError("unified runtime API requires the normalized SQLite backend"),
+            operation_id=operation_id,
         )
     if authority_mode() == "system":
         try:
             normalized_payload = validate_runtime_request(payload)
-            if normalized_payload["action"] == "remove":
-                return coordinated_runtime_remove(normalized_payload)
-            return coordinated_broker_runtime_request(normalized_payload)
+            return coordinated_broker_runtime_request(
+                normalized_payload,
+                operation_id=operation_id,
+            )
         except BaseException as error:
-            return _runtime_error_envelope(payload, error)
+            return _runtime_error_envelope(
+                payload,
+                error,
+                operation_id=operation_id,
+            )
     if authority_mode() != "account":
         return _runtime_error_envelope(
             payload,
@@ -17708,11 +19031,15 @@ def coordinated_runtime_request(
                     "action_required": "Submit the ID-only runtime request from an enrolled peer account.",
                 },
             ),
+            operation_id=operation_id,
         )
     try:
         normalized_payload = validate_runtime_request(payload)
         if normalized_payload["action"] == "remove":
-            return coordinated_runtime_remove(normalized_payload)
+            return _runtime_result_operation_envelope(
+                coordinated_runtime_remove(normalized_payload),
+                operation_id,
+            )
         reject_unsupported_safe_replace(normalized_payload)
         with AccountStore.open_default(coordinator_home()) as store:
             result = execute_runtime_request(
@@ -17750,16 +19077,56 @@ def coordinated_runtime_request(
                     cleanup_owner_available=lambda: cleanup_owner_available,
                 ),
             )
+        if normalized_payload["action"] == "capture_logs" and result.get("ok") is True:
+            target = normalized_payload["target"]
+            matching = [
+                item
+                for item in result.get("artifacts") or []
+                if isinstance(item, Mapping)
+                and item.get("resource_kind") == target["kind"]
+                and item.get("target_resource_id") == target["id"]
+            ]
+            if len(matching) != 1:
+                raise RuntimeError(
+                    "runtime log capture did not publish one exact artifact"
+                )
+            descriptor = matching[0]
+            artifact_id = str(uuid.UUID(str(descriptor.get("resource_id") or "")))
+            resolved = coordinated_runtime_artifact(
+                resource_kind=str(target["kind"]), resource_id=artifact_id
+            )
+            result["artifact"] = {
+                "availability": "available",
+                "artifact_id": artifact_id,
+                "resource_kind": target["kind"],
+                "target_resource_id": target["id"],
+                "source": descriptor.get("source"),
+                "captured_at": descriptor.get("captured_at"),
+                "bounds": descriptor.get("bounds"),
+                "truncated": descriptor.get("truncated") is True,
+            }
+            result["artifact_content"] = {
+                "artifact_id": artifact_id,
+                "text": resolved["text"],
+            }
         RUNTIME_REAPER_WAKE.set()
-        return result
+        return _runtime_result_operation_envelope(result, operation_id)
     except BaseException as error:
-        return _runtime_error_envelope(payload, error)
+        return _runtime_error_envelope(
+            payload,
+            error,
+            operation_id=operation_id,
+        )
 
 
-def coordinated_broker_runtime_request(payload: Any) -> dict[str, Any]:
+def coordinated_broker_runtime_request(
+    payload: Any, *, operation_id: str | None = None
+) -> dict[str, Any]:
     """Submit one path-free runtime request through the enrolled host broker."""
 
     request = validate_runtime_request(payload)
+    if operation_id is not None:
+        operation_id = canonical_runtime_operation_id(operation_id)
     if request["action"] == "run":
         raise StructuredCoordinatorError(
             "the host broker does not accept client commands",
@@ -17829,12 +19196,34 @@ def coordinated_broker_runtime_request(payload: Any) -> dict[str, Any]:
                 "action_required": "Enroll this exact root/worktree and resource through the Coordinator skill.",
             },
         )
-    root = profile.repository(canonical_project(request["root_repo"]))
-    effective = (
-        root
-        if request["temporary_repo"] is None
-        else profile.repository(canonical_project(request["temporary_repo"]))
-    )
+    # The installed profile is only a transport anchor. Repositories adopted
+    # after that file was published are resolved read-only from broker
+    # authority; this neither performs first-use adoption nor trusts a local
+    # filesystem path. The broker still authorizes the returned repository and
+    # every exact resource operation for this protected client account.
+    root = profile.resolve_repository(request["root_repo"])
+    if root is None:
+        raise StructuredCoordinatorError(
+            "the repository has not been adopted by the host broker",
+            {
+                "code": "repository_unenrolled",
+                "classification": "repository_bootstrap_required",
+                "action_required": "Run one typed start-like request as the actual local caller first.",
+            },
+        )
+    if request["temporary_repo"] is None:
+        effective = root
+    else:
+        effective = profile.resolve_repository(request["temporary_repo"])
+        if effective is None:
+            raise StructuredCoordinatorError(
+                "the temporary repository has not been adopted by the host broker",
+                {
+                    "code": "repository_unenrolled",
+                    "classification": "repository_bootstrap_required",
+                    "action_required": "Run one typed start-like request as the actual local caller first.",
+                },
+            )
     arguments = {
         "action": request["action"],
         "agent": request["agent"],
@@ -17867,11 +19256,12 @@ def coordinated_broker_runtime_request(payload: Any) -> dict[str, Any]:
             }
         )
     try:
-        operation_id, result = profile.call(
+        returned_operation_id, result = profile.call(
             repository=effective,
             resource_id=target_id,
             operation=BrokerOperation.RUNTIME_REQUEST,
             arguments=arguments,
+            operation_id=operation_id,
         )
     except BrokerError as error:
         maintenance = error.code in {
@@ -17894,7 +19284,7 @@ def coordinated_broker_runtime_request(payload: Any) -> dict[str, Any]:
                     }
                     else ("maintenance" if maintenance else "broker_runtime_unavailable")
                 ),
-                "operation_id": error.operation_id,
+                "operation_id": operation_id or error.operation_id,
                 **(
                     {
                         "retry_after_seconds": error.retry_after_seconds or 60,
@@ -17920,9 +19310,44 @@ def coordinated_broker_runtime_request(payload: Any) -> dict[str, Any]:
         raise BrokerError(
             "invalid_reply",
             "Broker runtime reply does not match the enrolled request context.",
+            operation_id=returned_operation_id,
+        )
+    if operation_id is not None and returned_operation_id != operation_id:
+        raise BrokerError(
+            "invalid_reply",
+            "Broker runtime reply is bound to another operation.",
             operation_id=operation_id,
         )
-    return result
+    if request["action"] == "capture_logs":
+        artifact = result.get("artifact")
+        content = result.get("artifact_content")
+        artifact_id = (
+            artifact.get("artifact_id") if isinstance(artifact, Mapping) else None
+        )
+        text = content.get("text") if isinstance(content, Mapping) else None
+        try:
+            canonical_artifact_id = str(uuid.UUID(str(artifact_id)))
+        except (ValueError, AttributeError):
+            canonical_artifact_id = ""
+        if (
+            result.get("ok") is not True
+            or result.get("classification") not in {"available", "retained"}
+            or not isinstance(artifact, Mapping)
+            or artifact.get("resource_kind") != request["target"]["kind"]
+            or artifact.get("target_resource_id") != target_id
+            or canonical_artifact_id != artifact_id
+            or "path" in artifact
+            or not isinstance(content, Mapping)
+            or content.get("artifact_id") != artifact_id
+            or not isinstance(text, str)
+            or len(text.encode("utf-8")) > RUNTIME_LOG_MAX_BYTES
+        ):
+            raise BrokerError(
+                "invalid_reply",
+                "Broker log capture reply does not contain one bounded artifact for the exact enrolled target.",
+                operation_id=returned_operation_id,
+            )
+    return _runtime_result_operation_envelope(result, returned_operation_id)
 
 
 def coordinated_reap_runtime_sessions() -> list[dict[str, Any]]:
@@ -17951,6 +19376,22 @@ def coordinated_runtime_artifact(
     *, resource_kind: str, resource_id: str
 ) -> dict[str, Any]:
     expected_sha256: str | None = None
+    if authority_mode() == "system" and resource_kind in {
+        "service",
+        "run",
+        "diagnostic",
+    }:
+        raise StructuredCoordinatorError(
+            "Account-local runtime artifacts are unavailable in server-wide mode.",
+            {
+                "code": "broker_runtime_artifact_unsupported",
+                "classification": "unsupported_safe_read",
+                "action_required": (
+                    "Use an artifact handle returned by the host broker; the client "
+                    "does not open a private authority database."
+                ),
+            },
+        )
     if resource_kind == "service":
         with AccountStore.open_default(coordinator_home()) as store:
             with store.read_transaction() as connection:
@@ -18379,6 +19820,10 @@ def build_parser() -> argparse.ArgumentParser:
         )
         project_action.add_argument("--allow-port-change", action="store_true")
         project_action.add_argument("--dry-run", action="store_true")
+        project_action.add_argument(
+            "--operation-id",
+            help="reuse the exact canonical UUID after a lost or uncertain project action reply",
+        )
 
     ephemeral = sub.add_parser(
         "ephemeral",
@@ -18432,21 +19877,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="reuse the exact UUID after a lost or uncertain broker reply",
     )
 
-    tests = sub.add_parser(
-        "test", help="run and inspect repository tests through the universal harness"
-    )
-    tests_sub = tests.add_subparsers(dest="action", required=True)
-    tests_run = tests_sub.add_parser("run")
-    tests_run.add_argument("--agent", required=True)
-    tests_run.add_argument("--project", required=True)
-    tests_choice = tests_run.add_mutually_exclusive_group(required=True)
-    tests_choice.add_argument("--profile")
-    tests_choice.add_argument("--group", action="append", dest="test_groups")
-    tests_run.add_argument("--select", action="append", default=[])
-    tests_stats = tests_sub.add_parser("stats")
-    tests_stats.add_argument("--project", required=True)
-    tests_stats.add_argument("--days", type=int, default=30)
-    tests_stats.add_argument("--limit", type=int, default=25)
+    add_universal_test_cli_parser(sub)
 
     docker = sub.add_parser("docker")
     docker_sub = docker.add_subparsers(dest="action", required=True)
@@ -18468,6 +19899,26 @@ def build_parser() -> argparse.ArgumentParser:
     compose_down.add_argument("--project", required=True)
     compose_down.add_argument("--file", action="append", default=[])
     compose_down.add_argument("--dry-run", action="store_true")
+    compose_run_once = docker_sub.add_parser(
+        "compose-run-once",
+        help=(
+            "run one administrator-enrolled Compose service without accepting "
+            "client commands, environment, mounts, or paths"
+        ),
+    )
+    compose_run_once.add_argument("--agent", required=True)
+    compose_run_once.add_argument("--project", required=True)
+    compose_run_once.add_argument("--service", required=True)
+    compose_run_once.add_argument(
+        "--timeout-seconds",
+        type=int,
+        default=DEFAULT_COMPOSE_RUN_ONCE_TIMEOUT_SECONDS,
+    )
+    compose_run_once.add_argument(
+        "--operation-id",
+        type=_canonical_compose_run_once_operation_id,
+        help="reuse the exact UUID after a lost or uncertain broker reply",
+    )
     logs = docker_sub.add_parser("logs")
     logs.add_argument("--container", required=True)
     logs.add_argument("--tail", default="80")
@@ -18495,7 +19946,12 @@ def build_parser() -> argparse.ArgumentParser:
     serve = api_sub.add_parser("serve")
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=DEFAULT_API_PORT)
-    serve.add_argument("--token-file")
+    serve.add_argument("--profile")
+    serve.add_argument(
+        "--systemd-socket",
+        action="store_true",
+        help="Adopt the sole systemd descriptor named api.",
+    )
     return parser
 
 
@@ -18614,47 +20070,33 @@ def handle_cli(args: argparse.Namespace) -> Any:
         return handle_broker_cli(args)
     if args.group == "ephemeral":
         return coordinated_ephemeral_action(args)
-    if args.group == "test" and args.action == "run":
-        profile = configured_broker_profile()
-        if profile is None:
-            raise TestHarnessError(
-                "universal test execution requires the configured host broker"
-            )
-        runner = UniversalTestRunner(
-            root=Path(canonical_project(args.project)),
-            profile=profile,
-            agent=args.agent,
-        )
-        return runner.run(
-            profile_name=args.profile,
-            group_names=args.test_groups or (),
-            selectors=args.select,
-        )
-    if args.group == "test" and args.action == "stats":
-        if not 1 <= args.days <= 3650 or not 1 <= args.limit <= 500:
-            raise ValueError("test stats require days 1-3650 and limit 1-500")
-        profile = configured_broker_profile()
-        if profile is None:
-            raise TestHarnessError(
-                "universal test statistics require the configured host broker"
-            )
-        return test_statistics(
-            profile=profile,
-            project=canonical_project(args.project),
-            days=args.days,
-            limit=args.limit,
+    if args.group == "test":
+        return handle_universal_test_cli(
+            args,
+            canonical_project=canonical_project,
+            broker_profile_loader=configured_broker_profile,
+            statistics_reader=coordinated_test_statistics_read,
         )
     if args.group == "observe":
         return coordinated_observe_host(namespace_to_options(args))
     if args.group == "runtime":
+        operation_id: str | None = None
         try:
+            operation_id = runtime_cli_operation_id(args)
             request = load_runtime_cli_request(args)
         except (OSError, RuntimeRequestError, ValueError) as error:
             context = getattr(error, "request_context", None)
             if not isinstance(context, Mapping):
                 context = runtime_cli_error_context(args)
-            return _runtime_error_envelope(dict(context), error)
-        return coordinated_runtime_request(request)
+            return _runtime_error_envelope(
+                dict(context),
+                error,
+                operation_id=operation_id,
+            )
+        return coordinated_runtime_request(
+            request,
+            operation_id=operation_id,
+        )
     if args.group == "state" and args.action == "reset":
         if not args.force:
             raise SystemExit("--force is required")
@@ -18727,6 +20169,8 @@ def handle_cli(args: argparse.Namespace) -> Any:
         if args.all:
             command.append("--all")
         return coordinated_run_docker(command, dry_run=args.dry_run)
+    if args.group == "docker" and args.action == "compose-run-once":
+        return coordinated_compose_run_once(args)
     if args.group == "docker" and args.action in {"compose-up", "compose-down"}:
         command = ["docker", "compose"]
         for file_name in args.file:
@@ -18769,6 +20213,25 @@ def handle_cli(args: argparse.Namespace) -> Any:
         return coordinated_release_port(namespace_to_options(args))
     if args.group == "port" and args.action == "unassign":
         return coordinated_unassign_port(namespace_to_options(args))
+    if authority_mode() == "system":
+        if args.group == "state" and args.action == "show":
+            return broker_authority_inventory()
+        if args.group == "server" and args.action == "list":
+            return _broker_server_rows()
+        if args.group == "port":
+            if args.action == "list":
+                leases, _assignments = _broker_port_rows()
+                return leases
+            if args.action == "assignments":
+                requested_project = (
+                    canonical_project(args.project)
+                    if args.project is not None
+                    else None
+                )
+                _leases, assignments = _broker_port_rows(
+                    project=requested_project
+                )
+                return assignments
     if state_backend() != LEGACY_JSON_BACKEND:
         if args.group == "state" and args.action == "show":
             return normalized_control_snapshot()
@@ -18937,14 +20400,23 @@ class BoundedThreadingHTTPServer(http.server.ThreadingHTTPServer):
         server_address: tuple[str, int],
         handler: type[http.server.BaseHTTPRequestHandler],
         *,
-        token: str,
+        listener: socket.socket | None = None,
     ):
-        self.api_token = token
         self._request_slots = threading.BoundedSemaphore(API_MAX_CONCURRENT_REQUESTS)
         self._work_slots = threading.BoundedSemaphore(
             API_MAX_CONCURRENT_REQUESTS - API_RESERVED_CONTROL_REQUESTS
         )
-        super().__init__(server_address, handler)
+        super().__init__(server_address, handler, bind_and_activate=listener is None)
+        if listener is not None:
+            # HTTPServer created one unused socket with bind_and_activate=False.
+            # Replace it with PID 1's already-listening descriptor; never bind
+            # a second port during code replacement.
+            self.socket.close()
+            self.socket = listener
+            self.server_address = listener.getsockname()
+            host, port = self.server_address[:2]
+            self.server_name = str(host)
+            self.server_port = int(port)
 
     def server_bind(self) -> None:
         """Bind without HTTPServer's reverse-DNS lookup.
@@ -19007,7 +20479,6 @@ def _validated_api_profile_identity() -> tuple[Path, tuple[int, ...]] | None:
         load_broker_profile(
             path=path,
             required=True,
-            allow_expired_for_ephemeral_cleanup=True,
         )
         after = _api_profile_identity(path)
         if before is not None and before == after:
@@ -19614,6 +21085,7 @@ API_GET_ROUTES = frozenset(
     {
         "/v1/ready",
         "/v1/inventory",
+        "/v1/inventory/source",
         "/v1/inventory/no-docker",
         "/v1/state",
         "/v1/ports",
@@ -19622,9 +21094,31 @@ API_GET_ROUTES = frozenset(
         "/v1/archives",
         "/v1/events",
         "/v1/tests",
+        "/v1/test-fleet",
         "/v1/test-repositories",
+        "/v1/test-runs",
+        "/v1/test-events",
     }
 )
+
+_TEST_RUN_API_PATH = re.compile(
+    r"^/v1/test-runs/([^/]+)(?:/(summary|failures|artifacts|cases|cancel|retry))?$"
+)
+_TEST_REPOSITORY_SETUP_API_PATH = re.compile(
+    r"^/v1/test-repositories/([^/]+)/setup$"
+)
+
+
+def _is_dynamic_test_get_route(path: str) -> bool:
+    match = _TEST_RUN_API_PATH.fullmatch(path)
+    if match is not None and match.group(2) not in {"cancel", "retry"}:
+        return True
+    return _TEST_REPOSITORY_SETUP_API_PATH.fullmatch(path) is not None
+
+
+def _is_dynamic_test_post_route(path: str) -> bool:
+    match = _TEST_RUN_API_PATH.fullmatch(path)
+    return match is not None and match.group(2) in {"cancel", "retry"}
 API_POST_ROUTES = frozenset(
     {
         "/v1/runtime",
@@ -19656,6 +21150,8 @@ API_POST_ROUTES = frozenset(
         "/v1/lifecycle/apply",
         "/v1/lifecycle/restore",
         "/v1/observe",
+        "/v1/test-plan",
+        "/v1/test-runs",
     }
 )
 
@@ -19747,6 +21243,373 @@ def parse_test_stats_query(raw_query: str) -> dict[str, Any]:
     return {"project": project, "days": days, "limit": limit}
 
 
+def parse_test_fleet_query(raw_query: str) -> dict[str, int]:
+    if not raw_query:
+        return {"hours": 24}
+    values = parse_qs(
+        raw_query,
+        keep_blank_values=True,
+        strict_parsing=True,
+        max_num_fields=1,
+    )
+    if set(values) != {"hours"} or len(values["hours"]) != 1:
+        raise ValueError("fleet test statistics accept one hours parameter")
+    raw_hours = values["hours"][0]
+    if not raw_hours.isdigit():
+        raise ValueError("fleet test statistics hours must be an integer")
+    hours = int(raw_hours)
+    if not 1 <= hours <= 168:
+        raise ValueError("fleet test statistics hours must be from 1 through 168")
+    return {"hours": hours}
+
+
+_TEST_RUN_STATES = frozenset(
+    {
+        "queued",
+        "running",
+        "cancelling",
+        "superseding",
+        "succeeded",
+        "failed",
+        "timed_out",
+        "cancelled",
+        "incomplete",
+        "abandoned",
+        "superseded",
+    }
+)
+
+
+def _test_entity_id(value: object, field: str, *, maximum: int = 256) -> str:
+    candidate = str(value or "")
+    if (
+        not candidate
+        or len(candidate) > maximum
+        or candidate[0] in "_.:@-"
+        or any(character not in OPAQUE_IDENTIFIER_CHARS for character in candidate)
+    ):
+        raise ValueError(f"{field} is invalid")
+    return candidate
+
+
+def _single_query_values(
+    raw_query: str,
+    *,
+    allowed: frozenset[str],
+    required: frozenset[str],
+) -> dict[str, str]:
+    values = parse_qs(
+        raw_query,
+        keep_blank_values=True,
+        strict_parsing=True,
+        max_num_fields=len(allowed),
+    )
+    if required - set(values) or set(values) - allowed or any(
+        len(items) != 1 for items in values.values()
+    ):
+        raise ValueError("test query parameters are invalid")
+    return {name: items[0] for name, items in values.items()}
+
+
+def parse_test_run_list_query(raw_query: str) -> dict[str, Any]:
+    values = _single_query_values(
+        raw_query,
+        allowed=frozenset({"repo_id", "after", "limit", "state"}),
+        required=frozenset({"repo_id"}),
+    )
+    repository_id = _test_entity_id(values["repo_id"], "repo_id")
+    raw_limit = values.get("limit", "50")
+    if not raw_limit.isdigit() or not 1 <= int(raw_limit) <= 200:
+        raise ValueError("test run history limit must be from 1 through 200")
+    result: dict[str, Any] = {
+        "repository_id": repository_id,
+        "limit": int(raw_limit),
+    }
+    if "after" in values:
+        result["after"] = _test_entity_id(values["after"], "after")
+    if "state" in values:
+        if values["state"] not in _TEST_RUN_STATES:
+            raise ValueError("test run state is invalid")
+        result["state"] = values["state"]
+    return result
+
+
+def parse_test_events_query(raw_query: str) -> dict[str, Any]:
+    values = _single_query_values(
+        raw_query,
+        allowed=frozenset({"repo_id", "after", "limit"}),
+        required=frozenset({"repo_id"}),
+    )
+    raw_after = values.get("after", "0")
+    raw_limit = values.get("limit", "200")
+    if not raw_after.isdigit() or not raw_limit.isdigit():
+        raise ValueError("test event cursor and limit must be integers")
+    after = int(raw_after)
+    limit = int(raw_limit)
+    if after < 0 or not 1 <= limit <= 500:
+        raise ValueError("test event cursor or limit is invalid")
+    return {
+        "repository_id": _test_entity_id(values["repo_id"], "repo_id"),
+        "after_event_id": after,
+        "limit": limit,
+    }
+
+
+def parse_test_evidence_query(raw_query: str, *, cases: bool) -> dict[str, Any]:
+    values = _single_query_values(
+        raw_query,
+        allowed=frozenset({"repo_id", "after", "limit"}),
+        required=frozenset({"repo_id"}),
+    )
+    raw_limit = values.get("limit", "25")
+    if not raw_limit.isdigit() or not 1 <= int(raw_limit) <= 50:
+        raise ValueError("test evidence limit must be from 1 through 50")
+    result: dict[str, Any] = {
+        "repository_id": _test_entity_id(values["repo_id"], "repo_id"),
+        "limit": int(raw_limit),
+    }
+    if cases:
+        raw_after = values.get("after", "0")
+        if not raw_after.isdigit():
+            raise ValueError("test case cursor must be non-negative")
+        result["after"] = int(raw_after)
+    elif "after" in values:
+        result["after"] = _test_entity_id(values["after"], "after")
+    return result
+
+
+def parse_test_run_identity_query(raw_query: str) -> str:
+    values = _single_query_values(
+        raw_query,
+        allowed=frozenset({"repo_id"}),
+        required=frozenset({"repo_id"}),
+    )
+    return _test_entity_id(values["repo_id"], "repo_id")
+
+
+def _async_test_profile() -> BrokerClientProfile:
+    profile = configured_broker_profile()
+    if profile is None:
+        raise RuntimeError(
+            "asynchronous test operations are unavailable without the protected broker profile"
+        )
+    return profile
+
+
+def coordinated_test_runs_read(
+    *,
+    repository_id: str,
+    after: str | None = None,
+    limit: int = 50,
+    state: str | None = None,
+) -> dict[str, Any]:
+    result = _async_test_profile().test_runs(
+        repository=repository_id,
+        after=after,
+        limit=limit,
+        state=state,
+    )
+    if result.get("repository_id") != repository_id or not isinstance(
+        result.get("runs"), list
+    ):
+        raise RuntimeError("broker returned contradictory test run history")
+    return dict(result)
+
+
+def coordinated_test_run_status_read(
+    *, repository_id: str, run_id: str
+) -> dict[str, Any]:
+    result = _async_test_profile().test_run_status(
+        repository=repository_id, run_id=run_id
+    )
+    if result.get("run_id") != run_id or result.get("repository_id") != repository_id:
+        raise RuntimeError("broker returned contradictory test run identity")
+    return dict(result)
+
+
+def coordinated_test_run_summary_read(
+    *, repository_id: str, run_id: str
+) -> dict[str, Any]:
+    result = _async_test_profile().test_run_summary(
+        repository=repository_id, run_id=run_id
+    )
+    if result.get("run_id") != run_id or result.get("repository_id") != repository_id:
+        raise RuntimeError("broker returned contradictory test run summary")
+    return dict(result)
+
+
+def coordinated_test_run_evidence_read(
+    *,
+    repository_id: str,
+    run_id: str,
+    kind: str,
+    after: str | int | None,
+    limit: int,
+) -> dict[str, Any]:
+    profile = _async_test_profile()
+    if kind == "failures":
+        result = profile.test_run_failures(
+            repository=repository_id,
+            run_id=run_id,
+            after=None if after is None else str(after),
+            limit=limit,
+        )
+        collection = "failures"
+    elif kind == "artifacts":
+        result = profile.test_run_artifacts(
+            repository=repository_id,
+            run_id=run_id,
+            after=None if after is None else str(after),
+            limit=limit,
+        )
+        collection = "artifacts"
+    elif kind == "cases":
+        result = profile.test_run_cases(
+            repository=repository_id,
+            run_id=run_id,
+            after=int(after or 0),
+            limit=limit,
+        )
+        collection = "cases"
+    else:
+        raise ValueError("test evidence kind is invalid")
+    if (
+        result.get("run_id") != run_id
+        or result.get("repository_id") != repository_id
+        or not isinstance(result.get(collection), list)
+    ):
+        raise RuntimeError("broker returned contradictory test evidence")
+    return dict(result)
+
+
+def coordinated_test_events_read(
+    *, repository_id: str, after_event_id: int = 0, limit: int = 200
+) -> dict[str, Any]:
+    result = _async_test_profile().test_events(
+        repository=repository_id,
+        after_event_id=after_event_id,
+        limit=limit,
+    )
+    if result.get("repository_id") != repository_id or not isinstance(
+        result.get("events"), list
+    ):
+        raise RuntimeError("broker returned contradictory test events")
+    return dict(result)
+
+
+def coordinated_test_repository_setup_read(*, repository_id: str) -> dict[str, Any]:
+    result = _async_test_profile().test_repository_setup(repository=repository_id)
+    if result.get("repository_id") != repository_id or result.get("status") not in {
+        "ready",
+        "missing",
+        "invalid",
+    }:
+        raise RuntimeError("broker returned contradictory test repository setup")
+    return dict(result)
+
+
+def _test_mutation_payload(
+    payload: Mapping[str, Any], *, required: frozenset[str]
+) -> dict[str, Any]:
+    required = required | {"actor"}
+    if set(payload) != required:
+        raise ValueError("test run mutation fields are invalid")
+    operation_id = str(payload.get("operation_id") or "")
+    try:
+        if str(uuid.UUID(operation_id)) != operation_id:
+            raise ValueError
+    except (ValueError, AttributeError):
+        raise ValueError("test mutation operation_id must be a canonical UUID") from None
+    actor = payload["actor"]
+    if (
+        not isinstance(actor, str)
+        or not actor
+        or len(actor) > 256
+        or any(character in actor for character in "\x00\r\n")
+    ):
+        raise ValueError("test mutation actor is invalid")
+    return dict(payload)
+
+
+def coordinated_test_run_cancel(
+    *, run_id: str, payload: Mapping[str, Any]
+) -> dict[str, Any]:
+    values = _test_mutation_payload(
+        payload, required=frozenset({"repo_id", "reason", "operation_id"})
+    )
+    reason = values["reason"]
+    if (
+        not isinstance(reason, str)
+        or not reason
+        or len(reason) > 512
+        or any(character in reason for character in "\x00\r\n")
+    ):
+        raise ValueError("test cancellation reason is invalid")
+    repository_id = _test_entity_id(values["repo_id"], "repo_id")
+    result = _async_test_profile().cancel_test_run(
+        repository=repository_id,
+        run_id=run_id,
+        reason=reason,
+        operation_id=str(values["operation_id"]),
+        actor=str(values["actor"]),
+    )
+    if result.get("run_id") != run_id or result.get("repository_id") != repository_id:
+        raise RuntimeError("broker returned contradictory test cancellation")
+    return dict(result)
+
+
+def coordinated_test_run_retry(
+    *, run_id: str, payload: Mapping[str, Any]
+) -> dict[str, Any]:
+    values = _test_mutation_payload(
+        payload, required=frozenset({"repo_id", "failed_only", "operation_id"})
+    )
+    if type(values["failed_only"]) is not bool:
+        raise ValueError("test retry failed_only must be boolean")
+    expected_repository_id = _test_entity_id(values["repo_id"], "repo_id")
+    result = _async_test_profile().retry_test_run(
+        repository=expected_repository_id,
+        run_id=run_id,
+        failed_only=bool(values["failed_only"]),
+        operation_id=str(values["operation_id"]),
+        actor=str(values["actor"]),
+    )
+    retry_run_id = result.get("run_id")
+    if (
+        not isinstance(retry_run_id, str)
+        or not retry_run_id
+        or len(retry_run_id) > 128
+        or retry_run_id[0] in "_.:@-"
+        or any(character not in OPAQUE_IDENTIFIER_CHARS for character in retry_run_id)
+        or result.get("repository_id") != expected_repository_id
+    ):
+        raise RuntimeError("broker returned contradictory test retry")
+    return dict(result)
+
+
+def _test_read_authority() -> str:
+    """Return the explicit/final test statistics authority.
+
+    The server-wide product fails closed on TestDB/testd.  Legacy authority
+    reads remain available only to the explicitly selected account-mode
+    compatibility surface and can never be enabled for a production service.
+    """
+
+    configured = str(os.environ.get(TEST_READ_AUTHORITY_ENV) or "").strip().lower()
+    mode = authority_mode()
+    if not configured:
+        return "legacy" if mode == "account" else "testd"
+    if configured not in {"testd", "legacy"}:
+        raise ValueError(
+            f"{TEST_READ_AUTHORITY_ENV} must be 'testd' or 'legacy'"
+        )
+    if configured == "legacy" and mode != "account":
+        raise RuntimeError(
+            "legacy test reads are forbidden outside explicit account authority mode"
+        )
+    return configured
+
+
 def coordinated_test_statistics_read(
     *, project: str, days: int, limit: int
 ) -> dict[str, Any]:
@@ -19769,6 +21632,12 @@ def coordinated_test_statistics_read(
             limit=limit,
         )
 
+    if _test_read_authority() == "testd":
+        raise RuntimeError(
+            "TestDB/testd is the active test read authority, but its protected "
+            "broker profile is unavailable; legacy authority statistics are fenced"
+        )
+
     database_path = coordinator_home() / NORMALIZED_DATABASE_NAME
     with AccountStore.open_default_read_only(coordinator_home()) as store:
         with store.read_transaction() as connection:
@@ -19788,6 +21657,25 @@ def coordinated_test_statistics_read(
     )
 
 
+def coordinated_test_fleet_read(*, hours: int = 24) -> dict[str, Any]:
+    """Read one host-wide bounded test projection through active authority."""
+
+    profile = configured_broker_profile()
+    if profile is not None:
+        return profile.fleet_test_statistics(hours=hours)
+    if _test_read_authority() == "testd":
+        raise RuntimeError(
+            "TestDB/testd is the active test read authority, but its protected "
+            "broker profile is unavailable; legacy authority fleet statistics are fenced"
+        )
+    records = CoordinatorTestRecords(
+        coordinator_home() / NORMALIZED_DATABASE_NAME,
+        expected_uid=os.geteuid(),
+        busy_timeout_ms=5_000,
+    )
+    return records.fleet_overview(hours=hours)
+
+
 def coordinated_test_repository_list() -> dict[str, Any]:
     """Return the lightweight enrolled repository catalog for test views.
 
@@ -19798,24 +21686,44 @@ def coordinated_test_repository_list() -> dict[str, Any]:
 
     profile = configured_broker_profile()
     if profile is not None:
-        repositories = [
-            {
-                "repo_id": repository.repo_id,
-                "canonical_root": repository.canonical_root,
-                "display_name": Path(repository.canonical_root).name
-                or repository.canonical_root,
-            }
-            for repository in profile.repositories.values()
-            if repository.enabled
-        ]
+        result = profile.test_repository_catalog()
+        repositories = list(result.get("repositories") or [])
+        expected_ids: set[str] = set()
+        for repository in profile.repositories.values():
+            try:
+                repository.require_current(
+                    account_id=profile.repository_account_id(repository)
+                )
+            except BrokerProfileError:
+                continue
+            expected_ids.add(repository.repo_id)
+        if (
+            {str(row.get("repo_id") or "") for row in repositories}
+            != expected_ids
+            or any(
+                row.get("setup_status") not in {"ready", "missing", "invalid"}
+                for row in repositories
+            )
+        ):
+            raise RuntimeError("broker returned contradictory test repository catalog")
     else:
+        if _test_read_authority() == "testd":
+            raise RuntimeError(
+                "TestDB/testd is the active test read authority, but its protected "
+                "broker profile is unavailable; legacy repository catalog is fenced"
+            )
         with AccountStore.open_default_read_only(coordinator_home()) as store:
             with store.read_transaction() as connection:
                 repositories = [
-                    dict(row)
+                    {
+                        **dict(row),
+                        "setup_status": "missing",
+                        "setup_observed_at": None,
+                        "setup_retained": False,
+                    }
                     for row in connection.execute(
                         """
-                        SELECT repo_id, canonical_root, display_name
+                        SELECT repo_id, display_name
                         FROM repositories
                         WHERE state = 'active'
                         ORDER BY lower(display_name), canonical_root, repo_id
@@ -19825,11 +21733,213 @@ def coordinated_test_repository_list() -> dict[str, Any]:
     repositories.sort(
         key=lambda row: (
             str(row["display_name"]).casefold(),
-            str(row["canonical_root"]),
+            str(row.get("canonical_root") or ""),
             str(row["repo_id"]),
         )
     )
     return {"schema_version": 1, "repositories": repositories}
+
+
+def coordinated_test_plan_preview(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Request one server-derived plan from an exact protected source identity."""
+
+    if not {"repo_id", "intent", "operation_id", "source"}.issubset(payload) or set(payload) - {
+        "repo_id",
+        "intent",
+        "operation_id",
+        "source",
+        "requested_targets",
+    }:
+        raise ValueError(
+            "test planning accepts repo_id, intent, operation_id, source, and optional requested_targets"
+        )
+    repo_id = str(payload.get("repo_id") or "")
+    intent = str(payload.get("intent") or "")
+    operation_id = str(payload.get("operation_id") or "")
+    if (
+        not repo_id
+        or len(repo_id) > 128
+        or repo_id[0] in "_.:@-"
+        or any(character not in OPAQUE_IDENTIFIER_CHARS for character in repo_id)
+    ):
+        raise ValueError("test planning requires one immutable repository id")
+    if intent not in {"change", "checkpoint", "handoff", "release", "manual"}:
+        raise ValueError("test planning intent is invalid")
+    try:
+        if str(uuid.UUID(operation_id)) != operation_id:
+            raise ValueError
+    except (ValueError, AttributeError):
+        raise ValueError("test planning operation_id must be a canonical UUID") from None
+    requested_raw = payload.get("requested_targets", [])
+    if not isinstance(requested_raw, list) or len(requested_raw) > 256:
+        raise ValueError("test planning requested_targets must be a bounded array")
+    requested_targets: list[str] = []
+    for target in requested_raw:
+        if (
+            not isinstance(target, str)
+            or not target.strip()
+            or len(target.strip().encode("utf-8")) > 128
+            or any(character in target for character in "\x00\r\n")
+        ):
+            raise ValueError("test planning requested target is invalid")
+        requested_targets.append(target.strip())
+    if len(set(requested_targets)) != len(requested_targets):
+        raise ValueError("test planning requested_targets must be unique")
+    if requested_targets and intent != "manual":
+        raise ValueError(
+            "test planning requested_targets are supported only for manual intent"
+        )
+    profile = configured_broker_profile()
+    if profile is None:
+        raise RuntimeError(
+            "asynchronous test planning is unavailable without the protected broker profile"
+        )
+    source = payload.get("source")
+    if not isinstance(source, Mapping) or set(source) != {
+        "schema_version",
+        "kind",
+        "repository_id",
+        "repository_generation",
+    }:
+        raise ValueError("test planning source fields are invalid")
+    if source.get("schema_version") != 1 or source.get("kind") not in {
+        "original",
+        "temporary",
+    }:
+        raise ValueError("test planning source selector is unsupported")
+    source_repo_id = source.get("repository_id")
+    source_generation = source.get("repository_generation")
+    if (
+        not isinstance(source_repo_id, str)
+        or not source_repo_id
+        or len(source_repo_id) > 128
+        or source_repo_id[0] in "_.:@-"
+        or any(character not in OPAQUE_IDENTIFIER_CHARS for character in source_repo_id)
+        or not isinstance(source_generation, int)
+        or isinstance(source_generation, bool)
+        or source_generation < 0
+    ):
+        raise ValueError("test planning source identity is invalid")
+    root_repository = profile.repository_by_id(repo_id)
+    if source["kind"] == "original":
+        if (
+            source_repo_id != root_repository.repo_id
+            or source_generation != root_repository.generation
+        ):
+            raise ValueError("original test source identity is stale")
+        temporary_root = None
+    else:
+        if source_repo_id == root_repository.repo_id:
+            raise ValueError("temporary test source must identify a nested repository")
+        temporary_repository = profile.repository_by_id(source_repo_id)
+        if source_generation != temporary_repository.generation:
+            raise ValueError("temporary test source identity is stale")
+        temporary_root = temporary_repository.canonical_root
+    result = profile.preview_test_plan(
+        repository=repo_id,
+        intent=intent,
+        temporary_root=temporary_root,
+        requested_targets=requested_targets,
+        operation_id=operation_id,
+    )
+    if (
+        result.get("repository_id") != repo_id
+        or result.get("intent") != intent
+        or not isinstance(result.get("plan_id"), str)
+        or not result["plan_id"]
+        or result.get("operation_id") != operation_id
+    ):
+        raise RuntimeError("broker returned a contradictory test plan identity")
+    return dict(result)
+
+
+def coordinated_test_run_submit(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Submit one pre-registered plan with exact repo and idempotency fences."""
+
+    if set(payload) != {"repo_id", "plan_id", "operation_id", "actor"}:
+        raise ValueError(
+            "test submission requires exactly repo_id, plan_id, operation_id, and actor"
+        )
+    repo_id = str(payload.get("repo_id") or "")
+    plan_id = str(payload.get("plan_id") or "")
+    operation_id = str(payload.get("operation_id") or "")
+    actor = payload["actor"]
+    if (
+        not isinstance(actor, str)
+        or not actor
+        or len(actor) > 256
+        or any(character in actor for character in "\x00\r\n")
+    ):
+        raise ValueError("test submission actor is invalid")
+    if (
+        not repo_id
+        or len(repo_id) > 128
+        or repo_id[0] in "_.:@-"
+        or any(character not in OPAQUE_IDENTIFIER_CHARS for character in repo_id)
+    ):
+        raise ValueError("test submission requires one immutable repository id")
+    if (
+        not plan_id
+        or len(plan_id) > 128
+        or plan_id[0] in "_.:@-"
+        or any(character not in OPAQUE_IDENTIFIER_CHARS for character in plan_id)
+    ):
+        raise ValueError("test submission requires one opaque plan id")
+    try:
+        if str(uuid.UUID(operation_id)) != operation_id:
+            raise ValueError
+    except (ValueError, AttributeError):
+        raise ValueError("test submission operation_id must be a canonical UUID") from None
+    profile = configured_broker_profile()
+    if profile is None:
+        raise RuntimeError(
+            "asynchronous test submission is unavailable without the protected broker profile"
+        )
+    result = profile.submit_test_plan(
+        repository=repo_id,
+        plan_id=plan_id,
+        operation_id=operation_id,
+        actor=str(actor),
+    )
+    if result.get("repository_id") != repo_id or not isinstance(
+        result.get("run_id"), str
+    ):
+        raise RuntimeError("broker returned a contradictory test run identity")
+    return dict(result)
+
+
+class _ApiResponseDeliveryError(RuntimeError):
+    """The response could not be completely delivered to the HTTP client."""
+
+
+def _api_call_journal_context(
+    path: str,
+) -> tuple[str, str | None, str | None]:
+    """Return a fixed route template and safe dynamic test correlation only."""
+
+    if path in API_GET_ROUTES or path in API_POST_ROUTES or path == "/healthz":
+        return path.strip("/").replace("/", ".") or "root", None, None
+    if path.startswith("/v1/runtime/artifacts/"):
+        return "v1.runtime.artifacts.item", None, None
+    run_match = _TEST_RUN_API_PATH.fullmatch(path)
+    if run_match is not None:
+        try:
+            run_id = _test_entity_id(
+                unquote(run_match.group(1), errors="strict"), "run_id"
+            )
+        except (UnicodeError, ValueError):
+            run_id = None
+        return "v1.tests.resource", run_id, None
+    setup_match = _TEST_REPOSITORY_SETUP_API_PATH.fullmatch(path)
+    if setup_match is not None:
+        try:
+            repository_id = _test_entity_id(
+                unquote(setup_match.group(1), errors="strict"), "repo_id"
+            )
+        except (UnicodeError, ValueError):
+            repository_id = None
+        return "v1.tests.resource", None, repository_id
+    return "unknown", None, None
 
 
 class ApiHandler(http.server.BaseHTTPRequestHandler):
@@ -19843,20 +21953,52 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
         self, status: int, payload: Any, *, headers: dict[str, str] | None = None
     ) -> None:
         body = json.dumps(payload, indent=2, sort_keys=True).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("X-Content-Type-Options", "nosniff")
-        if status == 401:
-            self.send_header("WWW-Authenticate", 'Bearer realm="codex-dev-coordinator"')
-        for name, value in (headers or {}).items():
-            self.send_header(name, value)
-        self.end_headers()
-        # HEAD describes the same representation as the corresponding request
-        # while never writing that representation to the connection.
-        if self.command != "HEAD":
-            self.wfile.write(body)
+        self._deliver_response(
+            status,
+            body,
+            content_type="application/json",
+            response_code=(
+                payload.get("code")
+                if isinstance(payload, Mapping)
+                and isinstance(payload.get("code"), str)
+                else None
+            ),
+            headers=headers,
+            body_allowed=self.command != "HEAD",
+        )
+
+    def _deliver_response(
+        self,
+        status: int,
+        body: bytes,
+        *,
+        content_type: str,
+        response_code: str | None,
+        headers: Mapping[str, str] | None = None,
+        body_allowed: bool = True,
+    ) -> None:
+        self._call_response_status = status
+        self._call_response_code = response_code
+        self._call_response_delivered = False
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            for name, value in (headers or {}).items():
+                self.send_header(name, value)
+            self.end_headers()
+            if body_allowed:
+                self.wfile.write(body)
+            self.wfile.flush()
+        except Exception as exc:
+            self._call_delivery_error = exc
+            raise _ApiResponseDeliveryError(
+                "HTTP response delivery did not complete"
+            ) from exc
+        self._call_response_delivered = True
+        self._call_delivery_error = None
 
     def _send_runtime_artifact(self, payload: Mapping[str, Any]) -> None:
         text_value = payload.get("text")
@@ -19865,13 +22007,12 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
         body = text_value.encode("utf-8")
         if len(body) > RUNTIME_ARTIFACT_MAX_BYTES:
             raise RuntimeError("runtime log artifact exceeds the 1 MiB limit")
-        self.send_response(200)
-        self.send_header("Content-Type", "text/plain; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("X-Content-Type-Options", "nosniff")
-        self.end_headers()
-        self.wfile.write(body)
+        self._deliver_response(
+            200,
+            body,
+            content_type="text/plain; charset=utf-8",
+            response_code=None,
+        )
 
     def _method_not_allowed(self, allowed: tuple[str, ...]) -> None:
         self._send(
@@ -19947,29 +22088,54 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
                 return False
         return True
 
-    def _authorized(self) -> bool:
-        header = self.headers.get("Authorization") or ""
-        scheme, _, supplied = header.partition(" ")
-        expected = str(getattr(self.server, "api_token", ""))
-        return (
-            scheme.lower() == "bearer"
-            and bool(supplied)
-            and hmac.compare_digest(supplied, expected)
-        )
-
-    def _require_authorization(self) -> bool:
-        if self._authorized():
-            return True
-        self._send(401, {"error": "unauthorized"})
-        return False
-
     def log_message(self, format: str, *args: Any) -> None:
         print(f"{self.address_string()} - {format % args}", file=sys.stderr)
 
     def _handle_get(self, path: str, raw_query: str = "") -> None:
         runtime_artifact = path.startswith("/v1/runtime/artifacts/")
         try:
-            if runtime_artifact:
+            test_run_match = _TEST_RUN_API_PATH.fullmatch(path)
+            test_setup_match = _TEST_REPOSITORY_SETUP_API_PATH.fullmatch(path)
+            if test_run_match is not None:
+                run_id = _test_entity_id(
+                    unquote(test_run_match.group(1), errors="strict"), "run_id"
+                )
+                action = test_run_match.group(2)
+                if action in {"cancel", "retry"}:
+                    self._send(404, {"error": "not found"})
+                    return
+                if action in {None, "summary"}:
+                    repository_id = parse_test_run_identity_query(raw_query)
+                    result = (
+                        coordinated_test_run_status_read(
+                            repository_id=repository_id, run_id=run_id
+                        )
+                        if action is None
+                        else coordinated_test_run_summary_read(
+                            repository_id=repository_id, run_id=run_id
+                        )
+                    )
+                else:
+                    query = parse_test_evidence_query(
+                        raw_query, cases=action == "cases"
+                    )
+                    result = coordinated_test_run_evidence_read(
+                        repository_id=str(query["repository_id"]),
+                        run_id=run_id,
+                        kind=action,
+                        after=query.get("after"),
+                        limit=int(query["limit"]),
+                    )
+            elif test_setup_match is not None:
+                if raw_query:
+                    raise ValueError("test repository setup does not accept query parameters")
+                repository_id = _test_entity_id(
+                    unquote(test_setup_match.group(1), errors="strict"), "repo_id"
+                )
+                result = coordinated_test_repository_setup_read(
+                    repository_id=repository_id
+                )
+            elif runtime_artifact:
                 parts = path.split("/")
                 if len(parts) != 6 or parts[:4] != ["", "v1", "runtime", "artifacts"]:
                     raise ValueError("invalid runtime artifact path")
@@ -19989,7 +22155,11 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
                     "version": VERSION,
                 }
             elif path == "/v1/inventory":
-                result: Any = coordinated_build_inventory()
+                result: Any = coordinated_retained_inventory()
+            elif path == "/v1/inventory/source":
+                # Internal producer route. The bounded observer is the only
+                # production caller; Console reads use /v1/inventory above.
+                result = coordinated_build_inventory()
             elif path == "/v1/archives":
                 result = coordinated_list_archives()
             elif path == "/v1/events":
@@ -19998,10 +22168,22 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
                 result = coordinated_test_statistics_read(
                     **parse_test_stats_query(raw_query)
                 )
+            elif path == "/v1/test-fleet":
+                result = coordinated_test_fleet_read(
+                    **parse_test_fleet_query(raw_query)
+                )
             elif path == "/v1/test-repositories":
                 if raw_query:
                     raise ValueError("test repository catalog does not accept query parameters")
                 result = coordinated_test_repository_list()
+            elif path == "/v1/test-runs":
+                result = coordinated_test_runs_read(
+                    **parse_test_run_list_query(raw_query)
+                )
+            elif path == "/v1/test-events":
+                result = coordinated_test_events_read(
+                    **parse_test_events_query(raw_query)
+                )
             elif path == "/v1/inventory/no-docker":
                 target = parse_registration_inventory_query(raw_query)
                 # An ordinary no-Docker inventory remains a pure committed
@@ -20062,6 +22244,8 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
                 self._send(404, {"error": "not found"})
                 return
             self._send(200, result)
+        except _ApiResponseDeliveryError:
+            raise
         except ValueError as exc:
             self._send(400, {"error": str(exc)})
         except KeyError as exc:
@@ -20075,6 +22259,21 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
     def _handle_post(self, path: str) -> None:
         try:
             payload = self._read_json()
+            test_run_match = _TEST_RUN_API_PATH.fullmatch(path)
+            if test_run_match is not None and test_run_match.group(2) in {
+                "cancel",
+                "retry",
+            }:
+                run_id = _test_entity_id(
+                    unquote(test_run_match.group(1), errors="strict"), "run_id"
+                )
+                result = (
+                    coordinated_test_run_cancel(run_id=run_id, payload=payload)
+                    if test_run_match.group(2) == "cancel"
+                    else coordinated_test_run_retry(run_id=run_id, payload=payload)
+                )
+                self._send(200, result)
+                return
             if path == "/v1/runtime":
                 result = coordinated_runtime_request(
                     payload,
@@ -20107,6 +22306,12 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
                         }
                     ),
                 )
+                return
+            if path == "/v1/test-plan":
+                self._send(200, coordinated_test_plan_preview(payload))
+                return
+            if path == "/v1/test-runs":
+                self._send(200, coordinated_test_run_submit(payload))
                 return
             if path == "/v1/lifecycle/plan":
                 self._send(200, coordinated_lifecycle_plan(payload))
@@ -20244,6 +22449,8 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
                 self._send(404, {"error": "not found"})
                 return
             self._send(404, {"error": "not found"})
+        except _ApiResponseDeliveryError:
+            raise
         except OverflowError as exc:
             self._send(413, {"error": str(exc)})
         except TypeError as exc:
@@ -20251,7 +22458,7 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
         except Exception as exc:
             self._send_exception(exc, default_status=400)
 
-    def _handle_request(self) -> None:
+    def _dispatch_request(self) -> None:
         if not self._request_boundary_ok():
             return
 
@@ -20275,12 +22482,6 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
         protected = path == "/v1" or path.startswith("/v1/")
         if not protected:
             self._send(404, {"error": "not found"})
-            return
-
-        # Authenticate the protected namespace before route or method
-        # dispatch. Otherwise BaseHTTPRequestHandler's inherited unsupported
-        # method path leaks a 501 before the bearer boundary is evaluated.
-        if not self._require_authorization():
             return
 
         # Reserve a fixed part of the listener for liveness/readiness even if
@@ -20309,13 +22510,17 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
 
         try:
             runtime_artifact = path.startswith("/v1/runtime/artifacts/")
-            if path in API_GET_ROUTES or runtime_artifact:
+            if (
+                path in API_GET_ROUTES
+                or runtime_artifact
+                or _is_dynamic_test_get_route(path)
+            ):
                 if method != "GET":
                     self._method_not_allowed(("GET",))
                     return
                 self._handle_get(path, parsed_request.query)
                 return
-            if path in API_POST_ROUTES:
+            if path in API_POST_ROUTES or _is_dynamic_test_post_route(path):
                 if method != "POST":
                     self._method_not_allowed(("POST",))
                     return
@@ -20325,6 +22530,87 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
         finally:
             if work_slot:
                 self.server._work_slots.release()
+
+    def _handle_request(self) -> None:
+        call_id = str(uuid.uuid4())
+        started = time.monotonic()
+        method = self.command.upper()
+        path = urlparse(self.path).path
+        route, run_id, repository_id = _api_call_journal_context(path)
+        operation = f"http.{method}.{route}"
+        self._call_response_status = None
+        self._call_response_code = None
+        self._call_response_delivered = False
+        self._call_delivery_error = None
+        _record_call_best_effort(
+            COORDINATOR_CALL_JOURNAL,
+            event_record(
+                boundary="api",
+                phase="received",
+                call_id=call_id,
+                request_id=call_id,
+                operation=operation,
+                repository_id=repository_id,
+                run_id=run_id,
+                outcome="received",
+            )
+        )
+        try:
+            self._dispatch_request()
+        except _ApiResponseDeliveryError:
+            self.close_connection = True
+        finally:
+            status = self._call_response_status
+            response_code = self._call_response_code
+            delivered = self._call_response_delivered
+            delivery_error = self._call_delivery_error
+            if delivery_error is not None:
+                outcome = "unavailable"
+                code = "http_response_delivery_failed"
+                diagnostic = diagnostic_for_exception(
+                    delivery_error, stage="http_response_delivery"
+                )
+            else:
+                outcome = (
+                    "ok"
+                    if delivered and isinstance(status, int) and status < 400
+                    else "busy"
+                    if delivered
+                    and status == 503
+                    and response_code == "control_plane_busy"
+                    else "unavailable"
+                    if delivered and status == 503
+                    else "rejected"
+                    if delivered and isinstance(status, int)
+                    else "failed"
+                )
+                code = (
+                    None
+                    if outcome == "ok"
+                    else response_code
+                    or (
+                        f"http_{status}"
+                        if delivered and isinstance(status, int)
+                        else "no_response"
+                    )
+                )
+                diagnostic = None
+            _record_call_best_effort(
+                COORDINATOR_CALL_JOURNAL,
+                event_record(
+                    boundary="api",
+                    phase="completed",
+                    call_id=call_id,
+                    request_id=call_id,
+                    operation=operation,
+                    repository_id=repository_id,
+                    run_id=run_id,
+                    duration_seconds=time.monotonic() - started,
+                    outcome=outcome,
+                    code=code,
+                    diagnostic=diagnostic,
+                ),
+            )
 
     def do_GET(self) -> None:  # noqa: N802
         self._handle_request()
@@ -20356,15 +22642,30 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
         raise AttributeError(name)
 
 
-def serve_api(host: str, port: int, *, token_file: str | None = None) -> None:
+def serve_api(
+    host: str,
+    port: int,
+    *,
+    profile: str | None = None,
+    systemd_socket: bool = False,
+) -> None:
     clear_exec_capability_inheritance()
     host = validate_api_bind_host(host)
+    if profile:
+        os.environ[PROFILE_PATH_ENV] = str(Path(profile).expanduser().absolute())
     profile_watch = _validated_api_profile_identity()
-    token_path = (
-        Path(token_file).expanduser().absolute() if token_file else api_token_path()
-    )
-    token = load_or_create_api_token(token_path)
-    server = BoundedThreadingHTTPServer((host, port), ApiHandler, token=token)
+    listener = None
+    if systemd_socket:
+        if host != "127.0.0.1" or port != DEFAULT_API_PORT:
+            raise ValueError(
+                "systemd API activation requires the fixed 127.0.0.1:29876 endpoint"
+            )
+        listener = take_systemd_listener(
+            descriptor_name="api",
+            family=socket.AF_INET,
+            expected_address=(host, port),
+        )
+    server = BoundedThreadingHTTPServer((host, port), ApiHandler, listener=listener)
     profile_watch_stop = threading.Event()
     profile_watch_thread: threading.Thread | None = None
     if profile_watch is not None:
@@ -20387,7 +22688,7 @@ def serve_api(host: str, port: int, *, token_file: str | None = None) -> None:
                 "host": host,
                 "port": actual_port,
                 "url": f"http://{host}:{actual_port}",
-                "token_file": str(token_path),
+                "transport": "trusted-loopback-http",
             }
         ),
         flush=True,
@@ -20479,18 +22780,80 @@ def serve_api(host: str, port: int, *, token_file: str | None = None) -> None:
             )
 
 
-def main(argv: list[str] | None = None) -> int:
-    parser = build_parser()
-    args = parser.parse_args(argv)
+def _notify_cli_failure_observer(
+    observer: Callable[[BaseException, Mapping[str, Any], str], None] | None,
+    error: BaseException,
+    payload: Mapping[str, Any],
+    *,
+    stage: str,
+) -> None:
+    """Keep optional CLI diagnostics outside the command's behavior."""
+
+    if observer is None:
+        return
+    try:
+        observer(error, payload, stage)
+    except Exception:
+        return
+
+
+def _safe_cli_failure_evidence(
+    error: BaseException,
+    *,
+    stage: str,
+    payload: Mapping[str, Any] | None = None,
+) -> dict[str, object]:
+    """Build terminal evidence without allowing diagnostics to affect the CLI."""
+
+    try:
+        failure_payload = (
+            payload if payload is not None else coordinator_exception_payload(error)
+        )
+        code = failure_payload.get("code")
+        message = failure_payload.get("error")
+    except Exception:
+        code = "internal_error"
+        message = None
+    try:
+        diagnostic: Mapping[str, object] | None = diagnostic_for_exception(
+            error,
+            stage=stage,
+        )
+    except Exception:
+        diagnostic = None
+    return {
+        "code": code if isinstance(code, str) else "internal_error",
+        "message": message if isinstance(message, str) else None,
+        "diagnostic": diagnostic,
+    }
+
+
+def _main_parsed(
+    args: argparse.Namespace,
+    *,
+    failure_observer: (
+        Callable[[BaseException, Mapping[str, Any], str], None] | None
+    ) = None,
+) -> int:
     if args.group == "api" and args.action == "serve":
         try:
-            serve_api(args.host, args.port, token_file=args.token_file)
+            serve_api(
+                args.host,
+                args.port,
+                profile=args.profile,
+                systemd_socket=bool(args.systemd_socket),
+            )
             return 0
         except Exception as exc:
+            payload = coordinator_exception_payload(exc)
+            _notify_cli_failure_observer(
+                failure_observer,
+                exc,
+                payload,
+                stage="api_serve",
+            )
             print(
-                json.dumps(
-                    coordinator_exception_payload(exc), indent=2, sort_keys=True
-                ),
+                json.dumps(payload, indent=2, sort_keys=True),
                 file=sys.stderr,
             )
             return 1
@@ -20503,10 +22866,15 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 0
         except Exception as exc:
+            payload = coordinator_exception_payload(exc)
+            _notify_cli_failure_observer(
+                failure_observer,
+                exc,
+                payload,
+                stage="broker_serve",
+            )
             print(
-                json.dumps(
-                    coordinator_exception_payload(exc), indent=2, sort_keys=True
-                ),
+                json.dumps(payload, indent=2, sort_keys=True),
                 file=sys.stderr,
             )
             return 1
@@ -20516,18 +22884,162 @@ def main(argv: list[str] | None = None) -> int:
             result, compact_json=bool(getattr(args, "compact_json", False))
         )
         if (
-            args.group == "runtime"
+            args.group in {"runtime", "test"}
             and isinstance(result, dict)
+            and "ok" in result
             and result.get("ok") is not True
         ):
             return 1
         return 0
     except Exception as exc:
+        payload = coordinator_exception_payload(exc)
+        _notify_cli_failure_observer(
+            failure_observer,
+            exc,
+            payload,
+            stage="command_execution",
+        )
         print(
-            json.dumps(coordinator_exception_payload(exc), indent=2, sort_keys=True),
+            json.dumps(payload, indent=2, sort_keys=True),
             file=sys.stderr,
         )
         return 1
+
+
+def main(argv: list[str] | None = None) -> int:
+    journal = COORDINATOR_CALL_JOURNAL
+    call_id = str(uuid.uuid4())
+    started = time.monotonic()
+    operation = "cli.unknown"
+    operation_id: object = None
+    run_id: object = None
+
+    def record_cli_event(**fields: object) -> None:
+        try:
+            record = event_record(
+                boundary="cli",
+                call_id=call_id,
+                operation=operation,
+                operation_id=(
+                    operation_id if isinstance(operation_id, str) else None
+                ),
+                run_id=run_id if isinstance(run_id, str) else None,
+                **fields,
+            )
+        except Exception:
+            return
+        _record_call_best_effort(journal, record)
+
+    record_cli_event(
+        phase="received",
+        outcome="received",
+    )
+
+    try:
+        parser = build_parser()
+        args = parser.parse_args(argv)
+    except SystemExit as exc:
+        status = exc.code if type(exc.code) is int else 1
+        if status == 0:
+            record_cli_event(
+                phase="completed",
+                duration_seconds=time.monotonic() - started,
+                outcome="ok",
+                code=None,
+            )
+        else:
+            evidence = _safe_cli_failure_evidence(
+                exc,
+                stage="argument_parsing",
+                payload={"code": "cli_argument_error"},
+            )
+            record_cli_event(
+                phase="completed",
+                duration_seconds=time.monotonic() - started,
+                outcome="rejected",
+                code=evidence["code"],
+                diagnostic=evidence["diagnostic"],
+            )
+        raise
+    except BaseException as exc:
+        evidence = _safe_cli_failure_evidence(exc, stage="argument_parsing")
+        record_cli_event(
+            phase="completed",
+            duration_seconds=time.monotonic() - started,
+            outcome="failed",
+            code=evidence["code"],
+            message=evidence["message"],
+            diagnostic=evidence["diagnostic"],
+        )
+        raise
+
+    parsed_group = getattr(args, "group", None)
+    parsed_action = getattr(args, "action", None)
+    if isinstance(parsed_group, str) and isinstance(parsed_action, str):
+        operation = f"cli.{parsed_group}.{parsed_action}"
+    elif isinstance(parsed_group, str):
+        operation = f"cli.{parsed_group}"
+    if parsed_group == "runtime" and getattr(args, "operation_id", None) is None:
+        runtime_cli_operation_id(args)
+    operation_id = getattr(args, "operation_id", None)
+    run_id = getattr(args, "run_id", None)
+    failure_evidence: dict[str, object] | None = None
+
+    def observe_failure(
+        error: BaseException,
+        payload: Mapping[str, Any],
+        stage: str,
+    ) -> None:
+        nonlocal failure_evidence
+        failure_evidence = _safe_cli_failure_evidence(
+            error,
+            stage=stage,
+            payload=payload,
+        )
+
+    exit_code = 1
+    try:
+        exit_code = _main_parsed(args, failure_observer=observe_failure)
+    except BaseException as exc:
+        failure_evidence = _safe_cli_failure_evidence(
+            exc,
+            stage="command_execution",
+        )
+        record_cli_event(
+            phase="completed",
+            duration_seconds=time.monotonic() - started,
+            outcome="failed",
+            code=failure_evidence["code"],
+            message=failure_evidence["message"],
+            diagnostic=failure_evidence["diagnostic"],
+        )
+        raise
+    else:
+        record_cli_event(
+            phase="completed",
+            duration_seconds=time.monotonic() - started,
+            outcome="ok" if exit_code == 0 else "failed",
+            code=(
+                None
+                if exit_code == 0
+                else (
+                    failure_evidence.get("code")
+                    if failure_evidence is not None
+                    else f"cli_exit_{exit_code}"
+                )
+            ),
+            message=(
+                failure_evidence.get("message")
+                if failure_evidence is not None
+                else None
+            ),
+            diagnostic=(
+                failure_evidence.get("diagnostic")
+                if failure_evidence is not None
+                else None
+            ),
+        )
+        return exit_code
 
 
 if __name__ == "__main__":

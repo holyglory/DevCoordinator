@@ -1,18 +1,20 @@
 #!/usr/bin/env python3
-"""Install or roll back the server-wide DevCoordinator system boundary.
+"""Install, explicitly activate, or roll back the server-wide boundary.
 
-The installer deliberately does not start the broker.  Enroll exact users,
-repositories, and server allowlists first, then enable the unit.  Runtime users
-need no sudo after installation: they reach the service through the 0660 Unix
-socket and their Codex/Claude skills are direct links to this repository.
-The complete explicit client set also owns one replacement-style systemd
-drop-in containing only those clients' canonical home write exceptions.
+Apply deliberately does not start the broker.  Enroll exact users,
+repositories, and server allowlists first, verify, then use the separate
+journal-bound ``activate`` action.  Runtime users need no sudo after
+installation: they reach the service through the trusted-local 0666 Unix
+socket and their Codex/Claude skills are direct links to this repository.  The
+complete explicit client set also owns one replacement-style systemd drop-in
+containing only those clients' canonical home write exceptions.
 """
 
 from __future__ import annotations
 
 import argparse
 import ast
+import fcntl
 import grp
 import hashlib
 import json
@@ -22,17 +24,29 @@ import pwd
 import re
 import shlex
 import shutil
+import socket
 import sqlite3
 import stat
+import struct
 import subprocess
 import sys
 import time
 import uuid
 from typing import Any
 
+SCRIPT_ROOT = Path(__file__).resolve().parent
+if str(SCRIPT_ROOT) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_ROOT))
 
-ROOT = Path(__file__).resolve().parents[1]
-ACCESS_GROUP = "devcoordinator-clients"
+from server_wide_installer_fence import (
+    InstallerFenceError,
+    InstallerFenceHandle,
+    acquire_installer_mutex,
+)
+
+
+ROOT = SCRIPT_ROOT.parent
+LEGACY_ACCESS_GROUP = "devcoordinator-clients"
 SERVICE_USER = "root"
 SYSTEM_FILES = {
     ROOT / "deploy/devcoordinator.sysusers.conf": Path(
@@ -50,18 +64,28 @@ ENROLLED_HOME_DROPIN = Path(
     "/etc/systemd/system/devcoordinator-broker.service.d/80-enrolled-home-write-paths.conf"
 )
 ENROLLED_HOME_DROPIN_SOURCE = "generated:enrolled-home-write-paths"
-BASE_READ_WRITE_PATHS = "/var/lib/devcoordinator /run/devcoordinator"
+BASE_READ_WRITE_PATHS = "/var/lib/devcoordinator -/run/devcoordinator"
 BROKER_UNIT_REQUIRED_SANDBOX = {
     "UMask": "UMask=0077",
     "NoNewPrivileges": "NoNewPrivileges=true",
     "PrivateTmp": "PrivateTmp=true",
     "ProtectSystem": "ProtectSystem=strict",
     "ProtectHome": "ProtectHome=read-only",
-    "RuntimeDirectoryPreserve": "RuntimeDirectoryPreserve=restart",
     "ReadWritePaths": f"ReadWritePaths={BASE_READ_WRITE_PATHS}",
 }
+MANAGED_SKILLS = (
+    "codex-dev-coordinator",
+    "postgres-docker-backup",
+)
+AGENT_SKILL_ROOTS = (
+    Path(".codex/skills"),
+    Path(".claude/skills"),
+)
 SKILL_SOURCE = ROOT / "skills/codex-dev-coordinator"
 JOURNAL_NAME = "install-journal.json"
+BROKER_UNIT = "devcoordinator-broker.service"
+BROKER_SOCKET = Path("/run/devcoordinator-authority.sock")
+INSTALLER_LOCK = Path("/run/devcoordinator-installer.lock")
 LEGACY_DOCKER_DROPIN = Path(
     "/etc/systemd/system/devcoordinator-broker.service.d/90-docker-config.conf"
 )
@@ -86,6 +110,7 @@ COMPOSE_VERSION_REQUIREMENT = "stable >=2.17,<3 or >=5,<6"
 AUTHORITY_DATABASE_PATH = Path("/var/lib/devcoordinator/coordinator.sqlite3")
 CLIENT_PROFILE_PATH = Path("/etc/devcoordinator/client-profiles.json")
 PROFILE_DATABASE_ENROLLMENT_DRIFT = "profile_database_enrollment_drift"
+AUTHORITY_SCHEMA_CUTOVER_REQUIRED = "authority_schema_cutover_required"
 DIRECT_DOCKER_SOCKET_ACCESS = "direct_client_docker_socket_access"
 DOCKER_ADMISSION_CONTRACT = "devcoordinator-docker-admission-observe-v1"
 DOCKER_SOURCE_POLICY_CONTRACT = "devcoordinator-managed-docker-source-v1"
@@ -138,6 +163,116 @@ class ProfileDatabaseEnrollmentDrift(InstallError):
     """The protected client profile promises access absent from service state."""
 
     code = PROFILE_DATABASE_ENROLLMENT_DRIFT
+
+
+class AuthoritySchemaCutoverRequired(InstallError):
+    """Activation cannot safely start the installed broker contract yet."""
+
+    code = AUTHORITY_SCHEMA_CUTOVER_REQUIRED
+    classification = "cutover_required"
+    action_required = (
+        "Run the sealed offline repository-owner authority migration, republish "
+        "every protected client profile from the migrated authority, then rerun "
+        "server-wide verify and activate."
+    )
+
+    def __init__(self, evidence: dict[str, Any]) -> None:
+        self.evidence = evidence
+        reasons = ", ".join(
+            sorted(
+                {
+                    str(issue.get("reason"))
+                    for issue in evidence.get("issues", [])
+                    if isinstance(issue, dict)
+                }
+            )
+        )
+        super().__init__(
+            f"{AUTHORITY_SCHEMA_CUTOVER_REQUIRED}: installed broker activation "
+            f"requires an offline authority/profile cutover ({reasons or 'invalid evidence'}); "
+            f"{self.action_required}"
+        )
+
+
+def install_test_admission_fence_schema(
+    *,
+    database_path: Path = AUTHORITY_DATABASE_PATH,
+) -> dict[str, Any]:
+    """Install the additive drain table only while the authority is offline.
+
+    Broker startup deliberately does not perform this migration.  The
+    service-lifetime flock proves that the installer cannot race a running
+    authority writer, and SQLite keeps the DDL plus validation in one
+    transaction.
+    """
+
+    if not path_lexists(database_path):
+        return {
+            "status": "deferred",
+            "reason": "authority_database_missing",
+            "database": os.fspath(database_path),
+        }
+    metadata = _protected_regular_metadata(
+        database_path, label="service authority database"
+    )
+    if metadata.st_uid != SYSTEM_OWNER_UID:
+        raise InstallError("service authority database has an unexpected owner")
+    lock_path = database_path.parent / ".broker-service.lock"
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0)
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    lock_fd = os.open(lock_path, flags, 0o600)
+    try:
+        lock_info = os.fstat(lock_fd)
+        if (
+            not stat.S_ISREG(lock_info.st_mode)
+            or lock_info.st_uid != SYSTEM_OWNER_UID
+            or stat.S_IMODE(lock_info.st_mode) != 0o600
+        ):
+            raise InstallError("broker service lifetime lock is unsafe")
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise InstallError(
+                "authority service is active; stop it before the explicit test-admission schema migration"
+            ) from error
+        module_root = ROOT / "skills/codex-dev-coordinator/scripts"
+        module_root_text = os.fspath(module_root)
+        if module_root_text not in sys.path:
+            sys.path.insert(0, module_root_text)
+        from devcoordinator.universal_test_admission import (  # type: ignore[import-not-found]
+            install_legacy_test_admission_schema,
+        )
+
+        connection = sqlite3.connect(
+            os.fspath(database_path), isolation_level=None, timeout=5.0
+        )
+        try:
+            connection.execute("PRAGMA foreign_keys = ON")
+            connection.execute("BEGIN IMMEDIATE")
+            created = install_legacy_test_admission_schema(connection)
+            integrity = str(connection.execute("PRAGMA quick_check").fetchone()[0])
+            if integrity != "ok":
+                raise InstallError(
+                    "authority database failed quick_check during admission schema migration"
+                )
+            connection.execute("COMMIT")
+        except BaseException:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+            raise
+        finally:
+            connection.close()
+        return {
+            "status": "installed" if created else "present",
+            "database": os.fspath(database_path),
+            "table": "broker_test_admission_fences",
+        }
+    finally:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        finally:
+            os.close(lock_fd)
 
 
 def validate_broker_unit_source(path: Path = BROKER_UNIT_SOURCE) -> None:
@@ -282,6 +417,23 @@ def require_runtime_dependencies() -> None:
     failure = runtime_dependency_failure(evidence)
     if failure is not None:
         raise InstallError(failure)
+
+
+def worker_runner_script_failure(script: Path | None = None) -> str | None:
+    """Return the exact native-runner trust failure without mutating source."""
+
+    candidate = (
+        SKILL_SOURCE / "scripts/dev_coordinator.py" if script is None else script
+    )
+    try:
+        metadata = candidate.lstat()
+    except OSError as error:
+        return f"worker runner script is unavailable: {candidate}: {error}"
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+        return f"worker runner script must be a regular non-symlink file: {candidate}"
+    if metadata.st_mode & 0o022:
+        return f"worker runner script must not be group/world writable: {candidate}"
+    return None
 
 
 def digest(path: Path) -> str:
@@ -653,6 +805,328 @@ def run(*arguments: str) -> None:
         )
 
 
+def _acquire_installer_lock() -> InstallerFenceHandle:
+    """Serialize all CLI system-boundary mutations on this host."""
+    try:
+        return acquire_installer_mutex(
+            expected_uid=SYSTEM_OWNER_UID,
+            expected_gid=SYSTEM_OWNER_GID,
+            lock_path=INSTALLER_LOCK,
+        )
+    except InstallerFenceError as error:
+        raise InstallError(str(error)) from error
+
+
+def _systemd_unit_property(property_name: str) -> str:
+    """Read one bounded systemd property for the fixed broker unit."""
+
+    completed = subprocess.run(
+        [
+            command("systemctl"),
+            "show",
+            BROKER_UNIT,
+            f"--property={property_name}",
+            "--value",
+        ],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+        timeout=10,
+    )
+    if completed.returncode:
+        raise InstallError(
+            f"could not inspect {BROKER_UNIT} {property_name}: "
+            f"{completed.stderr.strip()[:2048]}"
+        )
+    value = completed.stdout.strip()
+    if not value or "\n" in value or len(value) > 64:
+        raise InstallError(
+            f"systemd returned an invalid {property_name} for {BROKER_UNIT}"
+        )
+    return value
+
+
+def _systemd_unit_active() -> bool:
+    state = _systemd_unit_property("ActiveState")
+    if state == "inactive":
+        return False
+    # Every other known state is non-quiescent for an exact lifecycle
+    # transaction.  In particular ``activating/auto-restart`` frequently has
+    # MainPID=0 between crash-loop attempts; treating it as inactive made the
+    # baseline restore skip ``systemctl stop`` and allowed the loop to survive.
+    if state in {
+        "active",
+        "failed",
+        "activating",
+        "deactivating",
+        "reloading",
+        "maintenance",
+    }:
+        return True
+    raise InstallError(f"broker unit has an unsupported active state: {state}")
+
+
+def _systemd_unit_enabled() -> bool:
+    state = _systemd_unit_property("UnitFileState")
+    if state in {"enabled", "enabled-runtime"}:
+        return True
+    if state == "disabled":
+        return False
+    raise InstallError(f"broker unit has an unsupported enablement state: {state}")
+
+
+def _broker_socket_ready() -> bool:
+    """Prove the fixed broker listener and its kernel peer identity."""
+
+    try:
+        before = BROKER_SOCKET.lstat()
+    except FileNotFoundError:
+        return False
+    if (
+        not stat.S_ISSOCK(before.st_mode)
+        or before.st_uid != SYSTEM_OWNER_UID
+        or before.st_gid != SYSTEM_OWNER_GID
+        or stat.S_IMODE(before.st_mode) != 0o666
+    ):
+        raise InstallError("broker socket has unsafe identity or permissions")
+    try:
+        if BROKER_SOCKET.resolve(strict=True) != BROKER_SOCKET:
+            raise InstallError("broker socket path contains a symlink component")
+    except OSError as error:
+        raise InstallError("broker socket path cannot be verified") from error
+    if not hasattr(socket, "SO_PEERCRED"):
+        raise InstallError("broker activation requires Linux peer credentials")
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+            connection.settimeout(0.5)
+            connection.connect(os.fspath(BROKER_SOCKET))
+            credentials = connection.getsockopt(
+                socket.SOL_SOCKET,
+                socket.SO_PEERCRED,
+                struct.calcsize("3i"),
+            )
+    except (ConnectionRefusedError, FileNotFoundError, socket.timeout):
+        return False
+    except OSError as error:
+        raise InstallError("broker socket readiness probe failed") from error
+    peer_pid, peer_uid, _peer_gid = struct.unpack("3i", credentials)
+    if peer_pid <= 0 or peer_uid != SYSTEM_OWNER_UID:
+        raise InstallError("broker socket peer is not the installed authority")
+    try:
+        after = BROKER_SOCKET.lstat()
+    except FileNotFoundError:
+        return False
+    if (
+        not stat.S_ISSOCK(after.st_mode)
+        or (after.st_dev, after.st_ino) != (before.st_dev, before.st_ino)
+    ):
+        raise InstallError("broker socket identity changed during readiness probe")
+    return True
+
+
+def _wait_for_broker_ready(wait_seconds: int) -> None:
+    if type(wait_seconds) is not int or not 1 <= wait_seconds <= 120:
+        raise InstallError("--wait-seconds must be an integer from 1 through 120")
+    deadline = time.monotonic() + wait_seconds
+    while True:
+        if _systemd_unit_active() and _broker_socket_ready():
+            return
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise InstallError("broker did not become active and ready before the timeout")
+        time.sleep(min(0.1, remaining))
+
+
+def _broker_start_failure_evidence() -> dict[str, Any]:
+    """Capture bounded, private diagnostics before restoring a failed start."""
+
+    properties: dict[str, str] = {}
+    property_errors: dict[str, str] = {}
+    for name in (
+        "LoadState",
+        "ActiveState",
+        "SubState",
+        "Result",
+        "ExecMainCode",
+        "ExecMainStatus",
+        "MainPID",
+        "InvocationID",
+    ):
+        try:
+            properties[name] = _systemd_unit_property(name)
+        except InstallError as error:
+            property_errors[name] = str(error)[:1024]
+    journal: dict[str, Any]
+    try:
+        completed = subprocess.run(
+            [
+                command("journalctl"),
+                "--unit",
+                BROKER_UNIT,
+                "--no-pager",
+                "--lines",
+                "80",
+                "--output",
+                "short-iso",
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+            timeout=10,
+        )
+        stdout = completed.stdout[-64 * 1024 :]
+        stderr = completed.stderr[-4096:]
+        journal = {
+            "returncode": completed.returncode,
+            "tail": stdout,
+            "stderr": stderr,
+        }
+    except (OSError, subprocess.TimeoutExpired) as error:
+        journal = {"error": str(error)[:2048]}
+    return {
+        "captured_at_epoch": int(time.time()),
+        "unit": properties,
+        "property_errors": property_errors,
+        "journal": journal,
+    }
+
+
+def _verify_broker_client_readiness(names: list[str]) -> list[dict[str, Any]]:
+    """Prove one authenticated inventory read for every exact client UID."""
+
+    clients = client_records(names)
+    profile = _read_protected_profile(CLIENT_PROFILE_PATH)
+    generation, repositories, _ignored, issues = (
+        _current_profile_repository_enrollments(
+            profile,
+            now_epoch=int(time.time()),
+        )
+    )
+    if issues or not generation:
+        raise InstallError("broker client readiness profile is invalid")
+    client_script = SKILL_SOURCE / "scripts/dev_coordinator.py"
+    client_failure = worker_runner_script_failure(client_script)
+    if client_failure is not None:
+        raise InstallError(client_failure)
+    client_sha256 = digest(client_script)
+    evidence: list[dict[str, Any]] = []
+    for record, _home in clients:
+        candidates = sorted(
+            (
+                repository
+                for repository in repositories
+                if repository.get("uid") == record.pw_uid
+            ),
+            key=lambda repository: (
+                str(repository.get("canonical_root")),
+                str(repository.get("repo_id")),
+            ),
+        )
+        if not candidates:
+            raise InstallError(
+                f"broker client has no current repository enrollment: {record.pw_name}"
+            )
+        repository = candidates[0]
+        arguments = [
+            command("setpriv"),
+            "--reuid",
+            str(record.pw_uid),
+            "--regid",
+            str(record.pw_gid),
+            "--init-groups",
+            "--reset-env",
+            os.fspath(SYSTEM_PYTHON),
+            os.fspath(client_script),
+            "inventory",
+            "--project",
+            str(repository["canonical_root"]),
+            "--no-docker",
+            "--compact-json",
+        ]
+        try:
+            completed = subprocess.run(
+                arguments,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+                timeout=15,
+                env={
+                    "PATH": "/usr/sbin:/usr/bin",
+                    "LANG": "C.UTF-8",
+                    "PYTHONDONTWRITEBYTECODE": "1",
+                },
+            )
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise InstallError(
+                f"broker client readiness probe could not run: {record.pw_name}"
+            ) from error
+        if (
+            completed.returncode != 0
+            or not completed.stdout
+            or len(completed.stdout) > 32 * 1024 * 1024
+            or len(completed.stderr) > 64 * 1024
+        ):
+            detail = completed.stderr.decode(
+                "utf-8", errors="replace"
+            ).strip()[:2048]
+            raise InstallError(
+                f"broker client readiness probe failed for {record.pw_name}: {detail}"
+            )
+        try:
+            inventory = json.loads(completed.stdout)
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise InstallError("broker client readiness returned invalid JSON") from error
+        authority = inventory.get("authority") if isinstance(inventory, dict) else None
+        inventory_repositories = (
+            inventory.get("repositories") if isinstance(inventory, dict) else None
+        )
+        matching = (
+            [
+                item
+                for item in inventory_repositories
+                if isinstance(item, dict)
+                and item.get("repo_id") == repository["repo_id"]
+                and item.get("canonical_root") == repository["canonical_root"]
+                and item.get("generation") == repository["generation"]
+            ]
+            if isinstance(inventory_repositories, list)
+            else []
+        )
+        if (
+            not isinstance(inventory, dict)
+            or inventory.get("schema_version") != 2
+            or not isinstance(authority, dict)
+            or authority.get("scope") != "server-wide"
+            or authority.get("transport") != "authenticated-unix-socket"
+            or authority.get("socket") != os.fspath(BROKER_SOCKET)
+            or authority.get("service_uid") != SYSTEM_OWNER_UID
+            or authority.get("database_generation") != generation
+            or not isinstance(inventory_repositories, list)
+            or len(inventory_repositories) != 1
+            or len(matching) != 1
+        ):
+            raise InstallError(
+                f"broker client readiness contract is invalid for {record.pw_name}"
+            )
+        evidence.append(
+            {
+                "user": record.pw_name,
+                "uid": record.pw_uid,
+                "repository_id": repository["repo_id"],
+                "repository_generation": repository["generation"],
+                "canonical_root": repository["canonical_root"],
+                "authority_generation": generation,
+                "client_sha256": client_sha256,
+            }
+        )
+    return evidence
+
+
 def capture(*arguments: str) -> bytes:
     completed = subprocess.run(
         list(arguments),
@@ -667,6 +1141,36 @@ def capture(*arguments: str) -> bytes:
             f"{completed.stderr.decode('utf-8', errors='replace').strip()}"
         )
     return completed.stdout
+
+
+def run_json_command(
+    *arguments: str,
+    accepted_returncodes: tuple[int, ...] = (0,),
+) -> tuple[int, dict[str, Any]]:
+    """Run one bounded machine interface and require an object response."""
+
+    completed = subprocess.run(
+        list(arguments),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    if completed.returncode not in accepted_returncodes:
+        detail = completed.stderr.strip()[:2048]
+        raise InstallError(
+            f"command failed ({' '.join(arguments)}): {detail}"
+        )
+    if len(completed.stdout.encode("utf-8")) > 8 * 1024 * 1024:
+        raise InstallError("command returned oversized JSON evidence")
+    try:
+        value = json.loads(completed.stdout)
+    except json.JSONDecodeError as error:
+        raise InstallError("command returned invalid JSON evidence") from error
+    if not isinstance(value, dict):
+        raise InstallError("command returned non-object JSON evidence")
+    return completed.returncode, value
 
 
 def _docker_mutation_operation(tokens: list[str]) -> str | None:
@@ -1427,7 +1931,7 @@ def _read_protected_profile(path: Path) -> dict[str, Any]:
     expected = _protected_regular_metadata(
         path,
         label="broker client profile",
-        exact_mode=0o640,
+        exact_mode=0o644,
     )
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     descriptor = os.open(path, flags)
@@ -1476,6 +1980,9 @@ def _current_profile_repository_enrollments(
     current: list[dict[str, Any]] = []
     ignored = 0
     seen: set[tuple[int, str]] = set()
+    _schema, _parser, _error, repository_fields = (
+        _target_broker_activation_contract()
+    )
     for uid_raw, client in sorted(clients.items(), key=lambda item: str(item[0])):
         try:
             uid = int(uid_raw)
@@ -1505,15 +2012,18 @@ def _current_profile_repository_enrollments(
             ignored += len(repositories)
             continue
         for index, repository in enumerate(repositories):
-            if not isinstance(repository, dict):
+            if (
+                not isinstance(repository, dict)
+                or set(repository) != repository_fields
+            ):
                 issues.append(
                     _profile_database_issue(
-                        "profile_repository_invalid", uid=uid, index=index
+                        "profile_repository_fields_invalid", uid=uid, index=index
                     )
                 )
                 continue
-            enabled = repository.get("enabled", True)
-            valid_until_epoch = repository.get("valid_until_epoch", client_expiry)
+            enabled = repository["enabled"]
+            valid_until_epoch = repository["valid_until_epoch"]
             if type(enabled) is not bool or type(valid_until_epoch) is not int:
                 issues.append(
                     _profile_database_issue(
@@ -1524,18 +2034,18 @@ def _current_profile_repository_enrollments(
             if not enabled or now_epoch >= valid_until_epoch:
                 ignored += 1
                 continue
-            repository_account = repository.get("account_id", account_id)
-            issued_at = repository.get("issued_at", client_issued_at)
+            repository_account = repository["account_id"]
+            issued_at = repository["issued_at"]
             repo_id = repository.get("repo_id")
             canonical_root = repository.get("canonical_root")
             generation = repository.get("generation")
-            ephemeral_templates_raw = repository.get("ephemeral_templates", {})
-            ephemeral_secret_policies_raw = repository.get(
-                "ephemeral_secret_policies", {}
-            )
-            ephemeral_image_prefetch_templates_raw = repository.get(
-                "ephemeral_image_prefetch_templates", []
-            )
+            ephemeral_templates_raw = repository["ephemeral_templates"]
+            ephemeral_secret_policies_raw = repository[
+                "ephemeral_secret_policies"
+            ]
+            ephemeral_image_prefetch_templates_raw = repository[
+                "ephemeral_image_prefetch_templates"
+            ]
             if repository_account != account_id:
                 issues.append(
                     _profile_database_issue(
@@ -1791,12 +2301,10 @@ def _ephemeral_profile_database_issues(
 
     uid = int(repository["uid"])
     repo_id = str(repository["repo_id"])
-    profile_templates = dict(repository.get("ephemeral_templates") or {})
-    profile_secret_policies = dict(
-        repository.get("ephemeral_secret_policies") or {}
-    )
+    profile_templates = dict(repository["ephemeral_templates"])
+    profile_secret_policies = dict(repository["ephemeral_secret_policies"])
     profile_image_prefetch_template_ids = set(
-        repository.get("ephemeral_image_prefetch_templates") or ()
+        repository["ephemeral_image_prefetch_templates"]
     )
     profile_by_id = {
         str(template_id): str(name)
@@ -2392,6 +2900,272 @@ def require_profile_database_enrollment_consistency() -> dict[str, Any]:
     )
 
 
+def _target_broker_activation_contract(
+) -> tuple[int, Any, type[Exception], frozenset[str]]:
+    """Load the exact broker/profile contract that the installed unit executes."""
+
+    module_root = ROOT / "skills/codex-dev-coordinator/scripts"
+    module_root_text = os.fspath(module_root)
+    if module_root_text not in sys.path:
+        sys.path.insert(0, module_root_text)
+    try:
+        from devcoordinator.broker_profile import (  # type: ignore[import-not-found]
+            BrokerProfileError,
+            REPOSITORY_PROFILE_FIELDS,
+            profile_from_document,
+        )
+        from devcoordinator.schema import (  # type: ignore[import-not-found]
+            SCHEMA_VERSION,
+        )
+    except Exception as error:
+        raise InstallError(
+            "installed broker activation contract is unavailable"
+        ) from error
+
+    if (
+        type(SCHEMA_VERSION) is not int
+        or SCHEMA_VERSION <= 0
+        or not callable(profile_from_document)
+        or not isinstance(BrokerProfileError, type)
+        or not issubclass(BrokerProfileError, Exception)
+        or not isinstance(REPOSITORY_PROFILE_FIELDS, frozenset)
+        or not REPOSITORY_PROFILE_FIELDS
+    ):
+        raise InstallError("installed broker authority schema contract is invalid")
+    return (
+        SCHEMA_VERSION,
+        profile_from_document,
+        BrokerProfileError,
+        REPOSITORY_PROFILE_FIELDS,
+    )
+
+
+def _read_protected_authority_schema(path: Path) -> int:
+    expected = _protected_regular_metadata(
+        path,
+        label="service authority database",
+    )
+    connection = sqlite3.connect(
+        f"{path.resolve(strict=True).as_uri()}?mode=ro",
+        uri=True,
+        isolation_level=None,
+        timeout=5.0,
+    )
+    try:
+        connection.execute("PRAGMA query_only = ON")
+        connection.execute("BEGIN")
+        row = connection.execute(
+            "SELECT schema_version FROM schema_metadata WHERE singleton = 1"
+        ).fetchone()
+        if row is None or type(row[0]) is not int or int(row[0]) <= 0:
+            raise InstallError("service authority database schema metadata is invalid")
+        schema_version = int(row[0])
+        connection.execute("COMMIT")
+    except BaseException:
+        if connection.in_transaction:
+            connection.execute("ROLLBACK")
+        raise
+    finally:
+        connection.close()
+    current = path.lstat()
+    if (current.st_dev, current.st_ino) != (expected.st_dev, expected.st_ino):
+        raise InstallError("service authority database changed while it was inspected")
+    return schema_version
+
+
+def activation_authority_contract_check(
+    *,
+    database_path: Path = AUTHORITY_DATABASE_PATH,
+    profile_path: Path = CLIENT_PROFILE_PATH,
+) -> dict[str, Any]:
+    """Prove schema/profile compatibility before any activation lifecycle work.
+
+    It executes the target broker parser for every protected client and
+    requires an existing authority database to match the target broker schema
+    exactly. No compatibility inference is allowed.
+    """
+
+    target_schema, parse_profile, profile_error, _repository_fields = (
+        _target_broker_activation_contract()
+    )
+    evidence: dict[str, Any] = {
+        "ok": True,
+        "code": "activation_authority_contract_ready",
+        "database": os.fspath(database_path),
+        "profile": os.fspath(profile_path),
+        "target_broker_schema": target_schema,
+        "authority_database_schema": None,
+        "checked_profile_clients": [],
+        "checked_profile_repositories": 0,
+        "issues": [],
+    }
+    issues: list[dict[str, Any]] = evidence["issues"]
+
+    if path_lexists(database_path):
+        try:
+            database_schema = _read_protected_authority_schema(database_path)
+        except (InstallError, OSError, sqlite3.Error, ValueError) as error:
+            issues.append(
+                _profile_database_issue(
+                    "authority_schema_unavailable",
+                    detail=str(error)[:1024],
+                )
+            )
+        else:
+            evidence["authority_database_schema"] = database_schema
+            if database_schema != target_schema:
+                issues.append(
+                    _profile_database_issue(
+                        "authority_schema_mismatch",
+                        database_schema=database_schema,
+                        target_broker_schema=target_schema,
+                    )
+                )
+
+    if path_lexists(profile_path):
+        try:
+            document = _read_protected_profile(profile_path)
+        except (InstallError, OSError, ValueError) as error:
+            issues.append(
+                _profile_database_issue(
+                    "profile_target_contract_unavailable",
+                    detail=str(error)[:1024],
+                )
+            )
+        else:
+            clients = document.get("clients")
+            client_uids: list[int] = []
+            if isinstance(clients, dict) and clients:
+                for uid_raw in sorted(clients, key=str):
+                    try:
+                        uid = int(uid_raw)
+                    except (TypeError, ValueError):
+                        issues.append(
+                            _profile_database_issue(
+                                "profile_target_client_uid_invalid",
+                                uid=str(uid_raw)[:128],
+                            )
+                        )
+                        continue
+                    if uid < 0 or str(uid) != str(uid_raw):
+                        issues.append(
+                            _profile_database_issue(
+                                "profile_target_client_uid_invalid",
+                                uid=str(uid_raw)[:128],
+                            )
+                        )
+                        continue
+                    client_uids.append(uid)
+            else:
+                # Exercise the target parser even when the root/client shape is
+                # invalid; otherwise an empty protected profile could bypass
+                # the client contract simply because there was nothing to loop.
+                client_uids.append(0)
+
+            checked_uids: list[int] = evidence["checked_profile_clients"]
+            checked_repository_roots: set[str] = set()
+            for uid in client_uids:
+                raw_client = clients.get(str(uid)) if isinstance(clients, dict) else None
+                missing_owner_indexes: list[int] = []
+                if isinstance(raw_client, dict):
+                    repositories = raw_client.get("repositories")
+                    if isinstance(repositories, list):
+                        missing_owner_indexes = [
+                            index
+                            for index, repository in enumerate(repositories)
+                            if isinstance(repository, dict) and "owner_uid" not in repository
+                        ]
+                try:
+                    parsed = parse_profile(
+                        document,
+                        effective_uid=uid,
+                    )
+                except profile_error as error:
+                    reason = (
+                        "profile_repository_owner_uid_missing"
+                        if missing_owner_indexes
+                        else "profile_target_contract_invalid"
+                    )
+                    issue = _profile_database_issue(
+                        reason,
+                        uid=uid,
+                        detail=str(error)[:1024],
+                    )
+                    if missing_owner_indexes:
+                        issue["repository_indexes"] = missing_owner_indexes
+                    issues.append(issue)
+                    continue
+                except Exception as error:
+                    issues.append(
+                        _profile_database_issue(
+                            "profile_target_contract_invalid",
+                            uid=uid,
+                            detail=str(error)[:1024],
+                        )
+                    )
+                    continue
+                if missing_owner_indexes:
+                    issue = _profile_database_issue(
+                        "profile_repository_owner_uid_missing",
+                        uid=uid,
+                        detail=(
+                            "target parser accepted a merged profile containing "
+                            "repository entries without owner_uid"
+                        ),
+                    )
+                    issue["repository_indexes"] = missing_owner_indexes
+                    issues.append(issue)
+                    continue
+                checked_uids.append(uid)
+                checked_repository_roots.update(parsed.repositories)
+            evidence["checked_profile_repositories"] = len(
+                checked_repository_roots
+            )
+
+    if issues:
+        evidence["ok"] = False
+        evidence["code"] = AUTHORITY_SCHEMA_CUTOVER_REQUIRED
+        raise AuthoritySchemaCutoverRequired(evidence)
+    return evidence
+
+
+def managed_skill_sources() -> dict[str, Path]:
+    """Return the fixed canonical skill set after proving every source."""
+
+    skills_root = require_real(ROOT / "skills", directory=True)
+    sources: dict[str, Path] = {}
+    for name in MANAGED_SKILLS:
+        source = require_real(skills_root / name, directory=True)
+        skill_file = source / "SKILL.md"
+        try:
+            metadata = skill_file.lstat()
+        except OSError as error:
+            raise InstallError(f"canonical skill manifest is unavailable: {name}") from error
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+            raise InstallError(f"canonical skill manifest is unsafe: {name}")
+        sources[name] = source
+    return sources
+
+
+def client_skill_link_expectations(record: Any, home: Path) -> list[dict[str, Any]]:
+    """Describe every explicit runtime/skill destination without HOME inference."""
+
+    sources = managed_skill_sources()
+    return [
+        {
+            "user": record.pw_name,
+            "uid": record.pw_uid,
+            "runtime": relative.parts[0].removeprefix("."),
+            "target_root": str(home / relative),
+            "skill": skill,
+            "source": str(sources[skill]),
+            "destination": str(home / relative / skill),
+        }
+        for relative in AGENT_SKILL_ROOTS
+        for skill in MANAGED_SKILLS
+    ]
+
+
 def desired_plan(names: list[str]) -> dict[str, Any]:
     validate_broker_unit_source()
     clients = client_records(names)
@@ -2411,10 +3185,11 @@ def desired_plan(names: list[str]) -> dict[str, Any]:
     plan = {
         "authority": {
             "database": str(AUTHORITY_DATABASE_PATH),
-            "socket": "/run/devcoordinator/broker.sock",
+            "socket": "/run/devcoordinator-authority.sock",
             "profile": str(CLIENT_PROFILE_PATH),
             "service_user": SERVICE_USER,
-            "access_group": ACCESS_GROUP,
+            "socket_gid": SYSTEM_OWNER_GID,
+            "socket_mode": "0666",
         },
         "runtime_requirements": {
             "python": str(SYSTEM_PYTHON),
@@ -2442,15 +3217,20 @@ def desired_plan(names: list[str]) -> dict[str, Any]:
                 "home_write_paths": [os.fspath(path) for path in home_write_paths],
             }
         ],
+        "managed_skills": [
+            {"name": name, "source": str(source)}
+            for name, source in managed_skill_sources().items()
+        ],
         "clients": [
             {
                 "user": record.pw_name,
                 "uid": record.pw_uid,
                 "journal": f"/var/lib/devcoordinator-clients/{record.pw_uid}",
                 "skill_roots": [
-                    str(home / ".codex/skills"),
-                    str(home / ".claude/skills"),
+                    str(home / relative)
+                    for relative in AGENT_SKILL_ROOTS
                 ],
+                "skill_links": client_skill_link_expectations(record, home),
             }
             for record, home in clients
         ],
@@ -2485,9 +3265,8 @@ def desired_plan(names: list[str]) -> dict[str, Any]:
     if restart_precondition["ok"]:
         plan["next_step"] = (
             "Run broker enroll once per user/repository with repeated --server allowlists, "
-            "then rerun verify immediately before safely enabling or restarting "
-            "devcoordinator-broker.service so its mount namespace matches the replaced "
-            "enrolled-home drop-in."
+            "then rerun verify immediately before the journal-bound activate action "
+            "starts devcoordinator-broker.service with the replaced enrolled-home drop-in."
         )
     else:
         plan["next_step"] = (
@@ -2502,12 +3281,20 @@ def atomic_json(path: Path, value: dict[str, Any]) -> None:
     descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            os.fchmod(handle.fileno(), 0o600)
             json.dump(value, handle, indent=2, sort_keys=True)
             handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, path)
         os.chmod(path, 0o600)
+        directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        directory_flags |= getattr(os, "O_CLOEXEC", 0)
+        directory = os.open(path.parent, directory_flags)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
     finally:
         if temporary.exists():
             temporary.unlink()
@@ -2644,20 +3431,256 @@ def ensure_owned_directory(path: Path, *, uid: int, gid: int, mode: int) -> None
     os.chmod(path, mode)
 
 
+def _directory_state(path: Path) -> dict[str, Any]:
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return {"exists": False}
+    except OSError as error:
+        raise InstallError(f"required directory cannot be inspected: {path}") from error
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+        raise InstallError(f"required directory is unsafe: {path}")
+    return {
+        "exists": True,
+        "device": metadata.st_dev,
+        "inode": metadata.st_ino,
+        "uid": metadata.st_uid,
+        "gid": metadata.st_gid,
+        "mode": stat.S_IMODE(metadata.st_mode),
+    }
+
+
+def _same_directory_identity(state: dict[str, Any], metadata: os.stat_result) -> bool:
+    return (
+        state.get("exists") is True
+        and state.get("device") == metadata.st_dev
+        and state.get("inode") == metadata.st_ino
+        and stat.S_ISDIR(metadata.st_mode)
+        and not stat.S_ISLNK(metadata.st_mode)
+    )
+
+
+def install_owned_skill_directory(
+    path: Path,
+    *,
+    uid: int,
+    gid: int,
+    journal: dict[str, Any],
+    persist: Any,
+) -> dict[str, Any]:
+    """Create or normalize one exact agent directory with rollback evidence."""
+
+    before = _directory_state(path)
+    entry: dict[str, Any] = {
+        "path": str(path),
+        "before": before,
+        "expected_uid": uid,
+        "expected_gid": gid,
+        "expected_mode": 0o700,
+        "stage": "prepared",
+    }
+    journal["skill_root_directories"].append(entry)
+    persist()
+    if not before["exists"]:
+        try:
+            os.mkdir(path, 0o700)
+        except OSError as error:
+            raise InstallError(f"could not create agent skill directory: {path}") from error
+        entry["created"] = _directory_state(path)
+        persist()
+    try:
+        os.chown(path, uid, gid)
+        os.chmod(path, 0o700)
+    except OSError as error:
+        raise InstallError(f"could not secure agent skill directory: {path}") from error
+    entry["installed"] = _directory_state(path)
+    entry["stage"] = "installed"
+    persist()
+    return entry
+
+
+def install_client_skill_roots(
+    record: Any,
+    home: Path,
+    *,
+    journal: dict[str, Any],
+    persist: Any,
+) -> list[Path]:
+    """Install only the two explicit per-account Codex/Claude skill roots."""
+
+    roots: list[Path] = []
+    for relative in AGENT_SKILL_ROOTS:
+        root = home / relative
+        parent = root.parent
+        install_owned_skill_directory(
+            parent,
+            uid=record.pw_uid,
+            gid=record.pw_gid,
+            journal=journal,
+            persist=persist,
+        )
+        install_owned_skill_directory(
+            root,
+            uid=record.pw_uid,
+            gid=record.pw_gid,
+            journal=journal,
+            persist=persist,
+        )
+        roots.append(root)
+    return roots
+
+
+def rollback_skill_root_directories(entries: Any) -> None:
+    """Restore metadata or remove only unchanged directories created here."""
+
+    if not isinstance(entries, list):
+        raise InstallError("skill-root directory journal is invalid")
+    for raw in reversed(entries):
+        if not isinstance(raw, dict):
+            raise InstallError("skill-root directory journal entry is invalid")
+        path = Path(str(raw.get("path", "")))
+        before = raw.get("before")
+        installed = raw.get("installed")
+        if not path.is_absolute() or not isinstance(before, dict):
+            raise InstallError("skill-root directory rollback target is invalid")
+        try:
+            metadata = path.lstat()
+        except FileNotFoundError:
+            if before.get("exists") is False:
+                continue
+            raise InstallError(f"pre-existing skill directory disappeared: {path}")
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+            raise InstallError(f"skill directory changed type before rollback: {path}")
+        if isinstance(installed, dict) and not _same_directory_identity(
+            installed, metadata
+        ):
+            raise InstallError(f"skill directory identity changed before rollback: {path}")
+        if isinstance(installed, dict) and any(
+            value != installed.get(key)
+            for key, value in (
+                ("uid", metadata.st_uid),
+                ("gid", metadata.st_gid),
+                ("mode", stat.S_IMODE(metadata.st_mode)),
+            )
+        ):
+            raise InstallError(f"skill directory metadata changed before rollback: {path}")
+        if before.get("exists") is True:
+            if not _same_directory_identity(before, metadata):
+                raise InstallError(f"skill directory identity changed before rollback: {path}")
+            os.chown(path, int(before["uid"]), int(before["gid"]))
+            os.chmod(path, int(before["mode"]))
+            continue
+        if not isinstance(installed, dict):
+            raise InstallError(f"created skill directory changed before rollback: {path}")
+        try:
+            os.rmdir(path)
+        except OSError as error:
+            raise InstallError(
+                f"created skill directory is not empty or cannot be rolled back: {path}"
+            ) from error
+
+
+def skill_manager_arguments(
+    action: str,
+    roots: list[Path],
+    *,
+    transaction: Path | None = None,
+    allow_noncanonical: bool = False,
+) -> list[str]:
+    arguments = [
+        sys.executable,
+        str(ROOT / "scripts/manage_skill_links.py"),
+        action,
+        "--repo-root",
+        str(ROOT),
+    ]
+    for skill in MANAGED_SKILLS:
+        arguments.extend(("--skill", skill))
+    for root in roots:
+        arguments.extend(("--target-root", str(root)))
+    if transaction is not None:
+        arguments.extend(("--transaction-dir", str(transaction)))
+    if allow_noncanonical:
+        arguments.append("--allow-noncanonical")
+    arguments.append("--json")
+    return arguments
+
+
+def verify_skill_links(roots: list[Path]) -> dict[str, Any]:
+    """Return manager evidence plus explicit rows for missing/unsafe roots."""
+
+    available: list[Path] = []
+    entries: list[dict[str, Any]] = []
+    sources = managed_skill_sources()
+    for root in roots:
+        try:
+            metadata = root.lstat()
+        except FileNotFoundError:
+            status = "root_missing"
+        except OSError:
+            status = "root_unreadable"
+        else:
+            if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+                status = "root_unsafe"
+            else:
+                available.append(root)
+                continue
+        entries.extend(
+            {
+                "target_root": str(root),
+                "skill": skill,
+                "source": str(source),
+                "destination": str(root / skill),
+                "status": status,
+            }
+            for skill, source in sources.items()
+        )
+    manager_evidence: dict[str, Any] | None = None
+    if available:
+        _returncode, manager_evidence = run_json_command(
+            *skill_manager_arguments("verify", available),
+            accepted_returncodes=(0, 1),
+        )
+        manager_entries = manager_evidence.get("entries")
+        if not isinstance(manager_entries, list) or any(
+            not isinstance(entry, dict) for entry in manager_entries
+        ):
+            raise InstallError("skill link manager returned invalid verification evidence")
+        entries.extend(manager_entries)
+    expected = len(roots) * len(MANAGED_SKILLS)
+    if len(entries) != expected:
+        raise InstallError("skill link verification did not cover every root and skill")
+    return {
+        "ok": all(entry.get("status") == "direct_link" for entry in entries),
+        "skills": list(MANAGED_SKILLS),
+        "target_roots": [str(root) for root in roots],
+        "entries": entries,
+        "manager": manager_evidence,
+    }
+
+
 def capture_source_acl(transaction: Path) -> Path:
     """Preserve every ACL the installation will extend before mutation."""
 
-    source = require_real(SKILL_SOURCE, directory=True)
-    skills_root = require_real(source.parent, directory=True)
+    sources = managed_skill_sources()
+    skills_root = require_real(ROOT / "skills", directory=True)
     repository = require_real(ROOT, directory=True)
     backup = transaction / "canonical-skill-source.acl"
     getfacl = command("getfacl")
     payload = b"".join(
-        (
+        [
             capture(getfacl, "--absolute-names", str(repository)),
             capture(getfacl, "--absolute-names", str(skills_root)),
-            capture(getfacl, "--absolute-names", "--recursive", str(source)),
-        )
+            *[
+                capture(
+                    getfacl,
+                    "--absolute-names",
+                    "--recursive",
+                    str(source),
+                )
+                for source in sources.values()
+            ],
+        ]
     )
     descriptor = os.open(backup, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
@@ -2672,29 +3695,30 @@ def capture_source_acl(transaction: Path) -> Path:
 
 
 def grant_source_acl() -> None:
-    """Give clients live read/execute access without source write access."""
+    """Give every trusted-local account read/execute access to linked skills."""
 
-    source = require_real(SKILL_SOURCE, directory=True)
-    skills_root = require_real(source.parent, directory=True)
+    sources = managed_skill_sources()
+    skills_root = require_real(ROOT / "skills", directory=True)
     repository = require_real(ROOT, directory=True)
     setfacl = command("setfacl")
-    run(setfacl, "--modify", f"g:{ACCESS_GROUP}:--x", str(repository))
-    run(setfacl, "--modify", f"g:{ACCESS_GROUP}:--x", str(skills_root))
-    run(
-        setfacl,
-        "--recursive",
-        "--modify",
-        f"g:{ACCESS_GROUP}:rX",
-        str(source),
-    )
-    for directory, child_directories, _files in os.walk(source):
-        child_directories.sort()
+    run(setfacl, "--modify", "o::r-x", str(repository))
+    run(setfacl, "--modify", "o::r-x", str(skills_root))
+    for source in sources.values():
         run(
             setfacl,
+            "--recursive",
             "--modify",
-            f"d:g:{ACCESS_GROUP}:rX",
-            str(directory),
+            "o::rX",
+            str(source),
         )
+        for directory, child_directories, _files in os.walk(source):
+            child_directories.sort()
+            run(
+                setfacl,
+                "--modify",
+                "d:o::rX",
+                str(directory),
+            )
 
 
 def restore_source_acl(backup: Path) -> None:
@@ -2728,10 +3752,13 @@ def apply_install(names: list[str], transaction_raw: str, allow_noncanonical: bo
         "repo_root": str(ROOT),
         "system_files": [],
         "link_transactions": [],
+        "skill_link_evidence": [],
+        "skill_root_directories": [],
         "group_members_added": [],
         "client_journals": [],
         "legacy_docker_dropin": None,
         "legacy_docker_dropin_removed": False,
+        "test_admission_schema": None,
         "restart_precondition": restart_precondition,
     }
     atomic_json(transaction / JOURNAL_NAME, journal)
@@ -2762,26 +3789,20 @@ def apply_install(names: list[str], transaction_raw: str, allow_noncanonical: bo
 
         run(command("systemd-sysusers"), "/etc/sysusers.d/devcoordinator.conf")
         run(command("systemd-tmpfiles"), "--create", "/etc/tmpfiles.d/devcoordinator.conf")
+        journal["test_admission_schema"] = install_test_admission_fence_schema()
+        atomic_json(transaction / JOURNAL_NAME, journal)
         try:
-            service = pwd.getpwnam(SERVICE_USER)
-            access = grp.getgrnam(ACCESS_GROUP)
+            pwd.getpwnam(SERVICE_USER)
         except KeyError as error:
-            raise InstallError("system authority identity or access group is missing") from error
+            raise InstallError("system authority identity is missing") from error
 
         acl_backup = capture_source_acl(transaction)
         journal["source_acl_backup"] = str(acl_backup)
         atomic_json(transaction / JOURNAL_NAME, journal)
         grant_source_acl()
 
-        manager = ROOT / "scripts/manage_skill_links.py"
+        persist_journal = lambda: atomic_json(transaction / JOURNAL_NAME, journal)
         for record, home in clients:
-            current_groups = {group.gr_name for group in grp.getgrall() if record.pw_name in group.gr_mem}
-            if record.pw_gid == access.gr_gid:
-                current_groups.add(ACCESS_GROUP)
-            if ACCESS_GROUP not in current_groups:
-                run(command("usermod"), "-a", "-G", ACCESS_GROUP, record.pw_name)
-                journal["group_members_added"].append(record.pw_name)
-
             client_journal = Path(f"/var/lib/devcoordinator-clients/{record.pw_uid}")
             ensure_owned_directory(
                 client_journal,
@@ -2791,40 +3812,45 @@ def apply_install(names: list[str], transaction_raw: str, allow_noncanonical: bo
             )
             journal["client_journals"].append(str(client_journal))
 
-            roots: list[Path] = []
-            for relative in (Path(".codex/skills"), Path(".claude/skills")):
-                root = home / relative
-                root.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-                if root.parent.is_symlink():
-                    raise InstallError(f"agent configuration parent is a symlink: {root.parent}")
-                if not root.exists():
-                    root.mkdir(mode=0o700)
-                metadata = root.lstat()
-                if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
-                    raise InstallError(f"agent skill root is unsafe: {root}")
-                os.chown(root.parent, record.pw_uid, record.pw_gid)
-                os.chown(root, record.pw_uid, record.pw_gid)
-                roots.append(root)
+            roots = install_client_skill_roots(
+                record,
+                home,
+                journal=journal,
+                persist=persist_journal,
+            )
 
             link_transaction = transaction / f"skill-links-{record.pw_uid}"
-            arguments = [
-                sys.executable,
-                str(manager),
-                "apply",
-                "--repo-root",
-                str(ROOT),
-                "--transaction-dir",
-                str(link_transaction),
-                "--skill",
-                "codex-dev-coordinator",
-            ]
-            for root in roots:
-                arguments.extend(("--target-root", str(root)))
-            if allow_noncanonical:
-                arguments.append("--allow-noncanonical")
-            run(*arguments)
+            _returncode, preflight = run_json_command(
+                *skill_manager_arguments("plan", roots)
+            )
+            evidence: dict[str, Any] = {
+                "user": record.pw_name,
+                "uid": record.pw_uid,
+                "skills": list(MANAGED_SKILLS),
+                "target_roots": [str(root) for root in roots],
+                "preflight": preflight,
+                "transaction": str(link_transaction),
+            }
+            journal["skill_link_evidence"].append(evidence)
+            persist_journal()
+            _returncode, applied = run_json_command(
+                *skill_manager_arguments(
+                    "apply",
+                    roots,
+                    transaction=link_transaction,
+                    allow_noncanonical=allow_noncanonical,
+                )
+            )
             journal["link_transactions"].append(str(link_transaction))
-            atomic_json(transaction / JOURNAL_NAME, journal)
+            evidence["apply"] = applied
+            persist_journal()
+            verification = verify_skill_links(roots)
+            evidence["verification"] = verification
+            persist_journal()
+            if not verification["ok"]:
+                raise InstallError(
+                    "skill link manager did not publish every canonical skill directly"
+                )
 
         # These ownership checks document the intended split after tmpfiles.
         authority = Path("/var/lib/devcoordinator").lstat()
@@ -2833,8 +3859,8 @@ def apply_install(names: list[str], transaction_raw: str, allow_noncanonical: bo
         profile_parent = CLIENT_PROFILE_PATH.parent.lstat()
         if (
             profile_parent.st_uid != service.pw_uid
-            or profile_parent.st_gid != access.gr_gid
-            or stat.S_IMODE(profile_parent.st_mode) != 0o750
+            or profile_parent.st_gid != SYSTEM_OWNER_GID
+            or stat.S_IMODE(profile_parent.st_mode) != 0o755
         ):
             raise InstallError("client profile directory failed ownership/mode verification")
         # Recheck after every installer mutation. The initial proof prevents
@@ -2863,15 +3889,274 @@ def apply_install(names: list[str], transaction_raw: str, allow_noncanonical: bo
         raise
 
 
-def rollback_install(transaction: Path) -> dict[str, Any]:
-    if os.geteuid() != 0:
-        raise InstallError("rollback requires root")
+def _canonical_install_operation_id(raw: str) -> str:
+    try:
+        value = str(uuid.UUID(str(raw)))
+    except (ValueError, TypeError, AttributeError) as error:
+        raise InstallError("--operation-id must be one canonical UUID") from error
+    if value != raw:
+        raise InstallError("--operation-id must be one canonical UUID")
+    return value
+
+
+def _load_install_journal(transaction: Path) -> tuple[Path, Path, dict[str, Any]]:
     transaction = _private_transaction(transaction)
     journal_path = transaction / JOURNAL_NAME
     require_private_regular(journal_path, label="installation journal")
-    document = json.loads(journal_path.read_text(encoding="utf-8"))
-    if document.get("repo_root") != str(ROOT):
-        raise InstallError("transaction belongs to another repository")
+    try:
+        document = json.loads(journal_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise InstallError("installation journal is invalid") from error
+    if (
+        not isinstance(document, dict)
+        or document.get("version") != 1
+        or document.get("repo_root") != str(ROOT)
+    ):
+        raise InstallError("transaction belongs to another installer contract")
+    return transaction, journal_path, document
+
+
+def _journal_client_names(document: dict[str, Any]) -> list[str]:
+    evidence = document.get("skill_link_evidence")
+    if not isinstance(evidence, list) or not evidence:
+        raise InstallError("installation journal has no exact client evidence")
+    names: list[str] = []
+    for entry in evidence:
+        if (
+            not isinstance(entry, dict)
+            or not isinstance(entry.get("user"), str)
+            or not entry["user"]
+        ):
+            raise InstallError("installation journal client evidence is invalid")
+        names.append(str(entry["user"]))
+    if len(set(names)) != len(names):
+        raise InstallError("installation journal contains duplicate clients")
+    return sorted(names)
+
+
+def _restore_activation_service_baseline(initial_enabled: bool) -> None:
+    if _systemd_unit_active():
+        run(command("systemctl"), "stop", BROKER_UNIT)
+        if _systemd_unit_active():
+            raise InstallError("broker remained active while restoring activation baseline")
+    enabled = _systemd_unit_enabled()
+    if initial_enabled and not enabled:
+        run(command("systemctl"), "enable", BROKER_UNIT)
+    elif not initial_enabled and enabled:
+        run(command("systemctl"), "disable", BROKER_UNIT)
+    if _systemd_unit_enabled() != initial_enabled:
+        raise InstallError("broker enablement baseline could not be restored")
+
+
+def activate_install(
+    names: list[str],
+    transaction: Path,
+    operation_id: str,
+    wait_seconds: int,
+) -> dict[str, Any]:
+    """Activate one exact applied installation through a durable state machine."""
+
+    if os.geteuid() != 0:
+        raise InstallError("activate requires root")
+    operation_id = _canonical_install_operation_id(operation_id)
+    if type(wait_seconds) is not int or not 1 <= wait_seconds <= 120:
+        raise InstallError("--wait-seconds must be an integer from 1 through 120")
+    transaction, journal_path, document = _load_install_journal(transaction)
+    requested_clients = sorted(record.pw_name for record, _home in client_records(names))
+    journal_clients = _journal_client_names(document)
+    if requested_clients != journal_clients:
+        raise InstallError("activation client set does not match the installation journal")
+    if document.get("starts_service") is not False or document.get(
+        "requires_service_restart_for_sandbox_changes"
+    ) is not True:
+        raise InstallError("installation journal does not authorize explicit activation")
+
+    activation = document.get("activation")
+    if activation is not None:
+        if (
+            not isinstance(activation, dict)
+            or activation.get("operation_id") != operation_id
+            or activation.get("clients") != requested_clients
+            or activation.get("initial_active") is not False
+            or type(activation.get("initial_enabled")) is not bool
+        ):
+            raise InstallError("activation replay does not match its durable intent")
+    if document.get("status") not in {"applied", "activated"}:
+        raise InstallError("installation transaction is not activation-ready")
+
+    # This target-contract proof is intentionally activation-only and runs
+    # before even the installed-unit verifier inspects systemd.  Staging an
+    # installer transaction against schema 12 remains possible, but the target
+    # schema-13 broker cannot reach lifecycle inspection or mutation until the
+    # sealed owner migration and strict profile republication have completed.
+    authority_contract = activation_authority_contract_check()
+    verification = verify_install(requested_clients)
+    if not verification.get("ok"):
+        raise InstallError("current server-wide installation verification failed")
+    current_precondition = require_profile_database_enrollment_consistency()
+    if (
+        current_precondition != document.get("restart_precondition")
+        or current_precondition != verification.get("restart_precondition")
+    ):
+        raise InstallError("broker activation enrollment proof changed after apply")
+
+    if document.get("status") == "activated":
+        if not isinstance(activation, dict) or activation.get("phase") != "ready":
+            raise InstallError("activated installation journal is contradictory")
+        if not _systemd_unit_active():
+            raise InstallError("activated broker is no longer active")
+        client_readiness = _verify_broker_client_readiness(requested_clients)
+        if client_readiness != activation.get("client_readiness"):
+            raise InstallError("activated broker client readiness evidence changed")
+        replay = dict(document)
+        replay["replayed"] = True
+        return replay
+
+    if isinstance(activation, dict) and activation.get("phase") in {
+        "starting",
+        "restoring_baseline",
+    } and _systemd_unit_active():
+        try:
+            _wait_for_broker_ready(wait_seconds)
+            client_readiness = _verify_broker_client_readiness(requested_clients)
+        except BaseException:
+            _restore_activation_service_baseline(bool(activation["initial_enabled"]))
+            activation["phase"] = "failed"
+            activation["status"] = "failed"
+            document["status"] = "applied"
+            atomic_json(journal_path, document)
+            raise
+        activation["phase"] = "ready"
+        activation["status"] = "ready"
+        activation["client_readiness"] = client_readiness
+        activation["completed_at_epoch"] = int(time.time())
+        document["status"] = "activated"
+        atomic_json(journal_path, document)
+        replay = dict(document)
+        replay["replayed"] = True
+        return replay
+
+    initial_active = _systemd_unit_active()
+    if initial_active:
+        raise InstallError("activation requires the installed broker to be inactive")
+    initial_enabled = _systemd_unit_enabled()
+    if isinstance(activation, dict):
+        if initial_enabled is not activation["initial_enabled"]:
+            raise InstallError("broker enablement changed after failed activation")
+        activation["attempts"] = int(activation.get("attempts", 1)) + 1
+    else:
+        activation = {
+            "operation_id": operation_id,
+            "clients": requested_clients,
+            "initial_active": False,
+            "initial_enabled": initial_enabled,
+            "attempts": 1,
+        }
+        document["activation"] = activation
+    activation["authority_contract"] = authority_contract
+    activation["phase"] = "starting"
+    activation["status"] = "starting"
+    activation["started_at_epoch"] = int(time.time())
+    activation.pop("error", None)
+    activation.pop("client_readiness", None)
+    atomic_json(journal_path, document)
+
+    try:
+        if not initial_enabled:
+            run(command("systemctl"), "enable", BROKER_UNIT)
+        run(command("systemctl"), "start", BROKER_UNIT)
+        _wait_for_broker_ready(wait_seconds)
+        client_readiness = _verify_broker_client_readiness(requested_clients)
+    except BaseException as error:
+        activation["phase"] = "restoring_baseline"
+        activation["status"] = "failed"
+        activation["error"] = str(error)[:2048]
+        activation["failure_evidence"] = _broker_start_failure_evidence()
+        atomic_json(journal_path, document)
+        try:
+            _restore_activation_service_baseline(initial_enabled)
+        except BaseException as cleanup_error:
+            activation["phase"] = "cleanup_failed"
+            activation["cleanup_error"] = str(cleanup_error)[:2048]
+            document["status"] = "activation_rollback_required"
+            atomic_json(journal_path, document)
+            raise InstallError(
+                "broker activation failed and its service baseline could not be restored"
+            ) from cleanup_error
+        activation["phase"] = "failed"
+        document["status"] = "applied"
+        atomic_json(journal_path, document)
+        if isinstance(error, InstallError):
+            raise
+        raise InstallError("broker activation failed") from error
+
+    activation["phase"] = "ready"
+    activation["status"] = "ready"
+    activation["client_readiness"] = client_readiness
+    activation["completed_at_epoch"] = int(time.time())
+    document["status"] = "activated"
+    atomic_json(journal_path, document)
+    return document
+
+
+def restore_activation_baseline(
+    transaction: Path,
+    operation_id: str,
+) -> dict[str, Any]:
+    """Reconcile only the service state owned by one activation attempt."""
+
+    if os.geteuid() != 0:
+        raise InstallError("restore-activation-baseline requires root")
+    operation_id = _canonical_install_operation_id(operation_id)
+    _transaction, journal_path, document = _load_install_journal(transaction)
+    activation = document.get("activation")
+    if (
+        not isinstance(activation, dict)
+        or activation.get("operation_id") != operation_id
+        or activation.get("initial_active") is not False
+        or type(activation.get("initial_enabled")) is not bool
+        or document.get("status")
+        not in {"applied", "activated", "activation_rollback_required"}
+    ):
+        raise InstallError("activation baseline reconciliation is not authorized")
+    activation["phase"] = "restoring_baseline"
+    activation["status"] = "restoring_baseline"
+    atomic_json(journal_path, document)
+    _restore_activation_service_baseline(bool(activation["initial_enabled"]))
+    activation["phase"] = "failed"
+    activation["status"] = "failed"
+    activation["baseline_restored_at_epoch"] = int(time.time())
+    document["status"] = "applied"
+    atomic_json(journal_path, document)
+    return document
+
+
+def rollback_install(transaction: Path) -> dict[str, Any]:
+    if os.geteuid() != 0:
+        raise InstallError("rollback requires root")
+    transaction, journal_path, document = _load_install_journal(transaction)
+    activation = document.get("activation")
+    if activation is not None:
+        if (
+            not isinstance(activation, dict)
+            or activation.get("initial_active") is not False
+            or type(activation.get("initial_enabled")) is not bool
+            or not isinstance(activation.get("operation_id"), str)
+            or not isinstance(activation.get("clients"), list)
+        ):
+            raise InstallError("installation activation journal is invalid")
+        document["status"] = "rolling_back"
+        activation["phase"] = "restoring_baseline"
+        atomic_json(journal_path, document)
+        _restore_activation_service_baseline(bool(activation["initial_enabled"]))
+        activation["phase"] = "rolled_back"
+        activation["status"] = "rolled_back"
+        atomic_json(journal_path, document)
+    elif _systemd_unit_active():
+        raise InstallError(
+            "active broker is not owned by this installation transaction; stop it "
+            "through its owning activation before rollback"
+        )
     manager = ROOT / "scripts/manage_skill_links.py"
     for link_transaction in reversed(document.get("link_transactions", [])):
         run(
@@ -2881,6 +4166,7 @@ def rollback_install(transaction: Path) -> dict[str, Any]:
             "--transaction-dir",
             str(link_transaction),
         )
+    rollback_skill_root_directories(document.get("skill_root_directories", []))
     source_acl_backup = document.get("source_acl_backup")
     if source_acl_backup:
         restore_source_acl(Path(str(source_acl_backup)))
@@ -2892,7 +4178,7 @@ def rollback_install(transaction: Path) -> dict[str, Any]:
             raise InstallError("legacy broker drop-in journal entry is invalid")
         restore_legacy_docker_dropin(legacy_dropin, transaction)
     for user in reversed(document.get("group_members_added", [])):
-        run(command("gpasswd"), "-d", str(user), ACCESS_GROUP)
+        run(command("gpasswd"), "-d", str(user), LEGACY_ACCESS_GROUP)
     run(command("systemctl"), "daemon-reload")
     document["status"] = "rolled_back"
     atomic_json(journal_path, document)
@@ -2903,6 +4189,7 @@ def verify_install(names: list[str]) -> dict[str, Any]:
     plan = desired_plan(names)
     failures: list[str] = []
     failure_codes: list[str] = []
+    skill_link_evidence: list[dict[str, Any]] = []
     warnings, warning_codes = _docker_admission_warning_summary(
         plan["docker_admission"]
     )
@@ -2925,12 +4212,13 @@ def verify_install(names: list[str]) -> dict[str, Any]:
     dependency_failure = runtime_dependency_failure(dependency_evidence)
     if dependency_failure is not None:
         failures.append(dependency_failure)
+    runner_script_failure = worker_runner_script_failure()
+    if runner_script_failure is not None:
+        failures.append(runner_script_failure)
     try:
-        access = grp.getgrnam(ACCESS_GROUP)
         service = pwd.getpwnam(SERVICE_USER)
     except KeyError:
-        failures.append("service identity or access group is missing")
-        access = None
+        failures.append("service identity is missing")
         service = None
     for source, destination in SYSTEM_FILES.items():
         if not destination.is_file() or destination.is_symlink() or digest(destination) != digest(source):
@@ -2980,7 +4268,7 @@ def verify_install(names: list[str]) -> dict[str, Any]:
                 f"legacy broker Docker drop-in was not migrated: {LEGACY_DOCKER_DROPIN}"
             )
     profile_parent = CLIENT_PROFILE_PATH.parent
-    if access is not None and service is not None:
+    if service is not None:
         try:
             metadata = profile_parent.lstat()
         except FileNotFoundError:
@@ -2990,21 +4278,20 @@ def verify_install(names: list[str]) -> dict[str, Any]:
                 stat.S_ISLNK(metadata.st_mode)
                 or not stat.S_ISDIR(metadata.st_mode)
                 or metadata.st_uid != service.pw_uid
-                or metadata.st_gid != access.gr_gid
-                or stat.S_IMODE(metadata.st_mode) != 0o750
+                or metadata.st_gid != SYSTEM_OWNER_GID
+                or stat.S_IMODE(metadata.st_mode) != 0o755
             ):
                 failures.append(f"client profile directory is unsafe: {profile_parent}")
     profile = CLIENT_PROFILE_PATH
     if profile.exists() or profile.is_symlink():
         metadata = profile.lstat()
         if (
-            access is None
-            or service is None
+            service is None
             or stat.S_ISLNK(metadata.st_mode)
             or not stat.S_ISREG(metadata.st_mode)
             or metadata.st_uid != service.pw_uid
-            or metadata.st_gid != access.gr_gid
-            or stat.S_IMODE(metadata.st_mode) != 0o640
+            or metadata.st_gid != SYSTEM_OWNER_GID
+            or stat.S_IMODE(metadata.st_mode) != 0o644
         ):
             failures.append(f"client profile is unsafe: {profile}")
     for client in plan["clients"]:
@@ -3012,14 +4299,30 @@ def verify_install(names: list[str]) -> dict[str, Any]:
         journal = Path(client["journal"])
         if not journal.is_dir() or journal.is_symlink():
             failures.append(f"client journal is missing or unsafe: {journal}")
-        for root in client["skill_roots"]:
-            destination = Path(root) / "codex-dev-coordinator"
-            source = ROOT / "skills/codex-dev-coordinator"
-            if not destination.is_symlink() or os.readlink(destination) != str(source):
-                failures.append(f"skill is not a direct canonical link: {destination}")
-        groups = {group.gr_gid for group in grp.getgrall() if record.pw_name in group.gr_mem}
-        if access is not None and record.pw_gid != access.gr_gid and access.gr_gid not in groups:
-            failures.append(f"client is not in the broker access group: {record.pw_name}")
+        roots = [Path(str(root)) for root in client["skill_roots"]]
+        try:
+            evidence = verify_skill_links(roots)
+        except InstallError as error:
+            evidence = {
+                "ok": False,
+                "skills": list(MANAGED_SKILLS),
+                "target_roots": [str(root) for root in roots],
+                "entries": [],
+                "error": str(error),
+            }
+            failures.append(
+                f"canonical skill link verification failed for UID {record.pw_uid}: {error}"
+            )
+        else:
+            for entry in evidence["entries"]:
+                if entry.get("status") != "direct_link":
+                    failures.append(
+                        "skill is not a direct canonical link "
+                        f"({entry.get('status')}): {entry.get('destination')}"
+                    )
+        skill_link_evidence.append(
+            {"user": record.pw_name, "uid": record.pw_uid, **evidence}
+        )
     return {
         "ok": not failures,
         "failures": failures,
@@ -3027,6 +4330,7 @@ def verify_install(names: list[str]) -> dict[str, Any]:
         "warnings": warnings,
         "warning_codes": warning_codes,
         "plan": plan,
+        "skill_link_evidence": skill_link_evidence,
         "restart_precondition": restart_precondition,
         "runtime_dependency_evidence": dependency_evidence,
     }
@@ -3042,6 +4346,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     apply.add_argument("--client-user", action="append", required=True)
     apply.add_argument("--transaction-dir", required=True)
     apply.add_argument("--allow-noncanonical-skill-links", action="store_true")
+    activate = actions.add_parser("activate")
+    activate.add_argument("--client-user", action="append", required=True)
+    activate.add_argument("--transaction-dir", required=True)
+    activate.add_argument("--operation-id", required=True)
+    activate.add_argument("--wait-seconds", type=int, default=30)
+    restore_activation = actions.add_parser("restore-activation-baseline")
+    restore_activation.add_argument("--transaction-dir", required=True)
+    restore_activation.add_argument("--operation-id", required=True)
     rollback = actions.add_parser("rollback")
     rollback.add_argument("--transaction-dir", required=True)
     parser.add_argument("--json", action="store_true")
@@ -3050,7 +4362,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    lock_descriptor: InstallerFenceHandle | None = None
+    command_succeeded = False
     try:
+        if args.action in {
+            "apply",
+            "activate",
+            "restore-activation-baseline",
+            "rollback",
+        }:
+            lock_descriptor = _acquire_installer_lock()
         if args.action == "plan":
             result = desired_plan(args.client_user)
             if not result["restart_precondition"]["ok"]:
@@ -3062,6 +4383,18 @@ def main(argv: list[str] | None = None) -> int:
                 args.transaction_dir,
                 bool(args.allow_noncanonical_skill_links),
             )
+        elif args.action == "activate":
+            result = activate_install(
+                args.client_user,
+                Path(args.transaction_dir),
+                args.operation_id,
+                args.wait_seconds,
+            )
+        elif args.action == "restore-activation-baseline":
+            result = restore_activation_baseline(
+                Path(args.transaction_dir),
+                args.operation_id,
+            )
         elif args.action == "rollback":
             result = rollback_install(Path(args.transaction_dir))
         else:
@@ -3069,20 +4402,34 @@ def main(argv: list[str] | None = None) -> int:
             if not result["ok"]:
                 print(json.dumps(result, indent=2, sort_keys=True))
                 return 1
+        command_succeeded = True
     except (InstallError, OSError, ValueError, json.JSONDecodeError) as error:
         code = getattr(error, "code", None)
         if code is not None:
+            payload: dict[str, Any] = {
+                "ok": False,
+                "code": str(code),
+                "error": str(error),
+            }
+            classification = getattr(error, "classification", None)
+            action_required = getattr(error, "action_required", None)
+            evidence = getattr(error, "evidence", None)
+            if isinstance(classification, str) and classification:
+                payload["classification"] = classification
+            if isinstance(action_required, str) and action_required:
+                payload["action_required"] = action_required
+            if isinstance(evidence, dict):
+                payload["evidence"] = evidence
             print(
-                json.dumps(
-                    {"ok": False, "code": str(code), "error": str(error)},
-                    indent=2,
-                    sort_keys=True,
-                ),
+                json.dumps(payload, indent=2, sort_keys=True),
                 file=sys.stderr,
             )
         else:
             print(f"server-wide coordinator installation failed: {error}", file=sys.stderr)
         return 2
+    finally:
+        if lock_descriptor is not None:
+            lock_descriptor.close(command_succeeded=command_succeeded)
     print(json.dumps(result, indent=2, sort_keys=True))
     return 0
 

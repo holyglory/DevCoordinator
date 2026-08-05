@@ -17,7 +17,10 @@ from devcoordinator.broker import (
     BrokerRequest,
     PeerCredentials,
 )
-from devcoordinator.broker_persistence import BrokerPersistence
+from devcoordinator.broker_persistence import (
+    BrokerPersistence,
+    ComposeEnrollmentContainerScope,
+)
 from devcoordinator.cleanup_lifecycle import CleanupLifecycle
 from devcoordinator.store import (
     AccountStore,
@@ -59,11 +62,108 @@ class BrokerEnrollmentReinstallTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
+    def test_profile_compose_subset_uses_exact_snapshot_project_and_services(self) -> None:
+        persistence = mock.Mock()
+        persistence.compose_enrollment_container_scope.return_value = (
+            ComposeEnrollmentContainerScope(
+                lifecycle_container_ids=(
+                    "container-compose-a",
+                    "container-compose-b",
+                ),
+                non_lifecycle_container_ids=("container-run-once",),
+            )
+        )
+        result = broker_enrollment._compose_owned_container_ids_for_profile(
+            persistence,
+            repo_id="repo-compose",
+            root=self.root,
+            compose={
+                "declared": True,
+                "project_name": "project-runtime",
+                "services": ["web", "worker"],
+                "run_once_services": [
+                    {
+                        "name": "migrate",
+                        "max_timeout_seconds": 600,
+                        "receipt": {"required": {"ok": "boolean"}},
+                    }
+                ],
+            },
+            compose_definition_id="compose-definition",
+            enrollment_snapshot_id="snapshot-enrollment",
+            enrolled_container_ids=frozenset(
+                {
+                    "container-compose-a",
+                    "container-compose-b",
+                    "container-standalone",
+                }
+            ),
+        )
+        self.assertEqual(
+            result, ("container-compose-a", "container-compose-b")
+        )
+        persistence.compose_enrollment_container_scope.assert_called_once_with(
+            repo_id="repo-compose",
+            snapshot_id="snapshot-enrollment",
+            project_name="project-runtime",
+            service_names=("web", "worker"),
+            run_once_service_names=("migrate",),
+        )
+
+    def test_profile_compose_subset_rejects_resource_outside_container_grant(self) -> None:
+        persistence = mock.Mock()
+        persistence.compose_enrollment_container_scope.return_value = (
+            ComposeEnrollmentContainerScope(
+                lifecycle_container_ids=("container-foreign",),
+                non_lifecycle_container_ids=(),
+            )
+        )
+        with self.assertRaisesRegex(RuntimeError, "absent from client container grants"):
+            broker_enrollment._compose_owned_container_ids_for_profile(
+                persistence,
+                repo_id="repo-compose",
+                root=self.root,
+                compose={
+                    "declared": True,
+                    "project_name": "project-runtime",
+                    "services": ["web"],
+                },
+                compose_definition_id="compose-definition",
+                enrollment_snapshot_id="snapshot-enrollment",
+                enrolled_container_ids=frozenset({"container-known"}),
+            )
+
+    def test_profile_compose_subset_preserves_typed_incomplete_scope_failure(self) -> None:
+        persistence = mock.Mock()
+        persistence.compose_enrollment_container_scope.side_effect = BrokerError(
+            "compose_scope_incomplete",
+            "Compose enrollment omits active exclusively owned services.",
+        )
+
+        with self.assertRaises(BrokerError) as caught:
+            broker_enrollment._compose_owned_container_ids_for_profile(
+                persistence,
+                repo_id="repo-compose",
+                root=self.root,
+                compose={
+                    "declared": True,
+                    "project_name": "project-runtime",
+                    "services": ["web"],
+                },
+                compose_definition_id="compose-definition",
+                enrollment_snapshot_id="snapshot-enrollment",
+                enrolled_container_ids=frozenset({"container-known"}),
+            )
+
+        self.assertEqual(caught.exception.code, "compose_scope_incomplete")
+
     def _enroll(
         self,
         *,
         explicit_reinstall: bool = False,
         environment: object = None,
+        repository_owner_uid: object = UID,
+        socket_mode: int = 0o666,
     ) -> dict[str, object]:
         class RootEnrollmentOS:
             def geteuid(self) -> int:
@@ -133,6 +233,7 @@ class BrokerEnrollmentReinstallTests(unittest.TestCase):
                 socket_path=self.socket,
                 socket_gid=os.getgid(),
                 client_uid=UID,
+                repository_owner_uid=repository_owner_uid,
                 account_id="account-test",
                 canonical_root=str(self.root),
                 servers=(server,),
@@ -141,7 +242,23 @@ class BrokerEnrollmentReinstallTests(unittest.TestCase):
                 port_end=43_210,
                 profile_path=self.profile,
                 explicit_reinstall=explicit_reinstall,
+                socket_mode=socket_mode,
             )
+
+    def test_enrollment_publishes_universal_local_socket_mode(self) -> None:
+        self._enroll()
+
+        self.assertEqual(self.profile_publications[-1]["service"]["mode"], "0666")
+        with self.assertRaisesRegex(ValueError, "universal local socket mode 0666"):
+            self._enroll(socket_mode=0o660)
+
+    def test_repository_owner_uid_requires_a_positive_plain_integer(self) -> None:
+        for invalid in (True, False, 0, -1, "501", 1.0, None):
+            with self.subTest(repository_owner_uid=invalid):
+                with self.assertRaisesRegex(
+                    ValueError, "repository owner UID must be a positive integer"
+                ):
+                    self._enroll(repository_owner_uid=invalid)
 
     def _purge_worker(
         self, *, repo_id: str, server_id: str, sequence: str = "old"

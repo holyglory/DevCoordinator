@@ -1,0 +1,46 @@
+[Unit]
+Description=DevCoordinator temporary first-adoption trusted loopback API
+Requires=devcoordinator-api-handoff.socket
+After=devcoordinator-api-handoff.socket
+
+[Service]
+Type=exec
+User=devcoordinator-api
+Group=devcoordinator-api
+Slice=devcoordinator-control.slice
+UMask=0077
+Environment=DEVCOORDINATOR_ROLE=api-handoff
+Environment=DEVCOORDINATOR_INVENTORY_PUBLICATION=/var/lib/devcoordinator-observer/inventory.publication
+Environment=DEVCOORDINATOR_TEST_READ_AUTHORITY=testd
+Environment=DEVCOORDINATOR_CALL_LOG=/var/log/devcoordinator/calls.jsonl
+Environment=DEVCOORDINATOR_CALL_LOG_MAX_BYTES=4194304
+Environment=DEVCOORDINATOR_CALL_LOG_BACKUPS=4
+ExecStartPre=/opt/devcoordinator/releases/RELEASE_DIGEST/bin/devcoordinator-profile-check --read-only --profile /etc/devcoordinator/api-handoff-profile.json --expected-schema 1
+ExecStart=/opt/devcoordinator/releases/RELEASE_DIGEST/bin/devcoordinator-api --systemd-socket --profile /etc/devcoordinator/api-handoff-profile.json
+Restart=always
+RestartSec=2
+TimeoutStopSec=30s
+KillMode=mixed
+RuntimeDirectory=devcoordinator-api-handoff
+RuntimeDirectoryMode=0750
+LogsDirectory=devcoordinator
+LogsDirectoryMode=0777
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=devcoordinator-api-handoff
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+# Keep the handoff candidate behavior identical to the stable API: enrolled
+# repository identities below /home must remain readable during cutover.
+ProtectHome=read-only
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=/run/devcoordinator-api-handoff
+ReadOnlyPaths=/var/lib/devcoordinator-observer
+
+[Install]
+WantedBy=multi-user.target

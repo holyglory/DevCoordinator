@@ -1,11 +1,91 @@
-# Agent Runtime API
+# Runtime API
 
-This reference ships inside the standalone `codex-dev-coordinator` skill.
+> **Single-developer trust model:** local UID/GID, mode, ACL, link-count, and
+> Unix-socket ownership are attribution or hygiene only, never authorization or
+> preflight gates. Where older detail below describes metadata-based local
+> admission, the executable typed protocol and exact repository/resource IDs
+> supersede it. Public Console identity and project grants remain enforced.
 
-The runtime API is the only agent-facing lifecycle entrypoint. It resolves
-repository ownership, observes current state, performs one typed action, and
-returns one compact report. Agents should not reproduce its preflights or
-cleanup logic in shell commands.
+This reference ships inside the standalone `codex-dev-coordinator` skill. The
+immutable intent client is the default agent-facing lifecycle entrypoint. It
+resolves repository ownership and exact targets, observes current state,
+performs one typed action, and returns one bounded report. Agents must not
+reproduce its discovery, preflight, retry, convergence, or cleanup logic in
+shell commands.
+
+## Routine intent calls
+
+Run inside the active Git worktree; add command-scoped
+`--project /absolute/worktree` only from arbitrary cwd:
+
+```bash
+devcoordinator targets web --kind service
+devcoordinator runtime status web --kind service
+devcoordinator runtime ensure web --kind service --desired ready
+devcoordinator runtime ensure web --kind service --desired stopped
+```
+
+One runtime command performs the capability handshake, repository-context
+proof, target resolution, fresh observation, and bounded projection. `ensure`
+also owns no-op detection, safe start/stop selection, durable operation
+identity, convergence, and terminal proof. It does not mutate an unknown,
+unhealthy, unclassified, or contradictory target; it returns typed attention.
+An already desired target is a successful no-op.
+
+Python generates the operation UUID before discovery or transport. Preserve the
+returned `dc1:operation:…` handle. After an uncertain reply, follow it rather
+than generating a replacement operation:
+
+```bash
+devcoordinator operation follow dc1:operation:OPERATION_UUID
+```
+
+An explicit `--operation-id` is accepted only for the exact canonical UUID and
+request replay. The client automatically rejects an incompatible active
+release, authority generation, broker protocol, result schema, or required
+8 KiB global result envelope; that is not a reason to bypass it through a
+different interface. Other published per-surface bounds are enforced by the local
+projection rather than treated as handshake fields.
+
+`runtime start|stop|restart` remain available when the transition itself is the
+requested semantic action, and `runtime capture_logs` returns evidence for one
+exact target. Prefer `ensure` when the goal is a state. See
+[agent-client.md](agent-client.md) for the complete caller, MCP, call-count, and
+output-bound contract.
+
+## First use and sandboxed development servers
+
+An agent coding sandbox is not a host-runtime supervisor. If `npm run dev`,
+`vite`, `python -m http.server`, or another listener receives `EACCES` or cannot
+bind inside that sandbox, do not retry it there and do not disable the broker.
+Use the routine bounded host-runtime intent instead:
+
+```bash
+devcoordinator runtime serve prototype \
+  --project /home/holyglory/DesignDocEngine/prototype \
+  --cwd . --port 4173 --ttl-seconds 3600 \
+  --kill-after-run false --launch-timeout-seconds 30 \
+  -- npm run dev -- --host 0.0.0.0 --port 4173 --strictPort
+```
+
+`capabilities` and `targets` are pure for a valid new Git repository. They
+return `repository.state=unenrolled`, an empty target list, and the supported
+first-use action; they do not invent a broker outage and do not mutate state.
+The first `runtime serve` atomically adopts the repository, launches structured
+argv without a shell as the repository owner, uses the exact requested port,
+and gives systemd responsibility for control-group cleanup at the positive TTL.
+It never selects a fallback port. A fresh client process can immediately see
+the enrollment and follow the returned durable operation handle.
+
+If the request is wrong, the response explains the decision rather than only
+returning an internal code. Every error reports its stage, classification,
+whether the broker was contacted (`true`, `false`, or `null` when transport is
+ambiguous), whether a mutation occurred (`true`, `false`, or `null`), outcome
+certainty, retryability, a short `next_action`, and an exact `next_command` when
+one is safe. For example, a busy exact port returns `port_in_use`, identifies
+the collision, confirms no alternative was chosen, and tells the agent to stop
+or choose a port intentionally. A repository-relative cwd escape or shell argv
+is rejected before launch with the corrected invocation shape.
 
 ## Current authority boundary
 
@@ -17,17 +97,96 @@ classification, and exact-membership revalidation. Shared `start`, `stop`, and
 they use an exact underlying container ID, durable replay, fresh final
 observation, and terminal state/readiness proof. Enrolled worker-role services
 also support peer-UID status/start/stop/restart and structured,
-generation-checked replacement through a fixed native runner. Other service
-roles return `runtime_supervisor_required`. Start/restart with a TTL returns
-`runtime_cleanup_owner_required` until the broker owns durable expiry cleanup.
+generation-checked replacement through a fixed native runner. Other persistent
+service roles return `runtime_supervisor_required`. The dedicated `runtime
+serve` temporary-service path is broker supervised and owns durable expiry
+cleanup.
 An ambiguous restart remains `operation_outcome_uncertain` when observing the
-container running cannot prove that the restart transition occurred. `run`,
-client-authored port definitions, and Docker/database replacement are rejected.
+container running cannot prove that the restart transition occurred. Generic
+`run`, arbitrary client-authored service definitions, and Docker/database
+replacement are rejected; `runtime serve` is the narrow exact-port exception
+with structured argv, repository-relative cwd, positive TTL, and systemd-owned
+cleanup.
 Do not create a private shadow store to bypass that boundary. Explicit isolated
 account authority retains the full source implementation; its detached TTL
 lifecycle requires the long-lived authenticated `api serve` owner.
 
-## Call
+## Advanced: governed Compose run-once
+
+System authority supports one narrower alternative to client-authored `run`:
+an administrator may seal a repository Compose service and explicitly grant
+that exact name during root enrollment. It is a separate broker operation, not
+a general runtime-session command.
+
+The runtime manifest keeps lifecycle and one-shot scopes disjoint:
+
+```json
+{
+  "docker": {
+    "compose_files": ["compose.yml"],
+    "services": ["app", "database"],
+    "run_once_services": [
+      {
+        "name": "ingestion-once",
+        "max_timeout_seconds": 900,
+        "receipt": {
+          "required": {
+            "ok": "boolean",
+            "imported": "integer"
+          },
+          "optional": {
+            "language": "string_or_null",
+            "warnings": "string_array"
+          }
+        }
+      }
+    ]
+  }
+}
+```
+
+Root enrollment must separately include
+`--compose-run-once-service ingestion-once`. Declaration alone grants nothing.
+Every one-shot service needs an explicit image reference in the rendered
+Compose model. The client-facing invocation is:
+
+```bash
+python3 "$COORDINATOR" docker compose-run-once \
+  --agent "$AGENT" --project "$ROOT_REPO" \
+  --service ingestion-once --timeout-seconds 600 \
+  --operation-id "$OPERATION_UUID"
+```
+
+The default timeout is 600 seconds, policy ceilings are 600–3600 seconds, and
+the request timeout may not exceed the enrolled ceiling. Reuse the same
+operation UUID after a disconnect or uncertain reply. The request contains no
+command, environment, mounts, Compose paths, working directory, or Docker
+options.
+
+The broker proves the current merged model, binds the service's image reference
+to an immutable image ID, and creates one stopped, labeled container with
+`--no-deps`, `--no-TTY`, `--no-start`, `pull_policy: never`, and the repository
+cgroup/resource limits. The override also requires no restart policy, no open
+stdin, and no TTY, and inspection proves those values before start. It journals
+intent before each host effect and later uses only the immutable container ID.
+If replay observes a create intent but cannot recover the exact fully labeled
+container, it reports the ambiguity and never recreates that operation.
+
+The service writes exactly one UTF-8 JSON object to stdout. Only fields declared
+in the receipt contract are returned. Duplicate keys, non-finite numbers,
+trailing data, missing/unexpected fields, wrong types, invalid UTF-8, and
+receipts above 64 KiB are categorical failures. Complete stdout and stderr are
+drained separately, but only private SHA-256 and byte counts are retained; raw
+stream bytes are never returned or stored in the authority. The exact
+container and its anonymous volumes are removed before the durable public
+result commits.
+
+## Advanced structured call
+
+The lower-level producer remains for definitions, generation-checked
+replacement, bounded `run`, staged removal, and authority-specific operations
+that the intent client's capability document does not advertise. It is not the
+routine status/start/stop fast path.
 
 ```bash
 COORDINATOR="skills/codex-dev-coordinator/scripts/dev_coordinator.py"
@@ -38,13 +197,13 @@ python3 "$COORDINATOR" runtime status \
 python3 "$COORDINATOR" runtime --request-file /absolute/request.json
 ```
 
-Use flags for ordinary existing-target actions. Use `--request-file` or
-`--request-json` for structured definitions, replacement, and bounded `run`
-requests. Both forms use the same validator. The default response is one JSON
-line; use `--pretty` for inspection and `runtime --help` for the executable
-contract.
+Use `--request-file` or `--request-json` only for structured definitions,
+replacement, and bounded `run` requests. Both forms use the same validator. Do
+not hand-build routine JSON in a shell wrapper. The default response is one JSON
+line; use `--pretty` for human inspection and `runtime --help` for the exact
+advanced contract.
 
-## Request
+## Advanced request document
 
 Every request has this shape:
 
@@ -93,7 +252,7 @@ null. A `run` request supplies structured `run_argv`; the API starts the
 declared runtime, executes that command without a shell, and owns cleanup on
 success, failure, interruption, and TTL expiry.
 
-## Structured request examples
+## Advanced structured request examples
 
 Request and option names are lower-case `snake_case`; `KillAfterRun` is the
 top-level JSON boolean `kill_after_run`. The request and `options` objects are
@@ -368,10 +527,10 @@ Docker/database targets and rejects a `removed` disposition for either kind.
 
 ## Lower-level and operator interfaces
 
-Legacy `project`, `server`, `docker`, `port`, `broker`, archive, backup, and
-recovery commands remain compatibility/operator interfaces. Agents should use
+Advanced `project`, `server`, `docker`, `port`, `broker`, archive, backup, and
+recovery commands are separate current operator interfaces. Agents should use
 them only when a runtime report names a specific repair and `--help` confirms
 the required authority. Server-wide installation and recovery are described in
-[the coordinator skill README](../skills/codex-dev-coordinator/README.md), the
-[Console operations documentation](../apps/DevOpsConsole/README.md), and each
+[the coordinator skill README](../README.md), the
+[Console operations documentation](../../../apps/DevOpsConsole/README.md), and each
 script's generated help.

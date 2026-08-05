@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+import stat
 import tempfile
 import time
 import unittest
@@ -32,6 +33,24 @@ HOST_ID = "host-a"
 REPO_ID = "repo-a"
 
 
+def _private_test_parent() -> Path:
+    runtime = Path(
+        os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.geteuid()}")
+    ).resolve()
+    try:
+        info = runtime.lstat()
+    except OSError:
+        return Path.home().resolve()
+    if (
+        stat.S_ISDIR(info.st_mode)
+        and not stat.S_ISLNK(info.st_mode)
+        and info.st_uid == os.geteuid()
+        and stat.S_IMODE(info.st_mode) & (stat.S_IWGRP | stat.S_IWOTH) == 0
+    ):
+        return runtime
+    return Path.home().resolve()
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     groups = parser.add_subparsers(dest="group", required=True)
@@ -43,7 +62,7 @@ class ProtectedProfileEnrollmentMigrationTests(unittest.TestCase):
     def setUp(self) -> None:
         self._temporary = tempfile.TemporaryDirectory(
             prefix=".profile-enrollment-migration-",
-            dir=str(Path.home().resolve()),
+            dir=str(_private_test_parent()),
         )
         self.root = Path(self._temporary.name).resolve()
         self.project = self.root / "project"
@@ -115,7 +134,7 @@ class ProtectedProfileEnrollmentMigrationTests(unittest.TestCase):
         document = {
             "version": 1,
             "service": {
-                "socket": "/run/devcoordinator/broker.sock",
+                "socket": "/run/devcoordinator-authority.sock",
                 "uid": self.uid,
                 "gid": os.getegid(),
                 "mode": "0660",
@@ -135,9 +154,15 @@ class ProtectedProfileEnrollmentMigrationTests(unittest.TestCase):
                             "canonical_root": str(self.project),
                             "repo_id": REPO_ID,
                             "generation": 0,
+                            "owner_uid": self.uid,
                             "servers": {},
                             "containers": {},
                             "compose_definition_id": None,
+                            "compose_container_ids": [],
+                            "compose_run_once_services": {},
+                            "ephemeral_templates": {},
+                            "ephemeral_image_prefetch_templates": [],
+                            "ephemeral_secret_policies": {},
                             "account_id": ACCOUNT_ID,
                             "enabled": repository_enabled,
                             "issued_at": self.issued_at,
@@ -496,7 +521,7 @@ class ProtectedProfileEnrollmentMigrationTests(unittest.TestCase):
             self._migrate()
         self.assertIsNone(self._enrollment())
 
-    def test_migration_accepts_legacy_repository_expiry_fallback(self) -> None:
+    def test_migration_rejects_repository_missing_current_enrollment_fields(self) -> None:
         document = self._profile_document()
         repository = document["clients"][str(self.uid)]["repositories"][0]
         for field in (
@@ -507,11 +532,11 @@ class ProtectedProfileEnrollmentMigrationTests(unittest.TestCase):
         ):
             repository.pop(field)
         self._write_profile_document(document)
-        result = self._migrate()
-        self.assertEqual(result["inserted"], 1)
-        enrollment = self._enrollment()
-        self.assertEqual(enrollment["issued_at"], self.issued_at)
-        self.assertEqual(enrollment["valid_until_epoch"], self.valid_until)
+        with self.assertRaisesRegex(
+            ProfileEnrollmentMigrationError, "repository profile fields are invalid"
+        ):
+            self._migrate()
+        self.assertIsNone(self._enrollment())
 
     def test_migration_refuses_conflicting_enabled_row_without_overwrite(self) -> None:
         with CoordinatorStore.open(
@@ -767,7 +792,7 @@ class ProtectedProfileEnrollmentMigrationTests(unittest.TestCase):
             self._reconcile(rollback_root=alias)
         self.assertEqual(self.profile.read_bytes(), before)
 
-    def test_generation_reconciliation_preserves_legacy_repository_shape(self) -> None:
+    def test_generation_reconciliation_rejects_incomplete_repository_shape(self) -> None:
         document = self._profile_document()
         repository = document["clients"][str(self.uid)]["repositories"][0]
         for field in (
@@ -779,22 +804,14 @@ class ProtectedProfileEnrollmentMigrationTests(unittest.TestCase):
             repository.pop(field)
         self._write_profile_document(document)
         self._set_repository_generation(1)
+        before = self.profile.read_bytes()
 
-        result, _lock = self._reconcile()
-
-        self.assertEqual(result["status"], "reconciled")
-        published = self._profile_document()
-        published_repository = published["clients"][str(self.uid)][
-            "repositories"
-        ][0]
-        self.assertEqual(published_repository["generation"], 1)
-        for field in (
-            "account_id",
-            "enabled",
-            "issued_at",
-            "valid_until_epoch",
+        with self.assertRaisesRegex(
+            ProfileGenerationReconciliationError,
+            "repository profile fields are invalid",
         ):
-            self.assertNotIn(field, published_repository)
+            self._reconcile()
+        self.assertEqual(self.profile.read_bytes(), before)
 
     def test_generation_publication_corruption_rolls_back_atomically(self) -> None:
         self._set_repository_generation(1)

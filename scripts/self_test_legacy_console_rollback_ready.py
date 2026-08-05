@@ -1602,8 +1602,20 @@ def main() -> int:
                 interrupted_stdout, interrupted_stderr = interrupted.communicate(timeout=5)
         require(interrupted.returncode == 1, "SIGTERM did not produce a handled CLI failure")
         require(interrupted_stdout == "", "interrupted CLI emitted success output")
-        require("SIGTERM" in interrupted_stderr, "interrupted CLI omitted its signal")
-        require(read_ledger(interrupted_evidence)["status"] == "interrupted", "SIGTERM left running evidence")
+        require(
+            "interrupted" in interrupted_stderr.lower(),
+            "interrupted CLI omitted its interruption diagnostic",
+        )
+        interrupted_ledger = read_ledger(interrupted_evidence)
+        require(interrupted_ledger["status"] == "interrupted", "SIGTERM left running evidence")
+        require(
+            interrupted_ledger.get("error")
+            == (
+                "RollbackReadinessInterrupted: rollback readiness interrupted "
+                "by SIGTERM"
+            ),
+            "durable interruption evidence omitted or changed SIGTERM",
+        )
         cli_inventory_server.close()
 
     print(

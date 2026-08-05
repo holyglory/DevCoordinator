@@ -21,8 +21,10 @@ import {
   COORDINATOR_SCRIPT,
   apiCall,
   browse,
+  canonicalGitTempDir,
   canonicalTempDir,
   fetchUrl,
+  initializeFixtureGitRepository,
   login,
   makeJar,
   startStack,
@@ -79,8 +81,8 @@ describe('e2e: full console stack', () => {
 
   async function writeFakeDocker(binDir, webHostPort, callsLog) {
     const projectDir = path.join(binDir, 'e2eweb-project');
-    await fsp.mkdir(projectDir, { recursive: true });
-    execFileSync('git', ['-C', projectDir, 'init', '-q']);
+    await fsp.mkdir(projectDir, { recursive: true, mode: 0o700 });
+    await initializeFixtureGitRepository(projectDir);
     const labels = {
       'com.docker.compose.project': 'e2eweb',
       'com.docker.compose.project.working_dir': projectDir,
@@ -188,6 +190,7 @@ else:
 `;
     const fakeDocker = path.join(binDir, 'docker');
     await fsp.writeFile(fakeDocker, script, { encoding: 'utf8', mode: 0o755 });
+    return projectDir;
   }
 
   function assertDockerFixtureContract(extraEnv) {
@@ -235,7 +238,7 @@ print(json.dumps(dev_coordinator.docker_ps_inventory()))
     const fakeBin = await canonicalTempDir('devops-console-e2e-dockerbin-');
     extraTempDirs.push(fakeBin);
     dockerCallsLog = path.join(fakeBin, 'docker-calls.log');
-    await writeFakeDocker(fakeBin, dockerWeb.port, dockerCallsLog);
+    const dockerProjectRoot = await writeFakeDocker(fakeBin, dockerWeb.port, dockerCallsLog);
 
     const coordinatorEnv = {
       PATH: `${fakeBin}${path.delimiter}${process.env.PATH ?? ''}`,
@@ -246,6 +249,7 @@ print(json.dumps(dev_coordinator.docker_ps_inventory()))
       allowedEmails: [FIXTURE_EMAIL],
       coordinatorEnv,
       expectDocker: true,
+      repositoryOwnerRoots: [dockerProjectRoot],
       routes: ({ upstream, wsEcho }) => [
         // app -> ws-echo (answers plain GET too) — protected by default.
         { slug: 'app', kind: 'port', port: wsEcho.port },
@@ -788,16 +792,6 @@ print(json.dumps(dev_coordinator.docker_ps_inventory()))
   it('7b. Google-protected route uses private upstream auth without a second browser prompt', async () => {
     const jar = await authedJar();
 
-    const jwksResponse = await fetchUrl(
-      stack,
-      'https://console.vr.ae/.well-known/devops-console-identity.jwks',
-      { headers: { accept: 'application/json' } },
-    );
-    assert.equal(jwksResponse.status, 200, jwksResponse.text);
-    const jwks = JSON.parse(jwksResponse.text);
-    assert.equal(jwks.keys.length, 1);
-    assert.equal(jwks.keys[0].d, undefined, 'the public endpoint must never expose private key material');
-
     const anonymous = await fetchUrl(stack, 'https://sso.vr.ae/requires-upstream-auth', {
       headers: { accept: 'text/html' },
     });
@@ -818,36 +812,11 @@ print(json.dumps(dev_coordinator.docker_ps_inventory()))
     assert.equal(authed.status, 200, authed.text);
     const echoedHeaders = JSON.parse(authed.text).headers;
     assert.equal(echoedHeaders.authorization, FIXTURE_UPSTREAM_AUTHORIZATION);
-    const assertion = echoedHeaders['x-devops-console-assertion'];
-    const [encodedHeader, encodedPayload, encodedSignature] = assertion.split('.');
-    const assertionHeader = JSON.parse(Buffer.from(encodedHeader, 'base64url').toString('utf8'));
-    const assertionPayload = JSON.parse(Buffer.from(encodedPayload, 'base64url').toString('utf8'));
-    assert.equal(assertionHeader.kid, jwks.keys[0].kid);
-    assert.deepEqual(
-      {
-        iss: assertionPayload.iss,
-        aud: assertionPayload.aud,
-        sub: assertionPayload.sub,
-        resource: assertionPayload.resource,
-        method: assertionPayload.method,
-      },
-      {
-        iss: stack.consoleOrigin,
-        aud: 'sso.vr.ae',
-        sub: FIXTURE_EMAIL,
-        resource: 'route:sso',
-        method: 'GET',
-      },
-    );
-    assert.equal(assertionPayload.exp - assertionPayload.iat, 15);
+    assert.equal(echoedHeaders['x-devops-console-assertion'], undefined);
+    assert.equal(echoedHeaders['x-devops-console-email'], FIXTURE_EMAIL);
     assert.equal(
-      crypto.verify(
-        null,
-        Buffer.from(`${encodedHeader}.${encodedPayload}`, 'ascii'),
-        crypto.createPublicKey({ key: jwks.keys[0], format: 'jwk' }),
-        Buffer.from(encodedSignature, 'base64url'),
-      ),
-      true,
+      echoedHeaders['x-devops-console-route-id'],
+      stack.handle.routeStore.get('sso').instanceId,
     );
 
     const overview = await apiCall(stack, jar, 'GET', '/api/overview');
@@ -928,12 +897,9 @@ print(json.dumps(dev_coordinator.docker_ps_inventory()))
     const jar = await authedJar();
 
     // A real throwaway project repo for coordinator attribution.
-    const projectDir = await canonicalTempDir('devops-console-e2e-project-');
+    const projectDir = await canonicalGitTempDir('devops-console-e2e-project-');
     extraTempDirs.push(projectDir);
-    execFileSync('git', ['-C', projectDir, 'init', '-q']);
-    const toplevel = execFileSync('git', ['-C', projectDir, 'rev-parse', '--show-toplevel'], {
-      encoding: 'utf8',
-    }).trim();
+    const toplevel = projectDir;
 
     // Start a real server THROUGH the coordinator (isolated home, leased
     // port). The lease window is randomized per run and the start is retried:
@@ -1002,10 +968,9 @@ print(json.dumps(dev_coordinator.docker_ps_inventory()))
   it('9b. per-server subdomain: assign / change / remove via /api/servers/subdomain; Origin enforced', { timeout: 120_000 }, async () => {
     const jar = await authedJar();
 
-    const projectDir = await canonicalTempDir('devops-console-e2e-subdomain-');
+    const projectDir = await canonicalGitTempDir('devops-console-e2e-subdomain-');
     extraTempDirs.push(projectDir);
-    execFileSync('git', ['-C', projectDir, 'init', '-q']);
-    const toplevel = execFileSync('git', ['-C', projectDir, 'rev-parse', '--show-toplevel'], { encoding: 'utf8' }).trim();
+    const toplevel = projectDir;
 
     const rangeBase = 23000 + crypto.randomInt(0, 60) * 100;
     let server = null;
@@ -1135,8 +1100,16 @@ print(json.dumps(dev_coordinator.docker_ps_inventory()))
 
   it('11. port leases via console API: lease -> visible in overview -> Origin enforced -> release', async () => {
     const jar = await authedJar();
+    // This checkout can intentionally be shared through a non-owner ACL so
+    // multiple agent UIDs can collaborate. That must remain a production
+    // ownership blocker. Exercise the Console lease contract with a private,
+    // single-owner repository fixture instead of weakening that guard.
+    const projectDir = await canonicalGitTempDir('devops-console-e2e-lease-');
+    extraTempDirs.push(projectDir);
+    const toplevel = projectDir;
 
     const created = await apiCall(stack, jar, 'POST', '/api/ports/lease', {
+      project: toplevel,
       purpose: 'e2e lease',
       ttl: 120,
     }, { origin: stack.consoleOrigin });
@@ -1186,12 +1159,9 @@ print(json.dumps(dev_coordinator.docker_ps_inventory()))
 
     // The metrics sampler and the overview piggyback both feed the store; a
     // running coordinator server must eventually produce a charted entity.
-    const projectDir = await canonicalTempDir('devops-console-e2e-metrics-');
+    const projectDir = await canonicalGitTempDir('devops-console-e2e-metrics-');
     extraTempDirs.push(projectDir);
-    execFileSync('git', ['-C', projectDir, 'init', '-q']);
-    const toplevel = execFileSync('git', ['-C', projectDir, 'rev-parse', '--show-toplevel'], {
-      encoding: 'utf8',
-    }).trim();
+    const toplevel = projectDir;
 
     // Same port-range randomization + retry as test 9: concurrent suites can
     // bind-test the same free port; the loser retries on a fresh lease.
@@ -1278,12 +1248,9 @@ print(json.dumps(dev_coordinator.docker_ps_inventory()))
   it('13. durable port pins: server start pins its port -> survives stop -> unassign via console API', { timeout: 120_000 }, async () => {
     const jar = await authedJar();
 
-    const projectDir = await canonicalTempDir('devops-console-e2e-pins-');
+    const projectDir = await canonicalGitTempDir('devops-console-e2e-pins-');
     extraTempDirs.push(projectDir);
-    execFileSync('git', ['-C', projectDir, 'init', '-q']);
-    const toplevel = execFileSync('git', ['-C', projectDir, 'rev-parse', '--show-toplevel'], {
-      encoding: 'utf8',
-    }).trim();
+    const toplevel = projectDir;
 
     const rangeBase = 24000 + crypto.randomInt(0, 70) * 100;
     let server = null;
@@ -1344,6 +1311,7 @@ print(json.dumps(dev_coordinator.docker_ps_inventory()))
 
     // The pinned port cannot be leased by anyone else through the console.
     const steal = await apiCall(stack, jar, 'POST', '/api/ports/lease', {
+      project: toplevel,
       purpose: 'pin steal attempt',
       preferred: pinnedPort,
       ttl: 60,
@@ -1373,6 +1341,7 @@ print(json.dumps(dev_coordinator.docker_ps_inventory()))
     let reuse = null;
     for (let attempt = 0; attempt < 8; attempt++) {
       reuse = await apiCall(stack, jar, 'POST', '/api/ports/lease', {
+        project: toplevel,
         purpose: 'pin freed',
         preferred: pinnedPort,
         ttl: 60,
@@ -1452,12 +1421,9 @@ print(json.dumps(dev_coordinator.docker_ps_inventory()))
   it('15. project runtime control via console: start whole project -> members running -> stop', { timeout: 180_000 }, async () => {
     const jar = await authedJar();
 
-    const projectDir = await canonicalTempDir('devops-console-e2e-projact-');
+    const projectDir = await canonicalGitTempDir('devops-console-e2e-projact-');
     extraTempDirs.push(projectDir);
-    execFileSync('git', ['-C', projectDir, 'init', '-q']);
-    const toplevel = execFileSync('git', ['-C', projectDir, 'rev-parse', '--show-toplevel'], {
-      encoding: 'utf8',
-    }).trim();
+    const toplevel = projectDir;
     // Bind-checked OS-assigned port: a fixed random window would collide with
     // the coordinator-leased ranges other tests use (the suite's documented
     // flake mode).
@@ -1469,7 +1435,7 @@ print(json.dumps(dev_coordinator.docker_ps_inventory()))
       });
       srv.on('error', reject);
     });
-    await fsp.mkdir(path.join(toplevel, '.codex'), { recursive: true });
+    await fsp.mkdir(path.join(toplevel, '.codex'), { recursive: true, mode: 0o700 });
     await fsp.writeFile(
       path.join(toplevel, '.codex', 'dev-runtime.json'),
       JSON.stringify({
@@ -1483,7 +1449,7 @@ print(json.dumps(dev_coordinator.docker_ps_inventory()))
           health_url: 'http://127.0.0.1:{port}/',
         }],
       }),
-      'utf8',
+      { encoding: 'utf8', mode: 0o600 },
     );
 
     // Origin is enforced on project mutations.
@@ -1638,8 +1604,7 @@ print(json.dumps(dev_coordinator.docker_ps_inventory()))
 
     // Container logs flow end to end through the console endpoint.
     const logsRes = await apiCall(stack, jar, 'POST', '/api/docker/logs', {
-      name: 'e2eweb-app-1',
-      tail: 50,
+      resource_id: container.host_resource_id,
     }, { origin: stack.consoleOrigin });
     assert.equal(logsRes.status, 200, logsRes.text);
     assert.match(logsRes.json.text, /e2e fake container log line/);

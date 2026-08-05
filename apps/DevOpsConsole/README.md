@@ -10,8 +10,8 @@ third-party dependencies) that:
 - gates every subdomain behind **Google sign-in by default**, with a per-route
   *public / login-required* toggle in the control panel,
 - serves the control panel at `https://console.vr.ae` — hash-routed pages
-  (Projects, Servers, Routes, Docker, Port leases, Performance, Access,
-  Incoming invites, Telegram; tab nav on
+  (Projects, Tests, Open Coordinator bugs, Servers, Routes, Docker, Port
+  leases, Performance, Access, Incoming invites, Telegram; tab nav on
   desktop, a hamburger drawer on phones). The default Projects page is a tree
   of original root repos, their direct services, and nested temporary repos
   with their TTL and `KillAfterRun` policy. Root actions affect only the root
@@ -38,14 +38,33 @@ third-party dependencies) that:
   coalesce; failures back off from completion exponentially up to five minutes
   while pure inventory reads continue every tick. Every current running server
   and container row shows CPU %/memory
-  numbers plus a sparkline, and the Performance page renders full history
-  charts (history resets when the console restarts).
+  numbers plus a sparkline. The Performance page renders a reconciled
+  whole-host stacked history with attributed repositories, measured Agent
+  browsers, measured control work, estimated system/unclassified memory, and
+  available memory. Repository and Agent-browser detail opens from the legend;
+  browser timestamps are explicitly last observed work, not invented
+  historical use. History resets when the console restarts.
+
+  The Open Coordinator bugs page is deliberately outside that normal control
+  path. Agents write bounded, redacted reproduction records to the shared
+  open-only registry; `GET /api/bugs` reads it without contacting Coordinator
+  inventory, authority, broker, API, or testd. Every Console user may inspect
+  the actionable collection and its exact structured arguments. Configured
+  owners may Close a report, which physically removes the open file (and any
+  same-fingerprint duplicate) immediately. There is no closed history or
+  tombstone to synchronize between Console instances. A failed refresh keeps
+  the last collection visible and reports the error inside this page.
+  Authenticated users can export the complete open collection as portable JSON;
+  owners can import it through the same page. Imported reports remain labelled
+  with their originating server and stay distinct from matching local reports,
+  so disconnected Coordinator servers can exchange current bugs by copy/paste
+  without pretending that they share a live replication channel.
 
   In the required production unit, metrics and Telegram broker loops start 90
   seconds after the Console's own registration succeeds. This keeps the
   installed 80-second independent registration proof ahead of background host
   observation and event ingestion during restarts. The proof uses one
-  authenticated inventory request with the whole remaining startup deadline;
+  trusted-loopback inventory request with the whole remaining startup deadline;
   it never abandons a still-running broker read merely to retry it.
 
   Supervised workers have explicit start, stop, restart, crash-loop rearm, and
@@ -115,9 +134,9 @@ ones:
 | `ALLOWED_EMAILS` | Comma-separated configured owner accounts. Owners always have full Console/domain access and alone may edit the invited-user list. Keep at least one break-glass owner here. |
 | `SESSION_SECRET` | 64 hex chars (`openssl rand -hex 32`). Rotating it signs everyone out. |
 | `COORDINATOR_URL` | Coordinator API origin, default `http://127.0.0.1:29876`; only loopback `http(s)` origins without credentials, paths, queries, or fragments are accepted. |
-| `COORDINATOR_TOKEN_FILE` | Private mode-0600 bearer token created by the coordinator and read only by the server-side Console client. |
 | `COORDINATOR_AUTOSTART` | Optional local fallback; production sets `0` and uses `dev-coordinator.service`. |
 | `COORDINATOR_REGISTRATION_REQUIRED` | Production-only fail-closed gate. The unit pins `1`; direct/local runs omit it and log a bounded registration failure without exiting. |
+| `DEVCOORDINATOR_BUG_DIR` | Absolute shared open-bug directory. Production uses `/var/lib/devcoordinator-bugs/open`; a missing directory is an honest empty list. One `<bug_id>.json` file means open, and Close removes it instead of creating history. |
 | `LIFECYCLE_ENABLED` | Explicit cleanup activation gate (default `0`). Set to `1` only after the matching broker schema, generated home access, cleanup ACLs, and live plan/apply/restore checks are ready. |
 | `METRICS_INTERVAL_MS` | CPU/memory observation cadence for the history charts (default `10000`, floor `2000`). Metrics is the sole periodic observer; same-project requests coalesce and failures back off up to five minutes while committed inventory remains readable. |
 
@@ -205,7 +224,7 @@ auto-cleaned, service reloaded, all hosts still trusted).
 Setup (already done on this host; repeat if rebuilding):
 
 ```bash
-# 1. Store the 101domain API key, root-only, OUTSIDE the repo:
+# 1. Store the 101domain API key OUTSIDE the repo (0600 is hygiene):
 sudo install -d -m 700 /etc/letsencrypt/101domain
 printf 'DOMAIN101_API_KEY=%s\n' "<key>" | sudo tee /etc/letsencrypt/101domain/credentials.env >/dev/null
 sudo chmod 600 /etc/letsencrypt/101domain/credentials.env
@@ -218,16 +237,17 @@ sudo install -m 700 deploy/101domain/auth-hook.sh deploy/101domain/cleanup-hook.
 sudo certbot renew --cert-name vr.ae --dry-run
 ```
 
-The API key lives only in the root-only credentials file — never in the repo,
-which is public. The hooks read it from there.
+The API key lives only in the host credential file—never in the repo, which is
+public. Any local process that must use it relies on actual readability;
+UID/GID/mode metadata is not a second application authorization policy.
 
 Fallback (if the API is ever unavailable), a guided manual helper prints the
 exact TXT to add, verifies propagation, issues, and reloads:
 `sudo bash deploy/renew-wildcard.sh`.
 
-Cert files are root-owned; the service user reads them via a default ACL
-(`sudo setfacl -R -d -m u:holyglory:rX /etc/letsencrypt/{live,archive}`) so
-renewed files stay readable. A renewal deploy hook
+systemd reads the certificate files and passes them to the service through
+`LoadCredential`; no developer group or ACL membership is an application trust
+gate. A renewal deploy hook
 (`/etc/letsencrypt/renewal-hooks/deploy/devops-console`) reloads the service
 (SIGHUP) after any renewal. Note: changing the cert **path** in the external
 `console.env` needs a full restart; a same-path renewal only needs a reload.
@@ -315,25 +335,23 @@ candidate units. `systemd-analyze verify` is a syntax gate; after installation,
 also inspect systemd's resolved path properties because syntax validation does
 not prove which account home a specifier selects. Do not install/reload them over a running legacy service; the
 existing-host sequence below installs them only after the old cgroup is down.
-The first preflight intentionally does not require the API token because the
-coordinator creates it on first start.
+The Coordinator API uses the server's trusted loopback boundary and does not
+create or require an internal bearer credential.
 
 ```bash
 set -euo pipefail
 python3 "$DEVCOORDINATOR_ROOT/scripts/check_production_layout.py" \
   --repo-root "$DEVCOORDINATOR_ROOT" --home "$HOME" \
   --env-file "$CONSOLE_ENV" --state-dir "$CONSOLE_STATE" \
-  --acme-webroot "$ACME_WEBROOT" --coordinator-home "$COORDINATOR_HOME" \
-  --token-file "$COORDINATOR_HOME/api-token"
+  --acme-webroot "$ACME_WEBROOT" --coordinator-home "$COORDINATOR_HOME"
 
 sudo systemd-analyze verify \
   "$DEVCOORDINATOR_ROOT/apps/DevOpsConsole/deploy/dev-coordinator.service" \
   "$DEVCOORDINATOR_ROOT/apps/DevOpsConsole/deploy/devops-console.service"
 ```
 
-For a fresh host, start only the coordinator, rerun the token-required
-preflight, verify the anonymous/authenticated API boundary, and then start the
-Console:
+For a fresh host, start only the coordinator, rerun the production preflight,
+verify the trusted-loopback API boundary, and then start the Console:
 
 ```bash
 set -euo pipefail
@@ -350,11 +368,10 @@ sudo systemctl start dev-coordinator.service
 python3 "$DEVCOORDINATOR_ROOT/scripts/check_production_layout.py" \
   --repo-root "$DEVCOORDINATOR_ROOT" --home "$HOME" \
   --env-file "$CONSOLE_ENV" --state-dir "$CONSOLE_STATE" \
-  --acme-webroot "$ACME_WEBROOT" --coordinator-home "$COORDINATOR_HOME" \
-  --token-file "$COORDINATOR_HOME/api-token" --require-token --wait-token-seconds 10
+  --acme-webroot "$ACME_WEBROOT" --coordinator-home "$COORDINATOR_HOME"
 
 python3 "$DEVCOORDINATOR_ROOT/scripts/check_coordinator_auth_boundary.py" \
-  --token-file "$COORDINATOR_HOME/api-token" --host 127.0.0.1 --port 29876
+  --host 127.0.0.1 --port 29876
 
 sudo systemctl start devops-console.service
 systemctl status dev-coordinator.service devops-console.service
@@ -362,7 +379,7 @@ systemctl status dev-coordinator.service devops-console.service
 
 `dev-coordinator.service` does not finish starting merely because its Python
 process exists. Its pinned `ExecStartPost` probe waits for the loopback API and
-requires the complete anonymous/authenticated `200/401/200` contract within the
+requires the complete local/foreign-boundary `200/200/400/403` contract within the
 unit's bounded start timeout. The explicit probe above records the same
 contract at the deployment boundary.
 
@@ -761,8 +778,7 @@ find "$CONSOLE_STATE" "$COORDINATOR_HOME" -type f -exec chmod 600 {} +
 python3 "$DEVCOORDINATOR_ROOT/scripts/check_production_layout.py" \
   --repo-root "$DEVCOORDINATOR_ROOT" --home "$HOME" \
   --env-file "$CONSOLE_ENV" --state-dir "$CONSOLE_STATE" \
-  --acme-webroot "$ACME_WEBROOT" --coordinator-home "$COORDINATOR_HOME" \
-  --token-file "$COORDINATOR_HOME/api-token"
+  --acme-webroot "$ACME_WEBROOT" --coordinator-home "$COORDINATOR_HOME"
 
 python3 "$DEVCOORDINATOR_ROOT/scripts/write_cutover_phase_marker.py" \
   --marker "$CUTOVER_BACKUP/state-migration.attempted" \
@@ -828,7 +844,7 @@ PY
 ```
 
 Only now install the split units and start (not restart) the new coordinator.
-Run the token-required layout preflight and the anonymous/authenticated probe
+Run the production layout preflight and trusted-loopback boundary probe
 from the fresh-host section before starting the new Console.
 
 ```bash
@@ -847,16 +863,15 @@ sudo systemctl start dev-coordinator.service
 python3 "$DEVCOORDINATOR_ROOT/scripts/check_production_layout.py" \
   --repo-root "$DEVCOORDINATOR_ROOT" --home "$HOME" \
   --env-file "$CONSOLE_ENV" --state-dir "$CONSOLE_STATE" \
-  --acme-webroot "$ACME_WEBROOT" --coordinator-home "$COORDINATOR_HOME" \
-  --token-file "$COORDINATOR_HOME/api-token" --require-token --wait-token-seconds 10
+  --acme-webroot "$ACME_WEBROOT" --coordinator-home "$COORDINATOR_HOME"
 python3 "$DEVCOORDINATOR_ROOT/scripts/check_coordinator_auth_boundary.py" \
-  --token-file "$COORDINATOR_HOME/api-token" --host 127.0.0.1 --port 29876
+  --host 127.0.0.1 --port 29876
 sudo systemctl start devops-console.service
 # A successful start already includes the bounded MainPID registration gate;
 # no timing sleep is part of the correctness boundary.
 systemctl is-active --quiet devops-console.service
 python3 "$DEVCOORDINATOR_ROOT/scripts/check_coordinator_auth_boundary.py" \
-  --token-file "$COORDINATOR_HOME/api-token" --host 127.0.0.1 --port 29876 \
+  --host 127.0.0.1 --port 29876 \
   --inventory-output "$CUTOVER_BACKUP/post-cutover-inventory.json"
 CONSOLE_MAIN_PID="$(systemctl show --property MainPID --value devops-console.service)"
 test "$CONSOLE_MAIN_PID" -gt 1
@@ -1223,9 +1238,10 @@ rollback directories must be mode `0700` and their credential-state files mode
 
 ## Security model
 
-- The coordinator API on 29876 is loopback-only and bearer-authenticated. The
-  token stays in a private external file and is never returned to browser
-  JavaScript, logs, URLs, screenshots, or Git.
+- The coordinator API on 29876 is trusted local infrastructure: it binds only
+  to loopback, rejects non-loopback `Host`/`Origin`, and carries no redundant
+  application bearer credential. Browser JavaScript reaches it only through
+  the authenticated, repository-authorized Console API.
 - Sessions: HMAC-SHA256-signed cookie, `Domain=.vr.ae`, `HttpOnly`, `Secure`,
   `SameSite=Lax`; the cookie proves a verified Google identity, while current
   owner/invited membership and the exact Console/domain grant are re-checked
@@ -1238,7 +1254,10 @@ rollback directories must be mode `0700` and their credential-state files mode
 - On Google-protected routes, browser credentials cannot select an upstream
   identity: the edge strips caller `Authorization`, optionally injects the
   route's private backend credential, and suppresses backend HTTP-auth
-  challenges. Public routes preserve ordinary end-to-end HTTP authentication.
+  challenges. It also replaces caller-supplied local-attribution headers with
+  the verified Google email and immutable route ID; these compact on-host
+  headers are not a public authentication mechanism. Public routes preserve
+  ordinary end-to-end HTTP authentication.
 - Console API mutations require a same-origin `Origin` header (CSRF). Access
   list and backend-credential endpoints additionally require a configured
   owner.
@@ -1246,8 +1265,9 @@ rollback directories must be mode `0700` and their credential-state files mode
   claim bound to the verified Google subject, email, host-derived resource,
   and immutable resource instance. Only configured owners may read or decide
   the incoming queue.
-- Telegram tokens are validated and stored only in the private mode-`0600`
-  Console state. API views expose bot identity and `hasToken`, never the token;
+- Telegram tokens are validated and stored only in Console state. New files use
+  mode `0600` as hygiene, while reads gate on file shape and content rather than
+  local permission metadata. API views expose bot identity and `hasToken`, never the token;
   bot ownership is enforced server-side and configured owners retain the
   recovery/administration override.
 

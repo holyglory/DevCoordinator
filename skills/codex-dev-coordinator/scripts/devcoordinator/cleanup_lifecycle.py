@@ -37,6 +37,7 @@ from .repository_lifecycle import (
     RunningState,
 )
 from .sqlite_lifecycle import SQLiteLifecyclePersistence
+from .schema import advance_repository_owner_generation
 from .store import CoordinatorStore, canonical_json, fingerprint, utc_timestamp
 
 
@@ -1493,6 +1494,18 @@ class CleanupLifecycle:
             if blockers:
                 raise CleanupBlocked(blockers)
             planned_generation = _cleanup_target_generation(plan)
+            owner = connection.execute(
+                """
+                SELECT owner_uid, repository_generation
+                FROM repository_owners WHERE repo_id = ?
+                """,
+                (plan.target_id,),
+            ).fetchone()
+            if (
+                owner is None
+                or int(owner["repository_generation"]) != planned_generation
+            ):
+                raise PlanDriftError("project owner authority is missing or stale")
             changed = connection.execute(
                 """
                 UPDATE repositories
@@ -1504,6 +1517,26 @@ class CleanupLifecycle:
             ).rowcount
             if changed != 1:
                 raise PlanDriftError("project catalog identity changed before removal")
+            advance_repository_owner_generation(
+                connection,
+                repository_id=plan.target_id,
+                owner_uid=int(owner["owner_uid"]),
+                prior_repository_generation=planned_generation,
+                repository_generation=planned_generation + 1,
+                operation_id=plan.plan_id,
+                actor=actor,
+                reason="permanent project cleanup generation fence",
+                timestamp=timestamp,
+                evidence={
+                    "kind": "repository-project-cleanup",
+                    "plan_id": plan.plan_id,
+                    "repository_id": plan.target_id,
+                    "prior_repository_generation": planned_generation,
+                    "repository_generation": planned_generation + 1,
+                    "owner_uid": int(owner["owner_uid"]),
+                    "target_fingerprint": plan.target_fingerprint,
+                },
+            )
             self._insert_tombstone(connection, plan, actor, timestamp)
             self._complete_in_transaction(connection, plan, timestamp)
 
@@ -1601,9 +1634,50 @@ class CleanupLifecycle:
             if self._tombstone_exists(connection, plan):
                 self._complete_in_transaction(connection, plan, timestamp)
                 return
-            connection.execute(
-                "UPDATE repositories SET state = 'missing', generation = generation + 1, updated_at = ? WHERE repo_id = ?",
-                (timestamp, plan.target_id),
+            owner = connection.execute(
+                """
+                SELECT repository.generation, authority.owner_uid,
+                       authority.repository_generation
+                FROM repositories repository
+                JOIN repository_owners authority USING(repo_id)
+                WHERE repository.repo_id = ?
+                """,
+                (plan.target_id,),
+            ).fetchone()
+            if owner is None or int(owner["generation"]) != int(
+                owner["repository_generation"]
+            ):
+                raise PlanDriftError("worktree owner authority is missing or stale")
+            prior_generation = int(owner["generation"])
+            changed = connection.execute(
+                """
+                UPDATE repositories
+                SET state = 'missing', generation = generation + 1, updated_at = ?
+                WHERE repo_id = ? AND generation = ?
+                """,
+                (timestamp, plan.target_id, prior_generation),
+            ).rowcount
+            if changed != 1:
+                raise PlanDriftError("worktree repository generation changed")
+            advance_repository_owner_generation(
+                connection,
+                repository_id=plan.target_id,
+                owner_uid=int(owner["owner_uid"]),
+                prior_repository_generation=prior_generation,
+                repository_generation=prior_generation + 1,
+                operation_id=plan.plan_id,
+                actor=actor,
+                reason="permanent worktree cleanup generation fence",
+                timestamp=timestamp,
+                evidence={
+                    "kind": "repository-worktree-cleanup",
+                    "plan_id": plan.plan_id,
+                    "repository_id": plan.target_id,
+                    "prior_repository_generation": prior_generation,
+                    "repository_generation": prior_generation + 1,
+                    "owner_uid": int(owner["owner_uid"]),
+                    "target_fingerprint": plan.target_fingerprint,
+                },
             )
             self._insert_tombstone(connection, plan, actor, timestamp)
             self._complete_in_transaction(connection, plan, timestamp)

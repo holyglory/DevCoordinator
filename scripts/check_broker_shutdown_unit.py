@@ -28,7 +28,7 @@ BROKER_HOME_DROPIN = (
     "/etc/systemd/system/devcoordinator-broker.service.d/"
     "80-enrolled-home-write-paths.conf"
 )
-BASE_READ_WRITE_PATHS = "/var/lib/devcoordinator /run/devcoordinator"
+BASE_READ_WRITE_PATHS = "/var/lib/devcoordinator -/run/devcoordinator"
 HOME_DROPIN_COMMENT = (
     "# Generated transactionally from the complete explicit --client-user set."
 )
@@ -66,7 +66,6 @@ PROPERTIES = (
     "PrivateTmp",
     "ProtectSystem",
     "ProtectHome",
-    "RuntimeDirectoryPreserve",
     "ReadWritePaths",
     "ReadOnlyPaths",
     "BindPaths",
@@ -320,7 +319,6 @@ def validate_source_unit(source: str) -> None:
         "PrivateTmp": "PrivateTmp=true",
         "ProtectSystem": "ProtectSystem=strict",
         "ProtectHome": "ProtectHome=read-only",
-        "RuntimeDirectoryPreserve": "RuntimeDirectoryPreserve=restart",
         "ReadWritePaths": f"ReadWritePaths={BASE_READ_WRITE_PATHS}",
     }
     for key, directive in service_security.items():
@@ -338,6 +336,11 @@ def validate_source_unit(source: str) -> None:
         if source_directives(source, key):
             raise BrokerShutdownUnitError(
                 f"broker source unit must not add a {key} filesystem bypass"
+            )
+    for key in ("RuntimeDirectory", "RuntimeDirectoryMode", "RuntimeDirectoryPreserve"):
+        if source_directives(source, key):
+            raise BrokerShutdownUnitError(
+                "direct socket-activated broker must not own an obsolete runtime directory"
             )
 
 
@@ -368,7 +371,7 @@ def validate_effective_unit(
         "FragmentPath": BROKER_FRAGMENT,
         "DropInPaths": BROKER_HOME_DROPIN,
         "User": "root",
-        "Group": "devcoordinator-clients",
+        "Group": "root",
         "Environment": EXPECTED_ENVIRONMENT,
         "ExecStop": "",
         "ExecStopPost": "",
@@ -385,7 +388,6 @@ def validate_effective_unit(
         "PrivateTmp": "yes",
         "ProtectSystem": "strict",
         "ProtectHome": "read-only",
-        "RuntimeDirectoryPreserve": "restart",
         "ReadWritePaths": (
             BASE_READ_WRITE_PATHS + " " + " ".join(expected_home_paths)
         ),
@@ -407,6 +409,10 @@ def validate_effective_unit(
         raise BrokerShutdownUnitError(
             "effective broker unit violates pinned service/stop/sandbox properties: "
             + ", ".join(violations)
+        )
+    if any(key.startswith("RuntimeDirectory") for key in properties):
+        raise BrokerShutdownUnitError(
+            "effective direct socket-activated broker owns an obsolete runtime directory"
         )
     bounding = properties.get("CapabilityBoundingSet")
     if bounding is None:

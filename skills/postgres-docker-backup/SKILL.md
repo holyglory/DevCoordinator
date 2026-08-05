@@ -60,8 +60,10 @@ resolve the public mutation contract from the canonical enrolled repository
 directory before building backup or restore arguments:
 
 ```bash
+POSTGRES_BACKUP="$(realpath scripts/postgres_docker_backup.py)"
+test -x "$POSTGRES_BACKUP"
 cd "$PROJECT_ROOT"
-python3 scripts/postgres_docker_backup.py route
+python3 "$POSTGRES_BACKUP" route
 ```
 
 The result is `direct` when no host broker profile is installed, or `broker`

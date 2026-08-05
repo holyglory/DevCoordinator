@@ -24,6 +24,7 @@ from devcoordinator.normalized_server_lifecycle import (
     PortLeaseRequest,
     ServerStartRequest,
 )
+from devcoordinator.schema import establish_repository_owner_authority
 from devcoordinator.store import AccountStore, deterministic_id, utc_timestamp
 
 
@@ -93,6 +94,17 @@ class NormalizedPortLifecycleTests(unittest.TestCase):
                 """,
                 (repo_id, host_id, str(root), root.name, timestamp, timestamp),
             )
+            establish_repository_owner_authority(
+                connection,
+                repository_id=repo_id,
+                owner_uid=max(os.geteuid(), 1),
+                repository_generation=0,
+                operation_id=f"fixture-owner-{repo_id}",
+                actor="fixture",
+                reason="normalized lifecycle fixture owner authority",
+                timestamp=timestamp,
+                evidence={"kind": "normalized-lifecycle-fixture-owner"},
+            )
             connection.execute(
                 """
                 INSERT INTO repository_installations(
@@ -156,6 +168,17 @@ class NormalizedPortLifecycleTests(unittest.TestCase):
                     timestamp,
                     timestamp,
                 ),
+            )
+            establish_repository_owner_authority(
+                connection,
+                repository_id=foreign_repo_id,
+                owner_uid=max(os.geteuid(), 1),
+                repository_generation=0,
+                operation_id=f"fixture-owner-{foreign_repo_id}",
+                actor="foreign-fixture",
+                reason="restored foreign lifecycle fixture owner authority",
+                timestamp=timestamp,
+                evidence={"kind": "normalized-lifecycle-foreign-fixture-owner"},
             )
             connection.execute(
                 """
@@ -313,6 +336,115 @@ class NormalizedPortLifecycleTests(unittest.TestCase):
                 "classification": "healthy",
             },
         )
+
+    def test_status_commit_cannot_replace_pending_start_evidence(self) -> None:
+        service = self.server_service()
+        reservation = service.reserve_start(
+            self.start_request(
+                name="status-start-race",
+                port_start=3208,
+                port_end=3208,
+                preferred=3208,
+                explicit_range=True,
+            ),
+            observed_available_ports=[3208],
+        )
+        reservation = service.finalize_reserved_start_definition(
+            operation_id=str(reservation["operation_id"]),
+            server_definition_id=str(reservation["id"]),
+            definition_generation=int(reservation["_definition_generation"]),
+            argv=("python3", "fixture.py", "--port", "3208"),
+            environment={"PORT": "3208", "HOST": "127.0.0.1"},
+            health_url=None,
+        )
+        launched = service.mark_start_launched(
+            operation_id=str(reservation["operation_id"]),
+            server_definition_id=str(reservation["id"]),
+            definition_generation=int(reservation["_definition_generation"]),
+            pid=44008,
+            log_path=str(self.home / "status-start-race.log"),
+            process_start_time="fixture-start",
+            process_fingerprint="sha256:status-start-race",
+        )
+        observation_fingerprint = launched["_observation_fingerprint"]
+        passive = service.commit_status(
+            server_definition_id=str(launched["id"]),
+            expected_definition_generation=int(launched["generation"]),
+            expected_observation_fingerprint=observation_fingerprint,
+            health={
+                "ok": True,
+                "pid_alive": True,
+                "identity": {"ok": True, "observable": True},
+                "classification": "healthy",
+            },
+            stopped_reason=None,
+        )
+        self.assertEqual(passive["status"], "starting")
+        self.assertEqual(passive["pid"], 44008)
+        self.assertEqual(
+            passive["_observation_fingerprint"], observation_fingerprint
+        )
+
+        committed = service.commit_start_health(
+            operation_id=str(launched["operation_id"]),
+            server_definition_id=str(launched["id"]),
+            definition_generation=int(launched["_definition_generation"]),
+            health={
+                "ok": True,
+                "pid_alive": True,
+                "identity": {"ok": True, "observable": True},
+                "classification": "healthy",
+            },
+        )
+        self.assertEqual(committed["status"], "running")
+        self.assertEqual(committed["pid"], 44008)
+
+    def test_status_commit_cannot_replace_pending_stop_evidence(self) -> None:
+        running = self.running_server(name="status-stop-race", port=3209)
+        service = self.server_service()
+        reservation = service.reserve_stop(
+            agent="codex-a",
+            server_definition_id=str(running["id"]),
+            expected_definition_generation=int(running["generation"]),
+            expected_observation_fingerprint=running.get(
+                "_observation_fingerprint"
+            ),
+        )
+        observation_fingerprint = reservation["_observation_fingerprint"]
+        passive = service.commit_status(
+            server_definition_id=str(reservation["id"]),
+            expected_definition_generation=int(reservation["generation"]),
+            expected_observation_fingerprint=observation_fingerprint,
+            health={
+                "ok": False,
+                "pid_alive": False,
+                "identity": {"ok": True, "observable": True},
+                "classification": "stopped",
+            },
+            stopped_reason="passive status raced stop",
+        )
+        self.assertEqual(passive["status"], "stopping")
+        self.assertEqual(passive["pid"], 44001)
+        self.assertEqual(
+            passive["_observation_fingerprint"], observation_fingerprint
+        )
+
+        committed = service.commit_stop(
+            operation_id=str(reservation["operation_id"]),
+            server_definition_id=str(reservation["id"]),
+            agent="codex-a",
+            reason="Stopped by coordinator",
+            release_port=True,
+            stale_lease=False,
+            final_health={
+                "ok": False,
+                "pid_alive": False,
+                "identity": {"ok": True, "observable": True},
+                "classification": "stopped",
+            },
+        )
+        self.assertEqual(committed["status"], "stopped")
+        self.assertIsNone(committed["pid"])
 
     def test_direct_assignment_and_lease_lifecycle_retains_history(self) -> None:
         service = self.service()
@@ -1235,6 +1367,28 @@ class NormalizedPortLifecycleTests(unittest.TestCase):
                 earlier.canonical_root: earlier,
             }
         )
+        profile.test_repository_catalog.return_value = {
+            "schema_version": 1,
+            "repositories": [
+                {
+                    "repo_id": "repo-a",
+                    "canonical_root": "/srv/alpha",
+                    "display_name": "alpha",
+                    "setup_status": "ready",
+                },
+                {
+                    "repo_id": "repo-b",
+                    "canonical_root": "/srv/Beta",
+                    "display_name": "Beta",
+                    "setup_status": "missing",
+                },
+            ],
+        }
+        for repository in (enabled, earlier):
+            repository.require_current.return_value = repository
+        disabled.require_current.side_effect = dev_coordinator.BrokerProfileError(
+            "disabled"
+        )
         with (
             mock.patch.object(
                 dev_coordinator, "configured_broker_profile", return_value=profile
@@ -1255,14 +1409,299 @@ class NormalizedPortLifecycleTests(unittest.TestCase):
                     "repo_id": "repo-a",
                     "canonical_root": "/srv/alpha",
                     "display_name": "alpha",
+                    "setup_status": "ready",
                 },
                 {
                     "repo_id": "repo-b",
                     "canonical_root": "/srv/Beta",
                     "display_name": "Beta",
+                    "setup_status": "missing",
                 },
             ],
         )
+
+    def test_async_test_queries_are_bounded_and_repository_scoped(self) -> None:
+        self.assertEqual(
+            dev_coordinator.parse_test_run_list_query(
+                "repo_id=repo-a&limit=25&after=run-a&state=failed"
+            ),
+            {
+                "repository_id": "repo-a",
+                "limit": 25,
+                "after": "run-a",
+                "state": "failed",
+            },
+        )
+        self.assertEqual(
+            dev_coordinator.parse_test_events_query(
+                "repo_id=repo-a&after=41&limit=200"
+            ),
+            {"repository_id": "repo-a", "after_event_id": 41, "limit": 200},
+        )
+        self.assertEqual(
+            dev_coordinator.parse_test_evidence_query(
+                "repo_id=repo-a&after=17&limit=3", cases=True
+            ),
+            {"repository_id": "repo-a", "after": 17, "limit": 3},
+        )
+        with self.assertRaisesRegex(ValueError, "query parameters"):
+            dev_coordinator.parse_test_evidence_query(
+                "after=17&limit=3", cases=True
+            )
+        for query in (
+            "repo_id=repo-a&limit=0",
+            "repo_id=repo-a&state=invented",
+            "repo_id=repo-a&after=run-a&after=run-b",
+        ):
+            with self.assertRaises(ValueError):
+                dev_coordinator.parse_test_run_list_query(query)
+
+        profile = mock.Mock()
+        profile.test_runs.return_value = {
+            "repository_id": "repo-a",
+            "runs": [{"run_id": "run-a"}],
+            "next_cursor": None,
+        }
+        profile.test_events.return_value = {
+            "repository_id": "repo-a",
+            "events": [{"event_id": 42}],
+            "next_cursor": 42,
+        }
+        with mock.patch.object(
+            dev_coordinator, "configured_broker_profile", return_value=profile
+        ):
+            self.assertEqual(
+                dev_coordinator.coordinated_test_runs_read(
+                    repository_id="repo-a", limit=25
+                )["runs"][0]["run_id"],
+                "run-a",
+            )
+            self.assertEqual(
+                dev_coordinator.coordinated_test_events_read(
+                    repository_id="repo-a", after_event_id=41
+                )["events"][0]["event_id"],
+                42,
+            )
+        profile.test_runs.assert_called_once_with(
+            repository="repo-a", after=None, limit=25, state=None
+        )
+        profile.test_events.assert_called_once_with(
+            repository="repo-a", after_event_id=41, limit=200
+        )
+
+    def test_console_manual_plan_forwards_only_bounded_target_names(self) -> None:
+        profile = mock.Mock()
+        root = mock.Mock(
+            repo_id="repo-a",
+            generation=7,
+            canonical_root="/srv/repo-a",
+        )
+        temporary = mock.Mock(
+            repo_id="repo-a-worktree",
+            generation=3,
+            canonical_root="/srv/repo-a-worktree",
+        )
+        profile.repository_by_id.side_effect = lambda repo_id: {
+            "repo-a": root,
+            "repo-a-worktree": temporary,
+        }[repo_id]
+        profile.preview_test_plan.side_effect = lambda **arguments: {
+            "repository_id": "repo-a",
+            "intent": arguments["intent"],
+            "plan_id": "plan-a",
+            "operation_id": arguments["operation_id"],
+        }
+        with mock.patch.object(
+            dev_coordinator, "configured_broker_profile", return_value=profile
+        ):
+            result = dev_coordinator.coordinated_test_plan_preview(
+                {
+                    "repo_id": "repo-a",
+                    "intent": "manual",
+                    "operation_id": "00000000-0000-4000-8000-000000000011",
+                    "source": {
+                        "schema_version": 1,
+                        "kind": "original",
+                        "repository_id": "repo-a",
+                        "repository_generation": 7,
+                    },
+                    "requested_targets": ["unit", "integration"],
+                }
+            )
+        self.assertEqual(result["plan_id"], "plan-a")
+        profile.preview_test_plan.assert_called_once_with(
+            repository="repo-a",
+            intent="manual",
+            temporary_root=None,
+            requested_targets=["unit", "integration"],
+            operation_id="00000000-0000-4000-8000-000000000011",
+        )
+        profile.preview_test_plan.reset_mock()
+        with mock.patch.object(
+            dev_coordinator, "configured_broker_profile", return_value=profile
+        ):
+            result = dev_coordinator.coordinated_test_plan_preview(
+                {
+                    "repo_id": "repo-a",
+                    "intent": "manual",
+                    "operation_id": "00000000-0000-4000-8000-000000000013",
+                    "source": {
+                        "schema_version": 1,
+                        "kind": "temporary",
+                        "repository_id": "repo-a-worktree",
+                        "repository_generation": 3,
+                    },
+                    "requested_targets": ["unit"],
+                }
+            )
+        self.assertEqual(result["plan_id"], "plan-a")
+        profile.preview_test_plan.assert_called_once_with(
+            repository="repo-a",
+            intent="manual",
+            temporary_root="/srv/repo-a-worktree",
+            requested_targets=["unit"],
+            operation_id="00000000-0000-4000-8000-000000000013",
+        )
+        with mock.patch.object(
+            dev_coordinator, "configured_broker_profile", return_value=profile
+        ):
+            with self.assertRaisesRegex(
+                ValueError, "temporary test source identity is stale"
+            ):
+                dev_coordinator.coordinated_test_plan_preview(
+                    {
+                        "repo_id": "repo-a",
+                        "intent": "manual",
+                        "operation_id": "00000000-0000-4000-8000-000000000014",
+                        "source": {
+                            "schema_version": 1,
+                            "kind": "temporary",
+                            "repository_id": "repo-a-worktree",
+                            "repository_generation": 2,
+                        },
+                    }
+                )
+        with self.assertRaisesRegex(ValueError, "only for manual intent"):
+            dev_coordinator.coordinated_test_plan_preview(
+                {
+                    "repo_id": "repo-a",
+                    "intent": "change",
+                    "operation_id": "00000000-0000-4000-8000-000000000012",
+                    "source": {
+                        "schema_version": 1,
+                        "kind": "original",
+                        "repository_id": "repo-a",
+                        "repository_generation": 7,
+                    },
+                    "requested_targets": ["unit"],
+                }
+            )
+
+    def test_dynamic_test_routes_are_exact(self) -> None:
+        self.assertTrue(dev_coordinator._is_dynamic_test_get_route("/v1/test-runs/run-a"))
+        self.assertTrue(
+            dev_coordinator._is_dynamic_test_get_route(
+                "/v1/test-runs/run-a/failures"
+            )
+        )
+        self.assertTrue(
+            dev_coordinator._is_dynamic_test_get_route(
+                "/v1/test-repositories/repo-a/setup"
+            )
+        )
+        self.assertTrue(
+            dev_coordinator._is_dynamic_test_post_route(
+                "/v1/test-runs/run-a/cancel"
+            )
+        )
+        self.assertFalse(
+            dev_coordinator._is_dynamic_test_get_route(
+                "/v1/test-runs/run-a/cancel"
+            )
+        )
+        self.assertFalse(
+            dev_coordinator._is_dynamic_test_post_route(
+                "/v1/test-runs/run-a/failures"
+            )
+        )
+
+    def test_console_test_mutations_forward_the_authenticated_google_actor(self) -> None:
+        profile = mock.Mock()
+        profile.submit_test_plan.return_value = {
+            "repository_id": "repo-a",
+            "run_id": "run-a",
+        }
+        profile.cancel_test_run.return_value = {
+            "repository_id": "repo-a",
+            "run_id": "run-a",
+        }
+        profile.retry_test_run.return_value = {
+            "repository_id": "repo-a",
+            "run_id": "run-a-retry",
+        }
+        submit_operation = "11111111-1111-4111-8111-111111111111"
+        cancel_operation = "22222222-2222-4222-8222-222222222222"
+        retry_operation = "33333333-3333-4333-8333-333333333333"
+        with mock.patch.object(
+            dev_coordinator, "configured_broker_profile", return_value=profile
+        ):
+            dev_coordinator.coordinated_test_run_submit(
+                {
+                    "repo_id": "repo-a",
+                    "plan_id": "plan-a",
+                    "operation_id": submit_operation,
+                    "actor": "google:user@example.com",
+                }
+            )
+            dev_coordinator.coordinated_test_run_cancel(
+                run_id="run-a",
+                payload={
+                    "repo_id": "repo-a",
+                    "reason": "user requested",
+                    "operation_id": cancel_operation,
+                    "actor": "google:user@example.com",
+                },
+            )
+            retry = dev_coordinator.coordinated_test_run_retry(
+                run_id="run-a",
+                payload={
+                    "repo_id": "repo-a",
+                    "failed_only": True,
+                    "operation_id": retry_operation,
+                    "actor": "google:user@example.com",
+                },
+            )
+        self.assertEqual(retry["run_id"], "run-a-retry")
+
+        profile.submit_test_plan.assert_called_once_with(
+            repository="repo-a",
+            plan_id="plan-a",
+            operation_id=submit_operation,
+            actor="google:user@example.com",
+        )
+        profile.cancel_test_run.assert_called_once_with(
+            repository="repo-a",
+            run_id="run-a",
+            reason="user requested",
+            operation_id=cancel_operation,
+            actor="google:user@example.com",
+        )
+        profile.retry_test_run.assert_called_once_with(
+            repository="repo-a",
+            run_id="run-a",
+            failed_only=True,
+            operation_id=retry_operation,
+            actor="google:user@example.com",
+        )
+        with self.assertRaisesRegex(ValueError, "mutation fields"):
+            dev_coordinator.coordinated_test_run_cancel(
+                run_id="run-a",
+                payload={
+                    "reason": "user requested",
+                    "operation_id": "44444444-4444-4444-8444-444444444444",
+                    "actor": "google:user@example.com",
+                },
+            )
 
     def test_locked_state_is_legacy_only_and_has_no_sqlite_projection(self) -> None:
         source = inspect.getsource(dev_coordinator.locked_state)
@@ -1411,12 +1850,15 @@ class NormalizedPortLifecycleTests(unittest.TestCase):
             "/v1/lifecycle/apply",
             "/v1/lifecycle/restore",
             "/v1/observe",
+            "/v1/test-plan",
+            "/v1/test-runs",
         }
         self.assertEqual(
             set(dev_coordinator.API_GET_ROUTES),
             {
                 "/v1/ready",
                 "/v1/inventory",
+                "/v1/inventory/source",
                 "/v1/inventory/no-docker",
                 "/v1/state",
                 "/v1/ports",
@@ -1425,7 +1867,10 @@ class NormalizedPortLifecycleTests(unittest.TestCase):
                 "/v1/archives",
                 "/v1/events",
                 "/v1/tests",
+                "/v1/test-fleet",
                 "/v1/test-repositories",
+                "/v1/test-runs",
+                "/v1/test-events",
             },
         )
         self.assertEqual(set(dev_coordinator.API_POST_ROUTES), expected_post_routes)
@@ -1467,6 +1912,7 @@ class NormalizedPortLifecycleTests(unittest.TestCase):
                 "ps",
                 "compose-up",
                 "compose-down",
+                "compose-run-once",
                 "logs",
                 "start",
                 "stop",
@@ -2486,6 +2932,187 @@ class NormalizedPortLifecycleTests(unittest.TestCase):
         self.assertEqual(retained["status"], "active")
         self.assertEqual(retained["server_id"], reservation["id"])
 
+    def test_health_commit_conflict_cleans_process_lease_and_operation(self) -> None:
+        healthy = {
+            "ok": True,
+            "pid_alive": True,
+            "identity": {"ok": True, "observable": True},
+            "classification": "healthy",
+        }
+        conflict = NormalizedLifecycleConflict(
+            "server start launch evidence changed before health commit"
+        )
+        with (
+            mock.patch.dict(
+                os.environ,
+                {
+                    "CODEX_AGENT_COORDINATOR_HOME": str(self.home),
+                    "DEVCOORDINATOR_STATE_BACKEND": "sqlite",
+                },
+            ),
+            mock.patch.object(
+                dev_coordinator, "port_available", return_value=True
+            ),
+            mock.patch.object(
+                dev_coordinator,
+                "start_process",
+                return_value=(44011, str(self.home / "health-conflict.log")),
+            ),
+            mock.patch.object(
+                dev_coordinator,
+                "normalized_process_instance_evidence",
+                return_value=("fixture-start", "sha256:health-conflict-process"),
+            ),
+            mock.patch.object(
+                dev_coordinator, "wait_for_health", return_value=healthy
+            ),
+            mock.patch.object(dev_coordinator, "stop_pid") as stop_pid,
+            mock.patch.object(dev_coordinator, "pid_alive", return_value=False),
+            mock.patch.object(
+                NormalizedServerLifecycle,
+                "commit_start_health",
+                autospec=True,
+                side_effect=conflict,
+            ),
+            self.assertRaisesRegex(
+                NormalizedLifecycleConflict, "launch evidence changed"
+            ),
+        ):
+            dev_coordinator._coordinated_start_server_normalized(
+                {
+                    "agent": "codex-a",
+                    "project": str(self.project),
+                    "name": "health-conflict",
+                    "argv": ["python3", "fixture.py", "--port", "{port}"],
+                    "range": "3312-3312",
+                    "preferred": 3312,
+                    "ttl": 60,
+                    "health_timeout": 1,
+                }
+            )
+
+        stop_pid.assert_called_once_with(44011)
+        with AccountStore.open_default(
+            self.home, effective_uid=os.geteuid()
+        ) as store:
+            retained = NormalizedServerLifecycle(store).server(
+                canonical_project=str(self.project), name="health-conflict"
+            )
+            with store.read_transaction() as connection:
+                operation = connection.execute(
+                    """
+                    SELECT operation.status, operation.phase,
+                           operation.error_code
+                    FROM operations operation
+                    JOIN operation_targets target USING(operation_id)
+                    WHERE target.target_kind = 'server'
+                      AND target.target_id = ?
+                      AND operation.kind = 'server.start'
+                    ORDER BY operation.created_at DESC LIMIT 1
+                    """,
+                    (retained["id"],),
+                ).fetchone()
+                active_lease_count = int(
+                    connection.execute(
+                        """
+                        SELECT COUNT(*) FROM leases
+                        WHERE server_definition_id = ? AND status = 'active'
+                        """,
+                        (retained["id"],),
+                    ).fetchone()[0]
+                )
+        self.assertEqual(retained["status"], "stopped")
+        self.assertIsNone(retained["pid"])
+        self.assertEqual(retained["lease_status"], "released")
+        self.assertEqual(
+            tuple(operation),
+            ("failed", "rolled_back", "server_start_failed"),
+        )
+        self.assertEqual(active_lease_count, 0)
+
+    def test_stop_commit_conflict_terminalizes_operation_for_reconciliation(self) -> None:
+        running = self.running_server(name="stop-commit-conflict", port=3313)
+        healthy = {
+            "ok": True,
+            "pid_alive": True,
+            "identity": {"ok": True, "observable": True},
+            "classification": "healthy",
+        }
+        stopped = {
+            "ok": False,
+            "pid_alive": False,
+            "identity": {"ok": True, "observable": True},
+            "classification": "stopped",
+        }
+        conflict = NormalizedLifecycleConflict(
+            "server stop reservation changed before commit"
+        )
+        with (
+            mock.patch.dict(
+                os.environ,
+                {
+                    "CODEX_AGENT_COORDINATOR_HOME": str(self.home),
+                    "DEVCOORDINATOR_STATE_BACKEND": "sqlite",
+                },
+            ),
+            mock.patch.object(dev_coordinator, "prime_git_head_identity"),
+            mock.patch.object(
+                dev_coordinator, "server_health", side_effect=(healthy, stopped)
+            ),
+            mock.patch.object(dev_coordinator, "stop_pid") as stop_pid,
+            mock.patch.object(
+                NormalizedServerLifecycle,
+                "commit_stop",
+                autospec=True,
+                side_effect=conflict,
+            ),
+            self.assertRaises(dev_coordinator.StructuredCoordinatorError) as raised,
+        ):
+            dev_coordinator._coordinated_stop_server_normalized(
+                {
+                    "agent": "codex-a",
+                    "project": str(self.project),
+                    "server_id": str(running["id"]),
+                    "release_port": True,
+                }
+            )
+
+        self.assertEqual(
+            raised.exception.payload["code"], "server_stop_outcome_uncertain"
+        )
+        self.assertFalse(raised.exception.payload["process_still_alive"])
+        stop_pid.assert_called_once_with(44001)
+        with AccountStore.open_default(
+            self.home, effective_uid=os.geteuid()
+        ) as store:
+            retained = NormalizedServerLifecycle(store).server(
+                server_definition_id=str(running["id"])
+            )
+            with store.read_transaction() as connection:
+                operation = connection.execute(
+                    """
+                    SELECT operation.status, operation.phase,
+                           operation.error_code
+                    FROM operations operation
+                    JOIN operation_targets target USING(operation_id)
+                    WHERE target.target_kind = 'server'
+                      AND target.target_id = ?
+                      AND operation.kind = 'server.stop'
+                    ORDER BY operation.created_at DESC LIMIT 1
+                    """,
+                    (running["id"],),
+                ).fetchone()
+        self.assertEqual(retained["status"], "unhealthy")
+        self.assertEqual(retained["lease_status"], "active")
+        self.assertEqual(
+            tuple(operation),
+            (
+                "needs_attention",
+                "host_stop_uncertain",
+                "server_stop_outcome_uncertain",
+            ),
+        )
+
     def test_stop_failure_retains_lease_and_records_needs_attention(self) -> None:
         running = self.running_server(name="web", port=3303)
         service = self.server_service()
@@ -2684,7 +3311,7 @@ class NormalizedPortLifecycleTests(unittest.TestCase):
             ),
         ):
             server = dev_coordinator.BoundedThreadingHTTPServer(
-                ("127.0.0.1", 0), dev_coordinator.ApiHandler, token="test-token"
+                ("127.0.0.1", 0), dev_coordinator.ApiHandler
             )
             thread = threading.Thread(target=server.serve_forever, daemon=True)
             thread.start()
@@ -2697,7 +3324,7 @@ class NormalizedPortLifecycleTests(unittest.TestCase):
                     "127.0.0.1", port, timeout=5
                 )
                 body = None if payload is None else json.dumps(payload)
-                headers = {"Authorization": "Bearer test-token"}
+                headers: dict[str, str] = {}
                 if body is not None:
                     headers["Content-Type"] = "application/json"
                 try:

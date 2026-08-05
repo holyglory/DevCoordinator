@@ -1,0 +1,25 @@
+# Test lifecycle commands enter the host through a root-owned launcher that is
+# rebound only by DevCoordinator's transactional immutable-release switch.
+# Keep manifest authoring and every non-test Coordinator surface inside the
+# normal sandbox/approval policy.
+prefix_rule(
+    pattern = [
+        ["devcoordinator-test", "/usr/local/bin/devcoordinator-test"],
+        [
+            "plan",
+            "submit",
+            "status",
+            "summary",
+            "failures",
+            "artifact",
+            "cancel",
+            "retry",
+            "policy",
+            "catalog",
+            "stats",
+            "wait",
+        ],
+    ],
+    decision = "allow",
+    justification = "Allow attributed test lifecycle calls through the immutable DevCoordinator release without an approval prompt.",
+)

@@ -183,39 +183,31 @@ class VolatileSecretManagerTests(unittest.TestCase):
         self.assertEqual(stat.S_IMODE(manager.runtime_root.stat().st_mode), 0o700)
         self.assertEqual(mount.source_directory.parent, manager.runtime_root / str(self.run_id))
 
-    def test_rejects_symlink_untrusted_or_writable_runtime_parent(self) -> None:
-        """Only a trusted non-writable parent may host the private nested root."""
+    def test_rejects_symlink_but_accepts_local_parent_metadata(self) -> None:
+        """Path type is enforced; UID and mode are not local authorization."""
 
         trusted = self.root / "trusted-runtime"
         trusted.mkdir(mode=0o700)
         linked = self.root / "linked-runtime"
         linked.symlink_to(trusted, target_is_directory=True)
-        cases = (
-            ("symlink", linked, os.geteuid()),
-            ("untrusted-owner", self.root / "untrusted-runtime", os.geteuid() + 1),
+        manager = VolatileRunSecretManager(
+            runtime_root=linked / "ephemeral-secrets",
+            expected_uid=os.geteuid(),
+            clock=self.clock,
+            password_factory=lambda: b"r" * 64,
         )
-        for label, parent, expected_uid in cases:
-            with self.subTest(label=label):
-                if not parent.exists() and not parent.is_symlink():
-                    parent.mkdir(mode=0o700)
-                manager = VolatileRunSecretManager(
-                    runtime_root=parent / "ephemeral-secrets",
-                    expected_uid=expected_uid,
-                    clock=self.clock,
-                    password_factory=lambda: b"r" * 64,
-                )
-                with self.assertRaises(SecretGrantDenied):
-                    manager.provision_for_start(
-                        peer_uid=os.geteuid(),
-                        account_id="account-test",
-                        repository_id="repo-test",
-                        template_id="template-test",
-                        run_id=self.run_id,
-                        policy=self.policy,
-                        expires_at_epoch=self.clock.value + 600,
-                    )
+        with self.assertRaises(SecretGrantDenied):
+            manager.provision_for_start(
+                peer_uid=os.geteuid(),
+                account_id="account-test",
+                repository_id="repo-test",
+                template_id="template-test",
+                run_id=self.run_id,
+                policy=self.policy,
+                expires_at_epoch=self.clock.value + 600,
+            )
 
-        for label, mode in (("group-writable", 0o770), ("world-writable", 0o707)):
+        for index, (label, mode) in enumerate((("group-writable", 0o770), ("world-writable", 0o707))):
             with self.subTest(label=label):
                 parent = self.root / label
                 parent.mkdir(mode=mode)
@@ -226,16 +218,17 @@ class VolatileSecretManagerTests(unittest.TestCase):
                     clock=self.clock,
                     password_factory=lambda: b"s" * 64,
                 )
-                with self.assertRaises(SecretGrantDenied):
-                    manager.provision_for_start(
-                        peer_uid=os.geteuid(),
-                        account_id="account-test",
-                        repository_id="repo-test",
-                        template_id="template-test",
-                        run_id=self.run_id,
-                        policy=self.policy,
-                        expires_at_epoch=self.clock.value + 600,
-                    )
+                run_id = uuid.UUID(int=self.run_id.int + index + 1)
+                mount = manager.provision_for_start(
+                    peer_uid=os.geteuid(),
+                    account_id="account-test",
+                    repository_id="repo-test",
+                    template_id="template-test",
+                    run_id=run_id,
+                    policy=self.policy,
+                    expires_at_epoch=self.clock.value + 600,
+                )
+                self.assertTrue(mount.source_directory.is_dir())
 
 
 class SecretPolicyEnrollmentTests(unittest.TestCase):
@@ -328,7 +321,7 @@ class SecretPolicyEnrollmentTests(unittest.TestCase):
         document = {
             "version": 1,
             "service": {
-                "socket": "/run/devcoordinator/broker.sock",
+                "socket": "/run/devcoordinator-authority.sock",
                 "uid": 0,
                 "gid": 100,
                 "mode": "0660",
@@ -344,10 +337,14 @@ class SecretPolicyEnrollmentTests(unittest.TestCase):
                             "canonical_root": root,
                             "repo_id": "repo-test",
                             "generation": 0,
+                            "owner_uid": os.geteuid(),
                             "servers": {},
                             "containers": {},
                             "compose_definition_id": None,
+                            "compose_container_ids": [],
+                            "compose_run_once_services": {},
                             "ephemeral_templates": {"artifact-db": "template-test"},
+                            "ephemeral_image_prefetch_templates": [],
                             "ephemeral_secret_policies": {
                                 "artifact-db": {
                                     "policy": _POLICY,

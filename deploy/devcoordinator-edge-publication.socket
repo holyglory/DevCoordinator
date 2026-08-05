@@ -1,0 +1,15 @@
+[Unit]
+Description=DevCoordinator local edge publication socket
+
+[Socket]
+ListenStream=/run/devcoordinator-edge-publication/publish.sock
+Accept=no
+Service=devcoordinator-edge.service
+FileDescriptorName=publication
+SocketUser=devcoordinator-edge
+SocketMode=0666
+DirectoryMode=0755
+RemoveOnStop=no
+
+[Install]
+WantedBy=sockets.target

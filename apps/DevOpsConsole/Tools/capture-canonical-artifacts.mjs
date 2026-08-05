@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { createRequire } from 'node:module';
+import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import { promises as fsp } from 'node:fs';
 import path from 'node:path';
@@ -36,6 +37,17 @@ const CAPTURES = [
   { name: 'login-mobile.png', page: 'login', viewport: { width: 390, height: 844 } },
   { name: 'projects-desktop.png', page: 'projects', viewport: { width: 1440, height: 900 } },
   { name: 'projects-mobile.png', page: 'projects', viewport: { width: 390, height: 844 } },
+];
+const TESTS_DETAIL_OUTPUT = path.join(OUTPUT_ROOT, 'tests-detail-desktop.png');
+const TESTS_DETAIL_SOURCES = [
+  GENERATOR,
+  'apps/DevOpsConsole/src/ui/app.css',
+  'apps/DevOpsConsole/src/ui/app.js',
+  'apps/DevOpsConsole/src/ui/index.html',
+  'apps/DevOpsConsole/test/browser.server-project-disclosures.test.mjs',
+  'apps/DevOpsConsole/test/helpers/stack.mjs',
+  'ci/playwright/package-lock.json',
+  'ci/playwright/package.json',
 ];
 
 function loadLockedPlaywright() {
@@ -181,6 +193,40 @@ async function captureOne({ browser, stack, sessionCookie, definition }) {
   }
 }
 
+async function captureTestsDetail() {
+  const testFile = path.join(APP_ROOT, 'test', 'browser.server-project-disclosures.test.mjs');
+  const pattern = 'Tests loads fleet awareness within one second and reveals repository detail on demand';
+  await new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [
+      '--test',
+      `--test-name-pattern=${pattern}`,
+      testFile,
+    ], {
+      cwd: REPO_ROOT,
+      env: {
+        ...process.env,
+        TESTS_DESIGN_DETAIL_SCREENSHOT: TESTS_DETAIL_OUTPUT,
+      },
+      stdio: 'inherit',
+    });
+    child.once('error', reject);
+    child.once('exit', (code, signal) => {
+      if (code === 0) resolve();
+      else reject(new Error(`Tests detail capture failed (${signal || `exit ${code}`})`));
+    });
+  });
+  await writeProvenance({
+    pngPath: TESTS_DETAIL_OUTPUT,
+    repoRoot: REPO_ROOT,
+    fixtureId: 'devops-console-tests-selected-design-detail-open-v1:1486x1059',
+    generator: GENERATOR,
+    viewport: { width: 1486, height: 1059 },
+    sourceFiles: TESTS_DETAIL_SOURCES,
+  });
+  const provenance = await verifyArtifactPair(TESTS_DETAIL_OUTPUT);
+  process.stdout.write(`${path.relative(REPO_ROOT, TESTS_DETAIL_OUTPUT)} ${provenance.sha256}\n`);
+}
+
 async function main() {
   const { chromium } = loadLockedPlaywright();
   await fsp.mkdir(OUTPUT_ROOT, { recursive: true });
@@ -220,6 +266,7 @@ async function main() {
     if (stack) await stack.close();
     await fsp.rm(fakeBin, { recursive: true, force: true });
   }
+  await captureTestsDetail();
 }
 
 main().catch((error) => {

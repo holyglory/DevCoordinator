@@ -15,11 +15,15 @@ from devcoordinator.cleanup_lifecycle import (
     CleanupLifecycle,
     PlanDriftError,
 )
-from devcoordinator.schema import SCHEMA_VERSION
+from devcoordinator.schema import (
+    advance_repository_owner_generation,
+    establish_repository_owner_authority,
+)
 from devcoordinator.store import AccountStore, utc_timestamp
 
 
 UID = os.geteuid()
+OWNER_UID = UID if UID > 0 else 1
 
 
 class ProjectCleanupGenerationTests(unittest.TestCase):
@@ -46,6 +50,17 @@ class ProjectCleanupGenerationTests(unittest.TestCase):
                 ) VALUES (?, ?, ?, 'Generation Test', 'active', 0, ?, ?)
                 """,
                 (repo_id, host_id, str(self.root / "repository"), now, now),
+            )
+            establish_repository_owner_authority(
+                connection,
+                repository_id=repo_id,
+                owner_uid=OWNER_UID,
+                repository_generation=0,
+                operation_id="fixture-generation-owner",
+                actor="fixture",
+                reason="project cleanup fixture owner authority",
+                timestamp=now,
+                evidence={"kind": "project-cleanup-generation-fixture"},
             )
             connection.execute(
                 """
@@ -182,6 +197,18 @@ class ProjectCleanupGenerationTests(unittest.TestCase):
                     """,
                     (now, repo_id),
                 )
+                advance_repository_owner_generation(
+                    connection,
+                    repository_id=repo_id,
+                    owner_uid=OWNER_UID,
+                    prior_repository_generation=1,
+                    repository_generation=2,
+                    operation_id="fixture-explicit-reinstall-generation-2",
+                    actor="fixture",
+                    reason="explicit fixture reinstall",
+                    timestamp=now,
+                    evidence={"kind": "project-cleanup-generation-reinstall"},
+                )
                 connection.execute(
                     """
                     UPDATE repository_installations
@@ -264,13 +291,26 @@ class ProjectCleanupGenerationTests(unittest.TestCase):
             repo_id = self._seed_archived_project(store)
 
             def advance_generation(_plan: object, _actor: str) -> dict[str, bool]:
+                timestamp = utc_timestamp()
                 with store.immediate_transaction() as connection:
                     connection.execute(
                         """
                         UPDATE repositories SET generation = generation + 1,
                             updated_at = ? WHERE repo_id = ?
                         """,
-                        (utc_timestamp(), repo_id),
+                        (timestamp, repo_id),
+                    )
+                    advance_repository_owner_generation(
+                        connection,
+                        repository_id=repo_id,
+                        owner_uid=OWNER_UID,
+                        prior_repository_generation=0,
+                        repository_generation=1,
+                        operation_id="fixture-finalization-race-generation-1",
+                        actor="fixture",
+                        reason="simulate an exact concurrent generation advance",
+                        timestamp=timestamp,
+                        evidence={"kind": "project-cleanup-generation-race"},
                     )
                 return {"generation_advanced": True}
 
@@ -281,7 +321,7 @@ class ProjectCleanupGenerationTests(unittest.TestCase):
                 actor="test",
                 reason="generation race",
             )
-            with self.assertRaisesRegex(PlanDriftError, "identity changed"):
+            with self.assertRaisesRegex(PlanDriftError, "owner authority.*stale"):
                 lifecycle.apply(
                     plan_id=plan.plan_id,
                     plan_fingerprint=plan.plan_fingerprint,
@@ -305,7 +345,7 @@ class ProjectCleanupGenerationTests(unittest.TestCase):
             )
             self.assertIsNone(tombstone)
 
-    def test_v10_tombstones_migrate_without_losing_exact_evidence(self) -> None:
+    def test_v10_tombstones_require_offline_migration_without_startup_writes(self) -> None:
         repo_id = "repo-legacy-generation"
         project_operation = str(uuid.uuid4())
         server_operation = str(uuid.uuid4())
@@ -383,72 +423,28 @@ class ProjectCleanupGenerationTests(unittest.TestCase):
                 )
 
         self._downgrade_tombstones_to_v10()
-        expected_rows = [
-            (
-                "project",
-                repo_id,
-                repo_id,
-                "sha256:" + "a" * 64,
-                project_operation,
-                "legacy-project-actor",
-                "legacy project reason",
-                project_evidence,
-                now,
-                4,
-            ),
-            (
-                "server",
-                "server-legacy",
-                repo_id,
-                "sha256:" + "b" * 64,
-                server_operation,
-                "legacy-server-actor",
-                "legacy server reason",
-                '{"source":"legacy-server"}',
-                now,
-                0,
-            ),
-        ]
-
-        def assert_migrated_store() -> None:
-            with AccountStore.open(self.database, expected_uid=UID) as migrated:
-                self.assertEqual(migrated.metadata.schema_version, SCHEMA_VERSION)
-                with migrated.read_transaction() as connection:
-                    columns = {
-                        str(row[1]): int(row[5])
-                        for row in connection.execute(
-                            "PRAGMA table_info(cleanup_tombstones)"
-                        )
-                    }
-                    rows = [
-                        tuple(row)
-                        for row in connection.execute(
-                            """
-                            SELECT target_kind, target_id, repo_id,
-                                   immutable_fingerprint, operation_id, actor,
-                                   reason, evidence_json, removed_at,
-                                   target_generation
-                            FROM cleanup_tombstones
-                            ORDER BY target_kind, target_id
-                            """
-                        )
-                    ]
-                    foreign_key_violations = list(
-                        connection.execute("PRAGMA foreign_key_check")
-                    )
-                self.assertEqual(
-                    (
-                        columns["target_kind"],
-                        columns["target_id"],
-                        columns["target_generation"],
-                    ),
-                    (1, 2, 3),
-                )
-                self.assertEqual(rows, expected_rows)
-                self.assertEqual(foreign_key_violations, [])
-
-        assert_migrated_store()
-        assert_migrated_store()
+        before = self.database.read_bytes()
+        for _attempt in range(2):
+            with self.assertRaisesRegex(
+                RuntimeError, "unsupported coordinator database schema 10"
+            ):
+                with AccountStore.open(self.database, expected_uid=UID):
+                    pass
+            self.assertEqual(self.database.read_bytes(), before)
+        connection = sqlite3.connect(self.database)
+        try:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT schema_version FROM schema_metadata WHERE singleton = 1"
+                ).fetchone()[0],
+                10,
+            )
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM cleanup_tombstones").fetchone()[0],
+                2,
+            )
+        finally:
+            connection.close()
 
     def test_v10_malformed_project_evidence_rolls_back_atomically(self) -> None:
         repo_id = "repo-malformed-generation"
@@ -498,7 +494,9 @@ class ProjectCleanupGenerationTests(unittest.TestCase):
                 )
         self._downgrade_tombstones_to_v10()
 
-        with self.assertRaisesRegex(RuntimeError, "exact generation"):
+        with self.assertRaisesRegex(
+            RuntimeError, "unsupported coordinator database schema 10"
+        ):
             with AccountStore.open(self.database, expected_uid=UID):
                 pass
 
@@ -552,7 +550,9 @@ class ProjectCleanupGenerationTests(unittest.TestCase):
             pass
         self._downgrade_tombstones_to_v10(retain_generation_column=True)
 
-        with self.assertRaisesRegex(RuntimeError, "partial cleanup tombstone"):
+        with self.assertRaisesRegex(
+            RuntimeError, "unsupported coordinator database schema 10"
+        ):
             with AccountStore.open(self.database, expected_uid=UID):
                 pass
 

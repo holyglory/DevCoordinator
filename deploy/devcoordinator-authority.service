@@ -1,0 +1,47 @@
+[Unit]
+Description=DevCoordinator server-wide authority
+Requires=devcoordinator-authority.socket
+Wants=devcoordinator-testd.socket devcoordinator-test-snapshotd.socket
+After=devcoordinator-authority.socket devcoordinator-testd.socket devcoordinator-test-snapshotd.socket
+
+[Service]
+Type=exec
+User=root
+Group=root
+Slice=devcoordinator-control.slice
+UMask=0077
+Environment=DEVCOORDINATOR_ROLE=authority
+Environment=DEVCOORDINATOR_BROWSER_LIFECYCLE_STATE=/var/lib/devcoordinator/browser-lifecycle.json
+Environment=DEVCOORDINATOR_BROWSER_IDLE_SECONDS=900
+ExecStartPre=/opt/devcoordinator/releases/RELEASE_DIGEST/bin/devcoordinator-schema-check --read-only --database /var/lib/devcoordinator/authority.sqlite3 --expected-schema 13
+ExecStart=/opt/devcoordinator/releases/RELEASE_DIGEST/bin/devcoordinator-authority --systemd-socket --database /var/lib/devcoordinator/authority.sqlite3 --test-plane-socket /run/devcoordinator-testd/testd.sock --test-capability-policy /etc/devcoordinator/test-execution-capabilities.json --call-log /var/log/devcoordinator/calls.jsonl --call-log-max-bytes 4194304 --call-log-backups 4
+Restart=on-failure
+RestartSec=2
+TimeoutStopSec=2min
+KillMode=mixed
+StateDirectory=devcoordinator devcoordinator-test-artifacts
+StateDirectoryMode=0700
+LogsDirectory=devcoordinator
+LogsDirectoryMode=0777
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=devcoordinator-authority
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+# ProtectSystem keeps the host read-only except for the explicit paths below.
+# ProtectHome must stay disabled: its separate read-only mount takes precedence
+# over ReadWritePaths=/home and would make exact-cwd normalization fail EROFS.
+ProtectHome=false
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadOnlyPaths=/var/lib/devcoordinator-test-snapshots
+# The fixed authority normalizer changes only the descriptor-validated service
+# working tree. /home is writable in this root-owned sandbox so repositories
+# created by any trusted local developer account need no host ACL repair.
+ReadWritePaths=/home /var/lib/devcoordinator /var/lib/devcoordinator-test-runs /var/lib/devcoordinator-test-artifacts /var/lib/devcoordinator-test-fixtures -/run/devcoordinator -/run/devcoordinator/test-fixture-credentials
+
+[Install]
+WantedBy=multi-user.target

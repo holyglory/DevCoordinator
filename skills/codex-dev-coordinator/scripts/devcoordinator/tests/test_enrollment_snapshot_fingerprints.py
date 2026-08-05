@@ -7,10 +7,12 @@ from pathlib import Path
 import sqlite3
 import tempfile
 import unittest
+from unittest import mock
 
-from devcoordinator.broker import BrokerOperation
+from devcoordinator.broker import BrokerError, BrokerOperation
 from devcoordinator.broker_enrollment import (
     _disable_observed_resource_grants,
+    _grant_all_observed_access,
     _grant_observed_cleanup_resources,
     _grant_observed_containers,
     _grant_observed_databases,
@@ -21,9 +23,15 @@ from devcoordinator.broker_persistence import BrokerPersistence
 from devcoordinator.host_observation import commit_host_inventory_observation
 from devcoordinator.observer import SingleFlightObserver
 from devcoordinator.repository_lifecycle import ResourceKind
-from devcoordinator.schema import SCHEMA_VERSION
+from devcoordinator.schema import establish_repository_owner_authority
 from devcoordinator.sqlite_lifecycle import SQLiteLifecyclePersistence
-from devcoordinator.store import AccountStore, deterministic_id, fingerprint, utc_timestamp
+from devcoordinator.store import (
+    AccountStore,
+    CoordinatorStore,
+    deterministic_id,
+    fingerprint,
+    utc_timestamp,
+)
 
 
 HOST_ID = "enrollment-host"
@@ -60,6 +68,35 @@ class ObservationFingerprintTests(unittest.TestCase):
                     ) VALUES (?, 'enrollment-machine', 'test', 'test', ?, ?)
                     """,
                     (HOST_ID, now, now),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO repositories(
+                        repo_id, host_id, canonical_root, display_name, state,
+                        generation, created_at, updated_at
+                    ) VALUES (?, ?, ?, 'repository', 'active', 0, ?, ?)
+                    """,
+                    (REPO_ID, HOST_ID, str(self.repository), now, now),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO repository_installations(
+                        repo_id, status, startup_fenced, generation, actor,
+                        updated_at
+                    ) VALUES (?, 'installed', 0, 0, 'test', ?)
+                    """,
+                    (REPO_ID, now),
+                )
+                establish_repository_owner_authority(
+                    connection,
+                    repository_id=REPO_ID,
+                    owner_uid=os.geteuid(),
+                    repository_generation=0,
+                    operation_id="observation-fingerprint-owner",
+                    actor="test",
+                    reason="explicit test repository enrollment",
+                    timestamp=now,
+                    evidence={"source": "test_fixture"},
                 )
 
     def tearDown(self) -> None:
@@ -282,30 +319,39 @@ class SchemaV4FingerprintMigrationTests(unittest.TestCase):
                 "UPDATE schema_metadata SET schema_version = 3 WHERE singleton = 1"
             )
 
-    def test_v3_store_atomically_prefixes_exact_bare_digests(self) -> None:
+    def test_v3_store_requires_explicit_offline_migration_without_writes(self) -> None:
         self._downgrade_v3(policy_fingerprint=self.policy_digest)
 
-        with AccountStore.open_default(self.home) as store:
-            with store.read_transaction() as connection:
-                values = connection.execute(
-                    """
-                    SELECT
-                      (SELECT immutable_fingerprint FROM repository_memberships),
-                      (SELECT immutable_fingerprint FROM startup_policies),
-                      (SELECT schema_version FROM schema_metadata WHERE singleton = 1)
-                    """
-                ).fetchone()
-
-        self.assertEqual(values[0], "sha256:" + self.membership_digest)
-        self.assertEqual(values[1], "sha256:" + self.policy_digest)
-        self.assertEqual(int(values[2]), SCHEMA_VERSION)
-
-    def test_v3_malformed_leftover_rolls_back_every_conversion(self) -> None:
-        self._downgrade_v3(policy_fingerprint="sha256:" + "A" * 64)
-
-        with self.assertRaisesRegex(RuntimeError, "rejected malformed"):
+        before = self.database.read_bytes()
+        with self.assertRaisesRegex(
+            RuntimeError, "unsupported coordinator database schema 3"
+        ):
             AccountStore.open_default(self.home)
 
+        self.assertEqual(self.database.read_bytes(), before)
+        with sqlite3.connect(self.database) as connection:
+            values = connection.execute(
+                """
+                SELECT
+                  (SELECT immutable_fingerprint FROM repository_memberships),
+                  (SELECT immutable_fingerprint FROM startup_policies),
+                  (SELECT schema_version FROM schema_metadata WHERE singleton = 1)
+                """
+            ).fetchone()
+        self.assertEqual(values[0], self.membership_digest)
+        self.assertEqual(values[1], self.policy_digest)
+        self.assertEqual(int(values[2]), 3)
+
+    def test_v3_malformed_leftover_is_not_touched_by_startup(self) -> None:
+        self._downgrade_v3(policy_fingerprint="sha256:" + "A" * 64)
+
+        before = self.database.read_bytes()
+        with self.assertRaisesRegex(
+            RuntimeError, "unsupported coordinator database schema 3"
+        ):
+            AccountStore.open_default(self.home)
+
+        self.assertEqual(self.database.read_bytes(), before)
         with sqlite3.connect(self.database) as connection:
             values = connection.execute(
                 """
@@ -731,6 +777,133 @@ class EnrollmentSnapshotScopeTests(unittest.TestCase):
             active_lifecycle, {self._resource_id("current-orphan")}
         )
         self.assertEqual(active_cleanup, {self._resource_id("current")})
+
+    def test_observed_access_is_published_by_one_parity_preserving_batch(
+        self,
+    ) -> None:
+        transaction_count = 0
+        immediate_transaction = CoordinatorStore.immediate_transaction
+
+        def counted_transaction(store, *args, **kwargs):
+            nonlocal transaction_count
+            transaction_count += 1
+            return immediate_transaction(store, *args, **kwargs)
+
+        with (
+            mock.patch.object(
+                CoordinatorStore,
+                "immediate_transaction",
+                counted_transaction,
+            ),
+            mock.patch.object(
+                self.persistence,
+                "grant_observation_derived_access_batch",
+                wraps=self.persistence.grant_observation_derived_access_batch,
+            ) as batch,
+            mock.patch.object(self.persistence, "grant_runtime") as singular_runtime,
+            mock.patch.object(self.persistence, "grant_resource") as singular_resource,
+            mock.patch.object(self.persistence, "grant_database") as singular_database,
+            mock.patch.object(
+                self.persistence, "grant_lifecycle_resource"
+            ) as singular_lifecycle,
+            mock.patch.object(
+                self.persistence, "grant_cleanup_resource"
+            ) as singular_cleanup,
+        ):
+            aliases = _grant_all_observed_access(
+                self.persistence,
+                repo_id=REPO_ID,
+                client_uid=self.uid,
+                snapshot_id="current-snapshot",
+                include_cleanup=True,
+            )
+
+        batch.assert_called_once()
+        self.assertEqual(transaction_count, 1)
+        singular_runtime.assert_not_called()
+        singular_resource.assert_not_called()
+        singular_database.assert_not_called()
+        singular_lifecycle.assert_not_called()
+        singular_cleanup.assert_not_called()
+        call = batch.call_args.kwargs
+        self.assertEqual(len(call["container_identity_grants"]), 1)
+        self.assertEqual(len(call["runtime_grants"]), 8)
+        self.assertEqual(len(call["resource_grants"]), 3)
+        self.assertEqual(len(call["database_grants"]), 2)
+        self.assertEqual(len(call["lifecycle_resource_grants"]), 3)
+        self.assertEqual(len(call["cleanup_resource_grants"]), 5)
+        self.assertEqual(
+            aliases,
+            {
+                self.resources["current"][0]: self._resource_id("current"),
+                self.resources["current"][1]: self._resource_id("current"),
+            },
+        )
+
+    def test_late_invalid_batch_item_rolls_back_all_new_grants_after_revocation(
+        self,
+    ) -> None:
+        self._seed_stale_grants()
+        self.persistence.revoke_observation_derived_access(
+            uid=self.uid,
+            repo_id=REPO_ID,
+            containers=True,
+            databases=True,
+            lifecycle_resources=True,
+            cleanup_resources=True,
+        )
+        current_resource = self._resource_id("current")
+        with self.assertRaises(BrokerError):
+            self.persistence.grant_observation_derived_access_batch(
+                uid=self.uid,
+                repo_id=REPO_ID,
+                container_identity_grants=(
+                    (
+                        "current-snapshot",
+                        current_resource,
+                        self.resources["current"][1],
+                        False,
+                    ),
+                ),
+                runtime_grants=(("docker", current_resource, "status"),),
+                resource_grants=(
+                    (
+                        "container",
+                        current_resource,
+                        BrokerOperation.DOCKER_START,
+                    ),
+                ),
+                cleanup_resource_grants=(
+                    (
+                        "container",
+                        current_resource,
+                        "missing-control-binding",
+                        "sha256:" + "a" * 64,
+                        "sha256:" + "b" * 64,
+                        BrokerOperation.CLEANUP_PLAN,
+                    ),
+                ),
+            )
+
+        with AccountStore.open_default(self.home) as store:
+            with store.read_transaction() as connection:
+                active = sum(
+                    int(
+                        connection.execute(
+                            f"SELECT count(*) FROM {table} "
+                            "WHERE uid = ? AND repo_id = ? AND enabled = 1",
+                            (self.uid, REPO_ID),
+                        ).fetchone()[0]
+                    )
+                    for table in (
+                        "broker_runtime_acl",
+                        "broker_resource_acl",
+                        "broker_database_acl",
+                        "broker_lifecycle_resource_acl",
+                        "broker_cleanup_resource_acl",
+                    )
+                )
+        self.assertEqual(active, 0)
 
     def test_enrollment_never_grants_generic_lifecycle_to_ephemeral_container(
         self,

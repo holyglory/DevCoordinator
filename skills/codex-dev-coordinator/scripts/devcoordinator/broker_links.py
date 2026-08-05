@@ -17,6 +17,10 @@ from typing import Any, Callable, Mapping, Optional
 from .broker import BrokerClient, BrokerOperation, BrokerRequest
 from .broker_profile import BrokerClientProfile, BrokerRepositoryProfile
 from .repository_lifecycle import ResourceKind
+from .schema import (
+    advance_repository_owner_generation,
+    establish_repository_owner_authority,
+)
 from .sqlite_lifecycle import SQLiteLifecyclePersistence
 from .store import (
     AccountStore,
@@ -109,7 +113,7 @@ class BrokerLinkStore:
                     repository.repo_id,
                     server_definition_id,
                     broker_lease_id,
-                    profile.account_id,
+                    profile.repository_account_id(repository),
                     str(profile.service.socket_path),
                     profile.service.service_uid,
                     profile.service.socket_gid,
@@ -334,7 +338,7 @@ class BrokerLinkStore:
                     repository.repo_id,
                     server_definition_id,
                     broker_assignment_id,
-                    profile.account_id,
+                    profile.repository_account_id(repository),
                     str(profile.service.socket_path),
                     profile.service.service_uid,
                     profile.service.socket_gid,
@@ -787,6 +791,27 @@ class BrokerLinkStore:
                 raise RuntimeError(
                     "repository revocation changed before active projection removal"
                 )
+            advance_repository_owner_generation(
+                connection,
+                repository_id=repository.repo_id,
+                owner_uid=repository.owner_uid,
+                prior_repository_generation=repository.generation,
+                repository_generation=repository.generation + 1,
+                operation_id=broker_operation_id,
+                actor="broker-profile-mirror",
+                reason="permanent broker project removal generation fence",
+                timestamp=timestamp,
+                evidence={
+                    "kind": "broker-repository-materialization-revocation",
+                    "repository_id": repository.repo_id,
+                    "canonical_root": repository.canonical_root,
+                    "prior_repository_generation": repository.generation,
+                    "repository_generation": repository.generation + 1,
+                    "owner_uid": repository.owner_uid,
+                    "broker_database_generation": profile.service.database_generation,
+                    "immutable_fingerprint": immutable_fingerprint,
+                },
+            )
         return {
             "status": "revoked",
             "repo_id": repository.repo_id,
@@ -940,7 +965,7 @@ class BrokerLinkStore:
                         operation.value,
                         operation_id,
                         result.get("plan_id"),
-                        profile.account_id,
+                        profile.repository_account_id(repository),
                         str(profile.service.socket_path),
                         profile.service.service_uid,
                         profile.service.socket_gid,
@@ -1670,13 +1695,17 @@ class BrokerLinkStore:
 
         host_id = self._store.ensure_local_host()
         timestamp = utc_timestamp()
+        owner_operation_id = str(uuid.uuid4())
         with self._store.immediate_transaction() as connection:
             reactivated = False
             rows = list(
                 connection.execute(
                     """
-                    SELECT repo_id, canonical_root, state, generation
-                    FROM repositories
+                    SELECT repository.repo_id, repository.canonical_root,
+                           repository.state, repository.generation,
+                           owner.owner_uid, owner.repository_generation
+                    FROM repositories repository
+                    LEFT JOIN repository_owners owner USING(repo_id)
                     WHERE repo_id = ? OR canonical_root = ?
                     """,
                     (repository.repo_id, repository.canonical_root),
@@ -1709,9 +1738,34 @@ class BrokerLinkStore:
                         timestamp,
                     ),
                 )
+                establish_repository_owner_authority(
+                    connection,
+                    repository_id=repository.repo_id,
+                    owner_uid=repository.owner_uid,
+                    repository_generation=int(repository.generation),
+                    operation_id=owner_operation_id,
+                    actor="broker-profile-bootstrap",
+                    reason="protected profile repository owner authority",
+                    timestamp=timestamp,
+                    evidence={
+                        "kind": "broker-profile-repository-owner-bootstrap",
+                        "repository_id": repository.repo_id,
+                        "canonical_root": repository.canonical_root,
+                        "repository_generation": int(repository.generation),
+                        "owner_uid": repository.owner_uid,
+                    },
+                )
             else:
                 current = rows[0]
                 current_generation = int(current["generation"])
+                if (
+                    current["owner_uid"] is None
+                    or int(current["owner_uid"]) != repository.owner_uid
+                    or int(current["repository_generation"]) != current_generation
+                ):
+                    raise RuntimeError(
+                        "local repository owner authority is missing, stale, or conflicts with the protected profile"
+                    )
                 revoked = connection.execute(
                     """
                     SELECT 1
@@ -1757,6 +1811,25 @@ class BrokerLinkStore:
                             current_state,
                             current_generation,
                         ),
+                    )
+                    advance_repository_owner_generation(
+                        connection,
+                        repository_id=repository.repo_id,
+                        owner_uid=repository.owner_uid,
+                        prior_repository_generation=current_generation,
+                        repository_generation=int(repository.generation),
+                        operation_id=owner_operation_id,
+                        actor="broker-profile-bootstrap",
+                        reason="protected profile repository generation advance",
+                        timestamp=timestamp,
+                        evidence={
+                            "kind": "broker-profile-repository-owner-generation",
+                            "repository_id": repository.repo_id,
+                            "canonical_root": repository.canonical_root,
+                            "prior_repository_generation": current_generation,
+                            "repository_generation": int(repository.generation),
+                            "owner_uid": repository.owner_uid,
+                        },
                     )
                     reactivated = current_state == "missing"
             connection.execute(
@@ -1930,7 +2003,7 @@ def _require_same_lease(
         or int(row["port"]) != port
         or str(row["protocol"]) != protocol
         or str(row["status"]) not in {"reserved", "active"}
-        or str(row["account_id"]) != profile.account_id
+        or str(row["account_id"]) != profile.repository_account_id(repository)
         or str(row["broker_socket"]) != str(profile.service.socket_path)
         or int(row["broker_service_uid"]) != profile.service.service_uid
         or int(row["broker_socket_gid"]) != profile.service.socket_gid

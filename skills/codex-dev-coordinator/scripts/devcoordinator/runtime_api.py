@@ -31,7 +31,16 @@ from .store import deterministic_id, refuse_symlink_components, utc_timestamp
 
 
 RUNTIME_ACTIONS = frozenset(
-    {"status", "start", "stop", "restart", "replace", "run", "remove"}
+    {
+        "status",
+        "capture_logs",
+        "start",
+        "stop",
+        "restart",
+        "replace",
+        "run",
+        "remove",
+    }
 )
 RUNTIME_TARGET_KINDS = frozenset({"service", "docker", "database_stack"})
 RUNTIME_PURPOSES = frozenset({"development", "test", "temporary"})
@@ -290,7 +299,7 @@ def validate_runtime_request(payload: Any) -> dict[str, Any]:
     action = _nonempty_string(payload["action"], field="action", maximum=20)
     if action not in RUNTIME_ACTIONS:
         raise RuntimeRequestError(
-            "action must be status, start, stop, restart, replace, run, or remove"
+            "action must be status, capture_logs, start, stop, restart, replace, run, or remove"
         )
     purpose = _nonempty_string(payload["purpose"], field="purpose", maximum=20)
     if purpose not in RUNTIME_PURPOSES:
@@ -320,8 +329,10 @@ def validate_runtime_request(payload: Any) -> dict[str, Any]:
         raise RuntimeRequestError(
             "test and temporary runtime requests require ttl_seconds"
         )
-    if action == "status" and ttl_seconds is not None:
-        raise RuntimeRequestError("status is read-only and requires ttl_seconds=null")
+    if action in {"status", "capture_logs"} and ttl_seconds is not None:
+        raise RuntimeRequestError(
+            f"{action} is read-only and requires ttl_seconds=null"
+        )
     if action == "run" and purpose not in {"test", "temporary"}:
         raise RuntimeRequestError("run requires purpose test or temporary")
     if action == "remove" and (purpose != "development" or ttl_seconds is not None):
@@ -353,6 +364,14 @@ def validate_runtime_request(payload: Any) -> dict[str, Any]:
         )
     if kind in {"docker", "database_stack"} and target_id is None:
         raise RuntimeRequestError(f"{kind} target requires immutable id")
+    if action == "capture_logs" and kind not in {
+        "service",
+        "docker",
+        "database_stack",
+    }:
+        raise RuntimeRequestError(
+            "capture_logs requires a service, docker, or database_stack target"
+        )
     if action == "remove" and (kind != "service" or target_id is None):
         raise RuntimeRequestError(
             "remove currently requires an existing immutable service target"
@@ -365,6 +384,8 @@ def validate_runtime_request(payload: Any) -> dict[str, Any]:
     if option_extra:
         raise RuntimeRequestError("unknown runtime options: " + ", ".join(option_extra))
     options = dict(raw_options)
+    if action == "capture_logs" and options:
+        raise RuntimeRequestError("capture_logs accepts no runtime options")
     if "argv" in options:
         options["argv"] = _argv(options["argv"], field="options.argv")
     if "run_argv" in options:
@@ -1789,6 +1810,42 @@ def execute_runtime_request(
         if not isinstance(redacted, dict):  # pragma: no cover - report is an object
             raise RuntimeError("runtime report redaction returned a non-object")
         return redacted
+
+    if request["action"] == "capture_logs":
+        if classification_evidence:
+            capture_result: dict[str, Any] = {
+                "ok": False,
+                "classification": "unclassified_resource",
+                "error": (
+                    "repository scope contains unclassified or "
+                    "lifecycle-violating resources"
+                ),
+                "evidence": classification_evidence,
+            }
+        else:
+            capture = callbacks.capture_logs(
+                request, repository_context.effective.canonical_root
+            )
+            if not isinstance(capture, dict):
+                raise RuntimeError("runtime log capture returned a non-object")
+            capture_result = {
+                "ok": capture.get("availability") == "available",
+                "classification": (
+                    "available"
+                    if capture.get("availability") == "available"
+                    else str(capture.get("reason_code") or "log_capture_unavailable")
+                ),
+                "_runtime_log_capture": capture,
+            }
+            if capture_result["ok"] is not True:
+                capture_result["error"] = str(
+                    capture.get("message") or "runtime log capture is unavailable"
+                )
+        return report(
+            session_id=None,
+            action_result=capture_result,
+            inventory=classification_inventory,
+        )
 
     if request["action"] == "status":
         if classification_evidence:

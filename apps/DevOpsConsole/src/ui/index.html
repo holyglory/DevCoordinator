@@ -8,8 +8,8 @@
 <title>DevOps Console — vr.ae</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2016%2016'%3E%3Crect%20width='16'%20height='16'%20rx='3'%20fill='%230e1116'/%3E%3Ccircle%20cx='8'%20cy='8'%20r='4'%20fill='none'%20stroke='%234da3ff'%20stroke-width='2'/%3E%3Ccircle%20cx='8'%20cy='8'%20r='1.4'%20fill='%233fc97c'/%3E%3C/svg%3E">
 <!-- ?v= busts the 1h immutable asset cache on deploys; index.html itself is no-cache. -->
-<link rel="stylesheet" href="/app.css?v=d22d8015ccf4">
-<script src="/app.js?v=d22d8015ccf4" defer></script>
+<link rel="stylesheet" href="/app.css?v=b1052633dbaf">
+<script src="/app.js?v=b1052633dbaf" defer></script>
 </head>
 <body>
 
@@ -27,6 +27,7 @@
     <nav id="site-nav" class="site-nav" aria-label="Console sections">
       <a href="#/projects" data-nav="projects">Projects <span class="nav-count" id="nav-count-projects" hidden></span></a>
       <a href="#/tests" data-nav="tests">Tests <span class="nav-count" id="nav-count-tests" hidden></span></a>
+      <a href="#/bugs" data-nav="bugs">Bugs <span class="nav-count" id="nav-count-bugs" hidden></span></a>
       <a href="#/servers" data-nav="servers">Servers <span class="nav-count" id="nav-count-servers" hidden></span></a>
       <a href="#/routes" data-nav="routes">Routes <span class="nav-count" id="nav-count-routes" hidden></span></a>
       <a href="#/docker" data-nav="docker">Docker <span class="nav-count" id="nav-count-docker" hidden></span></a>
@@ -63,24 +64,48 @@
 
   <section id="sec-tests" class="card" data-page="tests" aria-labelledby="tests-h" hidden>
     <div class="sec-head collection-head test-head">
-      <h2 id="tests-h">Tests <span class="count" id="tests-count" hidden></span></h2>
-      <div class="test-filters">
-        <label for="tests-project">Repository</label>
-        <select id="tests-project" aria-label="Test repository"></select>
-        <label for="tests-days">Period</label>
-        <select id="tests-days" aria-label="Test statistics period">
-          <option value="7">7 days</option>
-          <option value="30" selected>30 days</option>
-          <option value="90">90 days</option>
-          <option value="365">1 year</option>
-        </select>
-        <span class="test-comparison"><span>Comparison</span><strong id="tests-comparison">Previous 30 days</strong></span>
-        <span class="test-updated" id="tests-updated">Waiting for data</span>
-        <span class="test-head-metric is-pass"><strong id="tests-pass-rate">—</strong><span>Pass rate</span></span>
-        <span class="test-head-metric is-fail"><strong id="tests-failed-runs">—</strong><span>Failed runs</span></span>
+      <div class="test-title">
+        <h2 id="tests-h">Tests <span class="count" id="tests-count" hidden></span></h2>
+        <p class="sec-sub">Fleet-wide test coverage, freshness and efficiency. Select a repository only when you need the detail.</p>
+      </div>
+      <div class="test-filters" role="search">
+        <label class="test-search" for="tests-search">
+          <span class="visually-hidden">Search repositories</span>
+          <input id="tests-search" type="search" autocomplete="off" spellcheck="false" placeholder="Search repositories">
+        </label>
+        <label class="test-window" for="tests-hours">
+          <span class="visually-hidden">Fleet time window</span>
+          <select id="tests-hours" aria-label="Fleet time window">
+            <option value="24" selected>Last 24 hours</option>
+          </select>
+        </label>
+        <button id="tests-run" class="btn primary" type="button" disabled>Run tests</button>
       </div>
     </div>
-    <div id="tests-body" class="sec-body" aria-live="polite">
+    <div class="test-refresh-line" hidden>
+      <span id="tests-updated"></span>
+      <span id="tests-retained" hidden>Latest refresh failed — showing last available data</span>
+    </div>
+    <div id="tests-body" class="sec-body" aria-live="off">
+      <div class="skel" aria-hidden="true"></div>
+      <div class="skel" aria-hidden="true"></div>
+    </div>
+  </section>
+
+  <section id="sec-bugs" class="card" data-page="bugs" aria-labelledby="bugs-h" hidden>
+    <div class="sec-head collection-head bugs-head">
+      <div>
+        <h2 id="bugs-h">Open Coordinator bugs <span class="count" id="bugs-count" hidden></span></h2>
+        <p class="sec-sub">Actionable failures reported here or imported from another server. Closing a report removes it from every Console instance sharing this registry.</p>
+      </div>
+      <div class="bugs-head-actions">
+        <button id="bugs-export" class="btn" type="button">Export</button>
+        <button id="bugs-import" class="btn" type="button">Import</button>
+        <button id="bugs-refresh" class="btn" type="button">Refresh</button>
+      </div>
+    </div>
+    <p id="bugs-retained" class="bugs-retained" role="status" hidden></p>
+    <div id="bugs-body" class="sec-body" aria-live="off">
       <div class="skel" aria-hidden="true"></div>
       <div class="skel" aria-hidden="true"></div>
     </div>
@@ -147,62 +172,13 @@
   </section>
 
   <section id="sec-routes" class="card" data-page="routes" aria-labelledby="routes-h" hidden>
-    <div class="sec-head">
-      <h2 id="routes-h">Routes <span class="count" id="routes-count" hidden></span></h2>
-      <p class="sec-sub">Every public URL on this box. Server-backed routes are easiest to manage as the server's subdomain on the Servers page; fixed-port routes are created here.</p>
-    </div>
-
-    <form id="route-form" autocomplete="off" novalidate>
-      <div class="rf-grid">
-        <div class="field">
-          <label for="rf-slug">Subdomain</label>
-          <input id="rf-slug" name="slug" type="text" maxlength="63" spellcheck="false"
-                 autocapitalize="none" placeholder="myapp" aria-describedby="rf-preview">
-          <p id="rf-preview" class="preview" aria-live="polite"></p>
-        </div>
-
-        <fieldset class="field target-field">
-          <legend>Target</legend>
-          <div class="seg" role="radiogroup" aria-label="Route target type">
-            <label class="segopt"><input type="radio" name="rf-kind" value="port" checked><span data-ui-allow-overlap="segmented-control label sits under its own transparent radio input for a whole-label click target">Fixed port</span></label>
-            <label class="segopt"><input type="radio" name="rf-kind" value="server"><span data-ui-allow-overlap="segmented-control label sits under its own transparent radio input for a whole-label click target">Managed server</span></label>
-            <label class="segopt"><input type="radio" name="rf-kind" value="docker"><span data-ui-allow-overlap="segmented-control label sits under its own transparent radio input for a whole-label click target">Container</span></label>
-          </div>
-          <div id="rf-port-wrap" class="target-input">
-            <label class="visually-hidden" for="rf-port">Port on 127.0.0.1</label>
-            <input id="rf-port" type="number" inputmode="numeric" min="1" max="65535" placeholder="Port on 127.0.0.1, e.g. 3000">
-          </div>
-          <div id="rf-server-wrap" class="target-input" hidden>
-            <label class="visually-hidden" for="rf-server">Coordinator server</label>
-            <select id="rf-server"><option value="">Loading servers…</option></select>
-          </div>
-          <div id="rf-container-wrap" class="target-input" hidden>
-            <label class="visually-hidden" for="rf-container">Docker container and port</label>
-            <select id="rf-container"><option value="">Loading containers…</option></select>
-          </div>
-          <p class="target-protocol-note">The Console terminates public HTTPS, then forwards plain HTTP to this target. Choose the app's HTTP listener, not its HTTPS/TLS listener.</p>
-        </fieldset>
-
-        <div class="field">
-          <label for="rf-title">Title <span class="opt">(optional)</span></label>
-          <input id="rf-title" type="text" maxlength="80" placeholder="e.g. Client preview">
-        </div>
-
-        <div class="field access-field">
-          <span class="field-label" id="rf-access-label">Access</span>
-          <button type="button" id="rf-access" class="switch" role="switch" aria-checked="true"
-                  aria-labelledby="rf-access-label rf-access-text">
-            <span class="knob" aria-hidden="true"></span>
-            <span class="sw-label" id="rf-access-text">Google sign-in required</span>
-          </button>
-        </div>
-
-        <div class="field submit-field">
-          <button type="submit" id="rf-submit" class="btn primary">Create route</button>
-        </div>
+    <div class="sec-head collection-head">
+      <div>
+        <h2 id="routes-h">Routes <span class="count" id="routes-count" hidden></span></h2>
+        <p class="sec-sub">Every public URL on this box. Server-backed routes are easiest to manage as the server's subdomain on the Servers page; fixed-port routes are created here.</p>
       </div>
-      <p id="rf-error" class="form-error" role="alert" hidden></p>
-    </form>
+      <button id="route-add" class="btn primary" type="button">Create route</button>
+    </div>
 
     <div id="routes-body" class="sec-body" aria-live="polite">
       <div class="skel" aria-hidden="true"></div>
@@ -229,41 +205,13 @@
   </section>
 
   <section id="sec-leases" class="card" data-page="ports" aria-labelledby="leases-h" hidden>
-    <div class="sec-head">
-      <h2 id="leases-h">Port leases <span class="count" id="leases-count" hidden></span></h2>
-      <p class="sec-sub">Ports reserved through the coordinator, so tools and agents never collide on a port.</p>
-    </div>
-
-    <form id="lease-form" autocomplete="off" novalidate>
-      <div class="rf-grid">
-        <div class="field">
-          <label for="lf-purpose">Purpose <span class="opt">(optional)</span></label>
-          <input id="lf-purpose" type="text" maxlength="120" placeholder="e.g. webpack dev server">
-        </div>
-        <div class="field">
-          <label for="lf-preferred">Preferred port <span class="opt">(optional)</span></label>
-          <input id="lf-preferred" type="number" inputmode="numeric" min="1" max="65535"
-                 placeholder="blank = next free in 3000-3999">
-        </div>
-        <div class="field">
-          <label for="lf-ttl">Expires after</label>
-          <select id="lf-ttl">
-            <option value="3600">1 hour</option>
-            <option value="28800" selected>8 hours</option>
-            <option value="86400">24 hours</option>
-            <option value="0">Never</option>
-          </select>
-        </div>
-        <div class="field">
-          <label for="lf-project">Project path <span class="opt">(optional)</span></label>
-          <input id="lf-project" type="text" spellcheck="false" placeholder="defaults to this console's repo">
-        </div>
-        <div class="field submit-field">
-          <button type="submit" id="lf-submit" class="btn primary">Lease a port</button>
-        </div>
+    <div class="sec-head collection-head">
+      <div>
+        <h2 id="leases-h">Port leases <span class="count" id="leases-count" hidden></span></h2>
+        <p class="sec-sub">Ports reserved through the coordinator, so tools and agents never collide on a port.</p>
       </div>
-      <p id="lf-error" class="form-error" role="alert" hidden></p>
-    </form>
+      <button id="lease-add" class="btn primary" type="button">Lease port</button>
+    </div>
 
     <div id="leases-body" class="sec-body">
       <div class="skel" aria-hidden="true"></div>
@@ -286,28 +234,256 @@
     <div class="sec-head collection-head">
       <div>
         <h2 id="perf-h">Performance <span class="count" id="perf-count" hidden></span></h2>
-        <p class="sec-sub">This machine's overall health first — CPU, memory, storage, load and uptime — then live CPU and memory per running server and container. Sampled continuously by the console; history resets when the console restarts.</p>
+        <p class="sec-sub">Whole-host resource composition across every repository. CPU is normalized to host capacity; memory reconciles attributed working sets with the host total.</p>
       </div>
-      <a class="btn" href="#/tests">Test dashboards</a>
+      <div class="perf-head-actions">
+        <span class="perf-window" aria-label="Performance history window">Last 60 minutes</span>
+        <a class="btn" href="#/tests">Test dashboards</a>
+      </div>
     </div>
-    <div id="perf-body" class="sec-body">
-      <div class="skel" aria-hidden="true"></div>
-      <div class="skel" aria-hidden="true"></div>
-    </div>
-  </section>
-
-  <section id="sec-usage" class="card" data-page="performance" aria-labelledby="usage-h" hidden>
-    <div class="sec-head">
-      <h2 id="usage-h">Usage by project <span class="count" id="usage-count" hidden></span></h2>
-      <p class="sec-sub">CPU and memory per project (servers + containers).</p>
-    </div>
-    <div id="usage-body" class="sec-body">
+    <div id="perf-body" class="sec-body" aria-live="off">
       <div class="skel" aria-hidden="true"></div>
       <div class="skel" aria-hidden="true"></div>
     </div>
   </section>
 
 </main>
+
+<dialog id="bugs-export-dialog" aria-labelledby="bugs-export-h">
+  <form id="bugs-export-form" method="dialog">
+    <div class="dialog-head">
+      <div>
+        <h2 id="bugs-export-h">Export open bugs</h2>
+        <p>Copy this portable JSON bundle to another Coordinator server.</p>
+      </div>
+      <button id="bugs-export-close" class="iconbtn" type="button" aria-label="Close bug export dialog" title="Close"></button>
+    </div>
+    <label for="bugs-export-json">Open bugs JSON</label>
+    <textarea id="bugs-export-json" class="bugs-transfer-json" readonly spellcheck="false" aria-describedby="bugs-export-help"></textarea>
+    <p id="bugs-export-help" class="field-help">If clipboard access is unavailable, select and copy the text manually.</p>
+    <p id="bugs-export-error" class="form-error" role="alert" hidden></p>
+    <div class="dialog-actions">
+      <button id="bugs-export-cancel" class="btn" type="button">Close</button>
+      <button id="bugs-export-copy" class="btn primary" type="button">Copy to Clipboard</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="bugs-import-dialog" aria-labelledby="bugs-import-h">
+  <form id="bugs-import-form" autocomplete="off" novalidate>
+    <div class="dialog-head">
+      <div>
+        <h2 id="bugs-import-h">Import open bugs</h2>
+        <p>Paste an exported Coordinator bug bundle. Imported reports remain labelled with their original server.</p>
+      </div>
+      <button id="bugs-import-close" class="iconbtn" type="button" aria-label="Close bug import dialog" title="Close"></button>
+    </div>
+    <label for="bugs-import-json">Open bugs JSON</label>
+    <textarea id="bugs-import-json" class="bugs-transfer-json" required spellcheck="false" placeholder="Paste exported JSON here"></textarea>
+    <p id="bugs-import-error" class="form-error" role="alert" hidden></p>
+    <div class="dialog-actions">
+      <button id="bugs-import-cancel" class="btn" type="button">Cancel</button>
+      <button id="bugs-import-submit" class="btn primary" type="submit">Import</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="perf-project-dialog" aria-labelledby="perf-project-dialog-title">
+  <div class="perf-dialog-shell">
+    <div class="dialog-head perf-dialog-head">
+      <div>
+        <h2 id="perf-project-dialog-title">Performance details</h2>
+        <p id="perf-project-dialog-subtitle">History for the last 60 minutes</p>
+      </div>
+      <button id="perf-project-dialog-close" class="iconbtn" type="button"
+              aria-label="Close performance details" title="Close"></button>
+    </div>
+    <div id="perf-project-dialog-body" class="perf-dialog-body" aria-live="off"></div>
+  </div>
+</dialog>
+
+<dialog id="route-dialog" aria-labelledby="route-dialog-h">
+  <form id="route-form" autocomplete="off" novalidate>
+    <div class="dialog-head">
+      <div>
+        <h2 id="route-dialog-h">Create route</h2>
+        <p>Publish one fixed HTTP port, managed server, or container at a public HTTPS subdomain.</p>
+      </div>
+      <button id="route-dialog-close" class="iconbtn" type="button" aria-label="Close route creation dialog" title="Close"></button>
+    </div>
+    <div class="rf-grid">
+      <div class="field">
+        <label for="rf-slug">Subdomain</label>
+        <input id="rf-slug" name="slug" type="text" maxlength="63" spellcheck="false"
+               autocapitalize="none" placeholder="myapp" aria-describedby="rf-preview">
+        <p id="rf-preview" class="preview" aria-live="polite"></p>
+      </div>
+
+      <fieldset class="field target-field">
+        <legend>Target</legend>
+        <div class="seg" role="radiogroup" aria-label="Route target type">
+          <label class="segopt"><input type="radio" name="rf-kind" value="port" checked><span data-ui-allow-overlap="segmented-control label sits under its own transparent radio input for a whole-label click target">Fixed port</span></label>
+          <label class="segopt"><input type="radio" name="rf-kind" value="server"><span data-ui-allow-overlap="segmented-control label sits under its own transparent radio input for a whole-label click target">Managed server</span></label>
+          <label class="segopt"><input type="radio" name="rf-kind" value="docker"><span data-ui-allow-overlap="segmented-control label sits under its own transparent radio input for a whole-label click target">Container</span></label>
+        </div>
+        <div id="rf-port-wrap" class="target-input">
+          <label class="visually-hidden" for="rf-port">Port on 127.0.0.1</label>
+          <input id="rf-port" type="number" inputmode="numeric" min="1" max="65535" placeholder="Port on 127.0.0.1, e.g. 3000">
+        </div>
+        <div id="rf-server-wrap" class="target-input" hidden>
+          <label class="visually-hidden" for="rf-server">Coordinator server</label>
+          <select id="rf-server"><option value="">Loading servers…</option></select>
+        </div>
+        <div id="rf-container-wrap" class="target-input" hidden>
+          <label class="visually-hidden" for="rf-container">Docker container and port</label>
+          <select id="rf-container"><option value="">Loading containers…</option></select>
+        </div>
+        <p class="target-protocol-note">The Console terminates public HTTPS, then forwards plain HTTP to this target. Choose the app's HTTP listener, not its HTTPS/TLS listener.</p>
+      </fieldset>
+
+      <div class="field">
+        <label for="rf-title">Title <span class="opt">(optional)</span></label>
+        <input id="rf-title" type="text" maxlength="80" placeholder="e.g. Client preview">
+      </div>
+
+      <div class="field access-field">
+        <span class="field-label" id="rf-access-label">Access</span>
+        <button type="button" id="rf-access" class="switch" role="switch" aria-checked="true"
+                aria-labelledby="rf-access-label rf-access-text">
+          <span class="knob" aria-hidden="true"></span>
+          <span class="sw-label" id="rf-access-text">Google sign-in required</span>
+        </button>
+      </div>
+    </div>
+    <p id="rf-error" class="form-error" role="alert" hidden></p>
+    <div class="dialog-actions">
+      <button id="route-cancel" class="btn" type="button">Cancel</button>
+      <button type="submit" id="rf-submit" class="btn primary">Create route</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="test-detail-dialog" aria-labelledby="test-detail-h">
+  <div class="test-detail-shell">
+    <div class="test-detail-head">
+      <div>
+        <p class="test-detail-kicker">Repository testing</p>
+        <h2 id="test-detail-h">Repository</h2>
+        <p id="test-detail-status" class="meta-passive">Loading statistics…</p>
+      </div>
+      <div class="test-detail-head-actions">
+        <label for="tests-days" class="visually-hidden">Repository statistics period</label>
+        <select id="tests-days" aria-label="Repository statistics period">
+          <option value="7">7 days</option>
+          <option value="30" selected>30 days</option>
+          <option value="90">90 days</option>
+          <option value="365">1 year</option>
+        </select>
+        <button id="test-detail-close" class="iconbtn" type="button" aria-label="Close repository test details" title="Close"></button>
+      </div>
+    </div>
+    <div class="test-detail-tabs" role="tablist" aria-label="Repository test information">
+      <button id="test-detail-tab-overview" type="button" role="tab" aria-controls="test-detail-body" aria-selected="true" data-test-detail-tab="overview">Overview</button>
+      <button id="test-detail-tab-runs" type="button" role="tab" aria-controls="test-detail-body" aria-selected="false" tabindex="-1" data-test-detail-tab="runs">Runs</button>
+      <button id="test-detail-tab-setup" type="button" role="tab" aria-controls="test-detail-body" aria-selected="false" tabindex="-1" data-test-detail-tab="setup">Setup</button>
+    </div>
+    <div id="test-detail-body" class="test-detail-body" role="tabpanel" aria-labelledby="test-detail-tab-overview" aria-live="polite"></div>
+    <div class="test-detail-actions">
+      <button id="test-detail-runs" class="btn" type="button">View runs</button>
+      <button id="test-detail-run" class="btn primary" type="button">Run tests</button>
+    </div>
+  </div>
+</dialog>
+
+<dialog id="test-run-dialog" aria-labelledby="test-run-h">
+  <form id="test-run-form" autocomplete="off" novalidate>
+    <div class="dialog-head">
+      <div>
+        <h2 id="test-run-h">Run tests</h2>
+        <p>The Coordinator selects the necessary targets and isolation policy before anything starts.</p>
+      </div>
+      <button id="test-run-close" class="iconbtn" type="button" aria-label="Close test run dialog" title="Close"></button>
+    </div>
+    <div class="test-run-fields">
+      <div class="field">
+        <label for="test-run-project">Repository</label>
+        <select id="test-run-project" required></select>
+      </div>
+      <div class="field">
+        <label for="test-run-source">Source</label>
+        <select id="test-run-source" required disabled>
+          <option value="">Reading authorized sources…</option>
+        </select>
+        <p id="test-run-source-help" class="field-help">Only server-authorized repository sources are available.</p>
+      </div>
+      <div class="field">
+        <label for="test-run-intent">Intent</label>
+        <select id="test-run-intent">
+          <option value="manual" selected>Manual check</option>
+          <option value="change">Current changes</option>
+          <option value="checkpoint">Checkpoint</option>
+          <option value="handoff">Handoff evidence</option>
+          <option value="release">Release evidence</option>
+        </select>
+      </div>
+      <fieldset id="test-run-target-field" class="test-run-target-field">
+        <legend>Targets</legend>
+        <p id="test-run-target-help">Manual runs start with every declared target selected. Clear anything you do not need.</p>
+        <div id="test-run-targets" class="test-run-targets" aria-describedby="test-run-target-help"></div>
+      </fieldset>
+    </div>
+    <div id="test-run-preview" class="test-run-preview">
+      <p class="meta-passive">Preview the plan to see selected targets, reasons, dependency waves and resource policy.</p>
+    </div>
+    <p id="test-run-error" class="form-error" role="alert" hidden></p>
+    <div class="dialog-actions">
+      <button id="test-run-cancel" class="btn" type="button">Cancel</button>
+      <button id="test-run-preview-button" class="btn" type="button">Preview plan</button>
+      <button id="test-run-submit" class="btn primary" type="submit" disabled>Submit run</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="lease-dialog" aria-labelledby="lease-dialog-h">
+  <form id="lease-form" autocomplete="off" novalidate>
+    <div class="dialog-head">
+      <div>
+        <h2 id="lease-dialog-h">Lease a port</h2>
+        <p>Reserve one exact port or let the coordinator choose the next free development port.</p>
+      </div>
+      <button id="lease-dialog-close" class="iconbtn" type="button" aria-label="Close port lease dialog" title="Close"></button>
+    </div>
+    <div class="rf-grid">
+      <div class="field">
+        <label for="lf-purpose">Purpose <span class="opt">(optional)</span></label>
+        <input id="lf-purpose" type="text" maxlength="120" placeholder="e.g. webpack dev server">
+      </div>
+      <div class="field">
+        <label for="lf-preferred">Preferred port <span class="opt">(optional)</span></label>
+        <input id="lf-preferred" type="number" inputmode="numeric" min="1" max="65535"
+               placeholder="blank = next free in 3000-3999">
+      </div>
+      <div class="field">
+        <label for="lf-ttl">Expires after</label>
+        <select id="lf-ttl">
+          <option value="3600">1 hour</option>
+          <option value="28800" selected>8 hours</option>
+          <option value="86400">24 hours</option>
+          <option value="0">Never</option>
+        </select>
+      </div>
+      <div class="field">
+        <label for="lf-project">Project path <span class="opt">(optional)</span></label>
+        <input id="lf-project" type="text" spellcheck="false" placeholder="defaults to this console's repo">
+      </div>
+    </div>
+    <p id="lf-error" class="form-error" role="alert" hidden></p>
+    <div class="dialog-actions">
+      <button id="lease-cancel" class="btn" type="button">Cancel</button>
+      <button type="submit" id="lf-submit" class="btn primary">Lease port</button>
+    </div>
+  </form>
+</dialog>
 
 <dialog id="access-dialog" aria-labelledby="access-dialog-h">
   <form id="access-form" method="dialog" autocomplete="off" novalidate>
@@ -394,6 +570,7 @@
 </dialog>
 
 <div id="popover" role="dialog" aria-modal="false" aria-label="Details" tabindex="-1" hidden></div>
+<div id="resource-kind-tooltip" class="resource-kind-tooltip" role="tooltip" hidden></div>
 <div id="live" class="visually-hidden" aria-live="polite"></div>
 
 <noscript>

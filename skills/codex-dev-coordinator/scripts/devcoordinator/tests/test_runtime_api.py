@@ -42,7 +42,6 @@ from devcoordinator.runtime_sessions import (
     next_runtime_cleanup_at,
     reap_expired_runtime_sessions,
 )
-from devcoordinator.schema import SCHEMA_VERSION
 from devcoordinator.schema import invariant_violations
 from devcoordinator.sqlite_lifecycle import SQLiteLifecyclePersistence
 from devcoordinator.store import (
@@ -85,7 +84,7 @@ class RuntimeApiTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
-    def test_legacy_empty_server_environment_list_normalizes_without_profile_failure(
+    def test_legacy_server_environment_lists_normalize_without_profile_failure(
         self,
     ) -> None:
         normalized = dev_coordinator.normalize_server_definition(
@@ -93,9 +92,18 @@ class RuntimeApiTests(unittest.TestCase):
             str(self.repository),
         )
         self.assertEqual(normalized["env"], {})
-        with self.assertRaisesRegex(ValueError, "key/value map"):
+        normalized = dev_coordinator.normalize_server_definition(
+            {
+                "name": "legacy-server",
+                "cmd": ["true"],
+                "env": ["A=B", "C=D=E"],
+            },
+            str(self.repository),
+        )
+        self.assertEqual(normalized["env"], {"A": "B", "C": "D=E"})
+        with self.assertRaisesRegex(ValueError, "KEY=VALUE strings"):
             dev_coordinator.normalize_server_definition(
-                {"name": "invalid-server", "cmd": ["true"], "env": ["A=B"]},
+                {"name": "invalid-server", "cmd": ["true"], "env": ["A"]},
                 str(self.repository),
             )
 
@@ -926,6 +934,9 @@ class RuntimeApiTests(unittest.TestCase):
         }
         with (
             mock.patch.object(
+                dev_coordinator, "authority_mode", return_value="account"
+            ),
+            mock.patch.object(
                 dev_coordinator, "coordinated_list_archives", return_value={"archives": []}
             ),
             mock.patch.object(
@@ -960,6 +971,9 @@ class RuntimeApiTests(unittest.TestCase):
             )
         )
         with (
+            mock.patch.object(
+                dev_coordinator, "authority_mode", return_value="account"
+            ),
             mock.patch.object(
                 dev_coordinator,
                 "coordinated_lifecycle_apply",
@@ -1095,6 +1109,9 @@ class RuntimeApiTests(unittest.TestCase):
         )
         with (
             mock.patch.object(
+                dev_coordinator, "authority_mode", return_value="account"
+            ),
+            mock.patch.object(
                 dev_coordinator,
                 "coordinated_lifecycle_apply",
                 return_value={"ok": True, "action": "purge", "status": "succeeded"},
@@ -1122,10 +1139,19 @@ class RuntimeApiTests(unittest.TestCase):
             canonical_root=str(self.repository),
             repo_id="repo-id",
             generation=3,
+            owner_uid=1000,
             server_ids={"worker": "old-worker-id"},
             container_ids={},
             compose_definition_id=None,
+            compose_container_ids=frozenset(),
+            compose_run_once_services={},
+            ephemeral_templates={},
+            ephemeral_image_prefetch_template_ids=frozenset(),
+            ephemeral_secret_policies={},
             account_id="account-id",
+            enabled=True,
+            issued_at="2026-01-01T00:00:00Z",
+            valid_until_epoch=int(time.time()) + 3600,
         )
         profile = dev_coordinator.BrokerClientProfile(
             service=dev_coordinator.BrokerServiceProfile(
@@ -1338,7 +1364,7 @@ class RuntimeApiTests(unittest.TestCase):
         self.assertIsNotNone(scope["root_device"])
         self.assertIsNotNone(scope["root_inode"])
 
-    def test_v4_backfill_is_deterministic_and_lossless(self) -> None:
+    def test_v4_store_requires_explicit_offline_migration_without_startup_writes(self) -> None:
         with AccountStore.open_default(self.home, effective_uid=os.geteuid()) as store:
             _host_id, repo_id = self._insert_repository(store)
         database = self.home / "coordinator.sqlite3"
@@ -1352,21 +1378,27 @@ class RuntimeApiTests(unittest.TestCase):
         connection.commit()
         connection.close()
 
-        with AccountStore.open_default(self.home, effective_uid=os.geteuid()) as store:
-            with store.read_transaction() as connection:
-                metadata = connection.execute(
+        before = database.read_bytes()
+        with self.assertRaisesRegex(
+            RuntimeError, "unsupported coordinator database schema 4"
+        ):
+            with AccountStore.open_default(self.home, effective_uid=os.geteuid()):
+                pass
+        self.assertEqual(database.read_bytes(), before)
+        connection = sqlite3.connect(database)
+        try:
+            self.assertEqual(
+                connection.execute(
                     "SELECT schema_version FROM schema_metadata WHERE singleton = 1"
-                ).fetchone()
-                family = connection.execute(
-                    """
-                    SELECT f.family_id, f.root_repo_id, s.project_kind
-                    FROM repository_families f JOIN repository_scopes s USING(family_id)
-                    WHERE s.repo_id = ?
-                    """,
-                    (repo_id,),
-                ).fetchone()
-        self.assertEqual(int(metadata[0]), SCHEMA_VERSION)
-        self.assertEqual(dict(family), {"family_id": repo_id, "root_repo_id": repo_id, "project_kind": "primary"})
+                ).fetchone()[0],
+                4,
+            )
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM repository_families").fetchone()[0],
+                0,
+            )
+        finally:
+            connection.close()
 
     def test_tree_shape_and_successful_reap_remove_only_active_projection(self) -> None:
         with AccountStore.open_default(self.home, effective_uid=os.geteuid()) as store:
@@ -1636,16 +1668,19 @@ class RuntimeApiTests(unittest.TestCase):
                 repository=linked.resolve(),
             )
             self.assertEqual(recreated_id, server_id)
+            replacement_timestamp = utc_timestamp()
+            replacement_request = copy.deepcopy(request)
+            replacement_request["ttl_seconds"] = 3600
             replacement_session = create_runtime_session(
                 store,
                 family_id=root_repo_id,
                 root_repo_id=root_repo_id,
                 repo_id=temporary_repo_id,
-                request=request,
-                timestamp="2026-01-01T00:00:03Z",
+                request=replacement_request,
+                timestamp=replacement_timestamp,
             )
             mark_runtime_session_started(
-                store, replacement_session, timestamp="2026-01-01T00:00:03Z"
+                store, replacement_session, timestamp=replacement_timestamp
             )
             link_runtime_resource(
                 store,
@@ -1654,7 +1689,7 @@ class RuntimeApiTests(unittest.TestCase):
                 resource_id=server_id,
                 cleanup_disposition="removed",
                 identity={"generation": 0},
-                timestamp="2026-01-01T00:00:03Z",
+                timestamp=replacement_timestamp,
             )
             finish_runtime_session(
                 store,
@@ -1662,7 +1697,7 @@ class RuntimeApiTests(unittest.TestCase):
                 succeeded=True,
                 result={"ok": True},
                 keep_running_until_ttl=True,
-                timestamp="2026-01-01T00:00:03Z",
+                timestamp=replacement_timestamp,
             )
             reinstalled = store.inventory_v2()
         temporary_scope = next(
@@ -4764,9 +4799,11 @@ class RuntimeApiTests(unittest.TestCase):
             mismatch["reason_code"], "runtime_resource_identity_changed"
         )
 
-    def test_runtime_and_artifact_routes_share_the_bearer_boundary(self) -> None:
+    def test_runtime_and_artifact_routes_share_the_trusted_loopback_boundary(
+        self,
+    ) -> None:
         server = dev_coordinator.BoundedThreadingHTTPServer(
-            ("127.0.0.1", 0), dev_coordinator.ApiHandler, token="runtime-token"
+            ("127.0.0.1", 0), dev_coordinator.ApiHandler
         )
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
@@ -4776,18 +4813,18 @@ class RuntimeApiTests(unittest.TestCase):
             method: str,
             path: str,
             *,
-            token: str | None,
             payload: dict[str, object] | None = None,
+            headers: dict[str, str] | None = None,
         ) -> tuple[int, object]:
             connection = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
             body = None if payload is None else json.dumps(payload)
-            headers: dict[str, str] = {}
-            if token is not None:
-                headers["Authorization"] = f"Bearer {token}"
+            request_headers = dict(headers or {})
             if body is not None:
-                headers["Content-Type"] = "application/json"
+                request_headers["Content-Type"] = "application/json"
             try:
-                connection.request(method, path, body=body, headers=headers)
+                connection.request(
+                    method, path, body=body, headers=request_headers
+                )
                 response = connection.getresponse()
                 raw = response.read()
                 if (response.getheader("Content-Type") or "").startswith(
@@ -4819,12 +4856,8 @@ class RuntimeApiTests(unittest.TestCase):
                     return_value={"path": "/private/fixture.log", "text": "fixture"},
                 ),
             ):
-                status, _body = request(
-                    "POST", "/v1/runtime", token=None, payload={}
-                )
-                self.assertEqual(status, 401)
                 status, body = request(
-                    "POST", "/v1/runtime", token="runtime-token", payload={}
+                    "POST", "/v1/runtime", payload={}
                 )
                 self.assertEqual(status, 409)
                 self.assertIsInstance(body, dict)
@@ -4835,36 +4868,55 @@ class RuntimeApiTests(unittest.TestCase):
                 status, body = request(
                     "GET",
                     "/v1/runtime/artifacts/service/fixture-id",
-                    token="runtime-token",
                 )
                 self.assertEqual(status, 200)
                 self.assertEqual(body, "fixture")
                 status, body = request(
                     "GET",
                     "/v1/runtime/artifacts/docker/11111111-1111-4111-8111-111111111111",
-                    token="runtime-token",
+                )
+                self.assertEqual(status, 200)
+                self.assertEqual(body, "fixture")
+                status, body = request(
+                    "GET",
+                    "/v1/runtime/artifacts/diagnostic/fixture-id",
                 )
                 self.assertEqual(status, 200)
                 self.assertEqual(body, "fixture")
                 status, _body = request(
-                    "GET",
-                    "/v1/runtime/artifacts/diagnostic/fixture-id",
-                    token=None,
-                )
-                self.assertEqual(status, 401)
-                status, _body = request(
                     "POST",
                     "/v1/runtime/artifacts/diagnostic/fixture-id",
-                    token="runtime-token",
                     payload={},
                 )
                 self.assertEqual(status, 405)
                 status, _body = request(
                     "GET",
                     "/v1/runtime/artifacts/diagnostic",
-                    token="runtime-token",
                 )
                 self.assertEqual(status, 400)
+                status, body = request(
+                    "GET",
+                    "/v1/runtime/artifacts/service/fixture-id",
+                    headers={"Host": "public.example.test"},
+                )
+                self.assertEqual(status, 400)
+                self.assertEqual(body, {"error": "invalid Host header"})
+                status, body = request(
+                    "GET",
+                    "/v1/runtime/artifacts/service/fixture-id",
+                    headers={"Origin": "https://public.example.test"},
+                )
+                self.assertEqual(status, 403)
+                self.assertEqual(
+                    body, {"error": "cross-origin requests are forbidden"}
+                )
+                status, body = request(
+                    "GET",
+                    "/v1/runtime/artifacts/service/fixture-id",
+                    headers={"Origin": f"http://localhost:{port}"},
+                )
+                self.assertEqual(status, 200)
+                self.assertEqual(body, "fixture")
             with mock.patch.object(
                 dev_coordinator,
                 "coordinated_runtime_artifact",
@@ -4873,7 +4925,6 @@ class RuntimeApiTests(unittest.TestCase):
                 status, _body = request(
                     "GET",
                     "/v1/runtime/artifacts/diagnostic/00000000-0000-0000-0000-000000000000",
-                    token="runtime-token",
                 )
                 self.assertEqual(status, 404)
         finally:
@@ -4883,7 +4934,7 @@ class RuntimeApiTests(unittest.TestCase):
 
     def test_http_api_preserves_generic_typed_maintenance_contract(self) -> None:
         server = dev_coordinator.BoundedThreadingHTTPServer(
-            ("127.0.0.1", 0), dev_coordinator.ApiHandler, token="runtime-token"
+            ("127.0.0.1", 0), dev_coordinator.ApiHandler
         )
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
@@ -4900,11 +4951,7 @@ class RuntimeApiTests(unittest.TestCase):
                     retry_after_seconds=37,
                 ),
             ):
-                connection.request(
-                    "GET",
-                    "/v1/inventory",
-                    headers={"Authorization": "Bearer runtime-token"},
-                )
+                connection.request("GET", "/v1/inventory")
                 response = connection.getresponse()
                 body = json.loads(response.read().decode("utf-8"))
             self.assertEqual(response.status, 503)
@@ -4924,7 +4971,7 @@ class RuntimeApiTests(unittest.TestCase):
 
     def test_project_work_cannot_exhaust_reserved_control_plane_readiness(self) -> None:
         server = dev_coordinator.BoundedThreadingHTTPServer(
-            ("127.0.0.1", 0), dev_coordinator.ApiHandler, token="runtime-token"
+            ("127.0.0.1", 0), dev_coordinator.ApiHandler
         )
         acquired = 0
         while server._work_slots.acquire(blocking=False):
@@ -4941,11 +4988,7 @@ class RuntimeApiTests(unittest.TestCase):
         def get(path: str) -> tuple[int, dict[str, object], str | None]:
             connection = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
             try:
-                connection.request(
-                    "GET",
-                    path,
-                    headers={"Authorization": "Bearer runtime-token"},
-                )
+                connection.request("GET", path)
                 response = connection.getresponse()
                 return (
                     response.status,

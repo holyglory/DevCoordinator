@@ -1465,10 +1465,22 @@ def build_runtime_report(
         and str(terminal_state.get("resource_kind") or "") == "service"
         and str(terminal_state.get("resource_id") or "") == target_id
     )
+    proved_retained_temporary_status = bool(
+        request.get("action") == "status"
+        and target_kind == "service"
+        and not target_matches
+        and action_result.get("ok") is True
+        and action_result.get("authority") == "broker_temporary_service"
+        and str(action_result.get("resource_id") or "") == target_id
+        and isinstance(action_result.get("session_id"), str)
+        and bool(action_result.get("session_id"))
+        and action_result.get("state") in {"expired", "cleanup_pending"}
+    )
     target_is_exact = bool(
         not target_id
         or proved_absent_stop
         or proved_worker_removal
+        or proved_retained_temporary_status
         or (
             len(target_matches) == 1
             and str(target_matches[0].get("repo_id") or "")

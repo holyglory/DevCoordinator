@@ -20,10 +20,12 @@ Their failure domains are intentionally asymmetric:
 - The Coordinator HTTP API preserves `code`, `classification`, operation ID,
   and retry interval. Console clients must pass the typed error object intact;
   flattening it to a message is a contract violation.
-- The loopback API reserves four request slots for authenticated readiness and
-  liveness remains outside the project-work admission gate. Saturated project
-  work receives a bounded `control_plane_capacity` response instead of
-  consuming the final control-plane threads.
+- The trusted-loopback API reserves four request slots for readiness; liveness
+  remains outside the project-work admission gate. It does not add an internal
+  bearer credential. Saturated project work receives a bounded
+  `control_plane_capacity` response instead of consuming the final
+  control-plane threads. Public Google OIDC and edge authorization are a
+  separate external boundary and remain required.
 - A project failure cannot become a global Console banner. With retained
   inventory, planned control-plane maintenance is silent; an attempted live
   mutation gets a bounded informational wait response and reconnects without

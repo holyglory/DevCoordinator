@@ -19,7 +19,7 @@ from devcoordinator.runtime_artifacts import (
 class RuntimeArtifactTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory(
-            prefix="devcoordinator-runtime-artifacts-", dir=Path.home()
+            prefix="devcoordinator-runtime-artifacts-"
         )
         self.root = Path(self.temporary.name).resolve() / "logs"
         self.root.mkdir(mode=0o700)
@@ -129,6 +129,25 @@ class RuntimeArtifactTests(unittest.TestCase):
         document = json.loads(manifest_path.read_text(encoding="utf-8"))
         self.assertFalse(Path(document["filename"]).is_absolute())
         self.assertNotIn(str(self.root), json.dumps(document, sort_keys=True))
+
+    def test_local_metadata_is_not_authorization_but_symlink_root_is_rejected(self) -> None:
+        result = self.persist(b"metadata independent\n")
+        self.root.chmod(0o777)
+        Path(result["path"]).chmod(0o666)
+        manifest, path = load_runtime_log_artifact(
+            root=self.root,
+            artifact_kind="docker",
+            artifact_id=result["artifact_id"],
+        )
+        self.assertEqual(path.read_bytes(), b"metadata independent\n")
+        alias = self.root.parent / "logs-link"
+        alias.symlink_to(self.root, target_is_directory=True)
+        with self.assertRaises(OSError):
+            load_runtime_log_artifact(
+                root=alias,
+                artifact_kind="docker",
+                artifact_id=result["artifact_id"],
+            )
 
 
 if __name__ == "__main__":

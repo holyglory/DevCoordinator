@@ -39,6 +39,7 @@ from devcoordinator.compose_contract import (
 )
 from devcoordinator.observer import SingleFlightObserver
 from devcoordinator.store import AccountStore, CoordinatorStore, utc_timestamp
+from devcoordinator.worker_native import project_repository_slice
 
 
 ACCOUNT = "account-alpha"
@@ -146,8 +147,8 @@ class ExtendedBrokerFixture:
             "CAPTURE_PROFILE=enabled\nCOMPOSE_REMOVE_ORPHANS=1\n",
             encoding="utf-8",
         )
-        self.env_one.chmod(0o600)
-        self.env_two.chmod(0o600)
+        self.env_one.chmod(0o660)
+        self.env_two.chmod(0o644)
         self.persistence = BrokerPersistence(
             self.root / "store" / "coordinator.sqlite3",
             expected_uid=os.geteuid(),
@@ -831,6 +832,9 @@ class BrokerAssignmentTests(unittest.TestCase):
         profile = self.fixture.root / "preflight-profile.json"
         database.write_bytes(b"prior-authority")
         profile.write_bytes(b"prior-profile")
+        environment = self.fixture.alpha_root / "preflight.env"
+        environment.write_text("SHARED=value\n", encoding="utf-8")
+        environment.chmod(0o660)
 
         def fail_renderer(**_arguments: object) -> bytes:
             raise RuntimeError("fixture renderer rejected the model")
@@ -849,6 +853,9 @@ class BrokerAssignmentTests(unittest.TestCase):
                 socket_path=self.fixture.root / "broker.sock",
                 socket_gid=0,
                 client_uid=os.geteuid(),
+                # The root preflight mock patches the shared ``os`` module;
+                # keep repository execution authority explicitly non-root.
+                repository_owner_uid=1,
                 account_id="account-preflight",
                 canonical_root=str(self.fixture.alpha_root),
                 servers=(),
@@ -858,6 +865,7 @@ class BrokerAssignmentTests(unittest.TestCase):
                 compose={
                     "declared": True,
                     "files": [str(self.fixture.compose_one)],
+                    "env_files": [str(environment)],
                     "services": ["web"],
                     "project_name": "preflight-stack",
                 },
@@ -1010,6 +1018,111 @@ class BrokerComposeTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.fixture.close()
 
+    def _add_observed_compose_container(
+        self,
+        *,
+        snapshot_id: str,
+        service_name: str,
+        lifecycle: str = "running",
+    ) -> str:
+        token = uuid.uuid4().hex
+        resource_id = "container-extra-" + token
+        full_id = hashlib.sha256(resource_id.encode("ascii")).hexdigest()
+        now = utc_timestamp()
+        with CoordinatorStore.open(
+            self.fixture.persistence.database_path,
+            expected_uid=os.geteuid(),
+        ) as store:
+            with store.immediate_transaction() as connection:
+                existing = connection.execute(
+                    """
+                    SELECT resource.engine_id
+                    FROM broker_observed_compose_containers observed
+                    JOIN docker_resources resource USING(docker_resource_id)
+                    WHERE observed.snapshot_id = ?
+                    ORDER BY observed.docker_resource_id
+                    LIMIT 1
+                    """,
+                    (snapshot_id,),
+                ).fetchone()
+                if existing is None:
+                    self.fail("fixture snapshot has no Compose container")
+                connection.execute(
+                    """
+                    INSERT INTO docker_resources(
+                        docker_resource_id, engine_id, full_container_id,
+                        current_name, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        resource_id,
+                        existing["engine_id"],
+                        full_id,
+                        f"alpha-stack-{service_name}-1",
+                        now,
+                        now,
+                    ),
+                )
+                binding_id = "binding-extra-" + token
+                connection.execute(
+                    """
+                    INSERT INTO control_bindings(
+                        binding_id, repo_id, resource_kind, resource_id,
+                        source_id, capability, provenance, authority_state,
+                        priority, generation, created_at, updated_at
+                    ) VALUES (?, ?, 'container', ?, ?, 'lifecycle',
+                              'fixture', 'authoritative', 100, 0, ?, ?)
+                    """,
+                    (binding_id, REPO_ALPHA, resource_id, SOURCE, now, now),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO repository_memberships(
+                        membership_id, repo_id, resource_kind,
+                        host_resource_id, immutable_fingerprint,
+                        control_binding_id, created_at
+                    ) VALUES (?, ?, 'container', ?, ?, ?, ?)
+                    """,
+                    (
+                        "membership-extra-" + token,
+                        REPO_ALPHA,
+                        resource_id,
+                        "immutable-extra-" + token,
+                        binding_id,
+                        now,
+                    ),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO observation_snapshot_resources(
+                        snapshot_id, resource_kind, resource_id,
+                        observation_fingerprint
+                    ) VALUES (?, 'container', ?, ?)
+                    """,
+                    (snapshot_id, resource_id, "observation-extra-" + token),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO broker_observed_compose_containers(
+                        snapshot_id, docker_resource_id, full_container_id,
+                        project_name, service_name, lifecycle,
+                        ownership_state, authoritative_owner_repo_id,
+                        observation_fingerprint
+                    ) VALUES (?, ?, ?, 'alpha-stack', ?, ?,
+                              'exclusive', ?, ?)
+                    """,
+                    (
+                        snapshot_id,
+                        resource_id,
+                        full_id,
+                        service_name,
+                        lifecycle,
+                        REPO_ALPHA,
+                        "compose-extra-" + token,
+                    ),
+                )
+        return resource_id
+
     def test_enrollment_container_grants_require_exact_snapshot_and_current_membership(
         self,
     ) -> None:
@@ -1073,6 +1186,96 @@ class BrokerComposeTests(unittest.TestCase):
                     (os.geteuid(), REPO_ALPHA),
                 ).fetchone()[0]
         self.assertEqual(enabled, 0)
+
+    def test_enrollment_compose_scope_accepts_exact_declared_services(self) -> None:
+        snapshot_id = self.fixture.observed_compose_snapshot(
+            owner_repo_id=REPO_ALPHA,
+            project_name="alpha-stack",
+        )
+
+        scope = self.fixture.persistence.compose_enrollment_container_scope(
+            repo_id=REPO_ALPHA,
+            snapshot_id=snapshot_id,
+            project_name="alpha-stack",
+            service_names=("web",),
+        )
+
+        self.assertEqual(len(scope.lifecycle_container_ids), 1)
+        self.assertEqual(scope.non_lifecycle_container_ids, ())
+
+    def test_enrollment_compose_scope_rejects_active_undeclared_service(self) -> None:
+        snapshot_id = self.fixture.observed_compose_snapshot(
+            owner_repo_id=REPO_ALPHA,
+            project_name="alpha-stack",
+        )
+        self._add_observed_compose_container(
+            snapshot_id=snapshot_id,
+            service_name="undeclared-worker",
+        )
+
+        with self.assertRaises(BrokerError) as caught:
+            self.fixture.persistence.compose_enrollment_container_scope(
+                repo_id=REPO_ALPHA,
+                snapshot_id=snapshot_id,
+                project_name="alpha-stack",
+                service_names=("web",),
+            )
+
+        self.assertEqual(caught.exception.code, "compose_scope_incomplete")
+        self.assertIn("undeclared-worker", caught.exception.message)
+
+    def test_enrollment_run_once_container_is_never_a_standalone_grant(self) -> None:
+        snapshot_id = self.fixture.observed_compose_snapshot(
+            owner_repo_id=REPO_ALPHA,
+            project_name="alpha-stack",
+        )
+        run_once_id = self._add_observed_compose_container(
+            snapshot_id=snapshot_id,
+            service_name="migrate",
+        )
+
+        scope = self.fixture.persistence.compose_enrollment_container_scope(
+            repo_id=REPO_ALPHA,
+            snapshot_id=snapshot_id,
+            project_name="alpha-stack",
+            service_names=("web",),
+            run_once_service_names=("migrate",),
+        )
+        aliases, identities, runtime_grants, resource_grants = (
+            broker_enrollment._collect_observed_containers(
+                self.fixture.persistence,
+                repo_id=REPO_ALPHA,
+                client_uid=os.geteuid(),
+                snapshot_id=snapshot_id,
+                excluded_container_ids=scope.non_lifecycle_container_ids,
+            )
+        )
+
+        self.assertEqual(scope.non_lifecycle_container_ids, (run_once_id,))
+        self.assertNotIn(run_once_id, set(aliases.values()))
+        self.assertNotIn(run_once_id, {item[1] for item in identities})
+        self.assertNotIn(run_once_id, {item[1] for item in runtime_grants})
+        self.assertNotIn(run_once_id, {item[1] for item in resource_grants})
+
+    def test_inactive_undeclared_compose_container_is_not_downgraded(self) -> None:
+        snapshot_id = self.fixture.observed_compose_snapshot(
+            owner_repo_id=REPO_ALPHA,
+            project_name="alpha-stack",
+        )
+        stopped_id = self._add_observed_compose_container(
+            snapshot_id=snapshot_id,
+            service_name="retired-worker",
+            lifecycle="stopped",
+        )
+
+        scope = self.fixture.persistence.compose_enrollment_container_scope(
+            repo_id=REPO_ALPHA,
+            snapshot_id=snapshot_id,
+            project_name="alpha-stack",
+            service_names=("web",),
+        )
+
+        self.assertEqual(scope.non_lifecycle_container_ids, (stopped_id,))
 
     def test_reenrollment_reuses_identity_when_compose_file_set_changes(self) -> None:
         override = self.fixture.alpha_root / "compose.reenrolled.yml"
@@ -1570,12 +1773,26 @@ volumes:
   configs: {}
 """
         )
+        require_sealable_compose_payload(
+            b"""services:
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        BUILD_MODE: local
+"""
+        )
         for label, payload in (
             ("top-level configs", b"services: {}\nconfigs: {}\n"),
             ("top-level secrets", b"services: {}\nsecrets: {}\n"),
             (
-                "service build",
-                b"services:\n  web:\n    build: .\n",
+                "service extends",
+                b"services:\n  web:\n    extends:\n      file: base.yml\n      service: web\n",
+            ),
+            (
+                "service env file",
+                b"services:\n  web:\n    env_file: [runtime.env]\n",
             ),
             (
                 "service secrets",
@@ -1642,6 +1859,10 @@ volumes:
                     "db": {"image": "postgres:17"},
                     "web": {
                         "image": "example.invalid/web:test",
+                        "build": {
+                            "context": ".",
+                            "dockerfile": "Dockerfile",
+                        },
                         "profiles": ["display"],
                         "depends_on": {"db": {"condition": "service_started"}},
                         "volumes": [
@@ -1667,14 +1888,16 @@ volumes:
         self.assertEqual(evidence.host_access_risks, ())
         self.assertEqual(evidence.replica_budget, 2)
 
-        with self.assertRaisesRegex(ValueError, "exactly match"):
-            require_effective_compose_model(
-                valid,
-                declared_services=("web",),
-                declared_profiles=("display",),
-                project_name="alpha-stack",
-                host_access_approved=False,
-            )
+        for mismatched_services in (("web",), ("db", "web", "missing")):
+            with self.subTest(declared_services=mismatched_services):
+                with self.assertRaisesRegex(ValueError, "exactly match"):
+                    require_effective_compose_model(
+                        valid,
+                        declared_services=mismatched_services,
+                        declared_profiles=("display",),
+                        project_name="alpha-stack",
+                        host_access_approved=False,
+                    )
         with self.assertRaisesRegex(ValueError, "profile is absent"):
             require_effective_compose_model(
                 valid,
@@ -2006,7 +2229,10 @@ volumes:
         self.assertIsInstance(environment, dict)
         self.assertEqual(environment["COMPOSE_REMOVE_ORPHANS"], "0")
         self.assertEqual(environment["COMPOSE_PARALLEL_LIMIT"], "4")
-        self.assertEqual(captured["command"][-3:], ("config", "--format", "json"))
+        self.assertEqual(
+            captured["command"][-4:],
+            ("config", "--no-interpolate", "--format", "json"),
+        )
         self.assertTrue(all(not Path(path).exists() for path in captured["paths"]))
 
     def test_effective_renderer_default_path_invokes_the_bounded_runner(self) -> None:
@@ -2171,7 +2397,10 @@ volumes:
             "<sealed-compose-0>",
             "--file",
             "<sealed-compose-1>",
+            "--file",
+            "<sealed-compose-2>",
             "up",
+            "--no-build",
             "--detach",
             "--no-deps",
             "db",
@@ -2181,11 +2410,25 @@ volumes:
         self.assertEqual(calls[0][1], "<pinned-cwd>")
         self.assertGreater(calls[0][2], 0)
         self.assertEqual(
-            compose_payloads[0],
-            (
-                self.fixture.compose_one.read_bytes(),
-                self.fixture.compose_two.read_bytes(),
-            ),
+            compose_payloads[0][:2],
+            (self.fixture.compose_one.read_bytes(), self.fixture.compose_two.read_bytes()),
+        )
+        expected_slice = project_repository_slice(
+            uid=os.geteuid(), repository_id=REPO_ALPHA
+        )
+        self.assertEqual(
+            json.loads(compose_payloads[0][2]),
+            {
+                "services": {
+                    service: {
+                        "cgroup_parent": expected_slice,
+                        "cpus": "8.0",
+                        "mem_limit": "20g",
+                        "pids_limit": 4096,
+                    }
+                    for service in ("db", "web")
+                }
+            },
         )
         self.assertEqual(environments[0]["COMPOSE_DISABLE_ENV_FILE"], "1")
         self.assertEqual(environments[0]["COMPOSE_REMOVE_ORPHANS"], "0")
@@ -2630,7 +2873,7 @@ volumes:
             "snapshot-post-" + current_id,
         )
 
-    def test_invoked_failure_is_reconciled_before_a_new_request_executes(self) -> None:
+    def test_invoked_failure_with_proven_final_state_completes_without_retry(self) -> None:
         calls = 0
 
         def runner(
@@ -2664,8 +2907,12 @@ volumes:
         )
         with self.assertLogs("devcoordinator.broker_host", level="ERROR") as logs:
             first = service.reply_for_document(self.fixture.peer(), request.to_wire())
-        self.assertFalse(first["ok"], first)
-        self.assertEqual(first["error"]["code"], "operation_outcome_uncertain")
+        self.assertTrue(first["ok"], first)
+        self.assertEqual(first["result"]["status"], "completed_by_observation")
+        self.assertTrue(first["result"]["host_invocation_uncertain"])
+        self.assertTrue(
+            first["result"]["compose_observation"]["desired_state_observed"]
+        )
         diagnostic = "\n".join(logs.output)
         self.assertIn("action=down", diagnostic)
         self.assertIn("phase=down", diagnostic)
@@ -2690,25 +2937,23 @@ volumes:
                     """,
                     (request.operation_id,),
                 ).fetchone()
-        self.assertEqual(operation["status"], "needs_attention")
-        self.assertEqual(operation["phase"], "reconciliation_required")
-        self.assertEqual(operation["error_code"], "operation_outcome_uncertain")
+        self.assertEqual(operation["status"], "succeeded")
+        self.assertEqual(operation["phase"], "completed")
+        self.assertIsNone(operation["error_code"])
         outcome = json.loads(str(operation["result_json"]))
         self.assertEqual(outcome["action"], "down")
         self.assertEqual(outcome["failed_phase"], "down")
-        self.assertEqual(outcome["completed_phases"], [])
+        self.assertEqual(outcome["status"], "completed_by_observation")
+        self.assertTrue(outcome["host_invocation_uncertain"])
         self.assertFalse(outcome["cleanup_failed"])
-        self.assertEqual(outcome["reconciliation_observation"]["status"], "completed")
-        self.assertEqual(target["status"], "failed")
-        self.assertEqual(target["phase"], "reconciliation_required")
-        self.assertEqual(
-            json.loads(str(target["error_json"]))["code"],
-            "operation_outcome_uncertain",
-        )
+        self.assertTrue(outcome["compose_observation"]["desired_state_observed"])
+        self.assertEqual(target["status"], "succeeded")
+        self.assertEqual(target["phase"], "completed")
+        self.assertIsNone(target["error_json"])
         restarted, _ = service_for(self.fixture, compose_runner=runner)
         replay = restarted.reply_for_document(self.fixture.peer(), request.to_wire())
-        self.assertFalse(replay["ok"], replay)
-        self.assertEqual(replay["error"]["code"], "operation_outcome_uncertain")
+        self.assertTrue(replay["ok"], replay)
+        self.assertEqual(replay["result"]["status"], "completed_by_observation")
         new_request = self.fixture.request(
             BrokerOperation.COMPOSE_DOWN,
             resource_id=COMPOSE_ALPHA,
@@ -2717,24 +2962,8 @@ volumes:
         blocked = restarted.reply_for_document(
             self.fixture.peer(), new_request.to_wire()
         )
-        self.assertFalse(blocked["ok"], blocked)
-        self.assertEqual(blocked["error"]["code"], "operation_outcome_uncertain")
+        self.assertTrue(blocked["ok"], blocked)
         self.assertEqual(calls, 2)
-        with CoordinatorStore.open(
-            self.fixture.persistence.database_path,
-            expected_uid=os.geteuid(),
-        ) as store:
-            with store.read_transaction() as connection:
-                reconciled = connection.execute(
-                    """
-                    SELECT status, phase, error_code
-                    FROM operations WHERE operation_id = ?
-                    """,
-                    (request.operation_id,),
-                ).fetchone()
-        self.assertEqual(reconciled["status"], "failed")
-        self.assertEqual(reconciled["phase"], "reconciled")
-        self.assertEqual(reconciled["error_code"], "compose_outcome_reconciled")
 
     def test_missing_effective_model_evidence_requires_fingerprint_abandonment(
         self,
@@ -2750,7 +2979,18 @@ volumes:
                 command, 1, stdout="", stderr="compose failed"
             )
 
-        service, _ = service_for(self.fixture, compose_runner=runner)
+        def observe_running_scope(_store: CoordinatorStore) -> Mapping[str, Any]:
+            snapshot_id = self.fixture.observed_compose_snapshot(
+                owner_repo_id=REPO_ALPHA,
+                project_name="alpha-stack",
+            )
+            return self.fixture.snapshot_evidence(snapshot_id)
+
+        service, _ = service_for(
+            self.fixture,
+            compose_runner=runner,
+            observer=observe_running_scope,
+        )
         request = self.fixture.request(
             BrokerOperation.COMPOSE_DOWN,
             resource_id=COMPOSE_ALPHA,
@@ -2989,7 +3229,18 @@ volumes:
                 command, 1, stdout="", stderr="compose failed"
             )
 
-        service, _ = service_for(self.fixture, compose_runner=runner)
+        def observe_running_scope(_store: CoordinatorStore) -> Mapping[str, Any]:
+            snapshot_id = self.fixture.observed_compose_snapshot(
+                owner_repo_id=REPO_ALPHA,
+                project_name="alpha-stack",
+            )
+            return self.fixture.snapshot_evidence(snapshot_id)
+
+        service, _ = service_for(
+            self.fixture,
+            compose_runner=runner,
+            observer=observe_running_scope,
+        )
         request = self.fixture.request(
             BrokerOperation.COMPOSE_DOWN,
             resource_id=COMPOSE_ALPHA,
@@ -3364,7 +3615,7 @@ volumes:
         )
         self.assertEqual(changed["generation"], first["generation"] + 1)
 
-    def test_compose_env_file_validation_rejects_unsafe_paths_and_accepts_private_file(
+    def test_compose_env_file_validation_rejects_unsafe_paths_and_accepts_trusted_local_access(
         self,
     ) -> None:
         outside = self.fixture.beta_root / "outside.env"
@@ -3381,7 +3632,6 @@ volumes:
             ("missing", missing),
             ("symlink", symlink),
             ("outside", outside),
-            ("non-private", public),
         ):
             with (
                 self.subTest(label=label),
@@ -3398,16 +3648,39 @@ volumes:
                     project_name=f"invalid-{label}",
                 )
 
-        accepted = self.fixture.persistence.provision_compose_definition(
-            repo_id=REPO_ALPHA,
-            compose_definition_id="compose-private-env",
-            cwd=self.fixture.alpha_root,
-            files=(self.fixture.compose_one,),
-            env_files=(self.fixture.env_one,),
-            profiles=("capture",),
-            services=("db",),
-            project_name="private-env-stack",
-        )
+        real_fstat = os.fstat
+        public_identity = (public.stat().st_dev, public.stat().st_ino)
+
+        class ForeignOwnerMetadata:
+            def __init__(self, metadata: os.stat_result) -> None:
+                self._metadata = metadata
+
+            @property
+            def st_uid(self) -> int:
+                return self._metadata.st_uid + 10_000
+
+            def __getattr__(self, name: str) -> Any:
+                return getattr(self._metadata, name)
+
+        def foreign_owner_fstat(descriptor: int) -> os.stat_result | ForeignOwnerMetadata:
+            metadata = real_fstat(descriptor)
+            if (metadata.st_dev, metadata.st_ino) == public_identity:
+                return ForeignOwnerMetadata(metadata)
+            return metadata
+
+        with mock.patch.object(
+            broker_persistence.os, "fstat", side_effect=foreign_owner_fstat
+        ):
+            accepted = self.fixture.persistence.provision_compose_definition(
+                repo_id=REPO_ALPHA,
+                compose_definition_id="compose-trusted-local-env",
+                cwd=self.fixture.alpha_root,
+                files=(self.fixture.compose_one,),
+                env_files=(public, self.fixture.env_one),
+                profiles=("capture",),
+                services=("db",),
+                project_name="trusted-local-env-stack",
+            )
         self.assertTrue(accepted["enabled"])
 
     def test_compose_env_file_drift_is_rejected_before_docker(self) -> None:
@@ -3731,13 +4004,23 @@ volumes:
             "<sealed-compose-0>",
             "--file",
             "<sealed-compose-1>",
+            "--file",
+            "<sealed-compose-2>",
         )
         self.assertEqual(
             calls,
             [
                 (*prefix, "stop", "db", "web"),
                 (*prefix, "stop", "db", "web"),
-                (*prefix, "up", "--detach", "--no-deps", "db", "web"),
+                (
+                    *prefix,
+                    "up",
+                    "--no-build",
+                    "--detach",
+                    "--no-deps",
+                    "db",
+                    "web",
+                ),
                 (*prefix, "down"),
             ],
         )
@@ -3749,11 +4032,25 @@ volumes:
                     self.fixture.env_one.read_bytes(),
                     self.fixture.env_two.read_bytes(),
                 )
-                and compose_payloads
+                and compose_payloads[:2]
                 == (
                     self.fixture.compose_one.read_bytes(),
                     self.fixture.compose_two.read_bytes(),
                 )
+                and json.loads(compose_payloads[2])
+                == {
+                    "services": {
+                        service: {
+                            "cgroup_parent": project_repository_slice(
+                                uid=os.geteuid(), repository_id=REPO_ALPHA
+                            ),
+                            "cpus": "8.0",
+                            "mem_limit": "20g",
+                            "pids_limit": 4096,
+                        }
+                        for service in ("db", "web")
+                    }
+                }
                 for env_payloads, compose_payloads in captured_inputs
             )
         )

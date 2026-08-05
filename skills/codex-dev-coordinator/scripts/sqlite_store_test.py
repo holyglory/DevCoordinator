@@ -334,7 +334,9 @@ class StoreTests(unittest.TestCase):
         finally:
             store.close()
 
-    def test_v1_store_upgrades_atomically_without_inventing_restore_state(self) -> None:
+    def test_v1_store_requires_explicit_offline_migration_without_startup_writes(
+        self,
+    ) -> None:
         store = self.open_store()
         database = store.path
         try:
@@ -355,37 +357,42 @@ class StoreTests(unittest.TestCase):
             legacy.commit()
         finally:
             legacy.close()
-        upgraded = AccountStore.open(database)
+        before = database.read_bytes()
+        with self.assertRaisesRegex(
+            RuntimeError, "unsupported coordinator database schema 1"
+        ):
+            AccountStore.open(database)
+        self.assertEqual(database.read_bytes(), before)
+        legacy = sqlite3.connect(str(database))
         try:
-            self.assertEqual(upgraded.metadata.schema_version, SCHEMA_VERSION)
+            self.assertEqual(
+                legacy.execute(
+                    "SELECT schema_version FROM schema_metadata WHERE singleton = 1"
+                ).fetchone()[0],
+                1,
+            )
             self.assertIsNotNone(
-                upgraded.connection.execute(
+                legacy.execute(
                     "SELECT 1 FROM hosts WHERE host_id = 'retained-host'"
                 ).fetchone()
             )
-            self.assertIsNotNone(
-                upgraded.connection.execute(
+            self.assertIsNone(
+                legacy.execute(
                     """
                     SELECT 1 FROM sqlite_master
                     WHERE type = 'table' AND name = 'startup_policy_restore_states'
                     """
                 ).fetchone()
             )
-            self.assertEqual(
-                upgraded.connection.execute(
-                    "SELECT COUNT(*) FROM startup_policy_restore_states"
-                ).fetchone()[0],
-                0,
-            )
         finally:
-            upgraded.close()
+            legacy.close()
 
-    def test_unsafe_parent_file_and_symlink_are_rejected(self) -> None:
-        unsafe = self.root / "unsafe"
-        unsafe.mkdir(mode=0o755)
-        unsafe.chmod(0o755)
-        with self.assertRaises(PermissionError):
-            AccountStore.open_default(unsafe)
+    def test_local_metadata_is_not_authorization_but_symlinks_are_rejected(self) -> None:
+        shared = self.root / "shared"
+        shared.mkdir(mode=0o755)
+        shared.chmod(0o755)
+        with AccountStore.open_default(shared) as store:
+            self.assertEqual(store.metadata.schema_version, SCHEMA_VERSION)
 
         target = private_directory(self.root / "target")
         alias = self.root / "alias"
@@ -396,8 +403,28 @@ class StoreTests(unittest.TestCase):
         database = self.store_home / "coordinator.sqlite3"
         database.write_bytes(b"")
         database.chmod(0o644)
-        with self.assertRaises(PermissionError):
-            AccountStore.open_default(self.store_home)
+        with AccountStore.open_default(self.store_home) as store:
+            self.assertEqual(store.metadata.schema_version, SCHEMA_VERSION)
+
+    def test_disappearing_sqlite_sidecar_is_a_valid_terminal_state(self) -> None:
+        database = self.store_home / "coordinator.sqlite3"
+        database.write_bytes(b"")
+        database.chmod(0o600)
+        disappearing = Path(f"{database}-wal")
+        original_exists = Path.exists
+
+        def observed_then_removed(path: Path) -> bool:
+            if path == disappearing:
+                return True
+            return original_exists(path)
+
+        with mock.patch.object(Path, "exists", observed_then_removed):
+            store_module._validate_private_sqlite_sidecars(database, os.geteuid())
+
+        shared = Path(f"{database}-shm")
+        shared.write_bytes(b"sidecar fixture")
+        shared.chmod(0o644)
+        store_module._validate_private_sqlite_sidecars(database, os.geteuid())
 
     def test_read_transaction_is_query_only_and_does_not_touch_revisions_or_files(self) -> None:
         store = self.open_store()
@@ -1007,7 +1034,7 @@ class StoreTests(unittest.TestCase):
             )
             self.assertEqual(
                 [row["resource_id"] for row in inventory["unassigned_resources"]],
-                ["container-free"],
+                ["container-free", "db-free"],
             )
             v2_server_ids = {
                 row["server_definition_id"] for row in inventory["resources"]["servers"]
@@ -2012,6 +2039,25 @@ class StoreTests(unittest.TestCase):
             self.assertEqual(
                 store.connection.execute("SELECT COUNT(*) FROM server_definitions WHERE name='web'").fetchone()[0],
                 1,
+            )
+            owner_rows = list(
+                store.connection.execute(
+                    """
+                    SELECT owner.owner_uid, owner.repository_generation,
+                           repository.generation
+                    FROM repositories repository
+                    JOIN repository_owners owner USING(repo_id)
+                    ORDER BY repository.repo_id
+                    """
+                )
+            )
+            self.assertEqual(len(owner_rows), report.repository_count)
+            self.assertTrue(
+                all(
+                    int(row[0]) == store.expected_uid
+                    and int(row[1]) == int(row[2])
+                    for row in owner_rows
+                )
             )
             self.assertFalse(store.check_invariants())
         finally:

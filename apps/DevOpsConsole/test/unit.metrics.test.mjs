@@ -179,6 +179,44 @@ describe('metrics store: ingest', () => {
     );
   });
 
+  it('publishes authoritative root and family series under the keys used by project views', () => {
+    const store = makeStore();
+    const t = 1_000_000;
+    store.ingest({
+      servers: [],
+      docker: { available: false, containers: [] },
+      project_usage: [],
+      repository_trees: [{
+        family_id: 'family-1',
+        root_repository: {
+          repo_id: 'repo-1',
+          display_name: 'GlobalFinance',
+          canonical_root: '/repos/global-finance',
+        },
+        usage: { cpu_percent: 24.5, memory_bytes: 600 },
+        scopes: [{
+          kind: 'root',
+          repo_id: 'repo-1',
+          display_name: 'GlobalFinance',
+          canonical_root: '/repos/global-finance',
+          usage: { cpu_percent: 20, memory_bytes: 500 },
+        }, {
+          kind: 'temporary',
+          repo_id: 'repo-tmp',
+          usage: { cpu_percent: 4.5, memory_bytes: 100 },
+        }],
+      }],
+    }, { at: t });
+
+    const view = store.history();
+    const root = view.entities.find((entity) => entity.key === 'repo:repo-1');
+    const family = view.entities.find((entity) => entity.key === 'family:family-1');
+    assert.deepEqual(root?.points, [[t, 20, 500]], 'root project popover resolves its recorded series');
+    assert.deepEqual(family?.points, [[t, 24.5, 600]], 'family usage views resolve their recorded series');
+    assert.equal(root?.project, '/repos/global-finance');
+    assert.equal(family?.name, 'GlobalFinance');
+  });
+
   it('ignores malformed payloads without throwing', () => {
     const store = makeStore();
     store.ingest(null);
@@ -452,6 +490,7 @@ describe('host health', () => {
       totalmemFn: () => 8 * 1024 ** 3,
       freememFn: () => 2 * 1024 ** 3,
       readMeminfo: async () => { throw new Error('not linux'); },
+      cgroupSlices: [],
       statFn: async (mount) => ({ dev: mount === '/home' ? 1 : 1 }), // same device
       statfsFn: async () => ({ bsize: 4096, blocks: 1000, bfree: 400, bavail: 300 }),
       mounts: ['/', '/home'],

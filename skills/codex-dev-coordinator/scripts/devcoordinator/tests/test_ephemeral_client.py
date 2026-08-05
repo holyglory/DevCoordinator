@@ -45,24 +45,26 @@ def _profile_document(root: str, *, ephemeral: bool) -> dict[str, object]:
         "canonical_root": root,
         "repo_id": "repo-alpha",
         "generation": 1,
+        "owner_uid": 1000,
         "servers": {},
         "containers": {},
         "compose_definition_id": None,
+        "compose_container_ids": [],
+        "compose_run_once_services": {},
+        "ephemeral_templates": (
+            {"artifact-db": "template-opaque"} if ephemeral else {}
+        ),
+        "ephemeral_image_prefetch_templates": [],
+        "ephemeral_secret_policies": {},
+        "account_id": "account-alpha",
+        "enabled": True,
+        "issued_at": "2026-07-23T00:00:00Z",
+        "valid_until_epoch": int(time.time()) + 3600,
     }
-    if ephemeral:
-        repository.update(
-            {
-                "account_id": "account-alpha",
-                "enabled": True,
-                "issued_at": "2026-07-23T00:00:00Z",
-                "valid_until_epoch": int(time.time()) + 3600,
-                "ephemeral_templates": {"artifact-db": "template-opaque"},
-            }
-        )
     return {
         "version": 1,
         "service": {
-            "socket": "/run/devcoordinator/broker.sock",
+            "socket": "/run/devcoordinator-authority.sock",
             "uid": 0,
             "gid": 100,
             "mode": "0660",
@@ -86,11 +88,18 @@ def _repository(
         canonical_root=root,
         repo_id=repo_id,
         generation=1,
+        owner_uid=1000,
         server_ids={},
         container_ids={},
         compose_definition_id=None,
+        compose_container_ids=frozenset(),
+        compose_run_once_services={},
         ephemeral_templates={"artifact-db": f"template-{repo_id}"},
+        ephemeral_image_prefetch_template_ids=frozenset(),
+        ephemeral_secret_policies={},
         account_id="account-alpha",
+        enabled=True,
+        issued_at="2026-07-23T00:00:00Z",
         valid_until_epoch=int(time.time()) + 3600,
     )
 
@@ -125,16 +134,38 @@ class _FakeProfile:
 
 
 class EphemeralProfileTests(unittest.TestCase):
-    def test_old_profile_remains_valid_and_new_profile_maps_only_opaque_ids(self) -> None:
-        old = profile_from_document(
-            _profile_document("/srv/old", ephemeral=False), effective_uid=501
+    def test_repository_profile_requires_the_exact_current_contract(self) -> None:
+        repository_fields = set(
+            _profile_document("/srv/current", ephemeral=True)["clients"]["501"][
+                "repositories"
+            ][0]  # type: ignore[index]
         )
-        self.assertEqual(old.repository("/srv/old").ephemeral_templates, {})
+        for missing in sorted(repository_fields):
+            with self.subTest(missing=missing):
+                document = _profile_document("/srv/current", ephemeral=True)
+                repository = document["clients"]["501"]["repositories"][0]  # type: ignore[index]
+                del repository[missing]
+                with self.assertRaises(BrokerProfileError):
+                    profile_from_document(document, effective_uid=501)
 
-        new = profile_from_document(
-            _profile_document("/srv/new", ephemeral=True), effective_uid=501
+        document = _profile_document("/srv/current", ephemeral=True)
+        repository = document["clients"]["501"]["repositories"][0]  # type: ignore[index]
+        repository["legacy_extension"] = True
+        with self.assertRaises(BrokerProfileError):
+            profile_from_document(document, effective_uid=501)
+
+    def test_profile_with_empty_ephemeral_templates_and_with_opaque_ids(self) -> None:
+        without_ephemeral = profile_from_document(
+            _profile_document("/srv/plain", ephemeral=False), effective_uid=501
         )
-        repository = new.repository("/srv/new")
+        self.assertEqual(
+            without_ephemeral.repository("/srv/plain").ephemeral_templates, {}
+        )
+
+        with_ephemeral = profile_from_document(
+            _profile_document("/srv/ephemeral", ephemeral=True), effective_uid=501
+        )
+        repository = with_ephemeral.repository("/srv/ephemeral")
         self.assertEqual(
             repository.ephemeral_template_id("artifact-db"), "template-opaque"
         )
@@ -160,7 +191,7 @@ class EphemeralProfileTests(unittest.TestCase):
                 with self.assertRaises(BrokerProfileError):
                     profile_from_document(document, effective_uid=501)
 
-    def test_expired_profile_is_usable_only_for_retained_owner_cleanup(self) -> None:
+    def test_profile_expiry_is_informational_while_disabled_scope_stays_exact(self) -> None:
         document = _profile_document("/srv/expired", ephemeral=True)
         client = document["clients"]["501"]  # type: ignore[index]
         client["valid_until_epoch"] = int(time.time()) - 1  # type: ignore[index]
@@ -168,15 +199,11 @@ class EphemeralProfileTests(unittest.TestCase):
         repository["enabled"] = False
         repository["valid_until_epoch"] = int(time.time()) - 1
 
-        with self.assertRaisesRegex(BrokerProfileError, "expired"):
-            profile_from_document(document, effective_uid=501)
-        profile = profile_from_document(
-            document,
-            effective_uid=501,
-            allow_expired_for_ephemeral_cleanup=True,
-        )
+        # Profile timestamps are inventory metadata on this single-developer
+        # host. They do not gate local connectivity or exact retained cleanup.
+        profile = profile_from_document(document, effective_uid=501)
         retained = profile.retained_ephemeral_repository("/srv/expired")
-        with self.assertRaisesRegex(BrokerProfileError, "expired"):
+        with self.assertRaisesRegex(BrokerProfileError, "disabled"):
             profile.repository("/srv/expired")
         with self.assertRaisesRegex(BrokerProfileError, "cannot discover"):
             profile.retained_ephemeral_repository("/srv/not-enrolled")
@@ -196,7 +223,7 @@ class EphemeralProfileTests(unittest.TestCase):
         self.assertEqual(result, {"status": "running"})
         self.assertEqual(call.call_args.kwargs["repo_id"], "repo-alpha")
         self.assertEqual(call.call_args.kwargs["resource_id"], "run-exact")
-        with self.assertRaisesRegex(BrokerProfileError, "expired"):
+        with self.assertRaisesRegex(BrokerProfileError, "disabled"):
             profile.call(
                 repository=retained,
                 resource_id="template-opaque",
@@ -400,8 +427,9 @@ class EphemeralManifestTests(unittest.TestCase):
             all_servers=True,
             server=[],
             database="/var/lib/devcoordinator/coordinator.sqlite3",
-            socket="/run/devcoordinator/broker.sock",
+            socket="/run/devcoordinator-authority.sock",
             client_uid=501,
+            repository_owner_uid=1000,
             account_id="account-alpha",
             approve_compose_host_access=False,
             explicit_reinstall=False,
@@ -446,8 +474,9 @@ class EphemeralManifestTests(unittest.TestCase):
             all_servers=True,
             server=[],
             database="/var/lib/devcoordinator/coordinator.sqlite3",
-            socket="/run/devcoordinator/broker.sock",
+            socket="/run/devcoordinator-authority.sock",
             client_uid=501,
+            repository_owner_uid=1000,
             account_id="account-alpha",
             approve_compose_host_access=False,
             explicit_reinstall=False,
@@ -675,9 +704,7 @@ class EphemeralCliTests(unittest.TestCase):
             dev_coordinator, "configured_broker_profile", return_value=profile
         ) as configured:
             dev_coordinator.coordinated_ephemeral_action(args)
-        configured.assert_called_once_with(
-            allow_expired_for_ephemeral_cleanup=True
-        )
+        configured.assert_called_once_with()
         self.assertEqual(len(profile.calls), 1)
         self.assertIs(profile.calls[0]["repository"], second)
         self.assertEqual(
@@ -690,12 +717,18 @@ class EphemeralCliTests(unittest.TestCase):
             canonical_root="/srv/expired",
             repo_id="repo-expired",
             generation=1,
+            owner_uid=1000,
             server_ids={},
             container_ids={},
             compose_definition_id=None,
+            compose_container_ids=frozenset(),
+            compose_run_once_services={},
             ephemeral_templates={"artifact-db": "template-expired"},
+            ephemeral_image_prefetch_template_ids=frozenset(),
+            ephemeral_secret_policies={},
             account_id="account-alpha",
             enabled=False,
+            issued_at="2026-07-23T00:00:00Z",
             valid_until_epoch=int(time.time()) - 1,
         )
         profile = _FakeProfile((expired,))
@@ -715,9 +748,7 @@ class EphemeralCliTests(unittest.TestCase):
             dev_coordinator, "configured_broker_profile", return_value=profile
         ) as configured:
             dev_coordinator.coordinated_ephemeral_action(finish)
-        configured.assert_called_once_with(
-            allow_expired_for_ephemeral_cleanup=True
-        )
+        configured.assert_called_once_with()
         self.assertEqual(profile.calls[0]["resource_id"], "run-exact")
         self.assertEqual(
             profile.calls[0]["operation"], BrokerOperation.EPHEMERAL_FINISH
@@ -744,9 +775,7 @@ class EphemeralCliTests(unittest.TestCase):
             self.assertRaisesRegex(BrokerProfileError, "disabled"),
         ):
             dev_coordinator.coordinated_ephemeral_action(renew)
-        configured.assert_called_once_with(
-            allow_expired_for_ephemeral_cleanup=False
-        )
+        configured.assert_called_once_with()
         self.assertEqual(len(profile.calls), 1)
 
     def test_mutations_require_agent_and_every_command_requires_project(self) -> None:

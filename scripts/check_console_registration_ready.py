@@ -24,7 +24,6 @@ from linux_proc_identity import (
     parse_start_ticks,
     read_stable_process_identity,
 )
-from secure_cutover_io import SecureIOError, read_private_regular
 from verify_post_cutover_registration import (
     RegistrationGraphError,
     current_registration_inventory_view,
@@ -1122,7 +1121,6 @@ def inventory_probe(
     *,
     host: str,
     port: int,
-    token: str,
     timeout: float,
     project: str,
     name: str,
@@ -1144,45 +1142,45 @@ def inventory_probe(
         connection.request(
             "GET",
             f"/v1/inventory/no-docker?{query}",
-            headers={"Authorization": f"Bearer {token}", "Host": f"{host}:{port}"},
+            headers={"Host": f"{host}:{port}"},
         )
         response = connection.getresponse()
         content_type = (response.getheader("Content-Type") or "").split(";", 1)[0].strip().lower()
         body = response.read(8 * 1024 * 1024 + 1)
     except http.client.RemoteDisconnected as error:
         raise InventoryTransportPending(
-            "authenticated no-Docker inventory transport closed during startup"
+            "local no-Docker inventory transport closed during startup"
         ) from error
     except (ConnectionRefusedError, ConnectionResetError, ConnectionAbortedError, TimeoutError) as error:
         raise InventoryTransportPending(
-            f"authenticated no-Docker inventory transport is starting: {type(error).__name__}"
+            f"local no-Docker inventory transport is starting: {type(error).__name__}"
         ) from error
     except OSError as error:
         if error.errno in {errno.ECONNREFUSED, errno.ECONNRESET, errno.ECONNABORTED, errno.ETIMEDOUT}:
             raise InventoryTransportPending(
-                f"authenticated no-Docker inventory transport is starting: {type(error).__name__}"
+                f"local no-Docker inventory transport is starting: {type(error).__name__}"
             ) from error
         raise ConsoleRegistrationError(
-            f"authenticated no-Docker inventory transport failed unsafely: {type(error).__name__}"
+            f"local no-Docker inventory transport failed unsafely: {type(error).__name__}"
         ) from error
     except http.client.HTTPException as error:
         raise ConsoleRegistrationError(
-            f"authenticated no-Docker inventory protocol failed: {type(error).__name__}"
+            f"local no-Docker inventory protocol failed: {type(error).__name__}"
         ) from error
     finally:
         connection.close()
     if response.status != 200:
         raise ConsoleRegistrationError(
-            f"authenticated no-Docker inventory returned HTTP {response.status}"
+            f"local no-Docker inventory returned HTTP {response.status}"
         )
     if content_type != "application/json" or len(body) > 8 * 1024 * 1024:
-        raise ConsoleRegistrationError("authenticated no-Docker inventory response is invalid")
+        raise ConsoleRegistrationError("local no-Docker inventory response is invalid")
     try:
         value = json.loads(body.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise ConsoleRegistrationError(f"authenticated no-Docker inventory JSON is invalid: {error}") from error
+        raise ConsoleRegistrationError(f"local no-Docker inventory JSON is invalid: {error}") from error
     if not isinstance(value, dict):
-        raise ConsoleRegistrationError("authenticated no-Docker inventory root is not an object")
+        raise ConsoleRegistrationError("local no-Docker inventory root is not an object")
     try:
         projected = current_registration_inventory_view(value)
     except RegistrationGraphError as error:
@@ -1273,7 +1271,6 @@ def wait_for_console_registration(
     project: str,
     name: str,
     port: int,
-    token: str,
     host: str,
     coordinator_port: int,
     expected_argv: list[str],
@@ -1307,7 +1304,6 @@ def wait_for_console_registration(
         lambda remaining: inventory_probe(
             host=host,
             port=coordinator_port,
-            token=token,
             timeout=remaining,
             project=project,
             name=name,
@@ -1414,8 +1410,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--unit", required=True)
     parser.add_argument("--main-pid", required=True, type=int)
-    parser.add_argument("--token-file", required=True, type=Path)
-    parser.add_argument("--token-owner-uid", type=int)
     parser.add_argument("--project", required=True)
     parser.add_argument("--name", required=True)
     parser.add_argument("--port", required=True, type=int)
@@ -1436,20 +1430,12 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.host != "127.0.0.1":
             raise ConsoleRegistrationError("coordinator host must be exact IPv4 loopback")
-        token = read_private_regular(
-            args.token_file,
-            label="coordinator token",
-            expected_uid=args.token_owner_uid,
-        ).decode("utf-8").strip()
-        if len(token) < 32 or any(character.isspace() for character in token):
-            raise ConsoleRegistrationError("coordinator token is invalid")
         report = wait_for_console_registration(
             unit=args.unit,
             main_pid=args.main_pid,
             project=args.project,
             name=args.name,
             port=args.port,
-            token=token,
             host=args.host,
             coordinator_port=args.coordinator_port,
             expected_argv=[
@@ -1463,7 +1449,7 @@ def main(argv: list[str] | None = None) -> int:
             poll_interval_seconds=args.poll_interval_seconds,
             systemctl=args.systemctl,
         )
-    except (ConsoleRegistrationError, SecureIOError, UnicodeDecodeError) as error:
+    except ConsoleRegistrationError as error:
         print(f"Console registration readiness failed: {error}", file=sys.stderr)
         return 1
     print(json.dumps(report, indent=2, sort_keys=True))

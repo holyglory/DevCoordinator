@@ -49,33 +49,31 @@ CONSOLE_STATE = f"{SERVICE_HOME}/.local/state/devops-console"
 CONSOLE_ENV = f"{SERVICE_HOME}/.config/devops-console/console.env"
 COORDINATOR_ARGV = (
     "/usr/bin/python3 /home/DevCoordinator/skills/codex-dev-coordinator/scripts/dev_coordinator.py "
-    f"api serve --host 127.0.0.1 --port 29876 --token-file {COORDINATOR_HOME}/api-token"
+    "api serve --host 127.0.0.1 --port 29876"
 )
 COORDINATOR_POSTSTART_ARGV = (
     "/usr/bin/python3 /home/DevCoordinator/scripts/check_coordinator_auth_boundary.py "
-    f"--token-file {COORDINATOR_HOME}/api-token --host 127.0.0.1 --port 29876 "
+    "--host 127.0.0.1 --port 29876 "
     "--wait-seconds 10 --poll-interval-seconds 0.1"
 )
 CONSOLE_PREFLIGHT_ARGV = (
     "/usr/bin/python3 /home/DevCoordinator/scripts/check_production_layout.py "
     f"--repo-root /home/DevCoordinator --home {SERVICE_HOME} --env-file {CONSOLE_ENV} "
     f"--state-dir {CONSOLE_STATE} --acme-webroot {CONSOLE_STATE}/acme "
-    f"--coordinator-home {COORDINATOR_HOME} --token-file {COORDINATOR_HOME}/api-token "
-    "--require-token --wait-token-seconds 10"
+    f"--coordinator-home {COORDINATOR_HOME}"
 )
 CONSOLE_ARGV = (
     "/usr/bin/env DEVCOORDINATOR_ROOT=/home/DevCoordinator DEVCOORDINATOR_AUTHORITY=system COORDINATOR_AUTOSTART=0 "
     "COORDINATOR_REGISTRATION_REQUIRED=1 "
     "COORDINATOR_URL=http://127.0.0.1:29876 "
     "COORDINATOR_SCRIPT=/home/DevCoordinator/skills/codex-dev-coordinator/scripts/dev_coordinator.py "
-    f"COORDINATOR_TOKEN_FILE={COORDINATOR_HOME}/api-token "
     f"CODEX_AGENT_COORDINATOR_HOME={COORDINATOR_JOURNAL} STATE_DIR={CONSOLE_STATE} "
     f"ACME_WEBROOT={CONSOLE_STATE}/acme /usr/bin/node bin/devops-console.mjs --env-file {CONSOLE_ENV}"
 )
 CONSOLE_POSTSTART_ARGV = (
     "/usr/bin/python3 /home/DevCoordinator/scripts/check_console_registration_ready.py "
     "--unit devops-console.service --main-pid $MAINPID "
-    f"--token-file {COORDINATOR_HOME}/api-token --project /home/DevCoordinator "
+    "--project /home/DevCoordinator "
     "--name devops-console --port 443 --host 127.0.0.1 --coordinator-port 29876 "
     f"--expected-executable /usr/bin/node --expected-script bin/devops-console.mjs "
     f"--env-file {CONSOLE_ENV} --expected-working-directory /home/DevCoordinator/apps/DevOpsConsole "

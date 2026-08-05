@@ -1,0 +1,16 @@
+[Unit]
+Description=DevCoordinator local test snapshot socket
+Before=devcoordinator-testd.service devcoordinator-test-snapshotd.service
+
+[Socket]
+ListenStream=/run/devcoordinator-test-snapshotd/snapshot.sock
+Service=devcoordinator-test-snapshotd.service
+FileDescriptorName=snapshotd
+Accept=no
+SocketMode=0666
+SocketUser=root
+DirectoryMode=0755
+RemoveOnStop=no
+
+[Install]
+WantedBy=sockets.target

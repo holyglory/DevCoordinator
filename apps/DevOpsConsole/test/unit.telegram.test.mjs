@@ -178,7 +178,7 @@ test('bot tokens persist only in an atomic private state file and every public v
   assert.doesNotMatch(JSON.stringify(await reloaded.status({ email: OWNER })), new RegExp(TOKEN_A));
 });
 
-test('state loading rejects permissive files and symlinks before reading bot secrets', async (t) => {
+test('state loading ignores local permission metadata but rejects symlinks', async (t) => {
   const { file, service } = await fixture(t);
   await registerA(service);
   const makeReload = () => createTelegramService({
@@ -188,10 +188,7 @@ test('state loading rejects permissive files and symlinks before reading bot sec
   });
 
   await fsp.chmod(file, 0o644);
-  await assert.rejects(
-    makeReload().load(),
-    (error) => error.code === 'unsafe_state_file' && /group\/world/.test(error.message),
-  );
+  await makeReload().load();
 
   await fsp.chmod(file, 0o600);
   const outside = `${file}.outside`;
