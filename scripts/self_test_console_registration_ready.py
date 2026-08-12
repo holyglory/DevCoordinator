@@ -367,7 +367,7 @@ def broker_published_stopped_fixture(
         "schema_version": 2,
         "authority": {
             "scope": "server-wide",
-            "transport": "authenticated-unix-socket",
+            "transport": "trusted-local-unix-socket",
             "socket": "/run/devcoordinator-authority.sock",
             "service_uid": 992,
             "database_generation": database_generation,
@@ -1603,7 +1603,7 @@ def main() -> int:
     schema_v2_ready = schema_v2_fixture(ready_fixture())
     schema_v2_before = copy.deepcopy(schema_v2_ready)
     state, report = classify(schema_v2_ready)
-    require(state == "ready" and report["server_pid"] == FIXTURES.MAIN_PID, "schema-v2 graph must pass")
+    require(state == "ready" and report["server_pid"] == FIXTURES.MAIN_PID, "schema-v3 graph must pass")
     require(schema_v2_ready == schema_v2_before, "readiness classification mutated schema-v2 input")
 
     missing_compatibility = schema_v2_fixture(ready_fixture())

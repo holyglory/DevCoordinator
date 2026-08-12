@@ -524,6 +524,27 @@ def test_public_broker_dispatch_never_reaches_client_docker(tmp: Path) -> None:
     class Profile:
         repositories = {str(project): repository}
 
+        def inventory(self, *, canonical_root):
+            check(canonical_root == str(project), "list used the wrong repository")
+            return {
+                "resources": {
+                    "databases": [
+                        {
+                            "database_binding_id": "database-app",
+                            "repo_id": "repo-broker-project",
+                            "docker_resource_id": "container-postgres",
+                            "database_name": "app",
+                        },
+                        {
+                            "database_binding_id": "database-other",
+                            "repo_id": "repo-other",
+                            "docker_resource_id": "container-other",
+                            "database_name": "other",
+                        },
+                    ]
+                }
+            }
+
         def call(self, *, repository, resource_id, operation, arguments):
             calls.append((operation.value, resource_id, dict(arguments)))
             return (
@@ -557,6 +578,11 @@ def test_public_broker_dispatch_never_reaches_client_docker(tmp: Path) -> None:
         route_error = io.StringIO()
         with contextlib.redirect_stdout(route_output), contextlib.redirect_stderr(route_error):
             route_status = module.main(["route"])
+        list_output = io.StringIO()
+        with contextlib.redirect_stdout(list_output), contextlib.redirect_stderr(
+            io.StringIO()
+        ):
+            list_status = module.main(["list"])
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(
             io.StringIO()
         ):
@@ -593,9 +619,13 @@ def test_public_broker_dispatch_never_reaches_client_docker(tmp: Path) -> None:
         module.docker = original_docker
         module.persist_coordinator_registry = original_registry
     check(
-        route_status == 0 and backup_status == 0 and restore_status == 0,
+        route_status == 0
+        and list_status == 0
+        and backup_status == 0
+        and restore_status == 0,
         "public broker dispatch failed: "
-        f"route={route_status}, backup={backup_status}, restore={restore_status}, "
+        f"route={route_status}, list={list_status}, backup={backup_status}, "
+        f"restore={restore_status}, "
         f"route_output={route_output.getvalue()!r}, route_error={route_error.getvalue()!r}",
     )
     check(
@@ -606,6 +636,17 @@ def test_public_broker_dispatch_never_reaches_client_docker(tmp: Path) -> None:
             "repository_id": "repo-broker-project",
         },
         "public database routing preflight did not bind the enrolled repository",
+    )
+    listed = json.loads(list_output.getvalue())
+    check(
+        listed["execution_authority"] == "broker"
+        and listed["repository_id"] == "repo-broker-project"
+        and [
+            item["database_binding_id"]
+            for item in listed["database_bindings"]
+        ]
+        == ["database-app"],
+        "public database list did not use the broker inventory",
     )
     check(
         calls
@@ -629,7 +670,7 @@ def test_public_broker_dispatch_never_reaches_client_docker(tmp: Path) -> None:
     )
 
 
-def test_public_broker_enrollment_failure_is_not_masked(tmp: Path) -> None:
+def test_public_broker_configuration_failure_is_not_masked(tmp: Path) -> None:
     coordinator_scripts = ROOT.parent / "codex-dev-coordinator" / "scripts"
     if not coordinator_scripts.is_dir():
         return
@@ -711,7 +752,7 @@ def main() -> int:
     tmp = Path(tempfile.mkdtemp(prefix="postgres-docker-backup-self-test-")).resolve(strict=True)
     try:
         test_public_broker_dispatch_never_reaches_client_docker(tmp)
-        test_public_broker_enrollment_failure_is_not_masked(tmp)
+        test_public_broker_configuration_failure_is_not_masked(tmp)
         fake_bin = tmp / "bin"
         fake_bin.mkdir()
         make_fake_docker(fake_bin / "docker")
@@ -1091,6 +1132,29 @@ def main() -> int:
         ]
         check(len(target_restores) == 1, "exactly one final restore may target appdb")
         check("--single-transaction" in target_restores[0] and "--exit-on-error" in target_restores[0], "custom restore must use one error-stopping transaction")
+        receipt_path = Path(restored["restore_receipt"])
+        check(receipt_path.is_file(), "successful restore must publish an exact durable receipt")
+        check(stat.S_IMODE(receipt_path.stat().st_mode) == 0o600, "restore receipt must be private")
+
+        log_path.write_text("", encoding="utf-8")
+        reconciled = parse_json(
+            run(
+                [
+                    "reconcile-restore",
+                    "--file",
+                    str(backup_path),
+                    "--expect-container-id",
+                    SOURCE_ID,
+                    "--safety-out-dir",
+                    str(tmp / "pre-restore"),
+                ],
+                env=env,
+            )
+        )
+        check(reconciled["matched"] is True, "lost restore reply must reconcile from exact evidence")
+        check(reconciled["reconciled_without_reexecution"] is True, "restore reconciliation must report no reexecution")
+        reconcile_sequence = docker_log(log_path)
+        check(not any("pg_restore" in command or "pg_dump" in command for command in reconcile_sequence), "restore reconciliation must not restore or back up again")
 
         rollback_env = dict(env)
         rollback_env["FAKE_DOCKER_FAIL"] = "transactional_restore"

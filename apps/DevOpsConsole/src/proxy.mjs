@@ -150,6 +150,11 @@ function appendSafeRawHeaders(lines, rawHeaders, protectedNames, excludedNames =
 
 function localAttributionHeaders(target) {
   if (target?.trustDomain === 'console') return null;
+  // Public project routes are a deliberate trust-boundary opt-out: the
+  // upstream receives neither a Console session identity nor a durable route
+  // identity.  Caller-supplied copies were stripped above, so returning no
+  // replacement headers makes the public-route contract attribution-free.
+  if (target?.route?.auth === 'public') return null;
   const attribution = target?.localAttribution;
   if (!attribution || typeof attribution !== 'object' || Array.isArray(attribution)) {
     throw new TypeError('project proxy target requires local attribution');
@@ -170,7 +175,7 @@ function localAttributionHeaders(target) {
       throw new TypeError('project proxy email attribution is invalid');
     }
   }
-  if (target?.route?.auth !== 'public' && email === null) {
+  if (email === null) {
     throw new TypeError('protected project proxy target requires email attribution');
   }
   return {

@@ -70,7 +70,7 @@ class ExactStoppedAdapter:
             identity_observable=self.identity_observable,
             immutable_fingerprint=target.immutable_fingerprint,
             ownership_observable=self.ownership_observable,
-            ownership_fingerprint=target.ownership_fingerprint,
+            observation_fingerprint=target.observation_fingerprint,
             running_state=self.running_state,
             listener_active=(
                 self.listener_active if target.kind is ResourceKind.SERVER else None
@@ -449,7 +449,7 @@ def _seed_broker_server_projections(store: AccountStore) -> None:
             """
             INSERT INTO broker_cleanup_resource_acl(
                 uid, repo_id, resource_kind, resource_id, control_binding_id,
-                immutable_fingerprint, ownership_fingerprint, operation,
+                immutable_fingerprint, observation_fingerprint, operation,
                 enabled, updated_at
             ) VALUES (?, ?, 'server', ?, 'binding-server', 'immutable:server',
                       'ownership:server', 'cleanup.apply', 1, ?)

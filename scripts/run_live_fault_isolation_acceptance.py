@@ -718,7 +718,7 @@ def _unrelated_state(
             ):
                 raw_ids = scope.get(key)
                 if not isinstance(raw_ids, list) or any(not isinstance(item, str) for item in raw_ids):
-                    raise FaultAcceptanceError("retained repository membership is invalid")
+                    raise FaultAcceptanceError("retained repository association is invalid")
                 resource_ids[resource_kind].update(raw_ids)
     present = {
         scope.get("repo_id")

@@ -35,6 +35,9 @@ OPENAI_AGENT = (
     / "agents"
     / "openai.yaml"
 )
+REPOSITORY_AGENTS = ROOT / "AGENTS.md"
+SKILL_README = ROOT / "skills" / "codex-dev-coordinator" / "README.md"
+TEST_ARCHITECTURE = ROOT / "docs" / "architecture" / "universal-test-harness.md"
 POSTGRES_SKILL = ROOT / "skills" / "postgres-docker-backup" / "SKILL.md"
 
 
@@ -274,6 +277,80 @@ def _require_local_links_resolve(*, source: Path, markdown: str) -> None:
             )
 
 
+def test_local_test_scope_is_bounded_and_batched() -> None:
+    skill = COORDINATOR_SKILL.read_text(encoding="utf-8")
+    reference = AGENT_CLIENT.read_text(encoding="utf-8")
+    agents = REPOSITORY_AGENTS.read_text(encoding="utf-8")
+    root_readme = ROOT_README.read_text(encoding="utf-8")
+    readme = SKILL_README.read_text(encoding="utf-8")
+    metadata = OPENAI_AGENT.read_text(encoding="utf-8")
+    architecture = TEST_ARCHITECTURE.read_text(encoding="utf-8")
+
+    for label, text in (
+        ("Coordinator skill", skill),
+        ("agent-client reference", reference),
+        ("repository agent instructions", agents),
+        ("root README", root_readme),
+        ("skill README", readme),
+        ("OpenAI skill metadata", metadata),
+        ("test architecture", architecture),
+    ):
+        _require_fragments(
+            label=f"{label} local-test boundary",
+            text=text,
+            fragments=("20 cases", "10 seconds"),
+        )
+
+    _require_fragments(
+        label="Coordinator skill governed-batch routing",
+        text=skill,
+        fragments=(
+            "Unit-test isolation does not make a broad invocation locally eligible",
+            "If either bound is unknown",
+            "use one governed batch",
+            "Do not recreate the selected batch",
+            "at most 20 collected cases and at most 10 seconds",
+            "Do not split a larger suite",
+            "21 collected cases",
+            "11-second execution allowance",
+            "unknown case or runtime scope",
+            "an unfiltered runner",
+            "a thousand-case suite",
+            "UIL-TESTING-011",
+        ),
+    )
+    _require_fragments(
+        label="agent-client governed-batch routing",
+        text=reference,
+        fragments=(
+            "Local feedback versus governed batches",
+            "Unit-test isolation alone is not proof of local eligibility",
+            "If the collected-case count or runtime bound is unknown",
+            "enqueue one governed batch",
+            "must not split a larger suite",
+        ),
+    )
+    _require_fragments(
+        label="repository agent routing",
+        text=agents,
+        fragments=(
+            "proven before launch",
+            "one Coordinator test enqueue",
+            "either bound is unknown or exceeded",
+        ),
+    )
+    forbidden = (
+        "isolated unit tests that do not touch a shared runtime",
+        "repository-native isolated unit or static checks",
+    )
+    for phrase in forbidden:
+        if phrase in skill or phrase in reference:
+            raise AssertionError(
+                "local-test guidance restored the unbounded isolation rule: "
+                + phrase
+            )
+
+
 def test_bug_intake_and_advisory_fallback_are_explicit() -> None:
     complete_skill = COORDINATOR_SKILL.read_text(encoding="utf-8")
     complete_reference = AGENT_CLIENT.read_text(encoding="utf-8")
@@ -388,7 +465,7 @@ def test_bug_intake_and_advisory_fallback_are_explicit() -> None:
             "devcoordinator-bug report",
             "local/advisory",
             "non-governed",
-            "never as release evidence",
+            "release evidence",
         ),
     )
 
@@ -437,6 +514,7 @@ def main() -> int:
         test_runtime_api_operator_links_resolve,
         test_broker_routing_resolves_skill_tool_before_project_cd,
         test_first_use_runtime_journey_is_copyable_and_explanatory,
+        test_local_test_scope_is_bounded_and_batched,
         test_bug_intake_and_advisory_fallback_are_explicit,
     )
     failures: list[str] = []

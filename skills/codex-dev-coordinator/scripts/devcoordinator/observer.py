@@ -216,7 +216,7 @@ class SingleFlightObserver:
                 if owner is not None:
                     connection.execute(
                         """
-                        INSERT INTO broker_host_observation_owners(
+                        INSERT INTO broker_host_observation_sessions(
                             snapshot_id, broker_instance_id, claimed_at
                         ) VALUES (?, ?, ?)
                         """,

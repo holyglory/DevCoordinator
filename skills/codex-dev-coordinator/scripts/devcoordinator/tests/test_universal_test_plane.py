@@ -641,6 +641,21 @@ class UniversalTestStoreTests(StoreFixture):
                 chunk=oversized,
             )
 
+        self.store.terminalize_attempt(
+            grant.attempt_id,
+            generation=grant.generation,
+            conclusion=AttemptConclusion.TEST_FAILED,
+            duration_seconds=1.5,
+            operation_id=operation_id(),
+            expected_result_chunk_ids=("chunk-1",),
+        )
+        terminal_replay = self.store.append_result_chunk(
+            grant.attempt_id,
+            generation=grant.generation,
+            chunk=chunk,
+        )
+        self.assertTrue(terminal_replay["replayed"])
+
     def test_incomplete_reporting_is_not_published_as_success(self) -> None:
         submitted = self.submit()
         grant = self.lease_lint(submitted.run_id)
@@ -1901,6 +1916,7 @@ class DurableAttemptSpoolTests(unittest.TestCase):
                 "active",
                 "pending",
                 "processed",
+                "terminal-conflicts",
                 "result-pending",
                 "result-processed",
             },
@@ -1939,6 +1955,70 @@ class DurableAttemptSpoolTests(unittest.TestCase):
         self.assertEqual(imported, ["attempt-1"])
         self.assertEqual(success["imported_envelope_ids"], ["exit-1"])
         self.assertEqual(self.spool.pending_envelopes(), ())
+
+    def test_priority_replay_bypasses_an_older_full_page(self) -> None:
+        paths: dict[str, Path] = {}
+        for index in range(3):
+            envelope = AttemptExitEnvelope(
+                envelope_id=f"exit-{index}",
+                attempt_id=f"attempt-{index}",
+                generation=1,
+                operation_id=str(uuid.uuid4()),
+                conclusion=AttemptConclusion.SUCCEEDED,
+                duration_seconds=1.0,
+            )
+            paths[self.spool.append(envelope).name] = envelope
+        priority_name = sorted(paths)[-1]
+        imported: list[str] = []
+
+        replay = self.spool.replay(
+            lambda value: imported.append(value.attempt_id),
+            limit=2,
+            priority_names=(priority_name,),
+        )
+
+        self.assertEqual(imported[0], paths[priority_name].attempt_id)
+        self.assertEqual(len(replay["imported_envelope_ids"]), 2)
+        self.assertEqual(len(self.spool.pending_envelopes()), 1)
+
+    def test_conflicting_duplicate_terminal_identity_leaves_one_hot_copy(self) -> None:
+        operation = str(uuid.uuid4())
+        first = AttemptExitEnvelope(
+            envelope_id="exit-conflicting-retry",
+            attempt_id="attempt-conflicting-retry",
+            generation=1,
+            operation_id=operation,
+            conclusion=AttemptConclusion.CANCELLED,
+            duration_seconds=1.0,
+        )
+        second = AttemptExitEnvelope(
+            envelope_id=first.envelope_id,
+            attempt_id=first.attempt_id,
+            generation=first.generation,
+            operation_id=first.operation_id,
+            conclusion=first.conclusion,
+            duration_seconds=2.0,
+        )
+        self.spool.append(first)
+        self.spool.append(second)
+        imported: list[str] = []
+
+        def unavailable(value: AttemptExitEnvelope) -> None:
+            imported.append(value.envelope_id)
+            raise RuntimeError("still unavailable")
+
+        replay = self.spool.replay(unavailable)
+
+        self.assertEqual(imported, [first.envelope_id])
+        self.assertEqual(replay["imported_envelope_ids"], [])
+        self.assertEqual(
+            replay["quarantined_conflicting_envelope_ids"],
+            [first.envelope_id],
+        )
+        self.assertEqual(len(self.spool.pending_envelopes()), 1)
+        self.assertEqual(
+            len(tuple(self.spool.terminal_conflicts.glob("*.json"))), 1
+        )
 
     def test_digest_tampering_fails_closed_without_deleting_evidence(self) -> None:
         path = self.spool.append(self.envelope())

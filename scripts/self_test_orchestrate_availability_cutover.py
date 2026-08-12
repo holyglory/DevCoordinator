@@ -423,41 +423,6 @@ def imported(pass_kind: str, *, migration_id: str) -> dict[str, object]:
         },
     )
 
-
-def delegation() -> dict[str, object]:
-    return cutover.seal(
-        cutover.DELEGATION_KIND,
-        {
-            "api_uid": API_UID,
-            "broker_account_id": cutover.API_BROKER_ACCOUNT,
-            "source_authority_generation": AUTHORITY_GENERATION,
-            "authority_generation": TARGET_AUTHORITY_GENERATION,
-            "profile_fingerprint": "c" * 64,
-            "profile_path": cutover.PROTECTED_PROFILE_PATH,
-            "profile_owner_uid": 0,
-            "profile_group_name": cutover.PROTECTED_PROFILE_GROUP,
-            "profile_group_gid": 2310,
-            "profile_mode": "0640",
-            "profile_source_kind": "authority-reconstructed",
-            "profile_source_sha256": "d" * 64,
-            "profile_authority_reconciled": True,
-            "profile_generation_matches_authority": True,
-            "atomic_publication_verified": True,
-            "existing_profile_contents_reused": False,
-            "google_actor_prefix": "google:",
-            "google_actor_policy": cutover.GOOGLE_ACTOR_POLICY,
-            "repository_grants": [
-                {
-                    "repository_id": "repo-alpha",
-                    "permissions": ["tests:read", "tests:run", "tests:operate"],
-                }
-            ],
-            "broker_verified": True,
-            "created_at": "2026-07-28T00:05:00Z",
-        },
-    )
-
-
 def profile_inventory_readiness(
     *, release: Path | str | None = None
 ) -> dict[str, object]:
@@ -466,33 +431,28 @@ def profile_inventory_readiness(
         if release is not None
         else f"/opt/devcoordinator/releases/{RELEASE}"
     )
-    delegated = delegation()
     return cutover.seal(
         cutover.PROFILE_INVENTORY_READINESS_KIND,
         {
             "profile_repair_sha256": "f" * 64,
-            "api_delegation_sha256": delegated["document_sha256"],
             "release_digest": RELEASE,
             "executor_release": release_path,
             "inventory_client_sha256": "2" * 64,
             "authority_database": AUTHORITY_DATABASE,
-            "source_authority_generation": AUTHORITY_GENERATION,
             "authority_generation": TARGET_AUTHORITY_GENERATION,
-            "authority_schema_version": 13,
+            "authority_schema_version": 15,
             "authority_migration_state": "ready",
             "profile_path": cutover.PROTECTED_PROFILE_PATH,
             "profile_sha256": "c" * 64,
             "profile_owner_uid": 0,
-            "profile_group_gid": 2310,
-            "profile_mode": "0640",
+            "profile_mode": "0644",
             "full_regeneration": True,
             "strict_profile_parse": True,
             "project": INVENTORY_PROJECT,
-            "owner_uid": OWNER_UID,
-            "owner_account_id": OWNER_ACCOUNT_ID,
+            "execution_uid": API_UID,
             "repository_id": "repo-alpha",
             "repository_generation": 7,
-            "owner_bound_grant": True,
+            "route_verified": True,
             "inventory_command": [
                 "inventory",
                 "--project",
@@ -503,7 +463,7 @@ def profile_inventory_readiness(
             "inventory_sha256": "e" * 64,
             "inventory_schema_version": 2,
             "inventory_scope": "server-wide",
-            "inventory_transport": "authenticated-unix-socket",
+            "inventory_transport": "trusted-local-unix-socket",
             "inventory_service_uid": 0,
             "inventory_database_generation": TARGET_AUTHORITY_GENERATION,
             "verified_at": "2026-07-28T00:05:30Z",
@@ -535,36 +495,6 @@ def refreshed_profile_inventory_readiness(
             "verified_at": verified_at,
         },
     )
-
-
-def capability_policy() -> dict[str, object]:
-    return cutover.seal(
-        cutover.CAPABILITY_POLICY_KIND,
-        {
-            "policy_path": cutover.TEST_CAPABILITY_POLICY_PATH,
-            "policy_owner_uid": 0,
-            "policy_mode": "0600",
-            "policy_file_sha256": "e" * 64,
-            "policy_fingerprint": "f" * 64,
-            "authority_generation": TARGET_AUTHORITY_GENERATION,
-            "authority_export_sha256": "0" * 64,
-            "dogfood_repository_id": "repo-alpha",
-            "repository_grants": [
-                {
-                    "repository_id": "repo-alpha",
-                    "generation": 7,
-                    "setup_status": "ready",
-                    "manifest_fingerprint": "1" * 64,
-                    "requested": ["network.loopback"],
-                    "granted": ["network.loopback"],
-                }
-            ],
-            "coverage_complete": True,
-            "broker_contract_verified": True,
-            "created_at": "2026-07-28T00:05:30Z",
-        },
-    )
-
 
 def candidate(*, release: Path | str | None = None) -> dict[str, object]:
     release_path = (
@@ -601,8 +531,7 @@ def candidate(*, release: Path | str | None = None) -> dict[str, object]:
                 "ok": True,
                 "kind": "project-runtime-isolation-verification",
                 "audit_sha256": "sha256:" + "8" * 64,
-                "source_schema_version": 13,
-                "repository_owner_map_sha256": None,
+                "source_schema_version": 15,
                 "audit_counts": {
                     "compliant": 1,
                     "legacy_requires_recreation": 0,
@@ -655,7 +584,6 @@ def candidate(*, release: Path | str | None = None) -> dict[str, object]:
             "test_database": TEST_DATABASE,
             "migration_seal_sha256": "",
             "checks_passed": True,
-            "test_capability_policy": capability_policy(),
             "preparation": preparation,
             "created_at": "2026-07-28T00:06:00Z",
         },
@@ -736,9 +664,6 @@ def through_activation() -> tuple[
     dict[str, object], dict[str, object], dict[str, object], dict[str, object]
 ]:
     state, authority_backup, test_backup = through_seal()
-    state = cutover.transition(
-        state, evidence_kind="api-delegation", evidence=delegation()
-    )
     state = cutover.transition(
         state,
         evidence_kind="profile-inventory-readiness",
@@ -1010,10 +935,6 @@ class CutoverTransitionTests(unittest.TestCase):
         self.assertEqual(
             completion["document_sha256"],
             state["evidence"]["test-history-discard"]["document_sha256"],
-        )
-
-        state = cutover.transition(
-            state, evidence_kind="api-delegation", evidence=delegation()
         )
         state = cutover.transition(
             state,
@@ -1498,9 +1419,6 @@ class CutoverTransitionTests(unittest.TestCase):
     def test_complete_evidence_chain_and_exact_replay(self) -> None:
         state, authority_backup, test_backup = through_seal()
         state = cutover.transition(
-            state, evidence_kind="api-delegation", evidence=delegation()
-        )
-        state = cutover.transition(
             state,
             evidence_kind="profile-inventory-readiness",
             evidence=profile_inventory_readiness(),
@@ -1724,26 +1642,8 @@ class CutoverTransitionTests(unittest.TestCase):
                 state, evidence_kind="migration-seal", evidence=wrong
             )
 
-    def test_api_profile_gate_rejects_reusing_untrusted_contents(self) -> None:
+    def test_candidate_requires_distinct_service_identities_and_exact_slices(self) -> None:
         state, _, _ = through_seal()
-        invalid = delegation()
-        unsigned = {
-            key: value
-            for key, value in invalid.items()
-            if key not in {"schema_version", "kind", "document_sha256"}
-        }
-        unsigned["existing_profile_contents_reused"] = True
-        invalid = cutover.seal(cutover.DELEGATION_KIND, unsigned)
-        with self.assertRaisesRegex(cutover.CutoverError, "delegation evidence"):
-            cutover.transition(
-                state, evidence_kind="api-delegation", evidence=invalid
-            )
-
-    def test_candidate_binds_api_uid_and_exact_slice_topology(self) -> None:
-        state, _, _ = through_seal()
-        state = cutover.transition(
-            state, evidence_kind="api-delegation", evidence=delegation()
-        )
         state = cutover.transition(
             state,
             evidence_kind="profile-inventory-readiness",
@@ -1759,49 +1659,15 @@ class CutoverTransitionTests(unittest.TestCase):
             "document_sha256"
         ]
         unsigned["service_uids"] = dict(unsigned["service_uids"])
-        unsigned["service_uids"]["devcoordinator-api.service"] = API_UID + 10
+        unsigned["service_uids"]["devcoordinator-api.service"] = unsigned[
+            "service_uids"
+        ]["devcoordinator-edge.service"]
         invalid = cutover.seal(cutover.CANDIDATE_KIND, unsigned)
         with self.assertRaisesRegex(cutover.CutoverError, "service UIDs"):
             cutover.transition(state, evidence_kind="candidate", evidence=invalid)
 
-    def test_candidate_rejects_incomplete_capability_policy(self) -> None:
-        state, _, _ = through_seal()
-        state = cutover.transition(
-            state, evidence_kind="api-delegation", evidence=delegation()
-        )
-        state = cutover.transition(
-            state,
-            evidence_kind="profile-inventory-readiness",
-            evidence=profile_inventory_readiness(),
-        )
-        invalid = candidate()
-        unsigned = {
-            key: value
-            for key, value in invalid.items()
-            if key not in {"schema_version", "kind", "document_sha256"}
-        }
-        unsigned["migration_seal_sha256"] = state["evidence"]["migration-seal"][
-            "document_sha256"
-        ]
-        policy = capability_policy()
-        policy_unsigned = {
-            key: value
-            for key, value in policy.items()
-            if key not in {"schema_version", "kind", "document_sha256"}
-        }
-        policy_unsigned["repository_grants"] = []
-        unsigned["test_capability_policy"] = cutover.seal(
-            cutover.CAPABILITY_POLICY_KIND, policy_unsigned
-        )
-        invalid = cutover.seal(cutover.CANDIDATE_KIND, unsigned)
-        with self.assertRaisesRegex(cutover.CutoverError, "policy grants"):
-            cutover.transition(state, evidence_kind="candidate", evidence=invalid)
-
     def test_candidate_state_machine_rejects_pending_project_isolation(self) -> None:
         state, _, _ = through_seal()
-        state = cutover.transition(
-            state, evidence_kind="api-delegation", evidence=delegation()
-        )
         state = cutover.transition(
             state,
             evidence_kind="profile-inventory-readiness",
@@ -1826,8 +1692,7 @@ class CutoverTransitionTests(unittest.TestCase):
             "ok": True,
             "kind": "project-runtime-isolation-verification",
             "audit_sha256": "sha256:" + "8" * 64,
-            "source_schema_version": 13,
-            "repository_owner_map_sha256": None,
+            "source_schema_version": 15,
             "audit_counts": {
                 "compliant": 1,
                 "legacy_requires_recreation": 1,
@@ -1851,9 +1716,6 @@ class CutoverTransitionTests(unittest.TestCase):
 
     def test_candidate_rejects_observation_or_mutating_isolation_evidence(self) -> None:
         state, _, _ = through_seal()
-        state = cutover.transition(
-            state, evidence_kind="api-delegation", evidence=delegation()
-        )
         state = cutover.transition(
             state,
             evidence_kind="profile-inventory-readiness",
@@ -2039,7 +1901,7 @@ class CutoverTransitionTests(unittest.TestCase):
             finalizer["hard_gate"],
             {
                 "scope": "server-wide",
-                "transport": "authenticated-unix-socket",
+                "transport": "trusted-local-unix-socket",
                 "canonical_project": "<canonical-global-finance-project-root>",
                 "repository_id": "<global-finance-repository-id>",
                 "users": [
@@ -2134,392 +1996,6 @@ class CutoverTransitionTests(unittest.TestCase):
             evidence=live_rollback_rehearsal(activated, activation),
         )
         assert_release_commands(live_rehearsed)
-
-
-class ProfileInventoryReadinessTests(unittest.TestCase):
-    def setUp(self) -> None:
-        self.temporary = tempfile.TemporaryDirectory()
-        self.root = Path(self.temporary.name)
-        self.release_root = self.root / "releases"
-        self.release = self.release_root / RELEASE
-        self.client = (
-            self.release
-            / "skills/codex-dev-coordinator/scripts/dev_coordinator.py"
-        )
-        self.client.parent.mkdir(parents=True)
-        self.client.write_text("#!/usr/bin/python3\n", encoding="utf-8")
-        self.client.chmod(0o755)
-        self.database = self.root / "authority.sqlite3"
-        with closing(sqlite3.connect(self.database)) as connection:
-            connection.execute(
-                "CREATE TABLE schema_metadata("
-                "singleton INTEGER PRIMARY KEY, schema_version INTEGER NOT NULL, "
-                "database_generation TEXT NOT NULL, migration_state TEXT NOT NULL)"
-            )
-            connection.execute(
-                "INSERT INTO schema_metadata VALUES (1, 13, ?, 'ready')",
-                (TARGET_AUTHORITY_GENERATION,),
-            )
-            connection.commit()
-        self.database.chmod(0o600)
-        self.profile = self.root / "client-profiles.json"
-        self.gid = os.getegid()
-        self.profile_patch = mock.patch.object(
-            cutover, "PROTECTED_PROFILE_PATH", str(self.profile)
-        )
-        self.release_patch = mock.patch.object(
-            cutover, "IMMUTABLE_RELEASE_ROOT", self.release_root
-        )
-        self.profile_patch.start()
-        self.release_patch.start()
-        state, _authority, _testd = through_seal()
-        unsigned = {
-            key: value
-            for key, value in state.items()
-            if key not in {"schema_version", "kind", "document_sha256"}
-        }
-        unsigned.update(
-            {
-                "release": str(self.release),
-                "authority_database": str(self.database),
-                "inventory_canary_project": INVENTORY_PROJECT,
-                "evidence": {
-                    key: value
-                    for key, value in unsigned["evidence"].items()
-                    if key != "authority-readiness"
-                },
-            }
-        )
-        self.sealed = cutover.seal(cutover.STATE_KIND, unsigned)
-        self.state, self.repair = self._bind_profile(
-            cutover._canonical(self._profile_document())
-        )
-        self.inventory = {
-            "schema_version": 2,
-            "authority": {
-                "scope": "server-wide",
-                "transport": "authenticated-unix-socket",
-                "socket": cutover.AUTHORITY_SOCKET_PATH,
-                "service_uid": 0,
-                "database_generation": TARGET_AUTHORITY_GENERATION,
-            },
-            "repositories": [
-                {
-                    "canonical_root": INVENTORY_PROJECT,
-                    "repo_id": "repo-alpha",
-                    "generation": 7,
-                }
-            ],
-        }
-        self.real_lstat = Path.lstat
-
-        def root_owned_lstat(path: Path):
-            info = self.real_lstat(path)
-            if Path(path) == self.profile:
-                values = list(info)
-                values[4] = 0
-                values[5] = self.gid
-                return os.stat_result(values)
-            return info
-
-        self.euid_patch = mock.patch.object(cutover.os, "geteuid", return_value=0)
-        self.identity_patch = mock.patch.object(
-            cutover,
-            "_database_identity",
-            return_value={"device": 1, "inode": 2, "size": 4096},
-        )
-        self.lstat_patch = mock.patch.object(Path, "lstat", new=root_owned_lstat)
-        self.euid_patch.start()
-        self.identity_patch.start()
-        self.lstat_patch.start()
-
-    def tearDown(self) -> None:
-        self.lstat_patch.stop()
-        self.identity_patch.stop()
-        self.euid_patch.stop()
-        self.release_patch.stop()
-        self.profile_patch.stop()
-        self.temporary.cleanup()
-
-    def _profile_document(
-        self,
-        *,
-        project: str = INVENTORY_PROJECT,
-        owner_uid: int = OWNER_UID,
-    ) -> dict[str, object]:
-        repository = {
-            "canonical_root": project,
-            "repo_id": "repo-alpha",
-            "generation": 7,
-            "owner_uid": owner_uid,
-            "servers": {},
-            "containers": {},
-            "compose_definition_id": None,
-            "account_id": OWNER_ACCOUNT_ID,
-            "enabled": True,
-            "issued_at": "2026-07-28T00:00:00Z",
-            "valid_until_epoch": 2_000_000_000,
-        }
-        api_repository = dict(repository)
-        api_repository["account_id"] = cutover.API_BROKER_ACCOUNT
-        return {
-            "version": 1,
-            "service": {
-                "socket": cutover.AUTHORITY_SOCKET_PATH,
-                "uid": 0,
-                "gid": self.gid,
-                "mode": "0660",
-                "database_generation": TARGET_AUTHORITY_GENERATION,
-            },
-            "clients": {
-                str(API_UID): {
-                    "account_id": cutover.API_BROKER_ACCOUNT,
-                    "issued_at": "2026-07-28T00:00:00Z",
-                    "valid_until_epoch": 2_000_000_000,
-                    "repositories": [api_repository],
-                },
-                str(OWNER_UID): {
-                    "account_id": OWNER_ACCOUNT_ID,
-                    "issued_at": "2026-07-28T00:00:00Z",
-                    "valid_until_epoch": 2_000_000_000,
-                    "repositories": [repository],
-                },
-            },
-        }
-
-    def _bind_profile(
-        self,
-        payload: bytes,
-        *,
-        grants: tuple[str, ...] = ("repo-alpha",),
-        owner_uid: int = OWNER_UID,
-    ) -> tuple[dict[str, object], dict[str, object]]:
-        self.profile.write_bytes(payload)
-        self.profile.chmod(0o640)
-        digest = cutover._file_digest(self.profile)
-        raw_delegation = delegation()
-        delegated = cutover.seal(
-            cutover.DELEGATION_KIND,
-            {
-                key: value
-                for key, value in raw_delegation.items()
-                if key not in {"schema_version", "kind", "document_sha256"}
-            }
-            | {
-                "profile_path": str(self.profile),
-                "profile_fingerprint": digest,
-                "profile_group_gid": self.gid,
-                "repository_grants": [
-                    {
-                        "repository_id": repository_id,
-                        "permissions": [
-                            "tests:read",
-                            "tests:run",
-                            "tests:operate",
-                        ],
-                    }
-                    for repository_id in grants
-                ],
-            },
-        )
-        state = cutover.transition(
-            self.sealed,
-            evidence_kind="api-delegation",
-            evidence=delegated,
-        )
-        repair = cutover.seal(
-            cutover.PROFILE_REPAIR_KIND,
-            {
-                "profile_path": str(self.profile),
-                "profile_owner_uid": 0,
-                "profile_group_gid": self.gid,
-                "profile_mode": "0640",
-                "profile_sha256": digest,
-                "source_authority_generation": AUTHORITY_GENERATION,
-                "authority_generation": TARGET_AUTHORITY_GENERATION,
-                "authority_source_sha256": "d" * 64,
-                "api_uid": API_UID,
-                "broker_account_id": cutover.API_BROKER_ACCOUNT,
-                "repository_ids": ["repo-alpha"],
-                "client_uids": [API_UID, OWNER_UID],
-                "repository_bindings": [
-                    {
-                        "client_uid": API_UID,
-                        "owner_uid": owner_uid,
-                        "account_id": cutover.API_BROKER_ACCOUNT,
-                        "repository_id": "repo-alpha",
-                        "generation": 7,
-                    },
-                    {
-                        "client_uid": OWNER_UID,
-                        "owner_uid": owner_uid,
-                        "account_id": OWNER_ACCOUNT_ID,
-                        "repository_id": "repo-alpha",
-                        "generation": 7,
-                    },
-                ],
-                "parser_verified": True,
-                "all_clients_parser_verified": True,
-                "existing_profile_contents_reused": False,
-                "atomic_publication_verified": True,
-                "created_at": "2026-07-28T00:05:00Z",
-            },
-        )
-        return state, repair
-
-    def _verify(
-        self,
-        *,
-        state: Mapping[str, object] | None = None,
-        repair: Mapping[str, object] | None = None,
-        inventory: Mapping[str, object] | None = None,
-    ) -> dict[str, object]:
-        return cutover.verify_post_v13_profile_inventory_readiness(
-            state=state or self.state,
-            profile_repair=repair or self.repair,
-            authority_database=self.database,
-            authority_uid=0,
-            inventory_fetcher=lambda **_values: inventory or self.inventory,
-            verified_at="2026-07-28T00:06:00Z",
-        )
-
-    def test_direct_gate_accepts_exact_owner_bound_inventory(self) -> None:
-        evidence = self._verify()
-        self.assertEqual(evidence["project"], INVENTORY_PROJECT)
-        self.assertEqual(evidence["owner_uid"], OWNER_UID)
-        self.assertEqual(evidence["repository_id"], "repo-alpha")
-        self.assertEqual(evidence["release_digest"], RELEASE)
-        self.assertEqual(evidence["executor_release"], str(self.release))
-        self.assertEqual(
-            evidence["inventory_client_sha256"],
-            cutover._file_digest(self.client),
-        )
-        transitioned = cutover.transition(
-            self.state,
-            evidence_kind="profile-inventory-readiness",
-            evidence=evidence,
-        )
-        self.assertIn("profile-inventory-readiness", transitioned["evidence"])
-
-    def test_direct_gate_rejects_stale_and_malformed_profiles(self) -> None:
-        self.profile.write_text("{}\n", encoding="utf-8")
-        with self.assertRaisesRegex(cutover.CutoverError, "changed"):
-            self._verify()
-        malformed_state, malformed_repair = self._bind_profile(b"{")
-        with self.assertRaisesRegex(cutover.CutoverError, "strict JSON"):
-            self._verify(state=malformed_state, repair=malformed_repair)
-
-    def test_direct_gate_rejects_wrong_owner_grant_generation_and_project(self) -> None:
-        wrong_owner_state, wrong_owner_repair = self._bind_profile(
-            cutover._canonical(self._profile_document(owner_uid=OWNER_UID + 10)),
-            owner_uid=OWNER_UID + 10,
-        )
-        with self.assertRaisesRegex(cutover.CutoverError, "owner-bound"):
-            self._verify(state=wrong_owner_state, repair=wrong_owner_repair)
-
-        denied_state, denied_repair = self._bind_profile(
-            cutover._canonical(self._profile_document()),
-            grants=("repo-beta",),
-        )
-        with self.assertRaisesRegex(cutover.CutoverError, "absent"):
-            self._verify(state=denied_state, repair=denied_repair)
-
-        with closing(sqlite3.connect(self.database)) as connection:
-            connection.execute(
-                "UPDATE schema_metadata SET database_generation = 'wrong-generation'"
-            )
-            connection.commit()
-        with self.assertRaisesRegex(cutover.CutoverError, "rotated"):
-            self._verify()
-        with closing(sqlite3.connect(self.database)) as connection:
-            connection.execute(
-                "UPDATE schema_metadata SET database_generation = ?",
-                (TARGET_AUTHORITY_GENERATION,),
-            )
-            connection.commit()
-
-        unsigned = {
-            key: value
-            for key, value in self.state.items()
-            if key not in {"schema_version", "kind", "document_sha256"}
-        }
-        unsigned["inventory_canary_project"] = "/home/example/Other"
-        wrong_project_state = cutover.seal(cutover.STATE_KIND, unsigned)
-        with self.assertRaisesRegex(cutover.CutoverError, "owner-bound"):
-            self._verify(state=wrong_project_state)
-
-    def test_direct_gate_rejects_wrong_inventory_generation(self) -> None:
-        inventory = json.loads(json.dumps(self.inventory))
-        inventory["authority"]["database_generation"] = "stale"
-        with self.assertRaisesRegex(cutover.CutoverError, "exact post-v13"):
-            self._verify(inventory=inventory)
-
-    def test_immutable_owner_command_is_exact_and_fails_closed(self) -> None:
-        successful = mock.Mock(
-            returncode=0,
-            stdout=cutover._canonical(self.inventory),
-            stderr=b"",
-        )
-        account = mock.Mock(pw_gid=2301)
-        with mock.patch.object(cutover.pwd, "getpwuid", return_value=account), mock.patch.object(
-            cutover.subprocess, "run", return_value=successful
-        ) as run:
-            result = cutover._inventory_as_repository_owner(
-                release=self.release,
-                project=INVENTORY_PROJECT,
-                owner_uid=OWNER_UID,
-            )
-        self.assertEqual(result, self.inventory)
-        command = run.call_args.args[0]
-        self.assertEqual(
-            command,
-            [
-                "/usr/bin/setpriv",
-                "--reuid",
-                str(OWNER_UID),
-                "--regid",
-                "2301",
-                "--init-groups",
-                "--reset-env",
-                "/usr/bin/python3",
-                str(self.client),
-                "inventory",
-                "--project",
-                INVENTORY_PROJECT,
-                "--no-docker",
-                "--compact-json",
-            ],
-        )
-        self.assertEqual(run.call_args.kwargs["timeout"], 15.0)
-        self.assertEqual(
-            run.call_args.kwargs["env"],
-            {
-                "PATH": "/usr/sbin:/usr/bin",
-                "LANG": "C.UTF-8",
-                "PYTHONDONTWRITEBYTECODE": "1",
-            },
-        )
-
-        failures = (
-            mock.Mock(returncode=3, stdout=b"{}", stderr=b"failed"),
-            mock.Mock(returncode=0, stdout=b"{", stderr=b""),
-            mock.Mock(
-                returncode=0,
-                stdout=b"x" * (cutover.MAX_DOCUMENT_BYTES + 1),
-                stderr=b"",
-            ),
-        )
-        for completed in failures:
-            with self.subTest(completed=completed), mock.patch.object(
-                cutover.pwd, "getpwuid", return_value=account
-            ), mock.patch.object(cutover.subprocess, "run", return_value=completed):
-                with self.assertRaises(cutover.CutoverError):
-                    cutover._inventory_as_repository_owner(
-                        release=self.release,
-                        project=INVENTORY_PROJECT,
-                        owner_uid=OWNER_UID,
-                    )
-
 
 class CutoverPersistenceTests(unittest.TestCase):
     def test_first_deployment_bootstrap_failure_then_exact_replay(self) -> None:
@@ -2681,189 +2157,6 @@ class CutoverPersistenceTests(unittest.TestCase):
             "issues": [],
         }
 
-    def test_repository_owner_capture_rejects_root_symlink_missing_and_toctou(self) -> None:
-        with tempfile.TemporaryDirectory() as raw:
-            root = Path(raw)
-            target = root / "repository"
-            target.mkdir()
-            owner_uid = os.geteuid() if os.geteuid() > 0 else 12345
-            if os.geteuid() == 0:
-                os.chown(target, owner_uid, os.getegid())
-            self.assertEqual(
-                cutover._authoritative_repository_owner_uid(str(target)), owner_uid
-            )
-            root_owned_values = list(root.lstat())
-            root_owned_values[stat.ST_UID] = 0
-            root_owned = os.stat_result(root_owned_values)
-            with mock.patch.object(Path, "lstat", return_value=root_owned), mock.patch.object(
-                os, "fstat", return_value=root_owned
-            ):
-                with self.assertRaises(cutover.CutoverError):
-                    cutover._authoritative_repository_owner_uid(str(root))
-            with self.assertRaises(cutover.CutoverError):
-                cutover._authoritative_repository_owner_uid(str(root / "missing"))
-            link = root / "repository-link"
-            link.symlink_to(target, target_is_directory=True)
-            with self.assertRaises(cutover.CutoverError):
-                cutover._authoritative_repository_owner_uid(str(link))
-
-            before = target.lstat()
-            changed_values = list(before)
-            changed_values[stat.ST_INO] = int(before.st_ino) + 1
-            changed = os.stat_result(changed_values)
-            with mock.patch.object(Path, "lstat", side_effect=[before, changed]):
-                with self.assertRaisesRegex(cutover.CutoverError, "changed"):
-                    cutover._authoritative_repository_owner_uid(str(target))
-
-    def test_authority_export_requires_authoritative_owner_enrollment(self) -> None:
-        with tempfile.TemporaryDirectory() as raw:
-            root = Path(raw)
-            os.chmod(root, 0o700)
-            database = root / "authority.sqlite3"
-            owner_uid = 12345
-            with closing(sqlite3.connect(database)) as connection:
-                connection.executescript(
-                    """
-                    CREATE TABLE schema_metadata(
-                        singleton INTEGER PRIMARY KEY,
-                        schema_version INTEGER NOT NULL,
-                        database_generation TEXT NOT NULL,
-                        migration_state TEXT NOT NULL
-                    );
-                    CREATE TABLE broker_repository_enrollments(repo_id TEXT, uid INTEGER, account_id TEXT, enabled INTEGER, valid_until_epoch INTEGER);
-                    CREATE TABLE broker_acl_principals(uid INTEGER, account_id TEXT, enabled INTEGER);
-                    CREATE TABLE repositories(repo_id TEXT PRIMARY KEY, canonical_root TEXT NOT NULL, generation INTEGER NOT NULL, state TEXT NOT NULL);
-                    CREATE TABLE repository_installations(repo_id TEXT PRIMARY KEY, status TEXT NOT NULL, startup_fenced INTEGER NOT NULL);
-                    CREATE TABLE repository_owners(
-                        repo_id TEXT PRIMARY KEY,
-                        owner_uid INTEGER NOT NULL,
-                        repository_generation INTEGER NOT NULL,
-                        authority_generation TEXT NOT NULL,
-                        evidence_sha256 TEXT NOT NULL
-                    );
-                    CREATE TABLE repository_owner_transfers(
-                        repo_id TEXT NOT NULL,
-                        owner_uid INTEGER NOT NULL,
-                        repository_generation INTEGER NOT NULL,
-                        authority_generation TEXT NOT NULL,
-                        evidence_sha256 TEXT NOT NULL
-                    );
-                    """
-                )
-                evidence = "a" * 64
-                connection.execute(
-                    "INSERT INTO schema_metadata VALUES (1, 13, ?, 'ready')",
-                    (AUTHORITY_GENERATION,),
-                )
-                connection.execute("INSERT INTO broker_acl_principals VALUES (?, 'api', 1)", (owner_uid + 1,))
-                connection.execute(
-                    "INSERT INTO broker_repository_enrollments VALUES ('repo-alpha', ?, 'api', 1, 2000000000)",
-                    (owner_uid + 1,),
-                )
-                connection.execute("INSERT INTO repositories VALUES ('repo-alpha', '/unused', 7, 'active')")
-                connection.execute("INSERT INTO repository_installations VALUES ('repo-alpha', 'installed', 0)")
-                connection.execute(
-                    "INSERT INTO repository_owners VALUES ('repo-alpha', ?, 7, ?, ?)",
-                    (owner_uid, AUTHORITY_GENERATION, evidence),
-                )
-                connection.execute(
-                    "INSERT INTO repository_owner_transfers VALUES ('repo-alpha', ?, 7, ?, ?)",
-                    (owner_uid, AUTHORITY_GENERATION, evidence),
-                )
-                connection.commit()
-            os.chmod(database, 0o600)
-            with self.assertRaisesRegex(cutover.CutoverError, "invalid or ambiguous"):
-                cutover.export_authority_test_repositories(
-                    database,
-                    authority_uid=os.geteuid(),
-                    now_epoch=1_900_000_000,
-                )
-
-    def test_authority_export_rejects_installed_repository_without_owner_enrollment(self) -> None:
-        with tempfile.TemporaryDirectory() as raw:
-            root = Path(raw)
-            os.chmod(root, 0o700)
-            database = root / "authority.sqlite3"
-            owner_uid = os.geteuid() if os.geteuid() > 0 else 12345
-            with closing(sqlite3.connect(database)) as connection:
-                connection.executescript(
-                    """
-                    CREATE TABLE schema_metadata(
-                        singleton INTEGER PRIMARY KEY,
-                        schema_version INTEGER NOT NULL,
-                        database_generation TEXT NOT NULL,
-                        migration_state TEXT NOT NULL
-                    );
-                    CREATE TABLE broker_repository_enrollments(repo_id TEXT, uid INTEGER, account_id TEXT, enabled INTEGER, valid_until_epoch INTEGER);
-                    CREATE TABLE broker_acl_principals(uid INTEGER, account_id TEXT, enabled INTEGER);
-                    CREATE TABLE repositories(repo_id TEXT PRIMARY KEY, canonical_root TEXT NOT NULL, generation INTEGER NOT NULL, state TEXT NOT NULL);
-                    CREATE TABLE repository_installations(repo_id TEXT PRIMARY KEY, status TEXT NOT NULL, startup_fenced INTEGER NOT NULL);
-                    CREATE TABLE repository_owners(
-                        repo_id TEXT PRIMARY KEY,
-                        owner_uid INTEGER NOT NULL,
-                        repository_generation INTEGER NOT NULL,
-                        authority_generation TEXT NOT NULL,
-                        evidence_sha256 TEXT NOT NULL
-                    );
-                    CREATE TABLE repository_owner_transfers(
-                        repo_id TEXT NOT NULL,
-                        owner_uid INTEGER NOT NULL,
-                        repository_generation INTEGER NOT NULL,
-                        authority_generation TEXT NOT NULL,
-                        evidence_sha256 TEXT NOT NULL
-                    );
-                    """
-                )
-                evidence = "b" * 64
-                connection.execute(
-                    "INSERT INTO schema_metadata VALUES (1, 13, ?, 'ready')",
-                    (AUTHORITY_GENERATION,),
-                )
-                connection.execute(
-                    "INSERT INTO broker_acl_principals VALUES (?, 'owner', 1)",
-                    (owner_uid,),
-                )
-                connection.execute(
-                    "INSERT INTO broker_repository_enrollments VALUES ('repo-ready', ?, 'owner', 1, 2000000000)",
-                    (owner_uid,),
-                )
-                connection.execute(
-                    "INSERT INTO repositories VALUES ('repo-ready', '/ready', 0, 'active')"
-                )
-                connection.execute(
-                    "INSERT INTO repository_installations VALUES ('repo-ready', 'installed', 0)"
-                )
-                connection.execute(
-                    "INSERT INTO repository_owners VALUES ('repo-ready', ?, 0, ?, ?)",
-                    (owner_uid, AUTHORITY_GENERATION, evidence),
-                )
-                connection.execute(
-                    "INSERT INTO repository_owner_transfers VALUES ('repo-ready', ?, 0, ?, ?)",
-                    (owner_uid, AUTHORITY_GENERATION, evidence),
-                )
-                connection.execute(
-                    "INSERT INTO repositories VALUES ('repo-stale', '/tmp', 0, 'active')"
-                )
-                connection.execute(
-                    "INSERT INTO repository_installations VALUES ('repo-stale', 'installed', 0)"
-                )
-                connection.execute(
-                    "INSERT INTO repository_owners VALUES ('repo-stale', ?, 0, ?, ?)",
-                    (owner_uid, AUTHORITY_GENERATION, evidence),
-                )
-                connection.execute(
-                    "INSERT INTO repository_owner_transfers VALUES ('repo-stale', ?, 0, ?, ?)",
-                    (owner_uid, AUTHORITY_GENERATION, evidence),
-                )
-                connection.commit()
-            os.chmod(database, 0o600)
-            with self.assertRaisesRegex(cutover.CutoverError, "invalid or ambiguous"):
-                cutover.export_authority_test_repositories(
-                    database,
-                    authority_uid=os.geteuid(),
-                    now_epoch=1_900_000_000,
-                )
-
     def test_root_authority_repository_diagnostic_is_bounded_and_stable(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
@@ -2894,7 +2187,7 @@ class CutoverPersistenceTests(unittest.TestCase):
                         resource_kind TEXT, resource_id TEXT, policy_kind TEXT,
                         policy_immutable_fingerprint TEXT,
                         target_immutable_fingerprint TEXT,
-                        control_binding_id TEXT, ownership_fingerprint TEXT,
+                        control_binding_id TEXT, observation_fingerprint TEXT,
                         native_identity_fingerprint TEXT, captured_value TEXT,
                         restore_required INTEGER, status TEXT,
                         docker_restart_policy TEXT, supervisor_manager TEXT,
@@ -2995,15 +2288,10 @@ class CutoverPersistenceTests(unittest.TestCase):
                         ),
                     )
 
-    def test_capability_policy_is_authority_bound_private_and_idempotent(self) -> None:
+    def test_host_routing_profile_is_reconstructed_without_access_state(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
             os.chmod(root, 0o700)
-            repository_root = root / "repo-alpha"
-            repository_root.mkdir()
-            owner_uid = os.geteuid() if os.geteuid() > 0 else 12345
-            if os.geteuid() == 0:
-                os.chown(repository_root, owner_uid, os.getegid())
             database = root / "authority.sqlite3"
             with closing(sqlite3.connect(database)) as connection:
                 connection.executescript(
@@ -3013,18 +2301,6 @@ class CutoverPersistenceTests(unittest.TestCase):
                         schema_version INTEGER NOT NULL,
                         database_generation TEXT NOT NULL,
                         migration_state TEXT NOT NULL
-                    );
-                    CREATE TABLE broker_repository_enrollments(
-                        repo_id TEXT NOT NULL,
-                        uid INTEGER NOT NULL,
-                        account_id TEXT NOT NULL,
-                        enabled INTEGER NOT NULL,
-                        valid_until_epoch INTEGER NOT NULL
-                    );
-                    CREATE TABLE broker_acl_principals(
-                        uid INTEGER NOT NULL,
-                        account_id TEXT NOT NULL,
-                        enabled INTEGER NOT NULL
                     );
                     CREATE TABLE repositories(
                         repo_id TEXT PRIMARY KEY,
@@ -3036,362 +2312,100 @@ class CutoverPersistenceTests(unittest.TestCase):
                         repo_id TEXT PRIMARY KEY,
                         status TEXT NOT NULL,
                         startup_fenced INTEGER NOT NULL
-                    );
-                    CREATE TABLE repository_owners(
-                        repo_id TEXT PRIMARY KEY,
-                        owner_uid INTEGER NOT NULL,
-                        repository_generation INTEGER NOT NULL,
-                        authority_generation TEXT NOT NULL,
-                        evidence_sha256 TEXT NOT NULL
-                    );
-                    CREATE TABLE repository_owner_transfers(
-                        repo_id TEXT NOT NULL,
-                        owner_uid INTEGER NOT NULL,
-                        repository_generation INTEGER NOT NULL,
-                        authority_generation TEXT NOT NULL,
-                        evidence_sha256 TEXT NOT NULL
-                    );
-                    """
-                )
-                evidence = "c" * 64
-                connection.execute(
-                    "INSERT INTO schema_metadata VALUES (1, 13, ?, 'ready')",
-                    (AUTHORITY_GENERATION,),
-                )
-                connection.execute(
-                    "INSERT INTO broker_acl_principals VALUES (?, ?, 1)",
-                    (owner_uid, "owner"),
-                )
-                connection.execute(
-                    "INSERT INTO broker_repository_enrollments VALUES (?, ?, ?, 1, ?)",
-                    ("repo-alpha", owner_uid, "owner", 2_000_000_000),
-                )
-                connection.execute(
-                    "INSERT INTO broker_acl_principals VALUES (?, ?, 1)",
-                    (owner_uid + 1, cutover.API_BROKER_ACCOUNT),
-                )
-                connection.execute(
-                    "INSERT INTO broker_repository_enrollments VALUES (?, ?, ?, 1, ?)",
-                    (
-                        "repo-alpha",
-                        owner_uid + 1,
-                        cutover.API_BROKER_ACCOUNT,
-                        2_000_000_000,
-                    ),
-                )
-                connection.execute(
-                    "INSERT INTO repositories VALUES (?, ?, 7, 'active')",
-                    ("repo-alpha", str(repository_root)),
-                )
-                connection.execute(
-                    "INSERT INTO repository_installations VALUES (?, 'installed', 0)",
-                    ("repo-alpha",),
-                )
-                connection.execute(
-                    "INSERT INTO repository_owners VALUES (?, ?, 7, ?, ?)",
-                    ("repo-alpha", owner_uid, AUTHORITY_GENERATION, evidence),
-                )
-                connection.execute(
-                    "INSERT INTO repository_owner_transfers VALUES (?, ?, 7, ?, ?)",
-                    ("repo-alpha", owner_uid, AUTHORITY_GENERATION, evidence),
-                )
-                connection.commit()
-            os.chmod(database, 0o600)
-            export_path = root / "authority-repositories.json"
-            exported = cutover.publish_authority_repository_export(
-                authority_database=database,
-                attestation=export_path,
-                authority_uid=os.geteuid(),
-                now_epoch=1_900_000_000,
-            )
-            self.assertEqual(export_path.stat().st_mode & 0o777, 0o600)
-            self.assertEqual(exported["repository_count"], 1)
-            self.assertEqual(
-                cutover.read_private_json(export_path, uid=os.geteuid())["repositories"],
-                [
-                    {
-                        "repository_id": "repo-alpha",
-                        "owner_uid": owner_uid,
-                        "repository_generation": 7,
-                    }
-                ],
-            )
-            self.assertEqual(
-                cutover.read_private_json(export_path, uid=os.geteuid())["kind"],
-                cutover.AUTHORITY_REPOSITORY_EXPORT_KIND,
-            )
-            destination = root / "test-execution-capabilities.json"
-            setup_reader = lambda repository_id, _owner_uid: self._ready_setup(
-                repository_id
-            )
-            arguments = {
-                "authority_database": database,
-                "snapshot_socket": root / "unused.sock",
-                "destination": destination,
-                "dogfood_repository_id": "repo-alpha",
-                "authority_uid": os.geteuid(),
-                "owner_gid": os.getegid(),
-                "now_epoch": 1_900_000_000,
-                "setup_reader": setup_reader,
-            }
-            first = cutover.publish_test_capability_policy(**arguments)
-            second = cutover.publish_test_capability_policy(**arguments)
-            self.assertTrue(first["created"])
-            self.assertFalse(second["created"])
-            self.assertEqual(destination.stat().st_mode & 0o777, 0o600)
-            self.assertEqual(
-                first["attestation"]["authority_generation"],
-                AUTHORITY_GENERATION,
-            )
-            self.assertEqual(
-                first["attestation"]["repository_grants"][0]["granted"],
-                [
-                    "credential.skydive-health-sweep-admin-v1",
-                    "network.loopback",
-                ],
-            )
-            self.assertEqual(
-                first["attestation"]["repository_grants"][0]["requested"],
-                first["attestation"]["repository_grants"][0]["granted"],
-            )
-            registry = cutover.SealedTestCapabilityRegistry.load(
-                destination,
-                expected_uid=os.geteuid(),
-                allow_missing=False,
-            )
-            credential_check = registry.check_requests(
-                repository_id="repo-alpha",
-                repository_generation=7,
-                credentials=("skydive-health-sweep-admin-v1",),
-            )
-            self.assertTrue(credential_check["ok"])
-            self.assertEqual(
-                credential_check["requested"],
-                ["credential.skydive-health-sweep-admin-v1"],
-            )
-
-    def test_api_profile_is_reconstructed_without_reusing_existing_contents(self) -> None:
-        with tempfile.TemporaryDirectory() as raw:
-            root = Path(raw)
-            os.chmod(root, 0o700)
-            database = root / "authority.sqlite3"
-            api_uid = os.geteuid() if os.geteuid() > 0 else 2302
-            with closing(sqlite3.connect(database)) as connection:
-                connection.executescript(
-                    """
-                    CREATE TABLE schema_metadata(
-                        singleton INTEGER PRIMARY KEY,
-                        schema_version INTEGER NOT NULL,
-                        database_generation TEXT NOT NULL,
-                        migration_state TEXT NOT NULL
-                    );
-                    CREATE TABLE broker_acl_principals(
-                        uid INTEGER PRIMARY KEY,
-                        account_id TEXT NOT NULL,
-                        enabled INTEGER NOT NULL
-                    );
-                    CREATE TABLE broker_repository_enrollments(
-                        repo_id TEXT NOT NULL,
-                        uid INTEGER NOT NULL,
-                        account_id TEXT NOT NULL,
-                        enabled INTEGER NOT NULL,
-                        issued_at TEXT NOT NULL,
-                        valid_until_epoch INTEGER NOT NULL
-                    );
-                    CREATE TABLE repositories(
-                        repo_id TEXT PRIMARY KEY,
-                        canonical_root TEXT NOT NULL,
-                        generation INTEGER NOT NULL,
-                        state TEXT NOT NULL
-                    );
-                    CREATE TABLE repository_owners(
-                        repo_id TEXT PRIMARY KEY,
-                        owner_uid INTEGER NOT NULL,
-                        repository_generation INTEGER NOT NULL
-                    );
-                    CREATE TABLE repository_installations(
-                        repo_id TEXT PRIMARY KEY,
-                        status TEXT NOT NULL,
-                        startup_fenced INTEGER NOT NULL
-                    );
-                    CREATE TABLE broker_resource_acl(
-                        uid INTEGER NOT NULL, repo_id TEXT NOT NULL,
-                        resource_kind TEXT NOT NULL, resource_id TEXT NOT NULL,
-                        enabled INTEGER NOT NULL
                     );
                     CREATE TABLE server_definitions(
                         server_definition_id TEXT PRIMARY KEY,
-                        repo_id TEXT NOT NULL, name TEXT NOT NULL
+                        repo_id TEXT NOT NULL,
+                        name TEXT NOT NULL
                     );
                     CREATE TABLE docker_resources(
                         docker_resource_id TEXT PRIMARY KEY,
-                        current_name TEXT NOT NULL,
-                        full_container_id TEXT NOT NULL
-                    );
-                    CREATE TABLE broker_compose_acl(
-                        uid INTEGER NOT NULL, repo_id TEXT NOT NULL,
-                        compose_definition_id TEXT NOT NULL,
-                        enabled INTEGER NOT NULL
+                        repo_id TEXT NOT NULL,
+                        current_name TEXT,
+                        full_container_id TEXT
                     );
                     CREATE TABLE broker_compose_definitions(
                         compose_definition_id TEXT PRIMARY KEY,
-                        repo_id TEXT NOT NULL, enabled INTEGER NOT NULL
-                    );
-                    CREATE TABLE broker_ephemeral_acl(
-                        uid INTEGER NOT NULL, repo_id TEXT NOT NULL,
-                        template_id TEXT NOT NULL, operation TEXT NOT NULL,
+                        repo_id TEXT NOT NULL,
                         enabled INTEGER NOT NULL
                     );
+                    CREATE TABLE broker_compose_run_once_services(
+                        compose_definition_id TEXT NOT NULL,
+                        service_name TEXT NOT NULL,
+                        max_timeout_seconds INTEGER NOT NULL,
+                        ordinal INTEGER NOT NULL
+                    );
                     CREATE TABLE ephemeral_container_templates(
-                        template_id TEXT PRIMARY KEY, repo_id TEXT NOT NULL,
-                        name TEXT NOT NULL, secret_policy_kind TEXT,
-                        secret_binding_id TEXT, enabled INTEGER NOT NULL
+                        template_id TEXT PRIMARY KEY,
+                        repo_id TEXT NOT NULL,
+                        name TEXT NOT NULL,
+                        secret_policy_kind TEXT,
+                        secret_binding_id TEXT,
+                        enabled INTEGER NOT NULL
                     );
                     """
                 )
                 connection.execute(
-                    "INSERT INTO schema_metadata VALUES (1, 13, ?, 'ready')",
+                    "INSERT INTO schema_metadata VALUES (1, 15, ?, 'ready')",
                     (TARGET_AUTHORITY_GENERATION,),
-                )
-                connection.execute(
-                    "INSERT INTO broker_acl_principals VALUES (?, ?, 1)",
-                    (api_uid, cutover.API_BROKER_ACCOUNT),
-                )
-                connection.execute(
-                    "INSERT INTO broker_repository_enrollments VALUES (?, ?, ?, 1, ?, ?)",
-                    (
-                        "repo-alpha",
-                        api_uid,
-                        cutover.API_BROKER_ACCOUNT,
-                        "2026-07-28T00:00:00Z",
-                        2_000_000_000,
-                    ),
                 )
                 connection.execute(
                     "INSERT INTO repositories VALUES (?, ?, 7, 'active')",
                     ("repo-alpha", "/home/example/repo-alpha"),
                 )
                 connection.execute(
-                    "INSERT INTO repository_owners VALUES (?, ?, 7)",
-                    ("repo-alpha", 2301),
-                )
-                connection.execute(
                     "INSERT INTO repository_installations VALUES (?, 'installed', 0)",
                     ("repo-alpha",),
+                )
+                connection.executemany(
+                    "INSERT INTO docker_resources VALUES (?, ?, ?, ?)",
+                    (
+                        (
+                            "container-old",
+                            "repo-alpha",
+                            "database",
+                            "a" * 64,
+                        ),
+                        (
+                            "container-current",
+                            "repo-alpha",
+                            "database",
+                            "b" * 64,
+                        ),
+                    ),
                 )
                 connection.commit()
             os.chmod(database, 0o600)
             destination = root / "client-profiles.json"
+            destination.write_text('{"obsolete": true}', encoding="utf-8")
+            os.chmod(destination, 0o600)
             arguments = {
                 "authority_database": database,
                 "destination": destination,
-                "api_uid": api_uid,
-                "access_gid": os.getegid() if os.getegid() > 0 else 2310,
+                "validation_uid": max(os.geteuid(), 1),
                 "authority_uid": os.geteuid(),
-                "source_authority_generation": AUTHORITY_GENERATION,
-                "target_authority_generation": TARGET_AUTHORITY_GENERATION,
-                "now_epoch": 1_900_000_000,
             }
-            legacy_repository = {
-                "canonical_root": "/home/example/repo-alpha",
-                "repo_id": "repo-alpha",
-                "generation": 7,
-                "servers": {},
-                "containers": {},
-                "compose_definition_id": None,
-            }
-            legacy_variants = (
-                dict(legacy_repository),
-                {
-                    **legacy_repository,
-                    "account_id": cutover.API_BROKER_ACCOUNT,
-                    "enabled": True,
-                    "issued_at": "2026-07-28T00:00:00Z",
-                    "valid_until_epoch": 2_000_000_000,
-                },
-                {**legacy_repository, "ephemeral_templates": {}},
-                {
-                    **legacy_repository,
-                    "account_id": cutover.API_BROKER_ACCOUNT,
-                    "enabled": True,
-                    "issued_at": "2026-07-28T00:00:00Z",
-                    "valid_until_epoch": 2_000_000_000,
-                    "ephemeral_templates": {},
-                    "ephemeral_secret_policies": {},
-                    "ephemeral_image_prefetch_templates": [],
-                },
+            first = cutover.reconstruct_api_profile_from_authority(**arguments)
+            self.assertTrue(first["changed"])
+            rebuilt = json.loads(destination.read_text(encoding="utf-8"))
+            self.assertEqual(rebuilt["version"], 2)
+            self.assertEqual(
+                set(rebuilt["service"]), {"socket", "database_generation"}
             )
-            first = None
-            for legacy in legacy_variants:
-                destination.write_text(
-                    json.dumps(
-                        {
-                            "version": 1,
-                            "service": {
-                                "socket": cutover.AUTHORITY_SOCKET_PATH,
-                                "uid": os.geteuid(),
-                                "gid": arguments["access_gid"],
-                                "mode": "0660",
-                                "database_generation": AUTHORITY_GENERATION,
-                            },
-                            "clients": {
-                                str(api_uid): {
-                                    "account_id": cutover.API_BROKER_ACCOUNT,
-                                    "issued_at": "2026-07-28T00:00:00Z",
-                                    "valid_until_epoch": 2_000_000_000,
-                                    "repositories": [legacy],
-                                }
-                            },
-                        }
-                    ),
-                    encoding="utf-8",
-                )
-                os.chmod(destination, 0o644)
-                first = cutover.reconstruct_api_profile_from_authority(
-                    **arguments
-                )
-                self.assertTrue(first["changed"])
-                rebuilt = json.loads(destination.read_text(encoding="utf-8"))
-                self.assertEqual(
-                    rebuilt["clients"][str(api_uid)]["repositories"][0][
-                        "owner_uid"
-                    ],
-                    2301,
-                )
-            self.assertIsNotNone(first)
+            self.assertEqual(
+                rebuilt["repositories"][0]["repo_id"], "repo-alpha"
+            )
+            containers = rebuilt["repositories"][0]["containers"]
+            self.assertNotIn("database", containers)
+            self.assertEqual(containers["a" * 64], "container-old")
+            self.assertEqual(containers["b" * 64], "container-current")
+            self.assertEqual(containers["container-old"], "container-old")
+            self.assertEqual(containers["container-current"], "container-current")
+            self.assertNotIn("clients", rebuilt)
+            self.assertNotIn("permissions", destination.read_text(encoding="utf-8"))
+            self.assertEqual(destination.stat().st_mode & 0o777, 0o644)
             second = cutover.reconstruct_api_profile_from_authority(**arguments)
-            assert first is not None
             self.assertFalse(second["changed"])
-            with self.assertRaisesRegex(
-                cutover.CutoverError, "exact sealed target generation"
-            ):
-                cutover.reconstruct_api_profile_from_authority(
-                    **{
-                        **arguments,
-                        "target_authority_generation": str(uuid.uuid4()),
-                    }
-                )
-            self.assertEqual(destination.stat().st_mode & 0o777, 0o640)
-            self.assertNotIn(
-                '"database_generation": "authority-generation"',
-                destination.read_text(encoding="utf-8"),
-            )
-            self.assertFalse(
-                first["attestation"]["existing_profile_contents_reused"]
-            )
-            self.assertEqual(
-                first["attestation"]["repository_ids"], ["repo-alpha"]
-            )
-            self.assertEqual(
-                first["attestation"]["source_authority_generation"],
-                AUTHORITY_GENERATION,
-            )
-            self.assertEqual(
-                first["attestation"]["authority_generation"],
-                TARGET_AUTHORITY_GENERATION,
-            )
-            self.assertFalse(hasattr(cutover, "verify_api_profile_delegation"))
-            self.assertNotIn("verify-api-profile", cutover._parser().format_help())
 
     def test_sqlite_backup_is_private_verified_and_replayable(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

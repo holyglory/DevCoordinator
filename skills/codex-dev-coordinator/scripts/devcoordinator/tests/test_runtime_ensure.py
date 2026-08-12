@@ -151,6 +151,26 @@ class RuntimeEnsureContractTests(unittest.TestCase):
                 },
                 "target_unhealthy",
             ),
+            (
+                {
+                    "exact": True,
+                    "resource_kind": "service",
+                    "lifecycle": "unobserved",
+                    "pid": 4242,
+                    "listener_observable": None,
+                },
+                "target_unknown",
+            ),
+            (
+                {
+                    "exact": True,
+                    "resource_kind": "service",
+                    "lifecycle": "unobserved",
+                    "pid": None,
+                    "listener_observable": True,
+                },
+                "target_unknown",
+            ),
         )
         for observation, reason in cases:
             with self.subTest(reason=reason, observation=observation):
@@ -163,29 +183,36 @@ class RuntimeEnsureContractTests(unittest.TestCase):
                 self.assertIsNone(decision.action)
                 self.assertEqual(decision.reason, reason)
 
+    def test_exact_never_started_service_can_be_bootstrapped_to_ready(self) -> None:
+        decision = decide_runtime_ensure(
+            {
+                "exact": True,
+                "resource_kind": "service",
+                "resource_id": SERVER_ID,
+                "lifecycle": "unobserved",
+                "health_classification": "unobserved",
+                "pid": None,
+                "listener_observable": None,
+                "sampled_at": "2026-08-12T07:44:31Z",
+            },
+            desired_state="ready",
+            family_classified=True,
+        )
+
+        self.assertEqual(decision.observed_state, "stopped")
+        self.assertEqual(decision.action, "start")
+        self.assertEqual(decision.classification, "mutation_required")
+
 
 class RuntimeEnsureBackendTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.fixture = broker_runtime_tests.BrokerRuntimeAuthorizationTests(
+        self.fixture = broker_runtime_tests.BrokerRuntimeTests(
             "test_authorized_status_returns_concise_rich_repository_report"
         )
         self.fixture.setUp()
 
     def tearDown(self) -> None:
         self.fixture.tearDown()
-
-    def _grant(
-        self,
-        action: str,
-        *,
-        resource_kind: str = "docker",
-        resource_id: str = CONTAINER_ID,
-    ) -> None:
-        self.fixture._grant(
-            action,
-            resource_kind=resource_kind,
-            resource_id=resource_id,
-        )
 
     def _request(
         self,
@@ -235,7 +262,6 @@ class RuntimeEnsureBackendTests(unittest.TestCase):
         )
 
     def test_stopped_to_ready_mutates_once_and_returns_terminal_proof(self) -> None:
-        self._grant("start")
         request = self._request(
             operation_id="11111111-1111-4111-8111-111111111111"
         )
@@ -258,7 +284,6 @@ class RuntimeEnsureBackendTests(unittest.TestCase):
         self.assertNotIn(b"/repos/", encoded)
 
     def test_already_stopped_is_durable_noop_replay_and_conflict_safe(self) -> None:
-        self._grant("stop")
         operation_id = "22222222-2222-4222-8222-222222222222"
         request = self._request(
             desired_state="stopped", operation_id=operation_id
@@ -273,7 +298,6 @@ class RuntimeEnsureBackendTests(unittest.TestCase):
         self.assertFalse(first["result"]["mutation_performed"])
         self.assertEqual(self.fixture.actions.calls, [])
 
-        self._grant("start")
         conflict = self._reply(
             request=self._request(
                 desired_state="ready", operation_id=operation_id
@@ -284,7 +308,6 @@ class RuntimeEnsureBackendTests(unittest.TestCase):
         self.assertEqual(self.fixture.actions.calls, [])
 
     def test_running_to_stopped_invokes_only_stop(self) -> None:
-        self._grant("stop")
 
         def observer(store: CoordinatorStore) -> dict[str, object]:
             lifecycle = "running" if not self.fixture.actions.calls else None
@@ -307,11 +330,6 @@ class RuntimeEnsureBackendTests(unittest.TestCase):
         self,
     ) -> None:
         seed_postgres_database(self.fixture.persistence)
-        self._grant(
-            "start",
-            resource_kind="database_stack",
-            resource_id=DATABASE_ID,
-        )
 
         def observer(store: CoordinatorStore) -> dict[str, object]:
             started = bool(self.fixture.actions.calls)
@@ -341,8 +359,39 @@ class RuntimeEnsureBackendTests(unittest.TestCase):
             [("start", CONTAINER_ID, "a" * 64)],
         )
 
+    def test_database_start_waits_for_fresh_readiness_convergence(self) -> None:
+        seed_postgres_database(self.fixture.persistence)
+        after_start_observations = 0
+
+        def observer(store: CoordinatorStore) -> dict[str, object]:
+            nonlocal after_start_observations
+            started = bool(self.fixture.actions.calls)
+            if started:
+                after_start_observations += 1
+            ready = started and after_start_observations >= 3
+            return self.fixture._runtime_observer(
+                store,
+                lifecycle="running" if started else "stopped",
+                database_available=ready,
+            )
+
+        with mock.patch.object(broker_backend_module.time, "sleep") as sleep:
+            reply = self._reply(
+                request=self._request(
+                    target_kind="database_stack",
+                    resource_id=DATABASE_ID,
+                    operation_id="cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+                ),
+                service=self.fixture._service(observer=observer),
+            )
+
+        self.assertTrue(reply["result"]["ok"], reply)
+        self.assertEqual(reply["result"]["classification"], "ensured_ready")
+        self.assertGreaterEqual(after_start_observations, 3)
+        self.assertGreaterEqual(sleep.call_count, 2)
+        self.assertEqual(len(self.fixture.actions.calls), 1)
+
     def test_unclassified_family_requires_attention_without_host_mutation(self) -> None:
-        self._grant("start")
         now = utc_timestamp()
         with CoordinatorStore.open(
             self.fixture.persistence.database_path, expected_uid=os.geteuid()
@@ -381,10 +430,9 @@ class RuntimeEnsureBackendTests(unittest.TestCase):
         self.assertEqual(followed["result"]["status"], "needs_attention")
         self.assertEqual(followed["result"]["next_transition"], "reconcile")
 
-    def test_invoked_uncertain_outcome_is_retained_and_followed_as_uncertain(
+    def test_invocation_error_reconciles_to_exact_ready_state(
         self,
     ) -> None:
-        self._grant("start")
         operation_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
         request = self._request(operation_id=operation_id)
 
@@ -405,48 +453,244 @@ class RuntimeEnsureBackendTests(unittest.TestCase):
         self.assertTrue(first["ok"], first)
         self.assertEqual(first, replay)
         result = first["result"]
-        self.assertFalse(result["ok"])
-        self.assertEqual(result["classification"], "attention_required")
-        self.assertEqual(result["attention_reason"], "mutation_outcome_uncertain")
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["classification"], "ensured_ready")
         self.assertTrue(result["mutation_performed"])
-        self.assertFalse(result["terminal_proof"]["certain"])
+        self.assertTrue(result["terminal_proof"]["certain"])
         self.assertEqual(len(self.fixture.actions.calls), 1)
 
         followed = self._follow(operation_id)
         self.assertTrue(followed["ok"], followed)
         projection = followed["result"]
-        self.assertEqual(projection["status"], "needs_attention")
-        self.assertEqual(projection["phase"], "reconciliation_required")
-        self.assertEqual(projection["outcome_certainty"], "uncertain")
-        self.assertEqual(projection["error_classification"], "outcome_uncertain")
-        self.assertEqual(projection["next_transition"], "reconcile")
+        self.assertEqual(projection["status"], "succeeded")
+        self.assertEqual(projection["outcome_certainty"], "certain")
 
-    def test_non_worker_service_mutation_requires_attention(self) -> None:
-        self._grant("start", resource_kind="service", resource_id=SERVER_ID)
+    def test_invoked_outcome_stays_uncertain_when_reconciliation_is_unavailable(
+        self,
+    ) -> None:
+        operation_id = "abababab-abab-4bab-8bab-abababababab"
+        request = self._request(operation_id=operation_id)
+
+        def fail_after_invocation(target):
+            self.fixture.actions.calls.append(
+                ("start", target.docker_resource_id, target.full_container_id)
+            )
+            raise RuntimeError("injected uncertain host boundary")
+
+        def observer(store: CoordinatorStore) -> dict[str, object]:
+            if self.fixture.actions.calls:
+                raise RuntimeError("injected reconciliation outage")
+            return self.fixture._runtime_observer(store, lifecycle="stopped")
+
+        with mock.patch.object(
+            self.fixture.actions,
+            "docker_start",
+            side_effect=fail_after_invocation,
+        ):
+            first = self._reply(
+                request=request,
+                service=self.fixture._service(observer=observer),
+            )
+
+        result = first["result"]
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["classification"], "attention_required")
+        self.assertEqual(
+            result["attention_reason"], "mutation_outcome_uncertain"
+        )
+        self.assertTrue(result["mutation_performed"])
+        self.assertFalse(result["terminal_proof"]["certain"])
+
+        followed = self._follow(operation_id)
+        self.assertEqual(followed["result"]["status"], "needs_attention")
+        self.assertEqual(
+            followed["result"]["outcome_certainty"], "uncertain"
+        )
+
+    def test_docker_isolation_preflight_rejection_is_certain_and_nonmutating(
+        self,
+    ) -> None:
+        with mock.patch.object(
+            self.fixture.actions,
+            "docker_start",
+            side_effect=broker_backend_module.BrokerBackendError(
+                "project_isolation_mismatch",
+                "container is outside its repository cgroup",
+            ),
+        ):
+            reply = self._reply(
+                request=self._request(
+                    operation_id="acacacac-acac-4cac-8cac-acacacacacac"
+                )
+            )
+
+        result = reply["result"]
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["classification"], "attention_required")
+        self.assertEqual(
+            result["attention_reason"], "mutation_preflight_failed"
+        )
+        self.assertFalse(result["mutation_performed"])
+        self.assertTrue(result["terminal_proof"]["certain"])
+
+    def test_non_worker_service_is_ensured_by_exact_peer_uid_supervisor(self) -> None:
         with CoordinatorStore.open(
             self.fixture.persistence.database_path, expected_uid=os.geteuid()
         ) as store:
             with store.immediate_transaction() as connection:
                 self.fixture._seed_stopped_worker_observation(connection)
+        calls: list[tuple[object, ...]] = []
 
-        reply = self._reply(
-            request=self._request(
-                target_kind="service",
-                resource_id=SERVER_ID,
-                operation_id="77777777-7777-4777-8777-777777777777",
+        class FakeController:
+            def __init__(self, _store, **kwargs):
+                calls.append(("init", kwargs["execution_uid"]))
+
+            def start(self, **kwargs):
+                calls.append(("start", kwargs["keep_alive"]))
+                return {
+                    "status": "running",
+                    "health": {
+                        "ok": True,
+                        "classification": "supervised_process_running",
+                    },
+                    "supervision": {"breaker_state": "armed"},
+                }
+
+        with mock.patch.object(
+            broker_backend_module, "WorkerController", FakeController
+        ):
+            reply = self._reply(
+                request=self._request(
+                    target_kind="service",
+                    resource_id=SERVER_ID,
+                    operation_id="77777777-7777-4777-8777-777777777777",
+                )
             )
-        )
 
         self.assertTrue(reply["ok"], reply)
-        self.assertEqual(reply["result"]["classification"], "attention_required")
+        self.assertEqual(reply["result"]["classification"], "ensured_ready")
+        self.assertTrue(reply["result"]["mutation_performed"])
         self.assertEqual(
-            reply["result"]["attention_reason"], "runtime_supervisor_required"
+            calls,
+            [("init", os.geteuid()), ("start", False)],
         )
-        self.assertFalse(reply["result"]["mutation_performed"])
         self.assertEqual(self.fixture.actions.calls, [])
 
+    def test_never_started_service_is_ensured_by_exact_peer_uid_supervisor(
+        self,
+    ) -> None:
+        calls: list[tuple[object, ...]] = []
+
+        class FakeController:
+            def __init__(self, _store, **kwargs):
+                calls.append(("init", kwargs["execution_uid"]))
+
+            def start(self, **kwargs):
+                calls.append(("start", kwargs["keep_alive"]))
+                return {
+                    "status": "running",
+                    "health": {
+                        "ok": True,
+                        "classification": "supervised_process_running",
+                    },
+                    "supervision": {"breaker_state": "armed"},
+                }
+
+        with mock.patch.object(
+            broker_backend_module, "WorkerController", FakeController
+        ):
+            reply = self._reply(
+                request=self._request(
+                    target_kind="service",
+                    resource_id=SERVER_ID,
+                    operation_id="12121212-1212-4212-8212-121212121212",
+                )
+            )
+
+        self.assertTrue(reply["ok"], reply)
+        self.assertEqual(reply["result"]["classification"], "ensured_ready")
+        self.assertTrue(reply["result"]["mutation_performed"])
+        self.assertEqual(calls, [("init", os.geteuid()), ("start", False)])
+
+    def test_network_service_ensure_rolls_back_when_listener_identity_is_wrong(
+        self,
+    ) -> None:
+        with CoordinatorStore.open(
+            self.fixture.persistence.database_path, expected_uid=os.geteuid()
+        ) as store:
+            with store.immediate_transaction() as connection:
+                now = utc_timestamp()
+                self.fixture._seed_stopped_worker_observation(connection)
+                connection.execute(
+                    """
+                    INSERT INTO port_assignments(
+                        assignment_id, host_id, repo_id, server_name, port,
+                        status, generation, created_at, updated_at
+                    ) VALUES ('ensure-network-web', ?, ?, 'web', 3112,
+                              'active', 0, ?, ?)
+                    """,
+                    (HOST_ID, PROJECT_ID, now, now),
+                )
+        self.fixture.actions.listener_evidence = {
+            "pid": 99_998,
+            "process_identity": "linux:99998:unrelated",
+            "cwd": "/repos/alpha",
+            "canonical_root": "/repos/alpha",
+            "port": 3112,
+            "protocol": "tcp",
+        }
+        calls: list[str] = []
+
+        class FakeController:
+            def __init__(self, _store, **_kwargs):
+                pass
+
+            def start(self, **_kwargs):
+                calls.append("start")
+                return {
+                    "status": "running",
+                    "pid": 42_006,
+                    "process_start_time": "ensure-listener-start",
+                    "health": {
+                        "ok": True,
+                        "classification": "supervised_process_running",
+                    },
+                    "supervision": {"breaker_state": "armed"},
+                }
+
+            def stop(self, **_kwargs):
+                calls.append("stop")
+                return {
+                    "status": "stopped",
+                    "health": {"ok": False, "classification": "stopped"},
+                    "supervision": {"breaker_state": "armed"},
+                    "terminal_process_proof": {
+                        "certain": True,
+                        "state": "absent",
+                    },
+                }
+
+        with mock.patch.object(
+            broker_backend_module, "WorkerController", FakeController
+        ):
+            reply = self._reply(
+                request=self._request(
+                    target_kind="service",
+                    resource_id=SERVER_ID,
+                    operation_id="78787878-7878-4878-8878-787878787878",
+                )
+            )
+
+        self.assertTrue(reply["ok"], reply)
+        self.assertFalse(reply["result"]["ok"])
+        self.assertEqual(reply["result"]["classification"], "attention_required")
+        self.assertEqual(
+            reply["result"]["terminal_proof"]["observed_state"], "stopped"
+        )
+        self.assertTrue(reply["result"]["terminal_proof"]["certain"])
+        self.assertEqual(calls, ["start", "stop"])
+
     def test_stale_repository_generation_is_rejected_before_observation(self) -> None:
-        self._grant("start")
 
         reply = self._reply(
             request=self._request(
@@ -461,7 +705,6 @@ class RuntimeEnsureBackendTests(unittest.TestCase):
 
     def test_supervised_worker_start_does_not_rearm_or_replace_policy(self) -> None:
         self.fixture._prepare_worker_replacement()
-        self._grant("start", resource_kind="service", resource_id=SERVER_ID)
         calls: list[tuple[object, ...]] = []
 
         class FakeController:

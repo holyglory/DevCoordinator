@@ -124,35 +124,6 @@ def _issue_summary(value: object) -> dict[str, str]:
     }
 
 
-def _capability_policy_summary(value: object) -> dict[str, object] | None:
-    if value is None:
-        return None
-    if not isinstance(value, Mapping):
-        return {"ok": False, "status": "invalid"}
-    missing_raw = value.get("missing", ())
-    missing_values = (
-        list(missing_raw)
-        if isinstance(missing_raw, (list, tuple))
-        else ["invalid-missing-list"]
-    )
-    retained_count = value.get("missing_count")
-    missing_count = (
-        retained_count
-        if type(retained_count) is int and retained_count >= len(missing_values)
-        else len(missing_values)
-    )
-    visible = [
-        _bounded_output_text(item, maximum_bytes=96) for item in missing_values[:8]
-    ]
-    return {
-        "ok": value.get("ok") is True,
-        "missing_count": missing_count,
-        "missing": visible,
-        "truncated": value.get("truncated") is True
-        or missing_count > len(visible),
-    }
-
-
 def _require_agent_envelope(
     document: dict[str, Any], *, surface: str
 ) -> dict[str, Any]:
@@ -253,13 +224,21 @@ def _add_explicit_repository_source(parser: argparse.ArgumentParser) -> None:
 
 
 def _add_run_repository(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument(
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument(
         "--repository-id",
         dest="repository",
-        required=True,
         type=_opaque_id,
-        help="immutable repository identity that owns the plan or run",
+        help="immutable repository identity when a current local route is present",
     )
+    source.add_argument(
+        "--root-repo",
+        help="canonical repository root to resolve through current authority state",
+    )
+
+
+def _add_submit_repository(parser: argparse.ArgumentParser) -> None:
+    _add_run_repository(parser)
 
 
 def add_universal_test_cli_parser(subparsers: Any) -> argparse.ArgumentParser:
@@ -282,7 +261,7 @@ def add_universal_test_cli_parser(subparsers: Any) -> argparse.ArgumentParser:
         ("validate", "validate the manifest contract without executing tests"),
         (
             "doctor",
-            "validate the contract and protected repository capability policy",
+            "validate the contract and host-wide execution prerequisites",
         ),
     ):
         command = manifest_actions.add_parser(action, help=help_text)
@@ -338,7 +317,7 @@ def add_universal_test_cli_parser(subparsers: Any) -> argparse.ArgumentParser:
     submit = actions.add_parser(
         "submit", help="enqueue a registered plan and return immediately"
     )
-    _add_run_repository(submit)
+    _add_submit_repository(submit)
     submit.add_argument("--plan-id", required=True, type=_opaque_id)
     submit.add_argument("--operation-id", required=True, type=_operation_id)
 
@@ -626,10 +605,6 @@ def _bounded_doctor_envelope(document: dict[str, Any]) -> dict[str, Any]:
             "issues": False,
         },
     )
-    if "capability_policy" in sanitized:
-        sanitized["capability_policy"] = _capability_policy_summary(
-            sanitized["capability_policy"]
-        )
     if "broker_profile_error" in sanitized:
         sanitized["broker_profile_error"] = _BROKER_PROFILE_ERROR
     if _encoded_size(sanitized) <= MAX_AGENT_ENVELOPE_BYTES:
@@ -709,90 +684,12 @@ def _bounded_doctor_envelope(document: dict[str, Any]) -> dict[str, Any]:
         for key in ("manifest_schema", "manifest_fingerprint"):
             if key in document:
                 candidate[key] = document[key]
-        if "capability_policy" in sanitized:
-            candidate["capability_policy"] = sanitized["capability_policy"]
         if "broker_profile_error" in sanitized:
             candidate["broker_profile_error"] = _BROKER_PROFILE_ERROR
         if _encoded_size(candidate) <= MAX_AGENT_ENVELOPE_BYTES:
             return candidate
     raise UniversalTestCliError(
         "manifest doctor exceeds the 8 KiB default agent output contract"
-    )
-
-
-def _doctor_capability_policy(
-    health: dict[str, Any], root: Path, broker_profile: object | None
-) -> dict[str, Any]:
-    if not health.get("manifest_fingerprint"):
-        return _bounded_doctor_envelope(health)
-    issues = list(health.get("issues", ()))
-    policy = None
-    if broker_profile is None:
-        issues.append(
-            {
-                "severity": "error",
-                "code": "capability_policy_unavailable",
-                "message": "sealed test capability policy could not be checked without the protected broker profile",
-            }
-        )
-    else:
-        try:
-            repository_id, _enrolled = _repository_id(root, broker_profile)
-            setup = _call_scheduler(
-                broker_profile,
-                "test_repository_setup",
-                action="manifest doctor",
-                repository=repository_id,
-            )
-            policy = setup.get("capability_policy") if setup is not None else None
-        except Exception:
-            issues.append(
-                {
-                    "severity": "error",
-                    "code": "capability_policy_unavailable",
-                    "message": "sealed test capability policy could not be checked",
-                }
-            )
-        if policy is not None:
-            if not isinstance(policy, Mapping) or policy.get("ok") is not True:
-                summary = _capability_policy_summary(policy)
-                missing_count = (
-                    summary.get("missing_count", 0)
-                    if isinstance(summary, Mapping)
-                    else 0
-                )
-                issues.append(
-                    {
-                        "severity": "error",
-                        "code": "capability_policy_missing",
-                        "message": (
-                            "sealed test capability policy is incomplete; "
-                            f"missing grant count: {missing_count}"
-                        ),
-                    }
-                )
-        elif not any(
-            issue.get("code") == "capability_policy_unavailable"
-            for issue in issues
-        ):
-            issues.append(
-                {
-                    "severity": "error",
-                    "code": "capability_policy_unavailable",
-                    "message": "broker setup omitted sealed test capability policy status",
-                }
-            )
-    errors = sum(issue.get("severity") == "error" for issue in issues)
-    warnings = sum(issue.get("severity") == "warning" for issue in issues)
-    return _bounded_doctor_envelope(
-        {
-            **health,
-            "ok": errors == 0,
-            "status": "invalid" if errors else health.get("status", "ready"),
-            "issues": issues,
-            "warning_count": warnings,
-            "capability_policy": _capability_policy_summary(policy),
-        }
     )
 
 
@@ -967,14 +864,27 @@ def _local_repository_id(root: Path) -> str:
     return "local-" + hashlib.sha256(str(root).encode("utf-8")).hexdigest()[:32]
 
 
+def _resolved_broker_repository(root: Path, broker_profile: object) -> object:
+    """Resolve one already-adopted repository without mutating first-use state."""
+
+    resolver = getattr(broker_profile, "resolve_repository", None)
+    if callable(resolver):
+        repository = resolver(str(root))
+    else:
+        repository = broker_profile.repository(str(root))  # type: ignore[attr-defined]
+    if repository is None:
+        raise LookupError(str(root))
+    return repository
+
+
 def _repository_id(root: Path, broker_profile: object | None) -> tuple[str, bool]:
     if broker_profile is None:
         return _local_repository_id(root), False
     try:
-        repository = broker_profile.repository(str(root))  # type: ignore[attr-defined]
+        repository = _resolved_broker_repository(root, broker_profile)
     except Exception as error:
         raise UniversalTestCliError(
-            "root repository is not uniquely enrolled in the configured broker profile"
+            "root repository is not uniquely configured in the configured broker profile"
         ) from error
     return str(repository.repo_id), True
 
@@ -1042,10 +952,6 @@ def _plan_registration_summary(
         "snapshot_id": plan.source.snapshot_id,
         "registered": raw.get("registered", True) is True,
     }
-    if "capability_policy" in raw:
-        summary["capability_policy"] = _capability_policy_summary(
-            raw.get("capability_policy")
-        )
     return summary
 
 
@@ -1186,7 +1092,7 @@ def _broker_plan_preview(
 ) -> dict[str, Any] | None:
     """Return one validated broker plan, or ``None`` when preview is absent."""
 
-    repository_id, enrolled = _repository_id(root, broker_profile)
+    repository_id, configured = _repository_id(root, broker_profile)
     preview = _call_scheduler(
         broker_profile,
         "preview_test_plan",
@@ -1261,7 +1167,7 @@ def _broker_plan_preview(
         "classification": "broker_test_plan",
         "agent": agent,
         "operation_id": operation_id,
-        "broker_enrolled": enrolled,
+        "broker_configured": configured,
         "attestable": plan.source.mode is SourceMode.IMMUTABLE,
         "plan": _compact_plan_document(plan) if compact else plan.to_document(),
         "submission": {
@@ -1355,7 +1261,7 @@ def build_local_plan(
         if raw_changes
         else discover_changes(effective)
     )
-    repository_id, enrolled = _repository_id(root, broker_profile)
+    repository_id, configured = _repository_id(root, broker_profile)
     content_fingerprint = _live_source_fingerprint(
         effective,
         manifest,
@@ -1408,7 +1314,7 @@ def build_local_plan(
         ),
         "agent": agent,
         "operation_id": operation_id,
-        "broker_enrolled": enrolled,
+        "broker_configured": configured,
         # Registration makes the plan asynchronously runnable, but live source
         # can never become reusable or release-grade evidence.
         "attestable": False,
@@ -1638,10 +1544,12 @@ def test_catalog(root: Path | None, broker_profile: object | None) -> dict[str, 
     if broker_profile is not None:
         if root is not None:
             try:
-                repositories = [broker_profile.repository(str(root.resolve()))]  # type: ignore[attr-defined]
+                repositories = [
+                    _resolved_broker_repository(root.resolve(), broker_profile)
+                ]
             except Exception as error:
                 raise UniversalTestCliError(
-                    "root repository is not uniquely enrolled for test setup"
+                    "root repository is not uniquely configured for test setup"
                 ) from error
         else:
             repositories = [
@@ -1681,7 +1589,8 @@ def _optional_broker_profile(
     """Keep local advisory work available when broker publication is invalid.
 
     The error remains explicit in the response and queue/evidence work remains
-    unavailable.  This does not downgrade or bypass broker authorization.
+    unavailable.  This does not substitute stale local state for broker-owned
+    publication.
     """
 
     try:
@@ -1735,13 +1644,7 @@ def handle_universal_test_cli(
         health = manifest_health(root, doctor=doctor)
         if not doctor:
             return health
-        broker_profile, broker_profile_error = _optional_broker_profile(
-            broker_profile_loader
-        )
-        result = _doctor_capability_policy(health, root, broker_profile)
-        if broker_profile_error is not None:
-            result["broker_profile_error"] = _BROKER_PROFILE_ERROR
-        return _bounded_doctor_envelope(result)
+        return _bounded_doctor_envelope(health)
     if action == "plan":
         root = Path(canonical_project(args.root_repo))
         temporary = (
@@ -1865,6 +1768,20 @@ def handle_universal_test_cli(
     broker_profile, broker_profile_error = _optional_broker_profile(
         broker_profile_loader
     )
+    if getattr(args, "root_repo", None) is not None:
+        if broker_profile is None:
+            raise UniversalTestCliError(
+                f"test {action} cannot resolve --root-repo because the protected "
+                "broker profile is unavailable"
+            )
+        root = Path(canonical_project(args.root_repo)).resolve()
+        try:
+            repository = _resolved_broker_repository(root, broker_profile)
+        except Exception as error:
+            raise UniversalTestCliError(
+                f"root repository is not currently configured for test {action}"
+            ) from error
+        context["repository"] = str(repository.repo_id)
     return _scheduler_result_or_pending(
         broker_profile=broker_profile,
         broker_profile_error=broker_profile_error,

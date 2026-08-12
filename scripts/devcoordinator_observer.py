@@ -161,6 +161,7 @@ def verify(args: argparse.Namespace) -> dict[str, Any]:
         args.database.expanduser().absolute(),
         args.publication.expanduser().absolute(),
         expected_owner_uid=os.geteuid(),
+        integrity_check=bool(args.full_integrity),
     )
     return {
         "ok": True,
@@ -190,6 +191,7 @@ def refresh_once(
         args.database.expanduser().absolute(),
         args.publication.expanduser().absolute(),
         expected_owner_uid=os.geteuid(),
+        integrity_check=False,
     )
     current = reconciled["envelope"]
 
@@ -246,6 +248,7 @@ def serve(args: argparse.Namespace) -> dict[str, Any]:
         args.database.expanduser().absolute(),
         publication,
         expected_owner_uid=os.geteuid(),
+        integrity_check=False,
     )
     current = retained["envelope"]
     group_id = projection_group(args.publication_group)
@@ -296,6 +299,12 @@ def parser() -> argparse.ArgumentParser:
             command.add_argument("--database", type=Path, required=True)
         if name in {"init", "serve"}:
             command.add_argument("--publication-group")
+        if name == "verify":
+            command.add_argument(
+                "--full-integrity",
+                action="store_true",
+                help="run the offline full SQLite integrity scan",
+            )
         if name in {"config-check", "serve"}:
             command.add_argument("--api-url", default="http://127.0.0.1:29876")
             command.add_argument("--project", required=True)

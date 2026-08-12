@@ -1380,13 +1380,10 @@ def run_availability_architecture_tests() -> None:
         "self_test_browser_cutover_binding.py",
         "self_test_install_browser_lcp_runtime.py",
         "self_test_orchestrate_availability_cutover.py",
-        "self_test_authority_readiness.py",
-        "self_test_authority_repository_repair.py",
         "self_test_activate_availability_release.py",
         "self_test_refresh_edge_tls_credential.py",
         "self_test_background_service_handoff.py",
         "self_test_project_isolation.py",
-        "self_test_manage_docker_admission.py",
     )
     for script_name in suites:
         script = ROOT / "scripts" / script_name
@@ -1617,17 +1614,17 @@ def check_ops_console_interaction_guardrails(*, run_macos_app_checks: bool = Tru
         "vertical-only service map scroll": "ScrollView(.vertical)",
         "expandable sidebar tree": "expandedProjects",
         "sidebar selection": "sidebarSelection",
-        "grouping consumes coordinator membership rows": "func makeProjectGroups(from inventory: Inventory)",
-        "usage key membership decoding": "case usageKey = \"usage_key\"",
-        "server membership decoding": "case serverIDs = \"server_ids\"",
-        "container membership decoding": "case containerNames = \"container_names\"",
+        "grouping consumes coordinator association data": "func makeProjectGroups(from inventory: Inventory)",
+        "usage key association decoding": "case usageKey = \"usage_key\"",
+        "server association decoding": "case serverIDs = \"server_ids\"",
+        "container association decoding": "case containerNames = \"container_names\"",
         "canonical repository identity": "struct RepositoryIdentity",
         "source-independent project group identity": "guard usageKey.hasPrefix(\"path:\") else { return unassignedProjectGroupID }",
         "global physical Docker reconciliation": "let physicalDocker = Dictionary(grouping: pendingDocker)",
-        "whole-runtime control intersection": "candidates.formIntersection(constraint)",
+        "whole-runtime route intersection": "candidates.formIntersection(constraint)",
         "unassigned resource aggregate": "name: \"Unassigned Resources\"",
         "stray items fallback group": "strayProjectGroupID",
-        "membership union across coordinator homes": "seenServerIDs.insert(serverID).inserted",
+        "association union across coordinator endpoints": "seenServerIDs.insert(serverID).inserted",
         "board name-claim divergence must-catch": "grouprepo-db must display under the path-keyed GroupRepo group",
         "board ambiguity divergence must-catch": "must stay out of the repo group whose actions do not touch it",
         "board stray visibility must-catch": "must stay visible in the stray fallback group",
@@ -1743,21 +1740,19 @@ def check_ops_console_interaction_guardrails(*, run_macos_app_checks: bool = Tru
         "compact bounded inventory request": "--stats-history-limit",
         "background-decoded normalized inventory handoff": "case success(NormalizedBoardProjection)",
         "sendable normalized inventory value graph": "struct NormalizedInventoryGraph: Decodable, Sendable",
-        "direct schema-v2 inventory decoder": "NormalizedInventoryGraph.self",
-        "direct schema-v2 Board projection": "graph.boardProjection(origin: origin)",
-        "schema-v2 fail-closed guard": "guard schemaVersion == 2 else",
+        "direct schema-v3 inventory decoder": "NormalizedInventoryGraph.self",
+        "direct schema-v3 Board projection": "graph.boardProjection(origin: origin)",
+        "schema-v3 fail-closed guard": "guard schemaVersion == 3 else",
         "normalized repository identity decoding": "case repoID = \"repo_id\"",
         "normalized database observation decoding": "case servers, docker, databases, telemetry, snapshots",
         "normalized restorable backup registry": "case databaseBackups = \"database_backups\"",
-        "database identity requires authoritative ownership": "guard ownershipError == nil,\n              let origin",
-        "database UI ownership gate": "guard database.ownershipError == nil,",
-        "database operation rechecks current ownership": "currentAuthoritativeDatabase(matching:",
-        "whole-project definition membership coverage": "requiredMembershipKeys.isSubset(of: presentMembershipKeys)",
+        "database identity requires unambiguous association": "guard associationError == nil,\n              let origin",
+        "database UI association gate": "guard database.associationError == nil,",
+        "database operation rechecks current identity": "currentDatabaseForMutation(matching:",
         "v1-only production rejection regression": "testV1OnlyPayloadCannotMasqueradeAsNormalizedInventory",
-        "poisoned v1 identity isolation regression": "testDirectV2ProjectionUsesDurableIdentitiesAndIgnoresEveryPoisonedV1Field",
-        "missing repository membership control regression": "testRepositoryControlRequiresCompleteAuthoritativeMembershipCoverage",
-        "non-database Docker membership regression": "testNonDatabaseDockerResourceRequiresMembershipBeforeProjectControl",
-        "uncontrolled database protection regression": "testDatabaseProtectionFailsClosedWhenCurrentOwnershipIsNotAuthoritative",
+        "poisoned v1 identity isolation regression": "testDirectV3ProjectionUsesDurableIdentitiesAndIgnoresEveryPoisonedV1Field",
+        "direct repository routing regression": "testRepositoryRoutingUsesDirectResourceAssociation",
+        "non-database Docker association regression": "testNonDatabaseDockerResourceUsesDirectRepositoryAssociation",
         "normalized database observation regression": "testFailedDatabaseObservationRetainsRuntimeSnapshotAndDegradesOnlyDatabaseCapability",
         "normalized fence violation regression": "testRunningDisabledRepositoryResourceIsOnlyAnExactUnassignedFenceViolation",
         "bounded command default timeout": "timeout: TimeInterval = 120",
@@ -1908,11 +1903,9 @@ def check_ops_console_interaction_guardrails(*, run_macos_app_checks: bool = Tru
         "coordinator process tree usage": "def annotate_server_process_usage(",
         "coordinator project usage rollup": "def build_project_usage(",
         "inventory project usage": "\"project_usage\": project_usage",
-        "unified container membership attribution": "def container_project_attribution(",
-        "membership claim set shared by display and actions": "def known_project_paths(",
         "ambiguous container name match stays unclaimed": "\"ambiguous_name\"",
-        "membership divergence must-catch fixture": "must-catch: unattributed grouprepo-db must remain visible as read-only evidence",
-        "membership blast radius regression": "one physical conflict must render as one unassigned resource",
+        "association divergence must-catch fixture": "must-catch: unattributed grouprepo-db must remain visible as read-only evidence",
+        "association blast radius regression": "one physical conflict must render as one unassigned resource",
         "bounded socket http health": "socket.create_connection((parsed.hostname, port), timeout=timeout)",
         # macOS runners black-hole reverse DNS: a stock HTTPServer.server_bind
         # stalls ~30s in socket.getfqdn between bind() and listen(). The API
@@ -1925,10 +1918,10 @@ def check_ops_console_interaction_guardrails(*, run_macos_app_checks: bool = Tru
         "project load hot process": "hotProcessLabel(",
         "multi coordinator origin discovery": "FileSystemCoordinatorOriginDiscovery",
         "three-source repository UI regression": "testThreeSourceRepositoryPublishesOneNevodProjectAndRoutesOneProjectAction",
-        "cross-project Docker conflict regression": "testDockerMembershipConflictBlocksBothOtherwiseControlledProjectActionsAndHealthIsNotNominal",
+        "cross-project Docker conflict regression": "testDockerAssociationConflictBlocksAmbiguousProjectActionsAndHealthIsNotNominal",
         "cross-project server conflict regression": "testSameActivePhysicalServerClaimedByTwoRepositoriesBlocksBothProjects",
         "usage-only unassigned regression": "testUsageOnlyNameEvidenceStillProducesOneUnassignedPresentation",
-        "catalog conflict health regression": "testCatalogOwnershipConflictMakesPublishedHealthNonNominalEvenWithoutResourceIdentity",
+        "catalog conflict health regression": "testCatalogAssociationConflictMakesPublishedHealthNonNominalEvenWithoutResourceIdentity",
         "privacy-safe attention readiness telemetry": "attention_items=\\(attentionItems, privacy: .public)",
         "generic attention readiness rejection": "reports generic duplicated attention",
         "missing attention item readiness rejection": "without a concrete attention item",
@@ -2001,7 +1994,7 @@ def check_ops_console_interaction_guardrails(*, run_macos_app_checks: bool = Tru
         "fake usage seed": "usageSeed",
         "unused group by control": "\"Group by\"",
         "unused group state": "groupBy",
-        # Grouping is consumed from coordinator project_usage membership; any
+        # Grouping is consumed from coordinator project association; any
         # client-side re-derivation of repo identity from resource names is
         # the display/action divergence class fixed on 2026-07-07.
         "client-side name-key grouping heuristic": "projectKey(fromResourceName",
@@ -2042,7 +2035,7 @@ def check_ops_console_interaction_guardrails(*, run_macos_app_checks: bool = Tru
     ]
     if normalized_present:
         raise SystemExit(
-            "DevOpsBoard normalized-v2 guard found prohibited pattern: "
+            "DevOpsBoard normalized-v3 guard found prohibited pattern: "
             + ", ".join(normalized_present)
         )
 
@@ -2121,7 +2114,7 @@ def check_devops_console(*, run_tests: bool = True) -> None:
         "ui prefs persisted server-side": "ui-prefs.json",
         "hidden items auto-reveal when running": "async function autoUnhide(",
         "hidden items auto-reveal wired into overview refresh": "autoUnhide(data);",
-        "project grouping uses coordinator membership": "function projectGroupsOf(",
+        "project grouping uses coordinator association": "function projectGroupsOf(",
         "hamburger nav aria wiring": 'aria-controls="site-nav"',
         "charts built without innerHTML": "document.createElementNS(SVG_NS",
         "fast close clears drain timers": "clearTimeout(killTimer)",
@@ -2156,7 +2149,7 @@ def check_devops_console(*, run_tests: bool = True) -> None:
         "host probe with injectable readers": "export function createHostProbe(",
         "host sampled before coordinator inventory": "await sampleHost();",
         "host snapshot in metrics history": "host: hostNow,",
-        "performance page machine panel": "function hostPanel(",
+        "performance page composition panel": "function performanceCompositionPanel(",
         "explicit production IPv4 listener": "config.bindHost ?? '0.0.0.0'",
         "production listener behavior test": "production TLS binds the explicit IPv4 wildcard",
     }

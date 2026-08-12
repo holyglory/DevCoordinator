@@ -14,10 +14,10 @@ def _load_repository_cli():
     test_file = Path(__file__).resolve()
     skill_root = test_file.parents[3]
     repository_root = skill_root.parent.parent
-    enrolled_skill = repository_root / "skills" / skill_root.name
+    configured_skill = repository_root / "skills" / skill_root.name
     cli_path = repository_root / "scripts" / "migrate_universal_test_history.py"
     try:
-        source_tree_matches = enrolled_skill.samefile(skill_root)
+        source_tree_matches = configured_skill.samefile(skill_root)
     except OSError:
         source_tree_matches = False
     if not source_tree_matches or not cli_path.is_file():

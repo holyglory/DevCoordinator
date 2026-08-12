@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""Switch the production graph to one immutable, same-schema release.
+"""Switch the production graph to one immutable compatible release.
 
-This is the routine fast release path.  It deliberately does not migrate,
-copy, validate, or replace databases: authority data, inventory, routes,
-grants, Telegram configuration, Console settings, and test history stay in
-place unless the caller explicitly selects the disposable test-history reset.
+This is the routine fast release path. Authority data, inventory, routes,
+Telegram configuration, Console settings, and test history stay in place
+unless the target authority schema declares a supported transactional upgrade
+or the caller explicitly selects the disposable test-history reset. A schema
+upgrade is performed only with the writers stopped and an exact rollback
+backup already recorded in this switch journal.
 
 The switch installs the immutable unit set, refreshes systemd identities and
 runtime directories, starts a second Console slot on two unused loopback
@@ -26,6 +28,7 @@ import pwd
 import re
 import shutil
 import socket
+import sqlite3
 import ssl
 import stat
 import subprocess
@@ -43,6 +46,7 @@ if str(SCRIPT_ROOT) not in sys.path:
 
 import activate_availability_release as activation  # noqa: E402
 import install_availability_release as installer  # noqa: E402
+from devcoordinator.store import AccountStore  # noqa: E402
 
 
 KIND = "devcoordinator-same-schema-release-switch"
@@ -51,6 +55,7 @@ RELEASE_RE = re.compile(r"^[0-9a-f]{64}$")
 UNIT_ROOT = Path("/etc/systemd/system")
 SYSUSERS_ROOT = Path("/etc/sysusers.d")
 TMPFILES_ROOT = Path("/etc/tmpfiles.d")
+MAIN_TMPFILES_RENDERED = "devcoordinator.tmpfiles.conf"
 CODEX_ROOT = Path("/etc/codex")
 CODEX_RULE_ROOT = CODEX_ROOT / "rules"
 CLIENT_LAUNCHER = Path("/usr/local/bin/devcoordinator")
@@ -58,6 +63,7 @@ MCP_LAUNCHER = Path("/usr/local/bin/devcoordinator-mcp")
 BUG_LAUNCHER = Path("/usr/local/bin/devcoordinator-bug")
 TEST_LAUNCHER = Path("/usr/local/bin/devcoordinator-test")
 CALL_LOG_LAUNCHER = Path("/usr/local/bin/devcoordinator-call-log")
+SYSTEMD_UNIT_LAUNCHER = Path("/usr/local/bin/devcoordinator-systemd-unit")
 READ_ONLY_RULE = CODEX_RULE_ROOT / "devcoordinator-read-only.rules"
 TEST_RULE = CODEX_RULE_ROOT / "devcoordinator-test.rules"
 CLIENT_LAUNCHER_RENDERED = "devcoordinator-launcher"
@@ -65,11 +71,35 @@ MCP_LAUNCHER_RENDERED = "devcoordinator-mcp-launcher"
 BUG_LAUNCHER_RENDERED = "devcoordinator-bug-launcher"
 TEST_LAUNCHER_RENDERED = "devcoordinator-test-launcher"
 CALL_LOG_LAUNCHER_RENDERED = "devcoordinator-call-log-launcher"
+SYSTEMD_UNIT_LAUNCHER_RENDERED = "devcoordinator-systemd-unit-launcher"
 READ_ONLY_RULE_RENDERED = "devcoordinator-read-only.rules"
 TEST_RULE_RENDERED = "devcoordinator-test.rules"
 BROWSER_ACCOUNTING_CAPABILITY = "headless_browser_accounting"
 BROWSER_ACCOUNTING_WRAPPER = "devcoordinator-browser-accounting"
-BROWSER_LIFECYCLE_STATE = Path("/var/lib/devcoordinator/browser-lifecycle.json")
+BROWSER_LIFECYCLE_ROOT = Path("/var/lib/devcoordinator-browser-lifecycle")
+BROWSER_LIFECYCLE_STATE = BROWSER_LIFECYCLE_ROOT / "browser-lifecycle.json"
+BROWSER_LIFECYCLE_LOCK = Path(f"{BROWSER_LIFECYCLE_STATE}.lock")
+LEGACY_BROKER_SERVICE = "devcoordinator-broker.service"
+LEGACY_API_SERVICE = "dev-coordinator.service"
+LEGACY_CONTROL_PLANE_SERVICES = (
+    LEGACY_API_SERVICE,
+    LEGACY_BROKER_SERVICE,
+)
+LEGACY_ENABLE_MARKER = Path("/run/devcoordinator-enable-legacy-control-plane")
+LEGACY_RETIREMENT_DROPIN = "99-devcoordinator-retired.conf"
+LEGACY_RETIREMENT_PAYLOAD = (
+    "[Unit]\n"
+    "# The socket-activated authority/API replaced this checkout-bound unit.\n"
+    "# Keep stale project Wants= dependencies from reviving the retired stack.\n"
+    f"ConditionPathExists={LEGACY_ENABLE_MARKER}\n"
+).encode("utf-8")
+BROWSER_RUNTIME_LOCK_PRIVATE = Path(
+    "/var/lib/devcoordinator/browser/runtime-lock.json"
+)
+BROWSER_RUNTIME_LOCK_PUBLIC = Path(
+    "/etc/devcoordinator/browser-runtime-lock.json"
+)
+BROWSER_RUNTIME_LOCK_MAX_BYTES = 1024 * 1024
 BROWSER_CLEANUP_QUIESCENCE_SECONDS = 2
 BROWSER_CLEANUP_RESULT_MAX_BYTES = 4096
 STABLE_LAUNCHERS = {
@@ -80,6 +110,10 @@ STABLE_LAUNCHERS = {
     CALL_LOG_LAUNCHER_RENDERED: (
         CALL_LOG_LAUNCHER,
         "devcoordinator-call-log",
+    ),
+    SYSTEMD_UNIT_LAUNCHER_RENDERED: (
+        SYSTEMD_UNIT_LAUNCHER,
+        "devcoordinator-systemd-unit",
     ),
 }
 TEST_HISTORY_WRAPPER = "devcoordinator-test-history"
@@ -97,6 +131,7 @@ TEST_SPOOL_QUEUES = (
 )
 SLOT_ROOT = Path("/etc/devcoordinator/console-slots")
 CLIENT_PROFILE = Path("/etc/devcoordinator/client-profiles.json")
+AUTHORITY_DATABASE = Path("/var/lib/devcoordinator/authority.sqlite3")
 PUBLICATION_FILE = Path("/var/lib/devcoordinator-edge/routes.publication")
 MAINTENANCE_ROOT = Path("/run/devcoordinator-maintenance")
 MAINTENANCE_MARKER = MAINTENANCE_ROOT / "maintenance.json"
@@ -112,11 +147,20 @@ SERVICE_ORDER = (
     "devcoordinator-notifications.service",
     "devcoordinator-edge.service",
 )
+ROLLBACK_CRITICAL_SERVICES = (
+    "devcoordinator-authority.service",
+    "devcoordinator-api.service",
+    "devcoordinator-edge.service",
+)
+ROLLBACK_BACKGROUND_SERVICES = tuple(
+    unit for unit in SERVICE_ORDER if unit not in ROLLBACK_CRITICAL_SERVICES
+)
 RUNTIME_SOCKET_REBIND_ORDER = (
     "devcoordinator-test-snapshotd.socket",
     "devcoordinator-testd.socket",
 )
 REQUIRED_SOCKETS = activation.SOCKET_UNITS
+API_SOCKET = "devcoordinator-api.socket"
 
 
 class SwitchError(RuntimeError):
@@ -169,6 +213,81 @@ def load_json(path: Path) -> dict[str, object]:
     if not isinstance(value, Mapping):
         raise SwitchError(f"JSON document is not an object: {path}")
     return dict(value)
+
+
+def browser_runtime_lock_payload(path: Path) -> tuple[dict[str, object], bytes]:
+    """Read and validate the bounded sealed browser runtime inventory."""
+
+    try:
+        before = path.lstat()
+        if (
+            stat.S_ISLNK(before.st_mode)
+            or not stat.S_ISREG(before.st_mode)
+            or before.st_size > BROWSER_RUNTIME_LOCK_MAX_BYTES
+        ):
+            raise SwitchError("browser runtime inventory source is unsafe")
+        payload = path.read_bytes()
+        after = path.lstat()
+    except OSError as error:
+        raise SwitchError(f"browser runtime inventory is unavailable: {error}") from error
+    if (
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+    ) != (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+    ):
+        raise SwitchError("browser runtime inventory changed while it was read")
+    try:
+        value = json.loads(payload)
+    except (UnicodeError, json.JSONDecodeError) as error:
+        raise SwitchError("browser runtime inventory is invalid JSON") from error
+    if not isinstance(value, Mapping):
+        raise SwitchError("browser runtime inventory is not an object")
+    try:
+        verified = activation.browser_lcp.verify_runtime_lock_document(
+            value,
+            expected_uid=0,
+            expected_gid=0,
+        )
+    except (OSError, ValueError, activation.browser_lcp.BrowserLcpAcceptanceError) as error:
+        raise SwitchError(f"browser runtime inventory is invalid: {error}") from error
+    return dict(verified), payload
+
+
+def publish_browser_runtime_inventory() -> dict[str, object]:
+    """Project the non-secret runtime lock for actual-caller Playwright QA."""
+
+    verified, payload = browser_runtime_lock_payload(BROWSER_RUNTIME_LOCK_PRIVATE)
+    atomic_bytes(BROWSER_RUNTIME_LOCK_PUBLIC, payload, 0o644)
+    evidence = verify_public_browser_runtime_inventory()
+    if evidence["document_sha256"] != verified["document_sha256"]:
+        raise SwitchError("published browser runtime inventory changed identity")
+    return evidence
+
+
+def verify_public_browser_runtime_inventory() -> dict[str, object]:
+    source, source_payload = browser_runtime_lock_payload(BROWSER_RUNTIME_LOCK_PRIVATE)
+    public, public_payload = browser_runtime_lock_payload(BROWSER_RUNTIME_LOCK_PUBLIC)
+    info = BROWSER_RUNTIME_LOCK_PUBLIC.lstat()
+    ok = (
+        source_payload == public_payload
+        and source["document_sha256"] == public["document_sha256"]
+        and stat.S_IMODE(info.st_mode) == 0o644
+    )
+    if not ok:
+        raise SwitchError("public browser runtime inventory is stale or unreadable")
+    return {
+        "ok": True,
+        "path": str(BROWSER_RUNTIME_LOCK_PUBLIC),
+        "mode": stat.S_IMODE(info.st_mode),
+        "document_sha256": public["document_sha256"],
+        "source_sha256": hashlib.sha256(source_payload).hexdigest(),
+    }
 
 
 def load_journal(path: Path) -> dict[str, object] | None:
@@ -557,7 +676,7 @@ def perform_headless_browser_cleanup(
     return result
 
 
-def active_console(runner: Runner) -> tuple[str, str]:
+def active_console_units(runner: Runner) -> list[str]:
     output = runner.require(
         [
             "/usr/bin/systemctl",
@@ -570,13 +689,57 @@ def active_console(runner: Runner) -> tuple[str, str]:
         ],
         "active Console discovery",
     )
-    units = sorted(
+    return sorted(
         {
             line.split()[0]
             for line in output.splitlines()
             if line.strip() and line.split()[0].startswith("devcoordinator-console@")
         }
     )
+
+
+def recover_published_console(runner: Runner) -> tuple[str, str]:
+    """Recover the exact slot retained by the stable edge publication.
+
+    A stopped Console instance cannot select a different release: the signed,
+    atomically published edge snapshot and its immutable slot file remain the
+    authority.  Recovery starts only that exact slot plus the stable API
+    socket.  It never guesses from installed unit names and never resolves an
+    ambiguous two-slot topology.
+    """
+
+    published = publication_snapshot()
+    digest = str(published["release_digest"])
+    if RELEASE_RE.fullmatch(digest) is None:
+        raise SwitchError("published Console release identity is invalid")
+    slot = SLOT_ROOT / f"{digest}.env"
+    if not slot.is_file() or slot.is_symlink():
+        raise SwitchError("published Console slot configuration is unavailable")
+    values = parse_slot(slot.read_text(encoding="utf-8"))
+    if (
+        values["DEVCOORDINATOR_RELEASE_DIGEST"] != digest
+        or int(values["HTTPS_PORT"]) != published["port"]
+    ):
+        raise SwitchError("published Console slot contradicts the edge publication")
+    unit = f"devcoordinator-console@{digest}.service"
+    runner.require(
+        ["/usr/bin/systemctl", "start", API_SOCKET],
+        "recover stable API socket",
+    )
+    runner.require(
+        ["/usr/bin/systemctl", "start", unit],
+        "recover published Console slot",
+    )
+    units = active_console_units(runner)
+    if units != [unit]:
+        raise SwitchError("published Console slot recovery did not converge")
+    return unit, digest
+
+
+def active_console(runner: Runner) -> tuple[str, str]:
+    units = active_console_units(runner)
+    if not units:
+        return recover_published_console(runner)
     if len(units) != 1:
         raise SwitchError("same-schema switch requires exactly one active Console slot")
     match = re.fullmatch(r"devcoordinator-console@([0-9a-f]{64})\.service", units[0])
@@ -690,6 +853,7 @@ def render_release(release: Path, transaction_root: Path) -> dict[str, object]:
         *activation.TOPOLOGY_FILES,
         "devcoordinator-availability.sysusers.conf",
         "devcoordinator-availability.tmpfiles.conf",
+        MAIN_TMPFILES_RENDERED,
     ):
         source = release / "deploy" / name
         if not source.is_file() or source.is_symlink():
@@ -732,6 +896,7 @@ def destinations(rendered: Path) -> dict[str, Path]:
     result["devcoordinator-availability.tmpfiles.conf"] = (
         TMPFILES_ROOT / "devcoordinator-availability.tmpfiles.conf"
     )
+    result[MAIN_TMPFILES_RENDERED] = TMPFILES_ROOT / "devcoordinator.conf"
     for rendered_name, (destination, _immutable_name) in STABLE_LAUNCHERS.items():
         result[rendered_name] = destination
     result[READ_ONLY_RULE_RENDERED] = READ_ONLY_RULE
@@ -858,6 +1023,7 @@ def prepare(
     published = publication_snapshot()
     if published["release_digest"] != current_digest or published["port"] != old_outer:
         raise SwitchError("active Console slot contradicts the edge publication")
+    rendered = render_release(release, transaction_root)
     if current_digest == release.name:
         browser_cleanup = headless_browser_cleanup_plan(
             release,
@@ -885,7 +1051,7 @@ def prepare(
             "candidate_outer_port": old_outer,
             "candidate_inner_port": old_inner,
             "publication_before": published,
-            "rendered_units": None,
+            "rendered_units": rendered["rendered_units"],
             "expected_destinations": {},
             "backups": {},
             "candidate_started": True,
@@ -904,7 +1070,6 @@ def prepare(
         atomic_json(transaction_root / "journal.json", document)
         return document
     outer, inner = reserve_candidate_ports({old_outer, old_inner})
-    rendered = render_release(release, transaction_root)
     browser_cleanup = headless_browser_cleanup_plan(
         release,
         previous_release_digest=current_digest,
@@ -1014,7 +1179,197 @@ def restore_destination_backups(backups: Mapping[str, object]) -> None:
             raise SwitchError("same-schema rollback evidence is invalid")
 
 
+def _authority_schema_version(path: Path = AUTHORITY_DATABASE) -> int:
+    try:
+        connection = sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True)
+        try:
+            connection.execute("PRAGMA query_only = ON")
+            row = connection.execute(
+                "SELECT schema_version FROM schema_metadata WHERE singleton = 1"
+            ).fetchone()
+        finally:
+            connection.close()
+    except sqlite3.Error as error:
+        raise SwitchError(f"authority schema cannot be read: {error}") from error
+    if row is None or type(row[0]) is not int or int(row[0]) <= 0:
+        raise SwitchError("authority schema metadata is invalid")
+    return int(row[0])
+
+
+def _sqlite_backup(source: Path, destination: Path) -> dict[str, object]:
+    if destination.exists() or destination.is_symlink():
+        raise SwitchError("authority rollback backup destination already exists")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    source_connection = sqlite3.connect(f"{source.as_uri()}?mode=ro", uri=True)
+    destination_connection = sqlite3.connect(destination)
+    try:
+        source_connection.backup(destination_connection)
+        destination_connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    except sqlite3.Error as error:
+        destination_connection.close()
+        source_connection.close()
+        destination.unlink(missing_ok=True)
+        raise SwitchError(f"authority rollback backup failed: {error}") from error
+    destination_connection.close()
+    source_connection.close()
+    os.chmod(destination, 0o600)
+    return {
+        "path": str(destination),
+        "sha256": digest_file(destination),
+        "schema_version": _authority_schema_version(destination),
+    }
+
+
+def migrate_trusted_local_authority(
+    document: dict[str, object],
+    journal_path: Path,
+    transaction_root: Path,
+    runner: Runner,
+) -> dict[str, object]:
+    """Upgrade a supported legacy authority with exact rollback evidence."""
+
+    target_schema = int(activation.COORDINATOR_SCHEMA_VERSION)
+    current_schema = _authority_schema_version()
+    recorded = document.get("authority_migration")
+    if current_schema == target_schema:
+        if isinstance(recorded, Mapping) and recorded.get("phase") == "migrated":
+            return dict(recorded)
+        api_uid = int(pwd.getpwnam("devcoordinator-api").pw_uid)
+        profile = activation.cutover.reconstruct_api_profile_from_authority(
+            authority_database=AUTHORITY_DATABASE,
+            destination=CLIENT_PROFILE,
+            validation_uid=api_uid,
+            authority_uid=0,
+        )
+        result = {
+            "phase": "current",
+            "before_schema": target_schema,
+            "after_schema": target_schema,
+            "profile": profile,
+        }
+        document["authority_migration"] = result
+        atomic_json(journal_path, document)
+        return result
+    if current_schema not in {12, 13, 14}:
+        raise SwitchError(
+            f"authority schema {current_schema} cannot migrate to {target_schema}"
+        )
+    if recorded is not None:
+        raise SwitchError("authority migration journal contradicts the live schema")
+
+    # Stop every process that can read or write authority state before taking
+    # the exact rollback backup and opening the current release's store.
+    for unit in (
+        "devcoordinator-api.service",
+        "devcoordinator-test-snapshotd.service",
+        "devcoordinator-authority.service",
+    ):
+        runner.require(["/usr/bin/systemctl", "stop", unit], f"quiesce {unit}")
+
+    migration_root = transaction_root / "authority-migration"
+    migration_root.mkdir(parents=True, exist_ok=True)
+    database_backup = _sqlite_backup(
+        AUTHORITY_DATABASE, migration_root / "authority-before.sqlite3"
+    )
+    profile_info = CLIENT_PROFILE.lstat()
+    if stat.S_ISLNK(profile_info.st_mode) or not stat.S_ISREG(profile_info.st_mode):
+        raise SwitchError("authority routing profile is not a regular file")
+    profile_payload = CLIENT_PROFILE.read_bytes()
+    profile_backup = migration_root / "profile-before.json"
+    atomic_bytes(profile_backup, profile_payload, 0o600)
+    migration: dict[str, object] = {
+        "phase": "backed-up",
+        "before_schema": current_schema,
+        "after_schema": None,
+        "database_backup": database_backup,
+        "profile_backup": {
+            "path": str(profile_backup),
+            "sha256": hashlib.sha256(profile_payload).hexdigest(),
+            "mode": stat.S_IMODE(profile_info.st_mode),
+        },
+    }
+    document["authority_migration"] = migration
+    atomic_json(journal_path, document)
+
+    store = AccountStore.open(AUTHORITY_DATABASE, expected_uid=0)
+    try:
+        migrated_schema = int(store.metadata.schema_version)
+    finally:
+        store.close()
+    if migrated_schema != target_schema or _authority_schema_version() != target_schema:
+        raise SwitchError("trusted-local authority migration did not reach target schema")
+    api_uid = int(pwd.getpwnam("devcoordinator-api").pw_uid)
+    profile = activation.cutover.reconstruct_api_profile_from_authority(
+        authority_database=AUTHORITY_DATABASE,
+        destination=CLIENT_PROFILE,
+        validation_uid=api_uid,
+        authority_uid=0,
+    )
+    migration.update(
+        {
+            "phase": "migrated",
+            "after_schema": target_schema,
+            "profile": profile,
+        }
+    )
+    atomic_json(journal_path, document)
+    return migration
+
+
+def restore_authority_migration(
+    document: Mapping[str, object], runner: Runner
+) -> None:
+    migration = document.get("authority_migration")
+    if not isinstance(migration, Mapping) or migration.get("phase") not in {
+        "backed-up",
+        "migrated",
+    }:
+        return
+    database = migration.get("database_backup")
+    profile = migration.get("profile_backup")
+    if not isinstance(database, Mapping) or not isinstance(profile, Mapping):
+        raise SwitchError("authority migration rollback evidence is invalid")
+    database_backup = Path(str(database.get("path")))
+    profile_backup = Path(str(profile.get("path")))
+    if (
+        not database_backup.is_file()
+        or database_backup.is_symlink()
+        or digest_file(database_backup) != database.get("sha256")
+        or not profile_backup.is_file()
+        or profile_backup.is_symlink()
+        or digest_file(profile_backup) != profile.get("sha256")
+    ):
+        raise SwitchError("authority migration rollback backup changed")
+    for unit in (
+        "devcoordinator-api.service",
+        "devcoordinator-test-snapshotd.service",
+        "devcoordinator-authority.service",
+    ):
+        runner.require(["/usr/bin/systemctl", "stop", unit], f"quiesce {unit} for rollback")
+    source = sqlite3.connect(f"{database_backup.as_uri()}?mode=ro", uri=True)
+    target = sqlite3.connect(AUTHORITY_DATABASE)
+    try:
+        source.backup(target)
+    except sqlite3.Error as error:
+        raise SwitchError(f"authority rollback restore failed: {error}") from error
+    finally:
+        target.close()
+        source.close()
+    atomic_bytes(CLIENT_PROFILE, profile_backup.read_bytes(), int(profile["mode"]))
+    if _authority_schema_version() != int(migration["before_schema"]):
+        raise SwitchError("authority rollback schema did not restore exactly")
+
+
 def restart_services(runner: Runner) -> None:
+    # Routine replacement is also the repair path for a host whose required
+    # unit was disabled out of band.  Starting a disabled unit is not durable:
+    # it looks healthy until the next reboot.  Reassert both activation and the
+    # boot contract before replacing processes.
+    for unit in (*REQUIRED_SOCKETS, *SERVICE_ORDER):
+        runner.require(
+            ["/usr/bin/systemctl", "enable", "--now", unit],
+            f"enable required unit {unit}",
+        )
     # These socket units own their /run directory and pathname. Older service
     # templates lifecycle-managed the same directories, so an already-active
     # socket may retain only an unreachable, unlinked listener after a service
@@ -1024,6 +1379,50 @@ def restart_services(runner: Runner) -> None:
         runner.require(["/usr/bin/systemctl", "restart", unit], f"rebind {unit}")
     for unit in SERVICE_ORDER:
         runner.require(["/usr/bin/systemctl", "restart", unit], f"restart {unit}")
+
+
+def restore_rollback_control_plane(runner: Runner) -> None:
+    """Restore stable authority before any background unit can block rollback.
+
+    A background service may legitimately take its full start deadline.  The
+    stable client and authority must already execute the same restored release
+    before rollback attempts such a unit, otherwise an interrupted rollback
+    leaves every agent behind a release-handshake failure.
+    """
+
+    for unit in REQUIRED_SOCKETS:
+        runner.require(
+            ["/usr/bin/systemctl", "enable", "--now", unit],
+            f"rollback enable required socket {unit}",
+        )
+    for unit in ROLLBACK_CRITICAL_SERVICES:
+        runner.require(
+            ["/usr/bin/systemctl", "enable", "--now", unit],
+            f"rollback enable critical unit {unit}",
+        )
+        runner.require(
+            ["/usr/bin/systemctl", "restart", unit],
+            f"rollback restart critical unit {unit}",
+        )
+
+
+def restore_rollback_background_services(runner: Runner) -> None:
+    """Restore non-critical units only after stable authority is coherent."""
+
+    for unit in RUNTIME_SOCKET_REBIND_ORDER:
+        runner.require(
+            ["/usr/bin/systemctl", "restart", unit],
+            f"rollback rebind {unit}",
+        )
+    for unit in ROLLBACK_BACKGROUND_SERVICES:
+        runner.require(
+            ["/usr/bin/systemctl", "enable", "--now", unit],
+            f"rollback enable background unit {unit}",
+        )
+        runner.require(
+            ["/usr/bin/systemctl", "restart", unit],
+            f"rollback restart background unit {unit}",
+        )
 
 
 def unix_socket_health(path: Path, timeout_seconds: float = 1.0) -> dict[str, object]:
@@ -1045,6 +1444,10 @@ def unix_socket_health(path: Path, timeout_seconds: float = 1.0) -> dict[str, ob
 
 def unit_active(runner: Runner, unit: str) -> bool:
     return runner.run(["/usr/bin/systemctl", "is-active", "--quiet", unit]).returncode == 0
+
+
+def unit_enabled(runner: Runner, unit: str) -> bool:
+    return runner.run(["/usr/bin/systemctl", "is-enabled", "--quiet", unit]).returncode == 0
 
 
 def test_history_wrapper(release: Path) -> Path:
@@ -1568,6 +1971,49 @@ def switch_publication(
     )
 
 
+def legacy_retirement_path(unit: str) -> Path:
+    return UNIT_ROOT / f"{unit}.d" / LEGACY_RETIREMENT_DROPIN
+
+
+def legacy_retirement_guard_installed(unit: str) -> bool:
+    path = legacy_retirement_path(unit)
+    try:
+        return path.is_file() and not path.is_symlink() and path.read_bytes() == LEGACY_RETIREMENT_PAYLOAD
+    except OSError:
+        return False
+
+
+def retire_legacy_control_plane(runner: Runner) -> None:
+    # Schema-13 authority/API replaced the checkout-bound schema-12 services.
+    # Disabling alone is insufficient: an enabled Restart=always project unit
+    # may retain Wants= edges to either legacy unit and reactivate it. Install
+    # one persistent false condition before stopping both units so stale reverse
+    # dependencies remain harmless across project restarts and host reboots.
+    if LEGACY_ENABLE_MARKER.exists() or LEGACY_ENABLE_MARKER.is_symlink():
+        if LEGACY_ENABLE_MARKER.is_dir():
+            raise SwitchError("legacy control-plane enable marker is a directory")
+        LEGACY_ENABLE_MARKER.unlink()
+    for unit in LEGACY_CONTROL_PLANE_SERVICES:
+        atomic_bytes(
+            legacy_retirement_path(unit),
+            LEGACY_RETIREMENT_PAYLOAD,
+            0o644,
+        )
+    runner.require(
+        ["/usr/bin/systemctl", "daemon-reload"],
+        "load legacy control-plane retirement guards",
+    )
+    for unit in LEGACY_CONTROL_PLANE_SERVICES:
+        runner.require(
+            ["/usr/bin/systemctl", "disable", "--now", unit],
+            f"retire legacy control-plane unit {unit}",
+        )
+        runner.require(
+            ["/usr/bin/systemctl", "reset-failed", unit],
+            f"clear retired control-plane failure state {unit}",
+        )
+
+
 def normalize_local_paths(runner: Runner) -> None:
     runner.require(
         [
@@ -1580,15 +2026,44 @@ def normalize_local_paths(runner: Runner) -> None:
         [
             "/usr/bin/systemd-tmpfiles",
             "--create",
+            str(TMPFILES_ROOT / "devcoordinator.conf"),
             str(TMPFILES_ROOT / "devcoordinator-availability.tmpfiles.conf"),
         ],
         "systemd runtime path preparation",
     )
+    # Rollback can restore an older tmpfiles policy that predates the dedicated
+    # lifecycle publication root.  Recreate the exact root here as well so a
+    # post-promotion rollback remains replayable before the successor policy is
+    # installed again.  Never accept a symlink or non-directory in its place.
+    try:
+        lifecycle_root = BROWSER_LIFECYCLE_ROOT.lstat()
+    except FileNotFoundError:
+        BROWSER_LIFECYCLE_ROOT.mkdir(mode=0o755)
+        lifecycle_root = BROWSER_LIFECYCLE_ROOT.lstat()
+    if stat.S_ISLNK(lifecycle_root.st_mode) or not stat.S_ISDIR(
+        lifecycle_root.st_mode
+    ):
+        raise SwitchError(
+            "browser lifecycle publication root is not a directory: "
+            f"{BROWSER_LIFECYCLE_ROOT}"
+        )
+    os.chmod(BROWSER_LIFECYCLE_ROOT, 0o755)
+    for publication in (BROWSER_LIFECYCLE_STATE, BROWSER_LIFECYCLE_LOCK):
+        try:
+            info = publication.lstat()
+        except FileNotFoundError:
+            continue
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+            raise SwitchError(
+                f"browser lifecycle publication is not a regular file: {publication}"
+            )
+        os.chmod(publication, 0o644)
     if not CLIENT_PROFILE.is_file() or CLIENT_PROFILE.is_symlink():
         raise SwitchError("non-secret local client profile is unavailable")
     # Local Unix accounts are one trusted developer.  Publish this non-secret
     # profile for direct reads instead of relying on shared-group membership.
     os.chmod(CLIENT_PROFILE, 0o644)
+    publish_browser_runtime_inventory()
     # Same-schema delivery never takes the authority database offline.  Any
     # inherited marker therefore belongs to an abandoned legacy cutover and
     # must not keep every local account fenced after this healthy switch.
@@ -1602,6 +2077,48 @@ def normalize_local_paths(runner: Runner) -> None:
         if stat.S_ISDIR(marker.st_mode):
             raise SwitchError("stale maintenance marker path is a directory")
         MAINTENANCE_MARKER.unlink()
+
+
+def verify_browser_lifecycle_publication() -> dict[str, object]:
+    """Prove the actual caller can traverse and read lifecycle telemetry."""
+
+    try:
+        parent = BROWSER_LIFECYCLE_ROOT.lstat()
+    except OSError as error:
+        raise SwitchError(f"browser lifecycle parent is unavailable: {error}") from error
+    parent_ok = (
+        stat.S_ISDIR(parent.st_mode)
+        and not stat.S_ISLNK(parent.st_mode)
+        and stat.S_IMODE(parent.st_mode) == 0o755
+    )
+    publications: dict[str, object] = {}
+    for path in (BROWSER_LIFECYCLE_STATE, BROWSER_LIFECYCLE_LOCK):
+        try:
+            info = path.lstat()
+        except FileNotFoundError:
+            publications[str(path)] = {"present": False, "ok": True}
+            continue
+        ok = (
+            stat.S_ISREG(info.st_mode)
+            and not stat.S_ISLNK(info.st_mode)
+            and stat.S_IMODE(info.st_mode) == 0o644
+        )
+        publications[str(path)] = {
+            "present": True,
+            "mode": stat.S_IMODE(info.st_mode),
+            "ok": ok,
+        }
+    ok = parent_ok and all(
+        bool(item["ok"])
+        for item in publications.values()
+        if isinstance(item, Mapping)
+    )
+    return {
+        "ok": ok,
+        "parent": str(BROWSER_LIFECYCLE_ROOT),
+        "parent_mode": stat.S_IMODE(parent.st_mode),
+        "publications": publications,
+    }
 
 
 def save_phase(path: Path, document: dict[str, object], phase: str, **values: object) -> None:
@@ -1659,6 +2176,7 @@ def apply(
         if not isinstance(directory_states, Mapping):
             raise SwitchError("Codex configuration directory plan is unavailable")
         prepare_codex_directories(directory_states)
+        retire_legacy_control_plane(runner)
         rendered = Path(str(document["rendered_units"]))
         install_rendered_destinations(rendered)
         candidate_slot = SLOT_ROOT / f"{document['release_digest']}.env"
@@ -1675,6 +2193,12 @@ def apply(
             release,
             document,
             journal_path,
+            runner,
+        )
+        migrate_trusted_local_authority(
+            document,
+            journal_path,
+            transaction_root,
             runner,
         )
         restart_services(runner)
@@ -1801,6 +2325,29 @@ def verify(
         raise SwitchError("same-schema test-history reset is incomplete")
     units = [*SERVICE_ORDER, *REQUIRED_SOCKETS, str(document["candidate_console_unit"])]
     states = {unit: unit_active(runner, unit) for unit in units}
+    enabled_states = {unit: unit_enabled(runner, unit) for unit in units}
+    legacy_control_plane = {
+        unit: {
+            "active": unit_active(runner, unit),
+            "enabled": unit_enabled(runner, unit),
+            "retirement_guard": legacy_retirement_guard_installed(unit),
+        }
+        for unit in LEGACY_CONTROL_PLANE_SERVICES
+    }
+    for evidence in legacy_control_plane.values():
+        evidence["retired"] = (
+            evidence["active"] is False
+            and evidence["enabled"] is False
+            and evidence["retirement_guard"] is True
+        )
+    legacy_control_plane_retired = (
+        not LEGACY_ENABLE_MARKER.exists()
+        and not LEGACY_ENABLE_MARKER.is_symlink()
+        and all(bool(evidence["retired"]) for evidence in legacy_control_plane.values())
+    )
+    legacy_broker_retired = bool(
+        legacy_control_plane[LEGACY_BROKER_SERVICE]["retired"]
+    )
     probes = [
         http_health(api_url, 5.0),
         direct_https_health(int(document["candidate_outer_port"]), "/healthz"),
@@ -1838,6 +2385,28 @@ def verify(
     except OSError:
         profile_readable = False
     rendered = Path(str(document["rendered_units"]))
+    browser_runtime_inventory = verify_public_browser_runtime_inventory()
+    browser_lifecycle_publication = verify_browser_lifecycle_publication()
+    installed_host_contracts: dict[str, object] = {}
+    rendered_destinations = destinations(rendered)
+    for name in (
+        MAIN_TMPFILES_RENDERED,
+        "devcoordinator-availability.tmpfiles.conf",
+    ):
+        destination = rendered_destinations[name]
+        regular = destination.is_file() and not destination.is_symlink()
+        mode = destination.stat().st_mode & 0o777 if regular else None
+        installed_host_contracts[name] = {
+            "destination": str(destination),
+            "regular_file": regular,
+            "mode": mode,
+            "expected_mode": 0o644,
+            "sha256_matches": regular
+            and digest_file(destination) == digest_file(rendered / name),
+            "ok": regular
+            and mode == 0o644
+            and digest_file(destination) == digest_file(rendered / name),
+        }
     installed_client_access: dict[str, object] = {}
     for name in (
         *STABLE_LAUNCHERS,
@@ -1884,11 +2453,16 @@ def verify(
         }
     ok = (
         all(states.values())
+        and all(enabled_states.values())
+        and legacy_control_plane_retired
         and all(bool(item["ok"]) for item in probes)
         and status.get("mode") == "active"
         and status.get("release_digest") == document["release_digest"]
         and publication.get("release_digest") == document["release_digest"]
         and profile_readable
+        and browser_runtime_inventory["ok"] is True
+        and browser_lifecycle_publication["ok"] is True
+        and all(bool(item["ok"]) for item in installed_host_contracts.values())
         and all(bool(item["ok"]) for item in installed_client_access.values())
         and launcher_healthy
         and all(bool(item["ok"]) for item in codex_directories.values())
@@ -1897,10 +2471,17 @@ def verify(
         "ok": ok,
         "release_digest": document["release_digest"],
         "services": states,
+        "services_enabled": enabled_states,
+        "legacy_broker_retired": legacy_broker_retired,
+        "legacy_control_plane_retired": legacy_control_plane_retired,
+        "legacy_control_plane": legacy_control_plane,
         "probes": probes,
         "console_slot": status,
         "publication": publication,
         "client_profile_readable": profile_readable,
+        "browser_runtime_inventory": browser_runtime_inventory,
+        "browser_lifecycle_publication": browser_lifecycle_publication,
+        "installed_host_contracts": installed_host_contracts,
         "codex_client_access": installed_client_access,
         "codex_read_only_access": {
             name: installed_client_access[name]
@@ -1931,8 +2512,6 @@ def verify(
         "codex_rule_directories": codex_directories,
         "test_history_reset": dict(reset) if reset is not None else None,
     }
-    if not ok:
-        raise SwitchError("same-schema control-plane health failed")
     return result
 
 
@@ -1968,6 +2547,7 @@ def rollback(
 
     candidate = str(document["candidate_console_unit"])
     previous = str(document["previous_console_unit"])
+    candidate_control = str(document["candidate_control_socket"])
     previous_control = str(document["previous_control_socket"])
 
     live = publication_snapshot()
@@ -2012,17 +2592,17 @@ def rollback(
             "previous Console status",
         )
     if previous_status.get("mode") != "active":
-        runner.require_json(
-            [
-                str(release / "bin/devcoordinator-console-slot-control"),
-                "promote",
-                "--socket",
-                previous_control,
-                "--timeout-seconds",
-                "30",
-            ],
-            "previous Console promotion",
-        )
+        promotion = [
+            str(release / "bin/devcoordinator-console-slot-control"),
+            "promote",
+            "--socket",
+            previous_control,
+            "--timeout-seconds",
+            "30",
+        ]
+        if live_is_candidate:
+            promotion.extend(["--old-socket", candidate_control])
+        runner.require_json(promotion, "previous Console promotion")
     if live_is_candidate:
         switch_publication(
             runner,
@@ -2070,6 +2650,8 @@ def rollback(
     if not isinstance(directory_states, Mapping):
         raise SwitchError("Codex configuration directory rollback plan is unavailable")
     restore_codex_directories(directory_states)
+    restore_authority_migration(document, runner)
+    retire_legacy_control_plane(runner)
     runner.require(["/usr/bin/systemctl", "daemon-reload"], "rollback daemon reload")
     if reset is not None and reset.get("status") in {
         "resetting",
@@ -2078,7 +2660,7 @@ def rollback(
     }:
         reset_test_history_for_rollback(document, journal_path, runner)
     normalize_local_paths(runner)
-    restart_services(runner)
+    restore_rollback_control_plane(runner)
     runner.require(["/usr/bin/systemctl", "enable", "--now", previous], "previous Console restore")
     final_status = wait_slot_status(
         runner,
@@ -2097,6 +2679,13 @@ def rollback(
         http_health("https://console.vr.ae/healthz", 8.0),
         "restored Console final public health",
     )
+    save_phase(
+        journal_path,
+        document,
+        "rollback-control-plane-restored",
+        rollback_control_plane_restored_at=now(),
+    )
+    restore_rollback_background_services(runner)
     candidate_slot = SLOT_ROOT / f"{document['release_digest']}.env"
     candidate_slot.unlink(missing_ok=True)
     save_phase(journal_path, document, "rolled-back", completed_at=now())
@@ -2164,6 +2753,8 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps({"ok": False, "error": str(error)}, sort_keys=True), file=sys.stderr)
         return 1
     print(json.dumps(value, sort_keys=True))
+    if args.action == "verify" and value.get("ok") is not True:
+        return 1
     return 0
 
 

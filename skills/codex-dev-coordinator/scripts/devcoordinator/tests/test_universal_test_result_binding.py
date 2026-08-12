@@ -7,7 +7,7 @@ import tempfile
 import unittest
 
 from devcoordinator.broker import (
-    AuthorizedBrokerRequest,
+    AcceptedBrokerRequest,
     BrokerBackendError,
     BrokerOperation,
     BrokerRequest,
@@ -241,15 +241,7 @@ class UniversalTestResultBindingTests(unittest.TestCase):
                 )
         self.persistence = BrokerPersistence(self.database)
         with CoordinatorStore.open(self.database) as store:
-            with store.immediate_transaction() as connection:
-                connection.execute(
-                    "INSERT INTO broker_acl_principals(uid, account_id, enabled, updated_at) VALUES (?, 'account-tests', 1, ?)",
-                    (os.geteuid(), now),
-                )
-                connection.execute(
-                    "INSERT INTO broker_repository_enrollments(uid, repo_id, account_id, enabled, issued_at, valid_until_epoch, updated_at) VALUES (?, 'repo-tests', 'account-tests', 1, ?, 4102444800, ?)",
-                    (os.geteuid(), now, now),
-                )
+            with store.read_transaction() as connection:
                 self.generation = str(
                     connection.execute(
                         "SELECT database_generation FROM schema_metadata WHERE singleton = 1"
@@ -264,7 +256,7 @@ class UniversalTestResultBindingTests(unittest.TestCase):
 
     def request(
         self, operation: BrokerOperation, arguments: dict[str, object]
-    ) -> AuthorizedBrokerRequest:
+    ) -> AcceptedBrokerRequest:
         request = BrokerRequest.create(
             account_id="account-tests",
             project_id="repo-tests",
@@ -274,7 +266,7 @@ class UniversalTestResultBindingTests(unittest.TestCase):
             authority_generation=self.generation,
         )
         peer = PeerCredentials(uid=os.geteuid(), gid=os.getegid(), pid=os.getpid())
-        return self.persistence.authorize(peer, request)
+        return self.persistence.accept(peer, request)
 
     def execute(self, operation: BrokerOperation, arguments: dict[str, object]):
         return self.backend.execute(self.request(operation, arguments))
@@ -480,35 +472,6 @@ class UniversalTestResultBindingTests(unittest.TestCase):
                 (self.plane.source_run_id, "repo-tests"),
                 ("run-retry-foreign", "repo-tests"),
             ],
-        )
-
-    def test_opaque_run_lookup_cannot_change_caller_repository_authority(self) -> None:
-        now = datetime.now(UTC).isoformat()
-        with CoordinatorStore.open(self.database) as store:
-            with store.immediate_transaction() as connection:
-                connection.execute(
-                    "INSERT INTO repositories(repo_id, host_id, canonical_root, display_name, state, created_at, updated_at) VALUES ('repo-resolved', 'host-tests', ?, 'Resolved', 'active', ?, ?)",
-                    (str(self.root / "resolved"), now, now),
-                )
-                connection.execute(
-                    "INSERT INTO repository_installations(repo_id, status, startup_fenced, actor, updated_at) VALUES ('repo-resolved', 'installed', 0, 'test', ?)",
-                    (now,),
-                )
-                connection.execute(
-                    "INSERT INTO broker_repository_enrollments(uid, repo_id, account_id, enabled, issued_at, valid_until_epoch, updated_at) VALUES (?, 'repo-resolved', 'account-tests', 1, ?, 4102444800, ?)",
-                    (os.geteuid(), now, now),
-                )
-        self.plane.repository_id = "repo-resolved"
-
-        with self.assertRaises(BrokerBackendError) as raised:
-            self.execute(
-                BrokerOperation.TEST_RUN_STATUS,
-                {"run_id": self.plane.source_run_id},
-            )
-        self.assertEqual(raised.exception.code, "test_repository_mismatch")
-        self.assertEqual(
-            self.plane.status_calls,
-            [(self.plane.source_run_id, "repo-tests")],
         )
 
     def test_remote_not_found_is_not_reported_as_scheduler_unavailable(self) -> None:

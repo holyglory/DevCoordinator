@@ -59,12 +59,7 @@ def marker_path(maintenance_root: Path = MAINTENANCE_ROOT) -> Path:
 
 def _validate_parent(
     path: Path,
-    *,
-    expected_uid: int,
-    expected_gid: int | None,
-    allow_unmapped_owner: bool = False,
 ) -> os.stat_result:
-    del expected_uid, expected_gid, allow_unmapped_owner
     try:
         metadata = path.lstat()
     except OSError as error:
@@ -144,8 +139,6 @@ def _decode_state(document: Any) -> MaintenanceState:
 
 def load_maintenance_state(
     *,
-    expected_uid: int,
-    expected_gid: int | None = None,
     maintenance_root: Path = MAINTENANCE_ROOT,
 ) -> MaintenanceState | None:
     """Return an active marker, absence, or a malformed-marker error.
@@ -156,17 +149,7 @@ def load_maintenance_state(
     """
 
     marker = marker_path(maintenance_root)
-    allow_unmapped_owner = (
-        expected_uid == 0
-        and expected_gid is None
-        and Path(maintenance_root) == MAINTENANCE_ROOT
-    )
-    _validate_parent(
-        marker.parent,
-        expected_uid=expected_uid,
-        expected_gid=expected_gid,
-        allow_unmapped_owner=allow_unmapped_owner,
-    )
+    _validate_parent(marker.parent)
     try:
         metadata = marker.lstat()
     except FileNotFoundError:
@@ -226,10 +209,10 @@ def load_maintenance_state(
 
 @contextmanager
 def _exclusive_writer(
-    maintenance_root: Path, *, expected_uid: int, expected_gid: int
+    maintenance_root: Path,
 ):
     marker = marker_path(maintenance_root)
-    _validate_parent(marker.parent, expected_uid=expected_uid, expected_gid=expected_gid)
+    _validate_parent(marker.parent)
     lock = marker.parent / MAINTENANCE_LOCK_FILENAME
     flags = (
         os.O_RDWR
@@ -267,11 +250,8 @@ def maintenance_writer_lock(
 ):
     """Hold the canonical marker-writer exclusion across one fenced operation."""
 
-    with _exclusive_writer(
-        maintenance_root,
-        expected_uid=expected_uid,
-        expected_gid=expected_gid,
-    ):
+    del expected_uid, expected_gid
+    with _exclusive_writer(maintenance_root):
         yield
 
 
@@ -320,8 +300,6 @@ def activate_maintenance(
         expected_gid=expected_gid,
     ):
         existing = load_maintenance_state(
-            expected_uid=expected_uid,
-            expected_gid=expected_gid,
             maintenance_root=maintenance_root,
         )
         if existing is not None:
@@ -357,7 +335,7 @@ def activate_maintenance(
         try:
             os.fchown(descriptor, expected_uid, expected_gid)
             # The marker is an intentionally public, non-secret availability
-            # signal.  Every enrolled local account must be able to read it
+            # signal.  Every configured local account must be able to read it
             # even when the installation uses no shared Unix group.
             os.fchmod(descriptor, MAINTENANCE_MARKER_MODE)
             written = 0
@@ -388,8 +366,6 @@ def activate_maintenance(
         finally:
             os.close(directory)
     return load_maintenance_state(
-        expected_uid=expected_uid,
-        expected_gid=expected_gid,
         maintenance_root=maintenance_root,
     ) or state
 
@@ -410,8 +386,6 @@ def clear_maintenance(
         expected_gid=expected_gid,
     ):
         current = load_maintenance_state(
-            expected_uid=expected_uid,
-            expected_gid=expected_gid,
             maintenance_root=maintenance_root,
         )
         if current is None:

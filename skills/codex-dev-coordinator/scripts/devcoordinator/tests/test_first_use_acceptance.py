@@ -61,7 +61,7 @@ def _serve_result(*, execution_uid: int = 1000) -> dict[str, object]:
 
 
 class _FakeClient:
-    initial_state = "unenrolled"
+    initial_state = "unconfigured"
 
     def __init__(
         self,
@@ -83,7 +83,7 @@ class _FakeClient:
         self,
         arguments: tuple[str, ...],
         *,
-        expect_ok: bool,
+        expect_ok: bool | None,
         timeout: float = 90.0,
     ) -> dict[str, object]:
         del timeout
@@ -91,7 +91,7 @@ class _FakeClient:
             return {
                 "ok": True,
                 "repository": {
-                    "state": "enrolled" if self.served else self.initial_state
+                    "state": "configured" if self.served else self.initial_state
                 },
             }
         if arguments[0] == "targets":
@@ -128,7 +128,7 @@ class _FakeClient:
                 }
             return {
                 "ok": True,
-                "target_count": 0 if self.initial_state == "unenrolled" else 1,
+                "target_count": 0 if self.initial_state == "unconfigured" else 1,
                 "targets": [],
             }
         if arguments[:2] == ("operation", "follow"):
@@ -200,12 +200,66 @@ class _FakeClient:
         raise AssertionError(f"unexpected client call: {arguments!r}")
 
     @staticmethod
-    def _assert_expectation(actual: bool, expected: bool) -> None:
+    def _assert_expectation(actual: bool | None, expected: bool) -> None:
+        if actual is None:
+            return
         if actual is not expected:
             raise AssertionError("test acceptance expectation is contradictory")
 
 
 class FirstUseAcceptanceTests(unittest.TestCase):
+    def test_ttl_terminal_visibility_retries_a_stale_active_projection(self) -> None:
+        class StaleTargetClient(_FakeClient):
+            def call(
+                self,
+                arguments: tuple[str, ...],
+                *,
+                expect_ok: bool | None,
+                timeout: float = 90.0,
+            ) -> dict[str, object]:
+                if (
+                    arguments[0] == "targets"
+                    and len(arguments) > 1
+                    and arguments[1].startswith("service-")
+                    and self.exact_target_reads == 1
+                ):
+                    del timeout
+                    self.exact_target_reads += 1
+                    selected = {
+                        "kind": "service",
+                        "id": "service-1234567890abcdef",
+                        "name": self.service_name,
+                        "state": "running",
+                        "ready": True,
+                    }
+                    return {
+                        "ok": True,
+                        "target_count": 1,
+                        "targets": [selected],
+                        "selected": selected,
+                    }
+                return super().call(
+                    arguments,
+                    expect_ok=expect_ok,
+                    timeout=timeout,
+                )
+
+        client = StaleTargetClient(Path("/client"), Path("/project"))
+        client.service_name = "prototype"
+        client.exact_target_reads = 1
+        client.status_reads = 1
+        with mock.patch.object(first_use_acceptance.time, "sleep") as sleep:
+            targets, status = first_use_acceptance._wait_for_ttl_terminal_visibility(
+                client=client,
+                common=("--project", "/project"),
+                service_id="service-1234567890abcdef",
+                deadline=first_use_acceptance.time.monotonic() + 1,
+            )
+
+        self.assertEqual(targets["code"], "target_not_found")
+        self.assertEqual(status["classification"], "expired")
+        sleep.assert_called_once_with(0.2)
+
     def test_root_requires_an_explicit_non_root_caller(self) -> None:
         with mock.patch.object(
             first_use_acceptance.os, "geteuid", return_value=0
@@ -341,6 +395,27 @@ class FirstUseAcceptanceTests(unittest.TestCase):
         ):
             self.assertEqual(first_use_acceptance._fetch(4173), payload)
 
+    def test_cold_page_fetch_retries_timeout_within_one_deadline(self) -> None:
+        payload = b'<html><div id="root"></div></html>'
+        with (
+            mock.patch.object(
+                first_use_acceptance,
+                "_fetch",
+                side_effect=(TimeoutError("timed out"), payload),
+            ) as fetch,
+            mock.patch.object(
+                first_use_acceptance.time,
+                "monotonic",
+                side_effect=(0.0, 0.1),
+            ),
+            mock.patch.object(first_use_acceptance.time, "sleep"),
+        ):
+            self.assertEqual(
+                first_use_acceptance._fetch_when_ready(4173, deadline=1.0),
+                payload,
+            )
+        self.assertEqual(fetch.call_count, 2)
+
     def test_cleanup_proof_uses_tcp_refusal_not_http_behavior(self) -> None:
         with (
             mock.patch.object(
@@ -400,12 +475,12 @@ class FirstUseAcceptanceTests(unittest.TestCase):
                 mismatched, port=4173, ttl_seconds=20, caller_uid=1000
             )
 
-    def test_first_unenrolled_run_reports_adoption_truthfully(self) -> None:
-        class UnenrolledClient(_FakeClient):
-            initial_state = "unenrolled"
+    def test_first_unconfigured_run_reports_adoption_truthfully(self) -> None:
+        class UnconfiguredClient(_FakeClient):
+            initial_state = "unconfigured"
 
         with (
-            mock.patch.object(first_use_acceptance, "Client", UnenrolledClient),
+            mock.patch.object(first_use_acceptance, "Client", UnconfiguredClient),
             mock.patch.object(first_use_acceptance, "_fetch", return_value=b"ok"),
             mock.patch.object(
                 first_use_acceptance, "_wait_for_cleanup", return_value=True
@@ -424,12 +499,12 @@ class FirstUseAcceptanceTests(unittest.TestCase):
         self.assertTrue(result["repository_adoption_exercised"])
         self.assertTrue(result["first_use_runtime_proved"])
 
-    def test_repeat_run_reports_enrolled_smoke_not_first_use(self) -> None:
-        class EnrolledClient(_FakeClient):
-            initial_state = "enrolled"
+    def test_repeat_run_reports_configured_smoke_not_first_use(self) -> None:
+        class ConfiguredClient(_FakeClient):
+            initial_state = "configured"
 
         with (
-            mock.patch.object(first_use_acceptance, "Client", EnrolledClient),
+            mock.patch.object(first_use_acceptance, "Client", ConfiguredClient),
             mock.patch.object(first_use_acceptance, "_fetch", return_value=b"ok"),
             mock.patch.object(
                 first_use_acceptance, "_wait_for_cleanup", return_value=True
@@ -444,7 +519,7 @@ class FirstUseAcceptanceTests(unittest.TestCase):
                 )
             )
 
-        self.assertEqual(result["acceptance_mode"], "enrolled-repository-smoke")
+        self.assertEqual(result["acceptance_mode"], "configured-repository-smoke")
         self.assertFalse(result["repository_adoption_exercised"])
         self.assertFalse(result["first_use_runtime_proved"])
         self.assertTrue(result["http_ready"])
@@ -533,8 +608,8 @@ class FirstUseAcceptanceTests(unittest.TestCase):
                 )
 
     def test_nested_application_cwd_is_used_for_both_exact_port_launches(self) -> None:
-        class EnrolledClient(_FakeClient):
-            initial_state = "enrolled"
+        class ConfiguredClient(_FakeClient):
+            initial_state = "configured"
 
             def call(
                 self,
@@ -554,7 +629,7 @@ class FirstUseAcceptanceTests(unittest.TestCase):
                 )
 
         with (
-            mock.patch.object(first_use_acceptance, "Client", EnrolledClient),
+            mock.patch.object(first_use_acceptance, "Client", ConfiguredClient),
             mock.patch.object(first_use_acceptance, "_fetch", return_value=b"ok"),
             mock.patch.object(
                 first_use_acceptance, "_wait_for_cleanup", return_value=True
@@ -574,8 +649,8 @@ class FirstUseAcceptanceTests(unittest.TestCase):
         self.assertEqual(result["application_cwd"], "prototype")
 
     def test_auto_port_is_selected_once_and_remains_exact(self) -> None:
-        class EnrolledClient(_FakeClient):
-            initial_state = "enrolled"
+        class ConfiguredClient(_FakeClient):
+            initial_state = "configured"
 
             def call(
                 self,
@@ -617,7 +692,7 @@ class FirstUseAcceptanceTests(unittest.TestCase):
         cleaned: list[tuple[int, float]] = []
 
         with (
-            mock.patch.object(first_use_acceptance, "Client", EnrolledClient),
+            mock.patch.object(first_use_acceptance, "Client", ConfiguredClient),
             mock.patch.object(
                 first_use_acceptance,
                 "_select_ephemeral_port",
@@ -663,7 +738,7 @@ class FirstUseAcceptanceTests(unittest.TestCase):
 
     def test_auto_port_retries_only_a_prelaunch_port_race(self) -> None:
         class RacingClient(_FakeClient):
-            initial_state = "enrolled"
+            initial_state = "configured"
 
             def __init__(
                 self,
@@ -769,7 +844,7 @@ class FirstUseAcceptanceTests(unittest.TestCase):
         for envelope in cases:
             with self.subTest(envelope=envelope):
                 class MisleadingClient(_FakeClient):
-                    initial_state = "enrolled"
+                    initial_state = "configured"
 
                     def call(
                         self,

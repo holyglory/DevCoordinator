@@ -1,4 +1,19 @@
 {
+  "acceptance_setup": [
+    {
+      "argv": [
+        "{release}/bin/devcoordinator-production-browser-session",
+        "--output",
+        "{run_root}/production-browser-storage-state.json",
+        "--owner-uid",
+        "{caller_uid}",
+        "--owner-gid",
+        "{caller_gid}"
+      ],
+      "blocking": true,
+      "name": "production-browser-session"
+    }
+  ],
   "acceptance": [
     {
       "argv": [
@@ -55,6 +70,9 @@
         "{release}/bin/devcoordinator-production-console-acceptance-batch",
         "--release",
         "{release}",
+        "--storage-state",
+        "{run_root}/production-browser-storage-state.json",
+        "--consume-storage-state",
         "--output-dir",
         "{run_root}/browser"
       ],
@@ -63,26 +81,10 @@
     },
     {
       "argv": [
-        "{release}/bin/devcoordinator-first-use-acceptance",
-        "--client",
-        "{release}/bin/devcoordinator",
-        "--project",
-        "/home/holyglory/DesignDocEngine",
-        "--caller-user",
-        "holygloryTT",
-        "--cwd",
-        "prototype",
-        "--auto-port"
-      ],
-      "blocking": true,
-      "name": "first-use-development-server"
-    },
-    {
-      "argv": [
         "{release}/bin/devcoordinator-browser-accounting",
         "status",
         "--state",
-        "/var/lib/devcoordinator/browser-lifecycle.json",
+        "/var/lib/devcoordinator-browser-lifecycle/browser-lifecycle.json",
         "--json"
       ],
       "blocking": true,
@@ -148,6 +150,15 @@
       }
     ]
   },
-  "schema_version": 1,
-  "source_checks": []
+  "schema_version": 2,
+  "source_checks": [
+    {
+      "argv": [
+        "/usr/bin/python3",
+        "skills/postgres-docker-backup/scripts/self_test.py"
+      ],
+      "blocking": true,
+      "name": "postgres-backup-safety"
+    }
+  ]
 }

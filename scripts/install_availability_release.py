@@ -134,6 +134,7 @@ AVAILABILITY_TEMPLATES = (
     "devcoordinator-broker.service",
     "devcoordinator-availability.sysusers.conf",
     "devcoordinator-availability.tmpfiles.conf",
+    "devcoordinator.tmpfiles.conf",
     "devcoordinator-background.slice",
     "devcoordinator-console@.service",
     "devcoordinator-control.slice",
@@ -158,6 +159,7 @@ SOURCE_ROOTS = (
     Path("apps/DevOpsConsole/edge"),
     Path("apps/DevOpsConsole/src"),
     Path("skills/codex-dev-coordinator/scripts"),
+    Path("skills/postgres-docker-backup"),
 )
 SOURCE_FILES = (
     Path("apps/DevOpsConsole/package.json"),
@@ -170,7 +172,6 @@ SOURCE_FILES = (
     Path("deploy/devcoordinator-test.rules"),
     Path("scripts/activate_availability_release.py"),
     Path("scripts/availability_schema_check.py"),
-    Path("scripts/bridge_schema12_legacy_broker.py"),
     Path("scripts/browser_lcp_acceptance.py"),
     Path("scripts/check_availability_topology.py"),
     Path("scripts/clean_adopt_availability.py"),
@@ -178,10 +179,8 @@ SOURCE_FILES = (
     Path("scripts/install_availability_release.py"),
     Path("scripts/install_browser_lcp_runtime.py"),
     Path("scripts/manage_maintenance_mode.py"),
-    Path("scripts/manage_docker_admission.py"),
     Path("scripts/manage_universal_test_adoption.py"),
     Path("scripts/manage_universal_test_credentials.py"),
-    Path("scripts/migrate_repository_owner_authority.py"),
     Path("scripts/migrate_universal_test_history.py"),
     Path("scripts/orchestrate_availability_cutover.py"),
     Path("scripts/prepare_background_service_handoff.py"),
@@ -217,6 +216,11 @@ FORBIDDEN_PARTS = {
 FORBIDDEN_SUFFIXES = (".env", ".key", ".pem", ".sqlite", ".sqlite3", ".log")
 
 WRAPPERS = {
+    "devcoordinator-systemd-unit": (
+        "python",
+        "skills/codex-dev-coordinator/scripts/dev_coordinator.py",
+        ("systemd-unit",),
+    ),
     "devcoordinator-clean-adoption": (
         "python",
         "scripts/clean_adopt_availability.py",
@@ -256,16 +260,6 @@ WRAPPERS = {
         "python",
         "scripts/orchestrate_availability_cutover.py",
         ("recover-authority-repository-disable",),
-    ),
-    "devcoordinator-authority-repository-policy-reconciliation": (
-        "python",
-        "scripts/orchestrate_availability_cutover.py",
-        (),
-    ),
-    "devcoordinator-schema12-bridge": (
-        "python",
-        "scripts/bridge_schema12_legacy_broker.py",
-        (),
     ),
     "devcoordinator-maintenance": (
         "python",
@@ -352,11 +346,6 @@ WRAPPERS = {
         "scripts/audit_project_runtime_isolation.py",
         (),
     ),
-    "devcoordinator-docker-admission": (
-        "python",
-        "scripts/manage_docker_admission.py",
-        (),
-    ),
     "devcoordinator-production-console-acceptance-batch": (
         "python",
         "scripts/run_production_console_acceptance.py",
@@ -432,11 +421,6 @@ WRAPPERS = {
         "scripts/migrate_universal_test_history.py",
         (),
     ),
-    "devcoordinator-repository-owner-authority": (
-        "python",
-        "scripts/migrate_repository_owner_authority.py",
-        (),
-    ),
     "devcoordinator-test-preflight": (
         "python",
         "skills/codex-dev-coordinator/scripts/devcoordinator/universal_test_preflight.py",
@@ -502,7 +486,6 @@ AGENT_CLIENT_RUNTIME_PATHS = (
     "skills/codex-dev-coordinator/scripts/devcoordinator/ephemeral_secrets.py",
     "skills/codex-dev-coordinator/scripts/devcoordinator/legacy_import.py",
     "skills/codex-dev-coordinator/scripts/devcoordinator/maintenance.py",
-    "skills/codex-dev-coordinator/scripts/devcoordinator/repository_execution_scope.py",
     "skills/codex-dev-coordinator/scripts/devcoordinator/schema.py",
     "skills/codex-dev-coordinator/scripts/devcoordinator/store.py",
     "skills/codex-dev-coordinator/scripts/devcoordinator/test_actor.py",
@@ -528,10 +511,6 @@ AGENT_MCP_RUNTIME_PATH = (
     "skills/codex-dev-coordinator/scripts/devcoordinator/agent_mcp.py"
 )
 
-TEST_CAPABILITY_SOURCE = Path("deploy/devcoordinator-test-execution-capabilities.json")
-DEFAULT_TEST_CAPABILITY_POLICY = Path(
-    "/etc/devcoordinator/test-execution-capabilities.json"
-)
 MIB = 1024 * 1024
 GIB = 1024 * MIB
 CAPACITY_PLACEHOLDERS = {
@@ -647,34 +626,6 @@ def _sha256_file(path: Path) -> str:
         for block in iter(lambda: handle.read(1024 * 1024), b""):
             value.update(block)
     return value.hexdigest()
-
-
-def validated_test_capability_payload(path: Path) -> bytes:
-    """Validate the bounded administrator policy before installing it."""
-
-    path = path.expanduser().absolute()
-    info = path.lstat()
-    if (
-        stat.S_ISLNK(info.st_mode)
-        or not stat.S_ISREG(info.st_mode)
-        or path.resolve(strict=True) != path
-        or info.st_size > 1024 * 1024
-    ):
-        raise ReleaseError("test capability policy source is unsafe")
-    payload = path.read_bytes()
-    try:
-        document = json.loads(payload)
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise ReleaseError("test capability policy source is invalid JSON") from error
-    if (
-        not isinstance(document, dict)
-        or set(document) != {"schema_version", "repositories"}
-        or document["schema_version"] != 1
-        or not isinstance(document["repositories"], list)
-        or len(document["repositories"]) > 10_000
-    ):
-        raise ReleaseError("test capability policy source fields are invalid")
-    return payload
 
 
 def _safe_source_file(repo: Path, relative: Path) -> Path:
@@ -1041,18 +992,10 @@ def plan_release(repo: Path, release_root: Path) -> dict[str, Any]:
     entries, _wrappers = release_inputs(repo)
     digest = release_digest(entries)
     paths = {item["path"] for item in entries}
-    schema12_bridge_source = (
-        (repo / "scripts/bridge_schema12_legacy_broker.py").read_text(
-            encoding="utf-8"
-        )
-        if "scripts/bridge_schema12_legacy_broker.py" in paths
-        else ""
-    )
     activation_source = (
         "skills/codex-dev-coordinator/scripts/devcoordinator/systemd_activation.py"
         in paths
     )
-    validated_test_capability_payload(repo / TEST_CAPABILITY_SOURCE)
     capabilities = {
         "edge_systemd_sockets": "bin/devcoordinator-edge" in paths,
         "console_immutable_backend": "bin/devcoordinator-console" in paths,
@@ -1123,31 +1066,11 @@ def plan_release(repo: Path, release_root: Path) -> dict[str, Any]:
                 "skills/codex-dev-coordinator/scripts/devcoordinator/broker_host.py",
             )
         ),
-        "broker_only_docker_admission": all(
-            path in paths
-            for path in (
-                "bin/devcoordinator-docker-admission",
-                "scripts/manage_docker_admission.py",
-                "scripts/install_availability_release.py",
-                "scripts/server_wide_installer_fence.py",
-                "skills/codex-dev-coordinator/scripts/dev_coordinator.py",
-                "skills/codex-dev-coordinator/scripts/devcoordinator/broker_profile.py",
-            )
-        ),
         "background_service_handoff": all(
             path in paths
             for path in (
                 "bin/devcoordinator-background-handoff",
                 "scripts/prepare_background_service_handoff.py",
-            )
-        ),
-        "repository_owner_map_preparation": all(
-            path in paths
-            for path in (
-                "bin/devcoordinator-repository-owner-authority",
-                "scripts/migrate_repository_owner_authority.py",
-                "skills/codex-dev-coordinator/scripts/devcoordinator/repository_execution_scope.py",
-                "skills/codex-dev-coordinator/scripts/devcoordinator/repository_owner_authority.py",
             )
         ),
         "authority_readiness_recovery": all(
@@ -1177,16 +1100,6 @@ def plan_release(repo: Path, release_root: Path) -> dict[str, Any]:
                 "skills/codex-dev-coordinator/scripts/devcoordinator/maintenance.py",
             )
         ),
-        "authority_repository_startup_policy_reconciliation": all(
-            path in paths
-            for path in (
-                "bin/devcoordinator-authority-repository-policy-reconciliation",
-                "scripts/orchestrate_availability_cutover.py",
-                "skills/codex-dev-coordinator/scripts/devcoordinator/broker_cli.py",
-                "skills/codex-dev-coordinator/scripts/devcoordinator/maintenance.py",
-                "skills/codex-dev-coordinator/scripts/devcoordinator/schema.py",
-            )
-        ),
         "atomic_first_adoption_bindings": all(
             path in paths
             for path in (
@@ -1196,60 +1109,6 @@ def plan_release(repo: Path, release_root: Path) -> dict[str, Any]:
                 "skills/codex-dev-coordinator/scripts/devcoordinator/maintenance.py",
             )
         ),
-        "schema12_legacy_writer_handoff": all(
-            path in paths
-            for path in (
-                "bin/devcoordinator-schema12-bridge",
-                "deploy/devcoordinator-broker.service",
-                "scripts/bridge_schema12_legacy_broker.py",
-            )
-        ),
-        "schema12_clean_bridge_successor": all(
-            path in paths
-            for path in (
-                "bin/devcoordinator-schema12-bridge",
-                "scripts/bridge_schema12_legacy_broker.py",
-                "scripts/server_wide_installer_fence.py",
-                "scripts/install_availability_release.py",
-                "skills/codex-dev-coordinator/scripts/devcoordinator/broker_profile.py",
-                "skills/codex-dev-coordinator/scripts/devcoordinator/maintenance.py",
-                "skills/codex-dev-coordinator/scripts/devcoordinator/repository_execution_scope.py",
-                "skills/codex-dev-coordinator/scripts/devcoordinator/repository_owner_authority.py",
-            )
-        ),
-        "schema12_policy_reconciled_restored_recovery": all(
-            path in paths
-            for path in (
-                "bin/devcoordinator-schema12-bridge",
-                "scripts/bridge_schema12_legacy_broker.py",
-                "scripts/orchestrate_availability_cutover.py",
-                "scripts/server_wide_installer_fence.py",
-                "skills/codex-dev-coordinator/scripts/devcoordinator/broker_cli.py",
-                "skills/codex-dev-coordinator/scripts/devcoordinator/broker_profile.py",
-                "skills/codex-dev-coordinator/scripts/devcoordinator/maintenance.py",
-                "skills/codex-dev-coordinator/scripts/devcoordinator/repository_owner_authority.py",
-                "skills/codex-dev-coordinator/scripts/devcoordinator/schema.py",
-            )
-        )
-        and "def recover_policy_reconciled_restored_bridge("
-        in schema12_bridge_source
-        and '"recover-policy-reconciled-restored"'
-        in schema12_bridge_source,
-        "schema12_lifecycle_crash_loop_quiescence": all(
-            path in paths
-            for path in (
-                "bin/devcoordinator-schema12-bridge",
-                "deploy/devcoordinator-broker.service",
-                "scripts/bridge_schema12_legacy_broker.py",
-                "scripts/orchestrate_availability_cutover.py",
-                "scripts/server_wide_installer_fence.py",
-                "skills/codex-dev-coordinator/scripts/devcoordinator/maintenance.py",
-            )
-        )
-        and "def quiesce_lifecycle_recovery_crash_loop("
-        in schema12_bridge_source
-        and '"quiesce-lifecycle-recovery-crash-loop"'
-        in schema12_bridge_source,
         "typed_maintenance_control": all(
             path in paths
             for path in (
@@ -1306,7 +1165,6 @@ def plan_release(repo: Path, release_root: Path) -> dict[str, Any]:
                 "skills/codex-dev-coordinator/scripts/devcoordinator/universal_test_runner.py",
             )
         ),
-        "sealed_test_capability_policy": True,
         "evidence_gated_activation": all(
             path in paths
             for path in (
@@ -2361,88 +2219,6 @@ def render_units(
     }
 
 
-def install_test_capability_policy(
-    source: Path,
-    destination: Path = DEFAULT_TEST_CAPABILITY_POLICY,
-    *,
-    owner_uid: int = 0,
-    owner_gid: int = 0,
-) -> dict[str, Any]:
-    """Atomically install the explicit administrator-sealed test policy."""
-
-    payload = validated_test_capability_payload(source)
-    destination = destination.expanduser().absolute()
-    try:
-        parent_info = destination.parent.lstat()
-    except OSError as error:
-        raise ReleaseError("test capability policy parent does not exist") from error
-    if (
-        stat.S_ISLNK(parent_info.st_mode)
-        or not stat.S_ISDIR(parent_info.st_mode)
-        or destination.parent.resolve(strict=True) != destination.parent
-        or parent_info.st_uid != owner_uid
-        or parent_info.st_gid != owner_gid
-        or stat.S_IMODE(parent_info.st_mode) & 0o022
-    ):
-        raise ReleaseError("test capability policy parent is unsafe")
-    if os.geteuid() != 0 and (owner_uid, owner_gid) != (os.geteuid(), os.getegid()):
-        raise ReleaseError("only root may install the test policy for another identity")
-    existed = destination.exists() or destination.is_symlink()
-    if existed:
-        info = destination.lstat()
-        if (
-            stat.S_ISLNK(info.st_mode)
-            or not stat.S_ISREG(info.st_mode)
-            or info.st_uid != owner_uid
-            or info.st_gid != owner_gid
-            or stat.S_IMODE(info.st_mode) != 0o600
-        ):
-            raise ReleaseError("existing test capability policy is unsafe")
-        if destination.read_bytes() == payload:
-            return {
-                "ok": True,
-                "created": False,
-                "changed": False,
-                "destination": str(destination),
-                "sha256": _sha256_bytes(payload),
-            }
-    temporary = destination.parent / f".{destination.name}.{uuid.uuid4().hex}.partial"
-    _install_bytes(
-        temporary,
-        payload,
-        mode=0o600,
-        uid=owner_uid,
-        gid=owner_gid,
-    )
-    try:
-        os.replace(temporary, destination)
-        parent_fd = os.open(
-            destination.parent,
-            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
-        )
-        try:
-            os.fsync(parent_fd)
-        finally:
-            os.close(parent_fd)
-    finally:
-        temporary.unlink(missing_ok=True)
-    info = destination.lstat()
-    if (
-        info.st_uid != owner_uid
-        or info.st_gid != owner_gid
-        or stat.S_IMODE(info.st_mode) != 0o600
-        or destination.read_bytes() != payload
-    ):
-        raise ReleaseError("installed test capability policy failed verification")
-    return {
-        "ok": True,
-        "created": not existed,
-        "changed": True,
-        "destination": str(destination),
-        "sha256": _sha256_bytes(payload),
-    }
-
-
 def initialize_observer_projection(
     release: Path,
     publication: Path,
@@ -2673,15 +2449,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     observer.add_argument("--database", type=Path)
     observer.add_argument("--owner-uid", type=int, required=True)
     observer.add_argument("--owner-gid", type=int, required=True)
-    test_policy = subcommands.add_parser("install-test-capability-policy")
-    test_policy.add_argument(
-        "--source", type=Path, default=ROOT / TEST_CAPABILITY_SOURCE
-    )
-    test_policy.add_argument(
-        "--destination", type=Path, default=DEFAULT_TEST_CAPABILITY_POLICY
-    )
-    test_policy.add_argument("--owner-uid", type=int, default=0)
-    test_policy.add_argument("--owner-gid", type=int, default=0)
     console_slot = subcommands.add_parser("render-console-slot")
     console_slot.add_argument("--release", type=Path, required=True)
     console_slot.add_argument("--output", type=Path, required=True)
@@ -2723,13 +2490,6 @@ def main(argv: list[str] | None = None) -> int:
                 owner_uid=args.owner_uid,
                 owner_gid=args.owner_gid,
                 database=args.database,
-            )
-        elif args.action == "install-test-capability-policy":
-            result = install_test_capability_policy(
-                args.source,
-                args.destination,
-                owner_uid=args.owner_uid,
-                owner_gid=args.owner_gid,
             )
         else:
             result = render_console_slot(

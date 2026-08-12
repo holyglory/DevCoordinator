@@ -5,6 +5,7 @@ import unittest
 
 from devcoordinator.agent_projection import (
     AgentProjectionError,
+    MAX_RUNTIME_LOG_RESULT_BYTES,
     MAX_STATUS_RESULT_BYTES,
     MAX_TARGET_RESULT_BYTES,
     project_runtime_report,
@@ -109,6 +110,66 @@ class AgentProjectionTests(unittest.TestCase):
             projected, separators=(",", ":"), sort_keys=True
         ).encode()
         self.assertLessEqual(len(encoded), MAX_STATUS_RESULT_BYTES)
+
+    def test_runtime_log_projection_returns_bounded_exact_tail(self) -> None:
+        artifact_id = "11111111-1111-4111-8111-111111111111"
+        report = {
+            "ok": True,
+            "action": "capture_logs",
+            "classification": "available",
+            "target": {"kind": "docker", "id": "docker-1"},
+            "artifact": {
+                "availability": "available",
+                "artifact_id": artifact_id,
+                "resource_kind": "docker",
+                "target_resource_id": "docker-1",
+                "source": "docker_logs_exact_container",
+                "captured_at": "2026-08-09T00:00:00Z",
+                "bounds": {"tail_lines": 2_000, "max_bytes": 1_048_576},
+                "truncated": False,
+            },
+            "artifact_content": {
+                "artifact_id": artifact_id,
+                "text": "old\x1b[31m\n"
+                + ("diagnostic \\\"line\\\"\n" * 2_000)
+                + "latest cause\n",
+            },
+        }
+
+        projected = project_runtime_report(report)
+
+        self.assertEqual(projected["artifact"]["artifact_id"], artifact_id)
+        self.assertTrue(projected["artifact_content"]["projection_truncated"])
+        self.assertIn(
+            "older log output omitted", projected["artifact_content"]["text"]
+        )
+        self.assertTrue(
+            projected["artifact_content"]["text"].endswith("latest cause\n")
+        )
+        self.assertNotIn("\x1b", projected["artifact_content"]["text"])
+        encoded = json.dumps(
+            projected, separators=(",", ":"), sort_keys=True
+        ).encode()
+        self.assertLessEqual(len(encoded), MAX_RUNTIME_LOG_RESULT_BYTES)
+
+    def test_runtime_log_projection_rejects_contradictory_artifact_identity(
+        self,
+    ) -> None:
+        with self.assertRaises(AgentProjectionError) as raised:
+            project_runtime_report(
+                {
+                    "ok": True,
+                    "action": "capture_logs",
+                    "classification": "available",
+                    "target": {"kind": "docker", "id": "docker-1"},
+                    "artifact": {"artifact_id": "artifact-one"},
+                    "artifact_content": {
+                        "artifact_id": "artifact-two",
+                        "text": "log\n",
+                    },
+                }
+            )
+        self.assertEqual(raised.exception.code, "runtime_log_artifact_invalid")
 
 
 if __name__ == "__main__":

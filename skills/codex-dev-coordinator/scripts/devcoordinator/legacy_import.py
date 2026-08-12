@@ -21,7 +21,7 @@ import time
 from typing import Any, Callable, Generator, Iterable, Mapping, Sequence
 import uuid
 
-from .schema import establish_repository_owner_authority, invariant_violations
+from .schema import invariant_violations
 from .store import (
     AccountStore,
     canonical_json,
@@ -117,8 +117,6 @@ class _NormalizedPlan:
     server_environment: list[tuple[str, str, str]] = field(default_factory=list)
     server_source_records: list[dict[str, Any]] = field(default_factory=list)
     server_observations: dict[str, dict[str, Any]] = field(default_factory=dict)
-    control_bindings: list[dict[str, Any]] = field(default_factory=list)
-    memberships: list[dict[str, Any]] = field(default_factory=list)
     startup_policies: list[dict[str, Any]] = field(default_factory=list)
     assignments: list[dict[str, Any]] = field(default_factory=list)
     leases: list[dict[str, Any]] = field(default_factory=list)
@@ -850,48 +848,6 @@ def _finalize_servers(
             **observation_payload,
             "observation_fingerprint": fingerprint(observation_payload),
         }
-        authority = "conflicting" if blocking else "authoritative"
-        binding_id = deterministic_id("control-binding", "server", definition_id)
-        plan.control_bindings.append(
-            {
-                "binding_id": binding_id,
-                "repo_id": repo_id,
-                "source_resource_id": observation_item["source_resource"]["source_resource_id"],
-                "resource_kind": "server",
-                "resource_id": definition_id,
-                "source_id": (
-                    observation_item["capture"].source_id
-                    if blocking
-                    else normalized_source_id
-                ),
-                "capability": "lifecycle",
-                "provenance": (
-                    "legacy_current_conflict"
-                    if blocking
-                    else "normalized_exact_import"
-                    if exact
-                    else "normalized_current_import"
-                    if current
-                    else "normalized_historical_import"
-                ),
-                "authority_state": authority,
-                "priority": 0 if blocking else 100,
-                "generation": 0,
-                "created_at": now,
-                "updated_at": now,
-            }
-        )
-        plan.memberships.append(
-            {
-                "membership_id": deterministic_id("membership", repo_id, "server", definition_id),
-                "repo_id": repo_id,
-                "resource_kind": "server",
-                "host_resource_id": definition_id,
-                "immutable_fingerprint": selected["definition_fingerprint"],
-                "control_binding_id": binding_id,
-                "created_at": now,
-            }
-        )
         plan.startup_policies.append(
             {
                 "policy_id": deterministic_id("startup-policy", "server", definition_id, "coordinator"),
@@ -1279,6 +1235,7 @@ def _normalize_docker(plan: _NormalizedPlan, capture: LegacySourceCapture, host_
                 {
                     "docker_resource_id": docker_resource_id,
                     "engine_id": engine_id,
+                    "repo_id": repo_id if reason is None else None,
                     "full_container_id": immutable_id.lower(),
                     "current_name": str(value.get("name") or native_id),
                     "image": value.get("image"),
@@ -1301,37 +1258,6 @@ def _normalize_docker(plan: _NormalizedPlan, capture: LegacySourceCapture, host_
                     "updated_at": now,
                 }
             )
-            if repo_id is not None and reason is None:
-                binding_id = deterministic_id("control-binding", "container", docker_resource_id)
-                if not any(item["binding_id"] == binding_id for item in plan.control_bindings):
-                    plan.control_bindings.append(
-                        {
-                            "binding_id": binding_id,
-                            "repo_id": repo_id,
-                            "source_resource_id": source_resource["source_resource_id"],
-                            "resource_kind": "container",
-                            "resource_id": docker_resource_id,
-                            "source_id": capture.source_id,
-                            "capability": "lifecycle",
-                            "provenance": "legacy_sidecar",
-                            "authority_state": "authoritative",
-                            "priority": 50,
-                            "generation": 0,
-                            "created_at": now,
-                            "updated_at": now,
-                        }
-                    )
-                    plan.memberships.append(
-                        {
-                            "membership_id": deterministic_id("membership", repo_id, "container", docker_resource_id),
-                            "repo_id": repo_id,
-                            "resource_kind": "container",
-                            "host_resource_id": docker_resource_id,
-                            "immutable_fingerprint": fingerprint({"engine": engine_id, "container": immutable_id.lower()}),
-                            "control_binding_id": binding_id,
-                            "created_at": now,
-                        }
-                    )
             restart_policy = value.get("restart_policy")
             if restart_policy is not None:
                 plan.startup_policies.append(
@@ -1410,22 +1336,7 @@ def _finalize_docker_claims(plan: _NormalizedPlan, host_id: str) -> None:
 
         for claim in claims:
             claim["conflict_state"] = "conflicting"
-        plan.control_bindings = [
-            binding
-            for binding in plan.control_bindings
-            if not (
-                binding.get("resource_kind") == "container"
-                and binding.get("resource_id") == resource_id
-            )
-        ]
-        plan.memberships = [
-            membership
-            for membership in plan.memberships
-            if not (
-                membership.get("resource_kind") == "container"
-                and membership.get("host_resource_id") == resource_id
-            )
-        ]
+        plan.docker_resources[resource_id]["repo_id"] = None
         for policy in plan.startup_policies:
             if (
                 policy.get("resource_kind") == "container"
@@ -1491,70 +1402,15 @@ def _write_plan(
     plan: _NormalizedPlan,
     captures: Sequence[LegacySourceCapture],
     *,
-    repository_owner_uid: int,
     record_imports: bool = True,
     upsert: bool = False,
 ) -> tuple[str, ...]:
-    if (
-        isinstance(repository_owner_uid, bool)
-        or not isinstance(repository_owner_uid, int)
-        or repository_owner_uid <= 0
-    ):
-        raise LegacyImportError(
-            "legacy import repository owner UID must be a positive integer"
-        )
     _insert_record(connection, "hosts", plan.host, ignore=not upsert)
     _insert_record(connection, "coordinator_sources", plan.normalized_source, ignore=not upsert)
     for source in plan.sources:
         _insert_record(connection, "coordinator_sources", source, ignore=not upsert)
     for repository in plan.repositories.values():
         _insert_record(connection, "repositories", repository, ignore=not upsert)
-        repository_id = str(repository["repo_id"])
-        generation = int(repository["generation"])
-        owner = connection.execute(
-            """
-            SELECT authority.owner_uid, authority.repository_generation,
-                   catalog.generation
-            FROM repositories catalog
-            LEFT JOIN repository_owners authority USING(repo_id)
-            WHERE catalog.repo_id = ?
-            """,
-            (repository_id,),
-        ).fetchone()
-        if owner is None or int(owner["generation"]) != generation:
-            raise LegacyImportError(
-                "legacy import repository catalog changed before owner enrollment"
-            )
-        if owner["owner_uid"] is None:
-            timestamp = str(repository["updated_at"])
-            establish_repository_owner_authority(
-                connection,
-                repository_id=repository_id,
-                owner_uid=repository_owner_uid,
-                repository_generation=generation,
-                operation_id=deterministic_id(
-                    "legacy-import-repository-owner",
-                    repository_id,
-                    str(repository_owner_uid),
-                ),
-                actor="legacy-import",
-                reason="trusted account-store legacy repository import",
-                timestamp=timestamp,
-                evidence={
-                    "kind": "legacy-import-repository-owner",
-                    "repository_id": repository_id,
-                    "repository_generation": generation,
-                    "owner_uid": repository_owner_uid,
-                    "owner_authority_source": "account-store-expected-uid",
-                },
-            )
-        elif (
-            int(owner["owner_uid"]) != repository_owner_uid
-            or int(owner["repository_generation"]) != generation
-        ):
-            raise LegacyImportError(
-                "legacy import repository owner authority conflicts or is stale"
-            )
     for source_resource in plan.source_resources:
         _insert_record(connection, "source_resources", source_resource, ignore=not upsert)
     for definition in plan.server_definitions.values():
@@ -1573,10 +1429,6 @@ def _write_plan(
         _insert_record(connection, "server_source_records", record)
     for record in plan.server_observations.values():
         _insert_record(connection, "server_observations", record, ignore=not upsert)
-    for record in plan.control_bindings:
-        _insert_record(connection, "control_bindings", record)
-    for record in plan.memberships:
-        _insert_record(connection, "repository_memberships", record)
     for record in plan.startup_policies:
         _insert_record(connection, "startup_policies", record)
     for record in plan.assignments:
@@ -1603,7 +1455,7 @@ def _write_plan(
     for record in plan.docker_resources.values():
         _insert_record(connection, "docker_resources", record)
     for record in plan.docker_claims:
-        _insert_record(connection, "docker_ownership_claims", record)
+        _insert_record(connection, "docker_repository_hints", record)
     for record in plan.telemetry_samples:
         _insert_record(connection, "telemetry_samples", record)
     for record in plan.unassigned:
@@ -1758,7 +1610,6 @@ def import_legacy_homes(
                 connection,
                 plan,
                 captures,
-                repository_owner_uid=store.expected_uid,
             )
             _call_fault(fault_injector, "import.rows_written")
             violations = invariant_violations(connection)
@@ -2089,11 +1940,6 @@ def reconcile_imported_legacy_conflicts(
         f"{record['repo_id']}:{record['name']}": record
         for record in plan.server_definitions.values()
     }
-    plan_bindings_by_resource = {
-        str(record["resource_id"]): record
-        for record in plan.control_bindings
-        if record["resource_kind"] == "server"
-    }
     plan_arguments_by_definition: dict[str, list[tuple[int, str]]] = {}
     for definition_id, ordinal, argument in plan.server_arguments:
         plan_arguments_by_definition.setdefault(definition_id, []).append(
@@ -2109,11 +1955,6 @@ def reconcile_imported_legacy_conflicts(
         plan_source_records_by_definition.setdefault(
             str(record["server_definition_id"]), []
         ).append(record)
-    plan_memberships_by_resource = {
-        str(record["host_resource_id"]): record
-        for record in plan.memberships
-        if record["resource_kind"] == "server"
-    }
     plan_policies_by_resource = {
         str(record["resource_id"]): record
         for record in plan.startup_policies
@@ -2282,46 +2123,6 @@ def reconcile_imported_legacy_conflicts(
             # Host observations are newer measured truth and deliberately stay
             # untouched. The explicit Observe that invokes this migration will
             # sample them again after the catalog transaction commits.
-            binding = plan_bindings_by_resource[definition_id]
-            connection.execute(
-                """
-                UPDATE control_bindings
-                SET repo_id = ?, source_resource_id = ?, source_id = ?,
-                    provenance = ?, authority_state = ?, priority = ?, updated_at = ?
-                WHERE binding_id = ? AND generation = 0
-                """,
-                (
-                    binding["repo_id"],
-                    binding["source_resource_id"],
-                    binding["source_id"],
-                    binding["provenance"],
-                    binding["authority_state"],
-                    binding["priority"],
-                    now,
-                    binding["binding_id"],
-                ),
-            )
-            if connection.execute("SELECT changes()").fetchone()[0] != 1:
-                raise LegacyImportError(
-                    f"reclassified server control binding was modified after import: {logical_key}"
-                )
-            membership = plan_memberships_by_resource[definition_id]
-            connection.execute(
-                """
-                UPDATE repository_memberships
-                SET immutable_fingerprint = ?, control_binding_id = ?
-                WHERE resource_kind='server' AND host_resource_id = ?
-                """,
-                (
-                    membership["immutable_fingerprint"],
-                    membership["control_binding_id"],
-                    definition_id,
-                ),
-            )
-            if connection.execute("SELECT changes()").fetchone()[0] != 1:
-                raise LegacyImportError(
-                    f"reclassified server membership disappeared: {logical_key}"
-                )
             policy = plan_policies_by_resource[definition_id]
             connection.execute(
                 """
@@ -2641,7 +2442,7 @@ def load_legacy_state_projection(store: AccountStore) -> dict[str, Any]:
             """
             SELECT sr.native_id, c.repo_id, r.canonical_root, d.full_container_id,
                    d.current_name, c.source_id
-            FROM docker_ownership_claims c
+            FROM docker_repository_hints c
             JOIN source_resources sr USING(source_resource_id)
             LEFT JOIN repositories r ON r.repo_id = c.repo_id
             LEFT JOIN docker_resources d USING(docker_resource_id)
@@ -2770,30 +2571,6 @@ def replace_legacy_state_projection(
                 )
             repo_id = str(repository["repo_id"])
             _insert_record(connection, "repositories", repository, ignore=False)
-            if store.expected_uid <= 0:
-                raise LegacyImportError(
-                    "normalized account adapter cannot establish root as repository execution owner"
-                )
-            establish_repository_owner_authority(
-                connection,
-                repository_id=repo_id,
-                owner_uid=store.expected_uid,
-                repository_generation=int(repository["generation"]),
-                operation_id=deterministic_id(
-                    "normalized-adapter-owner", repo_id, str(current_revision + 1)
-                ),
-                actor="normalized-adapter",
-                reason="account-scoped normalized adapter repository registration",
-                timestamp=now,
-                evidence={
-                    "kind": "normalized-adapter-repository-owner",
-                    "repository_id": repo_id,
-                    "canonical_root": canonical,
-                    "repository_generation": int(repository["generation"]),
-                    "owner_uid": store.expected_uid,
-                    "source_id": source_id,
-                },
-            )
             connection.execute(
                 """
                 INSERT OR IGNORE INTO repository_installations(
@@ -2966,43 +2743,6 @@ def replace_legacy_state_projection(
                     observation["sampled_at"],
                     fingerprint(observation),
                 ),
-            )
-            binding_id = deterministic_id("control-binding", "server", definition_id)
-            _insert_record(
-                connection,
-                "control_bindings",
-                {
-                    "binding_id": binding_id,
-                    "repo_id": repo_id,
-                    "source_resource_id": source_resource_id,
-                    "resource_kind": "server",
-                    "resource_id": definition_id,
-                    "source_id": source_id,
-                    "capability": "lifecycle",
-                    "provenance": "normalized-adapter",
-                    "authority_state": "authoritative",
-                    "priority": 100,
-                    "generation": int(record.get("generation") or 0),
-                    "created_at": record.get("created_at") or now,
-                    "updated_at": record.get("updated_at") or now,
-                },
-                ignore=False,
-            )
-            _insert_record(
-                connection,
-                "repository_memberships",
-                {
-                    "membership_id": deterministic_id(
-                        "membership", repo_id, "server", definition_id
-                    ),
-                    "repo_id": repo_id,
-                    "resource_kind": "server",
-                    "host_resource_id": definition_id,
-                    "immutable_fingerprint": fingerprint(definition_payload),
-                    "control_binding_id": binding_id,
-                    "created_at": record.get("created_at") or now,
-                },
-                ignore=False,
             )
             _insert_record(
                 connection,
@@ -3236,7 +2976,7 @@ def replace_legacy_state_projection(
                     claim_id = deterministic_id("docker-claim", source_id, str(native_id))
                     _insert_record(
                         connection,
-                        "docker_ownership_claims",
+                        "docker_repository_hints",
                         {
                             "claim_id": claim_id,
                             "docker_resource_id": resource_id,

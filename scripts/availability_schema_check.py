@@ -148,7 +148,11 @@ def check_profile(
         after.st_mtime_ns,
     ):
         raise CheckError("profile changed while it was read")
-    if not isinstance(value, dict) or set(value) != {"version", "service", "clients"}:
+    if not isinstance(value, dict) or set(value) != {
+        "version",
+        "service",
+        "repositories",
+    }:
         raise CheckError("profile fields are invalid")
     if type(value.get("version")) is not int:
         raise CheckError("profile schema discriminator is missing or invalid")
@@ -156,8 +160,20 @@ def check_profile(
         raise CheckError(
             f"unsupported profile schema {value['version']}; expected {expected_schema}"
         )
-    if not isinstance(value.get("service"), dict) or not isinstance(value.get("clients"), dict):
-        raise CheckError("profile service or client collection is invalid")
+    service = value.get("service")
+    repositories = value.get("repositories")
+    if (
+        not isinstance(service, dict)
+        or set(service) != {"socket", "database_generation"}
+        or not isinstance(service.get("socket"), str)
+        or not Path(service["socket"]).is_absolute()
+        or not isinstance(service.get("database_generation"), str)
+        or not service["database_generation"]
+        or not isinstance(repositories, list)
+        or not repositories
+        or any(not isinstance(item, dict) for item in repositories)
+    ):
+        raise CheckError("profile service or repository catalog is invalid")
     return {
         "ok": True,
         "kind": "profile",

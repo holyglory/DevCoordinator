@@ -668,6 +668,29 @@ async function exerciseTestTabs(page, journeys) {
   try {
     await repository.click();
     await page.locator('#test-detail-dialog').waitFor({ state: 'visible', timeout: 5_000 });
+    const daysSelect = page.locator('#tests-days');
+    for (const days of ['7', '30', '90']) {
+      const response = page.waitForResponse((candidate) => {
+        const requestUrl = new URL(candidate.url());
+        return requestUrl.pathname === '/api/tests'
+          && requestUrl.searchParams.get('days') === days
+          && candidate.status() === 200;
+      }, { timeout: 5_000 });
+      await daysSelect.selectOption(days);
+      await response;
+      await page.waitForFunction((expected) => {
+        const selected = document.querySelector('#tests-days')?.value;
+        const period = document.querySelector(
+          '#test-detail-body > .test-detail-throughput > .test-panel-title > .meta-passive',
+        )?.textContent || '';
+        return selected === expected && period === `Last ${expected} days`;
+      }, days, { timeout: 5_000 });
+    }
+    journeys.push({
+      name: 'repository test windows',
+      status: 'passed',
+      detail: 'authenticated 7/30/90-day projections returned and rendered',
+    });
     const selector = '#test-detail-dialog [data-test-detail-tab]';
     const count = await page.locator(selector).count();
     if (count < 3) fail('repository detail tab set is incomplete');
@@ -740,6 +763,51 @@ async function exerciseLogs(page, route, journeys) {
   }
 }
 
+async function exerciseEmptyBugRegistry(page, journeys) {
+  try {
+    const api = await page.evaluate(async () => {
+      const response = await fetch('/api/bugs', {
+        credentials: 'same-origin',
+        cache: 'no-store',
+      });
+      let payload = null;
+      try {
+        payload = await response.json();
+      } catch {
+        // The status and malformed payload are reported below without leaking
+        // response contents into the acceptance artifact.
+      }
+      return {
+        status: response.status,
+        schemaVersion: payload?.schema_version ?? null,
+        bugCount: Array.isArray(payload?.bugs) ? payload.bugs.length : null,
+      };
+    });
+    if (api.status !== 200 || api.schemaVersion !== 1 || api.bugCount !== 0) {
+      fail(`authenticated /api/bugs is not empty (status ${api.status}, count ${api.bugCount})`);
+    }
+    const empty = page.locator('#bugs-body .bugs-empty p').filter({ visible: true });
+    if (await empty.count() !== 1) fail('rendered Bugs page lacks its unique empty state');
+    if ((await empty.first().innerText()).trim() !== 'No open Coordinator bugs.') {
+      fail('rendered Bugs page empty-state copy is not exact');
+    }
+    if (await page.locator('#bugs-body .bug-card').filter({ visible: true }).count() !== 0) {
+      fail('rendered Bugs page still contains an open report card');
+    }
+    journeys.push({
+      name: 'open bug registry empty',
+      status: 'passed',
+      detail: 'authenticated API and rendered page both contain zero open reports',
+    });
+  } catch (error) {
+    journeys.push({
+      name: 'open bug registry empty',
+      status: 'failed',
+      detail: text(error.message),
+    });
+  }
+}
+
 async function exerciseJourneys(page, route) {
   const journeys = [];
   await exerciseLifecycleTabs(page, route, journeys);
@@ -781,6 +849,7 @@ async function exerciseJourneys(page, route) {
       cancel: '#test-run-cancel',
     }, journeys);
   }
+  if (route === 'bugs') await exerciseEmptyBugRegistry(page, journeys);
   const dialogs = {
     routes: { name: 'create-route dialog open/cancel', trigger: '#route-add', dialog: '#route-dialog', cancel: '#route-cancel' },
     ports: { name: 'lease-port dialog open/cancel', trigger: '#lease-add', dialog: '#lease-dialog', cancel: '#lease-cancel' },

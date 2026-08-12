@@ -1,7 +1,7 @@
 interface:
   display_name: "Codex Dev Coordinator"
   short_description: "Coordinate runtimes, tests, and failure reports."
-  default_prompt: "Use $codex-dev-coordinator for attributed runtime work or governed tests. On a Coordinator tool or infrastructure failure, first file a structured devcoordinator-bug report; if only the test harness is unavailable, continue isolated repository-native checks as local/advisory non-governed results, never as release evidence."
+  default_prompt: "Use $codex-dev-coordinator for attributed runtime work and governed tests. On this single-developer server, remove a user- or agent-selected Docker container with one `devcoordinator storage remove container EXACT_RESOURCE_ID --reason REASON` call; do not route container deletion through storage plan/apply, archive, or administrator grants, and do not delete volumes. Run tests locally only when one focused invocation is proven to collect at most 20 cases, enforce at most 10 seconds of execution, need no shared state, and not split a larger suite; otherwise enqueue one governed batch. On a Coordinator tool or infrastructure failure, first file a structured devcoordinator-bug report; any local/advisory fallback keeps the same bounds, remains non-governed, and never serves as release evidence."
 
 policy:
   allow_implicit_invocation: true

@@ -5,9 +5,11 @@ from __future__ import annotations
 from contextlib import redirect_stdout
 import io
 import json
+import os
 from pathlib import Path
 import shutil
 import signal
+import stat
 import sys
 import tempfile
 import unittest
@@ -689,6 +691,24 @@ class BrowserLifecycleTests(unittest.TestCase):
         self.assertLessEqual(self.state.stat().st_size, lifecycle.MAX_STATE_BYTES)
         self.assertTrue(self.state.with_name(self.state.name + ".lock").is_file())
         json.loads(self.state.read_text(encoding="utf-8"))
+
+    def test_status_opens_existing_lock_read_only(self) -> None:
+        self.observe(2.0, reap_idle=False)
+        lock_path = self.state.with_name(self.state.name + ".lock")
+        opened_flags: list[int] = []
+        real_open = lifecycle.os.open
+
+        def recording_open(path: object, flags: int, *args: object) -> int:
+            if Path(path) == lock_path:
+                opened_flags.append(flags)
+            return real_open(path, flags, *args)
+
+        with mock.patch.object(lifecycle.os, "open", side_effect=recording_open):
+            state = lifecycle.read_browser_lifecycle_state(self.state)
+        self.assertIsNotNone(state)
+        self.assertEqual(opened_flags, [os.O_RDONLY])
+        self.assertEqual(stat.S_IMODE(lock_path.stat().st_mode), 0o644)
+        self.assertEqual(stat.S_IMODE(self.state.stat().st_mode), 0o644)
 
     def test_status_and_cleanup_cli_json_contracts(self) -> None:
         self.parent()

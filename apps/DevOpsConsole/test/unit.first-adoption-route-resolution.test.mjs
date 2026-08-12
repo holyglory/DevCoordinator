@@ -199,7 +199,7 @@ test('Console migration retains the explicit unavailable descriptor in its publi
   );
 });
 
-test('Console migration validates Telegram state through a configured owner identity', async (t) => {
+test('Console migration validates Telegram state through a configured administrator identity', async (t) => {
   const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'console-validation-test-'));
   t.after(() => fsp.rm(root, { recursive: true, force: true }));
   const state = path.join(root, 'state');
@@ -214,7 +214,7 @@ test('Console migration validates Telegram state through a configured owner iden
   const documents = {
     'routes.json': { version: 1, routes: {} },
     'upstream-auth.json': { version: 1, routes: {} },
-    'access-control.json': { version: 2, users: {}, requests: {} },
+    'access-control.json': { version: 3, users: {}, requests: {} },
     'telegram-control.json': {
       version: 1,
       revision: 0,

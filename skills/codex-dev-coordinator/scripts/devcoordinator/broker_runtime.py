@@ -1,6 +1,6 @@
 """ID-only broker boundary for the unified runtime API.
 
-The broker resolves only enrolled repository/resource identity.  Service
+The broker resolves only configured repository/resource identity.  Service
 process lifecycle remains fenced until peer-UID supervision exists; existing
 Docker identities may use the broker's typed lifecycle boundary.
 """
@@ -11,7 +11,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from .broker import AuthorizedBrokerRequest, BrokerBackendError, BrokerOperation
+from .broker import AcceptedBrokerRequest, BrokerBackendError, BrokerOperation
 from .runtime_redaction import redact_runtime_value
 from .runtime_report import build_runtime_report
 
@@ -33,15 +33,15 @@ class BrokerRuntimeSnapshot:
 
 
 def load_broker_runtime_snapshot(
-    authorized: AuthorizedBrokerRequest,
+    accepted: AcceptedBrokerRequest,
     *,
     persistence: Any,
 ) -> BrokerRuntimeSnapshot:
-    """Load one live-authorized repository-family projection."""
+    """Load one live-accepted repository-family projection."""
 
-    request = authorized.request
+    request = accepted.request
     context, inventory, classification_evidence = persistence.runtime_snapshot(
-        authorized
+        accepted
     )
     target_kind = str(request.arguments["target_kind"])
     runtime_request = {
@@ -102,7 +102,7 @@ def load_broker_runtime_snapshot(
 
 
 def build_broker_runtime_snapshot_report(
-    authorized: AuthorizedBrokerRequest,
+    accepted: AcceptedBrokerRequest,
     *,
     snapshot: BrokerRuntimeSnapshot,
     action_result: Mapping[str, Any],
@@ -127,14 +127,14 @@ def build_broker_runtime_snapshot_report(
 
 
 def unclassified_broker_runtime_report(
-    authorized: AuthorizedBrokerRequest,
+    accepted: AcceptedBrokerRequest,
     *,
     snapshot: BrokerRuntimeSnapshot,
     observation: Mapping[str, Any],
 ) -> dict[str, Any] | None:
     """Return a fail-closed report when family/target classification is unsafe."""
 
-    request = authorized.request
+    request = accepted.request
     target_kind = str(request.arguments["target_kind"])
     if snapshot.classification_evidence:
         action_result: dict[str, Any] = {
@@ -166,21 +166,21 @@ def unclassified_broker_runtime_report(
     else:
         return None
     return build_broker_runtime_snapshot_report(
-        authorized,
+        accepted,
         snapshot=snapshot,
         action_result=action_result,
     )
 
 
 def execute_broker_runtime_request(
-    authorized: AuthorizedBrokerRequest,
+    accepted: AcceptedBrokerRequest,
     *,
     persistence: Any,
     observation: Mapping[str, Any] | None,
 ) -> dict[str, Any]:
-    """Execute one already-authorized runtime request inside broker authority."""
+    """Execute one already-accepted runtime request inside broker authority."""
 
-    request = authorized.request
+    request = accepted.request
     if request.operation is not BrokerOperation.RUNTIME_REQUEST:
         raise ValueError("request is not a broker runtime request")
     action = str(request.arguments["action"])
@@ -198,7 +198,7 @@ def execute_broker_runtime_request(
             operation_id=request.operation_id,
         )
 
-    snapshot = load_broker_runtime_snapshot(authorized, persistence=persistence)
+    snapshot = load_broker_runtime_snapshot(accepted, persistence=persistence)
     context = snapshot.context
     inventory = snapshot.inventory
     classification_evidence = snapshot.classification_evidence
@@ -252,7 +252,7 @@ def execute_broker_runtime_request(
                 f"The exact {target_kind} target is {state}, not ready."
             )
     return build_broker_runtime_snapshot_report(
-        authorized,
+        accepted,
         snapshot=snapshot,
         action_result=action_result,
     )

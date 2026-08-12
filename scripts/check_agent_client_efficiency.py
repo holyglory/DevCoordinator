@@ -424,7 +424,6 @@ def _fixture_test_enqueue(ceiling: int) -> dict[str, Any]:
             "source": {"mode": "working_tree", "snapshot_id": "snapshot-" + "x" * 80},
         },
         "repository_id": "repository-" + "r" * 96,
-        "review_required": False,
         "run": {"id": RUN_ID, "state": "queued"},
         "submission_operation_id": child_operation_id(OPERATION_ID, "submit"),
         "submission_performed": True,

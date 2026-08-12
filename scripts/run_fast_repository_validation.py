@@ -272,7 +272,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             ),
         ),
     ]
-    if not args.skip_diff:
+    if not args.skip_diff and (ROOT / ".git").exists():
         checks.insert(
             0,
             (

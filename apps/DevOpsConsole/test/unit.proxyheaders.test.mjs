@@ -443,7 +443,7 @@ test('public routes preserve caller Authorization and upstream login challenges'
   assert.equal(publicHeaders.authorization, callerAuthorization);
   assert.equal(publicHeaders['x-devops-console-assertion'], undefined);
   assert.equal(publicHeaders['x-devops-console-email'], undefined);
-  assert.equal(publicHeaders['x-devops-console-route-id'], 'fixture-route-instance');
+  assert.equal(publicHeaders['x-devops-console-route-id'], undefined);
 
   const challenged = await request({
     port: edge.port,

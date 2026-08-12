@@ -1903,11 +1903,20 @@ def run(
         "LC_ALL": "C.UTF-8",
         **adapted_environment,
     }
+    # Some cross-platform tests need a short canonical scratch base (notably
+    # for AF_UNIX) and cannot use the account database home hidden by the
+    # native sandbox. Linux attempts receive a unit-private /tmp namespace;
+    # test-created directories remain 0700 on other platforms.
+    environment["DEVCOORDINATOR_TEST_TMP_ROOT"] = "/tmp"
     credential_directory = os.environ.get("CREDENTIALS_DIRECTORY")
     if descriptor.fixtures:
         if not credential_directory or not Path(credential_directory).is_absolute():
             raise TestStoreContractError("test fixture credentials are unavailable")
         environment["DEVCOORDINATOR_FIXTURE_DIRECTORY"] = credential_directory
+        # Fixture consumers use the standard systemd credentials contract for
+        # both the public fixture catalog and any broker-issued secret files.
+        # The compatibility alias above remains for older harness adapters.
+        environment["CREDENTIALS_DIRECTORY"] = credential_directory
     if descriptor.credentials:
         if not credential_directory or not Path(credential_directory).is_absolute():
             raise TestStoreContractError(

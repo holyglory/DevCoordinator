@@ -49,6 +49,9 @@ test('Telegram page lists existing bots before opening its secondary registratio
   assert.match(js, /projectIds: \[\.\.\.selected\]/,
     'project assignment must send exact IDs selected from coordinator inventory');
   assert.match(js, /\/authorizations\/\$\{encodeURIComponent\(authId\)\}\/decision/);
+  assert.match(js,
+    /renderTelegram\(\);\s*requestRegisteredTelegramFocus\([^;]+\);\s*closeTelegramDialog\(\);\s*restorePendingRegisteredTelegramFocus\(\);/,
+    'registration must arm focus before closing the modal and synchronously restore it afterward');
   assert.match(css, /@media \(max-width: 719px\)[\s\S]*\.queue-row-head, \.telegram-bot-head \{ flex-direction: column; \}/,
     'approval actions and bot metadata need an explicit narrow-screen layout');
 });

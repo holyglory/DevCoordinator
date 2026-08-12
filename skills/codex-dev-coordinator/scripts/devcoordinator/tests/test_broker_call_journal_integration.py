@@ -7,7 +7,7 @@ import time
 import unittest
 
 from devcoordinator.broker import (
-    AuthorizedBrokerRequest,
+    AcceptedBrokerRequest,
     BrokerError,
     BrokerOperation,
     BrokerRequest,
@@ -18,14 +18,14 @@ from devcoordinator.call_journal import RollingCallJournal, read_call_records
 
 
 class _Authorizer:
-    def authorize(
+    def accept(
         self, peer: PeerCredentials, request: BrokerRequest
-    ) -> AuthorizedBrokerRequest:
-        return AuthorizedBrokerRequest(peer=peer, request=request)
+    ) -> AcceptedBrokerRequest:
+        return AcceptedBrokerRequest(peer=peer, request=request)
 
 
 class _Writer:
-    def execute(self, authorized: AuthorizedBrokerRequest) -> dict[str, object]:
+    def execute(self, authorized: AcceptedBrokerRequest) -> dict[str, object]:
         return {
             "state": "complete",
             "run_id": authorized.request.arguments.get("run_id", "run-none"),
@@ -39,7 +39,7 @@ class _ExplodingJournal:
 
 
 class _TypedAdoptionFailureWriter:
-    def execute(self, authorized: AuthorizedBrokerRequest) -> dict[str, object]:
+    def execute(self, authorized: AcceptedBrokerRequest) -> dict[str, object]:
         raise BrokerError(
             "repository_context_changed",
             "The proven repository context changed before adoption.",
@@ -182,7 +182,6 @@ class BrokerCallJournalIntegrationTests(unittest.TestCase):
             arguments={
                 "agent": "codex:task:first-use",
                 "canonical_root": "/repo/new-project",
-                "owner_uid": 1000,
                 "project_kind": "primary",
             },
             operation_id=operation_id,

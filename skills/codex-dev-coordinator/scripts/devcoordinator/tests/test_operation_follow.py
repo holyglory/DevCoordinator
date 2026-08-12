@@ -89,7 +89,7 @@ class OperationFollowPersistenceTests(unittest.TestCase):
             resource_id=CONTAINER_ID,
             operation_id=FOLLOWED_OPERATION_ID,
         )
-        authorized = self.persistence.authorize(peer_for(), mutation)
+        authorized = self.persistence.accept(peer_for(), mutation)
         disposition = self.persistence.reserve_operation(authorized)
         self.assertEqual(disposition.state, "execute")
 
@@ -214,7 +214,7 @@ class OperationFollowPersistenceTests(unittest.TestCase):
         self.assertEqual(result["next_transition"], "reconcile")
         self.assertNotIn("/private", json.dumps(result, sort_keys=True))
 
-    def test_follow_hides_unknown_and_cross_account_operations_alike(self) -> None:
+    def test_follow_is_host_wide_for_trusted_local_callers(self) -> None:
         self.reserve_operation()
         with CoordinatorStore.open(
             self.persistence.database_path, expected_uid=os.geteuid()
@@ -239,16 +239,13 @@ class OperationFollowPersistenceTests(unittest.TestCase):
             peer_for(), unknown.to_wire()
         )
 
-        self.assertFalse(cross_account["ok"], cross_account)
+        self.assertTrue(cross_account["ok"], cross_account)
+        self.assertEqual(
+            cross_account["result"]["operation_id"], FOLLOWED_OPERATION_ID
+        )
         self.assertFalse(unknown_reply["ok"], unknown_reply)
         self.assertEqual(
-            cross_account["error"]["code"], "operation_follow_unavailable"
-        )
-        self.assertEqual(
             unknown_reply["error"]["code"], "operation_follow_unavailable"
-        )
-        self.assertEqual(
-            cross_account["error"]["message"], unknown_reply["error"]["message"]
         )
 
 
@@ -258,19 +255,13 @@ class OperationFollowProfileTests(unittest.TestCase):
             canonical_root="/repositories/alpha",
             repo_id=PROJECT_ID,
             generation=0,
-            owner_uid=os.geteuid(),
             server_ids={},
             container_ids={},
             compose_definition_id=None,
             compose_container_ids=frozenset(),
             compose_run_once_services={},
             ephemeral_templates={},
-            ephemeral_image_prefetch_template_ids=frozenset(),
             ephemeral_secret_policies={},
-            account_id="account-alpha",
-            enabled=True,
-            issued_at="2026-08-03T00:00:00Z",
-            valid_until_epoch=4_102_444_800,
         )
         expected = {"operation_id": FOLLOWED_OPERATION_ID, "status": "running"}
         profile = mock.Mock()

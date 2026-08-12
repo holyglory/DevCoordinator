@@ -79,7 +79,7 @@
     "server_launch": "structured argv is preferred; legacy cmd is parsed without a shell and rejects shell operators",
     "exact_lease_start": "lease_id requires structured argv and an active unbound manual lease owned by the same agent/project",
     "docker": "real commands resolve an absolute Docker entry point and are bounded by observation/lifecycle timeouts",
-    "durable_lifecycle": "target_kind is project, server, container, or worktree; repository is accepted only as compatibility input and is normalized to project; archive/purge always require a fresh plan and apply is bound to plan_id plus plan_fingerprint; restore requires explicit=true"
+    "durable_lifecycle": "target_kind is project, server, container, volume, or worktree; repository is accepted only as compatibility input and is normalized to project; exact volume purge requires fresh complete Compose ownership plus zero native container references; archive/purge always require a fresh plan and apply is bound to plan_id plus plan_fingerprint; restore is an explicit owner-invoked endpoint"
   },
   "event_contract": {
     "observe": "POST /v1/observe accepts exactly {agent,project} and commits one explicit full-Docker host observation; repeated unchanged samples append no transition events and unavailable or unobservable capabilities never invent stopped resources",
@@ -108,20 +108,19 @@
       "docker"
     ],
     "read_model": "GET /v1/state is a compatibility control snapshot derived from normalized SQLite; it is not the authoritative persistence format",
-    "persistence": "server-wide service-owned 0700 authority directory and 0600 coordinator.sqlite3; authenticated clients use the Unix broker and retain only private execution journals",
+    "persistence": "server-wide service-owned 0700 authority directory and 0600 coordinator.sqlite3; trusted local clients use the Unix broker and retain only private execution journals",
     "durable_ports": "successful server start/register pins project+name to a port until explicit unassign or attributed state reset",
     "operations": "short reservation/commit lock phases with same-target exclusion and bounded journal evidence"
   },
   "inventory_contract": {
-    "schema_version": 2,
+    "schema_version": 3,
     "read_semantics": "query-only",
-    "ordinary_inventory": "GET /v1/inventory returns the single server-wide broker snapshot without runtime sampling or persistence, including servers published by other enrolled UIDs",
+    "ordinary_inventory": "GET /v1/inventory returns the single server-wide broker snapshot without runtime sampling or persistence, including services configured from any local repository",
     "normalized_top_level": [
       "store",
       "repositories",
       "coordinator_sources",
       "docker_engines",
-      "memberships",
       "resources",
       "leases",
       "port_assignments",
@@ -132,30 +131,29 @@
       "unassigned_resources",
       "lifecycle_violations",
       "observations",
-      "control_bindings",
       "test_statistics",
       "agent_browsers"
     ],
     "compatibility_projection": "v1_compatibility",
     "compatibility_policy": "legacy Console rows are nested under v1_compatibility; non-colliding legacy aliases may also appear at top level, but top-level leases and port_assignments always retain normalized lease_id/assignment_id and repo_id identities",
-    "no_docker": "GET /v1/inventory/no-docker returns the authenticated committed normalized snapshot without a Docker CLI/daemon probe; when the systemd readiness client supplies exactly one project, name, and port query target, only compatibility rows that can affect that registration graph receive bounded current process, listener, and health observation on an in-memory copy; the route excludes unrelated services, process-usage sampling, and backup discovery and never persists derived lifecycle or lease changes",
+    "no_docker": "GET /v1/inventory/no-docker returns the committed normalized snapshot without a Docker CLI/daemon probe; when the systemd readiness client supplies exactly one project, name, and port query target, only compatibility rows that can affect that registration graph receive bounded current process, listener, and health observation on an in-memory copy; the route excludes unrelated services, process-usage sampling, and backup discovery and never persists derived lifecycle or lease changes",
     "project_usage": "rows include stable usage_key plus authoritative server_ids and exact container_resource_ids; container_names remain legacy display data and are not ownership keys",
     "agent_browsers": "an optional schema-1, path-free sidecar projection reports measured non-project headless/automation browser sessions, last observed resource work, bounded cleanup history, and idle-reaper policy. Project/container browser trees are excluded to avoid double accounting; omission leaves their bytes honestly in System / unclassified and never invalidates repository inventory",
-    "docker_ownership": "Compose labels and verified coordinator sidecars are mutation authority; name similarity is read-only evidence",
+    "docker_association": "Compose labels and verified coordinator sidecars provide exact repository association; name similarity is read-only evidence and is never used as a mutation target",
     "project_reports": "ok=false must be treated as failure even when HTTP status is 200; inspect partial, preflight_failed, classification, actions, and action_errors"
   },
   "test_contract": {
     "repositories": "GET /v1/test-repositories returns every current protected-profile repository ID and display name joined to testd's retained ready, missing, or invalid setup projection; the response never scans user worktrees and never exposes canonical paths, manifest text, argv, environment values, or fixture secrets",
     "setup": "GET /v1/test-repositories/:repo_id/setup executes the bounded repository-UID setup projection and returns only ready, missing, or invalid plus sanitized graph, policy, fixture, network, isolation, and input-coverage facts; it never returns argv, environment values, absolute repository paths, or manifest text",
-    "read": "GET /v1/tests requires one enrolled repo_id plus optional days (1-3650) and limit (1-500), and serves summary, comparison, daily and hourly data from testd-owned materialized TestDB rollups rather than legacy authority test tables",
+    "read": "GET /v1/tests requires one configured repo_id plus optional days (1-3650) and limit (1-500), and serves summary, comparison, daily and hourly data from testd-owned materialized TestDB rollups rather than legacy authority test tables",
     "fleet": "GET /v1/test-fleet accepts hours (1-168, default 24) and returns one bounded projection from testd-owned materialized TestDB rollups, scoped to the caller's exact current repository enrollments and keyed only by immutable repo_id: sparse repository-by-hour exact test seconds, capacity, health, efficiency, queue wait, freshness and actionable repository attention. Test assertion/error failures and infrastructure/setup failures have separate state, count, rate and detail fields. Repository state_scope is selected_window: it describes observations in the requested window and does not claim a historical failure remains unresolved. The read never accesses legacy authority test records or returns paths, commands, logs, or case identities",
-    "plan": "POST /v1/test-plan accepts repo_id, intent, one caller-generated canonical operation_id UUID, one exact schema-1 source selector, and an optional bounded requested_targets list for manual intent only. Original and temporary selectors carry an immutable repository ID plus protected-profile generation; temporary canonical paths are resolved only from the installed broker profile and re-authorized by the broker. The returned plan preserves operation_id so retries are durably idempotent. Target names must come from the sanitized enrolled-repository setup catalog; dependency closure, manifest, argv, resources and policy remain derived inside the authenticated test plane",
-    "submit": "POST /v1/test-runs accepts repo_id, plan_id and operation_id plus the trusted API's bounded diagnostic actor; the canonical UUID is the durable idempotency key, the broker derives authorization from the protected OS peer, and the plan must resolve to the same immutable repository before mutation",
+    "plan": "POST /v1/test-plan accepts repo_id, intent, one caller-generated canonical operation_id UUID, one exact schema-1 source selector, and an optional bounded requested_targets list for manual intent only. Original and temporary selectors carry an immutable repository ID plus catalog generation; temporary canonical paths are resolved only from the installed broker profile and revalidated by the broker. The returned plan preserves operation_id so retries are durably idempotent. Target names must come from the sanitized configured-repository setup catalog; dependency closure, manifest, argv, resources and policy remain derived inside the test plane",
+    "submit": "POST /v1/test-runs accepts repo_id, plan_id and operation_id plus the trusted API's bounded diagnostic actor; the canonical UUID is the durable idempotency key, and the plan must resolve to the same immutable repository before mutation",
     "history": "GET /v1/test-runs requires repo_id and accepts one opaque after cursor, one state filter, and limit 1-200; results are repository-scoped and do not expose another repository's run existence",
     "run_reads": "GET /v1/test-runs/:run_id and /summary return bounded run status and the <=8 KiB agent summary. /failures, /artifacts and /cases use cursor pagination with a maximum page of 50 and are reauthorized against the run's immutable repository before any result is disclosed",
     "events": "GET /v1/test-events requires repo_id and accepts a non-negative numeric event cursor plus limit 1-500; events are repository-scoped and polling never clears retained Console content",
     "control": "POST /v1/test-runs/:run_id/cancel accepts reason and operation_id. POST /retry accepts failed_only and operation_id. Every mutation is idempotent, reauthorizes the actual run repository, and does not trust the run ID as an ownership claim",
-    "google_authorization": "The public Console maps immutable repository grants tests:read, tests:run and tests:operate to these internal operations. Repository-scoped run routes verify the returned repository identity before disclosure; release intent remains owner-only",
+    "google_authorization": "Google sign-in protects the Console as a whole. Every signed-in Console user can read, run, cancel, and retry tests for every configured repository; no repository grants, memberships, or owner-only release gate exist. Repository-scoped routes still verify returned target identity for correctness",
     "hourly": "the read returns seven complete UTC days of hourly buckets; exact case intervals are split at hour boundaries and parallel intervals add, so test_seconds may exceed 3600 in one wall-clock hour; failure_count is attributed to the case start hour",
     "comparison": "comparison_summary and previous_daily cover the immediately preceding equal period, while dynamics reports suite-level current_seconds, previous_seconds, change_percent, failures, and last_run",
     "ownership": "the service-owned broker database stores repository-attributed sessions, group runs, and exact individual case timings; clients never receive a database handle",
@@ -164,9 +162,9 @@
   },
   "lifecycle_contract": {
     "archives": "GET /v1/archives returns {archives:[...]}; rows carry target_kind, target_id, display_name, archived_at, reason, actor and may include project_id/parent, restorable, removable, status, retained, effects, and blockers",
-    "plan": "POST /v1/lifecycle/plan accepts {target_kind,target_id,action:'archive'|'purge',reason,agent}; the response binds plan_id and plan_fingerprint (fingerprint is a compatibility alias) to target/effects/retained/deleted/blockers and supplies the exact purge confirmation_phrase",
+    "plan": "POST /v1/lifecycle/plan accepts exactly {target_kind,target_id,action:'archive'|'purge',reason}; the response binds plan_id and plan_fingerprint (fingerprint is a compatibility alias) to target/effects/retained/deleted/blockers and supplies the exact purge confirmation_phrase",
     "apply": "POST /v1/lifecycle/apply accepts exactly {plan_id,plan_fingerprint,confirmation_phrase}; confirmation_phrase is the empty string for archive and the exact server-issued phrase for purge",
-    "restore": "POST /v1/lifecycle/restore accepts {target_kind,target_id,reason,agent,explicit:true}; restore clears the durable fence and never implies that the resource started",
+    "restore": "POST /v1/lifecycle/restore accepts exactly {target_kind,target_id,reason}; restore clears the durable fence and never implies that the resource started",
     "result_truth": "apply and restore return ok, status, partial, needs_attention, and errors; ok=false, partial=true, needs_attention=true, or blocked/failed/partial status is failure even with HTTP 200",
     "retention": "archive stops and fences the exact resource while retaining declared data/history; permanent removal is available only for an archived row that advertises removable=true; worktree removal is shown only as an advertised removable child of an archived project"
   },

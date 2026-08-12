@@ -14,10 +14,13 @@ These rules apply to every agent working in this repository.
 
 ## Delegate runtime coordination to Python
 
-- Ordinary source inspection, editing, formatting, static checks, and isolated
-  unit tests do not need a Coordinator preflight or inventory call. Use the
-  Coordinator only when work observes or changes host-visible runtime state or
-  must publish durable shared test evidence.
+- Ordinary source inspection, editing, formatting, and static checks do not
+  need a Coordinator preflight or inventory call. A direct local test is
+  permitted only when its selector is proven before launch to collect at most
+  20 cases, a runner deadline limits execution to at most 10 seconds, it needs
+  no host-visible or shared state, and it is not one fragment of a suite split
+  across repeated local commands. Use one Coordinator test enqueue when either
+  bound is unknown or exceeded, or when durable shared evidence is required.
 - Never start, stop, restart, replace, remove, or inspect a process, Docker
   resource, Compose stack, or local database directly. Use:
   `python3 skills/codex-dev-coordinator/scripts/dev_coordinator.py runtime --help`.
@@ -47,8 +50,8 @@ These rules apply to every agent working in this repository.
 
 - One canonical Git worktree is one repository/project. Python owns the
   root-repository -> temporary-repository -> service hierarchy and exact
-  membership. Board and Console only render the returned tree and action
-  context.
+  non-authorizing association. Board and Console only render the returned tree
+  and action context.
 - Keep listener/process ownership tri-state and fail closed when it is not
   observable. The executable guards and tests—not agent prose—own platform,
   capability, PID-reuse, transaction, and cleanup details.

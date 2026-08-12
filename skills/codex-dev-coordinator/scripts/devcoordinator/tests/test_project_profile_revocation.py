@@ -6,13 +6,12 @@ import os
 from pathlib import Path
 import pwd
 import tempfile
-import time
 from types import SimpleNamespace
 import unittest
 from unittest import mock
 
 from devcoordinator import broker_backend as broker_backend_module
-from devcoordinator import broker_enrollment
+from devcoordinator import broker_configuration
 from devcoordinator.broker import BrokerOperation
 from devcoordinator.broker_backend import StoreBackedMutationBackend
 from devcoordinator.broker_links import BrokerLinkStore
@@ -29,7 +28,10 @@ UID = os.geteuid()
 
 class CanonicalTemporaryDirectory:
     def __init__(self) -> None:
-        home = Path(pwd.getpwuid(UID).pw_dir).resolve()
+        home = Path(
+            os.environ.get("DEVCOORDINATOR_TEST_TMP_ROOT")
+            or pwd.getpwuid(UID).pw_dir
+        ).resolve()
         self._temporary = tempfile.TemporaryDirectory(
             prefix="devcoordinator-project-revocation-",
             dir=str(home),
@@ -45,19 +47,13 @@ def repository_profile(root: Path, *, generation: int) -> BrokerRepositoryProfil
         canonical_root=str(root),
         repo_id="repo-project",
         generation=generation,
-        owner_uid=1000,
         server_ids={"worker": f"worker-generation-{generation}"},
         container_ids={"postgres": "container-old"},
         compose_definition_id=None,
         compose_container_ids=frozenset(),
         compose_run_once_services={},
         ephemeral_templates={},
-        ephemeral_image_prefetch_template_ids=frozenset(),
         ephemeral_secret_policies={},
-        account_id="account-project",
-        enabled=True,
-        issued_at="2026-07-26T00:00:00Z",
-        valid_until_epoch=int(time.time()) + 3600,
     )
 
 
@@ -65,15 +61,8 @@ def client_profile(repository: BrokerRepositoryProfile) -> BrokerClientProfile:
     return BrokerClientProfile(
         service=BrokerServiceProfile(
             socket_path=Path("/run/devcoordinator-authority.sock"),
-            service_uid=0,
-            socket_gid=62000,
-            socket_mode=0o660,
             database_generation="database-generation",
         ),
-        client_uid=UID,
-        account_id="account-project",
-        issued_at="2026-07-26T00:00:00Z",
-        valid_until_epoch=int(time.time()) + 3600,
         repositories={repository.canonical_root: repository},
     )
 
@@ -83,58 +72,28 @@ def profile_document(root: Path) -> dict[str, object]:
         "canonical_root": str(root),
         "repo_id": "repo-project",
         "generation": 7,
-        "owner_uid": 1000,
         "servers": {"worker": "worker-old"},
         "containers": {"postgres": "container-old"},
         "compose_definition_id": None,
         "compose_container_ids": [],
         "compose_run_once_services": {},
         "ephemeral_templates": {},
-        "ephemeral_image_prefetch_templates": [],
         "ephemeral_secret_policies": {},
-        "account_id": "account-project",
-        "enabled": True,
-        "issued_at": "2026-07-26T00:00:00Z",
-        "valid_until_epoch": int(time.time()) + 3600,
     }
     return {
-        "version": 1,
+        "version": 2,
         "service": {
             "socket": "/run/devcoordinator-authority.sock",
-            "uid": 0,
-            "gid": 62000,
-            "mode": "0660",
             "database_generation": "database-generation",
         },
-        "clients": {
-            "501": {
-                "account_id": "account-project",
-                "issued_at": "2026-07-26T00:00:00Z",
-                "valid_until_epoch": int(time.time()) + 3600,
-                "repositories": [dict(repository)],
+        "repositories": [
+            repository,
+            {
+                **repository,
+                "canonical_root": str(root.parent / "other"),
+                "repo_id": "repo-other",
             },
-            "502": {
-                "account_id": "account-project-two",
-                "issued_at": "2026-07-26T00:00:00Z",
-                "valid_until_epoch": int(time.time()) + 3600,
-                "repositories": [
-                    {**repository, "account_id": "account-project-two"}
-                ],
-            },
-            "503": {
-                "account_id": "unrelated",
-                "issued_at": "2026-07-26T00:00:00Z",
-                "valid_until_epoch": int(time.time()) + 3600,
-                "repositories": [
-                    {
-                        **repository,
-                        "canonical_root": str(root.parent / "other"),
-                        "repo_id": "repo-other",
-                        "account_id": "unrelated",
-                    }
-                ],
-            },
-        },
+        ],
     }
 
 
@@ -149,24 +108,20 @@ class ProjectProfileRevocationTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
-    def test_protected_profile_removes_exact_project_generation_for_every_client(
+    def test_routing_catalog_removes_only_the_exact_repository_generation(
         self,
     ) -> None:
         document = profile_document(self.root)
-        affected = broker_enrollment._revoke_repository_from_profile_document(
+        affected = broker_configuration._revoke_repository_from_profile_document(
             document,
             repo_id="repo-project",
             repository_generation=7,
         )
-        self.assertEqual(affected, [501, 502])
-        self.assertEqual(document["clients"]["501"]["repositories"], [])
-        self.assertEqual(document["clients"]["502"]["repositories"], [])
-        self.assertEqual(
-            document["clients"]["503"]["repositories"][0]["repo_id"],
-            "repo-other",
-        )
+        self.assertEqual(affected, [str(self.root)])
+        self.assertEqual(len(document["repositories"]), 1)
+        self.assertEqual(document["repositories"][0]["repo_id"], "repo-other")
 
-        replay = broker_enrollment._revoke_repository_from_profile_document(
+        replay = broker_configuration._revoke_repository_from_profile_document(
             document,
             repo_id="repo-project",
             repository_generation=7,
@@ -259,7 +214,7 @@ class ProjectProfileRevocationTests(unittest.TestCase):
 
     def test_project_revocation_guards_do_not_depend_on_assert_statements(self) -> None:
         for source in (
-            Path(broker_enrollment.__file__),
+            Path(broker_configuration.__file__),
             Path(__file__).parents[1] / "broker_links.py",
         ):
             text = source.read_text(encoding="utf-8")

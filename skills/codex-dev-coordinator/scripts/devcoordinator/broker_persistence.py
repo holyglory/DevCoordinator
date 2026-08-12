@@ -1,4 +1,4 @@
-"""Service-owned broker ACL, lease, and durable idempotency persistence.
+"""Service-owned broker catalog, lease, and durable idempotency persistence.
 
 Clients never receive this database path or a SQLite handle.  Every method
 opens the private coordinator store as the broker service UID and exposes a
@@ -20,16 +20,17 @@ import sqlite3
 import stat
 import time
 from typing import Any, Callable, Generator, Iterable, Mapping, Optional, Sequence
+from urllib.parse import urlsplit
 import uuid
 
 from .broker import (
-    AuthorizedBrokerRequest,
+    AcceptedBrokerRequest,
     BrokerError,
     BrokerOperation,
     BrokerRequest,
     PeerCredentials,
     TESTD_INTERNAL_OPERATIONS,
-    authenticated_request_fingerprint,
+    accepted_request_fingerprint,
 )
 from .browser_lifecycle import (
     BrowserLifecycleError,
@@ -59,14 +60,16 @@ from .compose_run_once import (
 from .store import (
     AccountStore,
     CoordinatorStore,
+    DEFAULT_BUSY_TIMEOUT_MS,
     deterministic_id,
     fingerprint,
     utc_timestamp,
 )
-from .schema import SCHEMA_VERSION, establish_repository_owner_authority
+from .schema import SCHEMA_VERSION
 from .runtime_ensure import (
     validate_runtime_ensure_result,
 )
+from .runtime_sessions import runtime_process_identity
 from .temporary_dev_service import temporary_dev_service_id
 from .database_backups import (
     inspect_database_backup,
@@ -162,32 +165,6 @@ _EPHEMERAL_MUTATION_OPERATIONS = _EPHEMERAL_OPERATIONS - {
     BrokerOperation.EPHEMERAL_IMAGE_STATUS,
     BrokerOperation.EPHEMERAL_SECRET_FD,
 }
-
-
-def _ephemeral_acl_operations_for_policy(
-    secret_policy_kind: str | None,
-    *,
-    allow_image_prefetch: bool = False,
-) -> tuple[BrokerOperation, ...]:
-    """Return only the operations justified by one sealed template policy.
-
-    Descriptor delivery is deliberately not a general ephemeral-container
-    capability. The sole reviewed password-file policy gets it; every other
-    template receives the four ordinary lifecycle grants only.
-    """
-
-    if secret_policy_kind is None:
-        operations = _EPHEMERAL_BASE_OPERATIONS
-    elif secret_policy_kind == POSTGRES_INITDB_PASSWORD_FILE_V1:
-        operations = _EPHEMERAL_BASE_OPERATIONS + (_EPHEMERAL_SECRET_FD_OPERATION,)
-    else:
-        raise BrokerError(
-            "control_binding_unavailable",
-            "Ephemeral template has an unsupported credential policy.",
-        )
-    if allow_image_prefetch:
-        return operations + (_EPHEMERAL_IMAGE_PREFETCH_OPERATION,)
-    return operations
 
 
 _COMPOSE_OPERATIONS = frozenset(
@@ -295,10 +272,10 @@ _TEST_OPERATIONS = frozenset(
 )
 
 
-def _operation_actor(authorized: AuthorizedBrokerRequest) -> str:
+def _operation_actor(accepted: AcceptedBrokerRequest) -> str:
     """Build durable actor metadata while keeping kernel identity authoritative."""
 
-    request = authorized.request
+    request = accepted.request
     actor = "broker:" + request.account_id
     if request.operation in _EPHEMERAL_MUTATION_OPERATIONS:
         client_agent = request.arguments.get("agent")
@@ -325,7 +302,7 @@ def _service_administrator_uid() -> int:
 
 
 class _BrokerInventoryStore(AccountStore):
-    """Reuse one authorized read snapshot inside the inventory projection."""
+    """Reuse one accepted read snapshot inside the inventory projection."""
 
     @contextmanager
     def read_transaction(self) -> Generator[sqlite3.Connection, None, None]:
@@ -337,105 +314,6 @@ class _BrokerInventoryStore(AccountStore):
 
 
 BROKER_SCHEMA = """
-CREATE TABLE IF NOT EXISTS broker_acl_principals (
-    uid INTEGER PRIMARY KEY CHECK(uid >= 0),
-    account_id TEXT NOT NULL,
-    enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0, 1)),
-    updated_at TEXT NOT NULL
-);
-
-CREATE UNIQUE INDEX IF NOT EXISTS broker_principal_uid_account_identity
-ON broker_acl_principals(uid, account_id);
-
-CREATE TABLE IF NOT EXISTS broker_repository_enrollments (
-    uid INTEGER NOT NULL,
-    repo_id TEXT NOT NULL
-        REFERENCES repositories(repo_id) ON DELETE CASCADE,
-    account_id TEXT NOT NULL,
-    enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0, 1)),
-    issued_at TEXT NOT NULL,
-    valid_until_epoch INTEGER NOT NULL CHECK(valid_until_epoch > 0),
-    enrollment_snapshot_id TEXT
-        REFERENCES observation_snapshots(snapshot_id) ON DELETE RESTRICT,
-    grant_snapshot_id TEXT
-        REFERENCES observation_snapshots(snapshot_id) ON DELETE RESTRICT,
-    updated_at TEXT NOT NULL,
-    PRIMARY KEY(uid, repo_id),
-    FOREIGN KEY(uid, account_id)
-        REFERENCES broker_acl_principals(uid, account_id) ON DELETE CASCADE,
-    CHECK(
-        (enrollment_snapshot_id IS NULL AND grant_snapshot_id IS NULL)
-        OR
-        (enrollment_snapshot_id IS NOT NULL AND grant_snapshot_id IS NOT NULL)
-    )
-);
-
-CREATE INDEX IF NOT EXISTS broker_repository_enrollments_by_repo
-ON broker_repository_enrollments(repo_id, enabled, valid_until_epoch);
-
-CREATE TABLE IF NOT EXISTS broker_resource_acl (
-    uid INTEGER NOT NULL REFERENCES broker_acl_principals(uid) ON DELETE CASCADE,
-    repo_id TEXT NOT NULL REFERENCES repositories(repo_id) ON DELETE CASCADE,
-    resource_kind TEXT NOT NULL CHECK(resource_kind IN ('server', 'container')),
-    resource_id TEXT NOT NULL,
-    operation TEXT NOT NULL CHECK(operation IN (
-        'port.lease', 'port.release', 'docker.start', 'docker.stop', 'docker.restart'
-    )),
-    enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0, 1)),
-    updated_at TEXT NOT NULL,
-    PRIMARY KEY(uid, repo_id, resource_kind, resource_id, operation)
-);
-
-CREATE TABLE IF NOT EXISTS broker_ephemeral_acl (
-    uid INTEGER NOT NULL REFERENCES broker_acl_principals(uid) ON DELETE CASCADE,
-    repo_id TEXT NOT NULL REFERENCES repositories(repo_id) ON DELETE CASCADE,
-    template_id TEXT NOT NULL
-        REFERENCES ephemeral_container_templates(template_id) ON DELETE CASCADE,
-    operation TEXT NOT NULL CHECK(operation IN (
-        'ephemeral.start', 'ephemeral.status', 'ephemeral.image_status',
-        'ephemeral.image_prefetch', 'ephemeral.renew', 'ephemeral.finish',
-        'ephemeral.secret_fd'
-    )),
-    enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0, 1)),
-    updated_at TEXT NOT NULL,
-    PRIMARY KEY(uid, repo_id, template_id, operation)
-);
-
-CREATE INDEX IF NOT EXISTS broker_ephemeral_acl_lookup
-ON broker_ephemeral_acl(repo_id, template_id, operation, enabled);
-
-CREATE TABLE IF NOT EXISTS broker_runtime_acl (
-    uid INTEGER NOT NULL REFERENCES broker_acl_principals(uid) ON DELETE CASCADE,
-    repo_id TEXT NOT NULL REFERENCES repositories(repo_id) ON DELETE CASCADE,
-    resource_kind TEXT NOT NULL
-        CHECK(resource_kind IN ('service', 'docker', 'database_stack')),
-    resource_id TEXT NOT NULL,
-    action TEXT NOT NULL CHECK(action IN ('status', 'start', 'stop', 'restart', 'replace')),
-    enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0, 1)),
-    updated_at TEXT NOT NULL,
-    PRIMARY KEY(uid, repo_id, resource_kind, resource_id, action)
-);
-
-CREATE INDEX IF NOT EXISTS broker_runtime_acl_by_resource
-ON broker_runtime_acl(repo_id, resource_kind, resource_id, action, enabled);
-
-CREATE TABLE IF NOT EXISTS broker_worker_acl (
-    uid INTEGER NOT NULL REFERENCES broker_acl_principals(uid) ON DELETE CASCADE,
-    repo_id TEXT NOT NULL REFERENCES repositories(repo_id) ON DELETE CASCADE,
-    server_definition_id TEXT NOT NULL
-        REFERENCES server_definitions(server_definition_id) ON DELETE CASCADE,
-    operation TEXT NOT NULL CHECK(operation IN (
-        'worker.launch_ticket', 'worker.launched', 'worker.exit',
-        'worker.policy_read', 'worker.attempt_read'
-    )),
-    enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0, 1)),
-    updated_at TEXT NOT NULL,
-    PRIMARY KEY(uid, repo_id, server_definition_id, operation)
-);
-
-CREATE INDEX IF NOT EXISTS broker_worker_acl_by_resource
-ON broker_worker_acl(repo_id, server_definition_id, operation, enabled);
-
 -- Permanent cleanup must fence an exact server incarnation before native or
 -- catalog mutation begins.  This record deliberately has no server-definition
 -- foreign key: deletion retains the no-resurrection boundary and an explicit
@@ -493,29 +371,6 @@ CREATE TABLE IF NOT EXISTS broker_worker_operation_requests (
         OR (status = 'failed' AND result_json IS NULL
             AND error_code IS NOT NULL AND error_message IS NOT NULL)
     )
-);
-
-CREATE TABLE IF NOT EXISTS broker_assignment_acl (
-    uid INTEGER NOT NULL REFERENCES broker_acl_principals(uid) ON DELETE CASCADE,
-    repo_id TEXT NOT NULL REFERENCES repositories(repo_id) ON DELETE CASCADE,
-    server_definition_id TEXT NOT NULL
-        REFERENCES server_definitions(server_definition_id) ON DELETE CASCADE,
-    operation TEXT NOT NULL CHECK(operation IN ('port.assign', 'port.unassign')),
-    enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0, 1)),
-    updated_at TEXT NOT NULL,
-    PRIMARY KEY(uid, repo_id, server_definition_id, operation)
-);
-
-CREATE TABLE IF NOT EXISTS broker_assignment_owners (
-    assignment_id TEXT PRIMARY KEY
-        REFERENCES port_assignments(assignment_id) ON DELETE CASCADE,
-    uid INTEGER NOT NULL REFERENCES broker_acl_principals(uid) ON DELETE RESTRICT,
-    account_id TEXT NOT NULL,
-    repo_id TEXT NOT NULL REFERENCES repositories(repo_id) ON DELETE RESTRICT,
-    server_definition_id TEXT NOT NULL
-        REFERENCES server_definitions(server_definition_id) ON DELETE RESTRICT,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS broker_compose_definitions (
@@ -666,30 +521,6 @@ CREATE TABLE IF NOT EXISTS broker_compose_run_once_services (
     UNIQUE(compose_definition_id, ordinal)
 );
 
-CREATE TABLE IF NOT EXISTS broker_compose_acl (
-    uid INTEGER NOT NULL REFERENCES broker_acl_principals(uid) ON DELETE CASCADE,
-    repo_id TEXT NOT NULL REFERENCES repositories(repo_id) ON DELETE CASCADE,
-    compose_definition_id TEXT NOT NULL
-        REFERENCES broker_compose_definitions(compose_definition_id) ON DELETE CASCADE,
-    operation TEXT NOT NULL CHECK(operation IN (
-        'compose.up', 'compose.stop', 'compose.restart', 'compose.down'
-    )),
-    enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0, 1)),
-    updated_at TEXT NOT NULL,
-    PRIMARY KEY(uid, repo_id, compose_definition_id, operation)
-);
-
-CREATE TABLE IF NOT EXISTS broker_compose_run_once_acl (
-    uid INTEGER NOT NULL REFERENCES broker_acl_principals(uid) ON DELETE CASCADE,
-    repo_id TEXT NOT NULL REFERENCES repositories(repo_id) ON DELETE CASCADE,
-    compose_definition_id TEXT NOT NULL
-        REFERENCES broker_compose_definitions(compose_definition_id) ON DELETE CASCADE,
-    service_name TEXT NOT NULL,
-    enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0, 1)),
-    updated_at TEXT NOT NULL,
-    PRIMARY KEY(uid, repo_id, compose_definition_id, service_name)
-);
-
 CREATE TABLE IF NOT EXISTS broker_compose_run_once_attempts (
     operation_id TEXT PRIMARY KEY
         REFERENCES operations(operation_id) ON DELETE CASCADE,
@@ -758,101 +589,23 @@ CREATE TABLE IF NOT EXISTS broker_observed_compose_containers (
     project_name TEXT NOT NULL,
     service_name TEXT,
     lifecycle TEXT NOT NULL CHECK(lifecycle IN ('running', 'stopped')),
-    ownership_state TEXT NOT NULL
-        CHECK(ownership_state IN ('exclusive', 'missing', 'conflicting')),
-    authoritative_owner_repo_id TEXT
+    association_state TEXT NOT NULL
+        CHECK(association_state IN ('exclusive', 'missing', 'conflicting')),
+    associated_repo_id TEXT
         REFERENCES repositories(repo_id) ON DELETE RESTRICT,
     observation_fingerprint TEXT NOT NULL,
     PRIMARY KEY(snapshot_id, docker_resource_id),
     CHECK(
-        (ownership_state = 'exclusive' AND authoritative_owner_repo_id IS NOT NULL)
+        (association_state = 'exclusive' AND associated_repo_id IS NOT NULL)
         OR
-        (ownership_state != 'exclusive' AND authoritative_owner_repo_id IS NULL)
+        (association_state != 'exclusive' AND associated_repo_id IS NULL)
     )
 );
 
 CREATE INDEX IF NOT EXISTS broker_observed_compose_containers_by_project
 ON broker_observed_compose_containers(snapshot_id, project_name, service_name);
 
-CREATE TABLE IF NOT EXISTS broker_lifecycle_acl (
-    uid INTEGER NOT NULL REFERENCES broker_acl_principals(uid) ON DELETE CASCADE,
-    repo_id TEXT NOT NULL REFERENCES repositories(repo_id) ON DELETE CASCADE,
-    operation TEXT NOT NULL CHECK(operation IN (
-        'repository.plan_remove', 'repository.remove', 'repository.reinstall',
-        'resource.attach', 'resource.plan_retire', 'resource.retire'
-    )),
-    enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0, 1)),
-    updated_at TEXT NOT NULL,
-    PRIMARY KEY(uid, repo_id, operation)
-);
-
-CREATE TABLE IF NOT EXISTS broker_lifecycle_resource_acl (
-    uid INTEGER NOT NULL REFERENCES broker_acl_principals(uid) ON DELETE CASCADE,
-    repo_id TEXT NOT NULL REFERENCES repositories(repo_id) ON DELETE CASCADE,
-    resource_kind TEXT NOT NULL CHECK(resource_kind IN ('server', 'container', 'supervisor')),
-    resource_id TEXT NOT NULL,
-    control_binding_id TEXT NOT NULL
-        REFERENCES control_bindings(binding_id) ON DELETE CASCADE,
-    immutable_fingerprint TEXT NOT NULL,
-    ownership_fingerprint TEXT NOT NULL,
-    operation TEXT NOT NULL CHECK(operation IN (
-        'resource.attach', 'resource.plan_retire', 'resource.retire'
-    )),
-    enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0, 1)),
-    updated_at TEXT NOT NULL,
-    PRIMARY KEY(uid, repo_id, resource_kind, resource_id, control_binding_id, operation)
-);
-
-CREATE TABLE IF NOT EXISTS broker_repository_read_acl (
-    uid INTEGER NOT NULL REFERENCES broker_acl_principals(uid) ON DELETE CASCADE,
-    repo_id TEXT NOT NULL REFERENCES repositories(repo_id) ON DELETE CASCADE,
-    operation TEXT NOT NULL CHECK(operation IN ('repository.list_removed')),
-    enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0, 1)),
-    updated_at TEXT NOT NULL,
-    PRIMARY KEY(uid, repo_id, operation)
-);
-
-CREATE TABLE IF NOT EXISTS broker_host_observation_acl (
-    uid INTEGER NOT NULL REFERENCES broker_acl_principals(uid) ON DELETE CASCADE,
-    repo_id TEXT NOT NULL REFERENCES repositories(repo_id) ON DELETE CASCADE,
-    enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0, 1)),
-    updated_at TEXT NOT NULL,
-    PRIMARY KEY(uid, repo_id)
-);
-
-CREATE TABLE IF NOT EXISTS broker_cleanup_acl (
-    uid INTEGER NOT NULL REFERENCES broker_acl_principals(uid) ON DELETE CASCADE,
-    repo_id TEXT NOT NULL REFERENCES repositories(repo_id) ON DELETE CASCADE,
-    operation TEXT NOT NULL CHECK(operation IN (
-        'archives.read', 'cleanup.plan', 'cleanup.apply', 'lifecycle.restore',
-        'repository.plan_remove', 'repository.remove', 'repository.reinstall',
-        'resource.plan_retire', 'resource.retire',
-        'resource.plan_archive', 'resource.archive', 'resource.restore'
-    )),
-    enabled INTEGER NOT NULL DEFAULT 0 CHECK(enabled IN (0, 1)),
-    updated_at TEXT NOT NULL,
-    PRIMARY KEY(uid, repo_id, operation)
-);
-
-CREATE TABLE IF NOT EXISTS broker_cleanup_resource_acl (
-    uid INTEGER NOT NULL REFERENCES broker_acl_principals(uid) ON DELETE CASCADE,
-    repo_id TEXT NOT NULL REFERENCES repositories(repo_id) ON DELETE CASCADE,
-    resource_kind TEXT NOT NULL CHECK(resource_kind IN ('server', 'container', 'supervisor')),
-    resource_id TEXT NOT NULL,
-    control_binding_id TEXT NOT NULL
-        REFERENCES control_bindings(binding_id) ON DELETE CASCADE,
-    immutable_fingerprint TEXT NOT NULL,
-    ownership_fingerprint TEXT NOT NULL,
-    operation TEXT NOT NULL CHECK(operation IN (
-        'resource.plan_archive', 'resource.archive', 'resource.restore',
-        'cleanup.plan', 'cleanup.apply'
-    )),
-    enabled INTEGER NOT NULL DEFAULT 0 CHECK(enabled IN (0, 1)),
-    updated_at TEXT NOT NULL,
-    PRIMARY KEY(uid, repo_id, resource_kind, resource_id, control_binding_id, operation)
-);
-
-CREATE TABLE IF NOT EXISTS broker_host_observation_owners (
+CREATE TABLE IF NOT EXISTS broker_host_observation_sessions (
     snapshot_id TEXT PRIMARY KEY
         REFERENCES observation_snapshots(snapshot_id) ON DELETE CASCADE,
     broker_instance_id TEXT NOT NULL,
@@ -872,19 +625,6 @@ CREATE TABLE IF NOT EXISTS broker_lifecycle_plan_observations (
     bound_at TEXT NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS broker_database_acl (
-    uid INTEGER NOT NULL REFERENCES broker_acl_principals(uid) ON DELETE CASCADE,
-    repo_id TEXT NOT NULL REFERENCES repositories(repo_id) ON DELETE CASCADE,
-    database_binding_id TEXT NOT NULL
-        REFERENCES database_bindings(database_binding_id) ON DELETE CASCADE,
-    docker_resource_id TEXT NOT NULL
-        REFERENCES docker_resources(docker_resource_id) ON DELETE CASCADE,
-    operation TEXT NOT NULL CHECK(operation IN ('database.backup', 'database.restore')),
-    enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0, 1)),
-    updated_at TEXT NOT NULL,
-    PRIMARY KEY(uid, repo_id, database_binding_id, operation)
-);
-
 CREATE TABLE IF NOT EXISTS broker_database_host_results (
     operation_id TEXT PRIMARY KEY
         REFERENCES operations(operation_id) ON DELETE CASCADE,
@@ -893,8 +633,53 @@ CREATE TABLE IF NOT EXISTS broker_database_host_results (
     recorded_at TEXT NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS broker_port_policies (
-    uid INTEGER NOT NULL REFERENCES broker_acl_principals(uid) ON DELETE CASCADE,
+CREATE TABLE IF NOT EXISTS broker_runtime_replacements (
+    operation_id TEXT PRIMARY KEY
+        REFERENCES operations(operation_id) ON DELETE CASCADE,
+    repo_id TEXT NOT NULL REFERENCES repositories(repo_id) ON DELETE RESTRICT,
+    resource_kind TEXT NOT NULL
+        CHECK(resource_kind IN ('docker', 'database_stack')),
+    requested_resource_id TEXT NOT NULL,
+    old_docker_resource_id TEXT NOT NULL
+        REFERENCES docker_resources(docker_resource_id) ON DELETE RESTRICT,
+    old_full_container_id TEXT NOT NULL,
+    database_binding_id TEXT,
+    database_name TEXT,
+    compose_definition_id TEXT NOT NULL
+        REFERENCES broker_compose_definitions(compose_definition_id) ON DELETE RESTRICT,
+    compose_service TEXT NOT NULL,
+    compose_operation_id TEXT NOT NULL UNIQUE,
+    backup_operation_id TEXT UNIQUE,
+    database_backup_id TEXT
+        REFERENCES database_backups(database_backup_id) ON DELETE RESTRICT,
+    new_docker_resource_id TEXT
+        REFERENCES docker_resources(docker_resource_id) ON DELETE RESTRICT,
+    new_full_container_id TEXT,
+    restore_result_json TEXT,
+    phase TEXT NOT NULL CHECK(phase IN (
+        'reserved', 'backup_complete', 'recreated', 'rebound',
+        'restore_intent', 'restore_complete', 'terminal'
+    )),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    CHECK(
+        (resource_kind = 'docker' AND database_binding_id IS NULL
+            AND database_name IS NULL AND backup_operation_id IS NULL)
+        OR
+        (resource_kind = 'database_stack' AND database_binding_id IS NOT NULL
+            AND database_name IS NOT NULL AND backup_operation_id IS NOT NULL)
+    ),
+    CHECK(
+        (new_docker_resource_id IS NULL AND new_full_container_id IS NULL)
+        OR
+        (new_docker_resource_id IS NOT NULL AND new_full_container_id IS NOT NULL)
+    )
+);
+
+-- Port ranges are host-allocation constraints, not caller permissions. They
+-- are attached to the target server and apply identically to every local
+-- caller.
+CREATE TABLE IF NOT EXISTS broker_port_ranges (
     repo_id TEXT NOT NULL REFERENCES repositories(repo_id) ON DELETE CASCADE,
     server_definition_id TEXT NOT NULL
         REFERENCES server_definitions(server_definition_id) ON DELETE CASCADE,
@@ -904,12 +689,12 @@ CREATE TABLE IF NOT EXISTS broker_port_policies (
     max_ttl_seconds INTEGER NOT NULL CHECK(max_ttl_seconds BETWEEN 1 AND 604800),
     enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0, 1)),
     updated_at TEXT NOT NULL,
-    PRIMARY KEY(uid, repo_id, server_definition_id, protocol, start_port, end_port)
+    PRIMARY KEY(repo_id, server_definition_id, protocol, start_port, end_port)
 );
 
 CREATE TABLE IF NOT EXISTS broker_operation_requests (
     operation_id TEXT PRIMARY KEY REFERENCES operations(operation_id) ON DELETE CASCADE,
-    uid INTEGER NOT NULL REFERENCES broker_acl_principals(uid) ON DELETE RESTRICT,
+    uid INTEGER NOT NULL CHECK(uid >= 0),
     account_id TEXT NOT NULL,
     repo_id TEXT NOT NULL REFERENCES repositories(repo_id) ON DELETE RESTRICT,
     resource_id TEXT NOT NULL,
@@ -917,34 +702,6 @@ CREATE TABLE IF NOT EXISTS broker_operation_requests (
     request_fingerprint TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
-
-CREATE TABLE IF NOT EXISTS broker_lease_owners (
-    lease_id TEXT PRIMARY KEY REFERENCES leases(lease_id) ON DELETE CASCADE,
-    uid INTEGER NOT NULL REFERENCES broker_acl_principals(uid) ON DELETE RESTRICT,
-    account_id TEXT NOT NULL,
-    repo_id TEXT NOT NULL REFERENCES repositories(repo_id) ON DELETE RESTRICT,
-    server_definition_id TEXT NOT NULL
-        REFERENCES server_definitions(server_definition_id) ON DELETE RESTRICT,
-    protocol TEXT NOT NULL CHECK(protocol IN ('tcp', 'udp')),
-    created_at TEXT NOT NULL
-);
-
-CREATE INDEX IF NOT EXISTS broker_acl_by_resource
-ON broker_resource_acl(repo_id, resource_kind, resource_id, operation, enabled);
-
-CREATE INDEX IF NOT EXISTS broker_port_policy_lookup
-ON broker_port_policies(uid, repo_id, server_definition_id, protocol, enabled);
-
-CREATE INDEX IF NOT EXISTS broker_assignment_acl_lookup
-ON broker_assignment_acl(repo_id, server_definition_id, operation, enabled);
-
-CREATE INDEX IF NOT EXISTS broker_compose_acl_lookup
-    ON broker_compose_acl(repo_id, compose_definition_id, operation, enabled);
-
-CREATE INDEX IF NOT EXISTS broker_compose_run_once_acl_lookup
-    ON broker_compose_run_once_acl(
-        repo_id, compose_definition_id, service_name, enabled
-    );
 
 CREATE INDEX IF NOT EXISTS broker_compose_run_once_attempt_phase
     ON broker_compose_run_once_attempts(compose_definition_id, phase);
@@ -959,34 +716,177 @@ CREATE TABLE IF NOT EXISTS broker_compose_operation_preflights (
     committed_at TEXT NOT NULL
 );
 
-CREATE INDEX IF NOT EXISTS broker_lifecycle_acl_lookup
-ON broker_lifecycle_acl(repo_id, operation, enabled);
+CREATE INDEX IF NOT EXISTS broker_host_observation_session_lookup
+ON broker_host_observation_sessions(broker_instance_id, snapshot_id);
 
-CREATE INDEX IF NOT EXISTS broker_lifecycle_resource_acl_lookup
-ON broker_lifecycle_resource_acl(
-    repo_id, resource_kind, resource_id, control_binding_id, operation, enabled
-);
+CREATE INDEX IF NOT EXISTS broker_port_range_lookup
+ON broker_port_ranges(repo_id, server_definition_id, protocol, enabled);
 
-CREATE INDEX IF NOT EXISTS broker_repository_read_acl_lookup
-ON broker_repository_read_acl(repo_id, operation, enabled);
-
-CREATE INDEX IF NOT EXISTS broker_host_observation_acl_lookup
-ON broker_host_observation_acl(repo_id, enabled);
-
-CREATE INDEX IF NOT EXISTS broker_cleanup_acl_lookup
-ON broker_cleanup_acl(repo_id, operation, enabled);
-
-CREATE INDEX IF NOT EXISTS broker_cleanup_resource_acl_lookup
-ON broker_cleanup_resource_acl(
-    repo_id, resource_kind, resource_id, control_binding_id, operation, enabled
-);
-
-CREATE INDEX IF NOT EXISTS broker_host_observation_owner_lookup
-ON broker_host_observation_owners(broker_instance_id, snapshot_id);
-
-CREATE INDEX IF NOT EXISTS broker_database_acl_lookup
-ON broker_database_acl(repo_id, docker_resource_id, database_binding_id, operation, enabled);
 """
+
+
+_LEGACY_LOCAL_AUTHORIZATION_TABLES = (
+    "broker_cleanup_resource_acl",
+    "broker_lifecycle_resource_acl",
+    "broker_database_acl",
+    "broker_compose_run_once_acl",
+    "broker_compose_acl",
+    "broker_assignment_acl",
+    "broker_worker_acl",
+    "broker_runtime_acl",
+    "broker_ephemeral_acl",
+    "broker_resource_acl",
+    "broker_repository_read_acl",
+    "broker_host_observation_acl",
+    "broker_cleanup_acl",
+    "broker_lifecycle_acl",
+    "broker_repository_configurations",
+    "broker_assignment_owners",
+    "broker_lease_owners",
+    "broker_acl_principals",
+)
+
+
+def _table_exists(connection: sqlite3.Connection, table: str) -> bool:
+    return connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (table,)
+    ).fetchone() is not None
+
+
+def _migrate_trusted_local_broker_schema(connection: sqlite3.Connection) -> None:
+    """Remove legacy caller/repository request validation state transactionally."""
+
+    if _table_exists(connection, "broker_host_observation_owners") and not _table_exists(
+        connection, "broker_host_observation_sessions"
+    ):
+        connection.execute(
+            "ALTER TABLE broker_host_observation_owners "
+            "RENAME TO broker_host_observation_sessions"
+        )
+
+    observed_columns = {
+        str(row["name"])
+        for row in connection.execute(
+            "PRAGMA table_info(broker_observed_compose_containers)"
+        )
+    }
+    if observed_columns and "ownership_state" in observed_columns:
+        connection.execute(
+            "ALTER TABLE broker_observed_compose_containers "
+            "RENAME TO broker_observed_compose_containers_legacy_owner"
+        )
+        connection.execute(
+            """
+            CREATE TABLE broker_observed_compose_containers (
+                snapshot_id TEXT NOT NULL
+                    REFERENCES observation_snapshots(snapshot_id) ON DELETE CASCADE,
+                docker_resource_id TEXT NOT NULL
+                    REFERENCES docker_resources(docker_resource_id) ON DELETE RESTRICT,
+                full_container_id TEXT NOT NULL,
+                project_name TEXT NOT NULL,
+                service_name TEXT,
+                lifecycle TEXT NOT NULL CHECK(lifecycle IN ('running', 'stopped')),
+                association_state TEXT NOT NULL
+                    CHECK(association_state IN ('exclusive', 'missing', 'conflicting')),
+                associated_repo_id TEXT REFERENCES repositories(repo_id) ON DELETE RESTRICT,
+                observation_fingerprint TEXT NOT NULL,
+                PRIMARY KEY(snapshot_id, docker_resource_id),
+                CHECK(
+                    (association_state = 'exclusive' AND associated_repo_id IS NOT NULL)
+                    OR (association_state != 'exclusive' AND associated_repo_id IS NULL)
+                )
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO broker_observed_compose_containers(
+                snapshot_id, docker_resource_id, full_container_id,
+                project_name, service_name, lifecycle, association_state,
+                associated_repo_id, observation_fingerprint
+            )
+            SELECT snapshot_id, docker_resource_id, full_container_id,
+                   project_name, service_name, lifecycle, ownership_state,
+                   authoritative_owner_repo_id, observation_fingerprint
+            FROM broker_observed_compose_containers_legacy_owner
+            """
+        )
+        connection.execute("DROP TABLE broker_observed_compose_containers_legacy_owner")
+
+    if _table_exists(connection, "broker_port_policies"):
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS broker_port_ranges (
+                repo_id TEXT NOT NULL REFERENCES repositories(repo_id) ON DELETE CASCADE,
+                server_definition_id TEXT NOT NULL
+                    REFERENCES server_definitions(server_definition_id) ON DELETE CASCADE,
+                protocol TEXT NOT NULL CHECK(protocol IN ('tcp', 'udp')),
+                start_port INTEGER NOT NULL CHECK(start_port BETWEEN 1 AND 65535),
+                end_port INTEGER NOT NULL CHECK(end_port BETWEEN start_port AND 65535),
+                max_ttl_seconds INTEGER NOT NULL CHECK(max_ttl_seconds BETWEEN 1 AND 604800),
+                enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0, 1)),
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY(repo_id, server_definition_id, protocol, start_port, end_port)
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO broker_port_ranges(
+                repo_id, server_definition_id, protocol, start_port, end_port,
+                max_ttl_seconds, enabled, updated_at
+            )
+            SELECT repo_id, server_definition_id, protocol, start_port, end_port,
+                   max(max_ttl_seconds), max(enabled), max(updated_at)
+            FROM broker_port_policies
+            GROUP BY repo_id, server_definition_id, protocol, start_port, end_port
+            ON CONFLICT(repo_id, server_definition_id, protocol, start_port, end_port)
+            DO UPDATE SET
+                max_ttl_seconds = excluded.max_ttl_seconds,
+                enabled = excluded.enabled,
+                updated_at = excluded.updated_at
+            """
+        )
+        connection.execute("DROP TABLE broker_port_policies")
+
+    operation_request_sql = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'broker_operation_requests'"
+    ).fetchone()
+    if operation_request_sql is not None and "broker_acl_principals" in str(
+        operation_request_sql[0]
+    ):
+        connection.execute(
+            "ALTER TABLE broker_operation_requests RENAME TO broker_operation_requests_legacy_auth"
+        )
+        connection.execute(
+            """
+            CREATE TABLE broker_operation_requests (
+                operation_id TEXT PRIMARY KEY REFERENCES operations(operation_id) ON DELETE CASCADE,
+                uid INTEGER NOT NULL CHECK(uid >= 0),
+                account_id TEXT NOT NULL,
+                repo_id TEXT NOT NULL REFERENCES repositories(repo_id) ON DELETE RESTRICT,
+                resource_id TEXT NOT NULL,
+                operation TEXT NOT NULL,
+                request_fingerprint TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO broker_operation_requests(
+                operation_id, uid, account_id, repo_id, resource_id,
+                operation, request_fingerprint, created_at
+            )
+            SELECT operation_id, uid, account_id, repo_id, resource_id,
+                   operation, request_fingerprint, created_at
+            FROM broker_operation_requests_legacy_auth
+            """
+        )
+        connection.execute("DROP TABLE broker_operation_requests_legacy_auth")
+
+    for table in _LEGACY_LOCAL_AUTHORIZATION_TABLES:
+        connection.execute(f'DROP TABLE IF EXISTS "{table}"')
 
 
 @dataclass(frozen=True)
@@ -1005,6 +905,12 @@ class DockerMutationTarget:
     control_generation: int
     repo_id: str | None = None
     owner_uid: int | None = None
+
+
+@dataclass(frozen=True)
+class DirectContainerRemovalTarget:
+    docker_resource_id: str
+    full_container_id: str
 
 
 @dataclass(frozen=True)
@@ -1074,7 +980,7 @@ class SealedTestFixtureTemplate:
 
 @dataclass(frozen=True)
 class EphemeralSecretRunTarget:
-    """Exact non-secret run snapshot authorized for one descriptor delivery."""
+    """Exact non-secret run snapshot accepted for one descriptor delivery."""
 
     run_id: str
     template_id: str
@@ -1109,6 +1015,36 @@ class RuntimeDockerMutationTarget:
 
 
 @dataclass(frozen=True)
+class RuntimeSessionCleanupTarget:
+    session_id: str
+    operation_id: str
+    repo_id: str
+    cleanup_disposition: str
+    target: RuntimeDockerMutationTarget
+
+
+@dataclass(frozen=True)
+class RuntimeReplacementRecord:
+    operation_id: str
+    repo_id: str
+    resource_kind: str
+    requested_resource_id: str
+    old_docker_resource_id: str
+    old_full_container_id: str
+    database_binding_id: str | None
+    database_name: str | None
+    compose_definition_id: str
+    compose_service: str
+    compose_operation_id: str
+    backup_operation_id: str | None
+    database_backup_id: str | None
+    new_docker_resource_id: str | None
+    new_full_container_id: str | None
+    restore_result: dict[str, Any] | None
+    phase: str
+
+
+@dataclass(frozen=True)
 class RuntimeServiceLogTarget:
     server_definition_id: str
     repo_id: str
@@ -1116,6 +1052,16 @@ class RuntimeServiceLogTarget:
     log_path: str
     definition_fingerprint: str
     owner_uid: int
+
+
+@dataclass(frozen=True)
+class RuntimeServiceEndpointTarget:
+    server_definition_id: str
+    repo_id: str
+    canonical_root: str
+    cwd: str
+    listener_port: int | None
+    listener_required: bool
 
 
 @dataclass(frozen=True)
@@ -1158,11 +1104,13 @@ class ComposeMutationTarget:
     definition_generation: int
     repository_generation: int
     owner_uid: int | None = None
+    recreate_service: str | None = None
+    wait_timeout_seconds: int | None = None
 
 
 @dataclass(frozen=True)
-class ComposeEnrollmentContainerScope:
-    """Exact enrollment projection for one observed Compose project.
+class ComposeConfigurationContainerScope:
+    """Exact configuration projection for one observed Compose project.
 
     ``lifecycle_container_ids`` are controlled by the retained Compose
     definition. ``non_lifecycle_container_ids`` belong to the same Compose
@@ -1204,13 +1152,13 @@ class ComposeRunOnceMutationTarget:
 
 
 @dataclass(frozen=True)
-class TestAttemptRepositoryAuthority:
-    """Exact current repository authority for one broker-owned attempt."""
+class TestRepositoryExecutionContext:
+    """Exact current repository and attributed execution UID for one attempt."""
 
     repo_id: str
     canonical_root: str
     generation: int
-    owner_uid: int
+    execution_uid: int
 
 
 @dataclass(frozen=True)
@@ -1223,13 +1171,8 @@ class TemporaryServiceExecutionContext:
     execution_uid: int
 
 
-class StoreBackedAuthorizer:
-    """Live single-developer authorizer over the durable policy union.
-
-    Peer UID is retained on the returned request for attribution.  Typed
-    account/project/resource/operation authority comes from the union of local
-    configured policies, including the internal test namespaces.
-    """
+class StoreBackedRequestAcceptor:
+    """Validate trusted-local requests against current typed state."""
 
     def __init__(
         self,
@@ -1238,20 +1181,18 @@ class StoreBackedAuthorizer:
         internal_testd_uid: int | None = None,
     ) -> None:
         self._persistence = persistence
-        # Compatibility-only input for older units. Internal test operations
-        # are authorized by their exact typed account/operation/repository
-        # contract; the connecting local UID is attribution, not a tenant
-        # boundary on this single-developer host.
+        # Compatibility-only input for older unit constructors. It is never an
+        # access decision on this single-developer host.
         del internal_testd_uid
 
-    def authorize(
+    def accept(
         self, peer: PeerCredentials, request: BrokerRequest
-    ) -> AuthorizedBrokerRequest:
+    ) -> AcceptedBrokerRequest:
         if request.operation in TEST_ADMISSION_ADMIN_OPERATIONS:
-            return self._persistence.authorize_test_admission_admin(peer, request)
+            return self._persistence.accept_test_admission_admin(peer, request)
         if request.operation in TESTD_INTERNAL_OPERATIONS:
-            return self._persistence.authorize_internal_testd(peer, request)
-        return self._persistence.authorize(peer, request)
+            return self._persistence.accept_internal_testd(peer, request)
+        return self._persistence.accept(peer, request)
 
 
 class BrokerPersistence:
@@ -1262,7 +1203,7 @@ class BrokerPersistence:
         database_path: str | os.PathLike[str],
         *,
         expected_uid: Optional[int] = None,
-        busy_timeout_ms: int = 5_000,
+        busy_timeout_ms: int = DEFAULT_BUSY_TIMEOUT_MS,
         compose_model_renderer: Optional[Callable[..., bytes]] = None,
     ) -> None:
         self.database_path = Path(database_path)
@@ -1292,72 +1233,53 @@ class BrokerPersistence:
                 ).fetchone()
         if row is None:
             raise BrokerError(
-                "project_access_denied",
-                "Repository is not provisioned in this broker authority.",
+                "repository_target_unavailable",
+                "Repository is not present in the Coordinator catalog.",
             )
         return str(row["host_id"])
 
-    def ensure_repository_enrollment(
+    def ensure_repository_catalog_entry(
         self,
-        authorized: AuthorizedBrokerRequest,
+        accepted: AcceptedBrokerRequest,
         *,
         context: Any,
+        reconcile_repository: Callable[[str, str, int], Mapping[str, Any]] | None = None,
     ) -> dict[str, Any]:
-        """Atomically adopt one proven Git context through an enrolled anchor.
+        """Register one proven Git context without creating access state."""
 
-        The request project is transport authority only.  The broker resolves
-        and revalidates the Git context before this method, then this single
-        writer transaction installs any missing normalized repository rows,
-        owner facts, family/scopes, and caller enrollment.  Existing disabled
-        or missing repositories are never revived by first use.
-        """
-
-        request = authorized.request
+        request = accepted.request
         if request.operation is not BrokerOperation.REPOSITORY_ENSURE:
             raise ValueError("request is not a repository ensure")
         if (
-            request.arguments["canonical_root"]
-            != context.effective.canonical_root
+            request.arguments["canonical_root"] != context.effective.canonical_root
             or request.arguments["project_kind"] != context.project_kind
-            or int(request.arguments["owner_uid"])
-            != int(context.effective.root_owner_uid)
         ):
             raise BrokerError(
                 "repository_context_changed",
-                "The proven repository context changed before adoption.",
+                "The proven repository context changed before registration.",
                 operation_id=request.operation_id,
             )
-
-        execution_uid = int(authorized.peer.uid)
-        if execution_uid <= 0:
-            raise BrokerError(
-                "repository_execution_peer_invalid",
-                "First-use repository execution requires a non-root local peer.",
-                operation_id=request.operation_id,
-            )
-
-        disposition = self.reserve_operation(authorized)
+        execution_uid = int(accepted.attribution_uid)
+        disposition = self.reserve_operation(accepted)
         if disposition.state == "completed":
             return dict(disposition.result or {})
         if disposition.state == "failed":
             raise BrokerError(
-                disposition.error_code or "repository_bootstrap_failed",
-                disposition.error_message or "Repository bootstrap failed.",
+                disposition.error_code or "repository_registration_failed",
+                disposition.error_message or "Repository registration failed.",
                 operation_id=request.operation_id,
             )
 
         from .repository_context import _revalidate_context
 
         timestamp = utc_timestamp()
-        valid_until_epoch = int(time.time()) + 365 * 24 * 60 * 60
         scopes = [context.root]
         if context.temporary is not None:
             scopes.append(context.temporary)
-
         with self._store() as store:
             with store.immediate_transaction() as connection:
-                _authorize_connection(
-                    connection, peer=authorized.peer, request=request
+                _validate_connection_request(
+                    connection, peer=accepted.peer, request=request
                 )
                 _revalidate_context(context)
                 anchor = connection.execute(
@@ -1366,8 +1288,8 @@ class BrokerPersistence:
                 ).fetchone()
                 if anchor is None:
                     raise BrokerError(
-                        "project_access_denied",
-                        "Repository bootstrap lost its enrolled transport anchor.",
+                        "repository_target_unavailable",
+                        "Repository registration lost its host routing anchor.",
                         operation_id=request.operation_id,
                     )
                 host_id = str(anchor["host_id"])
@@ -1380,14 +1302,10 @@ class BrokerPersistence:
                         """
                         SELECT repository.repo_id, repository.state,
                                repository.generation, installation.status,
-                               installation.startup_fenced, owner.owner_uid,
-                               owner.repository_generation
+                               installation.startup_fenced
                         FROM repositories AS repository
-                        LEFT JOIN repository_installations AS installation
-                          USING(repo_id)
-                        LEFT JOIN repository_owners AS owner USING(repo_id)
-                        WHERE repository.host_id = ?
-                          AND repository.canonical_root = ?
+                        LEFT JOIN repository_installations AS installation USING(repo_id)
+                        WHERE repository.host_id = ? AND repository.canonical_root = ?
                         """,
                         (host_id, root),
                     ).fetchone()
@@ -1399,39 +1317,7 @@ class BrokerPersistence:
                                 state, generation, created_at, updated_at
                             ) VALUES (?, ?, ?, ?, 'active', 0, ?, ?)
                             """,
-                            (
-                                repo_id,
-                                host_id,
-                                root,
-                                Path(root).name or root,
-                                timestamp,
-                                timestamp,
-                            ),
-                        )
-                        establish_repository_owner_authority(
-                            connection,
-                            repository_id=repo_id,
-                            owner_uid=execution_uid,
-                            repository_generation=0,
-                            operation_id=str(
-                                uuid.uuid5(
-                                    uuid.UUID(request.operation_id), repo_id
-                                )
-                            ),
-                            actor=str(request.arguments["agent"]),
-                            reason="first start-like repository use",
-                            timestamp=timestamp,
-                            evidence={
-                                "kind": "broker-first-use-repository-adoption",
-                                "repository_id": repo_id,
-                                "canonical_root": root,
-                                "repository_generation": 0,
-                                "owner_uid": execution_uid,
-                                "execution_uid": execution_uid,
-                                "filesystem_owner_uid": int(
-                                    scope.root_owner_uid
-                                ),
-                            },
+                            (repo_id, host_id, root, Path(root).name or root, timestamp, timestamp),
                         )
                         connection.execute(
                             """
@@ -1439,145 +1325,22 @@ class BrokerPersistence:
                                 repo_id, status, startup_fenced, generation,
                                 reason, actor, updated_at
                             ) VALUES (?, 'installed', 0, 0,
-                                      'first start-like repository use', ?, ?)
+                                      'first repository use', ?, ?)
                             """,
                             (repo_id, str(request.arguments["agent"]), timestamp),
                         )
                         changed = True
-                    else:
-                        if (
-                            str(existing["repo_id"]) != repo_id
-                            or str(existing["state"]) != "active"
-                            or str(existing["status"] or "") != "installed"
-                            or bool(existing["startup_fenced"])
-                            or existing["owner_uid"] is None
-                            or existing["repository_generation"] is None
-                            or int(existing["repository_generation"])
-                            != int(existing["generation"])
-                        ):
-                            raise BrokerError(
-                                "repository_startup_fenced",
-                                "An existing repository identity cannot be adopted implicitly.",
-                                operation_id=request.operation_id,
-                            )
-                    repository_ids[root] = repo_id
-
-                    execution_principal = connection.execute(
-                        """
-                        SELECT account_id, enabled
-                        FROM broker_acl_principals
-                        WHERE uid = ?
-                        """,
-                        (execution_uid,),
-                    ).fetchone()
-                    if execution_principal is None:
-                        execution_account_id = request.account_id
-                        connection.execute(
-                            """
-                            INSERT INTO broker_acl_principals(
-                                uid, account_id, enabled, updated_at
-                            ) VALUES (?, ?, 1, ?)
-                            """,
-                            (execution_uid, execution_account_id, timestamp),
-                        )
-                        changed = True
-                    else:
-                        execution_account_id = str(
-                            execution_principal["account_id"]
-                        )
-                        if not bool(execution_principal["enabled"]):
-                            raise BrokerError(
-                                "repository_execution_owner_disabled",
-                                "The repository execution account is explicitly disabled in Coordinator; re-enable that account before starting repository work.",
-                                operation_id=request.operation_id,
-                            )
-
-                    execution_enrollment = connection.execute(
-                        """
-                        SELECT account_id, enabled
-                        FROM broker_repository_enrollments
-                        WHERE uid = ? AND repo_id = ?
-                        """,
-                        (execution_uid, repo_id),
-                    ).fetchone()
-                    if execution_enrollment is None:
-                        connection.execute(
-                            """
-                            INSERT INTO broker_repository_enrollments(
-                                uid, repo_id, account_id, enabled, issued_at,
-                                valid_until_epoch, enrollment_snapshot_id,
-                                grant_snapshot_id, updated_at
-                            ) VALUES (?, ?, ?, 1, ?, ?, NULL, NULL, ?)
-                            """,
-                            (
-                                execution_uid,
-                                repo_id,
-                                execution_account_id,
-                                timestamp,
-                                valid_until_epoch,
-                                timestamp,
-                            ),
-                        )
-                        changed = True
                     elif (
-                        str(execution_enrollment["account_id"])
-                        != execution_account_id
+                        str(existing["repo_id"]) != repo_id
+                        or str(existing["state"]) != "active"
+                        or str(existing["status"] or "") != "installed"
+                        or bool(existing["startup_fenced"])
                     ):
                         raise BrokerError(
-                            "principal_account_conflict",
-                            "The repository execution enrollment conflicts with its current Coordinator account binding.",
+                            "repository_startup_fenced",
+                            "An unavailable repository identity cannot be revived implicitly.",
                             operation_id=request.operation_id,
                         )
-                    elif not bool(execution_enrollment["enabled"]):
-                        raise BrokerError(
-                            "repository_execution_owner_disabled",
-                            "The repository execution enrollment is explicitly disabled in Coordinator; re-enable it before starting repository work.",
-                            operation_id=request.operation_id,
-                        )
-
-                    enrollment = connection.execute(
-                        """
-                        SELECT account_id, enabled, issued_at,
-                               valid_until_epoch
-                        FROM broker_repository_enrollments
-                        WHERE uid = ? AND repo_id = ?
-                        """,
-                        (authorized.authorization_uid, repo_id),
-                    ).fetchone()
-                    if enrollment is not None and str(
-                        enrollment["account_id"]
-                    ) != request.account_id:
-                        raise BrokerError(
-                            "principal_account_conflict",
-                            "Repository bootstrap conflicts with an existing account binding.",
-                            operation_id=request.operation_id,
-                        )
-                    if enrollment is None:
-                        connection.execute(
-                            """
-                            INSERT INTO broker_repository_enrollments(
-                                uid, repo_id, account_id, enabled, issued_at,
-                                valid_until_epoch, enrollment_snapshot_id,
-                                grant_snapshot_id, updated_at
-                            ) VALUES (?, ?, ?, 1, ?, ?, NULL, NULL, ?)
-                            """,
-                            (
-                                authorized.authorization_uid,
-                                repo_id,
-                                request.account_id,
-                                timestamp,
-                                valid_until_epoch,
-                                timestamp,
-                            ),
-                        )
-                        changed = True
-                    else:
-                        if not bool(enrollment["enabled"]):
-                            raise BrokerError(
-                                "project_access_denied",
-                                "A disabled repository enrollment cannot be revived implicitly.",
-                                operation_id=request.operation_id,
-                            )
                     repository_ids[root] = repo_id
 
                 root_repo_id = repository_ids[context.root.canonical_root]
@@ -1603,17 +1366,25 @@ class BrokerPersistence:
                     repo_id = repository_ids[scope.canonical_root]
                     project_kind = (
                         "temporary"
-                        if context.temporary is not None
-                        and scope is context.temporary
+                        if context.temporary is not None and scope is context.temporary
                         else "primary"
                     )
                     connection.execute(
                         """
-                        INSERT OR IGNORE INTO repository_scopes(
+                        INSERT INTO repository_scopes(
                             repo_id, family_id, project_kind, git_dir,
                             git_common_dir, identity_fingerprint, root_device,
                             root_inode, created_at, updated_at
                         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(repo_id) DO UPDATE SET
+                            family_id = excluded.family_id,
+                            project_kind = excluded.project_kind,
+                            git_dir = excluded.git_dir,
+                            git_common_dir = excluded.git_common_dir,
+                            identity_fingerprint = excluded.identity_fingerprint,
+                            root_device = excluded.root_device,
+                            root_inode = excluded.root_inode,
+                            updated_at = excluded.updated_at
                         """,
                         (
                             repo_id,
@@ -1629,75 +1400,80 @@ class BrokerPersistence:
                         ),
                     )
 
-                effective_repo_id = repository_ids[
-                    context.effective.canonical_root
-                ]
+                effective_repo_id = repository_ids[context.effective.canonical_root]
                 effective = connection.execute(
-                    """
-                    SELECT repository.generation, owner.owner_uid,
-                           enrollment.issued_at, enrollment.valid_until_epoch
-                    FROM repositories AS repository
-                    JOIN repository_owners AS owner USING(repo_id)
-                    JOIN broker_repository_enrollments AS enrollment
-                      ON enrollment.repo_id = repository.repo_id
-                     AND enrollment.uid = ?
-                    WHERE repository.repo_id = ?
-                    """,
-                    (authorized.authorization_uid, effective_repo_id),
+                    "SELECT generation FROM repositories WHERE repo_id = ?",
+                    (effective_repo_id,),
                 ).fetchone()
                 if effective is None:
                     raise BrokerError(
-                        "repository_bootstrap_failed",
-                        "Repository bootstrap did not produce a current enrollment.",
+                        "repository_registration_failed",
+                        "Repository registration did not produce a current catalog entry.",
                         operation_id=request.operation_id,
                     )
                 repository_document = {
                     "canonical_root": context.effective.canonical_root,
                     "repo_id": effective_repo_id,
                     "generation": int(effective["generation"]),
-                    "owner_uid": int(effective["owner_uid"]),
-                    "execution_uid": int(effective["owner_uid"]),
-                    "filesystem_owner_uid": int(
-                        context.effective.root_owner_uid
-                    ),
+                    "execution_uid": execution_uid,
                     "servers": {},
                     "containers": {},
                     "compose_definition_id": None,
                     "compose_container_ids": [],
                     "compose_run_once_services": {},
                     "ephemeral_templates": {},
-                    "ephemeral_image_prefetch_templates": [],
                     "ephemeral_secret_policies": {},
-                    "account_id": request.account_id,
-                    "enabled": True,
-                    "issued_at": str(effective["issued_at"]),
-                    "valid_until_epoch": int(effective["valid_until_epoch"]),
                 }
                 result = {
-                    "schema_version": 1,
+                    "schema_version": 2,
                     "ok": True,
                     "operation_id": request.operation_id,
                     "changed": changed,
                     "repository": repository_document,
                 }
-                _finish_operation(
-                    connection, request.operation_id, result=result
+        if reconcile_repository is not None:
+            reconciliation = reconcile_repository(
+                effective_repo_id, context.effective.canonical_root, execution_uid
+            )
+            if not isinstance(reconciliation, Mapping):
+                raise RuntimeError("repository reconciliation did not return a mapping")
+            repository_document["compose_definition_id"] = reconciliation.get(
+                "compose_definition_id"
+            )
+            servers = reconciliation.get("servers", {})
+            if not isinstance(servers, Mapping):
+                raise RuntimeError(
+                    "repository reconciliation returned invalid persistent services"
                 )
-                return result
+            repository_document["servers"] = dict(servers)
+            run_once_services = reconciliation.get("compose_run_once_services", {})
+            if not isinstance(run_once_services, Mapping):
+                raise RuntimeError(
+                    "repository reconciliation returned invalid run-once services"
+                )
+            repository_document["compose_run_once_services"] = dict(run_once_services)
+            reconcile_changed = reconciliation.get("changed", False)
+            if type(reconcile_changed) is not bool:
+                raise RuntimeError(
+                    "repository reconciliation returned an invalid change outcome"
+                )
+            result["changed"] = bool(result["changed"] or reconcile_changed)
+        self.finish_operation(request.operation_id, result=result)
+        return result
 
-    def resolve_repository_enrollment(
-        self, authorized: AuthorizedBrokerRequest
+    def resolve_repository_catalog_entry(
+        self, accepted: AcceptedBrokerRequest
     ) -> dict[str, Any]:
-        """Read one prior first-use enrollment through an existing anchor."""
+        """Resolve one prior repository registration through a host anchor."""
 
-        request = authorized.request
+        request = accepted.request
         if request.operation is not BrokerOperation.REPOSITORY_RESOLVE:
             raise ValueError("request is not a repository resolve")
         canonical_root = str(request.arguments["canonical_root"])
         with self._store() as store:
             with store.read_transaction() as connection:
-                _authorize_connection(
-                    connection, peer=authorized.peer, request=request
+                _validate_connection_request(
+                    connection, peer=accepted.peer, request=request
                 )
                 anchor = connection.execute(
                     "SELECT host_id FROM repositories WHERE repo_id = ?",
@@ -1705,124 +1481,48 @@ class BrokerPersistence:
                 ).fetchone()
                 if anchor is None:
                     raise BrokerError(
-                        "project_access_denied",
-                        "Repository resolution lost its enrolled transport anchor.",
+                        "repository_target_unavailable",
+                        "Repository resolution lost its host routing anchor.",
                         operation_id=request.operation_id,
                     )
                 row = connection.execute(
                     """
                     SELECT repository.repo_id, repository.state,
                            repository.generation, installation.status,
-                           installation.startup_fenced, owner.owner_uid,
-                           owner.repository_generation
+                           installation.startup_fenced
                     FROM repositories AS repository
-                    LEFT JOIN repository_installations AS installation
-                      USING(repo_id)
-                    LEFT JOIN repository_owners AS owner USING(repo_id)
-                    WHERE repository.host_id = ?
-                      AND repository.canonical_root = ?
+                    LEFT JOIN repository_installations AS installation USING(repo_id)
+                    WHERE repository.host_id = ? AND repository.canonical_root = ?
                     """,
-                    (
-                        str(anchor["host_id"]),
-                        canonical_root,
-                    ),
+                    (str(anchor["host_id"]), canonical_root),
                 ).fetchone()
                 if row is None:
                     return {
-                        "schema_version": 1,
+                        "schema_version": 2,
                         "ok": True,
-                        "state": "unenrolled",
+                        "state": "unregistered",
                         "repository": None,
                     }
-                generation_revoked = connection.execute(
+                revoked = connection.execute(
                     """
                     SELECT 1 FROM broker_repository_revocations
                     WHERE repo_id = ? AND repository_generation = ?
                     """,
                     (str(row["repo_id"]), int(row["generation"])),
                 ).fetchone()
-                # Local accounts are routing/attribution identities on this
-                # single-developer host, not mutually distrusting principals.
-                # Prefer an exact-account route when one exists.  If the
-                # protected reader has never been enrolled for this newer
-                # repository, reuse another enabled local route without
-                # changing the physical peer UID. If matching account rows
-                # exist but none has an enabled principal and enrollment, that
-                # account-level block cannot silently fall through to another
-                # account. Enabled rows within one account are a policy union;
-                # disabling one UID row is not an account-wide veto while
-                # another matching row remains enabled. Enrollment expiry is
-                # retained evidence, not a local authorization boundary.
-                exact_enrollments = list(
-                    connection.execute(
-                        """
-                        SELECT enrollment.account_id, enrollment.enabled,
-                               enrollment.issued_at,
-                               enrollment.valid_until_epoch,
-                               principal.enabled AS principal_enabled
-                        FROM broker_repository_enrollments AS enrollment
-                        LEFT JOIN broker_acl_principals AS principal
-                          ON principal.uid = enrollment.uid
-                         AND principal.account_id = enrollment.account_id
-                        WHERE enrollment.repo_id = ?
-                          AND enrollment.account_id = ?
-                        ORDER BY enrollment.enabled DESC,
-                                 principal.enabled DESC,
-                                 enrollment.valid_until_epoch DESC,
-                                 enrollment.uid
-                        """,
-                        (str(row["repo_id"]), request.account_id),
-                    )
-                )
-                routing_enrollment = next(
-                    (
-                        enrollment
-                        for enrollment in exact_enrollments
-                        if bool(enrollment["enabled"])
-                        and bool(enrollment["principal_enabled"])
-                    ),
-                    None,
-                )
-                if not exact_enrollments:
-                    routing_enrollment = connection.execute(
-                        """
-                        SELECT enrollment.account_id, enrollment.enabled,
-                               enrollment.issued_at,
-                               enrollment.valid_until_epoch,
-                               principal.enabled AS principal_enabled
-                        FROM broker_repository_enrollments AS enrollment
-                        JOIN broker_acl_principals AS principal
-                          ON principal.uid = enrollment.uid
-                         AND principal.account_id = enrollment.account_id
-                        WHERE enrollment.repo_id = ?
-                          AND enrollment.enabled = 1
-                          AND principal.enabled = 1
-                        ORDER BY enrollment.valid_until_epoch DESC,
-                                 enrollment.account_id,
-                                 enrollment.uid
-                        LIMIT 1
-                        """,
-                        (str(row["repo_id"]),),
-                    ).fetchone()
                 current = (
                     str(row["state"]) == "active"
                     and str(row["status"] or "") == "installed"
                     and not bool(row["startup_fenced"])
-                    and row["owner_uid"] is not None
-                    and row["repository_generation"] is not None
-                    and int(row["repository_generation"])
-                    == int(row["generation"])
-                    and routing_enrollment is not None
-                    and generation_revoked is None
+                    and revoked is None
                 )
                 if not current:
                     return {
-                        "schema_version": 1,
+                        "schema_version": 2,
                         "ok": True,
                         "state": "blocked",
                         "repository": None,
                     }
-                assert routing_enrollment is not None
                 server_rows = list(
                     connection.execute(
                         """
@@ -1830,10 +1530,9 @@ class BrokerPersistence:
                         FROM server_definitions AS definition
                         WHERE definition.repo_id = ?
                           AND NOT EXISTS (
-                              SELECT 1 FROM broker_server_revocations AS revoked
-                              WHERE revoked.repo_id = definition.repo_id
-                                AND revoked.server_definition_id =
-                                    definition.server_definition_id
+                              SELECT 1 FROM broker_server_revocations AS revoked_server
+                              WHERE revoked_server.repo_id = definition.repo_id
+                                AND revoked_server.server_definition_id = definition.server_definition_id
                           )
                         ORDER BY definition.updated_at DESC,
                                  definition.server_definition_id DESC
@@ -1842,58 +1541,52 @@ class BrokerPersistence:
                         (str(row["repo_id"]),),
                     )
                 )
-                repository_document = {
-                    "canonical_root": canonical_root,
-                    "repo_id": str(row["repo_id"]),
-                    "generation": int(row["generation"]),
-                    "owner_uid": int(row["owner_uid"]),
-                    "servers": {
-                        str(server["name"]): str(
-                            server["server_definition_id"]
-                        )
-                        for server in reversed(server_rows)
-                    },
-                    "containers": {},
-                    "compose_definition_id": None,
-                    "compose_container_ids": [],
-                    "compose_run_once_services": {},
-                    "ephemeral_templates": {},
-                    "ephemeral_image_prefetch_templates": [],
-                    "ephemeral_secret_policies": {},
-                    "account_id": str(routing_enrollment["account_id"]),
-                    "enabled": True,
-                    "issued_at": str(routing_enrollment["issued_at"]),
-                    "valid_until_epoch": int(
-                        routing_enrollment["valid_until_epoch"]
-                    ),
-                }
+                compose_definition_id, compose_run_once_services = (
+                    _repository_compose_profile_connection(
+                        connection, repo_id=str(row["repo_id"])
+                    )
+                )
                 return {
-                    "schema_version": 1,
+                    "schema_version": 2,
                     "ok": True,
-                    "state": "enrolled",
-                    "repository": repository_document,
+                    "state": "available",
+                    "repository": {
+                        "canonical_root": canonical_root,
+                        "repo_id": str(row["repo_id"]),
+                        "generation": int(row["generation"]),
+                        "execution_uid": int(accepted.attribution_uid),
+                        "servers": {
+                            str(server["name"]): str(server["server_definition_id"])
+                            for server in reversed(server_rows)
+                        },
+                        "containers": {},
+                        "compose_definition_id": compose_definition_id,
+                        "compose_container_ids": [],
+                        "compose_run_once_services": compose_run_once_services,
+                        "ephemeral_templates": {},
+                        "ephemeral_secret_policies": {},
+                    },
                 }
 
-    def authorize_test_admission_admin(
+    def accept_test_admission_admin(
         self, peer: PeerCredentials, request: BrokerRequest
-    ) -> AuthorizedBrokerRequest:
-        """Authorize only the local authority identity for cutover fencing."""
+    ) -> AcceptedBrokerRequest:
+        """Validate the fixed test-admission target namespace."""
 
         if request.operation not in TEST_ADMISSION_ADMIN_OPERATIONS:
             raise BrokerError(
-                "operation_access_denied",
+                "operation_unavailable",
                 "This request is not a test-admission administration operation.",
                 operation_id=request.operation_id,
             )
         if (
-            request.account_id != "devcoordinator-authority"
-            or request.project_id != "authority"
+            request.project_id != "authority"
             or request.resource_id != "test-admission"
             or request.repository_generation != 0
         ):
             raise BrokerError(
-                "peer_not_authorized",
-                "Test admission migration controls require the exact typed authority namespace.",
+                "resource_identity_mismatch",
+                "Test admission migration controls require the exact typed target namespace.",
                 operation_id=request.operation_id,
             )
         with self._store() as store:
@@ -1904,10 +1597,10 @@ class BrokerPersistence:
         if generation is None or str(generation[0]) != request.authority_generation:
             raise BrokerError(
                 "broker_generation_mismatch",
-                "The migration request belongs to another authority database generation.",
+                "The migration request belongs to another database generation.",
                 operation_id=request.operation_id,
             )
-        return AuthorizedBrokerRequest(peer=peer, request=request)
+        return AcceptedBrokerRequest(peer=peer, request=request)
 
     def active_test_admission_proof(self) -> Mapping[str, object] | None:
         with self._store() as store:
@@ -1943,19 +1636,19 @@ class BrokerPersistence:
                     proof_sha256=proof_sha256,
                 )
 
-    def reauthorize_test_repository(
+    def retarget_test_repository(
         self,
-        authorized: AuthorizedBrokerRequest,
+        accepted: AcceptedBrokerRequest,
         *,
         repo_id: str,
-    ) -> AuthorizedBrokerRequest:
-        """Resolve an opaque test handle to its repo, then reauthorize exactly.
+    ) -> AcceptedBrokerRequest:
+        """Resolve an opaque test handle to its exact repository target.
 
         The original request project is only a host-test-namespace anchor for
         commands whose public contract contains a plan/run id but no path.
         This method preserves the caller attribution and binds the same exact
-        account, operation and operation id to the resolved immutable
-        repository before any read or mutation crosses into testd.
+        operation and operation id to the resolved immutable repository before
+        any read or mutation crosses into testd.
         """
 
         _require_identifier(repo_id, "project_id")
@@ -1970,11 +1663,11 @@ class BrokerPersistence:
                 ).fetchone()
         if repository is None or generation is None:
             raise BrokerError(
-                "project_access_denied",
-                "The resolved test repository is not provisioned in this authority.",
-                operation_id=authorized.request.operation_id,
+                "repository_unavailable",
+                "The resolved test repository is not present in the local catalog.",
+                operation_id=accepted.request.operation_id,
             )
-        request = authorized.request
+        request = accepted.request
         exact = BrokerRequest.create(
             operation_id=request.operation_id,
             authority_generation=str(generation[0]),
@@ -1985,12 +1678,12 @@ class BrokerPersistence:
             operation=request.operation,
             arguments=request.arguments,
         )
-        return self.authorize(authorized.peer, exact)
+        return self.accept(accepted.peer, exact)
 
     def current_test_repositories(
-        self, authorized: AuthorizedBrokerRequest
+        self, accepted: AcceptedBrokerRequest
     ) -> tuple[dict[str, object], ...]:
-        """Return active test enrollments for the request's configured account.
+        """Return every active repository in the server-wide test catalog.
 
         This authority read supplies only immutable IDs and display metadata.
         Test setup state and telemetry remain owned by testd's separate store.
@@ -2002,30 +1695,24 @@ class BrokerPersistence:
                     dict(row)
                     for row in connection.execute(
                         """
-                        SELECT DISTINCT repository.repo_id, repository.canonical_root,
+                        SELECT repository.repo_id, repository.canonical_root,
                                repository.display_name, repository.generation
-                        FROM broker_repository_enrollments AS enrollment
-                        JOIN broker_acl_principals AS principal
-                          ON principal.uid = enrollment.uid
-                         AND principal.account_id = enrollment.account_id
-                        JOIN repositories AS repository
-                          ON repository.repo_id = enrollment.repo_id
-                        WHERE enrollment.account_id = ?
-                          AND enrollment.enabled = 1
-                          AND principal.enabled = 1
-                          AND repository.state = 'active'
+                        FROM repositories AS repository
+                        JOIN repository_installations AS installation USING(repo_id)
+                        WHERE repository.state = 'active'
+                          AND installation.status = 'installed'
+                          AND installation.startup_fenced = 0
                         ORDER BY lower(repository.display_name),
                                  repository.repo_id
                         LIMIT 501
                         """,
-                        (authorized.request.account_id,),
                     )
                 ]
         if len(rows) > 500:
             raise BrokerError(
                 "test_repository_catalog_too_large",
                 "The authenticated test repository catalog exceeds its safe bound.",
-                operation_id=authorized.request.operation_id,
+                operation_id=accepted.request.operation_id,
             )
         return tuple(rows)
 
@@ -2046,171 +1733,18 @@ class BrokerPersistence:
         return str(row["database_generation"])
 
     def initialize(self) -> None:
+        """Install the trusted-local broker schema and erase legacy ACL state."""
+
         with self._store() as store:
             with store.immediate_transaction(
                 max_seconds=BROKER_INITIALIZATION_MAX_SECONDS,
                 revision_kind=None,
                 check_invariants=False,
             ) as connection:
+                _migrate_trusted_local_broker_schema(connection)
                 for statement in BROKER_SCHEMA.split(";"):
                     if statement.strip():
                         connection.execute(statement)
-                ephemeral_acl_row = connection.execute(
-                    "SELECT sql FROM sqlite_master "
-                    "WHERE type = 'table' AND name = 'broker_ephemeral_acl'"
-                ).fetchone()
-                ephemeral_acl_sql = str(
-                    ephemeral_acl_row[0] if ephemeral_acl_row else ""
-                )
-                if (
-                    "ephemeral.secret_fd" not in ephemeral_acl_sql
-                    or "ephemeral.image_status" not in ephemeral_acl_sql
-                    or "ephemeral.image_prefetch" not in ephemeral_acl_sql
-                ):
-                    connection.execute(
-                        "ALTER TABLE broker_ephemeral_acl "
-                        "RENAME TO broker_ephemeral_acl_pre_image_cache"
-                    )
-                    connection.execute(
-                        """
-                        CREATE TABLE broker_ephemeral_acl (
-                            uid INTEGER NOT NULL REFERENCES broker_acl_principals(uid) ON DELETE CASCADE,
-                            repo_id TEXT NOT NULL REFERENCES repositories(repo_id) ON DELETE CASCADE,
-                            template_id TEXT NOT NULL
-                                REFERENCES ephemeral_container_templates(template_id) ON DELETE CASCADE,
-                            operation TEXT NOT NULL CHECK(operation IN (
-                                'ephemeral.start', 'ephemeral.status', 'ephemeral.image_status',
-                                'ephemeral.image_prefetch', 'ephemeral.renew', 'ephemeral.finish',
-                                'ephemeral.secret_fd'
-                            )),
-                            enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0, 1)),
-                            updated_at TEXT NOT NULL,
-                            PRIMARY KEY(uid, repo_id, template_id, operation)
-                        )
-                        """
-                    )
-                    connection.execute(
-                        """
-                        INSERT INTO broker_ephemeral_acl(
-                            uid, repo_id, template_id, operation, enabled, updated_at
-                        )
-                        SELECT uid, repo_id, template_id, operation, enabled, updated_at
-                        FROM broker_ephemeral_acl_pre_image_cache
-                        WHERE operation IN (
-                            'ephemeral.start', 'ephemeral.status',
-                            'ephemeral.renew', 'ephemeral.finish', 'ephemeral.secret_fd'
-                        )
-                        """
-                    )
-                    connection.execute("DROP TABLE broker_ephemeral_acl_pre_image_cache")
-                    connection.execute(
-                        "CREATE INDEX IF NOT EXISTS broker_ephemeral_acl_lookup "
-                        "ON broker_ephemeral_acl(repo_id, template_id, operation, enabled)"
-                    )
-
-                runtime_acl_row = connection.execute(
-                    "SELECT sql FROM sqlite_master "
-                    "WHERE type = 'table' AND name = 'broker_runtime_acl'"
-                ).fetchone()
-                runtime_acl_sql = str(runtime_acl_row[0] if runtime_acl_row else "")
-                if "'replace'" not in runtime_acl_sql:
-                    connection.execute(
-                        "ALTER TABLE broker_runtime_acl RENAME TO broker_runtime_acl_v1"
-                    )
-                    connection.execute(
-                        """
-                        CREATE TABLE broker_runtime_acl (
-                            uid INTEGER NOT NULL REFERENCES broker_acl_principals(uid) ON DELETE CASCADE,
-                            repo_id TEXT NOT NULL REFERENCES repositories(repo_id) ON DELETE CASCADE,
-                            resource_kind TEXT NOT NULL
-                                CHECK(resource_kind IN ('service', 'docker', 'database_stack')),
-                            resource_id TEXT NOT NULL,
-                            action TEXT NOT NULL CHECK(action IN (
-                                'status', 'start', 'stop', 'restart', 'replace'
-                            )),
-                            enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0, 1)),
-                            updated_at TEXT NOT NULL,
-                            PRIMARY KEY(uid, repo_id, resource_kind, resource_id, action)
-                        )
-                        """
-                    )
-                    connection.execute(
-                        """
-                        INSERT INTO broker_runtime_acl(
-                            uid, repo_id, resource_kind, resource_id,
-                            action, enabled, updated_at
-                        )
-                        SELECT uid, repo_id, resource_kind, resource_id,
-                               action, enabled, updated_at
-                        FROM broker_runtime_acl_v1
-                        """
-                    )
-                    connection.execute("DROP TABLE broker_runtime_acl_v1")
-                    connection.execute(
-                        """
-                        CREATE INDEX IF NOT EXISTS broker_runtime_acl_by_resource
-                        ON broker_runtime_acl(
-                            repo_id, resource_kind, resource_id, action, enabled
-                        )
-                        """
-                    )
-                cleanup_acl_sql = str(
-                    connection.execute(
-                        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'broker_cleanup_resource_acl'"
-                    ).fetchone()[0]
-                )
-                if "cleanup.plan" not in cleanup_acl_sql:
-                    connection.execute(
-                        "ALTER TABLE broker_cleanup_resource_acl RENAME TO broker_cleanup_resource_acl_v1"
-                    )
-                    connection.execute(
-                        """
-                        CREATE TABLE broker_cleanup_resource_acl (
-                            uid INTEGER NOT NULL REFERENCES broker_acl_principals(uid) ON DELETE CASCADE,
-                            repo_id TEXT NOT NULL REFERENCES repositories(repo_id) ON DELETE CASCADE,
-                            resource_kind TEXT NOT NULL CHECK(resource_kind IN ('server', 'container', 'supervisor')),
-                            resource_id TEXT NOT NULL,
-                            control_binding_id TEXT NOT NULL REFERENCES control_bindings(binding_id) ON DELETE CASCADE,
-                            immutable_fingerprint TEXT NOT NULL,
-                            ownership_fingerprint TEXT NOT NULL,
-                            operation TEXT NOT NULL CHECK(operation IN (
-                                'resource.plan_archive', 'resource.archive', 'resource.restore',
-                                'cleanup.plan', 'cleanup.apply'
-                            )),
-                            enabled INTEGER NOT NULL DEFAULT 0 CHECK(enabled IN (0, 1)),
-                            updated_at TEXT NOT NULL,
-                            PRIMARY KEY(uid, repo_id, resource_kind, resource_id, control_binding_id, operation)
-                        )
-                        """
-                    )
-                    connection.execute(
-                        """
-                        INSERT INTO broker_cleanup_resource_acl(
-                            uid, repo_id, resource_kind, resource_id,
-                            control_binding_id, immutable_fingerprint,
-                            ownership_fingerprint, operation, enabled, updated_at
-                        )
-                        SELECT uid, repo_id, resource_kind, resource_id,
-                               control_binding_id, immutable_fingerprint,
-                               ownership_fingerprint, operation, enabled, updated_at
-                        FROM broker_cleanup_resource_acl_v1
-                        """
-                    )
-                    connection.execute("DROP TABLE broker_cleanup_resource_acl_v1")
-                # Existing server-wide enrollments predate the explicit host
-                # observation mutation grant. Preserve exact enabled grants;
-                # INSERT OR IGNORE also preserves a later operator revocation.
-                connection.execute(
-                    """
-                    INSERT OR IGNORE INTO broker_host_observation_acl(
-                        uid, repo_id, enabled, updated_at
-                    )
-                    SELECT a.uid, a.repo_id, 1, a.updated_at
-                    FROM broker_repository_read_acl a
-                    WHERE a.operation = 'repository.list_removed'
-                      AND a.enabled = 1
-                    """
-                )
 
                 effective_columns = {
                     str(row["name"])
@@ -2218,165 +1752,39 @@ class BrokerPersistence:
                         "PRAGMA table_info(broker_compose_effective_model_evidence)"
                     )
                 }
-                if "service_replicas_json" not in effective_columns:
-                    connection.execute(
-                        "ALTER TABLE broker_compose_effective_model_evidence "
-                        "ADD COLUMN service_replicas_json TEXT NOT NULL DEFAULT '{}'"
-                    )
-                if "model_services_json" not in effective_columns:
-                    connection.execute(
-                        "ALTER TABLE broker_compose_effective_model_evidence "
-                        "ADD COLUMN model_services_json TEXT NOT NULL DEFAULT '[]'"
-                    )
-                    connection.execute(
-                        "UPDATE broker_compose_effective_model_evidence "
-                        "SET model_services_json = services_json"
-                    )
-                if "model_service_replicas_json" not in effective_columns:
-                    connection.execute(
-                        "ALTER TABLE broker_compose_effective_model_evidence "
-                        "ADD COLUMN model_service_replicas_json TEXT NOT NULL DEFAULT '{}'"
-                    )
-                    connection.execute(
-                        "UPDATE broker_compose_effective_model_evidence "
-                        "SET model_service_replicas_json = service_replicas_json"
-                    )
-                if "service_images_json" not in effective_columns:
-                    connection.execute(
-                        "ALTER TABLE broker_compose_effective_model_evidence "
-                        "ADD COLUMN service_images_json TEXT NOT NULL DEFAULT '{}'"
-                    )
-                run_once_attempt_columns = {
+                compose_column_defaults = {
+                    "service_replicas_json": "{}",
+                    "model_services_json": "[]",
+                    "model_service_replicas_json": "{}",
+                    "service_images_json": "{}",
+                }
+                for column, default in compose_column_defaults.items():
+                    if column not in effective_columns:
+                        connection.execute(
+                            f"ALTER TABLE broker_compose_effective_model_evidence "
+                            f"ADD COLUMN {column} TEXT NOT NULL DEFAULT '{default}'"
+                        )
+                run_once_columns = {
                     str(row["name"])
                     for row in connection.execute(
                         "PRAGMA table_info(broker_compose_run_once_attempts)"
                     )
                 }
-                if (
-                    run_once_attempt_columns
-                    and "receipt_error_code" not in run_once_attempt_columns
-                ):
+                if run_once_columns and "receipt_error_code" not in run_once_columns:
                     connection.execute(
                         "ALTER TABLE broker_compose_run_once_attempts "
                         "ADD COLUMN receipt_error_code TEXT"
                     )
-                worker_operation_columns = {
+                worker_columns = {
                     str(row["name"])
                     for row in connection.execute(
                         "PRAGMA table_info(broker_worker_operation_requests)"
                     )
                 }
-                if "prepared_json" not in worker_operation_columns:
+                if "prepared_json" not in worker_columns:
                     connection.execute(
                         "ALTER TABLE broker_worker_operation_requests "
                         "ADD COLUMN prepared_json TEXT"
-                    )
-                _backfill_exact_worker_acl(
-                    connection,
-                    now_epoch=int(time.time()),
-                    updated_at=utc_timestamp(),
-                )
-                _backfill_worker_replace_acl(
-                    connection,
-                    now_epoch=int(time.time()),
-                    updated_at=utc_timestamp(),
-                )
-                compose_acl_row = connection.execute(
-                    "SELECT sql FROM sqlite_master "
-                    "WHERE type = 'table' AND name = 'broker_compose_acl'"
-                ).fetchone()
-                compose_acl_sql = str(compose_acl_row[0] if compose_acl_row else "")
-                if (
-                    "compose.stop" not in compose_acl_sql
-                    or "compose.restart" not in compose_acl_sql
-                ):
-                    connection.execute(
-                        "ALTER TABLE broker_compose_acl RENAME TO broker_compose_acl_v1"
-                    )
-                    connection.execute(
-                        """
-                        CREATE TABLE broker_compose_acl (
-                            uid INTEGER NOT NULL REFERENCES broker_acl_principals(uid) ON DELETE CASCADE,
-                            repo_id TEXT NOT NULL REFERENCES repositories(repo_id) ON DELETE CASCADE,
-                            compose_definition_id TEXT NOT NULL
-                                REFERENCES broker_compose_definitions(compose_definition_id) ON DELETE CASCADE,
-                            operation TEXT NOT NULL CHECK(operation IN (
-                                'compose.up', 'compose.stop', 'compose.restart', 'compose.down'
-                            )),
-                            enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0, 1)),
-                            updated_at TEXT NOT NULL,
-                            PRIMARY KEY(uid, repo_id, compose_definition_id, operation)
-                        )
-                        """
-                    )
-                    connection.execute(
-                        """
-                        INSERT INTO broker_compose_acl(
-                            uid, repo_id, compose_definition_id,
-                            operation, enabled, updated_at
-                        )
-                        SELECT uid, repo_id, compose_definition_id,
-                               operation, enabled, updated_at
-                        FROM broker_compose_acl_v1
-                        WHERE operation IN (
-                            'compose.up', 'compose.stop',
-                            'compose.restart', 'compose.down'
-                        )
-                        """
-                    )
-                    connection.execute(
-                        """
-                        INSERT INTO broker_compose_acl(
-                            uid, repo_id, compose_definition_id,
-                            operation, enabled, updated_at
-                        )
-                        SELECT uid, repo_id, compose_definition_id,
-                               'compose.stop', enabled, updated_at
-                        FROM broker_compose_acl_v1
-                        WHERE operation = 'compose.down'
-                          AND NOT EXISTS (
-                              SELECT 1 FROM broker_compose_acl_v1 stop
-                              WHERE stop.uid = broker_compose_acl_v1.uid
-                                AND stop.repo_id = broker_compose_acl_v1.repo_id
-                                AND stop.compose_definition_id =
-                                    broker_compose_acl_v1.compose_definition_id
-                                AND stop.operation = 'compose.stop'
-                          )
-                        """
-                    )
-                    connection.execute(
-                        """
-                        INSERT INTO broker_compose_acl(
-                            uid, repo_id, compose_definition_id,
-                            operation, enabled, updated_at
-                        )
-                        SELECT up.uid, up.repo_id, up.compose_definition_id,
-                               'compose.restart',
-                               CASE WHEN up.enabled = 1 AND down.enabled = 1
-                                    THEN 1 ELSE 0 END,
-                               CASE WHEN up.updated_at > down.updated_at
-                                    THEN up.updated_at ELSE down.updated_at END
-                        FROM broker_compose_acl_v1 up
-                        JOIN broker_compose_acl_v1 down
-                          ON down.uid = up.uid
-                         AND down.repo_id = up.repo_id
-                         AND down.compose_definition_id = up.compose_definition_id
-                         AND down.operation = 'compose.down'
-                        WHERE up.operation = 'compose.up'
-                          AND NOT EXISTS (
-                              SELECT 1 FROM broker_compose_acl_v1 restart
-                              WHERE restart.uid = up.uid
-                                AND restart.repo_id = up.repo_id
-                                AND restart.compose_definition_id =
-                                    up.compose_definition_id
-                                AND restart.operation = 'compose.restart'
-                          )
-                        """
-                    )
-                    connection.execute("DROP TABLE broker_compose_acl_v1")
-                    connection.execute(
-                        "CREATE INDEX IF NOT EXISTS broker_compose_acl_lookup "
-                        "ON broker_compose_acl(repo_id, compose_definition_id, operation, enabled)"
                     )
                 _migrate_legacy_compose_definition_fingerprints(connection)
                 _disable_legacy_unscoped_compose_definitions(connection)
@@ -2404,210 +1812,6 @@ class BrokerPersistence:
                     "CREATE UNIQUE INDEX IF NOT EXISTS one_enabled_compose_project_name "
                     "ON broker_compose_definitions(project_name) WHERE enabled = 1"
                 )
-
-    def provision_principal(
-        self, *, uid: int, account_id: str, enabled: bool = True
-    ) -> None:
-        if type(uid) is not int or uid < 0:
-            raise ValueError("uid must be a non-negative integer")
-        _require_identifier(account_id, "account_id")
-        with self._store() as store:
-            with store.immediate_transaction() as connection:
-                existing = connection.execute(
-                    "SELECT account_id FROM broker_acl_principals WHERE uid = ?",
-                    (uid,),
-                ).fetchone()
-                if existing is not None and str(existing["account_id"]) != account_id:
-                    raise BrokerError(
-                        "principal_account_conflict",
-                        "This operating-system UID is already enrolled for a different account; transfer requires an explicit administrative decommission and reenrollment.",
-                    )
-                connection.execute(
-                    """
-                    INSERT INTO broker_acl_principals(uid, account_id, enabled, updated_at)
-                    VALUES (?, ?, ?, ?)
-                    ON CONFLICT(uid) DO UPDATE SET
-                        enabled = excluded.enabled,
-                        updated_at = excluded.updated_at
-                    """,
-                    (uid, account_id, int(enabled), utc_timestamp()),
-                )
-
-    def provision_repository_enrollment(
-        self,
-        *,
-        uid: int,
-        repo_id: str,
-        account_id: str,
-        issued_at: str,
-        valid_until_epoch: int,
-        enrollment_snapshot_id: str | None = None,
-        grant_snapshot_id: str | None = None,
-        enabled: bool = True,
-    ) -> None:
-        """Persist one UID/account's independently expiring repository authority."""
-
-        if type(uid) is not int or uid < 0:
-            raise ValueError("uid must be a non-negative integer")
-        _require_identifier(repo_id, "project_id")
-        _require_identifier(account_id, "account_id")
-        if not isinstance(issued_at, str) or not issued_at:
-            raise ValueError("issued_at must be a non-empty timestamp")
-        if type(valid_until_epoch) is not int or valid_until_epoch <= 0:
-            raise ValueError("valid_until_epoch must be a positive integer")
-        if (enrollment_snapshot_id is None) != (grant_snapshot_id is None):
-            raise ValueError(
-                "repository enrollment snapshot identifiers must both be present or both be absent"
-            )
-        for value, field in (
-            (enrollment_snapshot_id, "enrollment_snapshot_id"),
-            (grant_snapshot_id, "grant_snapshot_id"),
-        ):
-            if value is not None:
-                _require_identifier(value, field)
-        now = utc_timestamp()
-        with self._store() as store:
-            with store.immediate_transaction() as connection:
-                principal = connection.execute(
-                    "SELECT account_id FROM broker_acl_principals WHERE uid = ?",
-                    (uid,),
-                ).fetchone()
-                if principal is None:
-                    raise BrokerError(
-                        "peer_not_authorized",
-                        "The operating-system account must be provisioned before repository enrollment.",
-                    )
-                if str(principal["account_id"]) != account_id:
-                    raise BrokerError(
-                        "principal_account_conflict",
-                        "Repository enrollment cannot transfer a UID to a different account.",
-                    )
-                repository = connection.execute(
-                    "SELECT 1 FROM repositories WHERE repo_id = ?",
-                    (repo_id,),
-                ).fetchone()
-                if repository is None:
-                    raise BrokerError(
-                        "project_access_denied",
-                        "Repository enrollment targets an unknown project identity.",
-                    )
-                existing = connection.execute(
-                    """
-                    SELECT account_id
-                    FROM broker_repository_enrollments
-                    WHERE uid = ? AND repo_id = ?
-                    """,
-                    (uid, repo_id),
-                ).fetchone()
-                if existing is not None and str(existing["account_id"]) != account_id:
-                    raise BrokerError(
-                        "principal_account_conflict",
-                        "Existing repository authority belongs to a different account and cannot be transferred implicitly.",
-                    )
-                connection.execute(
-                    """
-                    INSERT INTO broker_repository_enrollments(
-                        uid, repo_id, account_id, enabled, issued_at,
-                        valid_until_epoch, enrollment_snapshot_id,
-                        grant_snapshot_id, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(uid, repo_id) DO UPDATE SET
-                        enabled = excluded.enabled,
-                        issued_at = excluded.issued_at,
-                        valid_until_epoch = excluded.valid_until_epoch,
-                        enrollment_snapshot_id = excluded.enrollment_snapshot_id,
-                        grant_snapshot_id = excluded.grant_snapshot_id,
-                        updated_at = excluded.updated_at
-                    """,
-                    (
-                        uid,
-                        repo_id,
-                        account_id,
-                        int(enabled),
-                        issued_at,
-                        valid_until_epoch,
-                        enrollment_snapshot_id,
-                        grant_snapshot_id,
-                        now,
-                    ),
-                )
-
-    def revoke_observation_derived_access(
-        self,
-        *,
-        uid: int,
-        repo_id: str,
-        containers: bool = False,
-        databases: bool = False,
-        lifecycle_resources: bool = False,
-        cleanup_resources: bool = False,
-    ) -> None:
-        """Disable stale observation-derived grants before exact reprovisioning."""
-
-        _require_identifier(repo_id, "project_id")
-        if not any(
-            (containers, databases, lifecycle_resources, cleanup_resources)
-        ):
-            return
-        now = utc_timestamp()
-        with self._store() as store:
-            with store.immediate_transaction() as connection:
-                _require_principal(connection, uid)
-                if containers:
-                    connection.execute(
-                        """
-                        UPDATE broker_resource_acl
-                        SET enabled = 0, updated_at = ?
-                        WHERE uid = ? AND repo_id = ?
-                          AND resource_kind = 'container'
-                        """,
-                        (now, uid, repo_id),
-                    )
-                    connection.execute(
-                        """
-                        UPDATE broker_runtime_acl
-                        SET enabled = 0, updated_at = ?
-                        WHERE uid = ? AND repo_id = ?
-                          AND resource_kind = 'docker'
-                        """,
-                        (now, uid, repo_id),
-                    )
-                if databases:
-                    connection.execute(
-                        """
-                        UPDATE broker_database_acl
-                        SET enabled = 0, updated_at = ?
-                        WHERE uid = ? AND repo_id = ?
-                        """,
-                        (now, uid, repo_id),
-                    )
-                    connection.execute(
-                        """
-                        UPDATE broker_runtime_acl
-                        SET enabled = 0, updated_at = ?
-                        WHERE uid = ? AND repo_id = ?
-                          AND resource_kind = 'database_stack'
-                        """,
-                        (now, uid, repo_id),
-                    )
-                if lifecycle_resources:
-                    connection.execute(
-                        """
-                        UPDATE broker_lifecycle_resource_acl
-                        SET enabled = 0, updated_at = ?
-                        WHERE uid = ? AND repo_id = ?
-                        """,
-                        (now, uid, repo_id),
-                    )
-                if cleanup_resources:
-                    connection.execute(
-                        """
-                        UPDATE broker_cleanup_resource_acl
-                        SET enabled = 0, updated_at = ?
-                        WHERE uid = ? AND repo_id = ?
-                        """,
-                        (now, uid, repo_id),
-                    )
 
     def provision_ephemeral_template(
         self,
@@ -2638,7 +1842,7 @@ class BrokerPersistence:
 
         The broker wire protocol never accepts these values.  Runs copy this
         definition into their write-ahead record before Docker is invoked, so
-        later reenrollment cannot change an in-flight recovery target.
+        later reconfiguration cannot change an in-flight recovery target.
         """
 
         _require_identifier(template_id, "template_id")
@@ -2770,8 +1974,8 @@ class BrokerPersistence:
                 ).fetchone()
                 if repository is None:
                     raise BrokerError(
-                        "project_access_denied",
-                        "Ephemeral template repository is not provisioned.",
+                        "repository_unavailable",
+                        "Ephemeral template repository is not present in the local catalog.",
                     )
                 previous_policy = connection.execute(
                     """
@@ -2867,15 +2071,6 @@ class BrokerPersistence:
                     )
                     connection.execute(
                         """
-                        UPDATE broker_ephemeral_acl
-                        SET enabled = 0, updated_at = ?
-                        WHERE repo_id = ? AND template_id = ?
-                          AND operation = 'ephemeral.secret_fd' AND enabled = 1
-                        """,
-                        (now, repo_id, template_id),
-                    )
-                    connection.execute(
-                        """
                         UPDATE ephemeral_container_runs
                         SET status = 'cleanup_pending', phase = 'secret_policy_revoked',
                             cleanup_requested = 1,
@@ -2953,21 +2148,6 @@ class BrokerPersistence:
                     )
                 connection.execute(
                     """
-                    UPDATE broker_ephemeral_acl
-                    SET enabled = 0, updated_at = ?
-                    WHERE repo_id = ? AND operation IN (
-                        'ephemeral.start', 'ephemeral.image_status',
-                        'ephemeral.image_prefetch', 'ephemeral.renew',
-                        'ephemeral.secret_fd'
-                    ) AND template_id IN (
-                        SELECT template_id FROM ephemeral_container_templates
-                        WHERE repo_id = ? AND enabled = 0
-                    )
-                    """,
-                    (now, repo_id, repo_id),
-                )
-                connection.execute(
-                    """
                     UPDATE ephemeral_container_runs
                     SET next_reconcile_at_epoch = 0,
                         generation = generation + 1, updated_at = ?
@@ -2980,97 +2160,15 @@ class BrokerPersistence:
                     (now, repo_id, repo_id),
                 )
 
-    def replace_ephemeral_access(
-        self,
-        *,
-        uid: int,
-        repo_id: str,
-        template_ids: Iterable[str],
-        prefetch_template_ids: Iterable[str] = (),
-    ) -> None:
-        _require_identifier(repo_id, "project_id")
-        normalized = tuple(dict.fromkeys(str(item) for item in template_ids))
-        for template_id in normalized:
-            _require_identifier(template_id, "template_id")
-        prefetch = tuple(
-            dict.fromkeys(str(item) for item in prefetch_template_ids)
-        )
-        for template_id in prefetch:
-            _require_identifier(template_id, "template_id")
-        if not set(prefetch) <= set(normalized):
-            raise ValueError(
-                "ephemeral image prefetch grants must be a subset of enrolled templates"
-            )
-        now = utc_timestamp()
-        with self._store() as store:
-            with store.immediate_transaction() as connection:
-                _require_principal(connection, uid)
-                connection.execute(
-                    "UPDATE broker_ephemeral_acl SET enabled = 0, updated_at = ? WHERE uid = ? AND repo_id = ?",
-                    (now, uid, repo_id),
-                )
-                for template_id in normalized:
-                    template = connection.execute(
-                        """
-                        SELECT enabled, secret_policy_kind
-                        FROM ephemeral_container_templates
-                        WHERE template_id = ? AND repo_id = ?
-                        """,
-                        (template_id, repo_id),
-                    ).fetchone()
-                    if template is None or not bool(template["enabled"]):
-                        raise BrokerError(
-                            "control_binding_unavailable",
-                            "Ephemeral access targets a disabled or unknown template.",
-                        )
-                    policy_kind = template["secret_policy_kind"]
-                    operations = _ephemeral_acl_operations_for_policy(
-                        None if policy_kind is None else str(policy_kind),
-                        allow_image_prefetch=template_id in prefetch,
-                    )
-                    for operation in operations:
-                        connection.execute(
-                            """
-                            INSERT INTO broker_ephemeral_acl(
-                                uid, repo_id, template_id, operation, enabled, updated_at
-                            ) VALUES (?, ?, ?, ?, 1, ?)
-                            ON CONFLICT(uid, repo_id, template_id, operation)
-                            DO UPDATE SET enabled = 1, updated_at = excluded.updated_at
-                            """,
-                            (uid, repo_id, template_id, operation.value, now),
-                        )
-                connection.execute(
-                    """
-                    UPDATE ephemeral_container_runs
-                    SET next_reconcile_at_epoch = 0,
-                        generation = generation + 1, updated_at = ?
-                    WHERE repo_id = ? AND owner_uid = ?
-                      AND status NOT IN ('cleaned', 'failed')
-                      AND NOT EXISTS (
-                          SELECT 1 FROM ephemeral_container_templates template
-                          JOIN broker_ephemeral_acl acl
-                            ON acl.template_id = template.template_id
-                           AND acl.repo_id = template.repo_id
-                          WHERE template.template_id = ephemeral_container_runs.template_id
-                            AND template.repo_id = ephemeral_container_runs.repo_id
-                            AND template.enabled = 1
-                            AND acl.uid = ephemeral_container_runs.owner_uid
-                            AND acl.operation = 'ephemeral.start'
-                            AND acl.enabled = 1
-                      )
-                    """,
-                    (now, repo_id, uid),
-                )
-
     def ephemeral_image_target(
         self,
-        authorized: AuthorizedBrokerRequest,
+        accepted: AcceptedBrokerRequest,
         *,
         require_reserved_operation: bool = False,
     ) -> EphemeralImageTarget:
         """Resolve only the current sealed image for one template-scoped request."""
 
-        request = authorized.request
+        request = accepted.request
         if request.operation not in {
             BrokerOperation.EPHEMERAL_START,
             BrokerOperation.EPHEMERAL_IMAGE_STATUS,
@@ -3079,8 +2177,8 @@ class BrokerPersistence:
             raise ValueError("request does not target an ephemeral template image")
         with self._store() as store:
             with store.read_transaction() as connection:
-                _authorize_connection(
-                    connection, peer=authorized.peer, request=request
+                _validate_connection_request(
+                    connection, peer=accepted.peer, request=request
                 )
                 return _ephemeral_image_target_for_request(
                     connection,
@@ -3090,7 +2188,7 @@ class BrokerPersistence:
 
     def complete_ephemeral_image_prefetch(
         self,
-        authorized: AuthorizedBrokerRequest,
+        accepted: AcceptedBrokerRequest,
         *,
         target: EphemeralImageTarget,
         proof: Mapping[str, Any],
@@ -3099,7 +2197,7 @@ class BrokerPersistence:
     ) -> dict[str, Any]:
         """Persist one exact, digest-proven image cache receipt."""
 
-        request = authorized.request
+        request = accepted.request
         if request.operation is not BrokerOperation.EPHEMERAL_IMAGE_PREFETCH:
             raise ValueError("request is not an ephemeral image prefetch")
         if cache_origin not in {"already_present", "pulled", "reconciled"}:
@@ -3108,8 +2206,8 @@ class BrokerPersistence:
             raise ValueError("ephemeral image cache changed must be boolean or null")
         with self._store() as store:
             with store.immediate_transaction() as connection:
-                _authorize_connection(
-                    connection, peer=authorized.peer, request=request
+                _validate_connection_request(
+                    connection, peer=accepted.peer, request=request
                 )
                 current = _ephemeral_image_target_for_request(
                     connection,
@@ -3162,43 +2260,43 @@ class BrokerPersistence:
 
     def ephemeral_secret_fd_target(
         self,
-        authorized: AuthorizedBrokerRequest,
+        accepted: AcceptedBrokerRequest,
         *,
         template_id: str,
         run_id: uuid.UUID,
     ) -> EphemeralSecretRunTarget:
-        """Authorize one descriptor retrieval against the exact running run.
+        """Accept one descriptor retrieval against the exact running run.
 
         This returns only policy and opaque binding metadata; the password is
         deliberately owned by the volatile runtime manager and never enters
         this database transaction or the wire result.
         """
 
-        request = authorized.request
+        request = accepted.request
         if request.operation is not BrokerOperation.EPHEMERAL_SECRET_FD:
             raise ValueError("request is not an ephemeral credential delivery")
         canonical_run_id = str(run_id)
         if request.resource_id != canonical_run_id:
             raise BrokerError(
-                "resource_access_denied",
+                "resource_unavailable",
                 "Credential delivery must target the exact ephemeral run identity.",
                 operation_id=request.operation_id,
             )
         _require_identifier(template_id, "template_id")
         with self._store() as store:
             with store.read_transaction() as connection:
-                row = _authorize_connection(
-                    connection, peer=authorized.peer, request=request
+                row = _validate_connection_request(
+                    connection, peer=accepted.peer, request=request
                 )
                 if row is None:
                     raise BrokerError(
-                        "resource_access_denied",
+                        "resource_unavailable",
                         "Credential delivery requires an exact running ephemeral run.",
                         operation_id=request.operation_id,
                     )
                 if str(row["template_id"]) != template_id:
                     raise BrokerError(
-                        "resource_access_denied",
+                        "resource_unavailable",
                         "Credential delivery template does not match the exact run.",
                         operation_id=request.operation_id,
                     )
@@ -3311,7 +2409,8 @@ class BrokerPersistence:
                 ).fetchone()
         if repo is None:
             raise BrokerError(
-                "project_access_denied", "Compose repository is not provisioned."
+                "repository_unavailable",
+                "Compose repository is not present in the local catalog.",
             )
         canonical_root = _canonical_existing_path(
             repo["canonical_root"], field="repository root", directory=True
@@ -3848,8 +2947,8 @@ class BrokerPersistence:
             },
         }
 
-    def enrolled_compose_definition_id(self, *, repo_id: str) -> str | None:
-        """Return the sole definition managed by repository enrollment."""
+    def configured_compose_definition_id(self, *, repo_id: str) -> str | None:
+        """Return the sole definition managed by repository configuration."""
 
         _require_identifier(repo_id, "project_id")
         with self._store() as store:
@@ -3870,12 +2969,12 @@ class BrokerPersistence:
         if len(enabled) > 1 or (not enabled and len(rows) > 1):
             raise BrokerError(
                 "compose_definition_conflict",
-                "Repository enrollment found multiple Compose definitions; reconcile them explicitly before reenrollment.",
+                "Repository configuration found multiple Compose definitions; reconcile them explicitly before reconfiguration.",
             )
         selected = enabled[0] if enabled else (rows[0] if rows else None)
         return None if selected is None else str(selected["compose_definition_id"])
 
-    def compose_enrollment_container_scope(
+    def compose_configuration_container_scope(
         self,
         *,
         repo_id: str,
@@ -3883,7 +2982,7 @@ class BrokerPersistence:
         project_name: str,
         service_names: Sequence[str],
         run_once_service_names: Sequence[str] = (),
-    ) -> ComposeEnrollmentContainerScope:
+    ) -> ComposeConfigurationContainerScope:
         """Resolve and validate one repository's complete Compose project scope.
 
         The protected client profile needs this exact subset so a whole-project
@@ -3894,7 +2993,7 @@ class BrokerPersistence:
         are all required.  An active, exclusively owned container in this same
         Compose project may not disappear merely because its service was omitted
         from the lifecycle declaration; that partial declaration is rejected
-        with a typed enrollment error.  Explicit run-once services remain
+        with a typed configuration error.  Explicit run-once services remain
         outside both lifecycle and standalone resource scopes.
         """
 
@@ -3955,7 +3054,7 @@ class BrokerPersistence:
                 if snapshot is None:
                     raise BrokerError(
                         "docker_observation_mismatch",
-                        "Compose-owned container projection requires the exact completed enrollment snapshot.",
+                        "Compose-owned container projection requires the exact completed configuration snapshot.",
                     )
                 rows = list(
                     connection.execute(
@@ -3964,10 +3063,10 @@ class BrokerPersistence:
                                observed.full_container_id,
                                observed.service_name,
                                observed.lifecycle,
-                               observed.ownership_state,
-                               observed.authoritative_owner_repo_id,
+                               observed.association_state,
+                               observed.associated_repo_id,
                                resource.full_container_id AS current_full_container_id,
-                               binding.authority_state
+                               resource.repo_id AS current_repo_id
                         FROM broker_observed_compose_containers observed
                         JOIN observation_snapshot_resources present
                           ON present.snapshot_id = observed.snapshot_id
@@ -3975,18 +3074,11 @@ class BrokerPersistence:
                          AND present.resource_id = observed.docker_resource_id
                         JOIN docker_resources resource
                           ON resource.docker_resource_id = observed.docker_resource_id
-                        LEFT JOIN repository_memberships membership
-                          ON membership.repo_id = ?
-                         AND membership.resource_kind = 'container'
-                         AND membership.host_resource_id = observed.docker_resource_id
-                        LEFT JOIN control_bindings binding
-                          ON binding.binding_id = membership.control_binding_id
                         WHERE observed.snapshot_id = ?
                           AND observed.project_name = ?
                         ORDER BY observed.docker_resource_id
                         """,
                         (
-                            repo_id,
                             snapshot_id,
                             normalized_project,
                         ),
@@ -4003,8 +3095,8 @@ class BrokerPersistence:
                 else str(row["service_name"])
             )
             exclusively_owned = (
-                str(row["ownership_state"]) == "exclusive"
-                and str(row["authoritative_owner_repo_id"] or "") == repo_id
+                str(row["association_state"]) == "exclusive"
+                and str(row["associated_repo_id"] or "") == repo_id
             )
             if service_name not in lifecycle_services:
                 if (
@@ -4020,30 +3112,30 @@ class BrokerPersistence:
                 continue
             if (
                 not exclusively_owned
-                or str(row["authority_state"] or "") != "authoritative"
+                or str(row["current_repo_id"] or "") != repo_id
                 or str(row["full_container_id"]).lower()
                 != str(row["current_full_container_id"]).lower()
             ):
                 raise BrokerError(
-                    "control_binding_unavailable",
+                    "resource_identity_unavailable",
                     "Compose-owned container identity changed before profile publication.",
                 )
             lifecycle_result.append(resource_id)
         if unexpected_active_services:
             raise BrokerError(
                 "compose_scope_incomplete",
-                "Compose enrollment omits active exclusively owned services from "
+                "Compose configuration omits active exclusively owned services from "
                 f"project {normalized_project!r}: "
                 + ", ".join(sorted(unexpected_active_services))
-                + ". Declare each service as lifecycle or explicit run-once before enrollment.",
+                + ". Declare each service as lifecycle or explicit run-once before configuration.",
             )
         all_result_ids = (*lifecycle_result, *non_lifecycle_result)
         if len(set(all_result_ids)) != len(all_result_ids):
             raise BrokerError(
-                "control_binding_unavailable",
-                "Compose-owned container identity is duplicated in enrollment evidence.",
+                "resource_identity_unavailable",
+                "Compose-owned container identity is duplicated in configuration evidence.",
             )
-        return ComposeEnrollmentContainerScope(
+        return ComposeConfigurationContainerScope(
             lifecycle_container_ids=tuple(sorted(lifecycle_result)),
             non_lifecycle_container_ids=tuple(sorted(non_lifecycle_result)),
         )
@@ -4059,159 +3151,13 @@ class BrokerPersistence:
     ) -> tuple[str, ...]:
         """Return the lifecycle-controlled subset of a validated Compose scope."""
 
-        return self.compose_enrollment_container_scope(
+        return self.compose_configuration_container_scope(
             repo_id=repo_id,
             snapshot_id=snapshot_id,
             project_name=project_name,
             service_names=service_names,
             run_once_service_names=run_once_service_names,
         ).lifecycle_container_ids
-
-    def replace_compose_access(
-        self,
-        *,
-        uid: int,
-        repo_id: str,
-        compose_definition_id: str,
-    ) -> None:
-        """Atomically replace one client's Compose authority for a repository."""
-
-        _require_identifier(repo_id, "project_id")
-        _require_identifier(compose_definition_id, "compose_definition_id")
-        now = utc_timestamp()
-        with self._store() as store:
-            with store.immediate_transaction() as connection:
-                _require_principal(connection, uid)
-                definition = connection.execute(
-                    """
-                    SELECT enabled FROM broker_compose_definitions
-                    WHERE compose_definition_id = ? AND repo_id = ?
-                    """,
-                    (compose_definition_id, repo_id),
-                ).fetchone()
-                if definition is None or not bool(definition["enabled"]):
-                    raise BrokerError(
-                        "compose_definition_invalid",
-                        "Replacement Compose definition is not enabled for this repository.",
-                    )
-                connection.execute(
-                    """
-                    UPDATE broker_compose_acl
-                    SET enabled = 0, updated_at = ?
-                    WHERE uid = ? AND repo_id = ?
-                      AND compose_definition_id != ?
-                    """,
-                    (now, uid, repo_id, compose_definition_id),
-                )
-                connection.executemany(
-                    """
-                    INSERT INTO broker_compose_acl(
-                        uid, repo_id, compose_definition_id, operation,
-                        enabled, updated_at
-                    ) VALUES (?, ?, ?, ?, 1, ?)
-                    ON CONFLICT(
-                        uid, repo_id, compose_definition_id, operation
-                    ) DO UPDATE SET enabled = 1, updated_at = excluded.updated_at
-                    """,
-                    (
-                        (
-                            uid,
-                            repo_id,
-                            compose_definition_id,
-                            operation.value,
-                            now,
-                        )
-                        for operation in (
-                            BrokerOperation.COMPOSE_UP,
-                            BrokerOperation.COMPOSE_STOP,
-                            BrokerOperation.COMPOSE_RESTART,
-                            BrokerOperation.COMPOSE_DOWN,
-                        )
-                    ),
-                )
-
-    def replace_compose_run_once_access(
-        self,
-        *,
-        uid: int,
-        repo_id: str,
-        compose_definition_id: str,
-        service_names: Iterable[str],
-    ) -> dict[str, int]:
-        """Replace one UID's exact per-service one-shot capability set."""
-
-        _require_identifier(repo_id, "project_id")
-        _require_identifier(compose_definition_id, "compose_definition_id")
-        if isinstance(service_names, (str, bytes)):
-            raise ValueError("service_names must be an exact service sequence")
-        normalized = tuple(
-            _require_compose_service_name(item) for item in service_names
-        )
-        if len(set(normalized)) != len(normalized):
-            raise ValueError("Compose run-once grants must not contain duplicates")
-        now = utc_timestamp()
-        with self._store() as store:
-            with store.immediate_transaction() as connection:
-                _require_principal(connection, uid)
-                definition = connection.execute(
-                    """
-                    SELECT enabled FROM broker_compose_definitions
-                    WHERE compose_definition_id = ? AND repo_id = ?
-                    """,
-                    (compose_definition_id, repo_id),
-                ).fetchone()
-                if definition is None or not bool(definition["enabled"]):
-                    raise BrokerError(
-                        "compose_definition_invalid",
-                        "Compose run-once grants require one enabled definition.",
-                    )
-                declared = {
-                    str(row["service_name"])
-                    for row in connection.execute(
-                        """
-                        SELECT service_name
-                        FROM broker_compose_run_once_services
-                        WHERE compose_definition_id = ?
-                        """,
-                        (compose_definition_id,),
-                    )
-                }
-                if not set(normalized) <= declared:
-                    raise BrokerError(
-                        "compose_run_once_policy_invalid",
-                        "Compose run-once grant references an undeclared service policy.",
-                    )
-                disabled = connection.execute(
-                    """
-                    UPDATE broker_compose_run_once_acl
-                    SET enabled = 0, updated_at = ?
-                    WHERE uid = ? AND repo_id = ?
-                    """,
-                    (now, uid, repo_id),
-                ).rowcount
-                connection.executemany(
-                    """
-                    INSERT INTO broker_compose_run_once_acl(
-                        uid, repo_id, compose_definition_id, service_name,
-                        enabled, updated_at
-                    ) VALUES (?, ?, ?, ?, 1, ?)
-                    ON CONFLICT(
-                        uid, repo_id, compose_definition_id, service_name
-                    ) DO UPDATE SET enabled = 1,
-                                    updated_at = excluded.updated_at
-                    """,
-                    (
-                        (
-                            uid,
-                            repo_id,
-                            compose_definition_id,
-                            service_name,
-                            now,
-                        )
-                        for service_name in normalized
-                    ),
-                )
-        return {"enabled": len(normalized), "disabled": disabled}
 
     def disable_repository_compose(self, *, repo_id: str) -> None:
         """Disable execution while deliberately retaining every name claim."""
@@ -4239,22 +3185,6 @@ class BrokerPersistence:
                 connection.execute(
                     """
                     UPDATE broker_compose_definitions
-                    SET enabled = 0, updated_at = ?
-                    WHERE repo_id = ?
-                    """,
-                    (now, repo_id),
-                )
-                connection.execute(
-                    """
-                    UPDATE broker_compose_acl
-                    SET enabled = 0, updated_at = ?
-                    WHERE repo_id = ?
-                    """,
-                    (now, repo_id),
-                )
-                connection.execute(
-                    """
-                    UPDATE broker_compose_run_once_acl
                     SET enabled = 0, updated_at = ?
                     WHERE repo_id = ?
                     """,
@@ -4405,22 +3335,6 @@ class BrokerPersistence:
                         "compose_project_name_release_conflict",
                         "Compose project-name claim changed during release.",
                     )
-                connection.execute(
-                    """
-                    UPDATE broker_compose_acl
-                    SET enabled = 0, updated_at = ?
-                    WHERE compose_definition_id = ? AND enabled = 1
-                    """,
-                    (now, compose_definition_id),
-                )
-                connection.execute(
-                    """
-                    UPDATE broker_compose_run_once_acl
-                    SET enabled = 0, updated_at = ?
-                    WHERE compose_definition_id = ? AND enabled = 1
-                    """,
-                    (now, compose_definition_id),
-                )
                 connection.execute(
                     """
                     INSERT INTO broker_compose_project_claim_history(
@@ -4620,710 +3534,6 @@ class BrokerPersistence:
                     )
                 return results
 
-    def grant_resource(
-        self,
-        *,
-        uid: int,
-        repo_id: str,
-        resource_kind: str,
-        resource_id: str,
-        operation: BrokerOperation,
-        enabled: bool = True,
-    ) -> None:
-        _require_identifier(repo_id, "project_id")
-        _require_identifier(resource_id, "resource_id")
-        if resource_kind not in {"server", "container", "compose"}:
-            raise ValueError("resource_kind must be server, container, or compose")
-        if operation in {
-            BrokerOperation.PORT_LEASE,
-            BrokerOperation.PORT_RELEASE,
-            BrokerOperation.PORT_ASSIGN,
-            BrokerOperation.PORT_UNASSIGN,
-        }:
-            expected_kind = "server"
-        elif operation in _COMPOSE_OPERATIONS:
-            expected_kind = "compose"
-        else:
-            expected_kind = "container"
-        if resource_kind != expected_kind:
-            raise ValueError("resource kind does not match broker operation")
-        with self._store() as store:
-            with store.immediate_transaction() as connection:
-                _require_principal(connection, uid)
-                _require_resource_membership(
-                    connection,
-                    repo_id=repo_id,
-                    resource_kind=resource_kind,
-                    resource_id=resource_id,
-                )
-                if operation in {
-                    BrokerOperation.PORT_ASSIGN,
-                    BrokerOperation.PORT_UNASSIGN,
-                }:
-                    connection.execute(
-                        """
-                        INSERT INTO broker_assignment_acl(
-                            uid, repo_id, server_definition_id, operation, enabled, updated_at
-                        ) VALUES (?, ?, ?, ?, ?, ?)
-                        ON CONFLICT(uid, repo_id, server_definition_id, operation)
-                        DO UPDATE SET enabled = excluded.enabled, updated_at = excluded.updated_at
-                        """,
-                        (
-                            uid,
-                            repo_id,
-                            resource_id,
-                            operation.value,
-                            int(enabled),
-                            utc_timestamp(),
-                        ),
-                    )
-
-                elif operation in _COMPOSE_OPERATIONS:
-                    connection.execute(
-                        """
-                        INSERT INTO broker_compose_acl(
-                            uid, repo_id, compose_definition_id, operation, enabled, updated_at
-                        ) VALUES (?, ?, ?, ?, ?, ?)
-                        ON CONFLICT(uid, repo_id, compose_definition_id, operation)
-                        DO UPDATE SET enabled = excluded.enabled, updated_at = excluded.updated_at
-                        """,
-                        (
-                            uid,
-                            repo_id,
-                            resource_id,
-                            operation.value,
-                            int(enabled),
-                            utc_timestamp(),
-                        ),
-                    )
-                else:
-                    connection.execute(
-                        """
-                        INSERT INTO broker_resource_acl(
-                            uid, repo_id, resource_kind, resource_id, operation, enabled, updated_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                        ON CONFLICT(uid, repo_id, resource_kind, resource_id, operation)
-                        DO UPDATE SET enabled = excluded.enabled, updated_at = excluded.updated_at
-                        """,
-                        (
-                            uid,
-                            repo_id,
-                            resource_kind,
-                            resource_id,
-                            operation.value,
-                            int(enabled),
-                            utc_timestamp(),
-                        ),
-                    )
-
-    def grant_runtime(
-        self,
-        *,
-        uid: int,
-        repo_id: str,
-        resource_kind: str,
-        resource_id: str,
-        action: str,
-        enabled: bool = True,
-    ) -> None:
-        """Grant one live-revalidated ID-only runtime action."""
-
-        _require_identifier(repo_id, "project_id")
-        _require_identifier(resource_id, "resource_id")
-        if resource_kind not in {"service", "docker", "database_stack"}:
-            raise ValueError(
-                "runtime resource_kind must be service, docker, or database_stack"
-            )
-        if action not in {"status", "start", "stop", "restart", "replace"}:
-            raise ValueError(
-                "runtime action must be status, start, stop, restart, or replace"
-            )
-        with self._store() as store:
-            with store.immediate_transaction() as connection:
-                _require_principal(connection, uid)
-                _require_runtime_resource_membership(
-                    connection,
-                    repo_id=repo_id,
-                    resource_kind=resource_kind,
-                    resource_id=resource_id,
-                )
-                connection.execute(
-                    """
-                    INSERT INTO broker_runtime_acl(
-                        uid, repo_id, resource_kind, resource_id,
-                        action, enabled, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(uid, repo_id, resource_kind, resource_id, action)
-                    DO UPDATE SET enabled = excluded.enabled,
-                                  updated_at = excluded.updated_at
-                    """,
-                    (
-                        uid,
-                        repo_id,
-                        resource_kind,
-                        resource_id,
-                        action,
-                        int(enabled),
-                        utc_timestamp(),
-                    ),
-                )
-
-    def grant_observation_derived_access_batch(
-        self,
-        *,
-        uid: int,
-        repo_id: str,
-        container_identity_grants: Iterable[
-            tuple[str, str, str, bool]
-        ] = (),
-        runtime_grants: Iterable[tuple[str, str, str]] = (),
-        resource_grants: Iterable[
-            tuple[str, str, BrokerOperation]
-        ] = (),
-        database_grants: Iterable[tuple[str, BrokerOperation]] = (),
-        lifecycle_resource_grants: Iterable[
-            tuple[str, str, str, str, str, BrokerOperation]
-        ] = (),
-        cleanup_resource_grants: Iterable[
-            tuple[str, str, str, str, str, BrokerOperation]
-        ] = (),
-    ) -> None:
-        """Atomically validate and publish one observation-derived ACL set.
-
-        Enrollment commits stale-grant revocation before calling this method.
-        Every desired current-state grant is then revalidated and inserted in
-        one bounded writer transaction, so a late invalid row rolls back the
-        complete replacement set instead of leaving partially enabled access.
-        """
-
-        _require_identifier(repo_id, "project_id")
-        container_identity_rows = _deduplicate_observation_grants(
-            container_identity_grants,
-            arity=4,
-            key_indexes=(1,),
-            label="container identity grant",
-        )
-        runtime_rows = _deduplicate_observation_grants(
-            runtime_grants,
-            arity=3,
-            key_indexes=(0, 1, 2),
-            label="runtime grant",
-        )
-        resource_rows = _deduplicate_observation_grants(
-            resource_grants,
-            arity=3,
-            key_indexes=(0, 1, 2),
-            label="resource grant",
-        )
-        database_rows = _deduplicate_observation_grants(
-            database_grants,
-            arity=2,
-            key_indexes=(0, 1),
-            label="database grant",
-        )
-        lifecycle_rows = _deduplicate_observation_grants(
-            lifecycle_resource_grants,
-            arity=6,
-            key_indexes=(0, 1, 2, 5),
-            label="lifecycle resource grant",
-        )
-        cleanup_rows = _deduplicate_observation_grants(
-            cleanup_resource_grants,
-            arity=6,
-            key_indexes=(0, 1, 2, 5),
-            label="cleanup resource grant",
-        )
-        if not any(
-            (
-                runtime_rows,
-                container_identity_rows,
-                resource_rows,
-                database_rows,
-                lifecycle_rows,
-                cleanup_rows,
-            )
-        ):
-            return
-
-        for snapshot_id, resource_id, full_container_id, compose_scoped in (
-            container_identity_rows
-        ):
-            _require_identifier(snapshot_id, "snapshot_id")
-            _require_identifier(resource_id, "resource_id")
-            if not re.fullmatch(r"[0-9a-f]{64}", full_container_id):
-                raise ValueError(
-                    "container identity grant requires a lowercase full container ID"
-                )
-            if type(compose_scoped) is not bool:
-                raise TypeError("container identity grant scope must be a boolean")
-
-        for resource_kind, resource_id, action in runtime_rows:
-            _require_identifier(resource_id, "resource_id")
-            if resource_kind not in {"docker", "database_stack"}:
-                raise ValueError(
-                    "observation-derived runtime resource_kind must be docker or database_stack"
-                )
-            if action not in {"status", "start", "stop", "restart"}:
-                raise ValueError(
-                    "observation-derived runtime action must be status, start, stop, or restart"
-                )
-        for resource_kind, resource_id, operation in resource_rows:
-            _require_identifier(resource_id, "resource_id")
-            if resource_kind != "container":
-                raise ValueError(
-                    "observation-derived resource_kind must be container"
-                )
-            if operation not in _DOCKER_OPERATIONS:
-                raise ValueError(
-                    "observation-derived resource operation must be a Docker lifecycle operation"
-                )
-        for database_binding_id, operation in database_rows:
-            _require_identifier(database_binding_id, "database_binding_id")
-            if operation not in _DATABASE_OPERATIONS:
-                raise ValueError("operation is not a broker database operation")
-        for rows, allowed_operations, label in (
-            (
-                lifecycle_rows,
-                frozenset(
-                    {
-                        BrokerOperation.RESOURCE_ATTACH,
-                        BrokerOperation.RESOURCE_PLAN_RETIRE,
-                        BrokerOperation.RESOURCE_RETIRE,
-                    }
-                ),
-                "lifecycle resource",
-            ),
-            (
-                cleanup_rows,
-                frozenset(
-                    {
-                        BrokerOperation.RESOURCE_PLAN_ARCHIVE,
-                        BrokerOperation.RESOURCE_ARCHIVE,
-                        BrokerOperation.RESOURCE_RESTORE,
-                        BrokerOperation.CLEANUP_PLAN,
-                        BrokerOperation.CLEANUP_APPLY,
-                    }
-                ),
-                "cleanup resource",
-            ),
-        ):
-            for (
-                resource_kind,
-                resource_id,
-                control_binding_id,
-                immutable_fingerprint,
-                ownership_fingerprint,
-                operation,
-            ) in rows:
-                if operation not in allowed_operations:
-                    raise ValueError(
-                        f"operation is not an exact {label} capability"
-                    )
-                if resource_kind not in {"server", "container", "supervisor"}:
-                    raise ValueError(f"resource_kind is not a {label} kind")
-                _require_identifier(resource_id, "resource_id")
-                _require_identifier(control_binding_id, "control_binding_id")
-                for value, field in (
-                    (immutable_fingerprint, "immutable_fingerprint"),
-                    (ownership_fingerprint, "ownership_fingerprint"),
-                ):
-                    if not re.fullmatch(r"sha256:[0-9a-f]{64}", value):
-                        raise ValueError(f"{field} must be a sha256 fingerprint")
-
-        timestamp = utc_timestamp()
-        with self._store() as store:
-            with store.immediate_transaction() as connection:
-                _require_principal(connection, uid)
-
-                for (
-                    snapshot_id,
-                    resource_id,
-                    full_container_id,
-                    compose_scoped,
-                ) in container_identity_rows:
-                    current = connection.execute(
-                        """
-                        SELECT full_container_id FROM docker_resources
-                        WHERE docker_resource_id = ?
-                        """,
-                        (resource_id,),
-                    ).fetchone()
-                    if (
-                        current is None
-                        or str(current["full_container_id"]) != full_container_id
-                    ):
-                        raise BrokerError(
-                            "control_binding_unavailable",
-                            "Observed container identity changed before access publication.",
-                        )
-                    owners = tuple(
-                        str(row["repo_id"])
-                        for row in connection.execute(
-                            """
-                            SELECT DISTINCT membership.repo_id
-                            FROM repository_memberships membership
-                            JOIN control_bindings binding
-                              ON binding.binding_id = membership.control_binding_id
-                            WHERE membership.resource_kind = 'container'
-                              AND membership.host_resource_id = ?
-                              AND binding.authority_state = 'authoritative'
-                            ORDER BY membership.repo_id
-                            """,
-                            (resource_id,),
-                        )
-                    )
-                    ephemeral = connection.execute(
-                        """
-                        SELECT 1
-                        FROM repository_memberships membership
-                        JOIN control_bindings binding
-                          ON binding.binding_id = membership.control_binding_id
-                        WHERE membership.repo_id = ?
-                          AND membership.resource_kind = 'container'
-                          AND membership.host_resource_id = ?
-                          AND binding.authority_state = 'authoritative'
-                          AND binding.provenance = 'coordinator_ephemeral'
-                        """,
-                        (repo_id, resource_id),
-                    ).fetchone()
-                    if owners != (repo_id,) or ephemeral is not None:
-                        raise BrokerError(
-                            "control_binding_unavailable",
-                            "Observed container no longer has one exact non-ephemeral owner.",
-                        )
-                    scope = connection.execute(
-                        """
-                        SELECT 1 FROM broker_observation_compose_scope
-                        WHERE snapshot_id = ?
-                        """,
-                        (snapshot_id,),
-                    ).fetchone()
-                    if compose_scoped:
-                        observed = connection.execute(
-                            """
-                            SELECT full_container_id, ownership_state,
-                                   authoritative_owner_repo_id
-                            FROM broker_observed_compose_containers
-                            WHERE snapshot_id = ? AND docker_resource_id = ?
-                            """,
-                            (snapshot_id, resource_id),
-                        ).fetchone()
-                        if (
-                            scope is None
-                            or observed is None
-                            or str(observed["full_container_id"])
-                            != full_container_id
-                            or str(observed["ownership_state"]) != "exclusive"
-                            or str(observed["authoritative_owner_repo_id"] or "")
-                            != repo_id
-                        ):
-                            raise BrokerError(
-                                "control_binding_unavailable",
-                                "Compose-scoped container evidence changed before access publication.",
-                            )
-                    else:
-                        standalone = connection.execute(
-                            """
-                            SELECT 1
-                            FROM observation_snapshot_resources observed
-                            WHERE observed.snapshot_id = ?
-                              AND observed.resource_kind = 'container'
-                              AND observed.resource_id = ?
-                              AND NOT EXISTS (
-                                  SELECT 1
-                                  FROM broker_observed_compose_containers compose
-                                  WHERE compose.snapshot_id = observed.snapshot_id
-                                    AND compose.docker_resource_id =
-                                        observed.resource_id
-                              )
-                            """,
-                            (snapshot_id, resource_id),
-                        ).fetchone()
-                        if standalone is None:
-                            raise BrokerError(
-                                "control_binding_unavailable",
-                                "Standalone container snapshot evidence changed before access publication.",
-                            )
-                        if scope is not None:
-                            explicit_membership = connection.execute(
-                                """
-                                SELECT 1
-                                FROM repository_memberships membership
-                                JOIN control_bindings binding
-                                  ON binding.binding_id =
-                                     membership.control_binding_id
-                                WHERE membership.repo_id = ?
-                                  AND membership.resource_kind = 'container'
-                                  AND membership.host_resource_id = ?
-                                  AND binding.authority_state = 'authoritative'
-                                  AND binding.provenance IN (
-                                      'operator_attach', 'runtime_manifest'
-                                  )
-                                """,
-                                (repo_id, resource_id),
-                            ).fetchone()
-                            if explicit_membership is None:
-                                raise BrokerError(
-                                    "control_binding_unavailable",
-                                    "Standalone container lacks explicit current ownership evidence.",
-                                )
-
-                for resource_kind, resource_id in {
-                    (str(row[0]), str(row[1])) for row in runtime_rows
-                }:
-                    _require_runtime_resource_membership(
-                        connection,
-                        repo_id=repo_id,
-                        resource_kind=resource_kind,
-                        resource_id=resource_id,
-                    )
-                for resource_kind, resource_id in {
-                    (str(row[0]), str(row[1])) for row in resource_rows
-                }:
-                    _require_resource_membership(
-                        connection,
-                        repo_id=repo_id,
-                        resource_kind=resource_kind,
-                        resource_id=resource_id,
-                    )
-
-                database_resources: dict[str, str] = {}
-                for database_binding_id in {
-                    str(row[0]) for row in database_rows
-                }:
-                    binding = connection.execute(
-                        """
-                        SELECT b.docker_resource_id
-                        FROM database_bindings b
-                        JOIN repository_memberships m
-                          ON m.resource_kind = 'container'
-                         AND m.host_resource_id = b.docker_resource_id
-                         AND m.repo_id = ?
-                        JOIN control_bindings c
-                          ON c.binding_id = m.control_binding_id
-                        WHERE b.database_binding_id = ?
-                          AND b.repo_id = ? AND b.engine_kind = 'postgresql'
-                          AND c.authority_state = 'authoritative'
-                        """,
-                        (repo_id, database_binding_id, repo_id),
-                    ).fetchone()
-                    if binding is None:
-                        raise BrokerError(
-                            "control_binding_unavailable",
-                            "PostgreSQL database is not an authoritative resource of this repository.",
-                        )
-                    database_resources[str(database_binding_id)] = str(
-                        binding["docker_resource_id"]
-                    )
-
-                for resource_kind, resource_id, control_binding_id in {
-                    (str(row[0]), str(row[1]), str(row[2]))
-                    for row in lifecycle_rows
-                }:
-                    exact = connection.execute(
-                        """
-                        SELECT 1
-                        FROM unassigned_resources u
-                        JOIN control_bindings b
-                          ON b.resource_kind = u.resource_kind
-                         AND b.resource_id = u.resource_id
-                        JOIN coordinator_sources s ON s.source_id = b.source_id
-                        WHERE u.resource_kind = ? AND u.resource_id = ?
-                          AND u.status = 'active' AND b.binding_id = ?
-                          AND b.authority_state = 'authoritative'
-                          AND s.effective_uid = ?
-                        """,
-                        (resource_kind, resource_id, control_binding_id, uid),
-                    ).fetchone()
-                    if exact is None:
-                        raise BrokerError(
-                            "resource_access_denied",
-                            "Standalone lifecycle grant requires an exact active resource or an exact existing grant being revoked.",
-                        )
-
-                for resource_kind, resource_id, control_binding_id in {
-                    (str(row[0]), str(row[1]), str(row[2]))
-                    for row in cleanup_rows
-                }:
-                    exact = connection.execute(
-                        """
-                        SELECT 1 FROM control_bindings b
-                        JOIN coordinator_sources s ON s.source_id = b.source_id
-                        LEFT JOIN repository_memberships m
-                          ON m.control_binding_id = b.binding_id
-                         AND m.resource_kind = b.resource_kind
-                         AND m.host_resource_id = b.resource_id
-                        WHERE b.binding_id = ? AND b.resource_kind = ?
-                          AND b.resource_id = ?
-                          AND b.authority_state = 'authoritative'
-                          AND (
-                            (m.repo_id = ? AND s.effective_uid IN (0, ?))
-                            OR (m.repo_id IS NULL AND s.effective_uid = ?)
-                          )
-                        """,
-                        (
-                            control_binding_id,
-                            resource_kind,
-                            resource_id,
-                            repo_id,
-                            uid,
-                            uid,
-                        ),
-                    ).fetchone()
-                    if exact is None:
-                        raise BrokerError(
-                            "resource_access_denied",
-                            "Cleanup grant requires an exact authoritative resource.",
-                        )
-
-                connection.executemany(
-                    """
-                    INSERT INTO broker_runtime_acl(
-                        uid, repo_id, resource_kind, resource_id,
-                        action, enabled, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, 1, ?)
-                    ON CONFLICT(uid, repo_id, resource_kind, resource_id, action)
-                    DO UPDATE SET enabled = 1, updated_at = excluded.updated_at
-                    """,
-                    (
-                        (uid, repo_id, kind, resource_id, action, timestamp)
-                        for kind, resource_id, action in runtime_rows
-                    ),
-                )
-                connection.executemany(
-                    """
-                    INSERT INTO broker_resource_acl(
-                        uid, repo_id, resource_kind, resource_id,
-                        operation, enabled, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, 1, ?)
-                    ON CONFLICT(
-                        uid, repo_id, resource_kind, resource_id, operation
-                    ) DO UPDATE SET enabled = 1,
-                                    updated_at = excluded.updated_at
-                    """,
-                    (
-                        (
-                            uid,
-                            repo_id,
-                            kind,
-                            resource_id,
-                            operation.value,
-                            timestamp,
-                        )
-                        for kind, resource_id, operation in resource_rows
-                    ),
-                )
-                connection.executemany(
-                    """
-                    INSERT INTO broker_database_acl(
-                        uid, repo_id, database_binding_id, docker_resource_id,
-                        operation, enabled, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, 1, ?)
-                    ON CONFLICT(uid, repo_id, database_binding_id, operation)
-                    DO UPDATE SET
-                        docker_resource_id = excluded.docker_resource_id,
-                        enabled = 1,
-                        updated_at = excluded.updated_at
-                    """,
-                    (
-                        (
-                            uid,
-                            repo_id,
-                            database_binding_id,
-                            database_resources[str(database_binding_id)],
-                            operation.value,
-                            timestamp,
-                        )
-                        for database_binding_id, operation in database_rows
-                    ),
-                )
-                for table, rows in (
-                    ("broker_lifecycle_resource_acl", lifecycle_rows),
-                    ("broker_cleanup_resource_acl", cleanup_rows),
-                ):
-                    connection.executemany(
-                        f"""
-                        INSERT INTO {table}(
-                            uid, repo_id, resource_kind, resource_id,
-                            control_binding_id, immutable_fingerprint,
-                            ownership_fingerprint, operation, enabled, updated_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
-                        ON CONFLICT(
-                            uid, repo_id, resource_kind, resource_id,
-                            control_binding_id, operation
-                        ) DO UPDATE SET
-                            immutable_fingerprint = excluded.immutable_fingerprint,
-                            ownership_fingerprint = excluded.ownership_fingerprint,
-                            enabled = 1,
-                            updated_at = excluded.updated_at
-                        """,
-                        (
-                            (
-                                uid,
-                                repo_id,
-                                kind,
-                                resource_id,
-                                binding_id,
-                                immutable_fingerprint,
-                                ownership_fingerprint,
-                                operation.value,
-                                timestamp,
-                            )
-                            for (
-                                kind,
-                                resource_id,
-                                binding_id,
-                                immutable_fingerprint,
-                                ownership_fingerprint,
-                                operation,
-                            ) in rows
-                        ),
-                    )
-
-    def grant_worker(
-        self,
-        *,
-        uid: int,
-        repo_id: str,
-        server_definition_id: str,
-        operation: BrokerOperation,
-        enabled: bool = True,
-    ) -> None:
-        """Grant one exact runner-to-broker worker protocol operation."""
-
-        _require_identifier(repo_id, "project_id")
-        _require_identifier(server_definition_id, "server_definition_id")
-        if operation not in _WORKER_OPERATIONS:
-            raise ValueError("operation is not a worker broker operation")
-        with self._store() as store:
-            with store.immediate_transaction() as connection:
-                _require_principal(connection, uid)
-                _require_resource_membership(
-                    connection,
-                    repo_id=repo_id,
-                    resource_kind="server",
-                    resource_id=server_definition_id,
-                )
-                connection.execute(
-                    """
-                    INSERT INTO broker_worker_acl(
-                        uid, repo_id, server_definition_id,
-                        operation, enabled, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(uid, repo_id, server_definition_id, operation)
-                    DO UPDATE SET enabled = excluded.enabled,
-                                  updated_at = excluded.updated_at
-                    """,
-                    (
-                        uid,
-                        repo_id,
-                        server_definition_id,
-                        operation.value,
-                        int(enabled),
-                        utc_timestamp(),
-                    ),
-                )
-
     def revoke_server_for_permanent_cleanup(
         self,
         *,
@@ -5339,7 +3549,7 @@ class BrokerPersistence:
         observation-bound.  This method proves the supplied target against
         that durable plan, then disables every operational and runner grant
         before native unregister/host mutation can begin.  The retained fence
-        prevents reenrollment code from reviving the old immutable ID.
+        prevents reconfiguration code from reviving the old immutable ID.
         """
 
         for value, label in (
@@ -5393,7 +3603,7 @@ class BrokerPersistence:
                 ).fetchone()
                 if definition is None and existing is None:
                     raise BrokerError(
-                        "control_binding_unavailable",
+                        "resource_identity_unavailable",
                         "Permanent worker revocation targets no current or already-revoked exact definition.",
                         operation_id=cleanup_operation_id,
                     )
@@ -5433,40 +3643,14 @@ class BrokerPersistence:
                             timestamp,
                         ),
                     )
-                disabled: dict[str, int] = {}
-                for table, predicate, parameters in (
-                    (
-                        "broker_resource_acl",
-                        "repo_id = ? AND resource_kind = 'server' AND resource_id = ?",
-                        (repo_id, server_definition_id),
-                    ),
-                    (
-                        "broker_runtime_acl",
-                        "repo_id = ? AND resource_kind = 'service' AND resource_id = ?",
-                        (repo_id, server_definition_id),
-                    ),
-                    (
-                        "broker_worker_acl",
-                        "repo_id = ? AND server_definition_id = ? "
-                        "AND operation IN ('worker.launch_ticket', 'worker.policy_read')",
-                        (repo_id, server_definition_id),
-                    ),
-                    (
-                        "broker_assignment_acl",
-                        "repo_id = ? AND server_definition_id = ?",
-                        (repo_id, server_definition_id),
-                    ),
-                    (
-                        "broker_port_policies",
-                        "repo_id = ? AND server_definition_id = ?",
-                        (repo_id, server_definition_id),
-                    ),
-                ):
-                    disabled[table] = connection.execute(
-                        f"UPDATE {table} SET enabled = 0, updated_at = ? "
-                        f"WHERE {predicate} AND enabled = 1",
-                        (timestamp, *parameters),
-                    ).rowcount
+                connection.execute(
+                    """
+                    UPDATE broker_port_ranges
+                    SET enabled = 0, updated_at = ?
+                    WHERE repo_id = ? AND server_definition_id = ?
+                    """,
+                    (timestamp, repo_id, server_definition_id),
+                )
         return {
             "status": "revoked",
             "repo_id": repo_id,
@@ -5475,8 +3659,7 @@ class BrokerPersistence:
             "cleanup_operation_id": cleanup_operation_id,
             "immutable_fingerprint": immutable_fingerprint,
             "already_revoked": existing is not None,
-            "disabled_grants": disabled,
-            "profile_update_required": True,
+            "routing_cache_update_required": True,
         }
 
     def revoke_repository_for_permanent_cleanup(
@@ -5567,8 +3750,8 @@ class BrokerPersistence:
                 ).fetchone()
                 if repository is None and existing is None:
                     raise BrokerError(
-                        "project_access_denied",
-                        "Permanent project revocation targets no current or retained exact repository generation.",
+                        "repository_unavailable",
+                        "Permanent repository removal targets no current or retained exact repository generation.",
                         operation_id=cleanup_operation_id,
                     )
                 canonical_root = (
@@ -5680,44 +3863,18 @@ class BrokerPersistence:
                         }
                     )
 
-                disabled: dict[str, int] = {}
-                for table in (
-                    "broker_resource_acl",
-                    "broker_runtime_acl",
-                    "broker_worker_acl",
-                    "broker_assignment_acl",
-                    "broker_port_policies",
-                    "broker_compose_acl",
-                    "broker_compose_run_once_acl",
-                    "broker_lifecycle_acl",
-                    "broker_lifecycle_resource_acl",
-                    "broker_repository_read_acl",
-                    "broker_host_observation_acl",
-                    "broker_cleanup_acl",
-                    "broker_cleanup_resource_acl",
-                    "broker_database_acl",
-                ):
-                    disabled[table] = connection.execute(
-                        f"UPDATE {table} SET enabled = 0, updated_at = ? "
-                        "WHERE repo_id = ? AND enabled = 1",
-                        (timestamp, repo_id),
-                    ).rowcount
-                disabled["broker_repository_enrollments"] = connection.execute(
-                    """
-                    UPDATE broker_repository_enrollments
-                    SET enabled = 0, updated_at = ?
-                    WHERE repo_id = ? AND enabled = 1
-                    """,
+                connection.execute(
+                    "UPDATE broker_port_ranges SET enabled = 0, updated_at = ? WHERE repo_id = ?",
                     (timestamp, repo_id),
-                ).rowcount
-                disabled["broker_compose_definitions"] = connection.execute(
+                )
+                connection.execute(
                     """
                     UPDATE broker_compose_definitions
                     SET enabled = 0, generation = generation + 1, updated_at = ?
                     WHERE repo_id = ? AND enabled = 1
                     """,
                     (timestamp, repo_id),
-                ).rowcount
+                )
         return {
             "status": "revoked",
             "repo_id": repo_id,
@@ -5727,8 +3884,7 @@ class BrokerPersistence:
             "immutable_fingerprint": immutable_fingerprint,
             "already_revoked": existing is not None,
             "server_revocations": server_revocations,
-            "disabled_grants": disabled,
-            "profile_update_required": True,
+            "routing_cache_update_required": True,
         }
 
     def remove_revoked_repository_server_definitions(
@@ -5859,12 +4015,6 @@ class BrokerPersistence:
                         (repo_id, name),
                     )
                 connection.execute(
-                    f"DELETE FROM repository_memberships WHERE repo_id = ? "
-                    f"AND resource_kind = 'server' "
-                    f"AND host_resource_id IN ({placeholders})",
-                    (repo_id, *server_ids),
-                )
-                connection.execute(
                     f"DELETE FROM unassigned_resources "
                     f"WHERE resource_kind = 'server' "
                     f"AND resource_id IN ({placeholders})",
@@ -5875,16 +4025,6 @@ class BrokerPersistence:
                     f"WHERE resource_kind = 'server' "
                     f"AND resource_id IN ({placeholders})",
                     server_ids,
-                )
-                connection.execute(
-                    f"""
-                    UPDATE control_bindings
-                    SET authority_state = 'retired',
-                        generation = generation + 1, updated_at = ?
-                    WHERE resource_kind = 'server'
-                      AND resource_id IN ({placeholders})
-                    """,
-                    (timestamp, *server_ids),
                 )
                 deleted = connection.execute(
                     f"DELETE FROM server_definitions WHERE repo_id = ? "
@@ -5905,10 +4045,9 @@ class BrokerPersistence:
             "removed_server_definition_ids": list(server_ids),
         }
 
-    def replace_server_access(
+    def replace_server_port_ranges(
         self,
         *,
-        uid: int,
         repo_id: str,
         server_definition_ids: Iterable[str],
         start_port: int,
@@ -5916,15 +4055,12 @@ class BrokerPersistence:
         protocol: str = "tcp",
         max_ttl_seconds: int = 7 * 24 * 60 * 60,
     ) -> None:
-        """Atomically replace one principal's exact server mutation allowlist."""
+        """Replace server-specific host allocation ranges for one repository."""
 
         _require_identifier(repo_id, "project_id")
-        requested = tuple(server_definition_ids)
-        if any(type(item) is not str for item in requested):
-            raise ValueError("server definition ids must be strings")
-        for item in requested:
+        selected = tuple(sorted(set(server_definition_ids)))
+        for item in selected:
             _require_identifier(item, "server_definition_id")
-        selected = tuple(sorted(set(requested)))
         if not 1 <= start_port <= end_port <= 65535:
             raise ValueError("server port range is invalid")
         if protocol not in {"tcp", "udp"}:
@@ -5934,7 +4070,6 @@ class BrokerPersistence:
         now = utc_timestamp()
         with self._store() as store:
             with store.immediate_transaction() as connection:
-                _require_principal(connection, uid)
                 known = {
                     str(row[0])
                     for row in connection.execute(
@@ -5944,147 +4079,29 @@ class BrokerPersistence:
                 }
                 if any(item not in known for item in selected):
                     raise BrokerError(
-                        "control_binding_unavailable",
-                        "Server access replacement includes a definition outside the exact repository.",
-                    )
-                revoked = {
-                    str(row[0])
-                    for row in connection.execute(
-                        """
-                        SELECT server_definition_id
-                        FROM broker_server_revocations
-                        WHERE repo_id = ?
-                        """,
-                        (repo_id,),
-                    )
-                }
-                if revoked.intersection(selected):
-                    raise BrokerError(
-                        "resource_permanently_removed",
-                        "Server access replacement cannot revive a permanently removed incarnation; explicitly reinstall it to obtain a new ID.",
+                        "resource_identity_mismatch",
+                        "Port range replacement includes a server outside the target repository.",
                     )
                 connection.execute(
-                    """
-                    UPDATE broker_resource_acl SET enabled = 0, updated_at = ?
-                    WHERE uid = ? AND repo_id = ? AND resource_kind = 'server'
-                      AND operation IN ('port.lease', 'port.release')
-                    """,
-                    (now, uid, repo_id),
-                )
-                connection.execute(
-                    """
-                    UPDATE broker_runtime_acl SET enabled = 0, updated_at = ?
-                    WHERE uid = ? AND repo_id = ? AND resource_kind = 'service'
-                    """,
-                    (now, uid, repo_id),
-                )
-                connection.execute(
-                    """
-                    UPDATE broker_worker_acl SET enabled = 0, updated_at = ?
-                    WHERE uid = ? AND repo_id = ?
-                    """,
-                    (now, uid, repo_id),
-                )
-                connection.execute(
-                    """
-                    UPDATE broker_assignment_acl SET enabled = 0, updated_at = ?
-                    WHERE uid = ? AND repo_id = ?
-                    """,
-                    (now, uid, repo_id),
-                )
-                connection.execute(
-                    """
-                    UPDATE broker_port_policies SET enabled = 0, updated_at = ?
-                    WHERE uid = ? AND repo_id = ?
-                    """,
-                    (now, uid, repo_id),
+                    "UPDATE broker_port_ranges SET enabled = 0, updated_at = ? WHERE repo_id = ?",
+                    (now, repo_id),
                 )
                 for server_id in selected:
-                    for runtime_action in (
-                        "status", "start", "stop", "restart", "replace"
-                    ):
-                        connection.execute(
-                            """
-                            INSERT INTO broker_runtime_acl(
-                                uid, repo_id, resource_kind, resource_id,
-                                action, enabled, updated_at
-                            ) VALUES (?, ?, 'service', ?, ?, 1, ?)
-                            ON CONFLICT(
-                                uid, repo_id, resource_kind, resource_id, action
-                            ) DO UPDATE SET enabled = 1,
-                                            updated_at = excluded.updated_at
-                            """,
-                            (uid, repo_id, server_id, runtime_action, now),
-                        )
-                    for worker_operation in sorted(
-                        _WORKER_OPERATIONS, key=lambda item: item.value
-                    ):
-                        connection.execute(
-                            """
-                            INSERT INTO broker_worker_acl(
-                                uid, repo_id, server_definition_id,
-                                operation, enabled, updated_at
-                            ) VALUES (?, ?, ?, ?, 1, ?)
-                            ON CONFLICT(
-                                uid, repo_id, server_definition_id, operation
-                            ) DO UPDATE SET enabled = 1,
-                                            updated_at = excluded.updated_at
-                            """,
-                            (
-                                uid,
-                                repo_id,
-                                server_id,
-                                worker_operation.value,
-                                now,
-                            ),
-                        )
-                    for operation in (
-                        BrokerOperation.PORT_LEASE,
-                        BrokerOperation.PORT_RELEASE,
-                    ):
-                        connection.execute(
-                            """
-                            INSERT INTO broker_resource_acl(
-                                uid, repo_id, resource_kind, resource_id,
-                                operation, enabled, updated_at
-                            ) VALUES (?, ?, 'server', ?, ?, 1, ?)
-                            ON CONFLICT(uid, repo_id, resource_kind, resource_id, operation)
-                            DO UPDATE SET enabled = 1, updated_at = excluded.updated_at
-                            """,
-                            (uid, repo_id, server_id, operation.value, now),
-                        )
-                    for operation in (
-                        BrokerOperation.PORT_ASSIGN,
-                        BrokerOperation.PORT_UNASSIGN,
-                    ):
-                        connection.execute(
-                            """
-                            INSERT INTO broker_assignment_acl(
-                                uid, repo_id, server_definition_id,
-                                operation, enabled, updated_at
-                            ) VALUES (?, ?, ?, ?, 1, ?)
-                            ON CONFLICT(uid, repo_id, server_definition_id, operation)
-                            DO UPDATE SET enabled = 1, updated_at = excluded.updated_at
-                            """,
-                            (uid, repo_id, server_id, operation.value, now),
-                        )
                     connection.execute(
                         """
-                        INSERT INTO broker_port_policies(
-                            uid, repo_id, server_definition_id, protocol,
+                        INSERT INTO broker_port_ranges(
+                            repo_id, server_definition_id, protocol,
                             start_port, end_port, max_ttl_seconds,
                             enabled, updated_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)
+                        ) VALUES (?, ?, ?, ?, ?, ?, 1, ?)
                         ON CONFLICT(
-                            uid, repo_id, server_definition_id,
-                            protocol, start_port, end_port
+                            repo_id, server_definition_id, protocol, start_port, end_port
                         ) DO UPDATE SET
                             max_ttl_seconds = excluded.max_ttl_seconds,
                             enabled = 1,
                             updated_at = excluded.updated_at
                         """,
                         (
-                            uid,
                             repo_id,
                             server_id,
                             protocol,
@@ -6095,10 +4112,9 @@ class BrokerPersistence:
                         ),
                     )
 
-    def grant_port_range(
+    def set_server_port_range(
         self,
         *,
-        uid: int,
         repo_id: str,
         server_definition_id: str,
         start_port: int,
@@ -6107,6 +4123,8 @@ class BrokerPersistence:
         max_ttl_seconds: int = 3_600,
         enabled: bool = True,
     ) -> None:
+        """Set one target server's allocation range for every local caller."""
+
         if (
             type(start_port) is not int
             or type(end_port) is not int
@@ -6119,24 +4137,28 @@ class BrokerPersistence:
             raise ValueError("max_ttl_seconds must be from one second to seven days")
         with self._store() as store:
             with store.immediate_transaction() as connection:
-                _require_principal(connection, uid)
-                _require_resource_membership(
-                    connection,
-                    repo_id=repo_id,
-                    resource_kind="server",
-                    resource_id=server_definition_id,
-                )
+                server = connection.execute(
+                    """
+                    SELECT 1 FROM server_definitions
+                    WHERE repo_id = ? AND server_definition_id = ?
+                    """,
+                    (repo_id, server_definition_id),
+                ).fetchone()
+                if server is None:
+                    raise BrokerError(
+                        "resource_identity_mismatch",
+                        "Port range target is not a current server definition.",
+                    )
                 conflict = connection.execute(
                     """
-                    SELECT start_port, end_port FROM broker_port_policies
-                    WHERE uid = ? AND repo_id = ? AND server_definition_id = ?
+                    SELECT start_port, end_port FROM broker_port_ranges
+                    WHERE repo_id = ? AND server_definition_id = ?
                       AND protocol = ? AND enabled = 1
                       AND NOT(end_port < ? OR start_port > ?)
                       AND NOT(start_port = ? AND end_port = ?)
                     LIMIT 1
                     """,
                     (
-                        uid,
                         repo_id,
                         server_definition_id,
                         protocol,
@@ -6148,22 +4170,21 @@ class BrokerPersistence:
                 ).fetchone()
                 if conflict is not None:
                     raise BrokerError(
-                        "overlapping_port_policy",
-                        "Port policies for one resource must not overlap.",
+                        "overlapping_port_range",
+                        "Port ranges for one server must not overlap.",
                     )
                 connection.execute(
                     """
-                    INSERT INTO broker_port_policies(
-                        uid, repo_id, server_definition_id, protocol,
+                    INSERT INTO broker_port_ranges(
+                        repo_id, server_definition_id, protocol,
                         start_port, end_port, max_ttl_seconds, enabled, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(uid, repo_id, server_definition_id, protocol, start_port, end_port)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(repo_id, server_definition_id, protocol, start_port, end_port)
                     DO UPDATE SET max_ttl_seconds = excluded.max_ttl_seconds,
                                   enabled = excluded.enabled,
                                   updated_at = excluded.updated_at
                     """,
                     (
-                        uid,
                         repo_id,
                         server_definition_id,
                         protocol,
@@ -6175,510 +4196,8 @@ class BrokerPersistence:
                     ),
                 )
 
-    def grant_lifecycle(
-        self,
-        *,
-        uid: int,
-        repo_id: str,
-        operation: BrokerOperation,
-        enabled: bool = True,
-    ) -> None:
-        if operation not in _LIFECYCLE_OPERATIONS:
-            raise ValueError("operation is not a broker lifecycle operation")
-        _require_identifier(repo_id, "project_id")
-        with self._store() as store:
-            with store.immediate_transaction() as connection:
-                _require_principal(connection, uid)
-                if (
-                    connection.execute(
-                        "SELECT 1 FROM repositories WHERE repo_id = ?",
-                        (repo_id,),
-                    ).fetchone()
-                    is None
-                ):
-                    raise BrokerError(
-                        "project_access_denied",
-                        "Lifecycle repository is not provisioned.",
-                    )
-                connection.execute(
-                    """
-                    INSERT INTO broker_lifecycle_acl(
-                        uid, repo_id, operation, enabled, updated_at
-                    ) VALUES (?, ?, ?, ?, ?)
-                    ON CONFLICT(uid, repo_id, operation)
-                    DO UPDATE SET enabled = excluded.enabled,
-                                  updated_at = excluded.updated_at
-                    """,
-                    (uid, repo_id, operation.value, int(enabled), utc_timestamp()),
-                )
-
-    def grant_database(
-        self,
-        *,
-        uid: int,
-        repo_id: str,
-        database_binding_id: str,
-        operation: BrokerOperation,
-        enabled: bool = True,
-    ) -> None:
-        if operation not in {
-            BrokerOperation.DATABASE_BACKUP,
-            BrokerOperation.DATABASE_RESTORE,
-        }:
-            raise ValueError("operation is not a broker database operation")
-        _require_identifier(repo_id, "project_id")
-        _require_identifier(database_binding_id, "database_binding_id")
-        with self._store() as store:
-            with store.immediate_transaction() as connection:
-                _require_principal(connection, uid)
-                binding = connection.execute(
-                    """
-                    SELECT b.docker_resource_id
-                    FROM database_bindings b
-                    JOIN repository_memberships m
-                      ON m.resource_kind = 'container'
-                     AND m.host_resource_id = b.docker_resource_id
-                     AND m.repo_id = ?
-                    JOIN control_bindings c ON c.binding_id = m.control_binding_id
-                    WHERE b.database_binding_id = ?
-                      AND b.repo_id = ? AND b.engine_kind = 'postgresql'
-                      AND c.authority_state = 'authoritative'
-                    """,
-                    (repo_id, database_binding_id, repo_id),
-                ).fetchone()
-                if binding is None:
-                    raise BrokerError(
-                        "control_binding_unavailable",
-                        "PostgreSQL database is not an authoritative resource of this repository.",
-                    )
-                connection.execute(
-                    """
-                    INSERT INTO broker_database_acl(
-                        uid, repo_id, database_binding_id, docker_resource_id,
-                        operation, enabled, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(uid, repo_id, database_binding_id, operation)
-                    DO UPDATE SET docker_resource_id = excluded.docker_resource_id,
-                                  enabled = excluded.enabled,
-                                  updated_at = excluded.updated_at
-                    """,
-                    (
-                        uid,
-                        repo_id,
-                        database_binding_id,
-                        str(binding["docker_resource_id"]),
-                        operation.value,
-                        int(enabled),
-                        utc_timestamp(),
-                    ),
-                )
-
-    def grant_lifecycle_resource(
-        self,
-        *,
-        uid: int,
-        repo_id: str,
-        resource_kind: str,
-        resource_id: str,
-        control_binding_id: str,
-        immutable_fingerprint: str,
-        ownership_fingerprint: str,
-        operation: BrokerOperation,
-        enabled: bool = True,
-    ) -> None:
-        if operation not in _RESOURCE_LIFECYCLE_OPERATIONS:
-            raise ValueError(
-                "operation is not a standalone-resource lifecycle operation"
-            )
-        if resource_kind not in {"server", "container", "supervisor"}:
-            raise ValueError("resource_kind is not a lifecycle resource kind")
-        for value, field in (
-            (repo_id, "project_id"),
-            (resource_id, "resource_id"),
-            (control_binding_id, "control_binding_id"),
-        ):
-            _require_identifier(value, field)
-        for value, field in (
-            (immutable_fingerprint, "immutable_fingerprint"),
-            (ownership_fingerprint, "ownership_fingerprint"),
-        ):
-            if not re.fullmatch(r"sha256:[0-9a-f]{64}", value):
-                raise ValueError(f"{field} must be a sha256 fingerprint")
-        with self._store() as store:
-            with store.immediate_transaction() as connection:
-                _require_principal(connection, uid)
-                if enabled:
-                    exact = connection.execute(
-                        """
-                        SELECT 1
-                        FROM unassigned_resources u
-                        JOIN control_bindings b
-                          ON b.resource_kind = u.resource_kind
-                         AND b.resource_id = u.resource_id
-                        JOIN coordinator_sources s ON s.source_id = b.source_id
-                        WHERE u.resource_kind = ? AND u.resource_id = ?
-                          AND u.status = 'active' AND b.binding_id = ?
-                          AND b.authority_state = 'authoritative'
-                          AND s.effective_uid = ?
-                        """,
-                        (resource_kind, resource_id, control_binding_id, uid),
-                    ).fetchone()
-                else:
-                    # Revocation must remain possible after retirement hides
-                    # the resource and retires its controller.  It may only
-                    # update the exact grant that was provisioned earlier.
-                    exact = connection.execute(
-                        """
-                        SELECT 1 FROM broker_lifecycle_resource_acl
-                        WHERE uid = ? AND repo_id = ?
-                          AND resource_kind = ? AND resource_id = ?
-                          AND control_binding_id = ?
-                          AND immutable_fingerprint = ?
-                          AND ownership_fingerprint = ? AND operation = ?
-                        """,
-                        (
-                            uid,
-                            repo_id,
-                            resource_kind,
-                            resource_id,
-                            control_binding_id,
-                            immutable_fingerprint,
-                            ownership_fingerprint,
-                            operation.value,
-                        ),
-                    ).fetchone()
-                if exact is None:
-                    raise BrokerError(
-                        "resource_access_denied",
-                        "Standalone lifecycle grant requires an exact active resource or an exact existing grant being revoked.",
-                    )
-                connection.execute(
-                    """
-                    INSERT INTO broker_lifecycle_resource_acl(
-                        uid, repo_id, resource_kind, resource_id,
-                        control_binding_id, immutable_fingerprint,
-                        ownership_fingerprint, operation, enabled, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(
-                        uid, repo_id, resource_kind, resource_id,
-                        control_binding_id, operation
-                    ) DO UPDATE SET
-                        immutable_fingerprint = excluded.immutable_fingerprint,
-                        ownership_fingerprint = excluded.ownership_fingerprint,
-                        enabled = excluded.enabled,
-                        updated_at = excluded.updated_at
-                    """,
-                    (
-                        uid,
-                        repo_id,
-                        resource_kind,
-                        resource_id,
-                        control_binding_id,
-                        immutable_fingerprint,
-                        ownership_fingerprint,
-                        operation.value,
-                        int(enabled),
-                        utc_timestamp(),
-                    ),
-                )
-
-    def grant_repository_read(
-        self,
-        *,
-        uid: int,
-        repo_id: str,
-        operation: BrokerOperation,
-        enabled: bool = True,
-    ) -> None:
-        if operation not in _REPOSITORY_READ_OPERATIONS:
-            raise ValueError("operation is not a repository broker read")
-        _require_identifier(repo_id, "project_id")
-        with self._store() as store:
-            with store.immediate_transaction() as connection:
-                _require_principal(connection, uid)
-                if (
-                    connection.execute(
-                        "SELECT 1 FROM repositories WHERE repo_id = ?", (repo_id,)
-                    ).fetchone()
-                    is None
-                ):
-                    raise BrokerError(
-                        "project_access_denied",
-                        "Repository read target is not provisioned.",
-                    )
-                connection.execute(
-                    """
-                    INSERT INTO broker_repository_read_acl(
-                        uid, repo_id, operation, enabled, updated_at
-                    ) VALUES (?, ?, ?, ?, ?)
-                    ON CONFLICT(uid, repo_id, operation)
-                    DO UPDATE SET enabled = excluded.enabled,
-                                  updated_at = excluded.updated_at
-                    """,
-                    (uid, repo_id, operation.value, int(enabled), utc_timestamp()),
-                )
-
-    def grant_cleanup(
-        self,
-        *,
-        uid: int,
-        repo_id: str,
-        operation: BrokerOperation,
-        enabled: bool = True,
-    ) -> None:
-        allowed = {
-            BrokerOperation.ARCHIVES_READ,
-            BrokerOperation.CLEANUP_PLAN,
-            BrokerOperation.CLEANUP_APPLY,
-            BrokerOperation.REPOSITORY_PLAN_REMOVE,
-            BrokerOperation.REPOSITORY_REMOVE,
-            BrokerOperation.REPOSITORY_REINSTALL,
-            BrokerOperation.RESOURCE_PLAN_RETIRE,
-            BrokerOperation.RESOURCE_RETIRE,
-            BrokerOperation.RESOURCE_PLAN_ARCHIVE,
-            BrokerOperation.RESOURCE_ARCHIVE,
-            BrokerOperation.RESOURCE_RESTORE,
-            BrokerOperation.LIFECYCLE_RESTORE,
-        }
-        if operation not in allowed:
-            raise ValueError("operation is not an explicit cleanup capability")
-        _require_identifier(repo_id, "project_id")
-        with self._store() as store:
-            with store.immediate_transaction() as connection:
-                _require_principal(connection, uid)
-                if connection.execute(
-                    "SELECT 1 FROM repositories WHERE repo_id = ?", (repo_id,)
-                ).fetchone() is None:
-                    raise BrokerError(
-                        "project_access_denied", "Cleanup repository is not provisioned."
-                    )
-                connection.execute(
-                    """
-                    INSERT INTO broker_cleanup_acl(
-                        uid, repo_id, operation, enabled, updated_at
-                    ) VALUES (?, ?, ?, ?, ?)
-                    ON CONFLICT(uid, repo_id, operation) DO UPDATE SET
-                        enabled = excluded.enabled,
-                        updated_at = excluded.updated_at
-                    """,
-                    (uid, repo_id, operation.value, int(enabled), utc_timestamp()),
-                )
-
-    def grant_cleanup_resource(
-        self,
-        *,
-        uid: int,
-        repo_id: str,
-        resource_kind: str,
-        resource_id: str,
-        control_binding_id: str,
-        immutable_fingerprint: str,
-        ownership_fingerprint: str,
-        operation: BrokerOperation,
-        enabled: bool = True,
-    ) -> None:
-        if operation not in {
-            BrokerOperation.RESOURCE_PLAN_ARCHIVE,
-            BrokerOperation.RESOURCE_ARCHIVE,
-            BrokerOperation.RESOURCE_RESTORE,
-            BrokerOperation.CLEANUP_PLAN,
-            BrokerOperation.CLEANUP_APPLY,
-        }:
-            raise ValueError("operation is not an exact resource cleanup capability")
-        if resource_kind not in {"server", "container", "supervisor"}:
-            raise ValueError("resource_kind is not a cleanup resource kind")
-        for value, field in (
-            (repo_id, "project_id"),
-            (resource_id, "resource_id"),
-            (control_binding_id, "control_binding_id"),
-        ):
-            _require_identifier(value, field)
-        for value, field in (
-            (immutable_fingerprint, "immutable_fingerprint"),
-            (ownership_fingerprint, "ownership_fingerprint"),
-        ):
-            if not re.fullmatch(r"sha256:[0-9a-f]{64}", value):
-                raise ValueError(f"{field} must be a sha256 fingerprint")
-        with self._store() as store:
-            with store.immediate_transaction() as connection:
-                _require_principal(connection, uid)
-                if enabled:
-                    exact = connection.execute(
-                        """
-                        SELECT 1 FROM control_bindings b
-                        JOIN coordinator_sources s ON s.source_id = b.source_id
-                        LEFT JOIN repository_memberships m
-                          ON m.control_binding_id = b.binding_id
-                         AND m.resource_kind = b.resource_kind
-                         AND m.host_resource_id = b.resource_id
-                        WHERE b.binding_id = ? AND b.resource_kind = ?
-                          AND b.resource_id = ? AND b.authority_state = 'authoritative'
-                          AND (
-                            (m.repo_id = ? AND s.effective_uid IN (0, ?))
-                            OR (m.repo_id IS NULL AND s.effective_uid = ?)
-                          )
-                        """,
-                        (
-                            control_binding_id,
-                            resource_kind,
-                            resource_id,
-                            repo_id,
-                            uid,
-                            uid,
-                        ),
-                    ).fetchone()
-                else:
-                    exact = connection.execute(
-                        """
-                        SELECT 1 FROM broker_cleanup_resource_acl
-                        WHERE uid = ? AND repo_id = ? AND resource_kind = ?
-                          AND resource_id = ? AND control_binding_id = ?
-                          AND operation = ?
-                        """,
-                        (
-                            uid,
-                            repo_id,
-                            resource_kind,
-                            resource_id,
-                            control_binding_id,
-                            operation.value,
-                        ),
-                    ).fetchone()
-                if exact is None:
-                    raise BrokerError(
-                        "resource_access_denied",
-                        "Cleanup grant requires an exact authoritative resource.",
-                    )
-                connection.execute(
-                    """
-                    INSERT INTO broker_cleanup_resource_acl(
-                        uid, repo_id, resource_kind, resource_id,
-                        control_binding_id, immutable_fingerprint,
-                        ownership_fingerprint, operation, enabled, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(
-                        uid, repo_id, resource_kind, resource_id,
-                        control_binding_id, operation
-                    ) DO UPDATE SET
-                        immutable_fingerprint = excluded.immutable_fingerprint,
-                        ownership_fingerprint = excluded.ownership_fingerprint,
-                        enabled = excluded.enabled,
-                        updated_at = excluded.updated_at
-                    """,
-                    (
-                        uid,
-                        repo_id,
-                        resource_kind,
-                        resource_id,
-                        control_binding_id,
-                        immutable_fingerprint,
-                        ownership_fingerprint,
-                        operation.value,
-                        int(enabled),
-                        utc_timestamp(),
-                    ),
-                )
-
-    def authorize_cleanup_resource(
-        self,
-        authorized: AuthorizedBrokerRequest,
-        *,
-        repo_id: str,
-        resource_kind: str,
-        resource_id: str,
-        control_binding_id: str,
-        immutable_fingerprint: str,
-        ownership_fingerprint: str,
-        operation: BrokerOperation,
-    ) -> None:
-        """Recheck one service-resolved exact cleanup/restore grant atomically."""
-
-        if operation not in {
-            BrokerOperation.CLEANUP_PLAN,
-            BrokerOperation.CLEANUP_APPLY,
-            BrokerOperation.RESOURCE_RESTORE,
-        }:
-            raise ValueError("operation is not an exact resource cleanup capability")
-        request = authorized.request
-        with self._store() as store:
-            with store.read_transaction() as connection:
-                _authorize_connection(connection, peer=authorized.peer, request=request)
-                grant = connection.execute(
-                    """
-                    SELECT a.enabled
-                    FROM broker_cleanup_resource_acl a
-                    JOIN control_bindings b ON b.binding_id = a.control_binding_id
-                    JOIN coordinator_sources s ON s.source_id = b.source_id
-                    JOIN repository_memberships m
-                      ON m.control_binding_id = b.binding_id
-                     AND m.resource_kind = b.resource_kind
-                     AND m.host_resource_id = b.resource_id
-                    WHERE a.uid = ? AND a.repo_id = ?
-                      AND a.resource_kind = ? AND a.resource_id = ?
-                      AND a.control_binding_id = ?
-                      AND a.immutable_fingerprint = ?
-                      AND a.ownership_fingerprint = ?
-                      AND a.operation = ? AND a.enabled = 1
-                      AND b.resource_kind = a.resource_kind
-                      AND b.resource_id = a.resource_id
-                      AND b.authority_state = 'authoritative'
-                      AND s.effective_uid IN (0, ?)
-                      AND m.repo_id = a.repo_id
-                    LIMIT 1
-                    """,
-                    (
-                        authorized.authorization_uid,
-                        repo_id,
-                        resource_kind,
-                        resource_id,
-                        control_binding_id,
-                        immutable_fingerprint,
-                        ownership_fingerprint,
-                        operation.value,
-                        authorized.authorization_uid,
-                    ),
-                ).fetchone()
-                if grant is None:
-                    raise BrokerError(
-                        "resource_access_denied",
-                        "Cleanup or restore requires an explicit current exact resource grant.",
-                        operation_id=request.operation_id,
-                    )
-
-    def grant_host_observation(
-        self,
-        *,
-        uid: int,
-        repo_id: str,
-        enabled: bool = True,
-    ) -> None:
-        """Grant one enrolled OS principal authority to refresh host evidence."""
-
-        _require_identifier(repo_id, "project_id")
-        with self._store() as store:
-            with store.immediate_transaction() as connection:
-                _require_principal(connection, uid)
-                if connection.execute(
-                    "SELECT 1 FROM repositories WHERE repo_id = ?", (repo_id,)
-                ).fetchone() is None:
-                    raise BrokerError(
-                        "project_access_denied",
-                        "Host observation target is not provisioned.",
-                    )
-                connection.execute(
-                    """
-                    INSERT INTO broker_host_observation_acl(
-                        uid, repo_id, enabled, updated_at
-                    ) VALUES (?, ?, ?, ?)
-                    ON CONFLICT(uid, repo_id)
-                    DO UPDATE SET enabled = excluded.enabled,
-                                  updated_at = excluded.updated_at
-                    """,
-                    (uid, repo_id, int(enabled), utc_timestamp()),
-                )
-
-    def fail_owned_host_observations(self, *, broker_instance_id: str) -> int:
-        """Durably terminate only running tickets claimed by one broker process."""
+    def fail_instance_host_observations(self, *, broker_instance_id: str) -> int:
+        """Durably terminate running tickets started by one broker process."""
 
         _require_identifier(broker_instance_id, "broker_instance_id")
         completed_at = utc_timestamp()
@@ -6690,7 +4209,7 @@ class BrokerPersistence:
                         """
                         SELECT s.snapshot_id
                         FROM observation_snapshots s
-                        JOIN broker_host_observation_owners o USING(snapshot_id)
+                        JOIN broker_host_observation_sessions o USING(snapshot_id)
                         WHERE o.broker_instance_id = ? AND s.status = 'running'
                         ORDER BY s.snapshot_id
                         """,
@@ -6713,48 +4232,28 @@ class BrokerPersistence:
                     )
         return len(owned)
 
-    def authorize(
+    def accept(
         self, peer: PeerCredentials, request: BrokerRequest
-    ) -> AuthorizedBrokerRequest:
-        if request.operation in TESTD_INTERNAL_OPERATIONS:
-            raise BrokerError(
-                "operation_access_denied",
-                "Internal test-attempt operations require the protected testd identity.",
-                operation_id=request.operation_id,
-            )
+    ) -> AcceptedBrokerRequest:
         with self._store() as store:
             with store.read_transaction() as connection:
-                _result, policy_uid = _authorize_connection_with_policy_uid(
-                    connection,
-                    peer=peer,
-                    request=request,
-                )
-        return AuthorizedBrokerRequest(
-            peer=peer,
-            request=request,
-            policy_uid=policy_uid,
-        )
+                _validate_connection_request(connection, peer=peer, request=request)
+        return AcceptedBrokerRequest(peer=peer, request=request)
 
-    def authorize_internal_testd(
+    def accept_internal_testd(
         self, peer: PeerCredentials, request: BrokerRequest
-    ) -> AuthorizedBrokerRequest:
-        """Authorize the typed internal scheduler namespace.
+    ) -> AcceptedBrokerRequest:
+        """Validate the typed internal scheduler namespace.
 
         The dedicated testd account remains useful for process isolation and
-        peer attribution, but its physical UID is not an authorization input.
-        Operation, account, repository state and generations remain exact.
+        peer attribution. Neither its label nor physical UID grants authority;
+        operation shape and current attempt state remain exact.
         """
 
         if request.operation not in TESTD_INTERNAL_OPERATIONS:
             raise BrokerError(
-                "operation_access_denied",
-                "The protected test scheduler may use only internal attempt operations.",
-                operation_id=request.operation_id,
-            )
-        if request.account_id != "devcoordinator-testd":
-            raise BrokerError(
-                "cross_account_access_denied",
-                "The protected test scheduler account identity is invalid.",
+                "operation_unavailable",
+                "The internal test scheduler accepts only attempt operations.",
                 operation_id=request.operation_id,
             )
         with self._store() as store:
@@ -6811,47 +4310,46 @@ class BrokerPersistence:
                 "The test attempt ticket targets an obsolete repository generation.",
                 operation_id=request.operation_id,
             )
-        return AuthorizedBrokerRequest(peer=peer, request=request)
+        return AcceptedBrokerRequest(peer=peer, request=request)
 
-    def test_attempt_repository_authority(
+    def test_attempt_repository_context(
         self,
         *,
         repo_id: str,
-        owner_uid: int | None,
+        execution_uid: int | None,
         operation_id: str,
-    ) -> TestAttemptRepositoryAuthority:
-        """Bind an attempt to the repository's explicit execution authority.
-
-        ``owner_uid`` is retained only for compatibility/diagnostics.  The
-        repository owner is selected exclusively from current repository
-        authority; a stale caller-side UID cannot block the attempt.
-        """
+    ) -> TestRepositoryExecutionContext:
+        """Bind an attempt to a current repository and recorded execution UID."""
 
         _require_identifier(repo_id, "project_id")
-        del owner_uid
-        authority = self.test_repository_execution_authority(
+        if type(execution_uid) is not int or execution_uid < 0:
+            raise BrokerError(
+                "test_execution_context_invalid",
+                "The test attempt has no valid execution attribution.",
+                operation_id=operation_id,
+            )
+        return self.test_repository_execution_context(
             repo_id=repo_id,
+            execution_uid=execution_uid,
             operation_id=operation_id,
         )
-        return authority
 
-    def test_repository_execution_authority(
+    def test_repository_execution_context(
         self,
         *,
         repo_id: str,
+        execution_uid: int,
         operation_id: str,
-    ) -> TestAttemptRepositoryAuthority:
-        """Resolve exactly one active schema-v13 execution owner.
-
-        The local peer remains the best-effort actor attribution. It cannot
-        select the operating-system identity used for repository inspection or
-        test execution; current repository authority selects that identity.
-        The current repository owner must also have an enabled broker principal
-        and repository enrollment. First-use adoption provisions that execution
-        enrollment atomically when the authorized caller and owner are different.
-        """
+    ) -> TestRepositoryExecutionContext:
+        """Resolve one current repository without any owner or ACL lookup."""
 
         _require_identifier(repo_id, "project_id")
+        if type(execution_uid) is not int or execution_uid < 0:
+            raise BrokerError(
+                "test_execution_context_invalid",
+                "Test execution requires a non-negative attributed UID.",
+                operation_id=operation_id,
+            )
         with self._store() as store:
             with store.read_transaction() as connection:
                 metadata = connection.execute(
@@ -6860,65 +4358,36 @@ class BrokerPersistence:
                     FROM schema_metadata WHERE singleton = 1
                     """
                 ).fetchone()
-                rows = connection.execute(
+                row = connection.execute(
                     """
                     SELECT repository.canonical_root, repository.generation,
                            repository.state, installation.status,
-                           installation.startup_fenced,
-                           owner.owner_uid, owner.repository_generation,
-                           owner.authority_generation, owner.evidence_sha256,
-                           enrollment.enabled,
-                           principal.enabled AS principal_enabled,
-                           transfer.owner_uid AS ledger_owner_uid,
-                           transfer.repository_generation AS ledger_repository_generation,
-                           transfer.evidence_sha256 AS ledger_evidence_sha256
+                           installation.startup_fenced
                     FROM repositories repository
                     JOIN repository_installations installation USING(repo_id)
-                    JOIN repository_owners owner
-                      ON owner.repo_id = repository.repo_id
-                    JOIN broker_repository_enrollments enrollment
-                      ON enrollment.repo_id = repository.repo_id
-                     AND enrollment.uid = owner.owner_uid
-                    JOIN broker_acl_principals principal
-                      ON principal.uid = enrollment.uid
-                     AND principal.account_id = enrollment.account_id
-                    JOIN repository_owner_transfers transfer
-                      ON transfer.repo_id = owner.repo_id
-                     AND transfer.authority_generation = owner.authority_generation
                     WHERE repository.repo_id = ?
                     """,
                     (repo_id,),
-                ).fetchall()
-        row = rows[0] if len(rows) == 1 else None
+                ).fetchone()
         if (
             metadata is None
             or int(metadata["schema_version"]) != SCHEMA_VERSION
             or str(metadata["migration_state"]) != "ready"
-            or len(rows) != 1
             or row is None
             or str(row["state"]) != "active"
             or str(row["status"]) != "installed"
             or bool(row["startup_fenced"])
-            or int(row["owner_uid"]) <= 0
-            or int(row["repository_generation"]) != int(row["generation"])
-            or int(row["ledger_owner_uid"]) != int(row["owner_uid"])
-            or int(row["ledger_repository_generation"])
-            != int(row["repository_generation"])
-            or str(row["ledger_evidence_sha256"])
-            != str(row["evidence_sha256"])
-            or not bool(row["enabled"])
-            or not bool(row["principal_enabled"])
         ):
             raise BrokerError(
-                "test_execution_owner_unavailable",
-                "The repository has no single current, enrolled execution owner.",
+                "test_repository_unavailable",
+                "The exact test repository is unavailable or fenced.",
                 operation_id=operation_id,
             )
-        return TestAttemptRepositoryAuthority(
+        return TestRepositoryExecutionContext(
             repo_id=repo_id,
             canonical_root=str(row["canonical_root"]),
             generation=int(row["generation"]),
-            owner_uid=int(row["owner_uid"]),
+            execution_uid=execution_uid,
         )
 
     def sealed_test_fixture_template(
@@ -6932,12 +4401,12 @@ class BrokerPersistence:
     ) -> SealedTestFixtureTemplate:
         """Resolve one administrator-sealed fixture after exact test authority."""
 
-        authority = self.test_attempt_repository_authority(
+        repository_context = self.test_attempt_repository_context(
             repo_id=repo_id,
-            owner_uid=owner_uid,
+            execution_uid=owner_uid,
             operation_id=operation_id,
         )
-        if authority.generation != repository_generation:
+        if repository_context.generation != repository_generation:
             raise BrokerError(
                 "project_generation_stale",
                 "The sealed fixture targets an obsolete repository generation.",
@@ -7049,10 +4518,10 @@ class BrokerPersistence:
     def _existing_operation_disposition(
         connection: sqlite3.Connection,
         *,
-        authorized: AuthorizedBrokerRequest,
+        accepted: AcceptedBrokerRequest,
         fingerprint: str,
     ) -> DurableOperationDisposition | None:
-        request = authorized.request
+        request = accepted.request
         existing = connection.execute(
             """
             SELECT o.status, o.result_json, o.error_code, o.error_message,
@@ -7097,7 +4566,7 @@ class BrokerPersistence:
             )
         if (
             existing["status"] == "needs_attention"
-            and authorized.request.operation is BrokerOperation.RUNTIME_REQUEST
+            and accepted.request.operation is BrokerOperation.RUNTIME_REQUEST
         ):
             return DurableOperationDisposition(
                 "reconcile",
@@ -7106,7 +4575,7 @@ class BrokerPersistence:
             )
         if (
             existing["status"] == "needs_attention"
-            and authorized.request.operation is BrokerOperation.RUNTIME_ENSURE
+            and accepted.request.operation is BrokerOperation.RUNTIME_ENSURE
             and isinstance(existing["result_json"], str)
         ):
             retained = _decode_runtime_ensure_result(
@@ -7129,39 +4598,39 @@ class BrokerPersistence:
         return DurableOperationDisposition("pending")
 
     def existing_operation_disposition(
-        self, authorized: AuthorizedBrokerRequest
+        self, accepted: AcceptedBrokerRequest
     ) -> DurableOperationDisposition | None:
         """Read an idempotent replay result without reserving a new operation."""
 
-        request_fingerprint = authenticated_request_fingerprint(authorized)
+        request_fingerprint = accepted_request_fingerprint(accepted)
         with self._store() as store:
             with store.read_transaction() as connection:
                 return self._existing_operation_disposition(
                     connection,
-                    authorized=authorized,
+                    accepted=accepted,
                     fingerprint=request_fingerprint,
                 )
 
     def reserve_operation(
         self,
-        authorized: AuthorizedBrokerRequest,
+        accepted: AcceptedBrokerRequest,
         *,
         compose_preflight: Mapping[str, Any] | None = None,
     ) -> DurableOperationDisposition:
-        request = authorized.request
-        request_fingerprint = authenticated_request_fingerprint(authorized)
+        request = accepted.request
+        request_fingerprint = accepted_request_fingerprint(accepted)
         now = utc_timestamp()
         with self._store() as store:
             with store.immediate_transaction() as connection:
                 existing = self._existing_operation_disposition(
                     connection,
-                    authorized=authorized,
+                    accepted=accepted,
                     fingerprint=request_fingerprint,
                 )
                 if existing is not None:
                     return existing
 
-                _authorize_connection(connection, peer=authorized.peer, request=request)
+                _validate_connection_request(connection, peer=accepted.peer, request=request)
                 compose_snapshot: sqlite3.Row | None = None
                 runtime_target: tuple[str, str, str, str] | None = None
                 if (
@@ -7267,8 +4736,8 @@ class BrokerPersistence:
                         ),
                         "broker." + request.operation.value,
                         request_fingerprint,
-                        authorized.peer.uid,
-                        _operation_actor(authorized),
+                        accepted.peer.uid,
+                        _operation_actor(accepted),
                         f"pid:{os.getpid()}",
                         now,
                         now,
@@ -7299,7 +4768,7 @@ class BrokerPersistence:
                     """,
                     (
                         request.operation_id,
-                        authorized.authorization_uid,
+                        accepted.attribution_uid,
                         request.account_id,
                         request.project_id,
                         request.resource_id,
@@ -7418,9 +4887,9 @@ class BrokerPersistence:
         return DurableOperationDisposition("execute")
 
     def port_lease_candidates(
-        self, authorized: AuthorizedBrokerRequest
+        self, accepted: AcceptedBrokerRequest
     ) -> tuple[int, ...]:
-        request = authorized.request
+        request = accepted.request
         protocol = str(request.arguments.get("protocol", "tcp"))
         ttl_seconds = int(
             request.arguments.get("ttl_seconds", DEFAULT_PORT_LEASE_TTL_SECONDS)
@@ -7428,10 +4897,9 @@ class BrokerPersistence:
         requested_port = request.arguments.get("requested_port")
         with self._store() as store:
             with store.read_transaction() as connection:
-                _authorize_connection(connection, peer=authorized.peer, request=request)
-                policies = _port_policy_rows(
+                _validate_connection_request(connection, peer=accepted.peer, request=request)
+                policies = _port_range_rows(
                     connection,
-                    account_id=request.account_id,
                     repo_id=request.project_id,
                     server_definition_id=request.resource_id,
                     protocol=protocol,
@@ -7456,7 +4924,19 @@ class BrokerPersistence:
                         )
                     requested_port = pinned_port
                 if requested_port is not None:
-                    return (int(requested_port),)
+                    selected = int(requested_port)
+                    if selected < 1024 or not any(
+                        int(policy["start_port"])
+                        <= selected
+                        <= int(policy["end_port"])
+                        for policy in policies
+                    ):
+                        raise BrokerError(
+                            "port_policy_denied",
+                            "Requested port is outside the configured server ranges.",
+                            operation_id=request.operation_id,
+                        )
+                    return (selected,)
                 return tuple(
                     port
                     for policy in policies
@@ -7467,12 +4947,12 @@ class BrokerPersistence:
 
     def complete_port_lease(
         self,
-        authorized: AuthorizedBrokerRequest,
+        accepted: AcceptedBrokerRequest,
         *,
         observed_available_port: int,
         listener_evidence: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
-        request = authorized.request
+        request = accepted.request
         protocol = str(request.arguments.get("protocol", "tcp"))
         ttl_seconds = int(
             request.arguments.get("ttl_seconds", DEFAULT_PORT_LEASE_TTL_SECONDS)
@@ -7489,14 +4969,13 @@ class BrokerPersistence:
         expires_at = utc_timestamp(now_seconds + ttl_seconds)
         with self._store() as store:
             with store.immediate_transaction() as connection:
-                _authorize_connection(connection, peer=authorized.peer, request=request)
+                _validate_connection_request(connection, peer=accepted.peer, request=request)
                 repo = connection.execute(
                     "SELECT host_id FROM repositories WHERE repo_id = ?",
                     (request.project_id,),
                 ).fetchone()
-                policies = _port_policy_rows(
+                policies = _port_range_rows(
                     connection,
-                    account_id=request.account_id,
                     repo_id=request.project_id,
                     server_definition_id=request.resource_id,
                     protocol=protocol,
@@ -7531,14 +5010,8 @@ class BrokerPersistence:
                     )
                 existing = connection.execute(
                     """
-                    SELECT l.*, o.uid AS lease_uid,
-                           o.account_id AS lease_account_id,
-                           o.repo_id AS lease_repo_id,
-                           o.server_definition_id AS lease_server_definition_id,
-                           o.protocol AS lease_protocol,
-                           d.name AS lease_server_name
+                    SELECT l.*, d.name AS lease_server_name
                     FROM leases l
-                    LEFT JOIN broker_lease_owners o USING(lease_id)
                     LEFT JOIN server_definitions d USING(server_definition_id)
                     WHERE l.host_id = ? AND l.port = ? AND l.status = 'active'
                     """,
@@ -7549,7 +5022,6 @@ class BrokerPersistence:
                     and existing is not None
                     and existing["repo_id"] == request.project_id
                     and existing["server_definition_id"] == request.resource_id
-                    and existing["agent"] == request.account_id
                     and (
                         existing["purpose"] == "broker"
                         or (
@@ -7558,10 +5030,7 @@ class BrokerPersistence:
                             and str(existing["owner"] or "").isdigit()
                         )
                     )
-                    and existing["lease_account_id"] == request.account_id
-                    and existing["lease_repo_id"] == request.project_id
-                    and existing["lease_server_definition_id"] == request.resource_id
-                    and existing["lease_protocol"] == protocol
+                    and existing["protocol"] == protocol
                 ):
                     if listener_evidence is None:
                         raise BrokerError(
@@ -7585,15 +5054,16 @@ class BrokerPersistence:
                         """
                         UPDATE leases
                         SET owner = ?, agent = ?, purpose = 'broker',
-                            expires_at = ?, process_fingerprint = ?,
+                            protocol = ?, expires_at = ?, process_fingerprint = ?,
                             generation = generation + 1, updated_at = ?
                         WHERE lease_id = ? AND status = 'active'
                           AND repo_id = ? AND server_definition_id = ?
                           AND port = ?
                         """,
                         (
-                            f"uid:{authorized.peer.uid}",
+                            f"uid:{accepted.peer.uid}",
                             request.account_id,
+                            protocol,
                             expires_at,
                             process_fingerprint,
                             now,
@@ -7632,11 +5102,11 @@ class BrokerPersistence:
                 connection.execute(
                     """
                     INSERT INTO leases(
-                        lease_id, host_id, repo_id, server_definition_id, port,
+                        lease_id, host_id, repo_id, server_definition_id, port, protocol,
                         owner, agent, purpose, status, expires_at,
                         process_fingerprint, generation,
                         created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, 'broker', 'active', ?, ?, 0, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'broker', 'active', ?, ?, 0, ?, ?)
                     """,
                     (
                         lease_id,
@@ -7644,7 +5114,8 @@ class BrokerPersistence:
                         request.project_id,
                         request.resource_id,
                         port,
-                        f"uid:{authorized.peer.uid}",
+                        protocol,
+                        f"uid:{accepted.peer.uid}",
                         request.account_id,
                         expires_at,
                         (
@@ -7665,23 +5136,6 @@ class BrokerPersistence:
                         now,
                     ),
                 )
-                connection.execute(
-                    """
-                    INSERT INTO broker_lease_owners(
-                        lease_id, uid, account_id, repo_id,
-                        server_definition_id, protocol, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        lease_id,
-                        authorized.authorization_uid,
-                        request.account_id,
-                        request.project_id,
-                        request.resource_id,
-                        protocol,
-                        now,
-                    ),
-                )
                 result = {
                     "lease_id": lease_id,
                     "port": port,
@@ -7695,27 +5149,27 @@ class BrokerPersistence:
                 return result
 
     def listener_adoption_preflight_target(
-        self, authorized: AuthorizedBrokerRequest
+        self, accepted: AcceptedBrokerRequest
     ) -> tuple[int, str]:
-        """Resolve an authorized adoption target before operation reservation."""
+        """Resolve an accepted adoption target before operation reservation."""
 
-        request = authorized.request
+        request = accepted.request
         if not bool(request.arguments.get("adopt_existing_listener")):
             raise BrokerError(
                 "invalid_arguments",
                 "Listener adoption was not requested.",
                 operation_id=request.operation_id,
             )
-        candidates = self.port_lease_candidates(authorized)
+        candidates = self.port_lease_candidates(accepted)
         if len(candidates) != 1:
             raise BrokerError(
                 "invalid_arguments",
-                "Listener adoption requires one exact authorized port.",
+                "Listener adoption requires one exact accepted port.",
                 operation_id=request.operation_id,
             )
         with self._store() as store:
             with store.read_transaction() as connection:
-                _authorize_connection(connection, peer=authorized.peer, request=request)
+                _validate_connection_request(connection, peer=accepted.peer, request=request)
                 row = connection.execute(
                     """
                     SELECT r.canonical_root
@@ -7727,34 +5181,34 @@ class BrokerPersistence:
                 ).fetchone()
                 if row is None:
                     raise BrokerError(
-                        "control_binding_unavailable",
-                        "Server listener adoption target is no longer enrolled.",
+                        "resource_identity_unavailable",
+                        "Server listener adoption target is no longer configured.",
                         operation_id=request.operation_id,
                     )
                 return int(candidates[0]), str(row["canonical_root"])
 
     def listener_adoption_target(
-        self, authorized: AuthorizedBrokerRequest
+        self, accepted: AcceptedBrokerRequest
     ) -> tuple[int, str]:
         """Resolve an exact existing-listener adoption target from service truth."""
 
-        request = authorized.request
+        request = accepted.request
         if not bool(request.arguments.get("adopt_existing_listener")):
             raise BrokerError(
                 "invalid_arguments",
                 "Listener adoption was not requested.",
                 operation_id=request.operation_id,
             )
-        candidates = self.port_lease_candidates(authorized)
+        candidates = self.port_lease_candidates(accepted)
         if len(candidates) != 1:
             raise BrokerError(
                 "invalid_arguments",
-                "Listener adoption requires one exact authorized port.",
+                "Listener adoption requires one exact accepted port.",
                 operation_id=request.operation_id,
             )
         with self._store() as store:
             with store.read_transaction() as connection:
-                _authorize_connection(connection, peer=authorized.peer, request=request)
+                _validate_connection_request(connection, peer=accepted.peer, request=request)
                 _require_reserved_target_fingerprint(
                     connection,
                     request=request,
@@ -7776,26 +5230,26 @@ class BrokerPersistence:
                 ).fetchone()
                 if row is None:
                     raise BrokerError(
-                        "control_binding_unavailable",
-                        "Server listener adoption target is no longer enrolled.",
+                        "resource_identity_unavailable",
+                        "Server listener adoption target is no longer configured.",
                         operation_id=request.operation_id,
                     )
                 return int(candidates[0]), str(row["canonical_root"])
 
     def complete_port_release(
-        self, authorized: AuthorizedBrokerRequest
+        self, accepted: AcceptedBrokerRequest
     ) -> dict[str, Any]:
-        request = authorized.request
+        request = accepted.request
         now = utc_timestamp()
         with self._store() as store:
             with store.immediate_transaction() as connection:
-                lease = _authorize_connection(
-                    connection, peer=authorized.peer, request=request
+                lease = _validate_connection_request(
+                    connection, peer=accepted.peer, request=request
                 )
                 if lease is None or lease["status"] not in {"active", "released"}:
                     raise BrokerError(
                         "lease_not_active",
-                        "The exact authorized lease is no longer active.",
+                        "The exact accepted lease is no longer active.",
                         operation_id=request.operation_id,
                     )
                 if lease["status"] == "active":
@@ -7817,15 +5271,15 @@ class BrokerPersistence:
                 return result
 
     def port_assignment_candidates(
-        self, authorized: AuthorizedBrokerRequest
+        self, accepted: AcceptedBrokerRequest
     ) -> tuple[int, ...]:
         """Return the one host port that must be proved free, or no probe for a no-op."""
 
-        request = authorized.request
+        request = accepted.request
         port = int(request.arguments["port"])
         with self._store() as store:
             with store.read_transaction() as connection:
-                _authorize_connection(connection, peer=authorized.peer, request=request)
+                _validate_connection_request(connection, peer=accepted.peer, request=request)
                 _require_reserved_target_fingerprint(
                     connection,
                     request=request,
@@ -7842,9 +5296,8 @@ class BrokerPersistence:
                     server_definition_id=request.resource_id,
                     operation_id=request.operation_id,
                 )
-                _require_assignment_port_policy(
+                _require_assignment_port_range(
                     connection,
-                    account_id=request.account_id,
                     repo_id=request.project_id,
                     server_definition_id=request.resource_id,
                     port=port,
@@ -7876,16 +5329,16 @@ class BrokerPersistence:
 
     def complete_port_assignment(
         self,
-        authorized: AuthorizedBrokerRequest,
+        accepted: AcceptedBrokerRequest,
         *,
         observed_available_port: Optional[int],
     ) -> dict[str, Any]:
-        request = authorized.request
+        request = accepted.request
         port = int(request.arguments["port"])
         now = utc_timestamp()
         with self._store() as store:
             with store.immediate_transaction() as connection:
-                _authorize_connection(connection, peer=authorized.peer, request=request)
+                _validate_connection_request(connection, peer=accepted.peer, request=request)
                 _require_reserved_target_fingerprint(
                     connection,
                     request=request,
@@ -7902,9 +5355,8 @@ class BrokerPersistence:
                     server_definition_id=request.resource_id,
                     operation_id=request.operation_id,
                 )
-                _require_assignment_port_policy(
+                _require_assignment_port_range(
                     connection,
-                    account_id=request.account_id,
                     repo_id=request.project_id,
                     server_definition_id=request.resource_id,
                     port=port,
@@ -7986,29 +5438,6 @@ class BrokerPersistence:
                             "The host port became assigned to another server.",
                             operation_id=request.operation_id,
                         ) from exc
-                connection.execute(
-                    """
-                    INSERT INTO broker_assignment_owners(
-                        assignment_id, uid, account_id, repo_id,
-                        server_definition_id, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(assignment_id) DO UPDATE SET
-                        uid = excluded.uid,
-                        account_id = excluded.account_id,
-                        repo_id = excluded.repo_id,
-                        server_definition_id = excluded.server_definition_id,
-                        updated_at = excluded.updated_at
-                    """,
-                    (
-                        assignment_id,
-                        authorized.authorization_uid,
-                        request.account_id,
-                        request.project_id,
-                        request.resource_id,
-                        created_at,
-                        now,
-                    ),
-                )
                 result = {
                     "assignment_id": assignment_id,
                     "repo_id": request.project_id,
@@ -8022,13 +5451,13 @@ class BrokerPersistence:
                 return result
 
     def complete_port_unassignment(
-        self, authorized: AuthorizedBrokerRequest
+        self, accepted: AcceptedBrokerRequest
     ) -> dict[str, Any]:
-        request = authorized.request
+        request = accepted.request
         now = utc_timestamp()
         with self._store() as store:
             with store.immediate_transaction() as connection:
-                _authorize_connection(connection, peer=authorized.peer, request=request)
+                _validate_connection_request(connection, peer=accepted.peer, request=request)
                 _require_reserved_target_fingerprint(
                     connection,
                     request=request,
@@ -8084,38 +5513,26 @@ class BrokerPersistence:
                 return result
 
     def docker_target(
-        self, authorized: AuthorizedBrokerRequest
+        self, accepted: AcceptedBrokerRequest
     ) -> DockerMutationTarget:
-        request = authorized.request
+        request = accepted.request
         with self._store() as store:
             with store.read_transaction() as connection:
-                _authorize_connection(connection, peer=authorized.peer, request=request)
+                _validate_connection_request(connection, peer=accepted.peer, request=request)
                 row = connection.execute(
                     """
                     SELECT d.docker_resource_id, d.full_container_id,
-                           b.generation AS control_generation,
-                           m.observation_revision,
-                           controller.effective_uid AS owner_uid
+                           d.repo_id, m.observation_revision
                     FROM docker_resources d
-                    JOIN repository_memberships membership
-                      ON membership.resource_kind = 'container'
-                     AND membership.host_resource_id = d.docker_resource_id
-                     AND membership.repo_id = ?
-                    JOIN control_bindings b
-                      ON b.binding_id = membership.control_binding_id
-                    JOIN coordinator_sources controller
-                      ON controller.source_id = b.source_id
                     CROSS JOIN schema_metadata m
                     WHERE d.docker_resource_id = ?
-                      AND b.authority_state = 'authoritative'
-                      AND controller.status = 'imported'
                     """,
-                    (request.project_id, request.resource_id),
+                    (request.resource_id,),
                 ).fetchone()
                 if row is None:
                     raise BrokerError(
-                        "control_binding_unavailable",
-                        "Docker resource no longer has one authoritative control binding.",
+                        "resource_unavailable",
+                        "Docker resource is no longer present in the current catalog.",
                         operation_id=request.operation_id,
                     )
                 expected = request.arguments.get("expected_observation_revision")
@@ -8128,31 +5545,64 @@ class BrokerPersistence:
                         "Docker observation changed before the requested mutation.",
                         operation_id=request.operation_id,
                     )
-                owner_uid = int(row["owner_uid"])
-                if owner_uid <= 0:
-                    raise BrokerError(
-                        "project_isolation_identity_unavailable",
-                        "The authoritative resource controller cannot be attributed to a non-root project account.",
-                        operation_id=request.operation_id,
-                    )
                 return DockerMutationTarget(
                     docker_resource_id=str(row["docker_resource_id"]),
                     full_container_id=str(row["full_container_id"]),
                     observation_revision=int(row["observation_revision"]),
-                    control_generation=int(row["control_generation"]),
-                    repo_id=request.project_id,
-                    owner_uid=owner_uid,
+                    control_generation=int(row["observation_revision"]),
+                    repo_id=str(row["repo_id"] or request.project_id),
+                    owner_uid=accepted.attribution_uid,
                 )
 
+    def direct_container_removal_target(
+        self, accepted: AcceptedBrokerRequest
+    ) -> DirectContainerRemovalTarget:
+        """Resolve one catalogued container without ownership or lifecycle policy."""
+
+        request = accepted.request
+        if request.operation is not BrokerOperation.CONTAINER_REMOVE:
+            raise ValueError("request is not direct container removal")
+        with self._store() as store:
+            with store.read_transaction() as connection:
+                _validate_connection_request(
+                    connection, peer=accepted.peer, request=request
+                )
+                row = connection.execute(
+                    """
+                    SELECT docker_resource_id, full_container_id
+                    FROM docker_resources
+                    WHERE docker_resource_id = ?
+                    """,
+                    (request.resource_id,),
+                ).fetchone()
+        if row is None:
+            raise BrokerError(
+                "resource_unavailable",
+                "Direct container removal requires one current Coordinator container target.",
+                operation_id=request.operation_id,
+            )
+        full_container_id = str(row["full_container_id"]).lower()
+        if re.fullmatch(r"[0-9a-f]{64}", full_container_id) is None:
+            raise BrokerError(
+                "resource_identity_invalid",
+                "Coordinator container target has no full native Docker identity.",
+                operation_id=request.operation_id,
+            )
+        return DirectContainerRemovalTarget(
+            docker_resource_id=str(row["docker_resource_id"]),
+            full_container_id=full_container_id,
+        )
+
     def runtime_docker_target(
-        self, authorized: AuthorizedBrokerRequest
+        self, accepted: AcceptedBrokerRequest
     ) -> RuntimeDockerMutationTarget:
         """Reauthorize and resolve a reserved runtime mutation to one container."""
 
-        request = authorized.request
+        request = accepted.request
         runtime_request = (
             request.operation is BrokerOperation.RUNTIME_REQUEST
-            and request.arguments["action"] in {"start", "stop", "restart"}
+            and request.arguments["action"]
+            in {"start", "stop", "restart", "replace"}
         )
         runtime_ensure = request.operation is BrokerOperation.RUNTIME_ENSURE
         if not (runtime_request or runtime_ensure) or request.arguments[
@@ -8161,8 +5611,8 @@ class BrokerPersistence:
             raise ValueError("request is not a Docker-backed runtime mutation")
         with self._store() as store:
             with store.read_transaction() as connection:
-                _authorize_connection(
-                    connection, peer=authorized.peer, request=request
+                _validate_connection_request(
+                    connection, peer=accepted.peer, request=request
                 )
                 row = _runtime_mutation_row(connection, request=request)
                 immutable_fingerprint = _runtime_target_fingerprint(
@@ -8214,12 +5664,1689 @@ class BrokerPersistence:
                     immutable_fingerprint=immutable_fingerprint,
                 )
 
+    def begin_broker_runtime_session(
+        self,
+        accepted: AcceptedBrokerRequest,
+        *,
+        target: RuntimeDockerMutationTarget,
+    ) -> str:
+        """Persist exact borrowed-resource ownership before a host mutation."""
+
+        request = accepted.request
+        if (
+            request.operation is not BrokerOperation.RUNTIME_REQUEST
+            or request.arguments["action"]
+            not in {"start", "stop", "restart", "replace"}
+            or request.arguments["target_kind"] not in {"docker", "database_stack"}
+        ):
+            raise ValueError("request is not a shared Docker-backed runtime mutation")
+        session_id = "session-" + uuid.uuid5(
+            uuid.NAMESPACE_URL,
+            "devcoordinator:broker-runtime-session:" + request.operation_id,
+        ).hex
+        timestamp = utc_timestamp()
+        with self._store() as store:
+            with store.immediate_transaction() as connection:
+                _validate_connection_request(
+                    connection, peer=accepted.peer, request=request
+                )
+                current = _runtime_mutation_row(connection, request=request)
+                current_fingerprint = _runtime_target_fingerprint(
+                    current, requested_resource_id=request.resource_id
+                )
+                if (
+                    current_fingerprint != target.immutable_fingerprint
+                    or str(current["docker_resource_id"])
+                    != target.docker_resource_id
+                    or str(current["full_container_id"]).lower()
+                    != target.full_container_id
+                ):
+                    raise BrokerError(
+                        "stale_resource_definition",
+                        "Runtime target changed before session ownership was committed.",
+                        operation_id=request.operation_id,
+                    )
+                scope = connection.execute(
+                    """
+                    SELECT scope.family_id, family.root_repo_id
+                    FROM repository_scopes scope
+                    JOIN repository_families family USING(family_id)
+                    WHERE scope.repo_id = ? AND family.root_repo_id = ?
+                    """,
+                    (
+                        request.project_id,
+                        str(request.arguments["root_repo_id"]),
+                    ),
+                ).fetchone()
+                operation = connection.execute(
+                    """
+                    SELECT created_at, status FROM operations
+                    WHERE operation_id = ? AND repo_id = ?
+                      AND kind = 'broker.runtime.request'
+                    """,
+                    (request.operation_id, request.project_id),
+                ).fetchone()
+                if scope is None or operation is None or operation["status"] != "running":
+                    raise BrokerError(
+                        "operation_state_conflict",
+                        "Runtime session no longer has its exact reserved operation and repository scope.",
+                        operation_id=request.operation_id,
+                    )
+                ttl_seconds = request.arguments["ttl_seconds"]
+                expires_at = None
+                if ttl_seconds is not None:
+                    created_epoch = calendar.timegm(
+                        time.strptime(
+                            str(operation["created_at"]), "%Y-%m-%dT%H:%M:%SZ"
+                        )
+                    )
+                    expires_at = time.strftime(
+                        "%Y-%m-%dT%H:%M:%SZ",
+                        time.gmtime(created_epoch + int(ttl_seconds)),
+                    )
+                elif bool(request.arguments["kill_after_run"]):
+                    # KillAfterRun cleanup is immediately due once the durable
+                    # replacement result commits. The session remains planned
+                    # until then, so the reaper cannot race the mutation.
+                    expires_at = str(operation["created_at"])
+                session_request = {
+                    "schema_version": 1,
+                    "action": str(request.arguments["action"]),
+                    "agent": str(request.arguments["agent"]),
+                    "purpose": str(request.arguments["purpose"]),
+                    "ttl_seconds": ttl_seconds,
+                    "kill_after_run": bool(request.arguments["kill_after_run"]),
+                    "target": {
+                        "kind": target.resource_kind,
+                        "id": target.resource_id,
+                    },
+                    "authority": "broker",
+                }
+                encoded_request = json.dumps(
+                    session_request,
+                    ensure_ascii=True,
+                    allow_nan=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                existing = connection.execute(
+                    """
+                    SELECT operation_id, repo_id, request_json
+                    FROM runtime_sessions WHERE session_id = ?
+                    """,
+                    (session_id,),
+                ).fetchone()
+                if existing is not None:
+                    if (
+                        str(existing["operation_id"] or "") != request.operation_id
+                        or str(existing["repo_id"]) != request.project_id
+                        or str(existing["request_json"]) != encoded_request
+                    ):
+                        raise BrokerError(
+                            "operation_state_conflict",
+                            "Runtime session replay contradicted its durable identity.",
+                            operation_id=request.operation_id,
+                        )
+                    return session_id
+                identity = {
+                    "state": "borrowed",
+                    "session_id": session_id,
+                    "operation_id": request.operation_id,
+                    "repository_id": request.project_id,
+                    "resource_kind": target.resource_kind,
+                    "resource_id": target.resource_id,
+                    "docker_resource_id": target.docker_resource_id,
+                    "full_container_id": target.full_container_id,
+                    "database_binding_id": target.database_binding_id,
+                    "database_name": target.database_name,
+                    "immutable_fingerprint": target.immutable_fingerprint,
+                }
+                execution_owner_pid = os.getpid()
+                execution_owner_identity = runtime_process_identity(
+                    execution_owner_pid
+                )
+                if execution_owner_identity is None:
+                    raise BrokerError(
+                        "runtime_cleanup_owner_unobservable",
+                        "Broker runtime session cannot prove its execution owner identity.",
+                        operation_id=request.operation_id,
+                    )
+                connection.execute(
+                    """
+                    INSERT INTO runtime_sessions(
+                        session_id, family_id, root_repo_id, repo_id,
+                        operation_id, action, purpose, ttl_seconds, expires_at,
+                        kill_after_run, status, actor, request_json,
+                        execution_owner_pid, execution_owner_identity,
+                        created_at, started_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'planned', ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        session_id,
+                        str(scope["family_id"]),
+                        str(scope["root_repo_id"]),
+                        request.project_id,
+                        request.operation_id,
+                        str(request.arguments["action"]),
+                        str(request.arguments["purpose"]),
+                        ttl_seconds,
+                        expires_at,
+                        int(bool(request.arguments["kill_after_run"])),
+                        str(request.arguments["agent"]),
+                        encoded_request,
+                        execution_owner_pid,
+                        execution_owner_identity,
+                        timestamp,
+                        timestamp,
+                        timestamp,
+                    ),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO runtime_session_resources(
+                        session_id, resource_kind, resource_id,
+                        immutable_fingerprint, identity_json,
+                        cleanup_disposition, cleanup_state, linked_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, 'retained', 'active', ?, ?)
+                    """,
+                    (
+                        session_id,
+                        target.resource_kind,
+                        target.resource_id,
+                        target.immutable_fingerprint,
+                        json.dumps(
+                            identity,
+                            ensure_ascii=True,
+                            allow_nan=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ),
+                        timestamp,
+                        timestamp,
+                    ),
+                )
+        return session_id
+
+    def broker_runtime_session_id(self, operation_id: str) -> str | None:
+        with self._store() as store:
+            with store.read_transaction() as connection:
+                row = connection.execute(
+                    """
+                    SELECT session_id, ttl_seconds, kill_after_run
+                    FROM runtime_sessions
+                    WHERE operation_id = ? ORDER BY created_at, session_id LIMIT 1
+                    """,
+                    (operation_id,),
+                ).fetchone()
+        return None if row is None else str(row["session_id"])
+
+    def runtime_replacement_record(
+        self, accepted: AcceptedBrokerRequest
+    ) -> RuntimeReplacementRecord | None:
+        """Load one resumable Docker-backed replacement journal."""
+
+        request = accepted.request
+        if (
+            request.operation is not BrokerOperation.RUNTIME_REQUEST
+            or request.arguments["action"] != "replace"
+            or request.arguments["target_kind"]
+            not in {"docker", "database_stack"}
+        ):
+            raise ValueError("request is not a Docker-backed replacement")
+        with self._store() as store:
+            with store.read_transaction() as connection:
+                _validate_connection_request(
+                    connection, peer=accepted.peer, request=request
+                )
+                row = connection.execute(
+                    """
+                    SELECT * FROM broker_runtime_replacements
+                    WHERE operation_id = ? AND repo_id = ?
+                    """,
+                    (request.operation_id, request.project_id),
+                ).fetchone()
+        return None if row is None else _runtime_replacement_record(row)
+
+    def prepare_runtime_replacement(
+        self,
+        accepted: AcceptedBrokerRequest,
+        *,
+        evidence: Mapping[str, Any],
+    ) -> RuntimeReplacementRecord:
+        """Bind replacement to one observed single-replica Compose service.
+
+        This is the last preflight transaction before any backup or Compose
+        host action. It proves the path-free runtime target, sealed Compose
+        definition, exact service identity, and every additional authority the
+        composed workflow needs.
+        """
+
+        request = accepted.request
+        if (
+            request.operation is not BrokerOperation.RUNTIME_REQUEST
+            or request.arguments["action"] != "replace"
+            or request.arguments["target_kind"]
+            not in {"docker", "database_stack"}
+        ):
+            raise ValueError("request is not a Docker-backed replacement")
+        snapshot_id = str(evidence.get("snapshot_id") or "")
+        timestamp = utc_timestamp()
+        with self._store() as store:
+            with store.immediate_transaction() as connection:
+                _validate_connection_request(
+                    connection, peer=accepted.peer, request=request
+                )
+                existing = connection.execute(
+                    """
+                    SELECT * FROM broker_runtime_replacements
+                    WHERE operation_id = ? AND repo_id = ?
+                    """,
+                    (request.operation_id, request.project_id),
+                ).fetchone()
+                if existing is not None:
+                    return _runtime_replacement_record(existing)
+
+                target_row = _runtime_mutation_row(connection, request=request)
+                target_fingerprint = _runtime_target_fingerprint(
+                    target_row, requested_resource_id=request.resource_id
+                )
+                operation = connection.execute(
+                    """
+                    SELECT status, error_code FROM operations
+                    WHERE operation_id = ? AND repo_id = ?
+                      AND kind = 'broker.runtime.request'
+                    """,
+                    (request.operation_id, request.project_id),
+                ).fetchone()
+                reserved = connection.execute(
+                    """
+                    SELECT status, phase, immutable_fingerprint
+                    FROM operation_targets
+                    WHERE operation_id = ? AND ordinal = 0
+                      AND target_kind = 'container'
+                      AND target_id = ? AND action = 'runtime.replace'
+                    """,
+                    (request.operation_id, target_row["docker_resource_id"]),
+                ).fetchone()
+                if (
+                    operation is None
+                    or reserved is None
+                    or str(reserved["immutable_fingerprint"])
+                    != target_fingerprint
+                ):
+                    raise BrokerError(
+                        "operation_state_conflict",
+                        "Replacement lost its exact reserved container identity.",
+                        operation_id=request.operation_id,
+                    )
+                if str(operation["status"]) == "needs_attention":
+                    # No replacement journal means the implementation contract
+                    # made no external replacement call. A broker restart may
+                    # therefore resume only after this transaction re-proves
+                    # the original immutable target in a fresh observation.
+                    if str(operation["error_code"] or "") != "operation_outcome_uncertain":
+                        raise BrokerError(
+                            "operation_state_conflict",
+                            "Replacement cannot resume from a terminal non-retryable failure.",
+                            operation_id=request.operation_id,
+                        )
+                    connection.execute(
+                        """
+                        UPDATE operations
+                        SET status = 'running', phase = 'executing',
+                            result_json = NULL, error_code = NULL,
+                            error_message = NULL, updated_at = ?,
+                            generation = generation + 1
+                        WHERE operation_id = ? AND status = 'needs_attention'
+                        """,
+                        (timestamp, request.operation_id),
+                    )
+                    connection.execute(
+                        """
+                        UPDATE operation_targets
+                        SET status = 'running', phase = 'executing',
+                            result_json = NULL, error_json = NULL,
+                            finished_at = NULL
+                        WHERE operation_id = ? AND ordinal = 0
+                          AND phase = 'reconciliation_required'
+                        """,
+                        (request.operation_id,),
+                    )
+                    connection.execute(
+                        """
+                        UPDATE runtime_sessions
+                        SET status = 'planned', updated_at = ?
+                        WHERE operation_id = ? AND status = 'cleanup_pending'
+                        """,
+                        (timestamp, request.operation_id),
+                    )
+                    connection.execute(
+                        """
+                        UPDATE runtime_session_resources
+                        SET cleanup_state = 'active', cleanup_error_json = NULL,
+                            updated_at = ?
+                        WHERE session_id IN (
+                            SELECT session_id FROM runtime_sessions
+                            WHERE operation_id = ?
+                        ) AND cleanup_disposition = 'retained'
+                        """,
+                        (timestamp, request.operation_id),
+                    )
+                elif str(operation["status"]) != "running":
+                    raise BrokerError(
+                        "operation_state_conflict",
+                        "Replacement no longer has a running durable operation.",
+                        operation_id=request.operation_id,
+                    )
+
+                repository = connection.execute(
+                    "SELECT host_id FROM repositories WHERE repo_id = ?",
+                    (request.project_id,),
+                ).fetchone()
+                if repository is None:
+                    raise BrokerError(
+                        "repository_unavailable",
+                        "Replacement repository is unavailable.",
+                        operation_id=request.operation_id,
+                    )
+                _require_exact_full_docker_snapshot(
+                    connection,
+                    snapshot_id=snapshot_id,
+                    host_id=str(repository["host_id"]),
+                    expected_evidence=evidence,
+                    operation_id=request.operation_id,
+                    require_compose_asset_scope=True,
+                    error_code="runtime_replace_observation_incomplete",
+                    error_message=(
+                        "Replacement requires one fresh complete Compose-aware Docker observation."
+                    ),
+                )
+                rows = list(
+                    connection.execute(
+                        """
+                        SELECT observed.full_container_id,
+                               observed.project_name, observed.service_name,
+                               observed.lifecycle, observed.association_state,
+                               observed.associated_repo_id,
+                               definition.compose_definition_id,
+                               definition.enabled, claim.claimed,
+                               effective.service_replicas_json
+                        FROM broker_observed_compose_containers observed
+                        JOIN broker_compose_definitions definition
+                          ON definition.repo_id = ?
+                         AND definition.project_name = observed.project_name
+                        JOIN broker_compose_project_claims claim
+                          USING(compose_definition_id)
+                        JOIN broker_compose_services service
+                          ON service.compose_definition_id =
+                             definition.compose_definition_id
+                         AND service.service_name = observed.service_name
+                        JOIN broker_compose_effective_model_evidence effective
+                          USING(compose_definition_id)
+                        WHERE observed.snapshot_id = ?
+                          AND observed.docker_resource_id = ?
+                        ORDER BY definition.compose_definition_id,
+                                 observed.service_name
+                        """,
+                        (
+                            request.project_id,
+                            snapshot_id,
+                            str(target_row["docker_resource_id"]),
+                        ),
+                    )
+                )
+                if len(rows) != 1:
+                    raise BrokerError(
+                        "runtime_replace_compose_scope_required",
+                        "Replacement target must resolve to one configured Compose service.",
+                        operation_id=request.operation_id,
+                    )
+                compose = rows[0]
+                lifecycle_services = tuple(
+                    str(row["service_name"])
+                    for row in connection.execute(
+                        """
+                        SELECT service_name FROM broker_compose_services
+                        WHERE compose_definition_id = ? ORDER BY ordinal
+                        """,
+                        (str(compose["compose_definition_id"]),),
+                    )
+                )
+                replicas = _require_service_replica_evidence(
+                    compose["service_replicas_json"],
+                    services=lifecycle_services,
+                    operation_id=request.operation_id,
+                )
+                if (
+                    str(compose["full_container_id"]).lower()
+                    != str(target_row["full_container_id"]).lower()
+                    or str(compose["association_state"]) != "exclusive"
+                    or str(compose["associated_repo_id"] or "")
+                    != request.project_id
+                    or not bool(compose["enabled"])
+                    or not bool(compose["claimed"])
+                    or dict(replicas).get(str(compose["service_name"])) != 1
+                ):
+                    raise BrokerError(
+                        "runtime_replace_compose_scope_required",
+                        "Replacement requires one current, exclusive, single-replica Compose service.",
+                        operation_id=request.operation_id,
+                    )
+                database_binding_id = target_row["database_binding_id"]
+                database_name = target_row["database_name"]
+                compose_operation_id = str(
+                    uuid.uuid5(
+                        uuid.NAMESPACE_URL,
+                        "devcoordinator:runtime-replace:compose:"
+                        + request.operation_id,
+                    )
+                )
+                backup_operation_id = (
+                    str(
+                        uuid.uuid5(
+                            uuid.NAMESPACE_URL,
+                            "devcoordinator:runtime-replace:backup:"
+                            + request.operation_id,
+                        )
+                    )
+                    if request.arguments["target_kind"] == "database_stack"
+                    else None
+                )
+                connection.execute(
+                    """
+                    INSERT INTO broker_runtime_replacements(
+                        operation_id, repo_id, resource_kind,
+                        requested_resource_id, old_docker_resource_id,
+                        old_full_container_id, database_binding_id,
+                        database_name, compose_definition_id,
+                        compose_service, compose_operation_id,
+                        backup_operation_id, phase, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                              'reserved', ?, ?)
+                    """,
+                    (
+                        request.operation_id,
+                        request.project_id,
+                        request.arguments["target_kind"],
+                        request.resource_id,
+                        str(target_row["docker_resource_id"]),
+                        str(target_row["full_container_id"]).lower(),
+                        database_binding_id,
+                        database_name,
+                        str(compose["compose_definition_id"]),
+                        str(compose["service_name"]),
+                        compose_operation_id,
+                        backup_operation_id,
+                        timestamp,
+                        timestamp,
+                    ),
+                )
+                row = connection.execute(
+                    "SELECT * FROM broker_runtime_replacements WHERE operation_id = ?",
+                    (request.operation_id,),
+                ).fetchone()
+                assert row is not None
+                return _runtime_replacement_record(row)
+
+    def record_runtime_replacement_backup(
+        self,
+        accepted: AcceptedBrokerRequest,
+        *,
+        database_backup_id: str,
+    ) -> RuntimeReplacementRecord:
+        """Bind one nested strong backup to the original replacement identity."""
+
+        request = accepted.request
+        _require_identifier(database_backup_id, "database_backup_id")
+        timestamp = utc_timestamp()
+        with self._store() as store:
+            with store.immediate_transaction() as connection:
+                _validate_connection_request(
+                    connection, peer=accepted.peer, request=request
+                )
+                row = connection.execute(
+                    "SELECT * FROM broker_runtime_replacements WHERE operation_id = ?",
+                    (request.operation_id,),
+                ).fetchone()
+                if row is None or str(row["resource_kind"]) != "database_stack":
+                    raise BrokerError(
+                        "operation_state_conflict",
+                        "Database replacement has no matching durable journal.",
+                        operation_id=request.operation_id,
+                    )
+                backup = connection.execute(
+                    """
+                    SELECT database_binding_id, docker_resource_id,
+                           source_container_id, source_database_name,
+                           status, verification_status, scope
+                    FROM database_backups WHERE database_backup_id = ?
+                    """,
+                    (database_backup_id,),
+                ).fetchone()
+                if (
+                    backup is None
+                    or str(backup["database_binding_id"] or "")
+                    != str(row["database_binding_id"])
+                    or str(backup["docker_resource_id"] or "")
+                    != str(row["old_docker_resource_id"])
+                    or str(backup["source_container_id"]).lower()
+                    != str(row["old_full_container_id"]).lower()
+                    or str(backup["source_database_name"] or "")
+                    != str(row["database_name"])
+                    or str(backup["status"]) != "available"
+                    or str(backup["verification_status"]) != "strong"
+                    or str(backup["scope"]) != "database"
+                ):
+                    raise BrokerError(
+                        "database_backup_unavailable",
+                        "Replacement backup does not strongly verify the exact original database identity.",
+                        operation_id=request.operation_id,
+                    )
+                existing_backup_id = row["database_backup_id"]
+                if (
+                    existing_backup_id is not None
+                    and str(existing_backup_id) != database_backup_id
+                ):
+                    raise BrokerError(
+                        "operation_id_conflict",
+                        "Replacement already references another immutable backup.",
+                        operation_id=request.operation_id,
+                    )
+                if str(row["phase"]) == "reserved":
+                    connection.execute(
+                        """
+                        UPDATE broker_runtime_replacements
+                        SET database_backup_id = ?, phase = 'backup_complete',
+                            updated_at = ?
+                        WHERE operation_id = ? AND phase = 'reserved'
+                        """,
+                        (database_backup_id, timestamp, request.operation_id),
+                    )
+                elif str(row["phase"]) not in {
+                    "backup_complete",
+                    "recreated",
+                    "rebound",
+                    "restore_intent",
+                    "restore_complete",
+                    "terminal",
+                }:
+                    raise BrokerError(
+                        "operation_state_conflict",
+                        "Replacement backup arrived in an invalid phase.",
+                        operation_id=request.operation_id,
+                    )
+                final = connection.execute(
+                    "SELECT * FROM broker_runtime_replacements WHERE operation_id = ?",
+                    (request.operation_id,),
+                ).fetchone()
+                assert final is not None
+                return _runtime_replacement_record(final)
+
+    def begin_runtime_replacement_restore(
+        self, accepted: AcceptedBrokerRequest
+    ) -> tuple[DatabaseMutationTarget, RegisteredDatabaseBackup, dict[str, Any] | None]:
+        """Load exact cross-incarnation restore material and commit intent."""
+
+        request = accepted.request
+        timestamp = utc_timestamp()
+        with self._store() as store:
+            with store.immediate_transaction() as connection:
+                _validate_connection_request(
+                    connection, peer=accepted.peer, request=request
+                )
+                journal = connection.execute(
+                    "SELECT * FROM broker_runtime_replacements WHERE operation_id = ?",
+                    (request.operation_id,),
+                ).fetchone()
+                if (
+                    journal is None
+                    or str(journal["resource_kind"]) != "database_stack"
+                    or str(journal["phase"])
+                    not in {
+                        "rebound",
+                        "restore_intent",
+                        "restore_complete",
+                        "terminal",
+                    }
+                    or journal["new_docker_resource_id"] is None
+                    or journal["database_backup_id"] is None
+                ):
+                    raise BrokerError(
+                        "operation_state_conflict",
+                        "Database replacement is not ready for its exact restore.",
+                        operation_id=request.operation_id,
+                    )
+                target_row = connection.execute(
+                    """
+                    SELECT database.database_binding_id,
+                           database.docker_resource_id,
+                           database.database_name, docker.full_container_id,
+                           metadata.observation_revision AS control_generation,
+                           metadata.observation_revision
+                    FROM database_bindings database
+                    JOIN docker_resources docker USING(docker_resource_id)
+                    CROSS JOIN schema_metadata metadata
+                    WHERE database.database_binding_id = ?
+                      AND database.repo_id = ?
+                      AND database.docker_resource_id = ?
+                      AND database.database_name = ?
+                      AND database.engine_kind = 'postgresql'
+                    """,
+                    (
+                        str(journal["database_binding_id"]),
+                        request.project_id,
+                        str(journal["new_docker_resource_id"]),
+                        str(journal["database_name"]),
+                    ),
+                ).fetchone()
+                backup_row = connection.execute(
+                    """
+                    SELECT database_backup_id, database_binding_id,
+                           artifact_path, manifest_path, artifact_sha256,
+                           source_container_id, source_database_name,
+                           status, verification_status, scope
+                    FROM database_backups WHERE database_backup_id = ?
+                    """,
+                    (str(journal["database_backup_id"]),),
+                ).fetchone()
+                if (
+                    target_row is None
+                    or backup_row is None
+                    or str(backup_row["database_binding_id"] or "")
+                    != str(journal["database_binding_id"])
+                    or str(backup_row["source_container_id"]).lower()
+                    != str(journal["old_full_container_id"]).lower()
+                    or str(backup_row["source_database_name"] or "")
+                    != str(journal["database_name"])
+                    or str(backup_row["status"]) != "available"
+                    or str(backup_row["verification_status"]) != "strong"
+                    or str(backup_row["scope"]) != "database"
+                ):
+                    raise BrokerError(
+                        "database_backup_unavailable",
+                        "Replacement restore lost its strongly verified original backup or exact new target.",
+                        operation_id=request.operation_id,
+                    )
+                descriptor = inspect_database_backup(
+                    str(backup_row["artifact_path"]),
+                    str(backup_row["manifest_path"]),
+                    expected_uid=self.expected_uid,
+                )
+                if (
+                    descriptor["verification_status"] != "strong"
+                    or descriptor["artifact_sha256"]
+                    != str(backup_row["artifact_sha256"])
+                    or descriptor["source_container_id"]
+                    != str(journal["old_full_container_id"]).lower()
+                    or descriptor["source_database_name"]
+                    != str(journal["database_name"])
+                ):
+                    raise BrokerError(
+                        "database_backup_unavailable",
+                        "Replacement backup evidence changed or no longer verifies strongly.",
+                        operation_id=request.operation_id,
+                    )
+                if str(journal["phase"]) == "rebound":
+                    connection.execute(
+                        """
+                        UPDATE broker_runtime_replacements
+                        SET phase = 'restore_intent', updated_at = ?
+                        WHERE operation_id = ? AND phase = 'rebound'
+                        """,
+                        (timestamp, request.operation_id),
+                    )
+                saved_result = None
+                if journal["restore_result_json"] is not None:
+                    decoded = json.loads(str(journal["restore_result_json"]))
+                    if not isinstance(decoded, dict):
+                        raise BrokerError(
+                            "operation_evidence_corrupt",
+                            "Replacement restore evidence has an invalid shape.",
+                            operation_id=request.operation_id,
+                        )
+                    saved_result = decoded
+                return (
+                    DatabaseMutationTarget(
+                        database_binding_id=str(
+                            target_row["database_binding_id"]
+                        ),
+                        docker_resource_id=str(target_row["docker_resource_id"]),
+                        full_container_id=str(
+                            target_row["full_container_id"]
+                        ).lower(),
+                        database_name=str(target_row["database_name"]),
+                        observation_revision=int(
+                            target_row["observation_revision"]
+                        ),
+                        control_generation=int(target_row["control_generation"]),
+                    ),
+                    RegisteredDatabaseBackup(
+                        database_backup_id=str(
+                            backup_row["database_backup_id"]
+                        ),
+                        database_binding_id=str(
+                            backup_row["database_binding_id"]
+                        ),
+                        artifact_path=str(descriptor["artifact_path"]),
+                        manifest_path=str(descriptor["manifest_path"]),
+                        artifact_sha256=str(descriptor["artifact_sha256"]),
+                    ),
+                    saved_result,
+                )
+
+    def save_runtime_replacement_restore_result(
+        self,
+        accepted: AcceptedBrokerRequest,
+        *,
+        result: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Journal completed replacement restore evidence before registration."""
+
+        request = accepted.request
+        try:
+            encoded = json.dumps(
+                dict(result),
+                ensure_ascii=True,
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        except (TypeError, ValueError) as exc:
+            raise BrokerError(
+                "invalid_backend_result",
+                "Replacement restore returned invalid JSON evidence.",
+                operation_id=request.operation_id,
+            ) from exc
+        if len(encoded.encode("utf-8")) > 64 * 1024:
+            raise BrokerError(
+                "invalid_backend_result",
+                "Replacement restore evidence exceeds its bounded journal.",
+                operation_id=request.operation_id,
+            )
+        timestamp = utc_timestamp()
+        with self._store() as store:
+            with store.immediate_transaction() as connection:
+                _validate_connection_request(
+                    connection, peer=accepted.peer, request=request
+                )
+                row = connection.execute(
+                    """
+                    SELECT phase, restore_result_json
+                    FROM broker_runtime_replacements
+                    WHERE operation_id = ? AND resource_kind = 'database_stack'
+                    """,
+                    (request.operation_id,),
+                ).fetchone()
+                if row is None or str(row["phase"]) not in {
+                    "restore_intent",
+                    "restore_complete",
+                    "terminal",
+                }:
+                    raise BrokerError(
+                        "operation_state_conflict",
+                        "Replacement restore has no matching durable intent.",
+                        operation_id=request.operation_id,
+                    )
+                if row["restore_result_json"] is not None:
+                    if str(row["restore_result_json"]) != encoded:
+                        raise BrokerError(
+                            "operation_id_conflict",
+                            "Replacement already has different restore evidence.",
+                            operation_id=request.operation_id,
+                        )
+                    return dict(result)
+                connection.execute(
+                    """
+                    UPDATE broker_runtime_replacements
+                    SET restore_result_json = ?, updated_at = ?
+                    WHERE operation_id = ? AND phase = 'restore_intent'
+                    """,
+                    (encoded, timestamp, request.operation_id),
+                )
+        return dict(result)
+
+    def complete_runtime_replacement_restore(
+        self,
+        accepted: AcceptedBrokerRequest,
+        *,
+        target: DatabaseMutationTarget,
+        backup: RegisteredDatabaseBackup,
+        result: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Register a strongly evidenced cross-incarnation restore exactly once."""
+
+        request = accepted.request
+        safety = result.get("safety_backup")
+        if not isinstance(safety, Mapping):
+            raise BrokerError(
+                "invalid_backend_result",
+                "Replacement restore omitted its mandatory safety backup.",
+                operation_id=request.operation_id,
+            )
+        safety_artifact = safety.get("backup")
+        safety_manifest = safety.get("manifest")
+        if not isinstance(safety_artifact, str) or not isinstance(
+            safety_manifest, str
+        ):
+            raise BrokerError(
+                "invalid_backend_result",
+                "Replacement restore safety-backup evidence is incomplete.",
+                operation_id=request.operation_id,
+            )
+        safety_descriptor = inspect_database_backup(
+            safety_artifact,
+            safety_manifest,
+            expected_uid=self.expected_uid,
+        )
+        if (
+            safety_descriptor["verification_status"] != "strong"
+            or safety_descriptor["source_container_id"]
+            != target.full_container_id
+            or safety_descriptor["source_database_name"]
+            != target.database_name
+        ):
+            raise BrokerError(
+                "invalid_backend_result",
+                "Replacement restore safety backup does not match the exact new target.",
+                operation_id=request.operation_id,
+            )
+        timestamp = utc_timestamp()
+        with self._store() as store:
+            with store.immediate_transaction() as connection:
+                _validate_connection_request(
+                    connection, peer=accepted.peer, request=request
+                )
+                journal = connection.execute(
+                    "SELECT * FROM broker_runtime_replacements WHERE operation_id = ?",
+                    (request.operation_id,),
+                ).fetchone()
+                if (
+                    journal is None
+                    or str(journal["phase"])
+                    not in {"restore_intent", "restore_complete", "terminal"}
+                    or str(journal["new_docker_resource_id"] or "")
+                    != target.docker_resource_id
+                    or str(journal["new_full_container_id"] or "").lower()
+                    != target.full_container_id
+                    or str(journal["database_backup_id"] or "")
+                    != backup.database_backup_id
+                    or str(journal["restore_result_json"] or "")
+                    != json.dumps(
+                        dict(result),
+                        ensure_ascii=True,
+                        allow_nan=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                ):
+                    raise BrokerError(
+                        "operation_state_conflict",
+                        "Replacement restore evidence no longer matches its exact journal.",
+                        operation_id=request.operation_id,
+                    )
+                if str(journal["phase"]) in {"restore_complete", "terminal"}:
+                    existing = connection.execute(
+                        """
+                        SELECT restore_event_id,
+                               safety_database_backup_id
+                        FROM database_restore_events
+                        WHERE restore_event_id = ?
+                        """,
+                        (
+                            deterministic_id(
+                                "database-restore-operation",
+                                request.operation_id,
+                            ),
+                        ),
+                    ).fetchone()
+                    if existing is None:
+                        raise BrokerError(
+                            "operation_evidence_corrupt",
+                            "Replacement restore journal lost its terminal event.",
+                            operation_id=request.operation_id,
+                        )
+                    return {
+                        "restore_event_id": str(existing["restore_event_id"]),
+                        "database_backup_id": backup.database_backup_id,
+                        "safety_database_backup_id": str(
+                            existing["safety_database_backup_id"]
+                        ),
+                        "database_binding_id": target.database_binding_id,
+                        "docker_resource_id": target.docker_resource_id,
+                        "database_name": target.database_name,
+                        "transactional": True,
+                        "status": "restored",
+                    }
+                safety_id = upsert_database_backup(
+                    connection, safety_descriptor
+                )
+                restore_event_id = record_successful_restore(
+                    connection,
+                    database_backup_id=backup.database_backup_id,
+                    target_container_id=target.full_container_id,
+                    target_database_name=target.database_name,
+                    result=result,
+                    safety_database_backup_id=safety_id,
+                    operation_id=request.operation_id,
+                )
+                connection.execute(
+                    """
+                    UPDATE broker_runtime_replacements
+                    SET phase = 'restore_complete', updated_at = ?
+                    WHERE operation_id = ? AND phase = 'restore_intent'
+                    """,
+                    (timestamp, request.operation_id),
+                )
+        return {
+            "restore_event_id": restore_event_id,
+            "database_backup_id": backup.database_backup_id,
+            "safety_database_backup_id": safety_id,
+            "database_binding_id": target.database_binding_id,
+            "docker_resource_id": target.docker_resource_id,
+            "database_name": target.database_name,
+            "transactional": True,
+            "status": "restored",
+        }
+
+    def finish_runtime_replacement(
+        self,
+        accepted: AcceptedBrokerRequest,
+        *,
+        result: Mapping[str, Any],
+    ) -> None:
+        """Commit the replacement report and terminal journal in one write."""
+
+        request = accepted.request
+        encoded = json.dumps(
+            dict(result),
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        timestamp = utc_timestamp()
+        with self._store() as store:
+            with store.immediate_transaction() as connection:
+                _validate_connection_request(
+                    connection, peer=accepted.peer, request=request
+                )
+                journal = connection.execute(
+                    "SELECT resource_kind, phase FROM broker_runtime_replacements WHERE operation_id = ?",
+                    (request.operation_id,),
+                ).fetchone()
+                expected_phase = (
+                    "restore_complete"
+                    if journal is not None
+                    and str(journal["resource_kind"]) == "database_stack"
+                    else "rebound"
+                )
+                if journal is None or str(journal["phase"]) not in {
+                    expected_phase,
+                    "terminal",
+                }:
+                    raise BrokerError(
+                        "operation_state_conflict",
+                        "Replacement cannot finish before identity and data preservation complete.",
+                        operation_id=request.operation_id,
+                    )
+                if str(journal["phase"]) == "terminal":
+                    return
+                operation = connection.execute(
+                    """
+                    UPDATE operations
+                    SET status = 'succeeded', phase = 'completed',
+                        result_json = ?, error_code = NULL,
+                        error_message = NULL, updated_at = ?,
+                        generation = generation + 1
+                    WHERE operation_id = ? AND status IN (
+                        'running', 'needs_attention'
+                    ) AND kind = 'broker.runtime.request'
+                    """,
+                    (encoded, timestamp, request.operation_id),
+                )
+                target = connection.execute(
+                    """
+                    UPDATE operation_targets
+                    SET status = 'succeeded', phase = 'completed',
+                        result_json = ?, error_json = NULL, finished_at = ?
+                    WHERE operation_id = ? AND ordinal = 0
+                      AND target_kind = 'container'
+                    """,
+                    (encoded, timestamp, request.operation_id),
+                )
+                if operation.rowcount != 1 or target.rowcount != 1:
+                    raise BrokerError(
+                        "operation_state_conflict",
+                        "Replacement terminal journal changed before commit.",
+                        operation_id=request.operation_id,
+                    )
+                connection.execute(
+                    """
+                    UPDATE broker_runtime_replacements
+                    SET phase = 'terminal', updated_at = ?
+                    WHERE operation_id = ?
+                    """,
+                    (timestamp, request.operation_id),
+                )
+                _settle_broker_runtime_session(
+                    connection,
+                    operation_id=request.operation_id,
+                    result=result,
+                    succeeded=True,
+                    timestamp=timestamp,
+                )
+
+    def rebind_runtime_replacement(
+        self,
+        accepted: AcceptedBrokerRequest,
+        *,
+        evidence: Mapping[str, Any],
+    ) -> RuntimeReplacementRecord:
+        """Atomically publish the new identity and retire the absent old one."""
+
+        request = accepted.request
+        snapshot_id = str(evidence.get("snapshot_id") or "")
+        timestamp = utc_timestamp()
+        with self._store() as store:
+            with store.immediate_transaction() as connection:
+                _validate_connection_request(
+                    connection, peer=accepted.peer, request=request
+                )
+                journal = connection.execute(
+                    "SELECT * FROM broker_runtime_replacements WHERE operation_id = ?",
+                    (request.operation_id,),
+                ).fetchone()
+                if journal is None:
+                    raise BrokerError(
+                        "operation_state_conflict",
+                        "Replacement has no durable preflight journal.",
+                        operation_id=request.operation_id,
+                    )
+                if str(journal["phase"]) in {
+                    "rebound",
+                    "restore_intent",
+                    "restore_complete",
+                    "terminal",
+                }:
+                    return _runtime_replacement_record(journal)
+                required_phase = (
+                    "backup_complete"
+                    if str(journal["resource_kind"]) == "database_stack"
+                    else "reserved"
+                )
+                if str(journal["phase"]) not in {required_phase, "recreated"}:
+                    raise BrokerError(
+                        "operation_state_conflict",
+                        "Replacement identity arrived in an invalid durable phase.",
+                        operation_id=request.operation_id,
+                    )
+                repository = connection.execute(
+                    "SELECT host_id FROM repositories WHERE repo_id = ?",
+                    (request.project_id,),
+                ).fetchone()
+                if repository is None:
+                    raise BrokerError(
+                        "repository_unavailable",
+                        "Replacement repository is unavailable.",
+                        operation_id=request.operation_id,
+                    )
+                _require_exact_full_docker_snapshot(
+                    connection,
+                    snapshot_id=snapshot_id,
+                    host_id=str(repository["host_id"]),
+                    expected_evidence=evidence,
+                    operation_id=request.operation_id,
+                    require_compose_asset_scope=True,
+                    error_code="runtime_replace_observation_incomplete",
+                    error_message=(
+                        "Replacement rebind requires one fresh complete Compose-aware Docker observation."
+                    ),
+                )
+                old_present = connection.execute(
+                    """
+                    SELECT 1 FROM observation_snapshot_resources
+                    WHERE snapshot_id = ? AND resource_kind = 'container'
+                      AND resource_id = ?
+                    """,
+                    (snapshot_id, str(journal["old_docker_resource_id"])),
+                ).fetchone()
+                definition = connection.execute(
+                    """
+                    SELECT project_name FROM broker_compose_definitions
+                    WHERE compose_definition_id = ? AND repo_id = ?
+                    """,
+                    (
+                        str(journal["compose_definition_id"]),
+                        request.project_id,
+                    ),
+                ).fetchone()
+                if definition is None:
+                    raise BrokerError(
+                        "runtime_replace_compose_scope_required",
+                        "Replacement Compose definition is no longer current.",
+                        operation_id=request.operation_id,
+                    )
+                candidates = list(
+                    connection.execute(
+                        """
+                        SELECT observed.docker_resource_id,
+                               observed.full_container_id,
+                               observed.lifecycle, observed.association_state,
+                               observed.associated_repo_id,
+                               docker.current_name, docker_observation.health,
+                               metadata.observation_revision AS control_generation,
+                               metadata.observation_revision
+                        FROM broker_observed_compose_containers observed
+                        JOIN docker_resources docker
+                          USING(docker_resource_id)
+                        JOIN docker_observations docker_observation
+                          USING(docker_resource_id)
+                        CROSS JOIN schema_metadata metadata
+                        WHERE observed.snapshot_id = ?
+                          AND observed.project_name = ?
+                          AND observed.service_name = ?
+                        ORDER BY observed.full_container_id
+                        """,
+                        (
+                            snapshot_id,
+                            str(definition["project_name"]),
+                            str(journal["compose_service"]),
+                        ),
+                    )
+                )
+                if (
+                    old_present is not None
+                    or len(candidates) != 1
+                    or str(candidates[0]["docker_resource_id"])
+                    == str(journal["old_docker_resource_id"])
+                    or str(candidates[0]["full_container_id"]).lower()
+                    == str(journal["old_full_container_id"]).lower()
+                    or re.fullmatch(
+                        r"[0-9a-f]{64}",
+                        str(candidates[0]["full_container_id"]).lower(),
+                    )
+                    is None
+                    or str(candidates[0]["lifecycle"]) != "running"
+                    or str(candidates[0]["association_state"]) != "exclusive"
+                    or str(
+                        candidates[0]["associated_repo_id"] or ""
+                    )
+                    != request.project_id
+                    or str(candidates[0]["health"] or "").lower()
+                    in {"starting", "unhealthy"}
+                ):
+                    raise BrokerError(
+                        "runtime_replace_identity_unproven",
+                        "Fresh observation did not prove one new healthy service identity and exact old-container absence.",
+                        operation_id=request.operation_id,
+                    )
+                current = candidates[0]
+                new_resource_id = str(current["docker_resource_id"])
+                new_full_id = str(current["full_container_id"]).lower()
+
+                new_database = None
+                new_database_observation = None
+                if str(journal["resource_kind"]) == "database_stack":
+                    new_database = connection.execute(
+                        """
+                        SELECT database_binding_id FROM database_bindings
+                        WHERE docker_resource_id = ? AND repo_id = ?
+                          AND database_name = ? AND engine_kind = 'postgresql'
+                        """,
+                        (
+                            new_resource_id,
+                            request.project_id,
+                            str(journal["database_name"]),
+                        ),
+                    ).fetchone()
+                    if new_database is not None:
+                        new_database_observation = connection.execute(
+                            """
+                            SELECT available, size_bytes, error_code,
+                                   error_message, sampled_at,
+                                   observation_fingerprint
+                            FROM database_observations
+                            WHERE database_binding_id = ?
+                              AND docker_resource_id = ?
+                            """,
+                            (
+                                str(new_database["database_binding_id"]),
+                                new_resource_id,
+                            ),
+                        ).fetchone()
+                    if new_database is None or new_database_observation is None:
+                        raise BrokerError(
+                            "runtime_replace_database_unobservable",
+                            "Fresh replacement observation did not publish the exact PostgreSQL database on the new container.",
+                            operation_id=request.operation_id,
+                        )
+
+                if str(journal["resource_kind"]) == "database_stack":
+                    assert new_database is not None
+                    assert new_database_observation is not None
+                    new_binding_id = str(new_database["database_binding_id"])
+                    old_binding_id = str(journal["database_binding_id"])
+                    connection.execute(
+                        "DELETE FROM database_observations WHERE database_binding_id = ?",
+                        (new_binding_id,),
+                    )
+                    connection.execute(
+                        "DELETE FROM database_bindings WHERE database_binding_id = ?",
+                        (new_binding_id,),
+                    )
+                    changed = connection.execute(
+                        """
+                        UPDATE database_bindings
+                        SET docker_resource_id = ?, updated_at = ?
+                        WHERE database_binding_id = ?
+                          AND docker_resource_id = ? AND repo_id = ?
+                        """,
+                        (
+                            new_resource_id,
+                            timestamp,
+                            old_binding_id,
+                            str(journal["old_docker_resource_id"]),
+                            request.project_id,
+                        ),
+                    ).rowcount
+                    if changed != 1:
+                        raise BrokerError(
+                            "runtime_replace_identity_changed",
+                            "Logical database binding changed before replacement rebind.",
+                            operation_id=request.operation_id,
+                        )
+                    connection.execute(
+                        """
+                        INSERT INTO database_observations(
+                            database_binding_id, docker_resource_id, available,
+                            size_bytes, error_code, error_message, sampled_at,
+                            observation_fingerprint
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(database_binding_id) DO UPDATE SET
+                            docker_resource_id = excluded.docker_resource_id,
+                            available = excluded.available,
+                            size_bytes = excluded.size_bytes,
+                            error_code = excluded.error_code,
+                            error_message = excluded.error_message,
+                            sampled_at = excluded.sampled_at,
+                            observation_fingerprint =
+                                excluded.observation_fingerprint
+                        """,
+                        (
+                            old_binding_id,
+                            new_resource_id,
+                            int(new_database_observation["available"]),
+                            new_database_observation["size_bytes"],
+                            new_database_observation["error_code"],
+                            new_database_observation["error_message"],
+                            str(new_database_observation["sampled_at"]),
+                            str(
+                                new_database_observation[
+                                    "observation_fingerprint"
+                                ]
+                            ),
+                        ),
+                    )
+                connection.execute(
+                    """
+                    UPDATE docker_resources
+                    SET repo_id = CASE
+                        WHEN docker_resource_id = ? THEN ?
+                        WHEN docker_resource_id = ? AND repo_id = ? THEN NULL
+                        ELSE repo_id END,
+                        updated_at = ?
+                    WHERE docker_resource_id IN (?, ?)
+                    """,
+                    (
+                        new_resource_id,
+                        request.project_id,
+                        str(journal["old_docker_resource_id"]),
+                        request.project_id,
+                        timestamp,
+                        new_resource_id,
+                        str(journal["old_docker_resource_id"]),
+                    ),
+                )
+
+                logical_resource_id = (
+                    new_resource_id
+                    if str(journal["resource_kind"]) == "docker"
+                    else str(journal["database_binding_id"])
+                )
+                target_material = {
+                    "resource_kind": str(journal["resource_kind"]),
+                    "docker_resource_id": new_resource_id,
+                    "full_container_id": new_full_id,
+                    "database_binding_id": (
+                        None
+                        if str(journal["resource_kind"]) == "docker"
+                        else str(journal["database_binding_id"])
+                    ),
+                    "database_name": (
+                        None
+                        if str(journal["resource_kind"]) == "docker"
+                        else str(journal["database_name"])
+                    ),
+                }
+                replacement_fingerprint = _runtime_target_fingerprint(
+                    target_material,
+                    requested_resource_id=logical_resource_id,
+                )
+                session = connection.execute(
+                    """
+                    SELECT session_id, ttl_seconds, kill_after_run
+                    FROM runtime_sessions
+                    WHERE operation_id = ? AND repo_id = ?
+                    """,
+                    (request.operation_id, request.project_id),
+                ).fetchone()
+                if session is None:
+                    raise BrokerError(
+                        "operation_state_conflict",
+                        "Replacement lost its durable cleanup session.",
+                        operation_id=request.operation_id,
+                    )
+                session_id = str(session["session_id"])
+                cleanup_disposition = (
+                    "removed"
+                    if session["ttl_seconds"] is not None
+                    or bool(session["kill_after_run"])
+                    else "retained"
+                )
+                identity = {
+                    "state": "created",
+                    "disposition": "session_created",
+                    "session_id": session_id,
+                    "operation_id": request.operation_id,
+                    "repository_id": request.project_id,
+                    "resource_kind": str(journal["resource_kind"]),
+                    "resource_id": logical_resource_id,
+                    "docker_resource_id": new_resource_id,
+                    "full_container_id": new_full_id,
+                    "database_binding_id": target_material[
+                        "database_binding_id"
+                    ],
+                    "database_name": target_material["database_name"],
+                    "immutable_fingerprint": replacement_fingerprint,
+                    "replaced": {
+                        "docker_resource_id": str(
+                            journal["old_docker_resource_id"]
+                        ),
+                        "full_container_id": str(
+                            journal["old_full_container_id"]
+                        ).lower(),
+                    },
+                }
+                connection.execute(
+                    """
+                    DELETE FROM runtime_session_resources
+                    WHERE session_id = ?
+                    """,
+                    (session_id,),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO runtime_session_resources(
+                        session_id, resource_kind, resource_id,
+                        immutable_fingerprint, identity_json,
+                        cleanup_disposition, cleanup_state, linked_at,
+                        updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?)
+                    """,
+                    (
+                        session_id,
+                        str(journal["resource_kind"]),
+                        logical_resource_id,
+                        replacement_fingerprint,
+                        json.dumps(
+                            identity,
+                            ensure_ascii=True,
+                            allow_nan=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ),
+                        cleanup_disposition,
+                        timestamp,
+                        timestamp,
+                    ),
+                )
+                connection.execute(
+                    """
+                    UPDATE broker_runtime_replacements
+                    SET new_docker_resource_id = ?,
+                        new_full_container_id = ?, phase = 'rebound',
+                        updated_at = ?
+                    WHERE operation_id = ?
+                    """,
+                    (
+                        new_resource_id,
+                        new_full_id,
+                        timestamp,
+                        request.operation_id,
+                    ),
+                )
+                final = connection.execute(
+                    "SELECT * FROM broker_runtime_replacements WHERE operation_id = ?",
+                    (request.operation_id,),
+                ).fetchone()
+                assert final is not None
+                return _runtime_replacement_record(final)
+
+    def runtime_session_cleanup_target(
+        self, resource: Mapping[str, Any]
+    ) -> RuntimeSessionCleanupTarget:
+        """Resolve one claimed session resource back to its sealed native ID."""
+
+        try:
+            identity = json.loads(str(resource["identity_json"]))
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise BrokerError(
+                "runtime_cleanup_identity_invalid",
+                "Runtime cleanup resource has no valid sealed identity.",
+            ) from exc
+        if not isinstance(identity, Mapping):
+            raise BrokerError(
+                "runtime_cleanup_identity_invalid",
+                "Runtime cleanup resource has no valid sealed identity.",
+            )
+        session_id = str(identity.get("session_id") or "")
+        repo_id = str(identity.get("repository_id") or "")
+        operation_id = str(identity.get("operation_id") or "")
+        resource_kind = str(resource.get("resource_kind") or "")
+        resource_id = str(resource.get("resource_id") or "")
+        if (
+            not session_id
+            or not repo_id
+            or not operation_id
+            or resource_kind not in {"docker", "database_stack"}
+            or identity.get("resource_kind") != resource_kind
+            or identity.get("resource_id") != resource_id
+            or identity.get("immutable_fingerprint")
+            != resource.get("immutable_fingerprint")
+        ):
+            raise BrokerError(
+                "runtime_cleanup_identity_invalid",
+                "Runtime cleanup resource contradicted its sealed identity.",
+                operation_id=operation_id or None,
+            )
+        with self._store() as store:
+            with store.read_transaction() as connection:
+                session = connection.execute(
+                    """
+                    SELECT status FROM runtime_sessions
+                    WHERE session_id = ? AND operation_id = ? AND repo_id = ?
+                    """,
+                    (session_id, operation_id, repo_id),
+                ).fetchone()
+                link = connection.execute(
+                    """
+                    SELECT cleanup_disposition, cleanup_state,
+                           immutable_fingerprint, identity_json
+                    FROM runtime_session_resources
+                    WHERE session_id = ? AND resource_kind = ? AND resource_id = ?
+                    """,
+                    (session_id, resource_kind, resource_id),
+                ).fetchone()
+                row = _runtime_cleanup_mutation_row(
+                    connection,
+                    repo_id=repo_id,
+                    resource_kind=resource_kind,
+                    resource_id=resource_id,
+                    operation_id=operation_id,
+                )
+                fingerprint_value = _runtime_target_fingerprint(
+                    row, requested_resource_id=resource_id
+                )
+                if (
+                    session is None
+                    or session["status"] != "cleaning"
+                    or link is None
+                    or link["cleanup_disposition"]
+                    not in {"retained", "removed"}
+                    or link["cleanup_state"] != "cleaning"
+                    or str(link["immutable_fingerprint"]) != fingerprint_value
+                    or str(link["identity_json"]) != str(resource["identity_json"])
+                    or fingerprint_value != str(resource["immutable_fingerprint"])
+                ):
+                    raise BrokerError(
+                        "runtime_cleanup_identity_changed",
+                        "Runtime cleanup target changed after its exact claim.",
+                        operation_id=operation_id,
+                    )
+                target = RuntimeDockerMutationTarget(
+                    resource_kind=str(row["resource_kind"]),
+                    resource_id=resource_id,
+                    docker_resource_id=str(row["docker_resource_id"]),
+                    full_container_id=str(row["full_container_id"]).lower(),
+                    database_binding_id=(
+                        None
+                        if row["database_binding_id"] is None
+                        else str(row["database_binding_id"])
+                    ),
+                    database_name=(
+                        None
+                        if row["database_name"] is None
+                        else str(row["database_name"])
+                    ),
+                    observation_revision=int(row["observation_revision"]),
+                    control_generation=int(row["control_generation"]),
+                    immutable_fingerprint=fingerprint_value,
+                )
+        return RuntimeSessionCleanupTarget(
+            session_id=session_id,
+            operation_id=operation_id,
+            repo_id=repo_id,
+            cleanup_disposition=str(link["cleanup_disposition"]),
+            target=target,
+        )
+
+    def verify_runtime_session_stopped(
+        self, cleanup: RuntimeSessionCleanupTarget
+    ) -> dict[str, Any]:
+        """Prove the same immutable container is now observably stopped."""
+
+        with self._store() as store:
+            with store.read_transaction() as connection:
+                row = _runtime_cleanup_mutation_row(
+                    connection,
+                    repo_id=cleanup.repo_id,
+                    resource_kind=cleanup.target.resource_kind,
+                    resource_id=cleanup.target.resource_id,
+                    operation_id=cleanup.operation_id,
+                )
+                current_fingerprint = _runtime_target_fingerprint(
+                    row, requested_resource_id=cleanup.target.resource_id
+                )
+                observation = connection.execute(
+                    """
+                    SELECT lifecycle, sampled_at FROM docker_observations
+                    WHERE docker_resource_id = ?
+                    """,
+                    (cleanup.target.docker_resource_id,),
+                ).fetchone()
+        if (
+            current_fingerprint != cleanup.target.immutable_fingerprint
+            or str(row["full_container_id"]).lower()
+            != cleanup.target.full_container_id
+            or observation is None
+            or str(observation["lifecycle"]).lower() != "stopped"
+        ):
+            raise BrokerError(
+                "runtime_cleanup_not_terminal",
+                "Runtime expiry cleanup did not prove the exact container stopped.",
+                operation_id=cleanup.operation_id,
+            )
+        return {
+            "resource_kind": cleanup.target.resource_kind,
+            "resource_id": cleanup.target.resource_id,
+            "docker_resource_id": cleanup.target.docker_resource_id,
+            "full_container_id": cleanup.target.full_container_id,
+            "lifecycle": "stopped",
+            "sampled_at": str(observation["sampled_at"]),
+        }
+
+    def verify_runtime_session_removed(
+        self,
+        cleanup: RuntimeSessionCleanupTarget,
+        *,
+        evidence: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Prove created identity absent before active-catalog retirement."""
+
+        snapshot_id = str(evidence.get("snapshot_id") or "")
+        with self._store() as store:
+            with store.read_transaction() as connection:
+                repository = connection.execute(
+                    "SELECT host_id FROM repositories WHERE repo_id = ?",
+                    (cleanup.repo_id,),
+                ).fetchone()
+                if repository is None:
+                    raise BrokerError(
+                        "runtime_cleanup_identity_changed",
+                        "Runtime cleanup repository disappeared.",
+                        operation_id=cleanup.operation_id,
+                    )
+                _require_exact_full_docker_snapshot(
+                    connection,
+                    snapshot_id=snapshot_id,
+                    host_id=str(repository["host_id"]),
+                    expected_evidence=evidence,
+                    operation_id=cleanup.operation_id,
+                    require_compose_asset_scope=False,
+                    error_code="runtime_cleanup_observation_incomplete",
+                    error_message=(
+                        "Created-resource cleanup requires one fresh complete Docker observation."
+                    ),
+                )
+                present = connection.execute(
+                    """
+                    SELECT 1 FROM observation_snapshot_resources
+                    WHERE snapshot_id = ? AND resource_kind = 'container'
+                      AND resource_id = ?
+                    """,
+                    (snapshot_id, cleanup.target.docker_resource_id),
+                ).fetchone()
+        if present is not None:
+            raise BrokerError(
+                "runtime_cleanup_not_terminal",
+                "Created replacement container remains present after removal.",
+                operation_id=cleanup.operation_id,
+            )
+        return {
+            "resource_kind": cleanup.target.resource_kind,
+            "resource_id": cleanup.target.resource_id,
+            "docker_resource_id": cleanup.target.docker_resource_id,
+            "full_container_id": cleanup.target.full_container_id,
+            "lifecycle": "absent",
+            "snapshot_id": snapshot_id,
+        }
+
     def runtime_docker_read_target(
-        self, authorized: AuthorizedBrokerRequest
+        self, accepted: AcceptedBrokerRequest
     ) -> RuntimeDockerMutationTarget:
         """Reauthorize one read-only runtime request to an exact container."""
 
-        request = authorized.request
+        request = accepted.request
         if (
             request.operation is not BrokerOperation.RUNTIME_REQUEST
             or request.arguments["action"] != "capture_logs"
@@ -8228,8 +7355,8 @@ class BrokerPersistence:
             raise ValueError("request is not a Docker-backed runtime log read")
         with self._store() as store:
             with store.read_transaction() as connection:
-                _authorize_connection(
-                    connection, peer=authorized.peer, request=request
+                _validate_connection_request(
+                    connection, peer=accepted.peer, request=request
                 )
                 row = _runtime_mutation_row(connection, request=request)
                 return RuntimeDockerMutationTarget(
@@ -8255,31 +7382,25 @@ class BrokerPersistence:
                 )
 
     def database_target(
-        self, authorized: AuthorizedBrokerRequest
+        self, accepted: AcceptedBrokerRequest
     ) -> DatabaseMutationTarget:
-        request = authorized.request
+        request = accepted.request
         if request.operation not in _DATABASE_OPERATIONS:
             raise ValueError("request is not a database operation")
         with self._store() as store:
             with store.read_transaction() as connection:
-                _authorize_connection(connection, peer=authorized.peer, request=request)
+                _validate_connection_request(connection, peer=accepted.peer, request=request)
                 row = connection.execute(
                     """
                     SELECT db.database_binding_id, db.docker_resource_id,
                            db.database_name, d.full_container_id,
-                           c.generation AS control_generation,
+                           m.observation_revision AS control_generation,
                            m.observation_revision
                     FROM database_bindings db
                     JOIN docker_resources d USING(docker_resource_id)
-                    JOIN repository_memberships r
-                      ON r.repo_id = db.repo_id
-                     AND r.resource_kind = 'container'
-                     AND r.host_resource_id = db.docker_resource_id
-                    JOIN control_bindings c ON c.binding_id = r.control_binding_id
                     CROSS JOIN schema_metadata m
                     WHERE db.repo_id = ? AND db.docker_resource_id = ?
                       AND db.database_name = ? AND db.engine_kind = 'postgresql'
-                      AND c.authority_state = 'authoritative'
                     """,
                     (
                         request.project_id,
@@ -8289,8 +7410,8 @@ class BrokerPersistence:
                 ).fetchone()
                 if row is None:
                     raise BrokerError(
-                        "control_binding_unavailable",
-                        "PostgreSQL database no longer has one authoritative enrolled container binding.",
+                        "resource_unavailable",
+                        "PostgreSQL database no longer resolves to the requested current container.",
                         operation_id=request.operation_id,
                     )
                 current_fingerprint = _database_target_fingerprint(row)
@@ -8318,7 +7439,7 @@ class BrokerPersistence:
                     ):
                         raise BrokerError(
                             "database_backup_unavailable",
-                            "Restore backup no longer matches the exact enrolled container identity.",
+                            "Restore backup no longer matches the exact configured container identity.",
                             operation_id=request.operation_id,
                         )
                 return DatabaseMutationTarget(
@@ -8332,12 +7453,12 @@ class BrokerPersistence:
 
     def save_database_host_result(
         self,
-        authorized: AuthorizedBrokerRequest,
+        accepted: AcceptedBrokerRequest,
         result: Mapping[str, Any],
     ) -> dict[str, Any]:
         """Journal completed host evidence before normalized registry commit."""
 
-        request = authorized.request
+        request = accepted.request
         if request.operation not in _DATABASE_OPERATIONS:
             raise ValueError("request is not a database operation")
         try:
@@ -8365,7 +7486,7 @@ class BrokerPersistence:
         )
         with self._store() as store:
             with store.immediate_transaction() as connection:
-                _authorize_connection(connection, peer=authorized.peer, request=request)
+                _validate_connection_request(connection, peer=accepted.peer, request=request)
                 operation = connection.execute(
                     "SELECT status FROM operations WHERE operation_id = ?",
                     (request.operation_id,),
@@ -8410,16 +7531,16 @@ class BrokerPersistence:
         return dict(result)
 
     def database_host_result(
-        self, authorized: AuthorizedBrokerRequest
+        self, accepted: AcceptedBrokerRequest
     ) -> dict[str, Any] | None:
         """Load replayable host evidence for one authenticated pending operation."""
 
-        request = authorized.request
+        request = accepted.request
         if request.operation not in _DATABASE_OPERATIONS:
             raise ValueError("request is not a database operation")
         with self._store() as store:
             with store.read_transaction() as connection:
-                _authorize_connection(connection, peer=authorized.peer, request=request)
+                _validate_connection_request(connection, peer=accepted.peer, request=request)
                 row = connection.execute(
                     """
                     SELECT h.result_json, h.result_fingerprint
@@ -8450,13 +7571,13 @@ class BrokerPersistence:
 
     def docker_observation_result(
         self,
-        authorized: AuthorizedBrokerRequest,
+        accepted: AcceptedBrokerRequest,
         target: DockerMutationTarget,
     ) -> dict[str, Any]:
-        request = authorized.request
+        request = accepted.request
         with self._store() as store:
             with store.read_transaction() as connection:
-                _authorize_connection(connection, peer=authorized.peer, request=request)
+                _validate_connection_request(connection, peer=accepted.peer, request=request)
                 row = connection.execute(
                     """
                     SELECT d.docker_resource_id, d.full_container_id,
@@ -8465,18 +7586,12 @@ class BrokerPersistence:
                            o.observation_fingerprint,
                            m.observation_revision
                     FROM docker_resources d
-                    JOIN repository_memberships r
-                      ON r.repo_id = ? AND r.resource_kind = 'container'
-                     AND r.host_resource_id = d.docker_resource_id
-                    JOIN control_bindings b ON b.binding_id = r.control_binding_id
                     JOIN docker_observations o USING(docker_resource_id)
                     CROSS JOIN schema_metadata m
                     WHERE d.docker_resource_id = ?
                       AND lower(d.full_container_id) = lower(?)
-                      AND b.authority_state = 'authoritative'
                     """,
                     (
-                        request.project_id,
                         target.docker_resource_id,
                         target.full_container_id,
                     ),
@@ -8496,13 +7611,13 @@ class BrokerPersistence:
 
     def repository_container_observations(
         self,
-        authorized: AuthorizedBrokerRequest,
+        accepted: AcceptedBrokerRequest,
         *,
         snapshot_id: str,
     ) -> list[dict[str, Any]]:
         """Project containers present in one exact completed Docker snapshot."""
 
-        request = authorized.request
+        request = accepted.request
         if request.operation not in {
             BrokerOperation.COMPOSE_UP,
             BrokerOperation.COMPOSE_STOP,
@@ -8514,8 +7629,8 @@ class BrokerPersistence:
             raise ValueError("Compose observation projection requires a snapshot ID")
         with self._store() as store:
             with store.read_transaction() as connection:
-                _authorize_connection(
-                    connection, peer=authorized.peer, request=request
+                _validate_connection_request(
+                    connection, peer=accepted.peer, request=request
                 )
                 snapshot = connection.execute(
                     """
@@ -8549,18 +7664,14 @@ class BrokerPersistence:
                                o.sampled_at AS current_sampled_at,
                                o.observation_fingerprint
                                    AS current_observation_fingerprint
-                        FROM repository_memberships r
-                        JOIN docker_resources d
-                          ON d.docker_resource_id = r.host_resource_id
+                        FROM docker_resources d
                         JOIN docker_engines e USING(engine_id)
-                        JOIN control_bindings b ON b.binding_id = r.control_binding_id
                         JOIN docker_observations o USING(docker_resource_id)
                         JOIN observation_snapshot_resources present
                           ON present.snapshot_id = ?
                          AND present.resource_kind = 'container'
                          AND present.resource_id = d.docker_resource_id
-                        WHERE r.repo_id = ? AND r.resource_kind = 'container'
-                          AND b.authority_state = 'authoritative'
+                        WHERE d.repo_id = ?
                           AND e.host_id = ?
                         ORDER BY d.current_name, d.full_container_id
                         """,
@@ -8568,17 +7679,94 @@ class BrokerPersistence:
                     )
                 ]
 
+    def compose_service_observation(
+        self,
+        accepted: AcceptedBrokerRequest,
+        *,
+        snapshot_id: str,
+        service: str,
+    ) -> dict[str, Any]:
+        """Return one snapshot-bound exact Compose service container identity."""
+
+        request = accepted.request
+        if request.operation is not BrokerOperation.COMPOSE_UP:
+            raise ValueError("request is not a Compose up operation")
+        service = _require_compose_service_name(service)
+        with self._store() as store:
+            with store.read_transaction() as connection:
+                _validate_connection_request(
+                    connection, peer=accepted.peer, request=request
+                )
+                definition = connection.execute(
+                    """
+                    SELECT project_name FROM broker_compose_definitions
+                    WHERE compose_definition_id = ? AND repo_id = ?
+                      AND enabled = 1
+                      AND EXISTS (
+                        SELECT 1 FROM broker_compose_services scoped
+                        WHERE scoped.compose_definition_id =
+                              broker_compose_definitions.compose_definition_id
+                          AND scoped.service_name = ?
+                      )
+                    """,
+                    (request.resource_id, request.project_id, service),
+                ).fetchone()
+                if definition is None:
+                    raise BrokerError(
+                        "compose_service_scope_required",
+                        "Exact Compose observation requires one configured lifecycle service.",
+                        operation_id=request.operation_id,
+                    )
+                rows = list(
+                    connection.execute(
+                        """
+                        SELECT observed.docker_resource_id,
+                               observed.full_container_id,
+                               resource.current_name,
+                               observed.snapshot_id,
+                               observed.lifecycle,
+                               observation.health,
+                               observation.sampled_at,
+                               observed.observation_fingerprint
+                        FROM broker_observed_compose_containers observed
+                        LEFT JOIN docker_resources resource
+                          USING(docker_resource_id)
+                        LEFT JOIN docker_observations observation
+                          USING(docker_resource_id)
+                        WHERE observed.snapshot_id = ?
+                          AND observed.service_name = ?
+                          AND observed.project_name = ?
+                          AND observed.association_state = 'exclusive'
+                          AND observed.associated_repo_id = ?
+                        ORDER BY observed.full_container_id
+                        """,
+                        (
+                            snapshot_id,
+                            service,
+                            str(definition["project_name"]),
+                            request.project_id,
+                        ),
+                    )
+                )
+                if len(rows) != 1:
+                    raise BrokerError(
+                        "compose_service_identity_unobservable",
+                        "Fresh observation did not prove one exact Compose service container.",
+                        operation_id=request.operation_id,
+                    )
+                return {"service": service, **dict(rows[0])}
+
     def registered_database_backup(
         self,
-        authorized: AuthorizedBrokerRequest,
+        accepted: AcceptedBrokerRequest,
         target: DatabaseMutationTarget,
     ) -> RegisteredDatabaseBackup:
-        request = authorized.request
+        request = accepted.request
         if request.operation != BrokerOperation.DATABASE_RESTORE:
             raise ValueError("request is not a database restore")
         with self._store() as store:
             with store.read_transaction() as connection:
-                _authorize_connection(connection, peer=authorized.peer, request=request)
+                _validate_connection_request(connection, peer=accepted.peer, request=request)
                 row = connection.execute(
                     """
                     SELECT database_backup_id, database_binding_id,
@@ -8630,7 +7818,7 @@ class BrokerPersistence:
 
     def register_database_backup_result(
         self,
-        authorized: AuthorizedBrokerRequest,
+        accepted: AcceptedBrokerRequest,
         target: DatabaseMutationTarget,
         result: Mapping[str, Any],
     ) -> dict[str, Any]:
@@ -8640,7 +7828,7 @@ class BrokerPersistence:
             raise BrokerError(
                 "invalid_backend_result",
                 "PostgreSQL backup host action omitted its service-owned artifact evidence.",
-                operation_id=authorized.request.operation_id,
+                operation_id=accepted.request.operation_id,
             )
         descriptor = inspect_database_backup(
             artifact, manifest, expected_uid=self.expected_uid
@@ -8655,14 +7843,14 @@ class BrokerPersistence:
             raise BrokerError(
                 "invalid_backend_result",
                 "PostgreSQL backup host action did not produce a strongly verified artifact for the exact target.",
-                operation_id=authorized.request.operation_id,
+                operation_id=accepted.request.operation_id,
             )
         with self._store() as store:
             with store.immediate_transaction() as connection:
-                _authorize_connection(
+                _validate_connection_request(
                     connection,
-                    peer=authorized.peer,
-                    request=authorized.request,
+                    peer=accepted.peer,
+                    request=accepted.request,
                 )
                 backup_id = upsert_database_backup(connection, descriptor)
                 row = connection.execute(
@@ -8680,7 +7868,7 @@ class BrokerPersistence:
                     raise BrokerError(
                         "invalid_backend_result",
                         "Verified backup could not be bound to the exact normalized database.",
-                        operation_id=authorized.request.operation_id,
+                        operation_id=accepted.request.operation_id,
                     )
         return {
             "database_backup_id": backup_id,
@@ -8693,7 +7881,7 @@ class BrokerPersistence:
 
     def register_database_restore_result(
         self,
-        authorized: AuthorizedBrokerRequest,
+        accepted: AcceptedBrokerRequest,
         target: DatabaseMutationTarget,
         backup: RegisteredDatabaseBackup,
         result: Mapping[str, Any],
@@ -8703,7 +7891,7 @@ class BrokerPersistence:
             raise BrokerError(
                 "invalid_backend_result",
                 "Transactional PostgreSQL restore omitted its mandatory safety backup.",
-                operation_id=authorized.request.operation_id,
+                operation_id=accepted.request.operation_id,
             )
         safety_artifact = safety.get("backup")
         safety_manifest = safety.get("manifest")
@@ -8711,7 +7899,7 @@ class BrokerPersistence:
             raise BrokerError(
                 "invalid_backend_result",
                 "Transactional PostgreSQL restore safety backup evidence is incomplete.",
-                operation_id=authorized.request.operation_id,
+                operation_id=accepted.request.operation_id,
             )
         safety_descriptor = inspect_database_backup(
             safety_artifact, safety_manifest, expected_uid=self.expected_uid
@@ -8724,14 +7912,14 @@ class BrokerPersistence:
             raise BrokerError(
                 "invalid_backend_result",
                 "Transactional PostgreSQL restore safety backup does not match the exact target.",
-                operation_id=authorized.request.operation_id,
+                operation_id=accepted.request.operation_id,
             )
         with self._store() as store:
             with store.immediate_transaction() as connection:
-                _authorize_connection(
+                _validate_connection_request(
                     connection,
-                    peer=authorized.peer,
-                    request=authorized.request,
+                    peer=accepted.peer,
+                    request=accepted.request,
                 )
                 safety_id = upsert_database_backup(connection, safety_descriptor)
                 restore_event_id = record_successful_restore(
@@ -8741,6 +7929,7 @@ class BrokerPersistence:
                     target_database_name=target.database_name,
                     result=result,
                     safety_database_backup_id=safety_id,
+                    operation_id=accepted.request.operation_id,
                 )
         return {
             "restore_event_id": restore_event_id,
@@ -8754,12 +7943,12 @@ class BrokerPersistence:
         }
 
     def compose_target(
-        self, authorized: AuthorizedBrokerRequest
+        self, accepted: AcceptedBrokerRequest
     ) -> ComposeMutationTarget:
-        request = authorized.request
+        request = accepted.request
         with self._store() as store:
             with store.read_transaction() as connection:
-                _authorize_connection(connection, peer=authorized.peer, request=request)
+                _validate_connection_request(connection, peer=accepted.peer, request=request)
                 row = connection.execute(
                     """
                     SELECT d.compose_definition_id, d.repo_id, d.cwd,
@@ -8791,7 +7980,7 @@ class BrokerPersistence:
                 ).fetchone()
                 if row is None:
                     raise BrokerError(
-                        "control_binding_unavailable",
+                        "resource_identity_unavailable",
                         "Compose definition no longer belongs to the exact repository.",
                         operation_id=request.operation_id,
                     )
@@ -8808,7 +7997,7 @@ class BrokerPersistence:
                 if not bool(row["claimed"]):
                     raise BrokerError(
                         "compose_project_name_released",
-                        "Compose project-name authority was released; reenroll before any lifecycle mutation.",
+                        "Compose project-name binding was released; reconfigure before any lifecycle mutation.",
                         operation_id=request.operation_id,
                     )
                 if any(
@@ -8830,7 +8019,7 @@ class BrokerPersistence:
                 ) != str(row["definition_fingerprint"]):
                     raise BrokerError(
                         "compose_effective_model_required",
-                        "Compose definition lacks an exact merged-model enrollment proof.",
+                        "Compose definition lacks an exact merged-model configuration proof.",
                         operation_id=request.operation_id,
                     )
                 files = tuple(
@@ -8895,6 +8084,25 @@ class BrokerPersistence:
                         "compose_run_once_image_unbound",
                         "Every Compose run-once service requires one sealed image reference.",
                         operation_id=request.operation_id,
+                    )
+                recreate_service: str | None = None
+                wait_timeout_seconds: int | None = None
+                if request.arguments.get("force_recreate") is True:
+                    recreate_service = str(request.arguments["service"])
+                    if recreate_service not in services:
+                        raise BrokerError(
+                            "compose_service_scope_required",
+                            "Exact Compose recreation requires one configured lifecycle service.",
+                            operation_id=request.operation_id,
+                        )
+                    if dict(service_replicas).get(recreate_service) != 1:
+                        raise BrokerError(
+                            "compose_service_replica_ambiguous",
+                            "Exact Compose recreation requires a single-replica service.",
+                            operation_id=request.operation_id,
+                        )
+                    wait_timeout_seconds = int(
+                        request.arguments["wait_timeout_seconds"]
                     )
                 effective_risks = _require_string_list_evidence(
                     row["host_access_risks_json"],
@@ -9045,23 +8253,25 @@ class BrokerPersistence:
                     definition_generation=int(row["definition_generation"]),
                     repository_generation=int(row["repository_generation"]),
                     owner_uid=int(repository_info.st_uid),
+                    recreate_service=recreate_service,
+                    wait_timeout_seconds=wait_timeout_seconds,
                 )
 
     def compose_run_once_target(
         self,
-        authorized: AuthorizedBrokerRequest,
+        accepted: AcceptedBrokerRequest,
     ) -> ComposeRunOnceMutationTarget:
         """Load one exact resumable one-shot phase without exposing raw output."""
 
-        request = authorized.request
+        request = accepted.request
         if request.operation is not BrokerOperation.COMPOSE_RUN_ONCE:
             raise ValueError("request is not a Compose run-once operation")
-        compose = self.compose_target(authorized)
+        compose = self.compose_target(accepted)
         with self._store() as store:
             with store.read_transaction() as connection:
-                _authorize_connection(
+                _validate_connection_request(
                     connection,
-                    peer=authorized.peer,
+                    peer=accepted.peer,
                     request=request,
                 )
                 row = _compose_run_once_attempt_connection(
@@ -9212,17 +8422,17 @@ class BrokerPersistence:
                 )
 
     def mark_compose_run_once_image_bind_intent(
-        self, authorized: AuthorizedBrokerRequest
+        self, accepted: AcceptedBrokerRequest
     ) -> None:
         self._advance_compose_run_once(
-            authorized,
+            accepted,
             expected_phases=("reserved",),
             next_phase="image_bind_intent",
         )
 
     def bind_compose_run_once_image(
         self,
-        authorized: AuthorizedBrokerRequest,
+        accepted: AcceptedBrokerRequest,
         *,
         image_id: str,
     ) -> None:
@@ -9231,24 +8441,24 @@ class BrokerPersistence:
         ) is None:
             raise ValueError("Compose run-once image ID is invalid")
         self._advance_compose_run_once(
-            authorized,
+            accepted,
             expected_phases=("image_bind_intent",),
             next_phase="image_bound",
             updates={"expected_image_id": image_id},
         )
 
     def mark_compose_run_once_create_intent(
-        self, authorized: AuthorizedBrokerRequest
+        self, accepted: AcceptedBrokerRequest
     ) -> None:
         self._advance_compose_run_once(
-            authorized,
+            accepted,
             expected_phases=("image_bound",),
             next_phase="create_intent",
         )
 
     def bind_compose_run_once_container(
         self,
-        authorized: AuthorizedBrokerRequest,
+        accepted: AcceptedBrokerRequest,
         *,
         full_container_id: str,
         image_id: str,
@@ -9264,60 +8474,60 @@ class BrokerPersistence:
             with store.read_transaction() as connection:
                 row = _compose_run_once_attempt_connection(
                     connection,
-                    request=authorized.request,
+                    request=accepted.request,
                 )
                 if str(row["expected_image_id"] or "") != image_id:
                     raise BrokerError(
                         "compose_run_once_image_mismatch",
                         "Created one-shot container does not use the bound image.",
-                        operation_id=authorized.request.operation_id,
+                        operation_id=accepted.request.operation_id,
                     )
         self._advance_compose_run_once(
-            authorized,
+            accepted,
             expected_phases=("create_intent",),
             next_phase="container_bound",
             updates={"full_container_id": normalized_id},
         )
 
     def mark_compose_run_once_start_intent(
-        self, authorized: AuthorizedBrokerRequest
+        self, accepted: AcceptedBrokerRequest
     ) -> None:
         self._advance_compose_run_once(
-            authorized,
+            accepted,
             expected_phases=("container_bound",),
             next_phase="start_intent",
         )
 
     def mark_compose_run_once_started(
-        self, authorized: AuthorizedBrokerRequest
+        self, accepted: AcceptedBrokerRequest
     ) -> None:
         self._advance_compose_run_once(
-            authorized,
+            accepted,
             expected_phases=("start_intent",),
             next_phase="started",
         )
 
     def mark_compose_run_once_wait_intent(
-        self, authorized: AuthorizedBrokerRequest
+        self, accepted: AcceptedBrokerRequest
     ) -> None:
         self._advance_compose_run_once(
-            authorized,
+            accepted,
             expected_phases=("started",),
             next_phase="wait_intent",
         )
 
     def mark_compose_run_once_stop_intent(
-        self, authorized: AuthorizedBrokerRequest
+        self, accepted: AcceptedBrokerRequest
     ) -> None:
         self._advance_compose_run_once(
-            authorized,
+            accepted,
             expected_phases=("wait_intent",),
             next_phase="stop_intent",
         )
 
     def record_compose_run_once_terminal(
         self,
-        authorized: AuthorizedBrokerRequest,
+        accepted: AcceptedBrokerRequest,
         *,
         exit_code: int | None,
         timed_out: bool,
@@ -9339,7 +8549,7 @@ class BrokerPersistence:
         ):
             raise ValueError("Compose run-once terminal error code is invalid")
         self._advance_compose_run_once(
-            authorized,
+            accepted,
             expected_phases=(
                 "create_intent",
                 "start_intent",
@@ -9356,17 +8566,17 @@ class BrokerPersistence:
         )
 
     def mark_compose_run_once_evidence_intent(
-        self, authorized: AuthorizedBrokerRequest
+        self, accepted: AcceptedBrokerRequest
     ) -> None:
         self._advance_compose_run_once(
-            authorized,
+            accepted,
             expected_phases=("terminal",),
             next_phase="evidence_intent",
         )
 
     def record_compose_run_once_evidence(
         self,
-        authorized: AuthorizedBrokerRequest,
+        accepted: AcceptedBrokerRequest,
         *,
         published_receipt: PublishedReceipt,
         stdout_sha256: str,
@@ -9403,7 +8613,7 @@ class BrokerPersistence:
             )
         )
         self._advance_compose_run_once(
-            authorized,
+            accepted,
             expected_phases=("evidence_intent",),
             next_phase="evidence_captured",
             updates={
@@ -9419,33 +8629,33 @@ class BrokerPersistence:
         )
 
     def mark_compose_run_once_cleanup_intent(
-        self, authorized: AuthorizedBrokerRequest
+        self, accepted: AcceptedBrokerRequest
     ) -> None:
         self._advance_compose_run_once(
-            authorized,
+            accepted,
             expected_phases=("evidence_captured",),
             next_phase="cleanup_intent",
         )
 
     def mark_compose_run_once_cleaned(
         self,
-        authorized: AuthorizedBrokerRequest,
+        accepted: AcceptedBrokerRequest,
         *,
         cleanup_status: str,
     ) -> None:
         if cleanup_status not in {"removed", "not_created"}:
             raise ValueError("Compose run-once cleanup status is invalid")
         self._advance_compose_run_once(
-            authorized,
+            accepted,
             expected_phases=("cleanup_intent",),
             next_phase="cleaned",
             updates={"cleanup_status": cleanup_status},
         )
 
     def compose_run_once_public_result(
-        self, authorized: AuthorizedBrokerRequest
+        self, accepted: AcceptedBrokerRequest
     ) -> dict[str, Any]:
-        target = self.compose_run_once_target(authorized)
+        target = self.compose_run_once_target(accepted)
         if target.phase != "cleaned":
             raise BrokerError(
                 "compose_run_once_incomplete",
@@ -9490,13 +8700,13 @@ class BrokerPersistence:
 
     def _advance_compose_run_once(
         self,
-        authorized: AuthorizedBrokerRequest,
+        accepted: AcceptedBrokerRequest,
         *,
         expected_phases: tuple[str, ...],
         next_phase: str,
         updates: Mapping[str, Any] | None = None,
     ) -> None:
-        request = authorized.request
+        request = accepted.request
         if request.operation is not BrokerOperation.COMPOSE_RUN_ONCE:
             raise ValueError("request is not a Compose run-once operation")
         if not expected_phases or next_phase not in _COMPOSE_RUN_ONCE_PHASES:
@@ -9507,9 +8717,9 @@ class BrokerPersistence:
         now = utc_timestamp()
         with self._store() as store:
             with store.immediate_transaction() as connection:
-                _authorize_connection(
+                _validate_connection_request(
                     connection,
-                    peer=authorized.peer,
+                    peer=accepted.peer,
                     request=request,
                 )
                 row = _compose_run_once_attempt_connection(
@@ -9568,20 +8778,20 @@ class BrokerPersistence:
 
     def require_compose_mutation_safe(
         self,
-        authorized: AuthorizedBrokerRequest,
+        accepted: AcceptedBrokerRequest,
         *,
         snapshot_id: str,
     ) -> None:
         """Fence every Compose action against exact fresh host and name ownership."""
 
-        request = authorized.request
+        request = accepted.request
         if request.operation not in _ALL_COMPOSE_OPERATIONS:
             raise ValueError("request is not a Compose operation")
         with self._store() as store:
             with store.read_transaction() as connection:
-                _authorize_connection(
+                _validate_connection_request(
                     connection,
-                    peer=authorized.peer,
+                    peer=accepted.peer,
                     request=request,
                 )
                 _require_compose_mutation_safe_connection(
@@ -9592,16 +8802,16 @@ class BrokerPersistence:
 
     def require_no_active_compose_operation(
         self,
-        authorized: AuthorizedBrokerRequest,
+        accepted: AcceptedBrokerRequest,
     ) -> None:
-        request = authorized.request
+        request = accepted.request
         if request.operation not in _ALL_COMPOSE_OPERATIONS:
             raise ValueError("request is not a Compose operation")
         with self._store() as store:
             with store.read_transaction() as connection:
-                _authorize_connection(
+                _validate_connection_request(
                     connection,
-                    peer=authorized.peer,
+                    peer=accepted.peer,
                     request=request,
                 )
                 _require_no_unresolved_compose_operation(
@@ -9611,18 +8821,18 @@ class BrokerPersistence:
 
     def reconcilable_prior_compose_operation_id(
         self,
-        authorized: AuthorizedBrokerRequest,
+        accepted: AcceptedBrokerRequest,
     ) -> str | None:
         """Return an exact prior uncertain Compose operation for this request."""
 
-        request = authorized.request
+        request = accepted.request
         if request.operation not in _COMPOSE_OPERATIONS:
             raise ValueError("request is not a Compose operation")
         with self._store() as store:
             with store.read_transaction() as connection:
-                _authorize_connection(
+                _validate_connection_request(
                     connection,
-                    peer=authorized.peer,
+                    peer=accepted.peer,
                     request=request,
                 )
                 row = connection.execute(
@@ -9662,15 +8872,53 @@ class BrokerPersistence:
                 ).fetchone()
                 return None if row is None else str(row["operation_id"])
 
+    def reconcilable_compose_operation_for_definition(
+        self,
+        *,
+        repo_id: str,
+        compose_definition_id: str,
+    ) -> str | None:
+        """Return one exact uncertain operation before configuration updates.
+
+        Repository configuration may need to replace the persisted Compose
+        definition after the manifest changes.  A prior uncertain operation
+        must be reconciled against its still-sealed definition first or the
+        definition-change fence and the normal Compose reconciliation path
+        deadlock each other.
+        """
+
+        _require_identifier(repo_id, "project_id")
+        _require_identifier(compose_definition_id, "compose_definition_id")
+        with self._store() as store:
+            with store.read_transaction() as connection:
+                row = connection.execute(
+                    """
+                    SELECT operation.operation_id
+                    FROM operations operation
+                    JOIN operation_targets target USING(operation_id)
+                    JOIN broker_compose_definitions definition
+                      ON definition.compose_definition_id = target.target_id
+                    WHERE target.target_kind = 'compose'
+                      AND target.target_id = ?
+                      AND definition.repo_id = ?
+                      AND operation.status = 'needs_attention'
+                      AND operation.phase = 'reconciliation_required'
+                    ORDER BY operation.created_at, operation.operation_id
+                    LIMIT 1
+                    """,
+                    (compose_definition_id, repo_id),
+                ).fetchone()
+        return None if row is None else str(row["operation_id"])
+
     def list_removed_repository(
-        self, authorized: AuthorizedBrokerRequest
+        self, accepted: AcceptedBrokerRequest
     ) -> list[dict[str, Any]]:
-        request = authorized.request
+        request = accepted.request
         if request.operation != BrokerOperation.REPOSITORY_LIST_REMOVED:
             raise ValueError("request is not a removed-repository read")
         with self._store() as store:
             with store.read_transaction() as connection:
-                _authorize_connection(connection, peer=authorized.peer, request=request)
+                _validate_connection_request(connection, peer=accepted.peer, request=request)
                 row = connection.execute(
                     """
                     SELECT r.repo_id, r.canonical_root, r.display_name,
@@ -9683,21 +8931,57 @@ class BrokerPersistence:
                 ).fetchone()
                 return [] if row is None else [dict(row)]
 
-    def inventory(self, authorized: AuthorizedBrokerRequest) -> dict[str, Any]:
-        """Return the one service-owned host graph after live peer authorization."""
+    def inventory(self, accepted: AcceptedBrokerRequest) -> dict[str, Any]:
+        """Return the one service-owned host graph after live peer request validation."""
 
-        request = authorized.request
+        request = accepted.request
         if request.operation != BrokerOperation.INVENTORY_READ:
             raise ValueError("request is not a host inventory read")
         with self._store() as store:
             # The normalized service and account stores share one schema.  The
-            # broker adapter also keeps authorization and projection inside
+            # broker adapter also keeps request validation and projection inside
             # the exact same SQLite read snapshot, so live revocation cannot
             # race a second inventory transaction.
             store.__class__ = _BrokerInventoryStore
             with store.read_transaction() as connection:
-                _authorize_connection(connection, peer=authorized.peer, request=request)
+                _validate_connection_request(connection, peer=accepted.peer, request=request)
                 graph = store.inventory_v2()
+                compose_project_owners: dict[str, list[str]] = {}
+                for row in connection.execute(
+                    """
+                    SELECT DISTINCT definition.project_name, definition.repo_id
+                    FROM broker_compose_definitions definition
+                    JOIN repositories repository USING(repo_id)
+                    LEFT JOIN broker_compose_project_claims claim
+                      USING(compose_definition_id)
+                    JOIN observation_snapshots snapshot
+                      ON snapshot.host_id = repository.host_id
+                    JOIN observation_capabilities capability USING(snapshot_id)
+                    JOIN broker_observation_compose_scope scope USING(snapshot_id)
+                    JOIN broker_observed_compose_assets asset
+                      ON asset.snapshot_id = snapshot.snapshot_id
+                     AND asset.project_name = definition.project_name
+                    WHERE repository.state = 'active'
+                      AND (definition.enabled = 1 OR claim.claimed = 1)
+                      AND snapshot.observer_domain = 'host-runtime-v2:full-docker'
+                      AND snapshot.status = 'completed'
+                      AND capability.docker_available = 1
+                      AND scope.assets_complete = 1
+                      AND snapshot.snapshot_id = (
+                          SELECT newer.snapshot_id
+                          FROM observation_snapshots newer
+                          WHERE newer.host_id = snapshot.host_id
+                            AND newer.observer_domain = 'host-runtime-v2:full-docker'
+                            AND newer.status = 'completed'
+                          ORDER BY newer.completed_at DESC, newer.snapshot_id DESC
+                          LIMIT 1
+                      )
+                    ORDER BY definition.project_name, definition.repo_id
+                    """
+                ):
+                    compose_project_owners.setdefault(
+                        str(row["project_name"]), []
+                    ).append(str(row["repo_id"]))
         # Test statistics are repository-owned, bounded projections over the
         # same service database. Keep them beside (not inside) runtime
         # resources so the Board cannot confuse test activity with host state.
@@ -9715,6 +8999,16 @@ class BrokerPersistence:
             for repository in graph["repositories"]
             if repository.get("installation_status") != "disabled"
         ]
+        # Physical Docker accounting is deliberately a cached authority-owned
+        # observer.  The first read schedules collection without delaying the
+        # inventory response; later reads receive one disjoint, project-aware
+        # storage snapshot and exact reclaim-plan candidates.
+        from .docker_storage import cached_project_docker_storage_inventory
+
+        graph["docker_storage"] = cached_project_docker_storage_inventory(
+            graph,
+            compose_project_owners=compose_project_owners,
+        )
         browser_state = str(
             os.environ.get("DEVCOORDINATOR_BROWSER_LIFECYCLE_STATE") or ""
         ).strip()
@@ -9747,18 +9041,18 @@ class BrokerPersistence:
         return graph
 
     def operation_follow(
-        self, authorized: AuthorizedBrokerRequest
+        self, accepted: AcceptedBrokerRequest
     ) -> dict[str, Any]:
         """Return one path-free decision projection for an exact durable call."""
 
-        request = authorized.request
+        request = accepted.request
         if request.operation is not BrokerOperation.OPERATION_FOLLOW:
             raise ValueError("request is not an operation follow read")
         followed_operation_id = str(request.arguments["operation_id"])
         with self._store() as store:
             with store.read_transaction() as connection:
-                _authorize_connection(
-                    connection, peer=authorized.peer, request=request
+                _validate_connection_request(
+                    connection, peer=accepted.peer, request=request
                 )
                 operation = connection.execute(
                     """
@@ -9770,24 +9064,13 @@ class BrokerPersistence:
                     JOIN broker_operation_requests AS original
                       USING(operation_id)
                     WHERE durable.operation_id = ?
-                      AND original.account_id = ?
-                      AND original.repo_id = ?
-                      AND (
-                        durable.repo_id IS NULL
-                        OR durable.repo_id = original.repo_id
-                      )
                     """,
-                    (
-                        followed_operation_id,
-                        request.account_id,
-                        request.project_id,
-                    ),
+                    (followed_operation_id,),
                 ).fetchone()
                 if operation is None:
                     raise BrokerError(
                         "operation_follow_unavailable",
-                        "The operation does not belong to the exact current "
-                        "account and repository.",
+                        "The exact operation does not exist.",
                         operation_id=request.operation_id,
                     )
 
@@ -9891,7 +9174,7 @@ class BrokerPersistence:
 
     def runtime_ensure_observation(
         self,
-        authorized: AuthorizedBrokerRequest,
+        accepted: AcceptedBrokerRequest,
         *,
         require_reserved: bool = False,
     ) -> dict[str, Any]:
@@ -9903,13 +9186,13 @@ class BrokerPersistence:
         and path-free.
         """
 
-        request = authorized.request
+        request = accepted.request
         if request.operation is not BrokerOperation.RUNTIME_ENSURE:
             raise ValueError("request is not a runtime ensure")
         with self._store() as store:
             with store.read_transaction() as connection:
-                _authorize_connection(
-                    connection, peer=authorized.peer, request=request
+                _validate_connection_request(
+                    connection, peer=accepted.peer, request=request
                 )
                 kind = str(request.arguments["target_kind"])
                 if kind == "service":
@@ -9935,7 +9218,7 @@ class BrokerPersistence:
                     ).fetchone()
                     if row is None:
                         raise BrokerError(
-                            "control_binding_unavailable",
+                            "resource_identity_unavailable",
                             "Runtime service no longer belongs to the exact "
                             "repository.",
                             operation_id=request.operation_id,
@@ -10048,9 +9331,9 @@ class BrokerPersistence:
                 return observation
 
     def runtime_snapshot(
-        self, authorized: AuthorizedBrokerRequest
+        self, accepted: AcceptedBrokerRequest
     ) -> tuple[dict[str, Any], dict[str, Any], list[dict[str, Any]]]:
-        """Return one authorized runtime family context and host snapshot.
+        """Return one accepted runtime family context and host snapshot.
 
         Classification is evaluated in the same read transaction as the
         inventory projection.  A shared-host status request must not report a
@@ -10058,7 +9341,7 @@ class BrokerPersistence:
         family has no proved owner.
         """
 
-        request = authorized.request
+        request = accepted.request
         if request.operation not in {
             BrokerOperation.RUNTIME_REQUEST,
             BrokerOperation.RUNTIME_ENSURE,
@@ -10067,8 +9350,8 @@ class BrokerPersistence:
         with self._store() as store:
             store.__class__ = _BrokerInventoryStore
             with store.read_transaction() as connection:
-                _authorize_connection(
-                    connection, peer=authorized.peer, request=request
+                _validate_connection_request(
+                    connection, peer=accepted.peer, request=request
                 )
                 root_repo_id = str(request.arguments["root_repo_id"])
                 rows = list(
@@ -10185,21 +9468,40 @@ class BrokerPersistence:
                 return context, inventory, classification_evidence
 
     def worker_execution_uid(
-        self, authorized: AuthorizedBrokerRequest
+        self, accepted: AcceptedBrokerRequest
     ) -> int:
-        """Resolve the enrolled worker policy UID independently of caller UID."""
+        """Resolve one supervised service execution UID.
 
-        request = authorized.request
+        An existing policy remains authoritative across callers.  On the first
+        exact-ID start, the already-accepted peer UID becomes the execution
+        identity that the native supervisor persists before launch.
+        """
+
+        request = accepted.request
         with self._store() as store:
             with store.read_transaction() as connection:
-                _authorize_connection(
-                    connection, peer=authorized.peer, request=request
+                _validate_connection_request(
+                    connection, peer=accepted.peer, request=request
                 )
-        return self.worker_execution_uid_for_resource(
-            repo_id=request.project_id,
-            server_definition_id=request.resource_id,
-            operation_id=request.operation_id,
-        )
+                row = connection.execute(
+                    """
+                    SELECT policy.execution_uid
+                    FROM server_definitions definition
+                    LEFT JOIN worker_policies policy USING(server_definition_id)
+                    WHERE definition.repo_id = ?
+                      AND definition.server_definition_id = ?
+                    """,
+                    (request.project_id, request.resource_id),
+                ).fetchone()
+        if row is None:
+            raise BrokerError(
+                "worker_execution_uid_unavailable",
+                "The exact supervised service has no current repository execution identity.",
+                operation_id=request.operation_id,
+            )
+        if row["execution_uid"] is None:
+            return int(accepted.peer.uid)
+        return int(row["execution_uid"])
 
     def worker_execution_uid_for_resource(
         self,
@@ -10212,7 +9514,7 @@ class BrokerPersistence:
 
         Lifecycle cleanup calls this after it has fenced the repository or
         resource. It therefore validates the retained worker definition and
-        policy directly instead of consulting an active test enrollment. The
+        policy directly instead of consulting an active test configuration. The
         local caller UID remains attribution only.
         """
 
@@ -10227,7 +9529,6 @@ class BrokerPersistence:
                     JOIN worker_policies policy USING(server_definition_id)
                     WHERE definition.repo_id = ?
                       AND definition.server_definition_id = ?
-                      AND lower(COALESCE(definition.role, '')) = 'worker'
                     """,
                     (repo_id, server_definition_id),
                 ).fetchall()
@@ -10243,11 +9544,11 @@ class BrokerPersistence:
         return int(row["execution_uid"])
 
     def require_worker_runtime_operation_current(
-        self, authorized: AuthorizedBrokerRequest
+        self, accepted: AcceptedBrokerRequest
     ) -> None:
         """Reauthorize and prove one reserved worker-control target unchanged."""
 
-        request = authorized.request
+        request = accepted.request
         runtime_request = (
             request.operation is BrokerOperation.RUNTIME_REQUEST
             and request.arguments["action"] in {
@@ -10261,8 +9562,8 @@ class BrokerPersistence:
             raise ValueError("request is not a worker runtime mutation")
         with self._store() as store:
             with store.read_transaction() as connection:
-                _authorize_connection(
-                    connection, peer=authorized.peer, request=request
+                _validate_connection_request(
+                    connection, peer=accepted.peer, request=request
                 )
                 row = connection.execute(
                     """
@@ -10331,13 +9632,13 @@ class BrokerPersistence:
 
     def require_worker_runtime_replacement_committed(
         self,
-        authorized: AuthorizedBrokerRequest,
+        accepted: AcceptedBrokerRequest,
         *,
         replacement: Mapping[str, Any],
     ) -> None:
         """Reauthorize and prove the replacement CAS committed exactly once."""
 
-        request = authorized.request
+        request = accepted.request
         if (
             request.operation is not BrokerOperation.RUNTIME_REQUEST
             or request.arguments["target_kind"] != "service"
@@ -10347,8 +9648,8 @@ class BrokerPersistence:
         expected_generation = int(request.arguments["expected_definition_generation"])
         with self._store() as store:
             with store.read_transaction() as connection:
-                _authorize_connection(
-                    connection, peer=authorized.peer, request=request
+                _validate_connection_request(
+                    connection, peer=accepted.peer, request=request
                 )
                 reserved = connection.execute(
                     """
@@ -10389,11 +9690,11 @@ class BrokerPersistence:
                     )
 
     def runtime_service_role(
-        self, authorized: AuthorizedBrokerRequest
+        self, accepted: AcceptedBrokerRequest
     ) -> str | None:
-        """Return the exact live-authorized service role for runtime routing."""
+        """Return the exact live-accepted service role for runtime routing."""
 
-        request = authorized.request
+        request = accepted.request
         if (
             request.operation is not BrokerOperation.RUNTIME_REQUEST
             or request.arguments["target_kind"] != "service"
@@ -10401,8 +9702,8 @@ class BrokerPersistence:
             raise ValueError("request is not a service runtime request")
         with self._store() as store:
             with store.read_transaction() as connection:
-                _authorize_connection(
-                    connection, peer=authorized.peer, request=request
+                _validate_connection_request(
+                    connection, peer=accepted.peer, request=request
                 )
                 row = connection.execute(
                     """
@@ -10413,18 +9714,135 @@ class BrokerPersistence:
                 ).fetchone()
                 if row is None:
                     raise BrokerError(
-                        "control_binding_unavailable",
+                        "resource_identity_unavailable",
                         "Runtime service no longer belongs to the exact repository.",
                         operation_id=request.operation_id,
                     )
                 return None if row["role"] is None else str(row["role"])
 
+    def runtime_service_endpoint_target(
+        self, accepted: AcceptedBrokerRequest
+    ) -> RuntimeServiceEndpointTarget:
+        """Resolve the sealed cwd and optional assigned TCP endpoint."""
+
+        request = accepted.request
+        if (
+            request.operation not in {
+                BrokerOperation.RUNTIME_REQUEST,
+                BrokerOperation.RUNTIME_ENSURE,
+            }
+            or request.arguments["target_kind"] != "service"
+        ):
+            raise ValueError("request is not a service runtime operation")
+        with self._store() as store:
+            with store.read_transaction() as connection:
+                _validate_connection_request(
+                    connection, peer=accepted.peer, request=request
+                )
+                row = connection.execute(
+                    """
+                    SELECT definition.server_definition_id,
+                           definition.repo_id, repository.canonical_root,
+                           definition.cwd,
+                           definition.health_url_template,
+                           assignment.port AS assignment_port,
+                           (
+                               SELECT MIN(lease.port) FROM leases lease
+                               WHERE lease.repo_id = definition.repo_id
+                                 AND lease.server_definition_id = definition.server_definition_id
+                                 AND lease.status = 'active'
+                           ) AS lease_port,
+                           (
+                               SELECT COUNT(*) FROM leases lease
+                               WHERE lease.repo_id = definition.repo_id
+                                 AND lease.server_definition_id = definition.server_definition_id
+                                 AND lease.status = 'active'
+                           ) AS lease_count
+                    FROM server_definitions definition
+                    JOIN repositories repository USING(repo_id)
+                    LEFT JOIN port_assignments assignment
+                      ON assignment.repo_id = definition.repo_id
+                     AND assignment.server_name = definition.name
+                     AND assignment.status = 'active'
+                    WHERE definition.repo_id = ?
+                      AND definition.server_definition_id = ?
+                    """,
+                    (request.project_id, request.resource_id),
+                ).fetchone()
+        if row is None:
+            raise BrokerError(
+                "resource_identity_unavailable",
+                "Runtime service no longer belongs to the exact repository.",
+                operation_id=request.operation_id,
+            )
+        assignment_port = row["assignment_port"]
+        lease_port = row["lease_port"]
+        if int(row["lease_count"]) > 1:
+            raise BrokerError(
+                "service_endpoint_binding_conflict",
+                "The exact service has more than one active port lease.",
+                operation_id=request.operation_id,
+            )
+        if (
+            assignment_port is not None
+            and lease_port is not None
+            and int(assignment_port) != int(lease_port)
+        ):
+            raise BrokerError(
+                "service_endpoint_binding_conflict",
+                "The exact service assignment and active lease disagree.",
+                operation_id=request.operation_id,
+            )
+        port = assignment_port if assignment_port is not None else lease_port
+        listener_required = port is not None or bool(row["health_url_template"])
+        if listener_required and port is None:
+            raise BrokerError(
+                "service_endpoint_binding_unavailable",
+                "A network service requires one exact active port assignment or lease.",
+                operation_id=request.operation_id,
+            )
+        if port is not None and row["health_url_template"]:
+            health_url = str(row["health_url_template"]).replace(
+                "{host}", "127.0.0.1"
+            ).replace("{port}", str(port))
+            try:
+                parsed_health = urlsplit(health_url)
+                health_port = parsed_health.port
+            except ValueError as error:
+                raise BrokerError(
+                    "service_endpoint_binding_conflict",
+                    "The exact service health endpoint is malformed.",
+                    operation_id=request.operation_id,
+                ) from error
+            if health_port is None:
+                health_port = (
+                    80
+                    if parsed_health.scheme == "http"
+                    else 443
+                    if parsed_health.scheme == "https"
+                    else None
+                )
+            if health_port != int(port):
+                raise BrokerError(
+                    "service_endpoint_binding_conflict",
+                    "The exact service health endpoint disagrees with its assigned port.",
+                    operation_id=request.operation_id,
+                )
+        return RuntimeServiceEndpointTarget(
+            server_definition_id=str(row["server_definition_id"]),
+            repo_id=str(row["repo_id"]),
+            canonical_root=str(row["canonical_root"]),
+            cwd=str(row["cwd"]),
+            listener_port=None if port is None else int(port),
+            listener_required=listener_required,
+        )
+
     def runtime_service_log_target(
-        self, authorized: AuthorizedBrokerRequest
+        self, accepted: AcceptedBrokerRequest
     ) -> RuntimeServiceLogTarget:
         """Reauthorize one service log read to its sealed definition path."""
 
-        request = authorized.request
+        request = accepted.request
         if (
             request.operation is not BrokerOperation.RUNTIME_REQUEST
             or request.arguments["action"] != "capture_logs"
@@ -10433,18 +9851,16 @@ class BrokerPersistence:
             raise ValueError("request is not a service runtime log read")
         with self._store() as store:
             with store.read_transaction() as connection:
-                _authorize_connection(
-                    connection, peer=authorized.peer, request=request
+                _validate_connection_request(
+                    connection, peer=accepted.peer, request=request
                 )
                 row = connection.execute(
                     """
                     SELECT definition.server_definition_id,
                            definition.repo_id, definition.role,
                            definition.log_path,
-                           definition.definition_fingerprint,
-                           owner.owner_uid
+                           definition.definition_fingerprint
                     FROM server_definitions definition
-                    JOIN repository_owners owner USING(repo_id)
                     WHERE definition.repo_id = ?
                       AND definition.server_definition_id = ?
                     """,
@@ -10454,7 +9870,6 @@ class BrokerPersistence:
                     row is None
                     or not isinstance(row["log_path"], str)
                     or not str(row["log_path"])
-                    or int(row["owner_uid"]) <= 0
                 ):
                     raise BrokerError(
                         "service_log_unavailable",
@@ -10467,19 +9882,19 @@ class BrokerPersistence:
                     role=None if row["role"] is None else str(row["role"]),
                     log_path=str(row["log_path"]),
                     definition_fingerprint=str(row["definition_fingerprint"]),
-                    owner_uid=int(row["owner_uid"]),
+                    owner_uid=accepted.attribution_uid,
                 )
 
-    def events(self, authorized: AuthorizedBrokerRequest) -> dict[str, Any]:
-        """Page the host event journal after live peer authorization."""
+    def events(self, accepted: AcceptedBrokerRequest) -> dict[str, Any]:
+        """Page the host event journal after live peer request validation."""
 
-        request = authorized.request
+        request = accepted.request
         if request.operation != BrokerOperation.EVENTS_READ:
             raise ValueError("request is not a host event read")
         with self._store() as store:
             with store.read_transaction() as connection:
-                _authorize_connection(
-                    connection, peer=authorized.peer, request=request
+                _validate_connection_request(
+                    connection, peer=accepted.peer, request=request
                 )
                 return list_event_page(
                     connection,
@@ -10488,17 +9903,17 @@ class BrokerPersistence:
                 )
 
     def server_publication_target(
-        self, authorized: AuthorizedBrokerRequest
+        self, accepted: AcceptedBrokerRequest
     ) -> dict[str, Any]:
-        """Resolve the exact active broker lease and enrolled repository root."""
+        """Resolve the exact active broker lease and configured repository root."""
 
-        request = authorized.request
+        request = accepted.request
         if request.operation != BrokerOperation.SERVER_PUBLISH:
             raise ValueError("request is not a server publication")
         with self._store() as store:
             with store.read_transaction() as connection:
-                lease = _authorize_connection(
-                    connection, peer=authorized.peer, request=request
+                lease = _validate_connection_request(
+                    connection, peer=accepted.peer, request=request
                 )
                 if lease is None:
                     raise BrokerError(
@@ -10519,20 +9934,20 @@ class BrokerPersistence:
 
     def complete_server_publication(
         self,
-        authorized: AuthorizedBrokerRequest,
+        accepted: AcceptedBrokerRequest,
         *,
         listener_evidence: Mapping[str, Any] | None,
     ) -> dict[str, Any]:
         """Commit broker-observed lifecycle into the shared authority graph."""
 
-        request = authorized.request
+        request = accepted.request
         arguments = request.arguments
         now = utc_timestamp()
         lifecycle = str(arguments["lifecycle"])
         with self._store() as store:
             with store.immediate_transaction(revision_kind="observation") as connection:
-                lease = _authorize_connection(
-                    connection, peer=authorized.peer, request=request
+                lease = _validate_connection_request(
+                    connection, peer=accepted.peer, request=request
                 )
                 if lease is None or lease["status"] != "active":
                     raise BrokerError(
@@ -10557,8 +9972,8 @@ class BrokerPersistence:
                 ).fetchone()
                 if definition is None:
                     raise BrokerError(
-                        "control_binding_unavailable",
-                        "Published server is no longer enrolled with this repository.",
+                        "resource_identity_unavailable",
+                        "Published server is no longer configured with this repository.",
                         operation_id=request.operation_id,
                     )
 
@@ -10615,7 +10030,7 @@ class BrokerPersistence:
                     "stopped_at": stopped_at,
                     "stopped_reason": stopped_reason,
                     "sampled_at": now,
-                    "peer_uid": authorized.peer.uid,
+                    "peer_uid": accepted.peer.uid,
                 }
                 observation_fingerprint = hashlib.sha256(
                     json.dumps(
@@ -10731,7 +10146,7 @@ class BrokerPersistence:
                         f"Broker published {lifecycle} lifecycle for {definition['name']}",
                         json.dumps(
                             {
-                                "peer_uid": authorized.peer.uid,
+                                "peer_uid": accepted.peer.uid,
                                 "lease_id": arguments["lease_id"],
                                 "listener_evidence": evidence,
                             },
@@ -10754,12 +10169,12 @@ class BrokerPersistence:
 
     def bind_lifecycle_plan_observation(
         self,
-        authorized: AuthorizedBrokerRequest,
+        accepted: AcceptedBrokerRequest,
         *,
         plan_id: str,
         evidence: Mapping[str, Any],
     ) -> dict[str, Any]:
-        request = authorized.request
+        request = accepted.request
         if request.operation not in _LIFECYCLE_PLAN_OPERATIONS_FOR_PERSISTENCE:
             raise ValueError("request is not a lifecycle planning operation")
         snapshot_id = str(evidence.get("snapshot_id") or "")
@@ -10777,7 +10192,7 @@ class BrokerPersistence:
             )
         with self._store() as store:
             with store.immediate_transaction() as connection:
-                _authorize_connection(connection, peer=authorized.peer, request=request)
+                _validate_connection_request(connection, peer=accepted.peer, request=request)
                 observed = connection.execute(
                     """
                     SELECT 1
@@ -10846,9 +10261,9 @@ class BrokerPersistence:
         }
 
     def require_lifecycle_plan_observation(
-        self, authorized: AuthorizedBrokerRequest
+        self, accepted: AcceptedBrokerRequest
     ) -> dict[str, Any]:
-        request = authorized.request
+        request = accepted.request
         if request.operation not in {
             BrokerOperation.REPOSITORY_REMOVE,
             BrokerOperation.RESOURCE_RETIRE,
@@ -10858,7 +10273,7 @@ class BrokerPersistence:
         plan_id = str(request.arguments["plan_id"])
         with self._store() as store:
             with store.read_transaction() as connection:
-                _authorize_connection(connection, peer=authorized.peer, request=request)
+                _validate_connection_request(connection, peer=accepted.peer, request=request)
                 row = connection.execute(
                     """
                     SELECT b.snapshot_id, b.observer_domain,
@@ -10908,13 +10323,20 @@ class BrokerPersistence:
                     error_code=error_code,
                     error_message=error_message,
                 )
+                _settle_broker_runtime_session(
+                    connection,
+                    operation_id=operation_id,
+                    result=result,
+                    succeeded=error_code is None,
+                    timestamp=utc_timestamp(),
+                )
 
     def temporary_service_launch_deadline(
-        self, authorized: AuthorizedBrokerRequest
+        self, accepted: AcceptedBrokerRequest
     ) -> tuple[str, int]:
         """Return the original operation-bound TTL deadline and seconds left."""
 
-        request = authorized.request
+        request = accepted.request
         if (
             request.operation is not BrokerOperation.RUNTIME_REQUEST
             or request.arguments.get("action") != "temporary_start"
@@ -10922,8 +10344,8 @@ class BrokerPersistence:
             raise ValueError("request is not a temporary service launch")
         with self._store() as store:
             with store.read_transaction() as connection:
-                _authorize_connection(
-                    connection, peer=authorized.peer, request=request
+                _validate_connection_request(
+                    connection, peer=accepted.peer, request=request
                 )
                 row = connection.execute(
                     "SELECT created_at FROM operations WHERE operation_id = ?",
@@ -10951,18 +10373,18 @@ class BrokerPersistence:
         ), remaining
 
     def temporary_service_execution_context(
-        self, authorized: AuthorizedBrokerRequest
+        self, accepted: AcceptedBrokerRequest
     ) -> TemporaryServiceExecutionContext:
         """Resolve a launch from repository state and its reserved caller UID.
 
         Repository ownership is deliberately absent from this lookup. On this
-        single-developer host it is attribution metadata, not an authorization
+        single-developer host it is attribution metadata, not an request validation
         or execution selector. ``operations.owner_uid`` is the physical peer
         that created the idempotent launch operation, so replay cannot silently
         change the execution identity.
         """
 
-        request = authorized.request
+        request = accepted.request
         if (
             request.operation is not BrokerOperation.RUNTIME_REQUEST
             or request.arguments.get("action") != "temporary_start"
@@ -10970,8 +10392,8 @@ class BrokerPersistence:
             raise ValueError("request is not a temporary service launch")
         with self._store() as store:
             with store.read_transaction() as connection:
-                _authorize_connection(
-                    connection, peer=authorized.peer, request=request
+                _validate_connection_request(
+                    connection, peer=accepted.peer, request=request
                 )
                 row = connection.execute(
                     """
@@ -11013,18 +10435,18 @@ class BrokerPersistence:
         )
 
     def temporary_service_predecessor(
-        self, authorized: AuthorizedBrokerRequest
+        self, accepted: AcceptedBrokerRequest
     ) -> dict[str, Any] | None:
         """Return the latest still-leased same-name session for live probing."""
 
-        request = authorized.request
+        request = accepted.request
         service_id = temporary_dev_service_id(
             request.project_id, str(request.arguments["name"])
         )
         with self._store() as store:
             with store.read_transaction() as connection:
-                _authorize_connection(
-                    connection, peer=authorized.peer, request=request
+                _validate_connection_request(
+                    connection, peer=accepted.peer, request=request
                 )
                 row = connection.execute(
                     """
@@ -11073,14 +10495,13 @@ class BrokerPersistence:
         }
 
     def temporary_service_status(
-        self, authorized: AuthorizedBrokerRequest
+        self, accepted: AcceptedBrokerRequest
     ) -> dict[str, Any] | None:
         """Resolve retained typed status metadata for one temporary service."""
 
-        request = authorized.request
+        request = accepted.request
         if (
             request.operation is not BrokerOperation.RUNTIME_REQUEST
-            or request.arguments.get("action") != "status"
             or request.arguments.get("target_kind") != "service"
         ):
             return None
@@ -11090,9 +10511,13 @@ class BrokerPersistence:
                     """
                     SELECT session.session_id, session.status,
                            session.expires_at, session.result_json,
-                           resource.identity_json
+                           resource.identity_json,
+                           definition.definition_fingerprint
                     FROM runtime_session_resources AS resource
                     JOIN runtime_sessions AS session USING(session_id)
+                    JOIN server_definitions AS definition
+                      ON definition.server_definition_id = resource.resource_id
+                     AND definition.repo_id = session.repo_id
                     WHERE resource.resource_kind = 'service'
                       AND resource.resource_id = ?
                       AND session.repo_id = ?
@@ -11126,11 +10551,12 @@ class BrokerPersistence:
             "cleanup": dict(result.get("cleanup") or {}),
             "expired": expired,
             "catalog_state": str(row["status"]),
+            "definition_fingerprint": str(row["definition_fingerprint"]),
         }
 
     def finish_temporary_dev_service(
         self,
-        authorized: AuthorizedBrokerRequest,
+        accepted: AcceptedBrokerRequest,
         *,
         result: Mapping[str, Any],
     ) -> dict[str, Any]:
@@ -11142,13 +10568,13 @@ class BrokerPersistence:
         stop publishing it at its positive TTL even if no client returns.
         """
 
-        request = authorized.request
+        request = accepted.request
         if (
             request.operation is not BrokerOperation.RUNTIME_REQUEST
             or request.arguments.get("action") != "temporary_start"
         ):
             raise ValueError("request is not a temporary service launch")
-        execution = self.temporary_service_execution_context(authorized)
+        execution = self.temporary_service_execution_context(accepted)
         document = dict(result)
         expected_session_id = "session-" + uuid.uuid5(
             uuid.NAMESPACE_URL,
@@ -11271,13 +10697,13 @@ class BrokerPersistence:
         }
         with self._store() as store:
             with store.immediate_transaction() as connection:
-                _authorize_connection(
-                    connection, peer=authorized.peer, request=request
+                _validate_connection_request(
+                    connection, peer=accepted.peer, request=request
                 )
                 replay = self._existing_operation_disposition(
                     connection,
-                    authorized=authorized,
-                    fingerprint=authenticated_request_fingerprint(authorized),
+                    accepted=accepted,
+                    fingerprint=accepted_request_fingerprint(accepted),
                 )
                 if replay is not None and replay.state == "completed":
                     retained = dict(replay.result or {})
@@ -11453,22 +10879,6 @@ class BrokerPersistence:
                         timestamp,
                     ),
                 )
-                connection.execute(
-                    """
-                    INSERT INTO broker_runtime_acl(
-                        uid, repo_id, resource_kind, resource_id,
-                        action, enabled, updated_at
-                    ) VALUES (?, ?, 'service', ?, 'status', 1, ?)
-                    ON CONFLICT(uid, repo_id, resource_kind, resource_id, action)
-                    DO UPDATE SET enabled = 1, updated_at = excluded.updated_at
-                    """,
-                    (
-                        authorized.authorization_uid,
-                        request.project_id,
-                        expected_service_id,
-                        timestamp,
-                    ),
-                )
                 _finish_operation(
                     connection, request.operation_id, result=document
                 )
@@ -11572,6 +10982,7 @@ class BrokerPersistence:
         completed_phases: Iterable[str],
         cleanup_failed: bool,
         observation: Mapping[str, Any] | None,
+        failure_code: str | None = None,
     ) -> None:
         """Fence an invoked Compose action whose host outcome is uncertain."""
 
@@ -11595,6 +11006,10 @@ class BrokerPersistence:
         normalized_completed = tuple(str(item) for item in completed_phases)
         if any(item not in {"up", "stop", "down"} for item in normalized_completed):
             raise ValueError("invalid completed Compose reconciliation phase")
+        if failure_code is not None and re.fullmatch(
+            r"[a-z][a-z0-9_]{0,63}", failure_code
+        ) is None:
+            raise ValueError("invalid Compose observation failure code")
         evidence = {
             "action": action,
             "failed_phase": failed_phase,
@@ -11606,6 +11021,8 @@ class BrokerPersistence:
                 else {"status": "completed", **dict(observation)}
             ),
         }
+        if failure_code is not None:
+            evidence["observation_failure_code"] = failure_code
         encoded = json.dumps(
             evidence,
             ensure_ascii=True,
@@ -11616,7 +11033,12 @@ class BrokerPersistence:
         error = json.dumps(
             {
                 "code": "operation_outcome_uncertain",
-                "message": "Docker Compose host outcome requires reconciliation.",
+                "message": (
+                    "Docker Compose host outcome requires reconciliation."
+                    if failure_code is None
+                    else "Docker Compose host outcome requires reconciliation after "
+                    f"observation failure {failure_code}."
+                ),
             },
             ensure_ascii=True,
             sort_keys=True,
@@ -11668,6 +11090,7 @@ class BrokerPersistence:
         *,
         action: str,
         failed_phase: str,
+        failure_code: str | None = None,
     ) -> None:
         """Durably fence an invoked Docker-backed runtime action."""
 
@@ -11675,11 +11098,20 @@ class BrokerPersistence:
             raise ValueError("unsupported runtime reconciliation action")
         if failed_phase not in {"host_invocation", "observation", "journal_commit"}:
             raise ValueError("unsupported runtime reconciliation phase")
+        if failure_code is not None and re.fullmatch(
+            r"[a-z][a-z0-9_]{0,63}", failure_code
+        ) is None:
+            raise ValueError("invalid runtime observation failure code")
         evidence = json.dumps(
             {
                 "action": action,
                 "failed_phase": failed_phase,
                 "completion_unknown": True,
+                **(
+                    {}
+                    if failure_code is None
+                    else {"observation_failure_code": failure_code}
+                ),
             },
             ensure_ascii=True,
             sort_keys=True,
@@ -11707,9 +11139,9 @@ class BrokerPersistence:
                             'Docker-backed runtime outcome is uncertain; fresh reconciliation is required before retry.',
                         updated_at = ?, generation = generation + 1
                     WHERE operation_id = ? AND status = 'running'
-                      AND kind = 'broker.runtime.request'
+                      AND kind IN ('broker.runtime.request', ?)
                     """,
-                    (evidence, now, operation_id),
+                    (evidence, now, operation_id, "broker.docker." + action),
                 )
                 target = connection.execute(
                     """
@@ -11718,9 +11150,16 @@ class BrokerPersistence:
                         result_json = ?, error_json = ?, finished_at = ?
                     WHERE operation_id = ? AND ordinal = 0
                       AND target_kind = 'container'
-                      AND action = ? AND status = 'running'
+                      AND action IN (?, ?) AND status = 'running'
                     """,
-                    (evidence, error, now, operation_id, "runtime." + action),
+                    (
+                        evidence,
+                        error,
+                        now,
+                        operation_id,
+                        "runtime." + action,
+                        "docker." + action,
+                    ),
                 )
                 if operation.rowcount != 1 or target.rowcount != 1:
                     raise BrokerError(
@@ -11728,6 +11167,14 @@ class BrokerPersistence:
                         "Runtime operation is no longer in its reserved state.",
                         operation_id=operation_id,
                     )
+                connection.execute(
+                    """
+                    UPDATE runtime_sessions
+                    SET status = 'cleanup_pending', updated_at = ?
+                    WHERE operation_id = ? AND status = 'planned'
+                    """,
+                    (now, operation_id),
+                )
 
     def finish_runtime_reconciliation(
         self,
@@ -11808,6 +11255,13 @@ class BrokerPersistence:
                         "Runtime reconciliation changed before it could settle.",
                         operation_id=operation_id,
                     )
+                _settle_broker_runtime_session(
+                    connection,
+                    operation_id=operation_id,
+                    result=result,
+                    succeeded=succeeded,
+                    timestamp=now,
+                )
 
     def recover_interrupted_compose_operations(self) -> dict[str, Any]:
         """Fence crash-left Compose reservations before the broker accepts clients."""
@@ -11921,6 +11375,7 @@ class BrokerPersistence:
                           AND target.action IN (
                               'docker.start', 'docker.stop', 'docker.restart',
                               'runtime.start', 'runtime.stop', 'runtime.restart',
+                              'runtime.replace',
                               'runtime.ensure.ready', 'runtime.ensure.stopped'
                           )
                         ORDER BY operation.created_at, operation.operation_id
@@ -11985,6 +11440,14 @@ class BrokerPersistence:
                             "Docker-backed operation changed during restart recovery.",
                             operation_id=operation_id,
                         )
+                    connection.execute(
+                        """
+                        UPDATE runtime_sessions
+                        SET status = 'cleanup_pending', updated_at = ?
+                        WHERE operation_id = ? AND status = 'planned'
+                        """,
+                        (now, operation_id),
+                    )
                     recovered.append(operation_id)
         return {"recovered": len(recovered), "operation_ids": recovered}
 
@@ -12246,18 +11709,18 @@ class BrokerPersistence:
 
     def compose_observation_result(
         self,
-        authorized: AuthorizedBrokerRequest,
+        accepted: AcceptedBrokerRequest,
         *,
         evidence: Mapping[str, Any],
     ) -> dict[str, Any]:
         """Prove a zero-exit Compose mutation's exact requested end state."""
 
-        request = authorized.request
+        request = accepted.request
         if request.operation not in _COMPOSE_OPERATIONS:
             raise ValueError("request is not a Compose mutation")
         with self._store() as store:
             with store.read_transaction() as connection:
-                _authorize_connection(connection, peer=authorized.peer, request=request)
+                _validate_connection_request(connection, peer=accepted.peer, request=request)
                 snapshot_id = str(evidence.get("snapshot_id") or "")
                 _require_compose_mutation_safe_connection(
                     connection,
@@ -12297,15 +11760,15 @@ class BrokerPersistence:
         evidence: Mapping[str, Any] | None,
         abandon_as_failed: bool = False,
         confirm_definition_fingerprint: str | None = None,
-        authorized: AuthorizedBrokerRequest | None = None,
+        accepted: AcceptedBrokerRequest | None = None,
     ) -> dict[str, Any]:
         """Resolve one uncertain Compose outcome as an evidenced terminal failure."""
 
-        if authorized is None and (os.geteuid() != 0 or self.expected_uid != 0):
+        if accepted is None and (os.geteuid() != 0 or self.expected_uid != 0):
             raise PermissionError(
                 "Compose reconciliation requires the root service administrator"
             )
-        if authorized is not None and authorized.request.operation not in _COMPOSE_OPERATIONS:
+        if accepted is not None and accepted.request.operation not in _COMPOSE_OPERATIONS:
             raise ValueError("automatic reconciliation requires a Compose request")
         _require_identifier(operation_id, "operation_id")
         if not abandon_as_failed and not isinstance(evidence, Mapping):
@@ -12313,24 +11776,24 @@ class BrokerPersistence:
         now = utc_timestamp()
         with self._store() as store:
             with store.immediate_transaction() as connection:
-                if authorized is not None:
-                    _authorize_connection(
+                if accepted is not None:
+                    _validate_connection_request(
                         connection,
-                        peer=authorized.peer,
-                        request=authorized.request,
+                        peer=accepted.peer,
+                        request=accepted.request,
                     )
                 candidate = _compose_reconciliation_candidate_connection(
                     connection, operation_id=operation_id
                 )
-                if authorized is not None and (
-                    candidate["repo_id"] != authorized.request.project_id
+                if accepted is not None and (
+                    candidate["repo_id"] != accepted.request.project_id
                     or candidate["compose_definition_id"]
-                    != authorized.request.resource_id
+                    != accepted.request.resource_id
                 ):
                     raise BrokerError(
-                        "resource_access_denied",
-                        "Prior Compose operation does not belong to the exact authorized definition.",
-                        operation_id=authorized.request.operation_id,
+                        "resource_unavailable",
+                        "Prior Compose operation does not belong to the exact accepted definition.",
+                        operation_id=accepted.request.operation_id,
                     )
                 scope_recoverable = bool(candidate["scope_recoverable"])
                 if abandon_as_failed:
@@ -12408,12 +11871,12 @@ class BrokerPersistence:
                 reconciliation = {
                     "mode": mode,
                     "administrator": {
-                        "uid": 0 if authorized is None else authorized.peer.uid,
+                        "uid": 0 if accepted is None else accepted.peer.uid,
                         "actor": (
                             "broker-admin:uid:0"
-                            if authorized is None
+                            if accepted is None
                             else "broker:auto-reconcile:uid:"
-                            + str(authorized.peer.uid)
+                            + str(accepted.peer.uid)
                         ),
                     },
                     "snapshot": snapshot_evidence,
@@ -12514,1649 +11977,166 @@ class BrokerPersistence:
                 }
 
 
-def _backfill_exact_worker_acl(
-    connection: sqlite3.Connection,
-    *,
-    now_epoch: int,
-    updated_at: str,
-) -> None:
-    """Migrate only existing exact, fully managed worker authority.
-
-    A worker protocol grant is an implementation detail of existing service
-    lifecycle authority. It is therefore backfilled only when the same
-    UID/repository has all four enabled exact-service actions, an enabled active
-    enrollment, and is the configured execution identity of a current
-    worker-role definition. ``INSERT OR IGNORE`` preserves explicit worker-ACL
-    revocations and makes repeated startup migration idempotent.
-    """
-
-    del now_epoch
-    connection.execute(
-        """
-        WITH eligible(uid, repo_id, server_definition_id) AS (
-            SELECT runtime.uid, runtime.repo_id, runtime.resource_id
-            FROM broker_runtime_acl runtime
-            JOIN server_definitions definition
-              ON definition.server_definition_id = runtime.resource_id
-             AND definition.repo_id = runtime.repo_id
-             AND lower(definition.role) = 'worker'
-            JOIN worker_policies policy
-              ON policy.server_definition_id = definition.server_definition_id
-             AND policy.repo_id = runtime.repo_id
-             AND policy.execution_uid = runtime.uid
-            JOIN repositories repository
-              ON repository.repo_id = runtime.repo_id
-             AND repository.state = 'active'
-            JOIN repository_installations installation
-              ON installation.repo_id = runtime.repo_id
-             AND installation.status = 'installed'
-             AND installation.startup_fenced = 0
-            JOIN broker_repository_enrollments enrollment
-              ON enrollment.uid = runtime.uid
-             AND enrollment.repo_id = runtime.repo_id
-             AND enrollment.enabled = 1
-            JOIN broker_acl_principals principal
-              ON principal.uid = runtime.uid
-             AND principal.account_id = enrollment.account_id
-             AND principal.enabled = 1
-            WHERE runtime.resource_kind = 'service'
-              AND runtime.enabled = 1
-              AND runtime.action IN ('status', 'start', 'stop', 'restart')
-              AND NOT EXISTS (
-                  SELECT 1 FROM broker_worker_acl revoked
-                  WHERE revoked.uid = runtime.uid
-                    AND revoked.repo_id = runtime.repo_id
-                    AND revoked.server_definition_id = runtime.resource_id
-                    AND revoked.enabled = 0
-              )
-            GROUP BY runtime.uid, runtime.repo_id, runtime.resource_id
-            HAVING COUNT(DISTINCT runtime.action) = 4
-        ), operations(operation) AS (
-            SELECT 'worker.launch_ticket'
-            UNION ALL SELECT 'worker.launched'
-            UNION ALL SELECT 'worker.exit'
-            UNION ALL SELECT 'worker.policy_read'
-            UNION ALL SELECT 'worker.attempt_read'
-        )
-        INSERT OR IGNORE INTO broker_worker_acl(
-            uid, repo_id, server_definition_id, operation, enabled, updated_at
-        )
-        SELECT eligible.uid, eligible.repo_id, eligible.server_definition_id,
-               operations.operation, 1, ?
-        FROM eligible CROSS JOIN operations
-        """,
-        (updated_at,),
-    )
-
-
-def _backfill_worker_replace_acl(
-    connection: sqlite3.Connection,
-    *,
-    now_epoch: int,
-    updated_at: str,
-) -> None:
-    """Grant replace only where prior exact worker lifecycle authority is complete.
-
-    This upgrades existing enrollments without broadening Docker or non-worker
-    authority. An explicit disabled replace row is a durable revocation and is
-    therefore preserved by ``INSERT OR IGNORE``.
-    """
-
-    del now_epoch
-    connection.execute(
-        """
-        WITH eligible(uid, repo_id, server_definition_id) AS (
-            SELECT runtime.uid, runtime.repo_id, runtime.resource_id
-            FROM broker_runtime_acl runtime
-            JOIN server_definitions definition
-              ON definition.server_definition_id = runtime.resource_id
-             AND definition.repo_id = runtime.repo_id
-             AND lower(definition.role) = 'worker'
-            JOIN worker_policies policy
-              ON policy.server_definition_id = definition.server_definition_id
-             AND policy.repo_id = runtime.repo_id
-             AND policy.execution_uid = runtime.uid
-            JOIN repositories repository
-              ON repository.repo_id = runtime.repo_id
-             AND repository.state = 'active'
-            JOIN repository_installations installation
-              ON installation.repo_id = runtime.repo_id
-             AND installation.status = 'installed'
-             AND installation.startup_fenced = 0
-            JOIN broker_repository_enrollments enrollment
-              ON enrollment.uid = runtime.uid
-             AND enrollment.repo_id = runtime.repo_id
-             AND enrollment.enabled = 1
-            JOIN broker_acl_principals principal
-              ON principal.uid = runtime.uid
-             AND principal.account_id = enrollment.account_id
-             AND principal.enabled = 1
-            WHERE runtime.resource_kind = 'service'
-              AND runtime.enabled = 1
-              AND runtime.action IN ('status', 'start', 'stop', 'restart')
-            GROUP BY runtime.uid, runtime.repo_id, runtime.resource_id
-            HAVING COUNT(DISTINCT runtime.action) = 4
-        )
-        INSERT OR IGNORE INTO broker_runtime_acl(
-            uid, repo_id, resource_kind, resource_id,
-            action, enabled, updated_at
-        )
-        SELECT uid, repo_id, 'service', server_definition_id,
-               'replace', 1, ?
-        FROM eligible
-        """,
-        (updated_at,),
-    )
-
-
-def _authorize_connection(
+def _validate_connection_request(
     connection: sqlite3.Connection,
     *,
     peer: PeerCredentials,
     request: BrokerRequest,
 ) -> Optional[sqlite3.Row]:
-    result, _policy_uid = _authorize_connection_with_policy_uid(
-        connection,
-        peer=peer,
-        request=request,
-    )
-    return result
+    """Validate freshness and resolve the few ingress targets callers consume.
 
-
-def _authorize_connection_with_policy_uid(
-    connection: sqlite3.Connection,
-    *,
-    peer: PeerCredentials,
-    request: BrokerRequest,
-) -> tuple[Optional[sqlite3.Row], int]:
-    """Authorize against any matching host-local policy.
-
-    The physical caller UID is attribution only.  Each configured principal
-    for the exact request account is evaluated as a policy row; a grant from
-    any one of them authorizes the request.  The returned public request still
-    carries the original kernel peer credentials.
+    This is deliberately not an request validation layer. The Unix peer is retained
+    only for attribution, while typed backends validate their own immutable
+    targets, current lifecycle state, idempotency keys, and safety invariants.
     """
 
-    policy_uids = tuple(
-        int(row["uid"])
-        for row in connection.execute(
-            """
-            SELECT uid
-            FROM broker_acl_principals
-            WHERE account_id = ?
-            ORDER BY enabled DESC, uid
-            """,
-            (request.account_id,),
-        )
-    )
-    if not policy_uids:
-        raise BrokerError(
-            "cross_account_access_denied",
-            "No configured local policy grants the requested account.",
-            operation_id=request.operation_id,
-        )
-
-    errors: list[BrokerError] = []
-    for policy_uid in policy_uids:
-        policy_peer = PeerCredentials(uid=policy_uid, gid=peer.gid, pid=peer.pid)
-        try:
-            return (
-                _authorize_connection_for_policy_uid(
-                    connection,
-                    peer=policy_peer,
-                    request=request,
-                ),
-                policy_uid,
-            )
-        except BrokerError as error:
-            errors.append(error)
-
-    # Prefer the error nearest the exact operation grant so diagnostics remain
-    # actionable when several local policy rows exist.
-    rank = {
-        "port_policy_denied": 90,
-        "operation_access_denied": 80,
-        "resource_access_denied": 70,
-        "control_binding_unavailable": 65,
-        "repository_startup_fenced": 60,
-        "project_access_denied": 40,
-        "peer_not_authorized": 10,
-    }
-    raise max(errors, key=lambda error: rank.get(error.code, 55))
-
-
-def _authorize_connection_for_policy_uid(
-    connection: sqlite3.Connection,
-    *,
-    peer: PeerCredentials,
-    request: BrokerRequest,
-) -> Optional[sqlite3.Row]:
-    ephemeral_retained_access = request.operation in {
-        BrokerOperation.EPHEMERAL_STATUS,
-        BrokerOperation.EPHEMERAL_FINISH,
-    }
+    del peer
     generation = connection.execute(
         "SELECT database_generation FROM schema_metadata WHERE singleton = 1"
     ).fetchone()
     if generation is None or str(generation[0]) != request.authority_generation:
         raise BrokerError(
             "broker_generation_mismatch",
-            "The client enrollment belongs to another broker database generation; rerun Coordinator skill installation.",
+            "The request belongs to another broker database generation; reload current Coordinator state.",
             operation_id=request.operation_id,
         )
-    principal = connection.execute(
-        "SELECT account_id, enabled FROM broker_acl_principals WHERE uid = ?",
-        (peer.uid,),
-    ).fetchone()
-    if principal is None or (
-        not principal["enabled"] and not ephemeral_retained_access
-    ):
-        raise BrokerError(
-            "peer_not_authorized",
-            "This operating-system account is not authorized to use the broker.",
-            operation_id=request.operation_id,
-        )
-    if request.account_id != principal["account_id"]:
-        raise BrokerError(
-            "cross_account_access_denied",
-            "The authenticated account cannot act for the requested account.",
-            operation_id=request.operation_id,
-        )
-    repository_identity = connection.execute(
-        """
-        SELECT canonical_root, state, generation
-        FROM repositories WHERE repo_id = ?
-        """,
-        (request.project_id,),
-    ).fetchone()
-    revoked_repository = connection.execute(
-        """
-        SELECT cleanup_operation_id
-        FROM broker_repository_revocations
-        WHERE repo_id = ? AND repository_generation = ?
-        """,
-        (request.project_id, request.repository_generation),
-    ).fetchone()
-    has_repository_revocation = connection.execute(
-        """
-        SELECT 1 FROM broker_repository_revocations
-        WHERE repo_id = ? LIMIT 1
-        """,
-        (request.project_id,),
-    ).fetchone() is not None
-    revoked_cleanup_replay = bool(
-        revoked_repository is not None
-        and request.operation is BrokerOperation.CLEANUP_APPLY
-        and str(request.arguments.get("plan_id") or "")
-        == str(revoked_repository["cleanup_operation_id"])
-    )
-    if revoked_repository is not None and not revoked_cleanup_replay:
-        raise BrokerError(
-            "project_permanently_removed",
-            "This exact repository generation is permanently removed; explicitly reinstall it through the Coordinator skill.",
-            operation_id=request.operation_id,
-        )
-    terminal_old_generation = request.operation in {
-        BrokerOperation.PORT_RELEASE,
-        BrokerOperation.PORT_UNASSIGN,
-        BrokerOperation.WORKER_LAUNCHED,
-        BrokerOperation.WORKER_EXIT,
-        BrokerOperation.WORKER_ATTEMPT_READ,
-    }
+
     if (
-        repository_identity is not None
-        and int(repository_identity["generation"])
-        != request.repository_generation
-        and has_repository_revocation
-        and not revoked_cleanup_replay
-        and not terminal_old_generation
-    ):
-        raise BrokerError(
-            "project_generation_stale",
-            "The broker request belongs to an obsolete repository generation; reload the protected Coordinator profile.",
-            operation_id=request.operation_id,
-        )
-    # security-assumptions.md requires exact immutable repository generation
-    # as a mistake-prevention gate even though local accounts are attribution
-    # identities, not mutually hostile tenants. Desired-state mutation must
-    # therefore never inherit the legacy revocation-dependent stale check.
-    if request.operation is BrokerOperation.RUNTIME_ENSURE and (
-        repository_identity is None
-        or int(repository_identity["generation"])
-        != request.repository_generation
-    ):
-        raise BrokerError(
-            "project_generation_stale",
-            "Runtime ensure requires the exact current repository generation; "
-            "reload the protected Coordinator profile.",
-            operation_id=request.operation_id,
-        )
-    enrollment = connection.execute(
-        """
-        SELECT account_id, enabled, valid_until_epoch
-        FROM broker_repository_enrollments
-        WHERE uid = ? AND repo_id = ?
-        """,
-        (peer.uid, request.project_id),
-    ).fetchone()
-    if (
-        enrollment is None or not bool(enrollment["enabled"])
-    ) and not ephemeral_retained_access and not revoked_cleanup_replay:
-        raise BrokerError(
-            "project_access_denied",
-            "The authenticated account has no enabled enrollment for this project.",
-            operation_id=request.operation_id,
-        )
-    if (
-        enrollment is not None
-        and str(enrollment["account_id"]) != request.account_id
-    ):
-        raise BrokerError(
-            "cross_account_access_denied",
-            "The repository enrollment belongs to another account.",
-            operation_id=request.operation_id,
-        )
-    revoked_server = connection.execute(
-        """
-        SELECT cleanup_operation_id
-        FROM broker_server_revocations
-        WHERE repo_id = ? AND server_definition_id = ?
-        """,
-        (request.project_id, request.resource_id),
-    ).fetchone()
-    if revoked_server is not None and request.operation not in {
-        BrokerOperation.WORKER_LAUNCHED,
-        BrokerOperation.WORKER_EXIT,
-        BrokerOperation.WORKER_ATTEMPT_READ,
-    }:
-        raise BrokerError(
-            "resource_permanently_removed",
-            "This exact server incarnation is permanently removed; explicitly reinstall it through the Coordinator skill to obtain a new ID.",
-            operation_id=request.operation_id,
-        )
-    installation = connection.execute(
-        """
-        SELECT r.state, i.status, i.startup_fenced
-        FROM repositories r JOIN repository_installations i USING(repo_id)
-        WHERE r.repo_id = ?
-        """,
-        (request.project_id,),
-    ).fetchone()
-    if (
-        installation is None
-        and request.operation is not BrokerOperation.CLEANUP_APPLY
-        and not ephemeral_retained_access
-    ):
-        raise BrokerError(
-            "project_access_denied",
-            "The authenticated account is not authorized for this project.",
-            operation_id=request.operation_id,
-        )
-    if (
-        request.operation
-        in (
-            _REPOSITORY_LIFECYCLE_OPERATIONS
-            | _REPOSITORY_BOOTSTRAP_OPERATIONS
-            | _REPOSITORY_DISCOVERY_OPERATIONS
-            | _REPOSITORY_READ_OPERATIONS
-            | _ARCHIVE_READ_OPERATIONS
-            | _HOST_READ_OPERATIONS
-            | _HOST_OBSERVE_OPERATIONS
-            | _TEST_OPERATIONS
-        )
+        request.operation in _REPOSITORY_LIFECYCLE_OPERATIONS
         and request.resource_id != request.project_id
     ):
         raise BrokerError(
-            "resource_access_denied",
-            "Repository lifecycle must target the exact authorized project identity.",
-            operation_id=request.operation_id,
-        )
-    start_like = request.operation in {
-        BrokerOperation.PORT_LEASE,
-        BrokerOperation.PORT_ASSIGN,
-        BrokerOperation.EPHEMERAL_START,
-        BrokerOperation.EPHEMERAL_IMAGE_PREFETCH,
-        BrokerOperation.EPHEMERAL_RENEW,
-        BrokerOperation.EPHEMERAL_SECRET_FD,
-        BrokerOperation.DOCKER_START,
-        BrokerOperation.DOCKER_RESTART,
-        BrokerOperation.COMPOSE_UP,
-        BrokerOperation.COMPOSE_RESTART,
-        BrokerOperation.COMPOSE_RUN_ONCE,
-        BrokerOperation.DATABASE_BACKUP,
-        BrokerOperation.DATABASE_RESTORE,
-        BrokerOperation.SERVER_PUBLISH,
-        BrokerOperation.HOST_OBSERVE,
-        BrokerOperation.TEST_RUN_START,
-        BrokerOperation.TEST_PLAN_PREVIEW,
-        BrokerOperation.TEST_PLAN_REGISTER,
-        BrokerOperation.TEST_RUN_SUBMIT,
-        BrokerOperation.WORKER_LAUNCH_TICKET,
-    } or (
-        request.operation is BrokerOperation.RUNTIME_REQUEST
-        and request.arguments["action"]
-        in {"start", "restart", "replace", "temporary_start"}
-    ) or (
-        request.operation is BrokerOperation.RUNTIME_ENSURE
-        and request.arguments["desired_state"] == "ready"
-    )
-    retained_cleanup_access = request.operation in {
-        BrokerOperation.ARCHIVES_READ,
-        BrokerOperation.CLEANUP_PLAN,
-        BrokerOperation.CLEANUP_APPLY,
-        BrokerOperation.LIFECYCLE_RESTORE,
-        BrokerOperation.REPOSITORY_REMOVE,
-        BrokerOperation.REPOSITORY_REINSTALL,
-        BrokerOperation.RESOURCE_RETIRE,
-        BrokerOperation.RESOURCE_ARCHIVE,
-        BrokerOperation.RESOURCE_RESTORE,
-        BrokerOperation.EPHEMERAL_STATUS,
-        BrokerOperation.EPHEMERAL_FINISH,
-        BrokerOperation.TEST_RUN_FINISH,
-        BrokerOperation.TEST_HEALTH,
-        BrokerOperation.TEST_STATS_READ,
-        BrokerOperation.TEST_FLEET_STATS_READ,
-        BrokerOperation.TEST_RUN_LIST,
-        BrokerOperation.TEST_RUN_STATUS,
-        BrokerOperation.TEST_RUN_SUMMARY,
-        BrokerOperation.TEST_RUN_FAILURES,
-        BrokerOperation.TEST_RUN_ARTIFACTS,
-        BrokerOperation.TEST_ARTIFACT_RESOLVE,
-        BrokerOperation.TEST_RUN_CASES,
-        BrokerOperation.TEST_RUN_CANCEL,
-        BrokerOperation.TEST_RUN_RETRY,
-        BrokerOperation.TEST_EVENTS_READ,
-        BrokerOperation.TEST_REPOSITORY_SETUP,
-        BrokerOperation.TEST_REPOSITORY_CATALOG,
-        BrokerOperation.TEST_EVIDENCE_CHECK,
-        BrokerOperation.WORKER_LAUNCHED,
-        BrokerOperation.WORKER_EXIT,
-        BrokerOperation.WORKER_POLICY_READ,
-        BrokerOperation.WORKER_ATTEMPT_READ,
-    }
-    if installation is not None and (
-        installation["state"] != "active"
-        and not retained_cleanup_access
-    ) or (
-        start_like
-        and (
-            installation["status"] != "installed"
-            or bool(installation["startup_fenced"])
-        )
-    ):
-        raise BrokerError(
-            "repository_startup_fenced",
-            "Repository is disabled or being decommissioned; start-like mutations are fenced.",
+            "lifecycle_rejected",
+            "Repository lifecycle requires the exact repository target.",
             operation_id=request.operation_id,
         )
 
-    resource_id = request.resource_id
-    resource_kind = "container"
-    lease_row: Optional[sqlite3.Row] = None
-    if request.operation in _EPHEMERAL_OPERATIONS:
-        if request.operation in {
-            BrokerOperation.EPHEMERAL_START,
-            BrokerOperation.EPHEMERAL_IMAGE_STATUS,
-            BrokerOperation.EPHEMERAL_IMAGE_PREFETCH,
-        }:
-            template_id = request.resource_id
-            target = connection.execute(
-                """
-                SELECT template_id, enabled
-                FROM ephemeral_container_templates
-                WHERE template_id = ? AND repo_id = ?
-                """,
-                (template_id, request.project_id),
-            ).fetchone()
-            if target is None or not bool(target["enabled"]):
-                raise BrokerError(
-                    "control_binding_unavailable",
-                    "Ephemeral template is disabled or no longer belongs to this repository.",
-                    operation_id=request.operation_id,
-                )
-        else:
-            target = connection.execute(
-                """
-                SELECT run.template_id, template.enabled,
-                       run.owner_uid, run.account_id, run.status,
-                       run.expires_at_epoch, run.secret_policy_kind,
-                       run.secret_binding_id,
-                       run.credential_renewal_phase
-                FROM ephemeral_container_runs run
-                JOIN ephemeral_container_templates template USING(template_id)
-                WHERE run.run_id = ? AND run.repo_id = ?
-                """,
-                (request.resource_id, request.project_id),
-            ).fetchone()
-            if (
-                target is None
-                or str(target["account_id"]) != request.account_id
-            ):
-                raise BrokerError(
-                    "resource_access_denied",
-                    "Ephemeral run does not belong to the authenticated principal and project.",
-                    operation_id=request.operation_id,
-                )
-            template_id = str(target["template_id"])
-            if (
-                request.operation
-                in {
-                    BrokerOperation.EPHEMERAL_RENEW,
-                    BrokerOperation.EPHEMERAL_SECRET_FD,
-                }
-                and not bool(target["enabled"])
-            ):
-                raise BrokerError(
-                    "control_binding_unavailable",
-                    "The ephemeral template was disabled; this run may only be inspected or finished.",
-                    operation_id=request.operation_id,
-                )
-            if request.operation is BrokerOperation.EPHEMERAL_SECRET_FD:
-                arguments = request.arguments
-                if (
-                    arguments.get("run_id") != request.resource_id
-                    or arguments.get("template_id") != template_id
-                    or str(target["status"]) != "running"
-                    or int(target["expires_at_epoch"]) <= int(time.time())
-                    or str(target["credential_renewal_phase"]) != "none"
-                ):
-                    raise BrokerError(
-                        "resource_access_denied",
-                        "Credential delivery requires the exact current running ephemeral run.",
-                        operation_id=request.operation_id,
-                    )
-        if not ephemeral_retained_access:
-            grant = connection.execute(
-                """
-                SELECT enabled FROM broker_ephemeral_acl
-                WHERE uid = ? AND repo_id = ? AND template_id = ?
-                  AND operation = ?
-                """,
-                (peer.uid, request.project_id, template_id, request.operation.value),
-            ).fetchone()
-            if grant is None or not bool(grant["enabled"]):
-                raise BrokerError(
-                    "operation_access_denied",
-                    "The authenticated account is not authorized for this ephemeral-container operation.",
-                    operation_id=request.operation_id,
-                )
+    if _requires_active_repository(request):
+        repository = connection.execute(
+            """
+            SELECT repository.generation, repository.state,
+                   installation.status, installation.startup_fenced
+            FROM repositories AS repository
+            JOIN repository_installations AS installation USING(repo_id)
+            WHERE repository.repo_id = ?
+            """,
+            (request.project_id,),
+        ).fetchone()
+        if (
+            repository is None
+            or str(repository["state"]) != "active"
+            or str(repository["status"]) != "installed"
+            or bool(repository["startup_fenced"])
+        ):
+            raise BrokerError(
+                "repository_startup_fenced",
+                "The exact repository is unavailable or fenced for new work.",
+                operation_id=request.operation_id,
+            )
+        if request.repository_generation != int(repository["generation"]):
+            raise BrokerError(
+                "project_generation_stale",
+                "The request belongs to an obsolete repository generation.",
+                operation_id=request.operation_id,
+            )
+
+    if request.operation is BrokerOperation.EPHEMERAL_SECRET_FD:
+        target = connection.execute(
+            """
+            SELECT run.template_id, template.enabled,
+                   run.owner_uid, run.account_id, run.status,
+                   run.expires_at_epoch, run.secret_policy_kind,
+                   run.secret_binding_id, run.credential_renewal_phase
+            FROM ephemeral_container_runs run
+            JOIN ephemeral_container_templates template USING(template_id)
+            WHERE run.run_id = ? AND run.repo_id = ?
+            """,
+            (request.resource_id, request.project_id),
+        ).fetchone()
+        if (
+            target is None
+            or request.arguments.get("run_id") != request.resource_id
+            or request.arguments.get("template_id") != str(target["template_id"])
+            or str(target["status"]) != "running"
+            or int(target["expires_at_epoch"]) <= int(time.time())
+            or str(target["credential_renewal_phase"]) != "none"
+            or not bool(target["enabled"])
+        ):
+            raise BrokerError(
+                "resource_unavailable",
+                "Credential delivery requires the exact current running ephemeral run.",
+                operation_id=request.operation_id,
+            )
         return target
 
-    if request.operation in {
-        BrokerOperation.RUNTIME_REQUEST,
-        BrokerOperation.RUNTIME_ENSURE,
-    }:
-        _require_runtime_repository_context(
-            connection, peer=peer, request=request
-        )
-        if (
-            request.operation is BrokerOperation.RUNTIME_REQUEST
-            and request.arguments["action"] == "temporary_start"
-        ):
-            # A first-use temporary service is repository-scoped; there is no
-            # pre-existing resource ACL or mutable server definition to
-            # authorize. The exact active repository context and typed local
-            # policy authorize the operation. Its reserved physical peer UID
-            # independently selects and records the non-root execution identity;
-            # legacy repository ownership never does.
-            if (
-                request.resource_id != request.project_id
-                or request.arguments["target_kind"] != "service"
-            ):
-                raise BrokerError(
-                    "resource_access_denied",
-                    "A temporary service must target the exact enrolled repository.",
-                    operation_id=request.operation_id,
-                )
-            return None
-        runtime_kind = str(request.arguments["target_kind"])
-        _require_runtime_resource_membership(
-            connection,
-            repo_id=request.project_id,
-            resource_kind=runtime_kind,
-            resource_id=request.resource_id,
-            operation_id=request.operation_id,
-        )
-        if request.operation is BrokerOperation.RUNTIME_ENSURE:
-            # security-assumptions.md permits no broader inferred authority:
-            # ensuring ready consumes the exact start grant and ensuring
-            # stopped consumes the exact stop grant for this one resource.
-            acl_action = (
-                "start"
-                if request.arguments["desired_state"] == "ready"
-                else "stop"
-            )
-        else:
-            acl_action = (
-                "status"
-                if request.arguments["action"] == "capture_logs"
-                else request.arguments["action"]
-            )
-        grant = connection.execute(
+    if request.operation is BrokerOperation.SERVER_PUBLISH:
+        lease = connection.execute(
             """
-            SELECT enabled FROM broker_runtime_acl
-            WHERE uid = ? AND repo_id = ? AND resource_kind = ?
-              AND resource_id = ? AND action = ?
-            """,
-            (
-                peer.uid,
-                request.project_id,
-                runtime_kind,
-                request.resource_id,
-                acl_action,
-            ),
-        ).fetchone()
-        if grant is None or not grant["enabled"]:
-            raise BrokerError(
-                "operation_access_denied",
-                "The authenticated account is not authorized for this exact runtime action.",
-                operation_id=request.operation_id,
-            )
-        return None
-    if request.operation in _WORKER_OPERATIONS:
-        definition = connection.execute(
-            """
-            SELECT definition.repo_id, policy.execution_uid
-            FROM server_definitions definition
-            LEFT JOIN worker_policies policy USING(server_definition_id)
-            WHERE definition.server_definition_id = ?
-            """,
-            (request.resource_id,),
-        ).fetchone()
-        if definition is None or str(definition["repo_id"]) != request.project_id:
-            raise BrokerError(
-                "resource_access_denied",
-                "The worker request does not target an exact server in the enrolled project.",
-                operation_id=request.operation_id,
-            )
-        grant = connection.execute(
-            """
-            SELECT enabled FROM broker_worker_acl
-            WHERE uid = ? AND repo_id = ? AND server_definition_id = ?
-              AND operation = ?
-            """,
-            (
-                peer.uid,
-                request.project_id,
-                request.resource_id,
-                request.operation.value,
-            ),
-        ).fetchone()
-        if grant is None or not bool(grant["enabled"]):
-            raise BrokerError(
-                "operation_access_denied",
-                "The authenticated account is not authorized for this exact worker operation.",
-                operation_id=request.operation_id,
-            )
-        if definition["execution_uid"] is None:
-            raise BrokerError(
-                "worker_not_configured",
-                "The exact server has no durable worker supervision policy.",
-                operation_id=request.operation_id,
-            )
-        if request.operation in {
-            BrokerOperation.WORKER_LAUNCHED,
-            BrokerOperation.WORKER_EXIT,
-            BrokerOperation.WORKER_ATTEMPT_READ,
-        }:
-            attempt = connection.execute(
-                """
-                SELECT repo_id, server_definition_id
-                FROM worker_attempts WHERE attempt_id = ?
-                """,
-                (request.arguments["attempt_id"],),
-            ).fetchone()
-            if (
-                attempt is None
-                or str(attempt["repo_id"]) != request.project_id
-                or str(attempt["server_definition_id"]) != request.resource_id
-            ):
-                raise BrokerError(
-                    "worker_attempt_access_denied",
-                    "The worker attempt does not belong to the exact enrolled project and server.",
-                    operation_id=request.operation_id,
-                )
-        return definition
-    if request.operation in _HOST_READ_OPERATIONS:
-        # Host inventory visibility is read-only and host-wide for every
-        # enrolled principal. Observation is an authoritative mutation and
-        # therefore follows the explicit exact-repository ACL below.
-        return None
-    if request.operation in _REPOSITORY_BOOTSTRAP_OPERATIONS:
-        # One existing exact enrollment is only a transport anchor. The
-        # service independently proves the requested Git root and performs the
-        # bounded adoption transaction before returning its immutable ID.
-        return None
-    if request.operation in _REPOSITORY_DISCOVERY_OPERATIONS:
-        # Canonical-root discovery is a pure authority read routed through an
-        # existing enrollment; it cannot create, revive, or change a project.
-        return None
-    if request.operation in _TEST_OPERATIONS:
-        # Repository enrollment is the complete authority for the universal
-        # test journal. Runs and statistics can target only that exact repo;
-        # result ownership is rechecked against the run row by the service.
-        return None
-    if request.operation in _HOST_OBSERVE_OPERATIONS:
-        grant = connection.execute(
-            """
-            SELECT enabled FROM broker_host_observation_acl
-            WHERE uid = ? AND repo_id = ?
-            """,
-            (peer.uid, request.project_id),
-        ).fetchone()
-        if grant is None or not grant["enabled"]:
-            raise BrokerError(
-                "operation_access_denied",
-                "The authenticated account is not authorized to refresh host observations.",
-                operation_id=request.operation_id,
-            )
-        return None
-    if request.operation in _REPOSITORY_READ_OPERATIONS:
-        grant = connection.execute(
-            """
-            SELECT enabled FROM broker_repository_read_acl
-            WHERE uid = ? AND repo_id = ? AND operation = ?
-            """,
-            (peer.uid, request.project_id, request.operation.value),
-        ).fetchone()
-        if grant is None or not grant["enabled"]:
-            raise BrokerError(
-                "operation_access_denied",
-                "The authenticated account is not authorized for this repository read.",
-                operation_id=request.operation_id,
-            )
-        return None
-    if request.operation in _ARCHIVE_READ_OPERATIONS:
-        grant = connection.execute(
-            """
-            SELECT enabled FROM broker_cleanup_acl
-            WHERE uid = ? AND repo_id = ? AND operation = ?
-            """,
-            (peer.uid, request.project_id, request.operation.value),
-        ).fetchone()
-        if grant is None or not grant["enabled"]:
-            raise BrokerError(
-                "operation_access_denied",
-                "The authenticated account is not authorized to read archives.",
-                operation_id=request.operation_id,
-            )
-        return None
-    if request.operation in _CLEANUP_OPERATIONS:
-        acl_repo_id = request.project_id
-        plan_row = None
-        if request.operation is BrokerOperation.CLEANUP_APPLY:
-            plan_row = connection.execute(
-                """
-                SELECT o.repo_id, o.kind, c.target_kind, c.target_id
-                FROM operations o
-                LEFT JOIN cleanup_plans c ON c.plan_id = o.operation_id
-                WHERE o.operation_id = ?
-                  AND (
-                    c.plan_id IS NOT NULL
-                    OR o.kind IN (
-                      'repository_decommission',
-                      'standalone_resource_retirement'
-                    )
-                  )
-                """,
-                (request.arguments["plan_id"],),
-            ).fetchone()
-            if plan_row is None or plan_row["repo_id"] is None:
-                raise BrokerError(
-                    "resource_access_denied",
-                    "Cleanup plan has no authorized project boundary.",
-                    operation_id=request.operation_id,
-                )
-            acl_repo_id = str(plan_row["repo_id"])
-        project_cleanup = (
-            request.operation is BrokerOperation.CLEANUP_PLAN
-            and str(request.arguments.get("target_kind") or "") == "project"
-        ) or (
-            request.operation is BrokerOperation.CLEANUP_APPLY
-            and plan_row is not None
-            and (
-                str(plan_row["kind"]) == "repository_decommission"
-                or str(plan_row["target_kind"] or "") == "project"
-            )
-        )
-        if project_cleanup:
-            active_ephemeral = connection.execute(
-                """
-                SELECT 1 FROM ephemeral_container_runs
-                WHERE repo_id = ? AND status NOT IN ('cleaned', 'failed')
-                LIMIT 1
-                """,
-                (acl_repo_id,),
-            ).fetchone()
-            if active_ephemeral is not None:
-                raise BrokerError(
-                    "ephemeral_runs_active",
-                    "Finish active broker-owned ephemeral runs before archiving or purging this project.",
-                    operation_id=request.operation_id,
-                )
-        grant = connection.execute(
-            """
-            SELECT enabled FROM broker_cleanup_acl
-            WHERE uid = ? AND repo_id = ? AND operation = ?
-            """,
-            (peer.uid, acl_repo_id, request.operation.value),
-        ).fetchone()
-        if (
-            grant is None or not grant["enabled"]
-        ) and not revoked_cleanup_replay:
-            raise BrokerError(
-                "operation_access_denied",
-                "The authenticated account is not authorized for permanent cleanup.",
-                operation_id=request.operation_id,
-            )
-        if request.operation in {
-            BrokerOperation.CLEANUP_PLAN,
-            BrokerOperation.LIFECYCLE_RESTORE,
-        }:
-            target_kind = str(request.arguments["target_kind"])
-            target_id = str(request.arguments["target_id"])
-            if target_kind in {"project", "worktree"}:
-                owned = target_id == request.project_id
-            else:
-                owned = connection.execute(
-                    """
-                    SELECT 1 FROM repository_memberships
-                    WHERE repo_id = ? AND resource_kind = ? AND host_resource_id = ?
-                    UNION ALL
-                    SELECT 1 FROM operations o
-                    JOIN operation_targets t USING(operation_id)
-                    WHERE o.repo_id = ? AND t.target_kind = ? AND t.target_id = ?
-                    LIMIT 1
-                    """,
-                    (
-                        request.project_id,
-                        target_kind,
-                        target_id,
-                        request.project_id,
-                        target_kind,
-                        target_id,
-                    ),
-                ).fetchone() is not None
-            if not owned:
-                raise BrokerError(
-                    "resource_access_denied",
-                    "Cleanup target does not belong to the authorized project.",
-                    operation_id=request.operation_id,
-                )
-            if (
-                request.operation is BrokerOperation.LIFECYCLE_RESTORE
-                and target_kind in {"server", "container"}
-            ):
-                exact_restore = connection.execute(
-                    """
-                    SELECT a.enabled
-                    FROM broker_cleanup_resource_acl a
-                    JOIN control_bindings b ON b.binding_id = a.control_binding_id
-                    WHERE a.uid = ? AND a.repo_id = ?
-                      AND a.resource_kind = ? AND a.resource_id = ?
-                      AND a.operation = 'resource.restore' AND a.enabled = 1
-                      AND b.resource_kind = a.resource_kind
-                      AND b.resource_id = a.resource_id
-                      AND b.authority_state = 'authoritative'
-                    LIMIT 1
-                    """,
-                    (peer.uid, request.project_id, target_kind, target_id),
-                ).fetchone()
-                if exact_restore is None:
-                    raise BrokerError(
-                        "resource_access_denied",
-                        "Resource restore requires an explicit exact restore grant.",
-                        operation_id=request.operation_id,
-                    )
-        else:
-            if plan_row is None:
-                raise BrokerError(
-                    "resource_access_denied",
-                    "Cleanup plan has no authorized project boundary.",
-                    operation_id=request.operation_id,
-                )
-        return None
-    if request.operation in _LIFECYCLE_OPERATIONS:
-        if request.operation in {
-            BrokerOperation.REPOSITORY_PLAN_REMOVE,
-            BrokerOperation.REPOSITORY_REMOVE,
-        }:
-            active_ephemeral = connection.execute(
-                """
-                SELECT 1 FROM ephemeral_container_runs
-                WHERE repo_id = ? AND status NOT IN ('cleaned', 'failed')
-                LIMIT 1
-                """,
-                (request.project_id,),
-            ).fetchone()
-            if active_ephemeral is not None:
-                raise BrokerError(
-                    "ephemeral_runs_active",
-                    "Finish active broker-owned ephemeral runs before removing this repository.",
-                    operation_id=request.operation_id,
-                )
-        canonical_resource_archive = request.operation in {
-            BrokerOperation.RESOURCE_PLAN_ARCHIVE,
-            BrokerOperation.RESOURCE_ARCHIVE,
-            BrokerOperation.RESOURCE_RESTORE,
-        }
-        if not canonical_resource_archive:
-            grant = connection.execute(
-                """
-                SELECT enabled FROM broker_lifecycle_acl
-                WHERE uid = ? AND repo_id = ? AND operation = ?
-                """,
-                (peer.uid, request.project_id, request.operation.value),
-            ).fetchone()
-            if grant is None or not grant["enabled"]:
-                raise BrokerError(
-                    "operation_access_denied",
-                    "The authenticated account is not authorized for this lifecycle operation.",
-                    operation_id=request.operation_id,
-                )
-        destructive_or_restore = request.operation in {
-            BrokerOperation.REPOSITORY_PLAN_REMOVE,
-            BrokerOperation.REPOSITORY_REMOVE,
-            BrokerOperation.REPOSITORY_REINSTALL,
-            BrokerOperation.RESOURCE_PLAN_RETIRE,
-            BrokerOperation.RESOURCE_RETIRE,
-            BrokerOperation.RESOURCE_PLAN_ARCHIVE,
-            BrokerOperation.RESOURCE_ARCHIVE,
-            BrokerOperation.RESOURCE_RESTORE,
-        }
-        if destructive_or_restore:
-            cleanup_grant = connection.execute(
-                """
-                SELECT enabled FROM broker_cleanup_acl
-                WHERE uid = ? AND repo_id = ? AND operation = ?
-                """,
-                (peer.uid, request.project_id, request.operation.value),
-            ).fetchone()
-            if cleanup_grant is None or not cleanup_grant["enabled"]:
-                raise BrokerError(
-                    "operation_access_denied",
-                    "This archive, restore, or removal capability is default-deny and has not been explicitly granted.",
-                    operation_id=request.operation_id,
-                )
-        if request.operation in _RESOURCE_LIFECYCLE_OPERATIONS:
-            cleanup_resource_operation = canonical_resource_archive
-            acl_table = (
-                "broker_cleanup_resource_acl"
-                if cleanup_resource_operation
-                else "broker_lifecycle_resource_acl"
-            )
-            unassigned_join = (
-                ""
-                if cleanup_resource_operation
-                else "JOIN unassigned_resources u ON u.resource_kind = a.resource_kind AND u.resource_id = a.resource_id"
-            )
-            unassigned_clause = "" if cleanup_resource_operation else "AND u.status = 'active'"
-            exact = connection.execute(
-                f"""
-                SELECT a.enabled
-                FROM {acl_table} a
-                JOIN control_bindings b ON b.binding_id = a.control_binding_id
-                JOIN coordinator_sources s ON s.source_id = b.source_id
-                {unassigned_join}
-                WHERE a.uid = ? AND a.repo_id = ?
-                  AND a.resource_kind = ? AND a.resource_id = ?
-                  AND a.control_binding_id = ?
-                  AND a.immutable_fingerprint = ?
-                  AND a.ownership_fingerprint = ?
-                  AND a.operation = ?
-                  AND b.resource_kind = a.resource_kind
-                  AND b.resource_id = a.resource_id
-                  AND b.authority_state = 'authoritative'
-                  AND b.provenance != 'coordinator_ephemeral'
-                  {unassigned_clause}
-                """,
-                (
-                    peer.uid,
-                    request.project_id,
-                    request.arguments["resource_kind"],
-                    request.resource_id,
-                    request.arguments["control_binding_id"],
-                    request.arguments["immutable_fingerprint"],
-                    request.arguments["ownership_fingerprint"],
-                    request.operation.value,
-                ),
-            ).fetchone()
-            if (
-                (exact is None or not exact["enabled"])
-                and request.operation in {
-                    BrokerOperation.RESOURCE_RETIRE,
-                    BrokerOperation.RESOURCE_ARCHIVE,
-                }
-            ):
-                exact = _authorized_completed_retirement_replay(
-                    connection,
-                    peer=peer,
-                    request=request,
-                )
-            if exact is None or not exact["enabled"]:
-                raise BrokerError(
-                    "resource_access_denied",
-                    "Standalone lifecycle request does not match an exact administrator-provisioned resource grant.",
-                    operation_id=request.operation_id,
-                )
-        return None
-    if request.operation in _DATABASE_OPERATIONS:
-        database_name = str(request.arguments["database_name"])
-        grant = connection.execute(
-            """
-            SELECT a.enabled, a.database_binding_id
-            FROM broker_database_acl a
-            JOIN database_bindings b USING(database_binding_id)
-            JOIN repository_memberships m
-              ON m.repo_id = a.repo_id
-             AND m.resource_kind = 'container'
-             AND m.host_resource_id = a.docker_resource_id
-            JOIN control_bindings c ON c.binding_id = m.control_binding_id
-            WHERE a.uid = ? AND a.repo_id = ?
-              AND a.docker_resource_id = ? AND a.operation = ?
-              AND b.docker_resource_id = a.docker_resource_id
-              AND b.repo_id = a.repo_id AND b.database_name = ?
-              AND b.engine_kind = 'postgresql'
-              AND c.repo_id = a.repo_id
-              AND c.resource_kind = 'container'
-              AND c.resource_id = a.docker_resource_id
-              AND c.authority_state = 'authoritative'
-            """,
-            (
-                peer.uid,
-                request.project_id,
-                request.resource_id,
-                request.operation.value,
-                database_name,
-            ),
-        ).fetchone()
-        if grant is None or not grant["enabled"]:
-            raise BrokerError(
-                "operation_access_denied",
-                "The authenticated account is not authorized for this PostgreSQL database operation.",
-                operation_id=request.operation_id,
-            )
-        if request.operation == BrokerOperation.DATABASE_RESTORE:
-            backup = connection.execute(
-                """
-                SELECT database_binding_id, docker_resource_id, status,
-                       verification_status, scope, source_container_id,
-                       source_database_name
-                FROM database_backups WHERE database_backup_id = ?
-                """,
-                (request.arguments["database_backup_id"],),
-            ).fetchone()
-            if (
-                backup is None
-                or backup["status"] != "available"
-                or backup["verification_status"] != "strong"
-                or backup["scope"] != "database"
-                or backup["database_binding_id"] != grant["database_binding_id"]
-                or backup["docker_resource_id"] != request.resource_id
-                or backup["source_database_name"] != database_name
-            ):
-                raise BrokerError(
-                    "database_backup_unavailable",
-                    "Restore requires a strongly verified service-owned backup of this exact database.",
-                    operation_id=request.operation_id,
-                )
-        return None
-    if request.operation == BrokerOperation.SERVER_PUBLISH:
-        lease_row = connection.execute(
-            """
-            SELECT l.status, l.port, b.protocol, b.server_definition_id,
-                   b.uid, b.account_id, b.repo_id
-            FROM leases l JOIN broker_lease_owners b USING(lease_id)
-            WHERE l.lease_id = ?
+            SELECT status, port, protocol, server_definition_id, repo_id
+            FROM leases WHERE lease_id = ?
             """,
             (request.arguments["lease_id"],),
         ).fetchone()
         if (
-            lease_row is None
-            or lease_row["status"] != "active"
-            or lease_row["account_id"] != request.account_id
-            or lease_row["repo_id"] != request.project_id
-            or lease_row["server_definition_id"] != request.resource_id
-            or int(lease_row["port"]) != int(request.arguments["listener_port"])
+            lease is None
+            or str(lease["status"]) != "active"
+            or str(lease["repo_id"]) != request.project_id
+            or str(lease["server_definition_id"]) != request.resource_id
+            or int(lease["port"]) != int(request.arguments["listener_port"])
         ):
             raise BrokerError(
-                "resource_access_denied",
-                "Server publication does not match the authenticated principal's exact active lease.",
+                "resource_identity_mismatch",
+                "Server publication does not match the exact active lease and server target.",
                 operation_id=request.operation_id,
             )
-        resource_id = request.resource_id
-        resource_kind = "server"
-    elif request.operation == BrokerOperation.PORT_RELEASE:
-        lease_row = connection.execute(
+        return lease
+
+    if request.operation is BrokerOperation.PORT_RELEASE:
+        lease = connection.execute(
             """
-            SELECT l.status, l.port, b.protocol, b.server_definition_id,
-                   b.uid, b.account_id, b.repo_id
-            FROM leases l JOIN broker_lease_owners b USING(lease_id)
-            WHERE l.lease_id = ?
+            SELECT status, port, protocol, server_definition_id, repo_id
+            FROM leases WHERE lease_id = ?
             """,
             (request.resource_id,),
         ).fetchone()
-        if (
-            lease_row is None
-            or lease_row["account_id"] != request.account_id
-            or lease_row["repo_id"] != request.project_id
-        ):
+        if lease is None or str(lease["repo_id"]) != request.project_id:
             raise BrokerError(
-                "resource_access_denied",
-                "The authenticated account is not authorized for this lease.",
+                "resource_identity_mismatch",
+                "Port release does not match the exact lease and repository target.",
                 operation_id=request.operation_id,
             )
-        resource_id = str(lease_row["server_definition_id"])
-        resource_kind = "server"
-    elif request.operation in {
-        BrokerOperation.PORT_LEASE,
-        BrokerOperation.PORT_ASSIGN,
-        BrokerOperation.PORT_UNASSIGN,
-    }:
-        resource_kind = "server"
-    elif request.operation in _ALL_COMPOSE_OPERATIONS:
-        resource_kind = "compose"
+        return lease
+
+    return None
+
+
+def _requires_active_repository(request: BrokerRequest) -> bool:
+    """Return whether this request would create, start, or publish new work."""
 
     if request.operation in {
+        BrokerOperation.HOST_OBSERVE,
         BrokerOperation.PORT_LEASE,
         BrokerOperation.PORT_ASSIGN,
-        BrokerOperation.PORT_UNASSIGN,
+        BrokerOperation.SERVER_PUBLISH,
+        BrokerOperation.EPHEMERAL_START,
+        BrokerOperation.EPHEMERAL_IMAGE_PREFETCH,
+        BrokerOperation.COMPOSE_UP,
+        BrokerOperation.COMPOSE_RESTART,
+        BrokerOperation.COMPOSE_RUN_ONCE,
+        BrokerOperation.DOCKER_START,
+        BrokerOperation.DOCKER_RESTART,
     }:
-        assignment_owner = connection.execute(
-            """
-            SELECT p.status, o.uid, o.account_id, o.repo_id,
-                   o.server_definition_id
-            FROM server_definitions s
-            JOIN port_assignments p
-              ON p.repo_id = s.repo_id AND p.server_name = s.name
-            LEFT JOIN broker_assignment_owners o USING(assignment_id)
-            WHERE s.repo_id = ? AND s.server_definition_id = ?
-            """,
-            (request.project_id, resource_id),
-        ).fetchone()
-        if (
-            assignment_owner is not None
-            and assignment_owner["status"] == "active"
-            and assignment_owner["uid"] is not None
-            and (
-                assignment_owner["account_id"] != request.account_id
-                or assignment_owner["repo_id"] != request.project_id
-                or assignment_owner["server_definition_id"] != resource_id
-            )
-        ):
-            raise BrokerError(
-                "resource_access_denied",
-                "The active port assignment belongs to another authenticated principal.",
-                operation_id=request.operation_id,
-            )
-
-    if request.operation in {
-        BrokerOperation.PORT_ASSIGN,
-        BrokerOperation.PORT_UNASSIGN,
-    }:
-        grant = connection.execute(
-            """
-            SELECT enabled FROM broker_assignment_acl
-            WHERE uid = ? AND repo_id = ? AND server_definition_id = ?
-              AND operation = ?
-            """,
-            (peer.uid, request.project_id, resource_id, request.operation.value),
-        ).fetchone()
-    elif request.operation in _COMPOSE_OPERATIONS:
-        grant = connection.execute(
-            """
-            SELECT enabled FROM broker_compose_acl
-            WHERE uid = ? AND repo_id = ? AND compose_definition_id = ?
-              AND operation = ?
-            """,
-            (peer.uid, request.project_id, resource_id, request.operation.value),
-        ).fetchone()
-    elif request.operation is BrokerOperation.COMPOSE_RUN_ONCE:
-        grant = connection.execute(
-            """
-            SELECT acl.enabled
-            FROM broker_compose_run_once_acl acl
-            JOIN broker_compose_run_once_services policy
-              ON policy.compose_definition_id = acl.compose_definition_id
-             AND policy.service_name = acl.service_name
-            JOIN broker_compose_definitions definition
-              ON definition.compose_definition_id = acl.compose_definition_id
-             AND definition.repo_id = acl.repo_id
-            WHERE acl.uid = ? AND acl.repo_id = ?
-              AND acl.compose_definition_id = ?
-              AND acl.service_name = ?
-              AND policy.max_timeout_seconds >= ?
-              AND definition.enabled = 1
-            """,
-            (
-                peer.uid,
-                request.project_id,
-                resource_id,
-                request.arguments["service"],
-                request.arguments["timeout_seconds"],
-            ),
-        ).fetchone()
-    elif request.operation == BrokerOperation.SERVER_PUBLISH:
-        grant = connection.execute(
-            """
-            SELECT enabled FROM broker_resource_acl
-            WHERE uid = ? AND repo_id = ? AND resource_kind = 'server'
-              AND resource_id = ? AND operation = 'port.lease'
-            """,
-            (peer.uid, request.project_id, resource_id),
-        ).fetchone()
-    else:
-        grant = connection.execute(
-            """
-            SELECT enabled FROM broker_resource_acl
-            WHERE uid = ? AND repo_id = ? AND resource_kind = ?
-              AND resource_id = ? AND operation = ?
-            """,
-            (
-                peer.uid,
-                request.project_id,
-                resource_kind,
-                resource_id,
-                request.operation.value,
-            ),
-        ).fetchone()
-    if grant is None or not grant["enabled"]:
-        raise BrokerError(
-            "operation_access_denied",
-            "The authenticated account is not authorized for this resource operation.",
-            operation_id=request.operation_id,
-        )
-
-    _require_resource_membership(
-        connection,
-        repo_id=request.project_id,
-        resource_kind=resource_kind,
-        resource_id=resource_id,
-        operation_id=request.operation_id,
-    )
-    if request.operation == BrokerOperation.PORT_LEASE:
-        ttl = int(request.arguments.get("ttl_seconds", DEFAULT_PORT_LEASE_TTL_SECONDS))
-        policies = _port_policy_rows(
-            connection,
-            account_id=request.account_id,
-            repo_id=request.project_id,
-            server_definition_id=resource_id,
-            protocol=str(request.arguments.get("protocol", "tcp")),
-            ttl_seconds=ttl,
-        )
-        requested = request.arguments.get("requested_port")
-        if requested is not None and not any(
-            int(row["start_port"]) <= requested <= int(row["end_port"])
-            for row in policies
-        ):
-            raise BrokerError(
-                "port_policy_denied",
-                "The requested port is outside the account's authorized ranges.",
-                operation_id=request.operation_id,
-            )
-    elif request.operation == BrokerOperation.PORT_ASSIGN:
-        _require_assignment_port_policy(
-            connection,
-            account_id=request.account_id,
-            repo_id=request.project_id,
-            server_definition_id=resource_id,
-            port=int(request.arguments["port"]),
-            operation_id=request.operation_id,
-        )
-    elif request.operation in _COMPOSE_START_OPERATIONS:
-        definition = connection.execute(
-            """
-            SELECT enabled FROM broker_compose_definitions
-            WHERE compose_definition_id = ? AND repo_id = ?
-            """,
-            (resource_id, request.project_id),
-        ).fetchone()
-        if definition is None or not definition["enabled"]:
-            raise BrokerError(
-                "compose_definition_disabled",
-                "Compose definition is disabled or unavailable.",
-                operation_id=request.operation_id,
-            )
-    elif request.operation is BrokerOperation.COMPOSE_RUN_ONCE:
-        policy = connection.execute(
-            """
-            SELECT definition.enabled, policy.max_timeout_seconds
-            FROM broker_compose_definitions definition
-            JOIN broker_compose_run_once_services policy
-              USING(compose_definition_id)
-            WHERE definition.compose_definition_id = ?
-              AND definition.repo_id = ?
-              AND policy.service_name = ?
-            """,
-            (
-                resource_id,
-                request.project_id,
-                request.arguments["service"],
-            ),
-        ).fetchone()
-        if (
-            policy is None
-            or not bool(policy["enabled"])
-            or int(request.arguments["timeout_seconds"])
-            > int(policy["max_timeout_seconds"])
-        ):
-            raise BrokerError(
-                "compose_run_once_policy_denied",
-                "Compose run-once request is outside the sealed service policy.",
-                operation_id=request.operation_id,
-            )
-    return lease_row
+        return True
+    if request.operation is BrokerOperation.RUNTIME_REQUEST:
+        return request.arguments.get("action") in {"start", "restart", "replace"}
+    if request.operation is BrokerOperation.RUNTIME_ENSURE:
+        return request.arguments.get("desired_state") == "ready"
+    return False
 
 
-def _authorized_completed_retirement_replay(
+def _port_range_rows(
     connection: sqlite3.Connection,
     *,
-    peer: PeerCredentials,
-    request: BrokerRequest,
-) -> Optional[sqlite3.Row]:
-    """Authorize only the exact confirmed plan after its resource is hidden.
-
-    Normal standalone authorization deliberately requires an active unassigned
-    resource and an authoritative controller.  Successful retirement removes
-    both conditions, so a client whose response was lost would otherwise be
-    unable to retrieve the durable idempotent result.  This fallback keeps the
-    administrator grant live but binds it to the exact broker-observed plan,
-    target identity, and fingerprint that were authorized before retirement.
-    It cannot create or apply a new plan against an inactive resource.
-    """
-
-    return connection.execute(
-        """
-        SELECT a.enabled
-        FROM broker_lifecycle_resource_acl a
-        JOIN broker_lifecycle_plan_observations observed
-          ON observed.plan_id = ? AND observed.repo_id = a.repo_id
-        JOIN operations operation
-          ON operation.operation_id = observed.plan_id
-        JOIN operation_targets target
-          ON target.operation_id = operation.operation_id
-         AND target.ordinal = 0
-        JOIN operation_target_parameters binding
-          ON binding.operation_id = operation.operation_id
-         AND binding.target_ordinal = target.ordinal
-         AND binding.name = 'control_binding_id'
-        WHERE a.uid = ? AND a.repo_id = ?
-          AND a.resource_kind = ? AND a.resource_id = ?
-          AND a.control_binding_id = ?
-          AND a.immutable_fingerprint = ?
-          AND a.ownership_fingerprint = ?
-          AND a.operation = 'resource.retire' AND a.enabled = 1
-          AND operation.kind = 'standalone_resource_retirement'
-          AND operation.status IN ('cancelled', 'succeeded')
-          AND operation.request_fingerprint = ?
-          AND target.target_kind = a.resource_kind
-          AND target.target_id = a.resource_id
-          AND target.immutable_fingerprint = a.immutable_fingerprint
-          AND binding.value = a.control_binding_id
-        """,
-        (
-            str(request.arguments["plan_id"]),
-            peer.uid,
-            request.project_id,
-            str(request.arguments["resource_kind"]),
-            request.resource_id,
-            str(request.arguments["control_binding_id"]),
-            str(request.arguments["immutable_fingerprint"]),
-            str(request.arguments["ownership_fingerprint"]),
-            str(request.arguments["plan_fingerprint"]),
-        ),
-    ).fetchone()
-
-
-def _require_principal(connection: sqlite3.Connection, uid: int) -> None:
-    if (
-        connection.execute(
-            "SELECT 1 FROM broker_acl_principals WHERE uid = ?", (uid,)
-        ).fetchone()
-        is None
-    ):
-        raise BrokerError("peer_not_authorized", "Broker principal is not provisioned.")
-
-
-def _require_runtime_repository_context(
-    connection: sqlite3.Connection,
-    *,
-    peer: PeerCredentials,
-    request: BrokerRequest,
-) -> None:
-    """Prove the wire IDs describe one enrolled root/worktree family."""
-
-    root_repo_id = str(request.arguments["root_repo_id"])
-    temporary_repo_id = request.arguments["temporary_repo_id"]
-    effective_repo_id = request.project_id
-    if temporary_repo_id is None:
-        if effective_repo_id != root_repo_id:
-            raise BrokerError(
-                "runtime_repository_context_mismatch",
-                "The effective repository is not the declared root repository.",
-                operation_id=request.operation_id,
-            )
-    elif effective_repo_id != str(temporary_repo_id):
-        raise BrokerError(
-            "runtime_repository_context_mismatch",
-            "The effective repository is not the declared temporary repository.",
-            operation_id=request.operation_id,
-        )
-    rows = list(
-        connection.execute(
-            """
-            SELECT scope.repo_id, scope.family_id, scope.project_kind,
-                   family.root_repo_id, repository.host_id, repository.state
-            FROM repository_scopes scope
-            JOIN repository_families family USING(family_id)
-            JOIN repositories repository USING(repo_id)
-            WHERE scope.repo_id IN (?, ?)
-            ORDER BY scope.repo_id
-            """,
-            (root_repo_id, effective_repo_id),
-        )
-    )
-    by_repo = {str(row["repo_id"]): row for row in rows}
-    root = by_repo.get(root_repo_id)
-    effective = by_repo.get(effective_repo_id)
-    if (
-        root is None
-        or effective is None
-        or str(root["project_kind"]) != "primary"
-        or str(root["root_repo_id"]) != root_repo_id
-        or str(effective["root_repo_id"]) != root_repo_id
-        or str(root["family_id"]) != str(effective["family_id"])
-        or str(root["host_id"]) != str(effective["host_id"])
-        or str(root["state"]) != "active"
-        or str(effective["state"]) != "active"
-        or (
-            temporary_repo_id is not None
-            and str(effective["project_kind"]) != "temporary"
-        )
-    ):
-        raise BrokerError(
-            "runtime_repository_context_mismatch",
-            "The runtime root/temporary repository IDs do not resolve to one active proved family.",
-            operation_id=request.operation_id,
-        )
-    enrollment = connection.execute(
-        """
-        SELECT account_id, enabled, valid_until_epoch
-        FROM broker_repository_enrollments
-        WHERE account_id = ? AND repo_id = ?
-          AND enabled = 1
-        ORDER BY valid_until_epoch DESC
-        LIMIT 1
-        """,
-        (request.account_id, root_repo_id),
-    ).fetchone()
-    if (
-        enrollment is None
-        or not bool(enrollment["enabled"])
-        or str(enrollment["account_id"]) != request.account_id
-    ):
-        raise BrokerError(
-            "runtime_root_enrollment_required",
-            "The configured account has no enabled enrollment for the exact root repository.",
-            operation_id=request.operation_id,
-        )
-
-
-def _require_runtime_resource_membership(
-    connection: sqlite3.Connection,
-    *,
-    repo_id: str,
-    resource_kind: str,
-    resource_id: str,
-    operation_id: Optional[str] = None,
-) -> None:
-    if resource_kind == "service":
-        exists = connection.execute(
-            """
-            SELECT 1 FROM server_definitions definition
-            WHERE definition.repo_id = ?
-              AND definition.server_definition_id = ?
-              AND NOT EXISTS (
-                SELECT 1 FROM broker_server_revocations revoked
-                WHERE revoked.repo_id = definition.repo_id
-                  AND revoked.server_definition_id = definition.server_definition_id
-              )
-            """,
-            (repo_id, resource_id),
-        ).fetchone()
-    elif resource_kind == "docker":
-        exists = connection.execute(
-            """
-            SELECT 1
-            FROM repository_memberships membership
-            JOIN control_bindings binding
-              ON binding.binding_id = membership.control_binding_id
-            WHERE membership.repo_id = ?
-              AND membership.resource_kind = 'container'
-              AND membership.host_resource_id = ?
-              AND binding.repo_id = membership.repo_id
-              AND binding.resource_kind = 'container'
-              AND binding.resource_id = membership.host_resource_id
-              AND binding.authority_state = 'authoritative'
-            """,
-            (repo_id, resource_id),
-        ).fetchone()
-    elif resource_kind == "database_stack":
-        exists = connection.execute(
-            """
-            SELECT 1
-            FROM database_bindings database
-            JOIN repository_memberships membership
-              ON membership.repo_id = database.repo_id
-             AND membership.resource_kind = 'container'
-             AND membership.host_resource_id = database.docker_resource_id
-            JOIN control_bindings binding
-              ON binding.binding_id = membership.control_binding_id
-            WHERE database.repo_id = ?
-              AND database.database_binding_id = ?
-              AND binding.repo_id = database.repo_id
-              AND binding.resource_kind = 'container'
-              AND binding.resource_id = database.docker_resource_id
-              AND binding.authority_state = 'authoritative'
-            """,
-            (repo_id, resource_id),
-        ).fetchone()
-    else:
-        raise ValueError("unsupported runtime resource kind")
-    if exists is None:
-        raise BrokerError(
-            "control_binding_unavailable",
-            "Runtime target no longer has exact repository membership and control authority.",
-            operation_id=operation_id,
-        )
-
-
-def _deduplicate_observation_grants(
-    grants: Iterable[tuple[Any, ...]],
-    *,
-    arity: int,
-    key_indexes: tuple[int, ...],
-    label: str,
-) -> tuple[tuple[Any, ...], ...]:
-    """Materialize a fixed-arity batch and reject ambiguous duplicate keys."""
-
-    if isinstance(grants, (str, bytes, bytearray, Mapping)):
-        raise TypeError(f"{label} batch must be an iterable of tuples")
-    rows = tuple(grants)
-    unique: dict[tuple[Any, ...], tuple[Any, ...]] = {}
-    for index, row in enumerate(rows):
-        if not isinstance(row, tuple) or len(row) != arity:
-            raise TypeError(
-                f"{label} batch item {index} must be a {arity}-item tuple"
-            )
-        key = tuple(row[position] for position in key_indexes)
-        prior = unique.get(key)
-        if prior is not None and prior != row:
-            raise ValueError(f"{label} batch contains a conflicting duplicate key")
-        unique.setdefault(key, row)
-    return tuple(unique.values())
-
-
-def _require_resource_membership(
-    connection: sqlite3.Connection,
-    *,
-    repo_id: str,
-    resource_kind: str,
-    resource_id: str,
-    operation_id: Optional[str] = None,
-) -> None:
-    if resource_kind == "server":
-        exists = connection.execute(
-            """
-            SELECT 1 FROM server_definitions definition
-            WHERE definition.server_definition_id = ?
-              AND definition.repo_id = ?
-              AND NOT EXISTS (
-                SELECT 1 FROM broker_server_revocations revoked
-                WHERE revoked.repo_id = definition.repo_id
-                  AND revoked.server_definition_id = definition.server_definition_id
-              )
-            """,
-            (resource_id, repo_id),
-        ).fetchone()
-    elif resource_kind == "container":
-        exists = connection.execute(
-            """
-            SELECT 1
-            FROM repository_memberships m
-            JOIN control_bindings b ON b.binding_id = m.control_binding_id
-            WHERE m.repo_id = ? AND m.resource_kind = 'container'
-              AND m.host_resource_id = ?
-              AND b.repo_id = m.repo_id
-              AND b.resource_kind = 'container'
-              AND b.resource_id = m.host_resource_id
-              AND b.authority_state = 'authoritative'
-              AND b.provenance != 'coordinator_ephemeral'
-            """,
-            (repo_id, resource_id),
-        ).fetchone()
-    elif resource_kind == "compose":
-        exists = connection.execute(
-            """
-            SELECT 1 FROM broker_compose_definitions
-            WHERE compose_definition_id = ? AND repo_id = ?
-            """,
-            (resource_id, repo_id),
-        ).fetchone()
-    else:
-        raise ValueError("unsupported broker resource kind")
-    if exists is None:
-        raise BrokerError(
-            "control_binding_unavailable",
-            "Resource no longer has exact repository membership and control authority.",
-            operation_id=operation_id,
-        )
-
-
-def _port_policy_rows(
-    connection: sqlite3.Connection,
-    *,
-    account_id: str,
     repo_id: str,
     server_definition_id: str,
     protocol: str,
@@ -14166,21 +12146,19 @@ def _port_policy_rows(
         connection.execute(
             """
             SELECT start_port, end_port, max_ttl_seconds
-            FROM broker_port_policies policy
-            JOIN broker_acl_principals principal ON principal.uid = policy.uid
-            WHERE principal.account_id = ? AND principal.enabled = 1
-              AND policy.repo_id = ? AND policy.server_definition_id = ?
-              AND policy.protocol = ? AND policy.enabled = 1
-              AND policy.max_ttl_seconds >= ?
+            FROM broker_port_ranges configured
+            WHERE configured.repo_id = ? AND configured.server_definition_id = ?
+              AND configured.protocol = ? AND configured.enabled = 1
+              AND configured.max_ttl_seconds >= ?
             ORDER BY start_port, end_port
             """,
-            (account_id, repo_id, server_definition_id, protocol, ttl_seconds),
+            (repo_id, server_definition_id, protocol, ttl_seconds),
         )
     )
     if not rows:
         raise BrokerError(
-            "port_policy_denied",
-            "The requested protocol or lease duration is outside the account policy.",
+            "port_range_unavailable",
+            "The requested protocol or lease duration has no configured host configured.",
         )
     return rows
 
@@ -14202,7 +12180,7 @@ def _server_identity(
     ).fetchone()
     if row is None:
         raise BrokerError(
-            "control_binding_unavailable",
+            "resource_identity_unavailable",
             "Server definition no longer belongs to the exact repository.",
             operation_id=operation_id,
         )
@@ -14225,11 +12203,150 @@ def _server_definition_fingerprint(
     ).fetchone()
     if row is None:
         raise BrokerError(
-            "control_binding_unavailable",
+            "resource_identity_unavailable",
             "Server definition no longer belongs to the exact repository.",
             operation_id=operation_id,
         )
     return str(row["definition_fingerprint"])
+
+
+def _settle_broker_runtime_session(
+    connection: sqlite3.Connection,
+    *,
+    operation_id: str,
+    result: Mapping[str, Any] | None,
+    succeeded: bool,
+    timestamp: str,
+) -> None:
+    """Settle a broker runtime session in the operation's transaction."""
+
+    session = connection.execute(
+        """
+        SELECT session_id, action, ttl_seconds, kill_after_run
+        FROM runtime_sessions
+        WHERE operation_id = ? ORDER BY created_at, session_id LIMIT 1
+        """,
+        (operation_id,),
+    ).fetchone()
+    if session is None:
+        return
+    cleanup_immediately = succeeded and bool(session["kill_after_run"])
+    keep_until_ttl = (
+        session["ttl_seconds"] is not None
+        and str(session["action"]) in {"start", "restart", "replace"}
+    )
+    status = (
+        "cleanup_pending"
+        if cleanup_immediately
+        else "running"
+        if succeeded and keep_until_ttl
+        else "succeeded"
+        if succeeded
+        else "failed"
+    )
+    encoded = (
+        None
+        if result is None
+        else json.dumps(
+            dict(result),
+            ensure_ascii=True,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    )
+    changed = connection.execute(
+        """
+        UPDATE runtime_sessions
+        SET status = ?, result_json = ?, finished_at = ?, updated_at = ?
+        WHERE session_id = ?
+          AND status IN ('planned', 'running', 'failed', 'cleanup_pending')
+        """,
+        (status, encoded, timestamp, timestamp, str(session["session_id"])),
+    ).rowcount
+    if changed != 1:
+        raise BrokerError(
+            "operation_state_conflict",
+            "Runtime session changed before its operation could settle.",
+            operation_id=operation_id,
+        )
+    if not keep_until_ttl and not cleanup_immediately:
+        connection.execute(
+            """
+            UPDATE runtime_session_resources
+            SET cleanup_state = cleanup_disposition,
+                cleaned_at = ?, updated_at = ?
+            WHERE session_id = ? AND cleanup_state = 'active'
+            """,
+            (timestamp, timestamp, str(session["session_id"])),
+        )
+
+
+def _runtime_cleanup_mutation_row(
+    connection: sqlite3.Connection,
+    *,
+    repo_id: str,
+    resource_kind: str,
+    resource_id: str,
+    operation_id: str,
+) -> sqlite3.Row:
+    """Resolve broker-owned cleanup without depending on a departed caller."""
+
+    if resource_kind == "docker":
+        rows = list(
+            connection.execute(
+                """
+                SELECT 'docker' AS resource_kind,
+                       d.docker_resource_id, d.full_container_id,
+                       NULL AS database_binding_id, NULL AS database_name,
+                           metadata.observation_revision AS control_generation,
+                           metadata.observation_revision
+                FROM docker_resources d
+                JOIN docker_engines engine USING(engine_id)
+                JOIN repositories repository
+                  ON repository.repo_id = ?
+                 AND repository.host_id = engine.host_id
+                CROSS JOIN schema_metadata metadata
+                WHERE d.docker_resource_id = ?
+                  AND (d.repo_id = repository.repo_id OR d.repo_id IS NULL)
+                """,
+                (repo_id, resource_id),
+            )
+        )
+    elif resource_kind == "database_stack":
+        rows = list(
+            connection.execute(
+                """
+                SELECT 'database_stack' AS resource_kind,
+                       d.docker_resource_id, d.full_container_id,
+                       database.database_binding_id, database.database_name,
+                       metadata.observation_revision AS control_generation,
+                       metadata.observation_revision
+                FROM database_bindings database
+                JOIN docker_resources d USING(docker_resource_id)
+                JOIN docker_engines engine USING(engine_id)
+                JOIN repositories repository
+                  ON repository.repo_id = database.repo_id
+                 AND repository.host_id = engine.host_id
+                CROSS JOIN schema_metadata metadata
+                WHERE repository.repo_id = ?
+                  AND database.database_binding_id = ?
+                  AND database.engine_kind = 'postgresql'
+                """,
+                (repo_id, resource_id),
+            )
+        )
+    else:
+        raise ValueError("runtime cleanup requires docker or database_stack")
+    if len(rows) != 1 or re.fullmatch(
+        r"[0-9a-fA-F]{64}", str(rows[0]["full_container_id"])
+    ) is None:
+        raise BrokerError(
+            "runtime_cleanup_identity_changed",
+            "Runtime cleanup target no longer resolves to one exact controlled Docker identity.",
+            operation_id=operation_id,
+        )
+    return rows[0]
 
 
 def _runtime_mutation_row(
@@ -14247,27 +12364,13 @@ def _runtime_mutation_row(
                 SELECT 'docker' AS resource_kind,
                        d.docker_resource_id, d.full_container_id,
                        NULL AS database_binding_id, NULL AS database_name,
-                       binding.generation AS control_generation,
+                       metadata.observation_revision AS control_generation,
                        metadata.observation_revision
                 FROM docker_resources d
-                JOIN docker_engines engine USING(engine_id)
-                JOIN repositories repository
-                  ON repository.repo_id = ?
-                 AND repository.host_id = engine.host_id
-                JOIN repository_memberships membership
-                  ON membership.repo_id = repository.repo_id
-                 AND membership.resource_kind = 'container'
-                 AND membership.host_resource_id = d.docker_resource_id
-                JOIN control_bindings binding
-                  ON binding.binding_id = membership.control_binding_id
-                 AND binding.repo_id = membership.repo_id
-                 AND binding.resource_kind = 'container'
-                 AND binding.resource_id = membership.host_resource_id
-                 AND binding.authority_state = 'authoritative'
                 CROSS JOIN schema_metadata metadata
                 WHERE d.docker_resource_id = ?
                 """,
-                (request.project_id, request.resource_id),
+                (request.resource_id,),
             )
         )
     elif resource_kind == "database_stack":
@@ -14277,7 +12380,7 @@ def _runtime_mutation_row(
                 SELECT 'database_stack' AS resource_kind,
                        d.docker_resource_id, d.full_container_id,
                        database.database_binding_id, database.database_name,
-                       binding.generation AS control_generation,
+                       metadata.observation_revision AS control_generation,
                        metadata.observation_revision
                 FROM database_bindings database
                 JOIN docker_resources d USING(docker_resource_id)
@@ -14285,36 +12388,25 @@ def _runtime_mutation_row(
                 JOIN repositories repository
                   ON repository.repo_id = database.repo_id
                  AND repository.host_id = engine.host_id
-                JOIN repository_memberships membership
-                  ON membership.repo_id = repository.repo_id
-                 AND membership.resource_kind = 'container'
-                 AND membership.host_resource_id = d.docker_resource_id
-                JOIN control_bindings binding
-                  ON binding.binding_id = membership.control_binding_id
-                 AND binding.repo_id = membership.repo_id
-                 AND binding.resource_kind = 'container'
-                 AND binding.resource_id = membership.host_resource_id
-                 AND binding.authority_state = 'authoritative'
                 CROSS JOIN schema_metadata metadata
-                WHERE repository.repo_id = ?
-                  AND database.database_binding_id = ?
+                WHERE database.database_binding_id = ?
                   AND database.engine_kind = 'postgresql'
                 """,
-                (request.project_id, request.resource_id),
+                (request.resource_id,),
             )
         )
     else:
         raise ValueError("runtime Docker mutation requires docker or database_stack")
     if len(rows) != 1:
         raise BrokerError(
-            "control_binding_unavailable",
+            "resource_identity_unavailable",
             "Runtime target no longer resolves to one exact controlled Docker identity.",
             operation_id=request.operation_id,
         )
     row = rows[0]
     if re.fullmatch(r"[0-9a-fA-F]{64}", str(row["full_container_id"])) is None:
         raise BrokerError(
-            "control_binding_unavailable",
+            "resource_identity_unavailable",
             "Runtime target has no immutable full Docker identity.",
             operation_id=request.operation_id,
         )
@@ -14341,6 +12433,67 @@ def _runtime_target_fingerprint(
             separators=(",", ":"),
         ).encode("utf-8")
     ).hexdigest()
+
+
+def _runtime_replacement_record(row: Mapping[str, Any]) -> RuntimeReplacementRecord:
+    restore_result: dict[str, Any] | None = None
+    if row["restore_result_json"] is not None:
+        try:
+            decoded = json.loads(str(row["restore_result_json"]))
+        except json.JSONDecodeError as exc:
+            raise BrokerError(
+                "operation_evidence_corrupt",
+                "Replacement restore evidence is not valid JSON.",
+                operation_id=str(row["operation_id"]),
+            ) from exc
+        if not isinstance(decoded, dict):
+            raise BrokerError(
+                "operation_evidence_corrupt",
+                "Replacement restore evidence has an invalid shape.",
+                operation_id=str(row["operation_id"]),
+            )
+        restore_result = decoded
+    return RuntimeReplacementRecord(
+        operation_id=str(row["operation_id"]),
+        repo_id=str(row["repo_id"]),
+        resource_kind=str(row["resource_kind"]),
+        requested_resource_id=str(row["requested_resource_id"]),
+        old_docker_resource_id=str(row["old_docker_resource_id"]),
+        old_full_container_id=str(row["old_full_container_id"]).lower(),
+        database_binding_id=(
+            None
+            if row["database_binding_id"] is None
+            else str(row["database_binding_id"])
+        ),
+        database_name=(
+            None if row["database_name"] is None else str(row["database_name"])
+        ),
+        compose_definition_id=str(row["compose_definition_id"]),
+        compose_service=str(row["compose_service"]),
+        compose_operation_id=str(row["compose_operation_id"]),
+        backup_operation_id=(
+            None
+            if row["backup_operation_id"] is None
+            else str(row["backup_operation_id"])
+        ),
+        database_backup_id=(
+            None
+            if row["database_backup_id"] is None
+            else str(row["database_backup_id"])
+        ),
+        new_docker_resource_id=(
+            None
+            if row["new_docker_resource_id"] is None
+            else str(row["new_docker_resource_id"])
+        ),
+        new_full_container_id=(
+            None
+            if row["new_full_container_id"] is None
+            else str(row["new_full_container_id"]).lower()
+        ),
+        restore_result=restore_result,
+        phase=str(row["phase"]),
+    )
 
 
 def _runtime_operation_action(request: BrokerRequest) -> str:
@@ -14371,7 +12524,8 @@ def _reserved_target_fingerprint(
 ) -> str:
     if (
         request.operation is BrokerOperation.RUNTIME_REQUEST
-        and request.arguments["action"] in {"start", "stop", "restart"}
+        and request.arguments["action"]
+        in {"start", "stop", "restart", "replace"}
         and request.arguments["target_kind"] in {"docker", "database_stack"}
     ) or (
         request.operation is BrokerOperation.RUNTIME_ENSURE
@@ -14400,7 +12554,7 @@ def _reserved_target_fingerprint(
         ).fetchone()
         if row is None:
             raise BrokerError(
-                "control_binding_unavailable",
+                "resource_identity_unavailable",
                 "Compose definition no longer belongs to the exact repository.",
                 operation_id=request.operation_id,
             )
@@ -14429,7 +12583,7 @@ def _reserved_target_fingerprint(
             ).fetchone()
         if row is None:
             raise BrokerError(
-                "control_binding_unavailable",
+                "resource_identity_unavailable",
                 "Ephemeral target no longer belongs to the exact repository authority.",
                 operation_id=request.operation_id,
             )
@@ -14451,7 +12605,7 @@ def _reserved_target_fingerprint(
             r"[0-9a-fA-F]{64}", str(row["full_container_id"])
         ) is None:
             raise BrokerError(
-                "control_binding_unavailable",
+                "resource_identity_unavailable",
                 "Docker target no longer belongs to the exact repository host.",
                 operation_id=request.operation_id,
             )
@@ -14461,19 +12615,13 @@ def _reserved_target_fingerprint(
             """
             SELECT db.database_binding_id, db.docker_resource_id,
                    db.database_name, d.full_container_id,
-                   c.generation AS control_generation,
+                   m.observation_revision AS control_generation,
                    m.observation_revision
             FROM database_bindings db
             JOIN docker_resources d USING(docker_resource_id)
-            JOIN repository_memberships r
-              ON r.repo_id = db.repo_id
-             AND r.resource_kind = 'container'
-             AND r.host_resource_id = db.docker_resource_id
-            JOIN control_bindings c ON c.binding_id = r.control_binding_id
             CROSS JOIN schema_metadata m
             WHERE db.repo_id = ? AND db.docker_resource_id = ?
               AND db.database_name = ? AND db.engine_kind = 'postgresql'
-              AND c.authority_state = 'authoritative'
             """,
             (
                 request.project_id,
@@ -14483,8 +12631,8 @@ def _reserved_target_fingerprint(
         ).fetchone()
         if row is None:
             raise BrokerError(
-                "control_binding_unavailable",
-                "PostgreSQL database no longer has one authoritative enrolled container binding.",
+                "resource_unavailable",
+                "PostgreSQL database no longer resolves to the requested current container.",
                 operation_id=request.operation_id,
             )
         return _database_target_fingerprint(row)
@@ -14542,10 +12690,9 @@ def _require_reserved_target_fingerprint(
         )
 
 
-def _require_assignment_port_policy(
+def _require_assignment_port_range(
     connection: sqlite3.Connection,
     *,
-    account_id: str,
     repo_id: str,
     server_definition_id: str,
     port: int,
@@ -14554,20 +12701,18 @@ def _require_assignment_port_policy(
     permitted = connection.execute(
         """
         SELECT 1
-        FROM broker_port_policies policy
-        JOIN broker_acl_principals principal ON principal.uid = policy.uid
-        WHERE principal.account_id = ? AND principal.enabled = 1
-          AND policy.repo_id = ? AND policy.server_definition_id = ?
-          AND policy.protocol = 'tcp' AND policy.enabled = 1
-          AND policy.start_port <= ? AND policy.end_port >= ?
+        FROM broker_port_ranges configured
+        WHERE configured.repo_id = ? AND configured.server_definition_id = ?
+          AND configured.protocol = 'tcp' AND configured.enabled = 1
+          AND configured.start_port <= ? AND configured.end_port >= ?
         LIMIT 1
         """,
-        (account_id, repo_id, server_definition_id, port, port),
+        (repo_id, server_definition_id, port, port),
     ).fetchone()
     if permitted is None:
         raise BrokerError(
-            "port_policy_denied",
-            "The requested assignment port is outside the account's authorized TCP ranges.",
+            "port_range_unavailable",
+            "The requested assignment port is outside the configured TCP ranges.",
             operation_id=operation_id,
         )
 
@@ -14987,22 +13132,6 @@ def _disable_legacy_unscoped_compose_definitions(
         """,
         (now, *definition_ids),
     )
-    connection.execute(
-        f"""
-        UPDATE broker_compose_acl
-        SET enabled = 0, updated_at = ?
-        WHERE compose_definition_id IN ({placeholders}) AND enabled = 1
-        """,
-        (now, *definition_ids),
-    )
-    connection.execute(
-        f"""
-        UPDATE broker_compose_run_once_acl
-        SET enabled = 0, updated_at = ?
-        WHERE compose_definition_id IN ({placeholders}) AND enabled = 1
-        """,
-        (now, *definition_ids),
-    )
     affected_operations = tuple(
         str(row["operation_id"])
         for row in connection.execute(
@@ -15027,7 +13156,7 @@ def _disable_legacy_unscoped_compose_definitions(
         SET status = 'needs_attention', phase = 'reconciliation_required',
             error_code = 'compose_service_scope_required',
             error_message =
-                'Legacy Compose definition had no exact service scope; reenroll it before mutation.',
+                'Legacy Compose definition had no exact service scope; reconfigure it before mutation.',
             updated_at = ?, generation = generation + 1
         WHERE operation_id IN ({operation_placeholders})
         """,
@@ -15044,7 +13173,7 @@ def _disable_legacy_unscoped_compose_definitions(
             json.dumps(
                 {
                     "code": "compose_service_scope_required",
-                    "message": "Exact Compose service scope requires reenrollment.",
+                    "message": "Exact Compose service scope requires reconfiguration.",
                 },
                 ensure_ascii=True,
                 sort_keys=True,
@@ -15085,22 +13214,6 @@ def _disable_unpinned_compose_definitions(
         """,
         (now, *definition_ids),
     )
-    connection.execute(
-        f"""
-        UPDATE broker_compose_acl
-        SET enabled = 0, updated_at = ?
-        WHERE compose_definition_id IN ({placeholders}) AND enabled = 1
-        """,
-        (now, *definition_ids),
-    )
-    connection.execute(
-        f"""
-        UPDATE broker_compose_run_once_acl
-        SET enabled = 0, updated_at = ?
-        WHERE compose_definition_id IN ({placeholders}) AND enabled = 1
-        """,
-        (now, *definition_ids),
-    )
     affected_operations = tuple(
         str(row["operation_id"])
         for row in connection.execute(
@@ -15125,7 +13238,7 @@ def _disable_unpinned_compose_definitions(
         SET status = 'needs_attention', phase = 'reconciliation_required',
             error_code = 'compose_directory_identity_required',
             error_message =
-                'Legacy Compose definition has no pinned directory identity; reenroll it before mutation.',
+                'Legacy Compose definition has no pinned directory identity; reconfigure it before mutation.',
             updated_at = ?, generation = generation + 1
         WHERE operation_id IN ({operation_placeholders})
         """,
@@ -15142,7 +13255,7 @@ def _disable_unpinned_compose_definitions(
             json.dumps(
                 {
                     "code": "compose_directory_identity_required",
-                    "message": "Pinned Compose directory identity requires reenrollment.",
+                    "message": "Pinned Compose directory identity requires reconfiguration.",
                 },
                 ensure_ascii=True,
                 sort_keys=True,
@@ -15156,7 +13269,7 @@ def _disable_unpinned_compose_definitions(
 def _disable_unvalidated_effective_compose_definitions(
     connection: sqlite3.Connection,
 ) -> None:
-    """Fence definitions lacking an exact merged-model enrollment proof."""
+    """Fence definitions lacking an exact merged-model configuration proof."""
 
     now = utc_timestamp()
     definition_ids = tuple(
@@ -15186,22 +13299,6 @@ def _disable_unvalidated_effective_compose_definitions(
         """,
         (now, *definition_ids),
     )
-    connection.execute(
-        f"""
-        UPDATE broker_compose_acl
-        SET enabled = 0, updated_at = ?
-        WHERE compose_definition_id IN ({placeholders}) AND enabled = 1
-        """,
-        (now, *definition_ids),
-    )
-    connection.execute(
-        f"""
-        UPDATE broker_compose_run_once_acl
-        SET enabled = 0, updated_at = ?
-        WHERE compose_definition_id IN ({placeholders}) AND enabled = 1
-        """,
-        (now, *definition_ids),
-    )
     affected_operations = tuple(
         str(row["operation_id"])
         for row in connection.execute(
@@ -15226,7 +13323,7 @@ def _disable_unvalidated_effective_compose_definitions(
         SET status = 'needs_attention', phase = 'reconciliation_required',
             error_code = 'compose_effective_model_required',
             error_message =
-                'Compose definition lacks a bound merged-model proof; reenroll it before mutation.',
+                'Compose definition lacks a bound merged-model proof; reconfigure it before mutation.',
             updated_at = ?, generation = generation + 1
         WHERE operation_id IN ({operation_placeholders})
         """,
@@ -15243,7 +13340,7 @@ def _disable_unvalidated_effective_compose_definitions(
             json.dumps(
                 {
                     "code": "compose_effective_model_required",
-                    "message": "Merged effective Compose validation requires reenrollment.",
+                    "message": "Merged effective Compose validation requires reconfiguration.",
                 },
                 ensure_ascii=True,
                 sort_keys=True,
@@ -15286,8 +13383,8 @@ def _require_observed_compose_project_name_available(
     rows = list(
         connection.execute(
             """
-            SELECT docker_resource_id, ownership_state,
-                   authoritative_owner_repo_id
+            SELECT docker_resource_id, association_state,
+                   associated_repo_id
             FROM broker_observed_compose_containers
             WHERE snapshot_id = ? AND project_name = ?
             ORDER BY docker_resource_id
@@ -15298,8 +13395,8 @@ def _require_observed_compose_project_name_available(
     exact_owned_container_seen = bool(rows)
     for row in rows:
         if (
-            str(row["ownership_state"]) != "exclusive"
-            or str(row["authoritative_owner_repo_id"] or "") != repo_id
+            str(row["association_state"]) != "exclusive"
+            or str(row["associated_repo_id"] or "") != repo_id
         ):
             raise BrokerError(
                 "compose_project_name_conflict",
@@ -15464,7 +13561,8 @@ def _require_no_unresolved_container_operation(
           AND target.target_id = ?
           AND target.action IN (
               'docker.start', 'docker.stop', 'docker.restart',
-              'runtime.start', 'runtime.stop', 'runtime.restart'
+              'runtime.start', 'runtime.stop', 'runtime.restart',
+              'runtime.replace'
           )
           AND operation.operation_id != ?
           AND operation.status IN (
@@ -15494,7 +13592,7 @@ def _require_no_unresolved_compose_definition_change(
     placeholders = ",".join("?" for _item in definition_ids)
     unresolved = connection.execute(
         f"""
-        SELECT operation.operation_id
+        SELECT operation.operation_id, operation.status
         FROM operations operation
         JOIN operation_targets target USING(operation_id)
         WHERE target.target_kind = 'compose'
@@ -15510,7 +13608,11 @@ def _require_no_unresolved_compose_definition_change(
     if unresolved is not None:
         raise BrokerError(
             "compose_operation_pending",
-            "Compose definition cannot change while an operation requires completion or reconciliation.",
+            "Compose definition cannot change while operation "
+            + str(unresolved["operation_id"])
+            + " is "
+            + str(unresolved["status"])
+            + " and requires completion or reconciliation.",
         )
 
 
@@ -15644,7 +13746,7 @@ def _compose_run_once_policies_connection(
         except (TypeError, ValueError, json.JSONDecodeError) as exc:
             raise BrokerError(
                 "compose_run_once_policy_invalid",
-                "Persisted Compose run-once policy is invalid; rerun Coordinator enrollment.",
+                "Persisted Compose run-once policy is invalid; rerun Coordinator configuration.",
                 operation_id=operation_id,
             ) from exc
         if (
@@ -15653,7 +13755,7 @@ def _compose_run_once_policies_connection(
         ):
             raise BrokerError(
                 "compose_run_once_policy_invalid",
-                "Persisted Compose run-once policy fingerprint is invalid; rerun Coordinator enrollment.",
+                "Persisted Compose run-once policy fingerprint is invalid; rerun Coordinator configuration.",
                 operation_id=operation_id,
             )
         policies.append(policy)
@@ -16035,7 +14137,7 @@ def _docker_reconciliation_candidate_connection(
         "identity_reservation_kind": (
             "full_container_id"
             if str(row["target_fingerprint"]).lower() == full_container_id
-            else "legacy_authenticated_request_fingerprint"
+            else "legacy_accepted_request_fingerprint"
         ),
         "uncertain_outcome": decoded,
     }
@@ -16069,8 +14171,8 @@ def _compose_action_observation_proof(
         connection.execute(
             """
             SELECT docker_resource_id, full_container_id, service_name,
-                   lifecycle, ownership_state,
-                   authoritative_owner_repo_id, observation_fingerprint
+                   lifecycle, association_state,
+                   associated_repo_id, observation_fingerprint
             FROM broker_observed_compose_containers
             WHERE snapshot_id = ? AND project_name = ?
             ORDER BY service_name, full_container_id
@@ -16080,8 +14182,8 @@ def _compose_action_observation_proof(
     )
     for row in rows:
         if (
-            str(row["ownership_state"]) != "exclusive"
-            or str(row["authoritative_owner_repo_id"] or "") != repo_id
+            str(row["association_state"]) != "exclusive"
+            or str(row["associated_repo_id"] or "") != repo_id
         ):
             raise BrokerError(
                 "compose_project_name_conflict",
@@ -16357,8 +14459,47 @@ def _select_available_port(
             return port
     raise BrokerError(
         "port_unavailable",
-        "No authorized port is currently available for this server.",
+        "No accepted port is currently available for this server.",
     )
+
+
+def _repository_compose_profile_connection(
+    connection: sqlite3.Connection,
+    *,
+    repo_id: str,
+) -> tuple[str | None, dict[str, int]]:
+    rows = list(
+        connection.execute(
+            """
+            SELECT compose_definition_id
+            FROM broker_compose_definitions
+            WHERE repo_id = ? AND enabled = 1
+            ORDER BY updated_at DESC, compose_definition_id
+            """,
+            (repo_id,),
+        )
+    )
+    if len(rows) > 1:
+        raise BrokerError(
+            "compose_definition_conflict",
+            "Repository has multiple enabled Compose definitions; reconcile them explicitly.",
+        )
+    if not rows:
+        return None, {}
+    compose_definition_id = str(rows[0]["compose_definition_id"])
+    run_once = {
+        str(row["service_name"]): int(row["max_timeout_seconds"])
+        for row in connection.execute(
+            """
+            SELECT service_name, max_timeout_seconds
+            FROM broker_compose_run_once_services
+            WHERE compose_definition_id = ?
+            ORDER BY ordinal
+            """,
+            (compose_definition_id,),
+        )
+    }
+    return compose_definition_id, run_once
 
 
 def _finish_operation(
@@ -16439,7 +14580,7 @@ def _ephemeral_image_target_for_request(
     request: BrokerRequest,
     require_reserved_operation: bool,
 ) -> EphemeralImageTarget:
-    """Read one enabled template after authorization, never caller image input."""
+    """Read one enabled template after request validation, never caller image input."""
 
     row = connection.execute(
         """
@@ -16451,7 +14592,7 @@ def _ephemeral_image_target_for_request(
     ).fetchone()
     if row is None:
         raise BrokerError(
-            "control_binding_unavailable",
+            "resource_identity_unavailable",
             "Ephemeral template is disabled or unavailable.",
             operation_id=request.operation_id,
         )
@@ -16459,14 +14600,14 @@ def _ephemeral_image_target_for_request(
         image_ref = _require_pinned_ephemeral_image(row["image_ref"])
     except ValueError as error:
         raise BrokerError(
-            "control_binding_unavailable",
+            "resource_identity_unavailable",
             "Ephemeral template does not retain an immutable image reference.",
             operation_id=request.operation_id,
         ) from error
     template_fingerprint = str(row["definition_fingerprint"])
     if re.fullmatch(r"sha256:[0-9a-f]{64}", template_fingerprint) is None:
         raise BrokerError(
-            "control_binding_unavailable",
+            "resource_identity_unavailable",
             "Ephemeral template does not retain a valid immutable definition fingerprint.",
             operation_id=request.operation_id,
         )
@@ -16774,7 +14915,7 @@ def _require_ephemeral_secret_policy_environment(
     PostgreSQL instance actually requires SCRAM authentication. A permissive
     ``POSTGRES_HOST_AUTH_METHOD`` overrides the image defaults, so it is
     forbidden rather than merely ignored. The exact initdb argument is kept
-    narrow deliberately: administrator enrollment is the one trusted place
+    narrow deliberately: administrator configuration is the one trusted place
     that declares this image contract.
     """
 

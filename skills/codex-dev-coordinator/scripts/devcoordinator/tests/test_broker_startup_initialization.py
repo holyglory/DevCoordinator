@@ -37,18 +37,8 @@ class _Rows:
 class _InitializationConnection:
     def execute(self, statement: str, parameters: object = ()):
         compact = " ".join(statement.split())
-        if (
-            "SELECT sql FROM sqlite_master" in compact
-            and "broker_cleanup_resource_acl" in compact
-        ):
-            return _Rows([("cleanup.plan",)])
         if "PRAGMA table_info(broker_compose_effective_model_evidence)" in compact:
             return _Rows([{"name": "service_replicas_json"}])
-        if (
-            "SELECT sql FROM sqlite_master" in compact
-            and "broker_compose_acl" in compact
-        ):
-            return _Rows([("compose.stop compose.restart",)])
         return _Rows([])
 
 

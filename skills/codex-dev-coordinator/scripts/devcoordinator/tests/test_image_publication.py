@@ -109,7 +109,7 @@ class ImagePublicationTests(unittest.TestCase):
                 service_uid=os.geteuid(),
                 broker_database_path=self.broker_database,
                 compose_renderer=rendered_model,
-                compose_enrollment_verifier=self._enrollment_verifier,
+                compose_configuration_verifier=self._configuration_verifier,
             )
 
         directory, manifest = publication.load_manifest(
@@ -142,7 +142,7 @@ class ImagePublicationTests(unittest.TestCase):
                     service_uid=os.geteuid(),
                     broker_database_path=self.broker_database,
                     compose_renderer=rendered_model,
-                    compose_enrollment_verifier=self._enrollment_verifier,
+                    compose_configuration_verifier=self._configuration_verifier,
                 )
         self.assertFalse((self.artifacts / "22222222-2222-4222-8222-222222222222").exists())
 
@@ -155,7 +155,7 @@ class ImagePublicationTests(unittest.TestCase):
                 service_uid=os.geteuid(),
                 broker_database_path=self.broker_database,
                 compose_renderer=rendered_model,
-                compose_enrollment_verifier=self._enrollment_verifier,
+                compose_configuration_verifier=self._configuration_verifier,
             )
         directory, manifest = publication.load_manifest(
             artifact_root=self.artifacts,
@@ -203,10 +203,10 @@ class ImagePublicationTests(unittest.TestCase):
                     self.specification,
                     renderer=rendered_model,
                     broker_database_path=self.broker_database,
-                    enrollment_verifier=self._enrollment_verifier,
+                    configuration_verifier=self._configuration_verifier,
                 )
 
-    def test_compose_capture_uses_the_enrollment_model_canonicalization(self) -> None:
+    def test_compose_capture_uses_the_configuration_model_canonicalization(self) -> None:
         observed: dict[str, object] = {}
 
         def verify(
@@ -217,7 +217,7 @@ class ImagePublicationTests(unittest.TestCase):
         ) -> dict[str, object]:
             observed["model_sha256"] = evidence["model_sha256"]
             observed["effective_model_sha256"] = getattr(effective, "model_sha256")
-            return self._enrollment_verifier(
+            return self._configuration_verifier(
                 _specification, evidence, effective, _database
             )
 
@@ -225,17 +225,17 @@ class ImagePublicationTests(unittest.TestCase):
             self.specification,
             renderer=rendered_model,
             broker_database_path=self.broker_database,
-            enrollment_verifier=verify,
+            configuration_verifier=verify,
         )
 
         self.assertEqual(observed["model_sha256"], observed["effective_model_sha256"])
 
-    def test_enrollment_reader_accepts_the_canonical_capture_digest(self) -> None:
+    def test_configuration_reader_accepts_the_canonical_capture_digest(self) -> None:
         material = publication.capture_compose_material(
             self.specification,
             renderer=rendered_model,
             broker_database_path=self.broker_database,
-            enrollment_verifier=self._enrollment_verifier,
+            configuration_verifier=self._configuration_verifier,
         )
         effective = require_effective_compose_model(
             rendered_model(),
@@ -263,6 +263,7 @@ class ImagePublicationTests(unittest.TestCase):
                     definition_fingerprint TEXT,
                     model_sha256 TEXT,
                     services_json TEXT,
+                    model_services_json TEXT,
                     profiles_json TEXT,
                     host_access_risks_json TEXT,
                     host_access_approved INTEGER,
@@ -296,11 +297,12 @@ class ImagePublicationTests(unittest.TestCase):
                 ),
             )
             database.execute(
-                "INSERT INTO broker_compose_effective_model_evidence VALUES (?, ?, ?, ?, ?, ?, 1, 0, ?)",
+                "INSERT INTO broker_compose_effective_model_evidence VALUES (?, ?, ?, ?, ?, ?, ?, 1, 0, ?)",
                 (
                     definition_id,
                     definition_fingerprint,
                     effective.model_sha256,
+                    json.dumps(sorted(self.specification.compose_lifecycle_services)),
                     json.dumps(sorted(self.specification.compose_services)),
                     json.dumps(list(effective.profiles)),
                     json.dumps(list(effective.host_access_risks)),
@@ -323,14 +325,14 @@ class ImagePublicationTests(unittest.TestCase):
             )
         database.close()
 
-        enrollment = publication.require_enrolled_compose_approval(
+        configuration = publication.require_configured_compose_approval(
             self.specification,
             material.evidence,
             effective,
             self.broker_database,
         )
 
-        self.assertEqual(enrollment["model_sha256"], effective.model_sha256)
+        self.assertEqual(configuration["model_sha256"], effective.model_sha256)
 
     def test_runtime_verification_requires_built_image_and_source_fingerprint(self) -> None:
         def runner(command: tuple[str, ...], _timeout: float, _environment: dict[str, str]) -> subprocess.CompletedProcess[str]:
@@ -379,7 +381,7 @@ class ImagePublicationTests(unittest.TestCase):
                 service_uid=os.geteuid(),
                 broker_database_path=self.broker_database,
                 compose_renderer=rendered_model,
-                compose_enrollment_verifier=self._enrollment_verifier,
+                compose_configuration_verifier=self._configuration_verifier,
             )
             (self.project / "services/worker/src/App/Program.cs").write_text(
                 "class Program { static int Changed = 1; }\n", encoding="utf-8"
@@ -393,7 +395,7 @@ class ImagePublicationTests(unittest.TestCase):
                     service_uid=os.geteuid(),
                     broker_database_path=self.broker_database,
                     compose_renderer=rendered_model,
-                    compose_enrollment_verifier=self._enrollment_verifier,
+                    compose_configuration_verifier=self._configuration_verifier,
                     docker_runner=lambda *_args: self.fail("Docker must not run after source drift"),
                 )
 
@@ -408,7 +410,7 @@ class ImagePublicationTests(unittest.TestCase):
                 service_uid=os.geteuid(),
                 broker_database_path=self.broker_database,
                 compose_renderer=rendered_model,
-                compose_enrollment_verifier=self._enrollment_verifier,
+                compose_configuration_verifier=self._configuration_verifier,
             )
             with self.assertRaisesRegex(publication.ImagePublicationError, "image build failed"):
                 publication.apply_publication(
@@ -419,7 +421,7 @@ class ImagePublicationTests(unittest.TestCase):
                     service_uid=os.geteuid(),
                     broker_database_path=self.broker_database,
                     compose_renderer=rendered_model,
-                    compose_enrollment_verifier=self._enrollment_verifier,
+                    compose_configuration_verifier=self._configuration_verifier,
                     docker_runner=lambda command, _timeout, _environment: subprocess.CompletedProcess(
                         command,
                         1,
@@ -448,7 +450,7 @@ class ImagePublicationTests(unittest.TestCase):
                 service_uid=os.geteuid(),
                 broker_database_path=self.broker_database,
                 compose_renderer=rendered_model,
-                compose_enrollment_verifier=self._enrollment_verifier,
+                compose_configuration_verifier=self._configuration_verifier,
             )
             _directory, planned = publication.load_manifest(
                 artifact_root=self.artifacts,
@@ -481,7 +483,7 @@ class ImagePublicationTests(unittest.TestCase):
                     service_uid=os.geteuid(),
                     broker_database_path=self.broker_database,
                     compose_renderer=rendered_model,
-                    compose_enrollment_verifier=self._enrollment_verifier,
+                    compose_configuration_verifier=self._configuration_verifier,
                     docker_runner=lambda command, _timeout, _environment: subprocess.CompletedProcess(
                         command, 0, stdout="built", stderr=""
                     ),
@@ -491,6 +493,197 @@ class ImagePublicationTests(unittest.TestCase):
         self.assertEqual(result["status"], "built")
         self.assertEqual(result["image_id"], IMAGE_ID)
         self.assertIsNone(result["runtime_verification"])
+
+    def test_run_once_service_has_a_sealed_build_only_publication(self) -> None:
+        config = json.loads(json.dumps(self.config))
+        config["docker"]["run_once_services"] = [
+            {
+                "name": "bootstrap",
+                "max_timeout_seconds": 600,
+                "receipt": {"required": {"ok": "boolean"}},
+            }
+        ]
+        config["image_publications"] = [
+            {
+                "name": "bootstrap",
+                "image": "example/bootstrap:local",
+                "dockerfile": "services/worker/Dockerfile",
+                "context_paths": [
+                    ".dockerignore",
+                    "services/worker/Dockerfile",
+                    "services/worker/src/App",
+                ],
+                "source_fingerprint": {
+                    "root": "services/worker/src/App",
+                    "exclude_directories": ["bin", "obj"],
+                },
+                "rollout_services": [],
+                "workload_service": "bootstrap",
+            }
+        ]
+        (self.project / "compose.yml").write_text(
+            (self.project / "compose.yml").read_text(encoding="utf-8")
+            + "  bootstrap:\n    image: example/bootstrap:local\n",
+            encoding="utf-8",
+        )
+        specification = publication.normalize_publication_spec(
+            project=self.project,
+            runtime_config=config,
+            name="bootstrap",
+        )
+
+        def run_once_model(**_kwargs: object) -> bytes:
+            return json.dumps(
+                {
+                    "name": "demo",
+                    "services": {
+                        "migrate": {"image": "postgres:17-alpine"},
+                        "worker": {"image": "example/worker:local"},
+                        "helper": {"image": "example/worker:local"},
+                        "bootstrap": {"image": "example/bootstrap:local"},
+                    },
+                }
+            ).encode("utf-8")
+
+        self.assertTrue(specification.build_only)
+        self.assertEqual(specification.rollout_services, ())
+        with mock.patch.object(
+            publication, "docker_image_id", return_value=IMAGE_ID
+        ), mock.patch.object(publication, "_docker_environment", return_value={}):
+            plan = publication.plan_publication(
+                specification=specification,
+                artifact_root=self.artifacts,
+                operation_id="38383838-3838-4383-8383-383838383838",
+                service_uid=os.geteuid(),
+                broker_database_path=self.broker_database,
+                compose_renderer=run_once_model,
+                compose_configuration_verifier=self._configuration_verifier,
+            )
+            _directory, planned = publication.load_manifest(
+                artifact_root=self.artifacts,
+                operation_id=plan["operation_id"],
+                expected_uid=os.geteuid(),
+            )
+            image = {
+                "image_id": IMAGE_ID,
+                "repo_digests": [],
+                "labels": {
+                    "io.devcoordinator.publication": specification.name,
+                    "io.devcoordinator.source-fingerprint": planned["source"]["fingerprint"],
+                    "io.devcoordinator.input-fingerprint": planned["snapshot"]["input_manifest_sha256"],
+                },
+            }
+            with mock.patch.object(
+                publication, "docker_image_evidence", return_value=image
+            ), mock.patch.object(
+                publication,
+                "installed_package_identity",
+                return_value="libgssapi-krb5-2=1.0:amd64",
+            ):
+                result = publication.apply_publication(
+                    specification=specification,
+                    artifact_root=self.artifacts,
+                    operation_id=plan["operation_id"],
+                    confirmation_fingerprint=plan["plan_fingerprint"],
+                    service_uid=os.geteuid(),
+                    broker_database_path=self.broker_database,
+                    compose_renderer=run_once_model,
+                    compose_configuration_verifier=self._configuration_verifier,
+                    docker_runner=lambda command, _timeout, _environment: subprocess.CompletedProcess(
+                        command, 0, stdout="built", stderr=""
+                    ),
+                    rollout=False,
+                )
+
+        self.assertEqual(result["status"], "built")
+        with self.assertRaisesRegex(
+            publication.ImagePublicationError, "build-only publication"
+        ):
+            publication.apply_publication(
+                specification=specification,
+                artifact_root=self.artifacts,
+                operation_id=plan["operation_id"],
+                confirmation_fingerprint=plan["plan_fingerprint"],
+                service_uid=os.geteuid(),
+            )
+
+    def test_apply_reuses_exact_built_image_without_rebuilding(self) -> None:
+        build_commands: list[tuple[str, ...]] = []
+
+        def build_runner(
+            command: tuple[str, ...], _timeout: float, _environment: dict[str, str]
+        ) -> subprocess.CompletedProcess[str]:
+            build_commands.append(command)
+            return subprocess.CompletedProcess(command, 0, stdout="built", stderr="")
+
+        with mock.patch.object(
+            publication, "docker_image_id", return_value=IMAGE_ID
+        ), mock.patch.object(publication, "_docker_environment", return_value={}):
+            plan = publication.plan_publication(
+                specification=self.specification,
+                artifact_root=self.artifacts,
+                operation_id="37373737-3737-4373-8373-373737373737",
+                service_uid=os.geteuid(),
+                broker_database_path=self.broker_database,
+                compose_renderer=rendered_model,
+                compose_configuration_verifier=self._configuration_verifier,
+            )
+            _directory, planned = publication.load_manifest(
+                artifact_root=self.artifacts,
+                operation_id=plan["operation_id"],
+                expected_uid=os.geteuid(),
+            )
+            image = {
+                "image_id": IMAGE_ID,
+                "repo_digests": [],
+                "labels": {
+                    "io.devcoordinator.publication": self.specification.name,
+                    "io.devcoordinator.source-fingerprint": planned["source"]["fingerprint"],
+                    "io.devcoordinator.input-fingerprint": planned["snapshot"]["input_manifest_sha256"],
+                },
+            }
+            with mock.patch.object(
+                publication, "docker_image_evidence", return_value=image
+            ), mock.patch.object(
+                publication,
+                "installed_package_identity",
+                return_value="libgssapi-krb5-2=1.0:amd64",
+            ), mock.patch.object(
+                publication,
+                "run_compose_rollout",
+                return_value={"phases": []},
+            ) as rollout, mock.patch.object(
+                publication,
+                "verify_published_runtime",
+                return_value={"status": "verified"},
+            ):
+                publication.apply_publication(
+                    specification=self.specification,
+                    artifact_root=self.artifacts,
+                    operation_id=plan["operation_id"],
+                    confirmation_fingerprint=plan["plan_fingerprint"],
+                    service_uid=os.geteuid(),
+                    broker_database_path=self.broker_database,
+                    compose_renderer=rendered_model,
+                    compose_configuration_verifier=self._configuration_verifier,
+                    docker_runner=build_runner,
+                    rollout=False,
+                )
+                result = publication.apply_publication(
+                    specification=self.specification,
+                    artifact_root=self.artifacts,
+                    operation_id=plan["operation_id"],
+                    confirmation_fingerprint=plan["plan_fingerprint"],
+                    service_uid=os.geteuid(),
+                    broker_database_path=self.broker_database,
+                    compose_renderer=rendered_model,
+                    compose_configuration_verifier=self._configuration_verifier,
+                    docker_runner=build_runner,
+                )
+
+        self.assertEqual(result["status"], "published")
+        self.assertEqual(len(build_commands), 1)
+        rollout.assert_called_once()
 
     def test_apply_persists_failed_rollout_diagnostic(self) -> None:
         with mock.patch.object(publication, "docker_image_id", return_value=IMAGE_ID), mock.patch.object(
@@ -503,7 +696,7 @@ class ImagePublicationTests(unittest.TestCase):
                 service_uid=os.geteuid(),
                 broker_database_path=self.broker_database,
                 compose_renderer=rendered_model,
-                compose_enrollment_verifier=self._enrollment_verifier,
+                compose_configuration_verifier=self._configuration_verifier,
             )
             _directory, planned = publication.load_manifest(
                 artifact_root=self.artifacts,
@@ -541,7 +734,7 @@ class ImagePublicationTests(unittest.TestCase):
                         service_uid=os.geteuid(),
                         broker_database_path=self.broker_database,
                         compose_renderer=rendered_model,
-                        compose_enrollment_verifier=self._enrollment_verifier,
+                        compose_configuration_verifier=self._configuration_verifier,
                         docker_runner=lambda command, _timeout, _environment: subprocess.CompletedProcess(
                             command, 0, stdout="ok", stderr=""
                         ),
@@ -636,7 +829,7 @@ class ImagePublicationTests(unittest.TestCase):
         self.assertNotIn("do-not-leak-bearer", json.dumps(raised.exception.evidence))
 
     @staticmethod
-    def _enrollment_verifier(
+    def _configuration_verifier(
         _specification: publication.PublicationSpec,
         _evidence: dict[str, object],
         _effective: object,

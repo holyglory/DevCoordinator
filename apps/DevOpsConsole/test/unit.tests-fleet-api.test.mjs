@@ -49,7 +49,6 @@ function responseRecorder() {
 }
 
 function fixture({
-  grants = new Set(['tests:read:repo-visible', 'tests:read:repo-idle']),
   runActor = 'google:viewer@example.test',
   admin = false,
   coordinatorOverrides = {},
@@ -249,11 +248,6 @@ function fixture({
           network: 'loopback', private_scratch: true, kill_after_run: true,
           cpu_millis: 8_000, memory_mib: 32_768, pids: 2_048,
         },
-        capability_policy: {
-          ok: false, policy_fingerprint: 'must-not-leak', repository_generation: 4,
-          requested: ['fixture.postgres', 'network.loopback'],
-          missing: ['fixture.postgres'], repository_grant: true, generation_match: true,
-        },
       };
     },
     async testEvents({ repoId }) {
@@ -270,7 +264,7 @@ function fixture({
     coordinator,
     routeStore: { list: () => [] },
     upstreamAuthStore: { describe: () => ({ configured: false }) },
-    accessStore: { isAdmin: () => admin, canAccess: (_email, grant) => grants.has(grant) },
+    accessStore: { isAdmin: () => admin, canAccess: () => false },
     guard: { checkOrigin: () => true },
     certManager: { info: () => null },
     metrics: { ingest: () => {}, history: () => ({ entities: [], host: null }) },
@@ -292,7 +286,7 @@ function p99(values) {
   return [...values].sort((left, right) => left - right)[Math.ceil(values.length * 0.99) - 1];
 }
 
-test('fleet Tests endpoint scopes rollups and joins never-tested enrolled repos', async () => {
+test('fleet Tests returns the full trusted-local fleet and joins never-tested repos', async () => {
   const { api, calls } = fixture();
   const req = { method: 'GET', url: '/api/tests/fleet?hours=24', headers: {} };
   const res = responseRecorder();
@@ -300,35 +294,30 @@ test('fleet Tests endpoint scopes rollups and joins never-tested enrolled repos'
 
   assert.equal(res.status, 200);
   const result = JSON.parse(res.body);
-  assert.deepEqual(result.repositories.map((item) => item.repo_id), ['repo-visible', 'repo-idle']);
-  assert.equal(result.repositories[1].state, 'idle');
-  assert.equal(result.repositories[1].setup_status, 'missing');
-  assert.equal(result.summary.repository_count, 2);
-  assert.equal(result.summary.repositories_with_activity, 1);
-  assert.equal(result.summary.test_count, 7);
-  assert.equal(result.summary.attempt_count, 1);
-  assert.equal(result.summary.test_failure_count, 0);
+  assert.deepEqual(result.repositories.map((item) => item.repo_id), ['repo-visible', 'repo-hidden', 'repo-idle']);
+  assert.equal(result.repositories[2].state, 'idle');
+  assert.equal(result.repositories[2].setup_status, 'missing');
+  assert.equal(result.summary.repository_count, 3);
+  assert.equal(result.summary.repositories_with_activity, 2);
+  assert.equal(result.summary.test_count, 1000);
+  assert.equal(result.summary.attempt_count, 100);
+  assert.equal(result.summary.test_failure_count, 42);
   assert.equal(result.summary.infrastructure_failure_count, 0);
-  assert.equal(result.summary.p95_queue_wait_seconds, null);
+  assert.equal(result.summary.p95_queue_wait_seconds, 91);
   assert.deepEqual(result.summary.avoided_work, {
-    available: false, test_count: null, test_seconds: null,
+    available: true, test_count: 640, test_seconds: 4_200,
   });
-  assert.equal(result.capacity[0].test_seconds, 120);
+  assert.equal(result.capacity[0].test_seconds, 9120);
   assert.equal(result.capacity[0].infrastructure_count, 0);
-  assert.equal(result.capacity[0].p95_queue_wait_seconds, null);
-  assert.equal(result.capacity[0].runner_capacity, undefined);
-  assert.deepEqual(result.attention, []);
-  assert.doesNotMatch(JSON.stringify(result), /repo-hidden|secret failure|private\/hidden/);
+  assert.equal(result.capacity[0].p95_queue_wait_seconds, 73);
+  assert.equal(result.capacity[0].runner_capacity, 16);
+  assert.equal(result.attention[0].repo_id, 'repo-hidden');
+  assert.doesNotMatch(JSON.stringify(result), /private\/hidden/);
   assert.deepEqual(calls, [{ hours: 24 }]);
 });
 
 test('fleet Tests preserves non-additive efficiency and capacity metrics for full-fleet readers', async () => {
-  const grants = new Set([
-    'tests:read:repo-visible',
-    'tests:read:repo-hidden',
-    'tests:read:repo-idle',
-  ]);
-  const { api } = fixture({ grants });
+  const { api } = fixture();
   const response = responseRecorder();
   await api.handle(
     { method: 'GET', url: '/api/tests/fleet?hours=24', headers: {} },
@@ -355,7 +344,7 @@ test('fleet Tests preserves non-additive efficiency and capacity metrics for ful
   assert.equal(result.summary.infrastructure_count, 0);
 });
 
-test('fleet Tests aggregates legacy failure counter names into current aliases', async () => {
+test('fleet Tests aggregates legacy failure counters with current fleet counters', async () => {
   const { api, payload } = fixture();
   const visible = payload.repositories.find((repository) => repository.repo_id === 'repo-visible');
   delete visible.summary.test_failure_count;
@@ -372,9 +361,9 @@ test('fleet Tests aggregates legacy failure counter names into current aliases',
 
   assert.equal(response.status, 200);
   const result = JSON.parse(response.body);
-  assert.equal(result.summary.test_failure_count, 3);
+  assert.equal(result.summary.test_failure_count, 45);
   assert.equal(result.summary.infrastructure_failure_count, 2);
-  assert.equal(result.summary.failed_run_count, 3);
+  assert.equal(result.summary.failed_run_count, 45);
   assert.equal(result.summary.infrastructure_count, 2);
 });
 
@@ -453,7 +442,6 @@ test('cached fleet Tests API handler p99 remains below 100ms for 50 repositories
   };
   const { api } = fixture({
     admin: true,
-    grants: new Set(),
     coordinatorOverrides: {
       async testRepositories() { return { schema_version: 1, repositories }; },
       async testFleet() { return fleet; },
@@ -489,7 +477,7 @@ test('fleet Tests endpoint rejects unbounded windows before Coordinator access',
   assert.deepEqual(calls, []);
 });
 
-test('repository catalog hides paths and repositories without a test grant', async () => {
+test('repository catalog returns every repository without host paths', async () => {
   const { api } = fixture();
   const res = responseRecorder();
   await api.handle(
@@ -499,13 +487,13 @@ test('repository catalog hides paths and repositories without a test grant', asy
   );
   assert.equal(res.status, 200);
   const payload = JSON.parse(res.body);
-  assert.deepEqual(payload.repositories.map((item) => item.repo_id), ['repo-visible', 'repo-idle']);
+  assert.deepEqual(payload.repositories.map((item) => item.repo_id), ['repo-visible', 'repo-hidden', 'repo-idle']);
   assert.equal(payload.repositories[0].canonical_root, undefined);
-  assert.doesNotMatch(res.body, /repo-hidden|\/private\//);
+  assert.doesNotMatch(res.body, /\/private\//);
 });
 
 test('repository catalog never exposes host paths, including to Console owners', async () => {
-  const { api } = fixture({ admin: true, grants: new Set() });
+  const { api } = fixture({ admin: true });
   const response = responseRecorder();
   await api.handle(
     { method: 'GET', url: '/api/tests/repositories', headers: {} },
@@ -516,8 +504,8 @@ test('repository catalog never exposes host paths, including to Console owners',
   assert.doesNotMatch(response.body, /canonical_root|\/private\//);
 });
 
-test('manual planning accepts only declared target names and resolves an exact server-authorized source', async () => {
-  const { api, calls } = fixture({ grants: new Set(['tests:run:repo-visible']) });
+test('manual planning accepts only declared target names and resolves an exact catalog source', async () => {
+  const { api, calls } = fixture();
   const operationId = '4d4f45a8-1df0-4d25-a2ae-4f50f77b1bf3';
   const planRes = responseRecorder();
   await api.handle(
@@ -575,26 +563,8 @@ test('manual planning accepts only declared target names and resolves an exact s
   assert.match(JSON.parse(rejected.body).error, /typed repository source selector/);
 });
 
-test('test planning denies a repository without an exact immutable grant', async () => {
-  const { api, calls } = fixture({ grants: new Set(['tests:run:repo-visible']) });
-  const operationId = 'b38ba7f7-82de-414a-9455-dd4e43e0e0e7';
-  const res = responseRecorder();
-  await api.handle(
-    jsonRequest('/api/tests/plan', {
-      repo_id: 'repo-hidden', intent: 'manual', operation_id: operationId,
-      source: {
-        schema_version: 1, kind: 'original', repository_id: 'repo-hidden', repository_generation: 1,
-      },
-    }),
-    res,
-    { email: 'viewer@example.test' },
-  );
-  assert.equal(res.status, 403);
-  assert.equal(calls.length, 0);
-});
-
 test('test planning rejects malformed or arbitrary browser source before coordinator access', async () => {
-  const { api, calls } = fixture({ grants: new Set(['tests:run:repo-visible']) });
+  const { api, calls } = fixture();
   const operationId = '9bfca90a-feba-45a5-b491-796673131208';
   const planRes = responseRecorder();
   await api.handle(jsonRequest('/api/tests/plan', {
@@ -605,8 +575,8 @@ test('test planning rejects malformed or arbitrary browser source before coordin
   assert.equal(calls.length, 0);
 });
 
-test('test source catalog exposes opaque authorized identities without host paths', async () => {
-  const { api, calls } = fixture({ grants: new Set(['tests:run:repo-visible']) });
+test('test source catalog exposes opaque identities without host paths', async () => {
+  const { api, calls } = fixture();
   const response = responseRecorder();
   await api.handle({
     method: 'GET', url: '/api/tests/repositories/repo-visible/sources', headers: {},
@@ -619,19 +589,8 @@ test('test source catalog exposes opaque authorized identities without host path
   assert.deepEqual(calls, [{ inventory: { maxAgeMs: 0 } }]);
 });
 
-test('test source catalog requires repository run authorization before inventory access', async () => {
-  const { api, calls } = fixture({ grants: new Set(['tests:read:repo-visible']) });
-  const response = responseRecorder();
-  await api.handle({
-    method: 'GET', url: '/api/tests/repositories/repo-visible/sources', headers: {},
-  }, response, { email: 'viewer@example.test' });
-  assert.equal(response.status, 403);
-  assert.equal(calls.length, 0);
-});
-
 test('malformed source authority fails as stale server evidence, not a browser request error', async () => {
   const { api } = fixture({
-    grants: new Set(['tests:run:repo-visible']),
     coordinatorOverrides: {
       async inventory() {
         return {
@@ -660,8 +619,8 @@ test('malformed source authority fails as stale server evidence, not a browser r
   assert.match(JSON.parse(response.body).error, /authority is malformed/);
 });
 
-test('temporary source planning is generation-bound and broker/profile authorized', async () => {
-  const { api, calls } = fixture({ grants: new Set(['tests:run:repo-visible']) });
+test('temporary source planning is generation-bound and catalog-resolved', async () => {
+  const { api, calls } = fixture();
   const operationId = '0a907e6e-03ca-4a74-9bb5-c634460ce94c';
   const response = responseRecorder();
   await api.handle(jsonRequest('/api/tests/plan', {
@@ -688,7 +647,7 @@ test('temporary source planning is generation-bound and broker/profile authorize
 });
 
 test('stale or cross-family temporary source identity fails before test planning', async () => {
-  const { api, calls } = fixture({ grants: new Set(['tests:run:repo-visible']) });
+  const { api, calls } = fixture();
   const operationId = 'ca0ded39-e154-4706-bdd7-e09ae36275cd';
   for (const source of [
     { ...ORIGINAL_SOURCE, repository_generation: 3 },
@@ -700,13 +659,13 @@ test('stale or cross-family temporary source identity fails before test planning
       repo_id: 'repo-visible', intent: 'manual', operation_id: operationId, source,
     }), response, { email: 'viewer@example.test' });
     assert.equal(response.status, 409);
-    assert.match(JSON.parse(response.body).error, /stale or no longer authorized/);
+    assert.match(JSON.parse(response.body).error, /stale or no longer (available|configured)/);
   }
   assert.equal(calls.filter((call) => call.plan).length, 0);
 });
 
 test('test planning rejects target selection outside manual intent before coordinator access', async () => {
-  const { api, calls } = fixture({ grants: new Set(['tests:run:repo-visible']) });
+  const { api, calls } = fixture();
   const operationId = 'b22de76b-5bc9-442f-8e17-d66c263713e8';
   const response = responseRecorder();
   await api.handle(jsonRequest('/api/tests/plan', {
@@ -719,7 +678,7 @@ test('test planning rejects target selection outside manual intent before coordi
   assert.equal(calls.length, 0);
 });
 
-test('run history and detail remain scoped to the repository grant', async () => {
+test('run history and detail remain bound to the requested repository identity', async () => {
   const { api, calls } = fixture();
   const history = responseRecorder();
   await api.handle(
@@ -730,8 +689,7 @@ test('run history and detail remain scoped to the repository grant', async () =>
   assert.equal(history.status, 200);
   const historyBody = JSON.parse(history.body);
   assert.equal(historyBody.runs[0].run_id, 'run-1');
-  assert.equal(historyBody.runs[0].can_retry, false,
-    'read access must not expose an enabled mutation affordance');
+  assert.equal(historyBody.runs[0].can_retry, true);
   assert.equal(historyBody.next_cursor, 'run-1');
   assert.deepEqual(historyBody.runs[0].wait, MEMORY_WAIT);
   assert.deepEqual(historyBody.runs[0].usage, {
@@ -784,8 +742,8 @@ test('run history forwards and returns one bounded opaque cursor', async () => {
   });
 });
 
-test('run lookup authorizes the repository before querying a user-supplied run id', async () => {
-  const { api, calls } = fixture({ grants: new Set(['tests:read:repo-visible']) });
+test('run lookup rejects a contradictory repository identity', async () => {
+  const { api, calls } = fixture();
   const response = responseRecorder();
   await api.handle(
     {
@@ -796,12 +754,11 @@ test('run lookup authorizes the repository before querying a user-supplied run i
     response,
     { email: 'viewer@example.test' },
   );
-  assert.equal(response.status, 403);
-  assert.equal(calls.some((item) => item.status), false,
-    'an unauthorized repository must not become a run-existence oracle');
+  assert.equal(response.status, 404);
+  assert.equal(calls.some((item) => item.status), true);
 });
 
-test('repository setup returns policy metadata without host paths or fixture secrets', async () => {
+test('repository setup returns execution metadata without host paths or fixture secrets', async () => {
   const { api } = fixture();
   const response = responseRecorder();
   await api.handle(
@@ -818,14 +775,7 @@ test('repository setup returns policy metadata without host paths or fixture sec
   assert.deepEqual(body.isolation, {
     network: 'loopback', private_scratch: true, kill_after_run: true,
   });
-  assert.deepEqual(body.capability_policy, {
-    ok: false,
-    repository_grant: true,
-    generation_match: true,
-    requested: ['fixture.postgres', 'network.loopback'],
-    missing: ['fixture.postgres'],
-    repository_generation: 4,
-  });
+  assert.equal(body.capability_policy, undefined);
   assert.doesNotMatch(response.body, /\/private\/|must-not-leak|"secret"|cpu_millis|memory_mib|"pids"/);
 });
 
@@ -857,8 +807,8 @@ test('run reads omit malformed capacity and measurement evidence', async () => {
   assert.equal(run.usage, undefined);
 });
 
-test('run history exposes operations only to the requester or tests:operate users', async () => {
-  const own = fixture({ grants: new Set(['tests:run:repo-visible']) });
+test('run history exposes terminal operations to every trusted local Console user', async () => {
+  const own = fixture();
   const ownResponse = responseRecorder();
   await own.api.handle(
     { method: 'GET', url: '/api/tests/runs?repo_id=repo-visible', headers: {} },
@@ -867,29 +817,14 @@ test('run history exposes operations only to the requester or tests:operate user
   );
   assert.equal(JSON.parse(ownResponse.body).runs[0].can_retry, true);
 
-  const foreign = fixture({
-    grants: new Set(['tests:run:repo-visible']),
-    runActor: 'google:someone-else@example.test',
-  });
+  const foreign = fixture({ runActor: 'google:someone-else@example.test' });
   const foreignResponse = responseRecorder();
   await foreign.api.handle(
     { method: 'GET', url: '/api/tests/runs?repo_id=repo-visible', headers: {} },
     foreignResponse,
     { email: 'viewer@example.test' },
   );
-  assert.equal(JSON.parse(foreignResponse.body).runs[0].can_retry, false);
-
-  const operator = fixture({
-    grants: new Set(['tests:operate:repo-visible']),
-    runActor: 'google:someone-else@example.test',
-  });
-  const operatorResponse = responseRecorder();
-  await operator.api.handle(
-    { method: 'GET', url: '/api/tests/runs?repo_id=repo-visible', headers: {} },
-    operatorResponse,
-    { email: 'viewer@example.test' },
-  );
-  assert.equal(JSON.parse(operatorResponse.body).runs[0].can_retry, true);
+  assert.equal(JSON.parse(foreignResponse.body).runs[0].can_retry, true);
 });
 
 test('test mutation ownership uses only the canonical actor from the authenticated session', async () => {
@@ -900,7 +835,6 @@ test('test mutation ownership uses only the canonical actor from the authenticat
     requested_by_actor: 'google:viewer@example.test',
   };
   const { api, calls } = fixture({
-    grants: new Set(['tests:run:repo-visible']),
     coordinatorOverrides: {
       async testRuns({ repoId }) {
         return { repository_id: repoId, runs: [legacyOwnedRun], next_cursor: null };
@@ -919,7 +853,7 @@ test('test mutation ownership uses only the canonical actor from the authenticat
   );
   assert.equal(history.status, 200);
   const visibleRun = JSON.parse(history.body).runs[0];
-  assert.equal(visibleRun.can_retry, false);
+  assert.equal(visibleRun.can_retry, true);
   assert.equal(visibleRun.requested_by, undefined);
   assert.equal(visibleRun.requested_by_actor, undefined);
 
@@ -932,8 +866,8 @@ test('test mutation ownership uses only the canonical actor from the authenticat
     retry,
     { email: 'viewer@example.test' },
   );
-  assert.equal(retry.status, 403);
-  assert.equal(calls.some((item) => item.retry), false);
+  assert.equal(retry.status, 202);
+  assert.equal(calls.some((item) => item.retry), true);
 
   const spoofedSubmission = responseRecorder();
   await api.handle(
@@ -970,8 +904,8 @@ test('case evidence uses a bounded numeric cursor', async () => {
   assert.equal(rejected.status, 400);
 });
 
-test('a requester may cancel their own run with tests:run access', async () => {
-  const { api, calls } = fixture({ grants: new Set(['tests:run:repo-visible']) });
+test('a trusted local Console user may cancel a run', async () => {
+  const { api, calls } = fixture();
   const operationId = '9a62e192-6892-4faf-a17c-c1a304dc5ee5';
   const res = responseRecorder();
   await api.handle(
@@ -990,64 +924,33 @@ test('a requester may cancel their own run with tests:run access', async () => {
   });
 });
 
-test('operating another actor run requires tests:operate', async () => {
+test('a trusted local Console user may retry another actor run', async () => {
   const operationId = '8c086de1-3d9a-4f02-92e3-cb89b80377ce';
-  const deniedFixture = fixture({
-    grants: new Set(['tests:run:repo-visible']),
-    runActor: 'google:owner@example.test',
-  });
-  const denied = responseRecorder();
-  await deniedFixture.api.handle(
+  const trustedFixture = fixture({ runActor: 'google:owner@example.test' });
+  const response = responseRecorder();
+  await trustedFixture.api.handle(
     jsonRequest('/api/tests/repositories/repo-visible/runs/run-1/retry', {
       failed_only: true, operation_id: operationId,
     }),
-    denied,
+    response,
     { email: 'viewer@example.test' },
   );
-  assert.equal(denied.status, 403);
-  assert.equal(deniedFixture.calls.some((item) => item.retry), false);
-
-  const allowedFixture = fixture({
-    grants: new Set(['tests:operate:repo-visible']),
-    runActor: 'google:owner@example.test',
-  });
-  const allowed = responseRecorder();
-  await allowedFixture.api.handle(
-    jsonRequest('/api/tests/repositories/repo-visible/runs/run-1/retry', {
-      failed_only: true, operation_id: operationId,
-    }),
-    allowed,
-    { email: 'viewer@example.test' },
-  );
-  assert.equal(allowed.status, 202);
-  assert.equal(allowedFixture.calls.some((item) => item.retry), true);
+  assert.equal(response.status, 202);
+  assert.equal(trustedFixture.calls.some((item) => item.retry), true);
 });
 
-test('release planning is reserved for Console owners', async () => {
+test('release planning is available to every trusted local Console user', async () => {
   const operationId = '291269e6-d81c-4ba5-982a-96f686166012';
-  const userFixture = fixture({ grants: new Set(['tests:run:repo-visible']) });
-  const denied = responseRecorder();
+  const userFixture = fixture();
+  const response = responseRecorder();
   await userFixture.api.handle(
     jsonRequest('/api/tests/plan', {
       repo_id: 'repo-visible', intent: 'release', operation_id: operationId,
       source: ORIGINAL_SOURCE,
     }),
-    denied,
+    response,
     { email: 'viewer@example.test' },
   );
-  assert.equal(denied.status, 403);
-  assert.equal(userFixture.calls.some((item) => item.plan), false);
-
-  const ownerFixture = fixture({ admin: true, grants: new Set() });
-  const allowed = responseRecorder();
-  await ownerFixture.api.handle(
-    jsonRequest('/api/tests/plan', {
-      repo_id: 'repo-visible', intent: 'release', operation_id: operationId,
-      source: ORIGINAL_SOURCE,
-    }),
-    allowed,
-    { email: 'owner@example.test' },
-  );
-  assert.equal(allowed.status, 200);
-  assert.equal(ownerFixture.calls.some((item) => item.plan), true);
+  assert.equal(response.status, 200);
+  assert.equal(userFixture.calls.some((item) => item.plan), true);
 });

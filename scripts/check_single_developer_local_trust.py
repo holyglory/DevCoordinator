@@ -60,7 +60,6 @@ PYTHON_TRUST_SOURCES = (
     "skills/codex-dev-coordinator/scripts/devcoordinator/repository_context.py",
     "skills/codex-dev-coordinator/scripts/devcoordinator/inventory_projection.py",
     "skills/codex-dev-coordinator/scripts/devcoordinator/universal_test_transport.py",
-    "skills/codex-dev-coordinator/scripts/devcoordinator/universal_test_capabilities.py",
     "skills/codex-dev-coordinator/scripts/devcoordinator/store.py",
     "skills/codex-dev-coordinator/scripts/devcoordinator/universal_test_store.py",
     "skills/codex-dev-coordinator/scripts/devcoordinator/universal_test_credentials.py",
@@ -71,7 +70,7 @@ PYTHON_TRUST_SOURCES = (
     "skills/codex-dev-coordinator/scripts/devcoordinator/universal_test_runtime.py",
     "skills/codex-dev-coordinator/scripts/devcoordinator/universal_test_spool.py",
     "skills/codex-dev-coordinator/scripts/devcoordinator/worker_runner.py",
-    "skills/codex-dev-coordinator/scripts/devcoordinator/broker_enrollment.py",
+    "skills/codex-dev-coordinator/scripts/devcoordinator/broker_configuration.py",
     "skills/codex-dev-coordinator/scripts/devcoordinator/project_runtime_isolation.py",
 )
 
@@ -83,7 +82,6 @@ METADATA_GUARD_SOURCES = frozenset(
         "skills/codex-dev-coordinator/scripts/devcoordinator/repository_context.py",
         "skills/codex-dev-coordinator/scripts/devcoordinator/inventory_projection.py",
         "skills/codex-dev-coordinator/scripts/devcoordinator/universal_test_transport.py",
-        "skills/codex-dev-coordinator/scripts/devcoordinator/universal_test_capabilities.py",
         "skills/codex-dev-coordinator/scripts/devcoordinator/store.py",
         "skills/codex-dev-coordinator/scripts/devcoordinator/universal_test_store.py",
         "skills/codex-dev-coordinator/scripts/devcoordinator/universal_test_credentials.py",
@@ -94,7 +92,7 @@ METADATA_GUARD_SOURCES = frozenset(
         "skills/codex-dev-coordinator/scripts/devcoordinator/universal_test_runtime.py",
         "skills/codex-dev-coordinator/scripts/devcoordinator/universal_test_spool.py",
         "skills/codex-dev-coordinator/scripts/devcoordinator/worker_runner.py",
-        "skills/codex-dev-coordinator/scripts/devcoordinator/broker_enrollment.py",
+        "skills/codex-dev-coordinator/scripts/devcoordinator/broker_configuration.py",
         "skills/codex-dev-coordinator/scripts/devcoordinator/project_runtime_isolation.py",
     }
 )
@@ -413,6 +411,17 @@ class _PythonTrustVisitor(ast.NodeVisitor):
         return super().visit(node)
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        if node.name == "operation_follow":
+            segment = ast.get_source_segment(self.source, node) or ""
+            if re.search(r"original\.(?:account_id|repo_id)\s*=", segment):
+                self.findings.append(
+                    Finding(
+                        "operation_follow_scope_gate_forbidden",
+                        self.relative,
+                        node.lineno,
+                        "exact operation follow must be host-wide for trusted local callers",
+                    )
+                )
         self.functions.append(node.name)
         self.generic_visit(node)
         self.functions.pop()
@@ -503,6 +512,18 @@ def _validate_python(root: Path, findings: list[Finding]) -> None:
         source = _read(root, relative, findings)
         if source is None:
             continue
+        if (
+            relative.endswith("/broker_persistence.py")
+            and "ephemeral_image_prefetch_templates" in source
+        ):
+            findings.append(
+                Finding(
+                    "retired_repository_profile_policy_field",
+                    relative,
+                    _line_of(source, source.index("ephemeral_image_prefetch_templates")),
+                    "broker repository replies must not serialize the retired image-prefetch allowlist",
+                )
+            )
         try:
             tree = ast.parse(source, filename=relative)
         except SyntaxError as error:

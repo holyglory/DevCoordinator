@@ -47,6 +47,10 @@ _LOGGER = logging.getLogger(__name__)
 
 
 MAX_TEST_ATTEMPT_TTL_SECONDS = 7 * 24 * 60 * 60
+# The repository process still receives the exact requested TTL.  The native
+# unit needs a bounded publication margin so the runner can write and fsync its
+# terminal result after stopping a child at that deadline.
+TEST_ATTEMPT_RESULT_PUBLICATION_GRACE_SECONDS = 30
 MAX_TEST_ATTEMPT_ARGUMENTS = 256
 MAX_TEST_ATTEMPT_ARGUMENT_BYTES = 32 * 1024
 MAX_TEST_ATTEMPT_ENVIRONMENT = 128
@@ -3243,7 +3247,8 @@ class SystemdTestAttemptManager:
             "--property=RestrictSUIDSGID=yes",
             "--property=LockPersonality=yes",
             "--property=UMask=0077",
-            f"--property=RuntimeMaxSec={descriptor.ttl_seconds}s",
+            "--property=RuntimeMaxSec="
+            f"{descriptor.ttl_seconds + TEST_ATTEMPT_RESULT_PUBLICATION_GRACE_SECONDS}s",
             "--property=StandardOutput=journal",
             "--property=StandardError=journal",
         ]

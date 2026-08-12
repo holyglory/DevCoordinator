@@ -14,6 +14,7 @@ __pycache__/
 .build/
 
 # Local audit outputs and scratch runs
+.local/
 audit-output/
 audit-outputs/
 full-repo-audit-run/

@@ -37,7 +37,6 @@ from devcoordinator.repository_lifecycle import (
     RunningState,
     StartupPolicyRef,
 )
-from devcoordinator.schema import establish_repository_owner_authority
 from devcoordinator.sqlite_lifecycle import SQLiteLifecyclePersistence
 from devcoordinator.store import AccountStore, deterministic_id, utc_timestamp
 
@@ -88,7 +87,7 @@ class RecordingAdapter:
             observable,
             target.immutable_fingerprint if observable else None,
             observable,
-            target.ownership_fingerprint if observable else None,
+            target.observation_fingerprint if observable else None,
             RunningState.RUNNING if running else RunningState.STOPPED,
             container_running=running if observable else None,
             policies=policies,
@@ -172,20 +171,9 @@ class LifecycleApplyObservationTests(unittest.TestCase):
                         """,
                         (
                             repo_id,
-                            "explicit lifecycle CLI test enrollment",
+                            "explicit lifecycle CLI test configuration",
                             timestamp,
                         ),
-                    )
-                    establish_repository_owner_authority(
-                        connection,
-                        repository_id=repo_id,
-                        owner_uid=os.geteuid(),
-                        repository_generation=0,
-                        operation_id=f"fixture-enroll-{repo_id}",
-                        actor="test",
-                        reason="explicit lifecycle CLI test enrollment",
-                        timestamp=timestamp,
-                        evidence={"source": "test_fixture"},
                     )
 
     @staticmethod
@@ -528,68 +516,6 @@ class LifecycleApplyObservationTests(unittest.TestCase):
             [("disable", self.A), ("stop", self.A)],
         )
 
-    def test_resume_rejects_controller_change_that_precedes_observation(self) -> None:
-        plan = self._plan_repository()
-        unchanged = self._sample(
-            self._container(self.A, project=self.repo_a),
-            self._container(self.B, project=self.repo_b),
-        )
-        interrupted = self._handle(
-            self._repository_remove_args(plan),
-            observe_before_apply=self._callback(unchanged),
-        )
-        self.assertEqual(interrupted["status"], "needs_attention")
-        with AccountStore.open_default(self.home) as store:
-            with store.immediate_transaction() as connection:
-                connection.execute(
-                    """
-                    UPDATE control_bindings SET capability = 'changed-controller'
-                    WHERE repo_id = ?
-                    """,
-                    (plan["repo_id"],),
-                )
-        self.adapter.add_container(self.A)
-
-        with self.assertRaisesRegex(PlanDriftError, "resources changed"):
-            self._handle(
-                self._repository_remove_args(plan),
-                observe_before_apply=self._callback(unchanged),
-            )
-
-        self.assertEqual(self.adapter.effects, [])
-
-    def test_resume_allows_refresh_only_controller_generation_churn(self) -> None:
-        plan = self._plan_repository()
-        unchanged = self._sample(
-            self._container(self.A, project=self.repo_a),
-            self._container(self.B, project=self.repo_b),
-        )
-        interrupted = self._handle(
-            self._repository_remove_args(plan),
-            observe_before_apply=self._callback(unchanged),
-        )
-        self.assertEqual(interrupted["status"], "needs_attention")
-        with AccountStore.open_default(self.home) as store:
-            with store.immediate_transaction() as connection:
-                connection.execute(
-                    """
-                    UPDATE control_bindings SET generation = generation + 1
-                    WHERE repo_id = ?
-                    """,
-                    (plan["repo_id"],),
-                )
-        self.adapter.add_container(self.A)
-
-        resumed = self._handle(
-            self._repository_remove_args(plan),
-            observe_before_apply=self._callback(unchanged),
-        )
-
-        self.assertEqual(resumed["status"], "succeeded")
-        self.assertEqual(
-            self.adapter.effects,
-            [("disable", self.A), ("stop", self.A)],
-        )
 
     def test_apply_fails_closed_for_timeout_malformed_or_unavailable_observation(self) -> None:
         plan = self._plan_repository()
@@ -634,7 +560,6 @@ class LifecycleApplyObservationTests(unittest.TestCase):
             return SQLiteLifecyclePersistence(store).resolve_standalone_resource(
                 ResourceKind(str(row["resource_kind"])),
                 str(row["resource_id"]),
-                str(row["control_binding_id"]),
             )
 
     def _plan_standalone(
@@ -653,10 +578,8 @@ class LifecycleApplyObservationTests(unittest.TestCase):
                 exact.resource_id,
                 "--immutable-fingerprint",
                 exact.immutable_fingerprint,
-                "--control-binding-id",
-                exact.control_binding_id,
-                "--ownership-fingerprint",
-                exact.ownership_fingerprint,
+                "--observation-fingerprint",
+                exact.observation_fingerprint,
                 "--request-project",
                 str(self.request_repo),
                 "--agent",
@@ -671,62 +594,6 @@ class LifecycleApplyObservationTests(unittest.TestCase):
             exact,
         )
 
-    def test_standalone_plan_rejects_controller_change_during_observation(self) -> None:
-        sample = self._sample(self._container(self.C))
-        self._commit_observation(sample)
-        exact = self._standalone_exact()
-        args = _parser().parse_args(
-            [
-                "resource",
-                "plan-retire",
-                "--resource-kind",
-                exact.kind.value,
-                "--resource-id",
-                exact.resource_id,
-                "--immutable-fingerprint",
-                exact.immutable_fingerprint,
-                "--control-binding-id",
-                exact.control_binding_id,
-                "--ownership-fingerprint",
-                exact.ownership_fingerprint,
-                "--request-project",
-                str(self.request_repo),
-                "--agent",
-                "test-agent",
-                "--reason",
-                "reject changed standalone controller",
-            ]
-        )
-        observe = self._callback(sample)
-
-        def changed_controller(project: str, agent: str) -> dict[str, object]:
-            result = observe(project, agent)
-            with AccountStore.open_default(self.home) as store:
-                with store.immediate_transaction() as connection:
-                    connection.execute(
-                        """
-                        UPDATE control_bindings
-                        SET capability = 'changed-controller',
-                            generation = generation + 1, updated_at = ?
-                        WHERE binding_id = ?
-                        """,
-                        (utc_timestamp(), exact.control_binding_id),
-                    )
-            return result
-
-        with self.assertRaisesRegex(
-            PlanDriftError, "standalone resource changed"
-        ):
-            self._handle(args, observe_before_plan=changed_controller)
-        with AccountStore.open_default(self.home) as store:
-            planned = store.connection.execute(
-                """
-                SELECT COUNT(*) FROM operations
-                WHERE kind = 'standalone_resource_retirement'
-                """
-            ).fetchone()[0]
-        self.assertEqual(planned, 0)
-        self.assertEqual(self.adapter.effects, [])
 
     def test_standalone_plan_rejects_native_identity_change_during_observation(self) -> None:
         sample = self._sample(self._container(self.C))
@@ -742,10 +609,8 @@ class LifecycleApplyObservationTests(unittest.TestCase):
                 exact.resource_id,
                 "--immutable-fingerprint",
                 exact.immutable_fingerprint,
-                "--control-binding-id",
-                exact.control_binding_id,
-                "--ownership-fingerprint",
-                exact.ownership_fingerprint,
+                "--observation-fingerprint",
+                exact.observation_fingerprint,
                 "--request-project",
                 str(self.request_repo),
                 "--agent",
@@ -817,7 +682,7 @@ class LifecycleApplyObservationTests(unittest.TestCase):
         plan: dict[str, object],
         *,
         immutable_fingerprint: str | None = None,
-        ownership_fingerprint: str | None = None,
+        observation_fingerprint: str | None = None,
     ) -> argparse.Namespace:
         target = plan["targets"][0]
         return _parser().parse_args(
@@ -834,13 +699,11 @@ class LifecycleApplyObservationTests(unittest.TestCase):
                     if immutable_fingerprint is None
                     else immutable_fingerprint
                 ),
-                "--control-binding-id",
-                str(target["control_binding_id"]),
-                "--ownership-fingerprint",
+                "--observation-fingerprint",
                 str(
-                    target["ownership_fingerprint"]
-                    if ownership_fingerprint is None
-                    else ownership_fingerprint
+                    target["observation_fingerprint"]
+                    if observation_fingerprint is None
+                    else observation_fingerprint
                 ),
                 "--request-project",
                 str(self.request_repo),
@@ -897,8 +760,8 @@ class LifecycleApplyObservationTests(unittest.TestCase):
         plan, sample, requested = self._plan_standalone()
         target = plan["targets"][0]
         self.assertNotEqual(
-            requested.ownership_fingerprint,
-            target["ownership_fingerprint"],
+            requested.observation_fingerprint,
+            target["observation_fingerprint"],
             "the fixture must reproduce planning observation generation churn",
         )
         self.adapter.add_container(self.C)
@@ -906,7 +769,7 @@ class LifecycleApplyObservationTests(unittest.TestCase):
         result = self._handle(
             self._resource_retire_args(
                 plan,
-                ownership_fingerprint=requested.ownership_fingerprint,
+                observation_fingerprint=requested.observation_fingerprint,
             ),
             observe_before_apply=self._callback(sample),
         )
@@ -918,58 +781,6 @@ class LifecycleApplyObservationTests(unittest.TestCase):
             [("disable", self.C), ("stop", self.C)],
         )
 
-    def test_standalone_resume_rejects_controller_change_after_partial_result(
-        self,
-    ) -> None:
-        plan, sample, _requested = self._plan_standalone()
-        interrupted = self._handle(
-            self._resource_retire_args(plan),
-            observe_before_apply=self._callback(sample),
-        )
-        self.assertEqual(interrupted["status"], "needs_attention")
-        self.assertEqual(self.adapter.effects, [])
-
-        # Reproduce a later authoritative refresh followed by a controller
-        # contract change that remains stable until retry. Archived-plan
-        # reconstruction used to return the plan target here, making the
-        # semantic comparison tautological and allowing host effects.
-        self._commit_observation(sample)
-        with AccountStore.open_default(self.home) as store:
-            with store.immediate_transaction() as connection:
-                connection.execute(
-                    """
-                    UPDATE control_bindings
-                    SET capability = 'changed-after-partial',
-                        generation = generation + 1, updated_at = ?
-                    WHERE binding_id = ?
-                    """,
-                    (utc_timestamp(), plan["targets"][0]["control_binding_id"]),
-                )
-        self.adapter.add_container(self.C)
-
-        with self.assertRaisesRegex(
-            LifecyclePlanStaleError, "standalone resource changed"
-        ) as raised:
-            self._handle(
-                self._resource_retire_args(plan),
-                observe_before_apply=lambda *_args: self.fail(
-                    "changed current controller must fail before retry observation"
-                ),
-            )
-
-        import dev_coordinator
-
-        payload = dev_coordinator.coordinator_exception_payload(raised.exception)
-        self.assertEqual(payload["code"], "lifecycle_fenced_resume_stale")
-        self.assertEqual(
-            payload["classification"],
-            "lifecycle_fenced_resume_identity_changed",
-        )
-        self.assertIs(payload["mutation_performed"], False)
-        self.assertIs(payload["prior_operation_effects_possible"], True)
-        self.assertIn("Do not create a replacement plan", payload["action_required"])
-        self.assertIn("exact confirmed operation", payload["action_required"])
-        self.assertEqual(self.adapter.effects, [])
 
     def test_standalone_retire_still_rejects_caller_immutable_identity_drift(
         self,
@@ -1025,43 +836,6 @@ class LifecycleApplyObservationTests(unittest.TestCase):
                 self.assertIs(payload["prior_operation_effects_possible"], True)
                 self.assertIn("Do not create a replacement plan", payload["action_required"])
 
-    def test_fenced_resume_authority_resolution_failure_keeps_exact_plan_context(
-        self,
-    ) -> None:
-        import dev_coordinator
-
-        plan, sample, _requested = self._plan_standalone()
-        interrupted = self._handle(
-            self._resource_retire_args(plan),
-            observe_before_apply=self._callback(sample),
-        )
-        self.assertEqual(interrupted["status"], "needs_attention")
-        with AccountStore.open_default(self.home) as store:
-            with store.immediate_transaction() as connection:
-                connection.execute(
-                    """
-                    UPDATE control_bindings
-                    SET authority_state = 'candidate', updated_at = ?
-                    WHERE binding_id = ?
-                    """,
-                    (utc_timestamp(), plan["targets"][0]["control_binding_id"]),
-                )
-
-        with self.assertRaises(FencedRetirementResumeError) as raised:
-            self._handle(
-                self._resource_retire_args(plan),
-                observe_before_apply=lambda *_args: self.fail(
-                    "authority resolution must fail before retry observation"
-                ),
-            )
-
-        payload = dev_coordinator.coordinator_exception_payload(raised.exception)
-        self.assertEqual(payload["code"], "internal_error")
-        self.assertEqual(payload["classification"], "unhealthy_process")
-        self.assertIs(payload["prior_operation_effects_possible"], True)
-        self.assertEqual(payload["recovery_scope"], "exact_confirmed_operation")
-        self.assertIs(payload["replacement_plan_allowed"], False)
-        self.assertIn("exact confirmed operation", payload["action_required"])
 
     def test_fenced_resume_preserves_nonidentity_operational_failure(self) -> None:
         import dev_coordinator
@@ -1099,45 +873,6 @@ class LifecycleApplyObservationTests(unittest.TestCase):
         self.assertIn("Start Docker Desktop", payload["action_required"])
         self.assertIn("Do not create a replacement plan", payload["action_required"])
 
-    def test_standalone_retire_reports_typed_semantic_controller_drift(
-        self,
-    ) -> None:
-        import dev_coordinator
-
-        plan, sample, _requested = self._plan_standalone()
-        observe = self._callback(sample)
-
-        def changed_controller(project: str, agent: str) -> dict[str, object]:
-            result = observe(project, agent)
-            with AccountStore.open_default(self.home) as store:
-                with store.immediate_transaction() as connection:
-                    connection.execute(
-                        """
-                        UPDATE control_bindings
-                        SET capability = 'changed-controller',
-                            generation = generation + 1, updated_at = ?
-                        WHERE binding_id = ?
-                        """,
-                        (utc_timestamp(), plan["targets"][0]["control_binding_id"]),
-                    )
-            return result
-
-        with self.assertRaisesRegex(
-            LifecyclePlanStaleError, "standalone resource changed"
-        ) as raised:
-            self._handle(
-                self._resource_retire_args(plan),
-                observe_before_apply=changed_controller,
-            )
-
-        payload = dev_coordinator.coordinator_exception_payload(raised.exception)
-        self.assertEqual(payload["code"], "lifecycle_plan_stale")
-        self.assertEqual(
-            payload["classification"], "lifecycle_target_identity_changed"
-        )
-        self.assertFalse(payload["mutation_performed"])
-        self.assertIn("newly generated lifecycle plan", payload["action_required"])
-        self.assertEqual(self.adapter.effects, [])
 
     def test_lifecycle_plan_stale_exception_payload_requires_refresh_and_new_plan(
         self,
@@ -1163,32 +898,19 @@ class LifecycleApplyObservationTests(unittest.TestCase):
             canonical_root=str(self.repo_a),
             repo_id="repo-expired",
             generation=1,
-            owner_uid=1000,
             server_ids={},
             container_ids={},
             compose_definition_id=None,
             compose_container_ids=frozenset(),
             compose_run_once_services={},
             ephemeral_templates={},
-            ephemeral_image_prefetch_template_ids=frozenset(),
             ephemeral_secret_policies={},
-            account_id="account-expired",
-            enabled=True,
-            issued_at=utc_timestamp(),
-            valid_until_epoch=1,
         )
         profile = BrokerClientProfile(
             service=BrokerServiceProfile(
                 socket_path=self.root / "broker.sock",
-                service_uid=0,
-                socket_gid=0,
-                socket_mode=0o666,
                 database_generation="generation-expired",
             ),
-            client_uid=0,
-            account_id="account-expired",
-            issued_at=utc_timestamp(),
-            valid_until_epoch=0,
             repositories={str(self.repo_a): repository},
         )
         args = _parser().parse_args(["repository", "list-removed"])

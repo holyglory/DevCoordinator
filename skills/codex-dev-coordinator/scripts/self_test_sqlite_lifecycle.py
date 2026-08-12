@@ -79,7 +79,7 @@ class ExactStateAdapter:
             True,
             target.immutable_fingerprint,
             True,
-            target.ownership_fingerprint,
+            target.observation_fingerprint,
             RunningState.RUNNING if running else RunningState.STOPPED,
             container_running=running if target.kind is ResourceKind.CONTAINER else None,
             supervisor_active=running if target.kind is ResourceKind.SUPERVISOR else None,
@@ -151,7 +151,7 @@ class CompositeSupervisorStateAdapter:
             True,
             target.immutable_fingerprint,
             True,
-            target.ownership_fingerprint,
+            target.observation_fingerprint,
             RunningState.RUNNING if self.running else RunningState.STOPPED,
             supervisor_active=self.running,
             policies={policy.policy_id: policy_observation},
@@ -1252,7 +1252,7 @@ def test_exact_unassigned_attach_and_retire() -> None:
             retire_ref = persistence.resolve_standalone_resource(
                 ResourceKind.CONTAINER, "docker-retire", "binding-retire"
             )
-            expect(bool(attach_ref.ownership_fingerprint), "ownership fingerprint missing")
+            expect(bool(attach_ref.observation_fingerprint), "ownership fingerprint missing")
             projected_attach = next(
                 item
                 for item in store.inventory_v2()["unassigned_resources"]
@@ -1263,7 +1263,7 @@ def test_exact_unassigned_attach_and_retire() -> None:
                 "Board projection immutable fingerprint does not match lifecycle authority",
             )
             expect(
-                projected_attach["ownership_fingerprint"] == attach_ref.ownership_fingerprint,
+                projected_attach["observation_fingerprint"] == attach_ref.observation_fingerprint,
                 "Board projection ownership fingerprint does not match lifecycle authority",
             )
             adapter = ExactStateAdapter()

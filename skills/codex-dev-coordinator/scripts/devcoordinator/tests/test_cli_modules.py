@@ -14,7 +14,7 @@ from unittest import mock
 import dev_coordinator
 
 import devcoordinator.broker_cli as broker_cli_module
-from devcoordinator import broker_enrollment
+from devcoordinator import broker_configuration
 from devcoordinator.broker import BrokerError, BrokerOperation, UnixBrokerServer
 from devcoordinator.broker_cli import add_broker_parser, handle_broker_cli, serve_broker
 from devcoordinator.lifecycle_cli import add_lifecycle_parsers
@@ -716,7 +716,7 @@ class LifecycleParserContractTests(unittest.TestCase):
         self.assertEqual(compose["profiles"], ["capture", "display"])
         self.assertEqual(compose["services"], ["collector", "api"])
 
-    def test_runtime_compose_project_name_reaches_broker_enrollment(self) -> None:
+    def test_runtime_compose_project_name_reaches_broker_configuration(self) -> None:
         with tempfile.TemporaryDirectory(
             prefix=".compose-project-name-", dir=str(Path.home().resolve())
         ) as raw_root:
@@ -750,7 +750,7 @@ class LifecycleParserContractTests(unittest.TestCase):
             "existing_stack",
         )
 
-    def test_broker_enrollment_materializes_legacy_cmd_into_fixed_worker_argv(
+    def test_broker_configuration_materializes_legacy_cmd_into_fixed_worker_argv(
         self,
     ) -> None:
         args = argparse.Namespace(
@@ -759,19 +759,13 @@ class LifecycleParserContractTests(unittest.TestCase):
             profile_output="/tmp/profile.json",
             runtime_file=None,
             access_group=None,
-            access_gid=100,
             all_servers=True,
             server=[],
             database="/tmp/coordinator.sqlite3",
             socket="/tmp/broker.sock",
-            client_uid=501,
-            repository_owner_uid=501,
-            account_id="account-test",
-            grant_ephemeral_image_prefetch=False,
+            execution_uid=501,
             approve_compose_host_access=False,
             explicit_reinstall=False,
-            grant_cleanup=False,
-            profile_valid_days=30,
             agent="test-agent",
         )
         server = {
@@ -785,7 +779,7 @@ class LifecycleParserContractTests(unittest.TestCase):
             "health_url": "http://127.0.0.1:{port}/dashboard",
             "env": {},
         }
-        enrolled = mock.Mock(return_value={})
+        configured = mock.Mock(return_value={})
         with (
             mock.patch.object(dev_coordinator, "canonical_project", return_value="/repository"),
             mock.patch.object(dev_coordinator, "parse_range", return_value=(3000, 3010)),
@@ -799,12 +793,12 @@ class LifecycleParserContractTests(unittest.TestCase):
                 "exclusive_broker_service_lock",
                 return_value=mock.MagicMock(),
             ),
-            mock.patch.object(dev_coordinator, "enroll_repository", enrolled),
+            mock.patch.object(dev_coordinator, "configure_repository", configured),
         ):
-            dev_coordinator.coordinated_broker_enroll(args)
+            dev_coordinator.coordinated_broker_configure(args)
 
         self.assertEqual(
-            enrolled.call_args.kwargs["servers"],
+            configured.call_args.kwargs["servers"],
             [
                 {
                     **server,
@@ -822,9 +816,9 @@ class LifecycleParserContractTests(unittest.TestCase):
             ],
         )
 
-    def test_broker_enrollment_rejects_unresolved_port_placeholder(self) -> None:
+    def test_broker_configuration_rejects_unresolved_port_placeholder(self) -> None:
         with self.assertRaisesRegex(ValueError, "web.*no declared port"):
-            dev_coordinator.materialize_enrolled_servers(
+            dev_coordinator.materialize_configured_servers(
                 [
                     {
                         "name": "web",
@@ -854,54 +848,11 @@ class LifecycleParserContractTests(unittest.TestCase):
                 "/repository",
             )
 
-    def test_enrollment_preserves_env_profiles_and_grants_each_typed_compose_action(
+    def test_configuration_rejects_symlinked_compose_inputs_before_canonicalization(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory(
-            prefix=".compose-enrollment-fields-", dir=str(Path.home().resolve())
-        ) as raw_root:
-            root = Path(raw_root).resolve()
-            compose_file = root / "compose.yml"
-            compose_file.write_text("services: {}\n", encoding="utf-8")
-            env_file = root / "runtime.env"
-            env_file.write_text("PRIVATE=value\n", encoding="utf-8")
-            env_file.chmod(0o600)
-            persistence = mock.Mock()
-
-            compose_id = broker_enrollment._provision_compose(
-                persistence,
-                repo_id="repo-alpha",
-                client_uid=501,
-                root=root,
-                compose={
-                    "declared": True,
-                    "files": [str(compose_file)],
-                    "env_files": [str(env_file)],
-                    "profiles": ["capture", "display"],
-                    "services": ["collector", "api"],
-                    "project_name": "alpha-stack",
-                },
-                observation_snapshot_id="snapshot-alpha",
-            )
-
-        self.assertIsNotNone(compose_id)
-        provisioned = persistence.provision_compose_definition.call_args.kwargs
-        self.assertEqual(provisioned["env_files"], (str(env_file),))
-        self.assertEqual(provisioned["profiles"], ("capture", "display"))
-        self.assertEqual(provisioned["services"], ("collector", "api"))
-        self.assertEqual(provisioned["observation_snapshot_id"], "snapshot-alpha")
-        persistence.replace_compose_access.assert_called_once_with(
-            uid=501,
-            repo_id="repo-alpha",
-            compose_definition_id=compose_id,
-        )
-        persistence.grant_resource.assert_not_called()
-
-    def test_enrollment_rejects_symlinked_compose_inputs_before_canonicalization(
-        self,
-    ) -> None:
-        with tempfile.TemporaryDirectory(
-            prefix=".compose-enrollment-symlink-", dir=str(Path.home().resolve())
+            prefix=".compose-configuration-symlink-", dir=str(Path.home().resolve())
         ) as raw_root:
             root = Path(raw_root).resolve()
             real_compose = root / "compose.yml"
@@ -913,10 +864,9 @@ class LifecycleParserContractTests(unittest.TestCase):
             env_file.chmod(0o600)
 
             with self.assertRaisesRegex(ValueError, "symbolic-link"):
-                broker_enrollment._provision_compose(
+                broker_configuration._provision_compose(
                     mock.Mock(),
                     repo_id="repo-alpha",
-                    client_uid=501,
                     root=root,
                     compose={
                         "declared": True,
@@ -926,9 +876,9 @@ class LifecycleParserContractTests(unittest.TestCase):
                     },
                 )
 
-    def test_enrollment_never_falls_back_to_an_older_available_snapshot(self) -> None:
+    def test_configuration_never_falls_back_to_an_older_available_snapshot(self) -> None:
         with tempfile.TemporaryDirectory(
-            prefix=".compose-enrollment-observation-", dir=str(Path.home().resolve())
+            prefix=".compose-configuration-observation-", dir=str(Path.home().resolve())
         ) as raw_root:
             database = Path(raw_root) / "coordinator.sqlite3"
             now = utc_timestamp()
@@ -972,7 +922,7 @@ class LifecycleParserContractTests(unittest.TestCase):
                         (now,),
                     )
                 unavailable_fence = (
-                    broker_enrollment.capture_observation_freshness_fence(
+                    broker_configuration.capture_observation_freshness_fence(
                         store,
                         host_id="host-alpha",
                     )
@@ -1003,7 +953,7 @@ class LifecycleParserContractTests(unittest.TestCase):
                         (now,),
                     )
                 with self.assertRaisesRegex(RuntimeError, "exact fresh"):
-                    broker_enrollment._require_exact_enrollment_observation(
+                    broker_configuration._require_exact_configuration_observation(
                         store,
                         evidence={
                             "snapshot_id": "fresh-unavailable",
@@ -1016,7 +966,7 @@ class LifecycleParserContractTests(unittest.TestCase):
                         fence=unavailable_fence,
                     )
 
-                available_fence = broker_enrollment.capture_observation_freshness_fence(
+                available_fence = broker_configuration.capture_observation_freshness_fence(
                     store,
                     host_id="host-alpha",
                 )
@@ -1045,7 +995,7 @@ class LifecycleParserContractTests(unittest.TestCase):
                         """,
                         (now,),
                     )
-                accepted = broker_enrollment._require_exact_enrollment_observation(
+                accepted = broker_configuration._require_exact_configuration_observation(
                     store,
                     evidence={
                         "snapshot_id": "fresh-available",
@@ -1059,11 +1009,11 @@ class LifecycleParserContractTests(unittest.TestCase):
                 )
         self.assertEqual(accepted, "fresh-available")
 
-    def test_enrollment_waits_out_joined_ticket_then_requires_new_snapshot(
+    def test_configuration_waits_out_joined_ticket_then_requires_new_snapshot(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory(
-            prefix=".compose-enrollment-joined-ticket-",
+            prefix=".compose-configuration-joined-ticket-",
             dir=str(Path.home().resolve()),
         ) as raw_root:
             database = Path(raw_root) / "coordinator.sqlite3"
@@ -1154,7 +1104,7 @@ class LifecycleParserContractTests(unittest.TestCase):
                         "completed_at": now,
                     }
 
-                accepted = broker_enrollment._capture_new_enrollment_observation(
+                accepted = broker_configuration._capture_new_configuration_observation(
                     store,
                     host_id="host-alpha",
                     observe_host=observe,
@@ -1163,7 +1113,7 @@ class LifecycleParserContractTests(unittest.TestCase):
         self.assertEqual(accepted, "new-ticket")
         self.assertEqual(calls, ["joined-ticket", "new-ticket"])
 
-    def test_compose_enrollment_retries_an_incomplete_local_asset_scan(self) -> None:
+    def test_compose_configuration_retries_an_incomplete_local_asset_scan(self) -> None:
         store = mock.Mock()
         connection = mock.Mock()
         scopes = iter(({"assets_complete": 0}, {"assets_complete": 1}))
@@ -1186,17 +1136,17 @@ class LifecycleParserContractTests(unittest.TestCase):
 
         with (
             mock.patch.object(
-                broker_enrollment,
+                broker_configuration,
                 "capture_observation_freshness_fence",
                 return_value=mock.Mock(joinable_snapshot_ids=frozenset()),
             ),
             mock.patch.object(
-                broker_enrollment,
-                "_require_exact_enrollment_observation",
+                broker_configuration,
+                "_require_exact_configuration_observation",
                 side_effect=lambda _store, *, evidence, fence: evidence["snapshot_id"],
             ),
         ):
-            accepted = broker_enrollment._capture_new_enrollment_observation(
+            accepted = broker_configuration._capture_new_configuration_observation(
                 store,
                 host_id="host-alpha",
                 observe_host=observe,
@@ -1206,11 +1156,11 @@ class LifecycleParserContractTests(unittest.TestCase):
         self.assertEqual(accepted, "snapshot-2")
         self.assertEqual(observed, ["snapshot-1", "snapshot-2"])
 
-    def test_enrollment_rejects_old_ticket_after_unrelated_revision_advance(
+    def test_configuration_rejects_old_ticket_after_unrelated_revision_advance(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory(
-            prefix=".compose-enrollment-stale-ticket-",
+            prefix=".compose-configuration-stale-ticket-",
             dir=str(Path.home().resolve()),
         ) as raw_root:
             database = Path(raw_root) / "coordinator.sqlite3"
@@ -1251,7 +1201,7 @@ class LifecycleParserContractTests(unittest.TestCase):
                         """,
                         (now,),
                     )
-                fence = broker_enrollment.capture_observation_freshness_fence(
+                fence = broker_configuration.capture_observation_freshness_fence(
                     store,
                     host_id="host-alpha",
                 )
@@ -1280,7 +1230,7 @@ class LifecycleParserContractTests(unittest.TestCase):
                         (now,),
                     )
                 with self.assertRaisesRegex(RuntimeError, "exact fresh"):
-                    broker_enrollment._require_exact_enrollment_observation(
+                    broker_configuration._require_exact_configuration_observation(
                         store,
                         evidence={
                             "snapshot_id": "old-ticket",
@@ -1356,9 +1306,7 @@ class LifecycleParserContractTests(unittest.TestCase):
                 "resource-id",
                 "--immutable-fingerprint",
                 "sha256:immutable",
-                "--control-binding-id",
-                "binding-id",
-                "--ownership-fingerprint",
+                "--observation-fingerprint",
                 "sha256:owner",
                 "--request-project",
                 "/repo",
@@ -1433,7 +1381,7 @@ class LifecycleParserContractTests(unittest.TestCase):
         )
         self.assertTrue(restored.explicit)
 
-    def test_board_resource_commands_require_every_exact_identity_field(self) -> None:
+    def test_resource_commands_require_every_exact_identity_field(self) -> None:
         identity = [
             "--resource-kind",
             "container",
@@ -1441,9 +1389,7 @@ class LifecycleParserContractTests(unittest.TestCase):
             "docker-id",
             "--immutable-fingerprint",
             "sha256:immutable",
-            "--control-binding-id",
-            "binding-id",
-            "--ownership-fingerprint",
+            "--observation-fingerprint",
             "sha256:owner",
         ]
         value = parser()
@@ -1460,7 +1406,7 @@ class LifecycleParserContractTests(unittest.TestCase):
                 "attach",
             ]
         )
-        self.assertEqual(attached.control_binding_id, "binding-id")
+        self.assertEqual(attached.resource_id, "docker-id")
         planned = value.parse_args(
             [
                 "resource",
@@ -1489,124 +1435,6 @@ class LifecycleParserContractTests(unittest.TestCase):
                     "retire",
                 ]
             )
-
-    def test_public_enrollment_accepts_compose_only_repository(self) -> None:
-        args = dev_coordinator.build_parser().parse_args(
-            [
-                "broker",
-                "enroll",
-                "--database",
-                "/service/coordinator.sqlite3",
-                "--socket",
-                "/run/devcoordinator-authority.sock",
-                "--access-gid",
-                "62000",
-                "--client-uid",
-                "501",
-                "--repository-owner-uid",
-                "501",
-                "--account-id",
-                "account-a",
-                "--project",
-                "/repo",
-                "--agent",
-                "codex-test",
-                "--profile-output",
-                "/etc/devcoordinator/profile.json",
-            ]
-        )
-        compose = {
-            "declared": True,
-            "cwd": "/repo",
-            "files": ["/repo/compose.yaml"],
-            "env_files": ["/repo/runtime.env"],
-            "profiles": ["capture"],
-            "services": ["app"],
-        }
-        with (
-            mock.patch.object(
-                dev_coordinator, "canonical_project", return_value="/repo"
-            ),
-            mock.patch.object(
-                dev_coordinator,
-                "build_project_runtime_spec",
-                return_value={
-                    "servers": [],
-                    "compose": compose,
-                    "runtime_file": "/repo/.codex/dev-runtime.json",
-                },
-            ),
-            mock.patch.object(
-                dev_coordinator,
-                "enroll_repository",
-                return_value={"status": "enrolled", "starts_resources": False},
-            ) as enroll,
-            mock.patch.object(
-                dev_coordinator,
-                "exclusive_broker_service_lock",
-                return_value=mock.MagicMock(),
-            ) as service_lock,
-        ):
-            result = dev_coordinator.handle_cli(args)
-
-        self.assertEqual(result["status"], "enrolled")
-        self.assertFalse(result["starts_resources"])
-        self.assertIs(result["ok"], True)
-        call = enroll.call_args.kwargs
-        self.assertEqual(call["servers"], [])
-        self.assertEqual(call["allowed_server_names"], ())
-        self.assertEqual(call["compose"], compose)
-        self.assertFalse(call["approve_compose_host_access"])
-        self.assertIs(
-            call["observe_host"],
-            dev_coordinator.observe_broker_service_store_for_enrollment,
-        )
-        service_lock.assert_called_once_with(Path("/service/coordinator.sqlite3"))
-
-    def test_public_enrollment_refuses_a_live_broker_lifetime_lock(self) -> None:
-        args = dev_coordinator.build_parser().parse_args(
-            [
-                "broker",
-                "enroll",
-                "--database",
-                "/service/coordinator.sqlite3",
-                "--socket",
-                "/run/devcoordinator-authority.sock",
-                "--access-gid",
-                "62000",
-                "--client-uid",
-                "501",
-                "--repository-owner-uid",
-                "501",
-                "--account-id",
-                "account-a",
-                "--project",
-                "/repo",
-                "--agent",
-                "codex-test",
-                "--profile-output",
-                "/etc/devcoordinator/profile.json",
-            ]
-        )
-        with (
-            mock.patch.object(
-                dev_coordinator, "canonical_project", return_value="/repo"
-            ),
-            mock.patch.object(
-                dev_coordinator,
-                "build_project_runtime_spec",
-                return_value={"servers": [], "compose": None},
-            ),
-            mock.patch.object(
-                dev_coordinator,
-                "exclusive_broker_service_lock",
-                side_effect=RuntimeError("broker service already holds lifetime lock"),
-            ),
-            mock.patch.object(dev_coordinator, "enroll_repository") as enroll,
-            self.assertRaisesRegex(RuntimeError, "lifetime lock"),
-        ):
-            dev_coordinator.handle_cli(args)
-        enroll.assert_not_called()
 
     def test_compose_project_name_release_parser_is_exact(self) -> None:
         args = dev_coordinator.build_parser().parse_args(
@@ -1667,7 +1495,7 @@ class LifecycleParserContractTests(unittest.TestCase):
             ),
             mock.patch.object(
                 dev_coordinator,
-                "observe_broker_service_store_for_enrollment",
+                "observe_broker_service_store_for_configuration",
                 return_value={**fresh, "joined": False},
             ),
             mock.patch.object(
@@ -1729,7 +1557,7 @@ class LifecycleParserContractTests(unittest.TestCase):
             ),
             mock.patch.object(
                 dev_coordinator,
-                "observe_broker_service_store_for_enrollment",
+                "observe_broker_service_store_for_configuration",
                 return_value={"snapshot_id": "old", "joined": False},
             ),
             mock.patch.object(
@@ -1874,7 +1702,7 @@ class LifecycleParserContractTests(unittest.TestCase):
                     "service": "postgres",
                     "container": "globalnewstracker-postgres",
                     "ports": [{"host": "127.0.0.1", "port": 54330}],
-                    "mutation_authorized": True,
+                    "lifecycle_managed": True,
                 }
             ],
             "servers": [],
@@ -1912,25 +1740,19 @@ class LifecycleParserContractTests(unittest.TestCase):
         self.assertEqual(result["actions"], [])
         self.assertEqual(result["action_errors"], [])
 
-    def test_system_project_restart_uses_only_enrolled_broker_resources(self) -> None:
+    def test_system_project_restart_uses_only_configured_broker_resources(self) -> None:
         repository_root = str(Path("/").joinpath("home", "private", "repository"))
         repository = dev_coordinator.BrokerRepositoryProfile(
             canonical_root=repository_root,
             repo_id="repo-a",
             generation=3,
-            owner_uid=1000,
             server_ids={"worker": "server-a"},
             container_ids={"database": "container-a"},
             compose_definition_id="compose-a",
             compose_container_ids=frozenset({"container-a"}),
             compose_run_once_services={},
             ephemeral_templates={},
-            ephemeral_image_prefetch_template_ids=frozenset(),
             ephemeral_secret_policies={},
-            account_id="account-a",
-            enabled=True,
-            issued_at="2026-08-03T00:00:00Z",
-            valid_until_epoch=4_102_444_800,
         )
         profile = mock.Mock()
         profile.repository.return_value = repository
@@ -1952,15 +1774,10 @@ class LifecycleParserContractTests(unittest.TestCase):
                         "role": "worker",
                     }
                 ],
-                "docker": [{"docker_resource_id": "container-a"}],
+                "docker": [
+                    {"docker_resource_id": "container-a", "repo_id": "repo-a"}
+                ],
             },
-            "memberships": [
-                {
-                    "repo_id": "repo-a",
-                    "resource_kind": "container",
-                    "host_resource_id": "container-a",
-                }
-            ],
             "observations": {
                 "servers": [
                     {"server_definition_id": "server-a", "lifecycle": "running"}
@@ -2080,7 +1897,7 @@ class LifecycleParserContractTests(unittest.TestCase):
                 )
             )
 
-        load.assert_called_once_with(expected_uid=0)
+        load.assert_called_once_with()
         self.assertEqual(payload["classification"], "maintenance")
         self.assertEqual(payload["code"], "maintenance_in_progress")
         self.assertEqual(payload["retry_after_seconds"], 45)
@@ -2100,7 +1917,7 @@ class LifecycleParserContractTests(unittest.TestCase):
                 )
             )
 
-        load.assert_called_once_with(expected_uid=0)
+        load.assert_called_once_with()
         self.assertEqual(payload["classification"], "maintenance")
         self.assertEqual(payload["code"], "maintenance_state_invalid")
         self.assertEqual(payload["retry_after_seconds"], 60)
@@ -2119,7 +1936,7 @@ class LifecycleParserContractTests(unittest.TestCase):
                 )
             )
 
-        load.assert_called_once_with(expected_uid=0)
+        load.assert_called_once_with()
         self.assertEqual(payload["classification"], "broker_configuration_required")
         self.assertEqual(payload["code"], "broker_profile_invalid")
         self.assertNotIn("maintenance_state_invalid", json.dumps(payload))
@@ -2239,7 +2056,12 @@ class BrokerCLIContractTests(unittest.TestCase):
         ):
             dev_coordinator._require_live_image_publication_maintenance_boundary()
         run.assert_called_once_with(
-            ["systemctl", "is-active", "--quiet", "dev-coordinator.service"],
+            [
+                "systemctl",
+                "is-active",
+                "--quiet",
+                "devcoordinator-authority.service",
+            ],
             check=False,
             stdin=dev_coordinator.subprocess.DEVNULL,
             stdout=dev_coordinator.subprocess.DEVNULL,
@@ -2263,9 +2085,16 @@ class BrokerCLIContractTests(unittest.TestCase):
                 dev_coordinator.subprocess,
                 "run",
                 return_value=mock.Mock(returncode=0),
-            ),
+            ) as run,
         ):
             dev_coordinator._require_live_image_publication_maintenance_boundary()
+        self.assertEqual(
+            [call.args[0][-1] for call in run.call_args_list],
+            [
+                "devcoordinator-authority.service",
+                "devcoordinator-api.service",
+            ],
+        )
 
     def test_sigterm_fences_mutations_before_serve_loop_poll(self) -> None:
         events: list[str] = []
@@ -2333,7 +2162,6 @@ class BrokerCLIContractTests(unittest.TestCase):
         self.addCleanup(temporary.cleanup)
         args = argparse.Namespace(
             access_group=None,
-            access_gid=os.getegid(),
             database=str(Path(temporary.name) / "coordinator.sqlite3"),
             socket="/run/devcoordinator-authority.sock",
             max_clients=4,
@@ -2446,7 +2274,6 @@ class BrokerCLIContractTests(unittest.TestCase):
         self.addCleanup(temporary.cleanup)
         args = argparse.Namespace(
             access_group=None,
-            access_gid=os.getegid(),
             database=str(Path(temporary.name) / "coordinator.sqlite3"),
             socket="/run/devcoordinator-authority.sock",
             max_clients=4,
@@ -2566,7 +2393,6 @@ class BrokerCLIContractTests(unittest.TestCase):
 
             args = argparse.Namespace(
                 access_group=None,
-                access_gid=os.getegid(),
                 database=str(root / "coordinator.sqlite3"),
                 socket=str(socket_path),
                 max_clients=4,
@@ -2659,7 +2485,6 @@ class BrokerCLIContractTests(unittest.TestCase):
 
                 args = argparse.Namespace(
                     access_group=None,
-                    access_gid=os.getegid(),
                     database=str(root / "coordinator.sqlite3"),
                     socket=str(path),
                     max_clients=4,
@@ -2813,7 +2638,7 @@ class BrokerCLIContractTests(unittest.TestCase):
             ),
             mock.patch.object(
                 dev_coordinator,
-                "observe_broker_service_store_for_enrollment",
+                "observe_broker_service_store_for_configuration",
                 return_value={"snapshot_id": "new-snapshot", "joined": False},
             ),
             mock.patch.object(
@@ -2989,7 +2814,7 @@ class BrokerCLIContractTests(unittest.TestCase):
             ),
             mock.patch.object(
                 dev_coordinator,
-                "observe_broker_service_store_for_enrollment",
+                "observe_broker_service_store_for_configuration",
                 side_effect=AssertionError("plan must not observe Docker"),
             ),
         ):
@@ -3051,7 +2876,7 @@ class BrokerCLIContractTests(unittest.TestCase):
             ) as capture_fence,
             mock.patch.object(
                 dev_coordinator,
-                "observe_broker_service_store_for_enrollment",
+                "observe_broker_service_store_for_configuration",
                 return_value=observed,
             ) as observe,
             mock.patch.object(
@@ -3128,8 +2953,6 @@ class BrokerCLIContractTests(unittest.TestCase):
                 "call",
                 "--socket",
                 "/run/devcoordinator-authority.sock",
-                "--account-id",
-                "account-a",
                 "--database-generation",
                 "generation-a",
                 "--project-id",
@@ -3174,7 +2997,7 @@ class BrokerCLIContractTests(unittest.TestCase):
             {"requested_port": 3200, "protocol": "tcp", "ttl_seconds": 60},
         )
         self.assertEqual(result["result"]["lease_id"], "lease-id")
-        self.assertIsNone(client_options[0]["expected_broker_uid"])
+        self.assertEqual(client_options[0], {"timeout_seconds": 10.0})
         with self.assertRaises(SystemExit):
             value.parse_args(
                 [
@@ -3182,10 +3005,6 @@ class BrokerCLIContractTests(unittest.TestCase):
                     "call",
                     "--socket",
                     "/run/devcoordinator-authority.sock",
-                    "--expected-broker-uid",
-                    "123",
-                    "--account-id",
-                    "account-a",
                     "--database-generation",
                     "generation-a",
                     "--project-id",
@@ -3206,10 +3025,6 @@ class BrokerCLIContractTests(unittest.TestCase):
             "call",
             "--socket",
             "/run/devcoordinator-authority.sock",
-            "--expected-broker-uid",
-            "123",
-            "--account-id",
-            "account-a",
             "--database-generation",
             "generation-a",
             "--project-id",
@@ -3256,10 +3071,6 @@ class BrokerCLIContractTests(unittest.TestCase):
                 "call",
                 "--socket",
                 "/run/devcoordinator-authority.sock",
-                "--expected-broker-uid",
-                "123",
-                "--account-id",
-                "account-a",
                 "--database-generation",
                 "generation-a",
                 "--project-id",
@@ -3292,75 +3103,6 @@ class BrokerCLIContractTests(unittest.TestCase):
         docker.requested_port = 3200
         with self.assertRaisesRegex(ValueError, "do not accept port"):
             handle_broker_cli(docker)
-
-    def test_admin_provisioning_names_the_service_owned_database_precondition(
-        self,
-    ) -> None:
-        value = parser()
-        with tempfile.TemporaryDirectory() as raw:
-            database = str(Path(raw) / "coordinator.sqlite3")
-            args = value.parse_args(
-                [
-                    "broker",
-                    "grant-resource",
-                    "--database",
-                    database,
-                    "--uid",
-                    "501",
-                    "--repo-id",
-                    "repo-id",
-                    "--resource-kind",
-                    "container",
-                    "--resource-id",
-                    "container-id",
-                    "--operation",
-                    "docker.stop",
-                ]
-            )
-            persistence = mock.Mock()
-            with mock.patch(
-                "devcoordinator.broker_cli.BrokerPersistence", return_value=persistence
-            ):
-                result = handle_broker_cli(args)
-            persistence.grant_resource.assert_called_once()
-            self.assertEqual(result["repo_id"], "repo-id")
-
-    def test_admin_runtime_grant_is_exact_and_typed(self) -> None:
-        value = parser()
-        with tempfile.TemporaryDirectory() as raw:
-            database = str(Path(raw) / "coordinator.sqlite3")
-            args = value.parse_args(
-                [
-                    "broker",
-                    "grant-runtime",
-                    "--database",
-                    database,
-                    "--uid",
-                    "501",
-                    "--repo-id",
-                    "repo-id",
-                    "--resource-kind",
-                    "service",
-                    "--resource-id",
-                    "service-id",
-                    "--runtime-action",
-                    "restart",
-                ]
-            )
-            persistence = mock.Mock()
-            with mock.patch(
-                "devcoordinator.broker_cli.BrokerPersistence", return_value=persistence
-            ):
-                result = handle_broker_cli(args)
-            persistence.grant_runtime.assert_called_once_with(
-                uid=501,
-                repo_id="repo-id",
-                resource_kind="service",
-                resource_id="service-id",
-                action="restart",
-                enabled=True,
-            )
-            self.assertEqual(result["runtime_action"], "restart")
 
     def test_store_artifact_admin_commands_cover_account_and_service_roles(
         self,

@@ -119,7 +119,24 @@ Lease expiry, missed heartbeat, crash, timeout, cancellation, incomplete
 reporting, abandonment, test failure, infrastructure failure, and superseded
 live work are distinct outcomes.
 
+The ordinary heartbeat lease remains short so a real testd crash is detected
+promptly. A replacement daemon may cross an expired ordinary lease only for an
+exact still-active attempt reconstructed from its private durable spool. It
+validates the retained generation, lease owner, repository/runtime binding and
+launch identity, grants one bounded recovery lease, then returns to normal
+observation and heartbeat. Missing, contradictory, reaped or terminal
+identities are never reconstructed, and recovery never creates a second launch.
+
 ## Source modes and reuse
+
+Agent-local tests are a narrow feedback path, not an alternate suite runner.
+One direct invocation is eligible only when its selector is proven before
+launch to collect at most 20 cases, its runner enforces at most 10 seconds of
+execution, it needs no host-visible or shared state, and it is not one fragment
+of a suite split across repeated local commands. Unknown or larger scope and
+durable evidence use one governed plan and asynchronous run. The same limit
+applies to advisory tests after a reported harness failure; static checks remain
+local and outside the test-case limit.
 
 `change` and `checkpoint` runs are advisory live-worktree runs. They do not
 lock editing. Selection is recomputed immediately before launch; a source
@@ -171,9 +188,11 @@ timeout, post-launch heartbeat loss, or other infrastructure outcome is retried
 by this policy. Schema 3 is the only accepted manifest schema; every earlier or
 unknown schema is rejected rather than normalized or upgraded during planning.
 
-Network defaults to none. Private loopback, host loopback, and external access
-are separate protected capabilities. `host-loopback` is admitted only for an
-exact manual-only target with no fixtures; named operational credentials remain
+Network defaults to none. Private `loopback` is ordinary isolated test
+reachability on this confirmed single-developer host and needs no separate
+repository-generation grant. Host loopback and external access remain separate
+protected capabilities. `host-loopback` is admitted only for an exact
+manual-only target with no fixtures; named operational credentials remain
 optional. Its generation-bound `network.host-loopback` grant runs in the host
 network namespace without `PrivateNetwork` or `NetworkNamespacePath`, while
 systemd `IPAddressDeny=any`, `IPAddressAllow=localhost`, and

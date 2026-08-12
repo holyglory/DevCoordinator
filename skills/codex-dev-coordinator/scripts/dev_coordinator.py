@@ -74,10 +74,10 @@ from devcoordinator.call_journal import (
     diagnostic_for_exception,
     event_record,
 )
-from devcoordinator.broker_enrollment import (
+from devcoordinator.broker_configuration import (
     _normalize_ephemeral_templates,
-    enroll_repository,
-    reconcile_enrolled_runtime_container_declarations,
+    configure_repository,
+    reconcile_configured_runtime_container_declarations,
 )
 from devcoordinator.compose_run_once import (
     DEFAULT_COMPOSE_RUN_ONCE_TIMEOUT_SECONDS,
@@ -91,6 +91,11 @@ from devcoordinator.image_publication import (
     publication_status,
     rollback_publication,
 )
+from devcoordinator.systemd_commissioning import (
+    DESIRED_STATES as SYSTEMD_COMMISSIONING_STATES,
+    apply_commissioning as apply_systemd_commissioning,
+    plan_commissioning as plan_systemd_commissioning,
+)
 from devcoordinator.maintenance import (
     MAX_RETRY_AFTER_SECONDS,
     MaintenanceMarkerError,
@@ -98,6 +103,7 @@ from devcoordinator.maintenance import (
     load_maintenance_state,
 )
 from devcoordinator.inventory_projection import read_projection
+from devcoordinator.agent_projection import AgentProjectionError, project_targets
 from devcoordinator.broker_persistence import BrokerPersistence
 from devcoordinator.broker_links import BrokerLink, BrokerLinkStore
 from devcoordinator.broker_profile import (
@@ -138,7 +144,6 @@ from devcoordinator.repository_lifecycle import (
     StandaloneRetirementPlan,
 )
 from devcoordinator.sqlite_lifecycle import SQLiteLifecyclePersistence
-from devcoordinator.schema import establish_repository_owner_authority
 from devcoordinator.store import (
     AccountStore,
     deterministic_id,
@@ -218,6 +223,7 @@ from devcoordinator.worker_cleanup import unregister_workers_for_plan
 VERSION = 2
 COORDINATOR_CALL_JOURNAL = configured_call_journal()
 NORMALIZED_SCHEMA_VERSION = 2
+INVENTORY_SCHEMA_VERSION = 3
 NORMALIZED_DATABASE_NAME = "coordinator.sqlite3"
 RUNTIME_REAPER_WAKE = threading.Event()
 RUNTIME_CLEANUP_AGENT = "runtime-session-cleanup"
@@ -467,9 +473,7 @@ def coordinator_exception_payload(exc: BaseException) -> dict[str, Any]:
         # broker- and database-independent, so prefer its typed wait response
         # while (and only while) an exact trusted marker is active.
         try:
-            maintenance = load_maintenance_state(
-                expected_uid=0,
-            )
+            maintenance = load_maintenance_state()
         except (MaintenanceMarkerError, OSError):
             return {
                 "error": (
@@ -2948,29 +2952,6 @@ def resolve_or_install_repository_for_action(
             """,
             (repo_id, host_id, str(root), root.name or str(root), timestamp, timestamp),
         )
-        if scope.root_owner_uid <= 0 or scope.root_owner_uid != store.expected_uid:
-            raise RuntimeError(
-                "account-scoped repository registration requires the exact positive store owner UID"
-            )
-        establish_repository_owner_authority(
-            connection,
-            repository_id=repo_id,
-            owner_uid=scope.root_owner_uid,
-            repository_generation=0,
-            operation_id=str(uuid.uuid4()),
-            actor="coordinator-skill",
-            reason="first account-scoped coordinator use",
-            timestamp=timestamp,
-            evidence={
-                "kind": "account-scoped-repository-owner-registration",
-                "repository_id": repo_id,
-                "canonical_root": str(root),
-                "repository_generation": 0,
-                "owner_uid": scope.root_owner_uid,
-                "repository_identity_fingerprint": scope.identity_fingerprint,
-                "git_identity_fingerprint": scope.git_identity_fingerprint,
-            },
-        )
         connection.execute(
             """
             INSERT INTO repository_installations(
@@ -3450,7 +3431,7 @@ def normalized_guarded_action(
         @functools.wraps(function)
         def guarded(options: dict[str, Any], *args: Any, **kwargs: Any) -> Any:
             if command.startswith("project ") and authority_mode() == "system":
-                # Project lifecycle is an orchestration of already-enrolled
+                # Project lifecycle is an orchestration of already-configured
                 # opaque resources. The broker owns its repository fence and
                 # journal; opening a per-UID compatibility store here creates
                 # split authority and prevents the dedicated API account from
@@ -3461,7 +3442,7 @@ def normalized_guarded_action(
                 # The host broker owns both admission and persistence in
                 # server-wide mode.  Opening the compatibility account store
                 # here would recreate split authority before the broker call
-                # and makes a cleanly re-enrolled client depend on stale
+                # and makes a cleanly re-configured client depend on stale
                 # per-UID database state.
                 return function(options, *args, **kwargs)
             if (
@@ -4379,7 +4360,7 @@ def container_project_attribution(
 
     Display grouping (`build_project_usage`) and whole-project actions
     (`build_project_runtime_spec` via `matching_project_containers`) both
-    resolve container membership here, so the group a UI shows a container
+    resolve container association here, so the group a UI shows a container
     under is exactly the group whose project start/stop/restart acts on it.
 
     Explicit attribution (Compose labels or coordinator sidecar metadata)
@@ -4405,7 +4386,7 @@ def container_project_attribution(
         else "unclaimed"
     )
     identity["suggested_project"] = claimants[0] if len(claimants) == 1 else None
-    identity["mutation_authorized"] = False
+    identity["lifecycle_managed"] = False
     identity["read_only_evidence"] = True
     return identity
 
@@ -4492,8 +4473,8 @@ def build_project_usage(
     projects: dict[str, dict[str, Any]] = {}
     pids_by_project: dict[str, set[int]] = {}
     containers = docker.get("containers") or []
-    # Same claim set as matching_project_containers: membership shown here is
-    # exactly the membership whole-project actions act on.
+    # Same claim set as matching_project_containers: association shown here is
+    # exactly the target set whole-project actions act on.
     claimant_paths = known_project_paths(
         state,
         containers,
@@ -4518,7 +4499,7 @@ def build_project_usage(
                 "process_memory_bytes": 0,
                 "docker_cpu_percent": 0.0,
                 "docker_memory_bytes": 0,
-                # Authoritative membership so UIs can group inventory rows by
+                # Exact association so UIs can group inventory rows by
                 # repo without re-implementing the identity heuristics above.
                 "server_ids": [],
                 "container_names": [],
@@ -5482,7 +5463,7 @@ def docker_ps_inventory(
         # Docker can return useful objects on stdout even when one member of a
         # bulk inspect raced away and the overall command exits non-zero. Such
         # partial rows enrich ordinary inventory, but they never satisfy the
-        # exhaustive Compose-enrollment observation boundary.
+        # exhaustive Compose-configuration observation boundary.
         for line in str(inspect_result.get("stdout") or "").splitlines():
             if not line.strip():
                 continue
@@ -5697,7 +5678,7 @@ def docker_ps_inventory(
         }
     compose_assets_result = docker_compose_asset_inventory()
     # Compose assets alone cannot prove a safe Compose scope: a concurrently
-    # failed bulk container inspection leaves container membership and
+    # failed bulk container inspection leaves container association and
     # lifecycle evidence incomplete. Do not publish partial assets for the
     # commit path to mistake for an exhaustive observation.
     compose_assets_complete = (
@@ -6112,7 +6093,7 @@ def normalize_server_definition(raw: dict[str, Any], project: str) -> dict[str, 
     elif isinstance(raw_environment, (list, tuple)):
         # Older checked-in runtime manifests use the process-manager-friendly
         # ["KEY=value", ...] form.  Normalize it once at the manifest boundary;
-        # broker enrollment applies the same bounded string-map contract to the
+        # broker configuration applies the same bounded string-map contract to the
         # result before anything can be launched.
         environment = {}
         for item in raw_environment:
@@ -6166,8 +6147,8 @@ def normalize_docker_dependency(raw: dict[str, Any]) -> dict[str, Any]:
         "ports": ports,
         "health_url": raw.get("health_url"),
         "declared": True,
-        "mutation_authorized": True,
-        "ownership_source": "runtime_declaration",
+        "lifecycle_managed": True,
+        "association_source": "runtime_declaration",
     }
 
 
@@ -6391,7 +6372,7 @@ def matching_project_containers(
     return matches
 
 
-def container_has_authorized_project_provenance(
+def container_has_exact_project_association(
     container: dict[str, Any], project: str
 ) -> bool:
     """Return whether Docker/coordinator evidence—not a name—owns this container."""
@@ -6599,7 +6580,7 @@ def build_project_runtime_spec(
     ):
         name = container.get("name")
         if name and name not in known_containers:
-            authorized = container_has_authorized_project_provenance(
+            associated = container_has_exact_project_association(
                 container, resolved_project
             )
             discovered = {
@@ -6607,18 +6588,18 @@ def build_project_runtime_spec(
                 "name": name,
                 "container": name,
                 "image": container.get("image"),
-                "required": authorized and not declared_compose_runtime,
+                "required": associated and not declared_compose_runtime,
                 "ports": [],
                 "health_url": None,
                 "declared": False,
                 "discovered": True,
-                "mutation_authorized": authorized and not declared_compose_runtime,
-                "ownership_source": container.get("metadata_source")
-                if authorized
+                "lifecycle_managed": associated and not declared_compose_runtime,
+                "association_source": container.get("metadata_source")
+                if associated
                 else "name_heuristic",
-                "read_only_evidence": not authorized or declared_compose_runtime,
+                "read_only_evidence": not associated or declared_compose_runtime,
             }
-            if authorized and not declared_compose_runtime:
+            if associated and not declared_compose_runtime:
                 docker_dependencies.append(discovered)
             else:
                 # A declared Compose definition controls the full service
@@ -6780,8 +6761,8 @@ def docker_dependency_status(
         "recent_logs": logs,
         "declared": dep.get("declared", False),
         "discovered": dep.get("discovered", False),
-        "mutation_authorized": dep.get("mutation_authorized", False),
-        "ownership_source": dep.get("ownership_source"),
+        "lifecycle_managed": dep.get("lifecycle_managed", False),
+        "association_source": dep.get("association_source"),
         "read_only_evidence": dep.get("read_only_evidence", False),
     }
 
@@ -7397,7 +7378,7 @@ def project_runtime_stop(
     before = project_runtime_report(state, spec, action="pre-stop")
     actions: list[dict[str, Any]] = []
     # Like start/restart, stop records sidecar attribution for the containers
-    # it acts on, so display grouping converges to explicit membership after
+    # it acts on, so display grouping converges to explicit association after
     # any whole-project action.
     actions.extend(ensure_runtime_docker_metadata(state, spec, options))
     for server_def in reversed(spec.get("servers", [])):
@@ -8787,7 +8768,7 @@ def coordinated_start_server(options: dict[str, Any]) -> dict[str, Any]:
             or link.server_definition_id != repository.server_id(name)
         ):
             raise BrokerProfileError(
-                "the supplied broker lease belongs to another enrolled server"
+                "the supplied broker lease belongs to another configured server"
             )
         result = _coordinated_start_server_local(options)
         publication = publish_broker_server(
@@ -9972,10 +9953,10 @@ def release_normalized_local_lease_if_active(
     )
 
 
-def _system_broker_server_enrollment(
+def _system_broker_server_route(
     options: Mapping[str, Any],
 ) -> tuple[BrokerClientProfile, BrokerRepositoryProfile, str, str] | None:
-    """Resolve one exact enrolled server before consulting a client journal.
+    """Resolve one exact configured server before consulting a client journal.
 
     Server-wide inventory is intentionally host-wide, while mutation authority
     is repository/server scoped.  A per-UID journal is only reconciliation
@@ -9996,22 +9977,22 @@ def _system_broker_server_enrollment(
     if project_value:
         repository = profile.repository(canonical_project(project_value))
         if name_value:
-            enrolled_id = repository.server_id(name_value)
-            if server_id_value and server_id_value != enrolled_id:
+            configured_id = repository.server_id(name_value)
+            if server_id_value and server_id_value != configured_id:
                 raise BrokerProfileError(
-                    "server stop target does not match the exact enrolled server identity"
+                    "server stop target does not match the exact configured server identity"
                 )
-            return profile, repository, name_value, enrolled_id
+            return profile, repository, name_value, configured_id
         if not server_id_value:
             raise KeyError("server-id or project/name is required")
         matching_names = sorted(
             name
-            for name, enrolled_id in repository.server_ids.items()
-            if enrolled_id == server_id_value
+            for name, configured_id in repository.server_ids.items()
+            if configured_id == server_id_value
         )
         if len(matching_names) != 1:
             raise BrokerProfileError(
-                f"server id {server_id_value!r} is not enrolled for repository "
+                f"server id {server_id_value!r} is not configured for repository "
                 f"{repository.canonical_root}"
             )
         return profile, repository, matching_names[0], server_id_value
@@ -10021,16 +10002,16 @@ def _system_broker_server_enrollment(
     matches = [
         (repository, name)
         for repository in profile.repositories.values()
-        for name, enrolled_id in repository.server_ids.items()
-        if enrolled_id == server_id_value
+        for name, configured_id in repository.server_ids.items()
+        if configured_id == server_id_value
     ]
     if len(matches) != 1:
         raise BrokerProfileError(
-            f"server id {server_id_value!r} is not one exact server enrolled "
+            f"server id {server_id_value!r} is not one exact server configured "
             "for the authenticated account"
         )
-    repository, enrolled_name = matches[0]
-    return profile, repository, enrolled_name, server_id_value
+    repository, configured_name = matches[0]
+    return profile, repository, configured_name, server_id_value
 
 
 def _coordinated_stop_server_normalized(options: dict[str, Any]) -> dict[str, Any]:
@@ -10040,7 +10021,7 @@ def _coordinated_stop_server_normalized(options: dict[str, Any]) -> dict[str, An
         raise ValueError(
             "server stop requires --agent so the coordinator can attribute the action"
         )
-    broker_enrollment = _system_broker_server_enrollment(prepared)
+    broker_configuration = _system_broker_server_route(prepared)
     snapshot = _normalized_server_from_options(prepared)
     project = canonical_project(
         str(prepared.get("project") or snapshot.get("project") or "")
@@ -10057,16 +10038,16 @@ def _coordinated_stop_server_normalized(options: dict[str, Any]) -> dict[str, An
             raise ValueError(
                 "server stop project does not match the registered server project"
             )
-        if broker_enrollment is not None:
-            _profile, repository, enrolled_name, enrolled_id = broker_enrollment
+        if broker_configuration is not None:
+            _profile, repository, configured_name, configured_id = broker_configuration
             if (
                 canonical_project(str(snapshot.get("project") or ""))
                 != repository.canonical_root
-                or str(snapshot.get("name") or "") != enrolled_name
-                or str(snapshot.get("id") or "") != enrolled_id
+                or str(snapshot.get("name") or "") != configured_name
+                or str(snapshot.get("id") or "") != configured_id
             ):
                 raise BrokerProfileError(
-                    "client reconciliation journal does not match the exact enrolled "
+                    "client reconciliation journal does not match the exact configured "
                     "broker server identity"
                 )
         health = server_health(snapshot)
@@ -10192,7 +10173,7 @@ def _coordinated_stop_server_normalized(options: dict[str, Any]) -> dict[str, An
                 "classification": "reconciliation_required",
                 "broker_lease_id": broker_link.broker_resource_id,
                 "server": normalized_public_server(committed),
-                "action_required": "Restore the enrolled broker profile and publish the stopped lifecycle before releasing the lease.",
+                "action_required": "Restore the configured broker profile and publish the stopped lifecycle before releasing the lease.",
             },
         )
     profile, repository = broker_context
@@ -10570,7 +10551,7 @@ def coordinated_status_server(options: dict[str, Any]) -> dict[str, Any]:
         requested_id = options.get("server_id")
         if requested_id is not None and str(requested_id) != server_definition_id:
             raise StructuredCoordinatorError(
-                "server status target does not match the enrolled repository profile",
+                "server status target does not match the configured repository profile",
                 {
                     "code": "broker_runtime_target_mismatch",
                     "classification": "invalid_request",
@@ -10935,7 +10916,7 @@ def coordinated_register_docker_metadata(options: dict[str, Any]) -> dict[str, A
     if configured_broker_context(project) is not None:
         raise BrokerProfileError(
             "Docker registration in broker mode is service-owned: run a full service "
-            "observation and rerun Coordinator skill enrollment; client-side Docker "
+            "observation and rerun Coordinator skill configuration; client-side Docker "
             "inspection and local ownership fallback are disabled"
         )
     container = normalize_container_name(prepared.get("container"))
@@ -11017,21 +10998,18 @@ def coordinated_register_docker_metadata(options: dict[str, Any]) -> dict[str, A
                 ),
             )
             with store.read_transaction() as connection:
-                membership = connection.execute(
+                association = connection.execute(
                     """
                     SELECT r.canonical_root
                     FROM docker_resources d
-                    LEFT JOIN repository_memberships m
-                      ON m.resource_kind = 'container'
-                     AND m.host_resource_id = d.docker_resource_id
-                    LEFT JOIN repositories r USING(repo_id)
+                    LEFT JOIN repositories r ON r.repo_id = d.repo_id
                     WHERE lower(d.full_container_id) = lower(?)
                     """,
                     (immutable_id,),
                 ).fetchone()
             if not skipped and (
-                membership is None
-                or canonical_project(str(membership[0] or "")) != project
+                association is None
+                or canonical_project(str(association[0] or "")) != project
             ):
                 raise RuntimeError(
                     "Docker observation found conflicting repository ownership; "
@@ -11205,7 +11183,7 @@ def coordinated_list_events(
         result = profile.events(after=after, limit=limit)
         authority = {
             "scope": "server-wide",
-            "transport": "authenticated-unix-socket",
+            "transport": "trusted-local-unix-socket",
         }
     else:
         database_path = coordinator_home() / NORMALIZED_DATABASE_NAME
@@ -11498,12 +11476,10 @@ def coordinated_build_registration_inventory(
     for key in (
         "backup_evidence",
         "backups",
-        "control_bindings",
         "database_backups",
         "database_restore_events",
         "docker_engines",
         "events",
-        "memberships",
         "project_usage",
         "recent_events",
         "unassigned_resources",
@@ -11533,7 +11509,7 @@ def empty_normalized_inventory(*, project: str | None = None) -> dict[str, Any]:
         "project_usage": [],
     }
     result = {
-        "schema_version": NORMALIZED_SCHEMA_VERSION,
+        "schema_version": INVENTORY_SCHEMA_VERSION,
         "store": {
             "schema_version": 1,
             "state_revision": 0,
@@ -11544,7 +11520,6 @@ def empty_normalized_inventory(*, project: str | None = None) -> dict[str, Any]:
         "repositories": [],
         "coordinator_sources": [],
         "docker_engines": [],
-        "memberships": [],
         "resources": {
             "servers": [],
             "docker": [],
@@ -11566,7 +11541,6 @@ def empty_normalized_inventory(*, project: str | None = None) -> dict[str, Any]:
             "telemetry": [],
             "snapshots": [],
         },
-        "control_bindings": [],
         "v1_compatibility": compatibility,
     }
     for key, value in compatibility.items():
@@ -11666,16 +11640,6 @@ def filter_normalized_inventory_project(
         for row in result.get("test_statistics", [])
         if str(row.get("repo_id")) in family_repo_ids
     ]
-    result["memberships"] = [
-        row
-        for row in result.get("memberships", [])
-        if str(row.get("repo_id")) in repo_ids
-    ]
-    result["control_bindings"] = [
-        row
-        for row in result.get("control_bindings", [])
-        if str(row.get("repo_id")) in repo_ids
-    ]
     result["leases"] = [
         row for row in result.get("leases", []) if str(row.get("repo_id")) in repo_ids
     ]
@@ -11704,21 +11668,15 @@ def filter_normalized_inventory_project(
         if str(row.get("repo_id")) in repo_ids
     ]
     docker_scope_ids = {
-        str(row.get("host_resource_id"))
-        for row in result.get("memberships", [])
-        if row.get("resource_kind") in {"container", "docker"}
-        and row.get("host_resource_id")
+        str(row.get("docker_resource_id"))
+        for row in resources.get("docker", [])
+        if str(row.get("repo_id")) in repo_ids
+        and row.get("docker_resource_id")
     }
     docker_scope_ids.update(
         str(row.get("docker_resource_id"))
         for row in repository_databases
         if row.get("docker_resource_id")
-    )
-    docker_scope_ids.update(
-        str(row.get("resource_id"))
-        for row in result.get("control_bindings", [])
-        if row.get("resource_kind") in {"container", "docker"}
-        and row.get("resource_id")
     )
     docker_scope_ids.update(docker_violation_ids)
     resources["docker"] = [
@@ -11842,7 +11800,6 @@ def filter_normalized_inventory_project(
     source_ids = {
         str(row.get("source_id"))
         for rows in (
-            result.get("control_bindings", []),
             result.get("leases", []),
             result.get("backup_evidence", []),
             result.get("database_backups", []),
@@ -12313,7 +12270,7 @@ def coordinated_observe_host(options: dict[str, Any]) -> dict[str, Any]:
         response["max_age_seconds"] = max_age_seconds
         response["authority"] = {
             "scope": "server-wide",
-            "transport": "authenticated-unix-socket",
+            "transport": "trusted-local-unix-socket",
         }
         return response
     with AccountStore.open_default(coordinator_home()) as store:
@@ -12415,12 +12372,12 @@ def coordinated_observe_host(options: dict[str, Any]) -> dict[str, Any]:
         }
 
 
-def observe_broker_service_store_for_enrollment(
+def observe_broker_service_store_for_configuration(
     store: AccountStore,
 ) -> dict[str, Any]:
     """Run one full service-owned observation before publishing client ACLs.
 
-    Enrollment is an administrator transaction journey: the repository and
+    Configuration is an administrator transaction journey: the repository and
     runtime definitions exist first, then the service observes Docker once,
     then exact grants/profile mappings are derived.  A failed observation
     aborts before a client profile is installed.
@@ -12453,13 +12410,13 @@ def observe_broker_service_store_for_enrollment(
         )
 
     outcome = observe_once()
-    reconciliation = reconcile_enrolled_runtime_container_declarations(
+    reconciliation = reconcile_configured_runtime_container_declarations(
         store,
         snapshot_id=outcome.snapshot_id,
     )
     if reconciliation["changed"]:
         # Runtime-manifest adoption reconstructs observation-derived
-        # membership without advancing repository/profile generations. Capture
+        # association without advancing repository/profile generations. Capture
         # one new exact snapshot so database children, grants, and the public
         # projection all refer to the repaired parent in the same observer
         # cycle. This path runs only when a declaration actually repaired a
@@ -12567,7 +12524,7 @@ def observe_broker_service_store_for_enrollment(
     }
 
 
-def materialize_enrolled_servers(
+def materialize_configured_servers(
     servers: list[Mapping[str, Any]],
 ) -> list[dict[str, Any]]:
     """Resolve each declared server command into the fixed worker argv contract."""
@@ -12604,8 +12561,8 @@ def materialize_enrolled_servers(
     return materialized
 
 
-def coordinated_broker_enroll(args: argparse.Namespace) -> dict[str, Any]:
-    """Synchronize one repository into the service broker and publish trust."""
+def coordinated_broker_configure(args: argparse.Namespace) -> dict[str, Any]:
+    """Synchronize one repository into the trusted-local routing catalog."""
 
     project = canonical_project(str(args.project))
     start_port, end_port = parse_range(str(args.port_range))
@@ -12620,44 +12577,26 @@ def coordinated_broker_enroll(args: argparse.Namespace) -> dict[str, Any]:
         runtime_file=args.runtime_file,
         include_docker=False,
     )
-    servers = materialize_enrolled_servers(list(specification.get("servers") or []))
+    servers = materialize_configured_servers(list(specification.get("servers") or []))
     compose = specification.get("compose")
-    # The profile schema still carries a numeric GID for compatibility, but it
-    # is not an authorization input on a single-developer host.  Missing or
-    # stale local group definitions therefore cannot block enrollment.
-    socket_gid = int(args.access_gid) if args.access_gid is not None else 0
-    allowed_server_names = None if args.all_servers else tuple(args.server or ())
     database_path = Path(str(args.database)).expanduser().absolute()
     with exclusive_broker_service_lock(database_path):
-        result = enroll_repository(
+        result = configure_repository(
             database_path=database_path,
             socket_path=Path(str(args.socket)).expanduser().absolute(),
-            socket_gid=socket_gid,
-            client_uid=int(args.client_uid),
-            repository_owner_uid=int(args.repository_owner_uid),
-            account_id=str(args.account_id),
+            execution_uid=int(getattr(args, "execution_uid", os.geteuid())),
             canonical_root=project,
             servers=servers,
-            allowed_server_names=allowed_server_names,
             port_start=start_port,
             port_end=end_port,
             profile_path=profile_output.absolute(),
             ephemeral_containers=tuple(
                 specification.get("ephemeral_containers") or ()
             ),
-            grant_ephemeral_image_prefetch=bool(
-                getattr(args, "grant_ephemeral_image_prefetch", False)
-            ),
             compose=compose if isinstance(compose, dict) else None,
-            allowed_compose_run_once_services=tuple(
-                getattr(args, "compose_run_once_service", None) or ()
-            ),
             approve_compose_host_access=bool(args.approve_compose_host_access),
-            observe_host=observe_broker_service_store_for_enrollment,
+            observe_host=observe_broker_service_store_for_configuration,
             explicit_reinstall=bool(args.explicit_reinstall),
-            grant_cleanup_capabilities=bool(args.grant_cleanup),
-            validity_seconds=int(args.profile_valid_days) * 24 * 60 * 60,
-            socket_mode=int(getattr(args, "socket_mode", 0o666)),
         )
     result["observation"] = {
         "scope": OBSERVER_DOMAIN_FULL_DOCKER,
@@ -12665,9 +12604,9 @@ def coordinated_broker_enroll(args: argparse.Namespace) -> dict[str, Any]:
     }
     result["runtime_file"] = specification.get("runtime_file")
     result["agent"] = str(args.agent)
-    # Enrollment is consumed by the same strict JSON command boundary as the
-    # other activation helpers.  Make successful enrollment explicit so a
-    # clean adoption cannot mistake a valid ``status=enrolled`` response for a
+    # Configuration is consumed by the same strict JSON command boundary as
+    # the other activation helpers. Make successful configuration explicit so a
+    # clean adoption cannot mistake a valid result for a
     # failed command.
     result["ok"] = True
     return result
@@ -12781,7 +12720,7 @@ def _require_live_image_publication_maintenance_boundary() -> None:
     """Fail closed unless offline publication preserves the public control plane."""
 
     try:
-        maintenance = load_maintenance_state(expected_uid=0)
+        maintenance = load_maintenance_state()
     except (MaintenanceMarkerError, OSError, ValueError) as exc:
         raise RuntimeError(
             "image publication could not verify server-wide maintenance mode"
@@ -12791,25 +12730,29 @@ def _require_live_image_publication_maintenance_boundary() -> None:
             "image publication apply/rollback requires active server-wide "
             "maintenance mode before the broker is stopped"
         )
-    try:
-        api_state = subprocess.run(
-            ["systemctl", "is-active", "--quiet", "dev-coordinator.service"],
-            check=False,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=5.0,
-        )
-    except (OSError, subprocess.SubprocessError) as exc:
-        raise RuntimeError(
-            "image publication could not verify the loopback Coordinator API"
-        ) from exc
-    if api_state.returncode != 0:
-        raise RuntimeError(
-            "image publication requires dev-coordinator.service to remain active; "
-            "stop only devcoordinator-broker.service so Consoles and agents receive "
-            "the maintenance response instead of ECONNREFUSED"
-        )
+    for unit, role in (
+        ("devcoordinator-authority.service", "Coordinator authority"),
+        ("devcoordinator-api.service", "loopback Coordinator API"),
+    ):
+        try:
+            state = subprocess.run(
+                ["systemctl", "is-active", "--quiet", unit],
+                check=False,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=5.0,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise RuntimeError(
+                f"image publication could not verify the {role}"
+            ) from exc
+        if state.returncode != 0:
+            raise RuntimeError(
+                f"image publication requires {unit} to remain active; stop only "
+                "devcoordinator-broker.service so Consoles and agents receive "
+                "the maintenance response instead of ECONNREFUSED"
+            )
 
 
 def coordinated_broker_compose_reconcile(
@@ -12860,7 +12803,7 @@ def coordinated_broker_compose_reconcile(
                     store,
                     host_id=str(candidate["host_id"]),
                 )
-                observed = observe_broker_service_store_for_enrollment(store)
+                observed = observe_broker_service_store_for_configuration(store)
                 evidence = require_exact_fresh_observation(
                     store,
                     evidence=observed,
@@ -12916,7 +12859,7 @@ def coordinated_broker_docker_reconcile(
                 store,
                 host_id=str(candidate["host_id"]),
             )
-            observed = observe_broker_service_store_for_enrollment(store)
+            observed = observe_broker_service_store_for_configuration(store)
             evidence = require_exact_fresh_observation(
                 store,
                 evidence=observed,
@@ -12961,7 +12904,7 @@ def coordinated_broker_compose_project_name_release(
                     store,
                     host_id=str(candidate["host_id"]),
                 )
-                observed = observe_broker_service_store_for_enrollment(store)
+                observed = observe_broker_service_store_for_configuration(store)
                 try:
                     evidence = require_exact_fresh_observation(
                         store,
@@ -13332,7 +13275,7 @@ def _exact_broker_project_context(
 
     raw_project = str(options.get("project") or "").strip()
     if not raw_project or not Path(raw_project).is_absolute():
-        raise ValueError("project action requires an absolute enrolled project")
+        raise ValueError("project action requires an absolute configured project")
     lexical_project = os.path.normpath(raw_project)
     profile = configured_broker_profile()
     if profile is None:  # pragma: no cover - system mode requires a profile
@@ -13436,25 +13379,23 @@ def _unique_inventory_rows(
 def _broker_project_inventory_scope(
     inventory: Mapping[str, Any], *, repository: BrokerRepositoryProfile
 ) -> dict[str, Any]:
-    """Select one exact enrolled repository without resolving its filesystem."""
+    """Select one configured repository without resolving its filesystem."""
 
     resources = inventory.get("resources")
     observations = inventory.get("observations")
     compatibility = inventory.get("v1_compatibility")
-    memberships = inventory.get("memberships")
     if (
         not isinstance(resources, Mapping)
         or not isinstance(observations, Mapping)
         or not isinstance(compatibility, Mapping)
-        or not isinstance(memberships, list)
     ):
         raise BrokerError("invalid_reply", "Broker project inventory is malformed.")
     docker_compatibility = compatibility.get("docker")
     if not isinstance(docker_compatibility, Mapping):
         raise BrokerError("invalid_reply", "Broker project Docker inventory is malformed.")
 
-    enrolled_server_ids = frozenset(repository.server_ids.values())
-    enrolled_container_ids = frozenset(repository.container_ids.values())
+    configured_server_ids = frozenset(repository.server_ids.values())
+    configured_container_ids = frozenset(repository.container_ids.values())
     server_resources = {
         resource_id: row
         for resource_id, row in _unique_inventory_rows(
@@ -13462,21 +13403,9 @@ def _broker_project_inventory_scope(
             identity="server_definition_id",
             label="server resources",
         ).items()
-        if resource_id in enrolled_server_ids
+        if resource_id in configured_server_ids
         and str(row.get("repo_id") or "") == repository.repo_id
     }
-    member_container_ids: set[str] = set()
-    for row in memberships:
-        if not isinstance(row, Mapping):
-            raise BrokerError(
-                "invalid_reply", "Broker project inventory has a malformed membership."
-            )
-        if (
-            str(row.get("repo_id") or "") == repository.repo_id
-            and str(row.get("resource_kind") or "") == "container"
-            and str(row.get("host_resource_id") or "") in enrolled_container_ids
-        ):
-            member_container_ids.add(str(row["host_resource_id"]))
     docker_resources = {
         resource_id: row
         for resource_id, row in _unique_inventory_rows(
@@ -13484,7 +13413,8 @@ def _broker_project_inventory_scope(
             identity="docker_resource_id",
             label="Docker resources",
         ).items()
-        if resource_id in member_container_ids
+        if resource_id in configured_container_ids
+        and str(row.get("repo_id") or "") == repository.repo_id
     }
     server_observations = {
         resource_id: row
@@ -13493,7 +13423,7 @@ def _broker_project_inventory_scope(
             identity="server_definition_id",
             label="server observations",
         ).items()
-        if resource_id in enrolled_server_ids
+        if resource_id in configured_server_ids
     }
     docker_observations = {
         resource_id: row
@@ -13502,14 +13432,14 @@ def _broker_project_inventory_scope(
             identity="docker_resource_id",
             label="Docker observations",
         ).items()
-        if resource_id in member_container_ids
+        if resource_id in configured_container_ids
     }
     compatibility_servers = {
         resource_id: row
         for resource_id, row in _unique_inventory_rows(
             compatibility.get("servers"), identity="id", label="compatibility servers"
         ).items()
-        if resource_id in enrolled_server_ids
+        if resource_id in configured_server_ids
     }
     compatibility_containers = {
         resource_id: row
@@ -13518,7 +13448,7 @@ def _broker_project_inventory_scope(
             identity="host_resource_id",
             label="compatibility containers",
         ).items()
-        if resource_id in member_container_ids
+        if resource_id in configured_container_ids
     }
     isolation_rows: dict[str, Mapping[str, Any]] = {}
     for key in ("project_runtime_isolation", "isolation_audit", "isolation"):
@@ -13530,7 +13460,7 @@ def _broker_project_inventory_scope(
             if not isinstance(row, Mapping):
                 continue
             resource_id = str(row.get("resource_id") or "")
-            if resource_id in enrolled_server_ids | enrolled_container_ids:
+            if resource_id in configured_server_ids | configured_container_ids:
                 isolation_rows[resource_id] = row
     return {
         "server_resources": server_resources,
@@ -13539,7 +13469,7 @@ def _broker_project_inventory_scope(
         "docker_observations": docker_observations,
         "compatibility_servers": compatibility_servers,
         "compatibility_containers": compatibility_containers,
-        "member_container_ids": frozenset(member_container_ids),
+        "configured_container_ids": configured_container_ids,
         "isolation_rows": isolation_rows,
     }
 
@@ -13658,7 +13588,7 @@ def _broker_project_services(
 def coordinated_broker_project_runtime_action(
     options: Mapping[str, Any], *, action: str
 ) -> dict[str, Any]:
-    """Apply a whole-project action using only enrolled opaque resources.
+    """Apply a whole-project action using only configured opaque resources.
 
     The broker is the sole persistence and lifecycle authority.  The API does
     not parse repository files, open a per-account database, or require Unix
@@ -13937,7 +13867,7 @@ def coordinated_broker_project_runtime_action(
         },
         "authority": {
             "scope": "server-wide",
-            "transport": "authenticated-unix-socket",
+            "transport": "trusted-local-unix-socket",
         },
     }
 
@@ -14251,12 +14181,12 @@ def dependency_owned_by_compose(
 def mutable_runtime_docker_dependencies(
     spec: dict[str, Any], *, exclude_compose_owned: bool = False
 ) -> list[dict[str, Any]]:
-    """Return dependencies with mutation authority, optionally deduplicated."""
+    """Return explicitly managed dependencies, optionally deduplicated."""
 
     dependencies = [
         dep
         for dep in spec.get("docker_dependencies", [])
-        if dep.get("mutation_authorized") is True
+        if dep.get("lifecycle_managed") is True
     ]
     if exclude_compose_owned:
         dependencies = [
@@ -14494,7 +14424,7 @@ def preflight_project_docker(
             identity = str(dependency.get("container") or dependency.get("name") or "")
             if not identity:
                 raise BrokerProfileError(
-                    "declared Docker dependency has no exact broker enrollment identity"
+                    "declared Docker dependency has no exact broker configuration identity"
                 )
             container_ids.append(repository.container_id(identity))
         declared_services = [str(item) for item in compose.get("services") or []]
@@ -15312,6 +15242,64 @@ def coordinated_broker_compose_command(
     return result
 
 
+def coordinated_compose_service_recreate(args: argparse.Namespace) -> dict[str, Any]:
+    """Recreate one configured Compose service without touching its siblings."""
+
+    project = canonical_project(str(args.project))
+    broker_context = configured_broker_context(project)
+    if broker_context is None:
+        raise BrokerProfileError(
+            "exact Compose service recreation requires an active broker configuration"
+        )
+    profile, repository = broker_context
+    operation_id, broker_result = profile.call(
+        repository=repository,
+        resource_id=repository.compose_id(),
+        operation=BrokerOperation.COMPOSE_UP,
+        arguments={
+            "service": str(args.service),
+            "force_recreate": True,
+            "wait_timeout_seconds": int(args.wait_timeout_seconds),
+        },
+        operation_id=(
+            None if args.operation_id is None else str(args.operation_id)
+        ),
+    )
+    return {
+        "ok": True,
+        "action": "compose_service_recreate",
+        "project": project,
+        "agent": str(args.agent),
+        "service": str(args.service),
+        "operation_id": operation_id,
+        "resource_id": repository.compose_id(),
+        "result": broker_result,
+    }
+
+
+def coordinated_systemd_unit(args: argparse.Namespace) -> dict[str, Any]:
+    """Plan, observe, or apply one exact project one-shot unit bundle."""
+
+    project = Path(canonical_project(str(args.project)))
+    desired = str(args.desired)
+    if args.systemd_action in {"plan", "status"}:
+        result = plan_systemd_commissioning(
+            project=project,
+            unit=str(args.unit),
+            desired=desired,
+        )
+        result["action"] = str(args.systemd_action)
+        return result
+    return apply_systemd_commissioning(
+        project=project,
+        unit=str(args.unit),
+        desired=desired,
+        operation_id=str(args.operation_id),
+        confirmation_fingerprint=str(args.confirm_plan_fingerprint),
+        journal_root=SYSTEM_AUTHORITY_ROOT / "systemd-commissioning",
+    )
+
+
 COMPOSE_START_LIKE_COMMANDS = {"create", "restart", "run", "start", "unpause", "up"}
 
 
@@ -15909,14 +15897,12 @@ def configured_broker_profile() -> BrokerClientProfile | None:
 def _ephemeral_repository(
     profile: BrokerClientProfile,
     project: str,
-    *,
-    retained_owner_access: bool = False,
 ) -> BrokerRepositoryProfile:
     """Resolve exactly the repository named by the caller.
 
-    Ephemeral lifecycle must never search every enrollment or infer a target
-    from the process cwd.  The explicit canonical project is part of the
-    authorization scope, including for read-only status.
+    Ephemeral lifecycle must never search every configuration or infer a target
+    from the process cwd. The explicit canonical project is a routing target,
+    not a caller access boundary.
     """
 
     requested = str(project or "").strip()
@@ -15925,8 +15911,6 @@ def _ephemeral_repository(
             "ephemeral commands require --project with the canonical repo path"
         )
     canonical = canonical_project(requested)
-    if retained_owner_access:
-        return profile.retained_ephemeral_repository(canonical)
     return profile.repository(canonical)
 
 
@@ -16003,7 +15987,6 @@ def coordinated_ephemeral_action(args: argparse.Namespace) -> dict[str, Any]:
     """Route ephemeral lifecycle only through the root-provisioned broker."""
 
     action = str(args.action)
-    retained_owner_access = action in {"status", "finish"}
     profile = configured_broker_profile()
     if profile is None:
         raise BrokerProfileError(
@@ -16011,11 +15994,7 @@ def coordinated_ephemeral_action(args: argparse.Namespace) -> dict[str, Any]:
             "direct Docker fallback is disabled"
         )
     if action == "status":
-        repository = _ephemeral_repository(
-            profile,
-            str(args.project),
-            retained_owner_access=True,
-        )
+        repository = _ephemeral_repository(profile, str(args.project))
         run_id = str(args.run_id)
         operation_id, result = profile.call(
             repository=repository,
@@ -16037,11 +16016,7 @@ def coordinated_ephemeral_action(args: argparse.Namespace) -> dict[str, Any]:
         return {"operation_id": operation_id, **result}
 
     agent, project = require_identity(vars(args), f"ephemeral {action}")
-    repository = _ephemeral_repository(
-        profile,
-        project,
-        retained_owner_access=action == "finish",
-    )
+    repository = _ephemeral_repository(profile, project)
     if args.action == "start":
         template_name = str(args.template)
         arguments: dict[str, Any] = {"agent": agent}
@@ -16106,16 +16081,15 @@ def broker_authority_inventory(
         result = profile.inventory()
     else:
         result = profile.inventory(canonical_root=canonical_project(project))
-    if result.get("schema_version") != NORMALIZED_SCHEMA_VERSION:
+    if result.get("schema_version") != INVENTORY_SCHEMA_VERSION:
         raise BrokerError(
-            "invalid_reply", "Broker inventory omitted the normalized schema-v2 graph."
+            "invalid_reply", "Broker inventory omitted the normalized schema-v3 graph."
         )
     result = filter_normalized_inventory_project(result, project)
     result["authority"] = {
         "scope": "server-wide",
-        "transport": "authenticated-unix-socket",
+        "transport": "trusted-local-unix-socket",
         "socket": str(profile.service.socket_path),
-        "service_uid": profile.service.service_uid,
         "database_generation": profile.service.database_generation,
     }
     if not include_docker:
@@ -16436,9 +16410,6 @@ def release_broker_lease_link(link: BrokerLink, *, rollback: bool) -> dict[str, 
         release_operation_id = str(pending.release_operation_id or release_operation_id)
     service = BrokerServiceProfile(
         socket_path=Path(link.broker_socket),
-        service_uid=link.broker_service_uid,
-        socket_gid=link.broker_socket_gid,
-        socket_mode=link.broker_socket_mode,
         database_generation=link.broker_database_generation,
     )
     try:
@@ -16552,9 +16523,6 @@ def release_broker_assignment_link(
         release_operation_id = str(pending.release_operation_id or release_operation_id)
     service = BrokerServiceProfile(
         socket_path=Path(link.broker_socket),
-        service_uid=link.broker_service_uid,
-        socket_gid=link.broker_socket_gid,
-        socket_mode=link.broker_socket_mode,
         database_generation=link.broker_database_generation,
     )
     try:
@@ -16592,7 +16560,7 @@ def coordinated_lease_port(options: dict[str, Any]) -> dict[str, Any]:
         server_name = str(options.get("name") or "").strip()
         if not server_name:
             raise BrokerProfileError(
-                "broker-backed port lease requires the enrolled server name (--name)"
+                "broker-backed port lease requires the configured server name (--name)"
             )
         if authority_mode() == "system":
             ttl_seconds = int(options.get("ttl") or DEFAULT_TTL_SECONDS)
@@ -17216,7 +17184,7 @@ def coordinated_relocate_port_assignment(options: dict[str, Any]) -> dict[str, A
                 "code": "broker_port_relocation_unsupported",
                 "classification": "unsupported_safe_lifecycle",
                 "action_required": (
-                    "Unassign the enrolled server from its current repository and "
+                    "Unassign the configured server from its current repository and "
                     "assign the destination server through separate broker-authorized commands."
                 ),
             },
@@ -17359,12 +17327,9 @@ def _runtime_docker_identity(
                 row = connection.execute(
                     """
                     SELECT d.docker_resource_id, d.full_container_id,
-                           d.current_name, m.immutable_fingerprint
+                           d.current_name
                     FROM docker_resources d
-                    JOIN repository_memberships m
-                      ON m.resource_kind = 'container'
-                     AND m.host_resource_id = d.docker_resource_id
-                    JOIN repositories r USING(repo_id)
+                    JOIN repositories r ON r.repo_id = d.repo_id
                     WHERE d.docker_resource_id = ? AND r.canonical_root = ?
                     """,
                     (target_id, project),
@@ -17374,16 +17339,13 @@ def _runtime_docker_identity(
                 row = connection.execute(
                     """
                     SELECT d.docker_resource_id, d.full_container_id,
-                           d.current_name, m.immutable_fingerprint,
+                           d.current_name,
                            b.database_binding_id
                     FROM database_bindings b
                     JOIN docker_resources d USING(docker_resource_id)
-                    JOIN repository_memberships m
-                      ON m.resource_kind = 'container'
-                     AND m.host_resource_id = d.docker_resource_id
                     JOIN repositories r ON r.repo_id = b.repo_id
                     WHERE b.database_binding_id = ? AND r.canonical_root = ?
-                      AND m.repo_id = b.repo_id
+                      AND d.repo_id = b.repo_id
                     """,
                     (target_id, project),
                 ).fetchone()
@@ -17403,11 +17365,15 @@ def _runtime_docker_identity(
                 ).fetchone()
             else:
                 strong_backup = None
+        exact, _repo_id = SQLiteLifecyclePersistence(store).resolve_resource(
+            ResourceKind.CONTAINER,
+            str(row["docker_resource_id"]),
+        )
     return {
         "docker_resource_id": str(row["docker_resource_id"]),
         "full_container_id": str(row["full_container_id"]),
         "name": str(row["current_name"]),
-        "immutable_fingerprint": str(row["immutable_fingerprint"]),
+        "immutable_fingerprint": exact.immutable_fingerprint,
         "strong_backup_id": (
             None if strong_backup is None else str(strong_backup[0])
         ),
@@ -17545,7 +17511,7 @@ def _runtime_compose_replace(
             "resource_kind": target["kind"],
             "resource_id": target["id"],
             "action_required": (
-                "Use the enrolled typed broker Compose lifecycle after it "
+                "Use the configured typed broker Compose lifecycle after it "
                 "supports post-recreate identity publication."
             ),
         },
@@ -18408,7 +18374,7 @@ def coordinated_runtime_dispatch(
                 "kind": "docker",
                 "docker_resource_id": identity["docker_resource_id"],
                 "full_container_id": identity["full_container_id"],
-                "membership_fingerprint": identity["immutable_fingerprint"],
+                "identity_fingerprint": identity["immutable_fingerprint"],
                 "prior_state": (previous_status or {}).get("status"),
             },
             "immutable_fingerprint": identity["immutable_fingerprint"],
@@ -18426,7 +18392,7 @@ def coordinated_runtime_dispatch(
                     "database_binding_id": target["id"],
                     "docker_resource_id": identity["docker_resource_id"],
                     "full_container_id": identity["full_container_id"],
-                    "membership_fingerprint": identity["immutable_fingerprint"],
+                    "identity_fingerprint": identity["immutable_fingerprint"],
                     "prior_state": (previous_status or {}).get("status"),
                 },
                 "immutable_fingerprint": identity["immutable_fingerprint"],
@@ -19028,7 +18994,7 @@ def coordinated_runtime_request(
                 {
                     "code": "runtime_service_client_forbidden",
                     "classification": "invalid_authority_context",
-                    "action_required": "Submit the ID-only runtime request from an enrolled peer account.",
+                    "action_required": "Submit the ID-only runtime request from an configured peer account.",
                 },
             ),
             operation_id=operation_id,
@@ -19040,7 +19006,19 @@ def coordinated_runtime_request(
                 coordinated_runtime_remove(normalized_payload),
                 operation_id,
             )
-        reject_unsupported_safe_replace(normalized_payload)
+        if (
+            normalized_payload["action"] == "replace"
+            and normalized_payload["target"]["kind"]
+            in {"docker", "database_stack"}
+        ):
+            # Account authority deliberately owns no privileged Compose paths.
+            # Route the path-free request through the installed broker, whose
+            # configured definition, backup registry, and durable operation log
+            # are the trusted replacement boundary.
+            return coordinated_broker_runtime_request(
+                normalized_payload,
+                operation_id=operation_id,
+            )
         with AccountStore.open_default(coordinator_home()) as store:
             result = execute_runtime_request(
                 normalized_payload,
@@ -19122,7 +19100,7 @@ def coordinated_runtime_request(
 def coordinated_broker_runtime_request(
     payload: Any, *, operation_id: str | None = None
 ) -> dict[str, Any]:
-    """Submit one path-free runtime request through the enrolled host broker."""
+    """Submit one path-free runtime request through the configured host broker."""
 
     request = validate_runtime_request(payload)
     if operation_id is not None:
@@ -19135,7 +19113,7 @@ def coordinated_broker_runtime_request(
                 "classification": "unsupported_safe_lifecycle",
                 "action_required": (
                     "Use the temporary/test account runtime for run; the shared "
-                    "broker accepts only typed enrolled lifecycle requests."
+                    "broker accepts only typed configured lifecycle requests."
                 ),
             },
         )
@@ -19173,7 +19151,7 @@ def coordinated_broker_runtime_request(
             {
                 "code": "broker_runtime_options_forbidden",
                 "classification": "invalid_request",
-                "action_required": "Reference an existing enrolled immutable resource ID only.",
+                "action_required": "Reference an existing configured immutable resource ID only.",
                 "unsupported_options": unsupported_options,
             },
         )
@@ -19189,9 +19167,9 @@ def coordinated_broker_runtime_request(
     profile = configured_broker_profile()
     if profile is None:
         raise StructuredCoordinatorError(
-            "the unified runtime authority is not enrolled with the host broker",
+            "the unified runtime authority is not configured with the host broker",
             {
-                "code": "runtime_broker_enrollment_required",
+                "code": "runtime_broker_configuration_required",
                 "classification": "shared_authority_required",
                 "action_required": "Enroll this exact root/worktree and resource through the Coordinator skill.",
             },
@@ -19206,7 +19184,7 @@ def coordinated_broker_runtime_request(
         raise StructuredCoordinatorError(
             "the repository has not been adopted by the host broker",
             {
-                "code": "repository_unenrolled",
+                "code": "repository_unconfigured",
                 "classification": "repository_bootstrap_required",
                 "action_required": "Run one typed start-like request as the actual local caller first.",
             },
@@ -19219,7 +19197,7 @@ def coordinated_broker_runtime_request(
             raise StructuredCoordinatorError(
                 "the temporary repository has not been adopted by the host broker",
                 {
-                    "code": "repository_unenrolled",
+                    "code": "repository_unconfigured",
                     "classification": "repository_bootstrap_required",
                     "action_required": "Run one typed start-like request as the actual local caller first.",
                 },
@@ -19244,7 +19222,7 @@ def coordinated_broker_runtime_request(
             "restart_window_seconds"
         ),
     }
-    if request["action"] == "replace":
+    if request["action"] == "replace" and request["target"]["kind"] == "service":
         arguments.update(
             {
                 "expected_definition_generation": request["options"][
@@ -19309,7 +19287,7 @@ def coordinated_broker_runtime_request(
     ):
         raise BrokerError(
             "invalid_reply",
-            "Broker runtime reply does not match the enrolled request context.",
+            "Broker runtime reply does not match the configured request context.",
             operation_id=returned_operation_id,
         )
     if operation_id is not None and returned_operation_id != operation_id:
@@ -19344,7 +19322,7 @@ def coordinated_broker_runtime_request(
         ):
             raise BrokerError(
                 "invalid_reply",
-                "Broker log capture reply does not contain one bounded artifact for the exact enrolled target.",
+                "Broker log capture reply does not contain one bounded artifact for the exact configured target.",
                 operation_id=returned_operation_id,
             )
     return _runtime_result_operation_envelope(result, returned_operation_id)
@@ -19626,7 +19604,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="run one attributed repository-scoped runtime lifecycle request",
         description="Run one strict repository-scoped lifecycle request.",
         epilog=(
-            "Flag mode covers existing-target status/start/stop/restart/remove.\n"
+            "Flag mode covers existing-target status/start/stop/restart/replace/remove.\n"
             "Discover immutable IDs with: inventory --project ROOT_REPO --compact-json\n"
             "Read repository_trees for ownership, then the matching resources entry for its ID.\n\n"
             "Every request supplies agent, root_repo, explicit nullable temporary_repo, "
@@ -19644,6 +19622,38 @@ def build_parser() -> argparse.ArgumentParser:
     add_runtime_cli_arguments(runtime)
     add_worker_cli_parser(sub)
 
+    systemd_unit = sub.add_parser(
+        "systemd-unit",
+        help=(
+            "plan, inspect, or confirmation-apply one exact project-owned "
+            "non-root systemd one-shot and optional timer"
+        ),
+    )
+    systemd_sub = systemd_unit.add_subparsers(
+        dest="systemd_action", required=True
+    )
+    for action in ("status", "plan", "apply"):
+        command = systemd_sub.add_parser(action)
+        command.add_argument("--project", required=True)
+        command.add_argument(
+            "--unit",
+            required=True,
+            help=(
+                "project unit stem or sibling .service filename; a .timer "
+                "selector is not accepted"
+            ),
+        )
+        command.add_argument(
+            "--desired",
+            choices=tuple(sorted(SYSTEMD_COMMISSIONING_STATES)),
+            default="commissioned",
+        )
+        if action == "apply":
+            command.add_argument(
+                "--operation-id", type=_canonical_compose_run_once_operation_id, required=True
+            )
+            command.add_argument("--confirm-plan-fingerprint", required=True)
+
     inventory = sub.add_parser(
         "inventory",
         help="read repository trees and immutable runtime resource IDs",
@@ -19651,7 +19661,7 @@ def build_parser() -> argparse.ArgumentParser:
             "Read normalized runtime inventory without performing a lifecycle action."
         ),
         epilog=(
-            "Use repository_trees for authoritative membership. Immutable IDs are in "
+            "Use repository_trees for exact resource association. Immutable IDs are in "
             "resources.servers[].server_definition_id, "
             "resources.docker[].docker_resource_id, and "
             "resources.databases[].database_binding_id."
@@ -19719,7 +19729,7 @@ def build_parser() -> argparse.ArgumentParser:
     lease.add_argument("--project", required=True)
     lease.add_argument(
         "--name",
-        help="enrolled server identity (required when the host broker is configured)",
+        help="configured server identity (required when the host broker is configured)",
     )
     lease.add_argument("--range", default=DEFAULT_RANGE)
     lease.add_argument("--preferred", type=int)
@@ -19899,10 +19909,26 @@ def build_parser() -> argparse.ArgumentParser:
     compose_down.add_argument("--project", required=True)
     compose_down.add_argument("--file", action="append", default=[])
     compose_down.add_argument("--dry-run", action="store_true")
+    compose_recreate = docker_sub.add_parser(
+        "compose-recreate-service",
+        help=(
+            "force-recreate one exact configured single-replica Compose service, "
+            "preserve its declared volumes, avoid dependencies, and wait for readiness"
+        ),
+    )
+    compose_recreate.add_argument("--agent", required=True)
+    compose_recreate.add_argument("--project", required=True)
+    compose_recreate.add_argument("--service", required=True)
+    compose_recreate.add_argument(
+        "--wait-timeout-seconds", type=int, default=120
+    )
+    compose_recreate.add_argument(
+        "--operation-id", type=_canonical_compose_run_once_operation_id
+    )
     compose_run_once = docker_sub.add_parser(
         "compose-run-once",
         help=(
-            "run one administrator-enrolled Compose service without accepting "
+            "run one administrator-configured Compose service without accepting "
             "client commands, environment, mounts, or paths"
         ),
     )
@@ -20056,8 +20082,8 @@ def handle_cli(args: argparse.Namespace) -> Any:
         )
     if args.group == "worker" and args.action == "runner":
         return coordinated_worker_runner(args.worker_id)
-    if args.group == "broker" and args.action == "enroll":
-        return coordinated_broker_enroll(args)
+    if args.group == "broker" and args.action == "configure":
+        return coordinated_broker_configure(args)
     if args.group == "broker" and args.action == "reconcile-compose":
         return coordinated_broker_compose_reconcile(args)
     if args.group == "broker" and args.action == "reconcile-docker":
@@ -20164,6 +20190,8 @@ def handle_cli(args: argparse.Namespace) -> Any:
             backup_dirs=args.backup_dir,
             stats_history_limit=args.stats_history_limit,
         )
+    if args.group == "systemd-unit":
+        return coordinated_systemd_unit(args)
     if args.group == "docker" and args.action == "ps":
         command = ["docker", "ps"]
         if args.all:
@@ -20171,6 +20199,8 @@ def handle_cli(args: argparse.Namespace) -> Any:
         return coordinated_run_docker(command, dry_run=args.dry_run)
     if args.group == "docker" and args.action == "compose-run-once":
         return coordinated_compose_run_once(args)
+    if args.group == "docker" and args.action == "compose-recreate-service":
+        return coordinated_compose_service_recreate(args)
     if args.group == "docker" and args.action in {"compose-up", "compose-down"}:
         command = ["docker", "compose"]
         for file_name in args.file:
@@ -20540,14 +20570,19 @@ def _watch_api_profile_changes(
 
 
 def _cleanup_profile_repositories(profile: BrokerClientProfile) -> tuple[BrokerRepositoryProfile, ...]:
-    repositories = tuple(
-        profile.repository(item.canonical_root)
-        for item in sorted(
-            profile.repositories.values(), key=lambda item: item.canonical_root
-        )
-    )
+    # One protected profile may retain multiple account configurations for the
+    # same canonical repository. ``profile.repository`` already applies the
+    # documented enabled/generation/caller tie-break; collapse repeated raw
+    # rows to that one selected authority before resolving lifecycle targets.
+    selected: dict[tuple[str, str], BrokerRepositoryProfile] = {}
+    for item in sorted(
+        profile.repositories.values(), key=lambda candidate: candidate.canonical_root
+    ):
+        repository = profile.repository(item.canonical_root)
+        selected[(repository.canonical_root, repository.repo_id)] = repository
+    repositories = tuple(selected[key] for key in sorted(selected))
     if not repositories:
-        raise BrokerProfileError("archive lifecycle requires an enrolled repository")
+        raise BrokerProfileError("archive lifecycle requires an configured repository")
     return repositories
 
 
@@ -20555,40 +20590,60 @@ def _cleanup_profile_target_repository(
     profile: BrokerClientProfile, *, target_kind: str, target_id: str
 ) -> BrokerRepositoryProfile:
     canonical_kind = "project" if target_kind == "repository" else target_kind
-    matches: list[BrokerRepositoryProfile] = []
-    for repository in _cleanup_profile_repositories(profile):
+    repositories = _cleanup_profile_repositories(profile)
+    inventory = profile.inventory(canonical_root=repositories[0].canonical_root)
+    matches: dict[tuple[str, str], BrokerRepositoryProfile] = {}
+    projection_kind = {"server": "service", "container": "docker"}.get(
+        canonical_kind
+    )
+    for repository in repositories:
         if canonical_kind in {"project", "worktree"} and repository.repo_id == target_id:
-            matches.append(repository)
-        elif canonical_kind == "server" and target_id in set(repository.server_ids.values()):
-            matches.append(repository)
-        elif canonical_kind == "container" and target_id in set(repository.container_ids.values()):
-            matches.append(repository)
+            matches[(repository.canonical_root, repository.repo_id)] = repository
+            continue
+        if projection_kind is None:
+            continue
+        try:
+            projection = project_targets(
+                inventory,
+                effective_root=repository.canonical_root,
+                selector=target_id,
+                kind=projection_kind,
+                limit=1,
+            )
+        except AgentProjectionError as error:
+            if error.code == "target_not_found":
+                continue
+            raise BrokerProfileError(
+                f"archive target inventory is invalid: {error}"
+            ) from error
+        selected = projection.get("selected")
+        if isinstance(selected, Mapping) and selected.get("id") == target_id:
+            matches[(repository.canonical_root, repository.repo_id)] = repository
     if len(matches) != 1:
         raise BrokerProfileError(
-            "archive target is not uniquely enrolled; rerun root Coordinator enrollment"
+            "archive target is not exactly one current authority-configured resource"
         )
-    return matches[0]
+    return next(iter(matches.values()))
 
 
 def coordinated_list_archives() -> dict[str, Any]:
     profile = configured_broker_profile()
     if profile is not None:
-        archives: dict[tuple[str, str], dict[str, Any]] = {}
-        for repository in _cleanup_profile_repositories(profile):
-            _operation_id, result = profile.call(
-                repository=repository,
-                resource_id=repository.repo_id,
-                operation=BrokerOperation.ARCHIVES_READ,
-                arguments={},
-            )
-            rows = result.get("archives")
-            if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
-                raise RuntimeError("host broker returned an invalid archive listing")
-            for row in rows:
-                project_id = str(row.get("project_id") or row.get("target_id") or "")
-                if project_id != repository.repo_id:
-                    raise RuntimeError("host broker archive escaped enrolled repository authority")
-                archives[(str(row.get("target_kind")), str(row.get("target_id")))] = dict(row)
+        repositories = _cleanup_profile_repositories(profile)
+        repository = min(repositories, key=lambda item: item.canonical_root)
+        _operation_id, result = profile.call(
+            repository=repository,
+            resource_id=repository.repo_id,
+            operation=BrokerOperation.ARCHIVES_READ,
+            arguments={},
+        )
+        rows = result.get("archives")
+        if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+            raise RuntimeError("host broker returned an invalid archive listing")
+        archives = {
+            (str(row.get("target_kind")), str(row.get("target_id"))): dict(row)
+            for row in rows
+        }
         return {
             "archives": sorted(
                 archives.values(),
@@ -20673,20 +20728,8 @@ def _direct_archive_plan(
         return _common_archive_plan_payload(plan, target)
     if target_kind not in {"server", "container"}:
         raise ValueError("archive target_kind must be project, server, or container")
-    with store.read_transaction() as connection:
-        binding = connection.execute(
-            """
-            SELECT binding_id FROM control_bindings
-            WHERE resource_kind = ? AND resource_id = ?
-              AND authority_state = 'authoritative'
-            ORDER BY priority DESC, binding_id LIMIT 1
-            """,
-            (target_kind, target_id),
-        ).fetchone()
-    if binding is None:
-        raise RuntimeError("archive target has no authoritative exact controller")
     exact, repo_id = persistence.resolve_resource(
-        ResourceKind(target_kind), target_id, str(binding["binding_id"])
+        ResourceKind(target_kind), target_id
     )
     plan = lifecycle.plan_resource_archive(
         exact, actor=actor, reason=reason, repo_id=repo_id
@@ -20703,16 +20746,28 @@ def _direct_cleanup_target_project_root(
                 "SELECT canonical_root FROM repositories WHERE repo_id = ?",
                 (target_id,),
             ).fetchone()
-        else:
+        elif target_kind == "server":
             row = connection.execute(
                 """
                 SELECT r.canonical_root
-                FROM repository_memberships m
-                JOIN repositories r ON r.repo_id = m.repo_id
-                WHERE m.resource_kind = ? AND m.host_resource_id = ?
+                FROM server_definitions s
+                JOIN repositories r ON r.repo_id = s.repo_id
+                WHERE s.server_definition_id = ?
                 """,
-                (target_kind, target_id),
+                (target_id,),
             ).fetchone()
+        elif target_kind in {"container", "docker"}:
+            row = connection.execute(
+                """
+                SELECT r.canonical_root
+                FROM docker_resources d
+                JOIN repositories r ON r.repo_id = d.repo_id
+                WHERE d.docker_resource_id = ?
+                """,
+                (target_id,),
+            ).fetchone()
+        else:
+            raise ValueError("cleanup target kind is unsupported")
     if row is None:
         raise RuntimeError("cleanup target has no local project observation boundary")
     return str(row["canonical_root"])
@@ -21059,20 +21114,8 @@ def coordinated_lifecycle_restore(payload: Mapping[str, Any]) -> dict[str, Any]:
                 reason=reason,
                 explicit=True,
             ).to_dict()
-        with store.read_transaction() as connection:
-            binding = connection.execute(
-                """
-                SELECT binding_id FROM control_bindings
-                WHERE resource_kind = ? AND resource_id = ?
-                  AND authority_state = 'authoritative'
-                ORDER BY priority DESC, binding_id LIMIT 1
-                """,
-                (target_kind, target_id),
-            ).fetchone()
-        if binding is None:
-            raise RuntimeError("archived resource has no authoritative exact controller")
         exact, _repo_id = persistence.resolve_resource(
-            ResourceKind(target_kind), target_id, str(binding["binding_id"]), include_archived=True
+            ResourceKind(target_kind), target_id, include_archived=True
         )
         return dict(
             lifecycle.restore_resource_archive(
@@ -21624,7 +21667,7 @@ def coordinated_test_statistics_read(
             or repository.canonical_root == str(Path(project).expanduser().resolve())
         ]
         if len(matches) != 1:
-            raise ValueError("project is not uniquely enrolled for test statistics")
+            raise ValueError("project is not uniquely configured for test statistics")
         return test_statistics(
             profile=profile,
             project=matches[0].canonical_root,
@@ -21677,31 +21720,37 @@ def coordinated_test_fleet_read(*, hours: int = 24) -> dict[str, Any]:
 
 
 def coordinated_test_repository_list() -> dict[str, Any]:
-    """Return the lightweight enrolled repository catalog for test views.
+    """Return the lightweight configured repository catalog for test views.
 
-    This deliberately does not build inventory or observe the host. In system
-    mode the protected profile is the authorization boundary; account mode
-    reads only active repositories from its normalized store.
+    This deliberately does not build inventory or observe the host. The broker
+    returns the host-wide catalog; the routing profile is transport state, not
+    a repository admission list.
     """
 
     profile = configured_broker_profile()
     if profile is not None:
         result = profile.test_repository_catalog()
-        repositories = list(result.get("repositories") or [])
-        expected_ids: set[str] = set()
-        for repository in profile.repositories.values():
-            try:
-                repository.require_current(
-                    account_id=profile.repository_account_id(repository)
-                )
-            except BrokerProfileError:
-                continue
-            expected_ids.add(repository.repo_id)
+        roots_by_id = {
+            repository.repo_id: repository.canonical_root
+            for repository in profile.repositories.values()
+        }
+        repositories = [
+            {
+                **dict(row),
+                "canonical_root": roots_by_id.get(str(row.get("repo_id") or "")),
+            }
+            for row in (result.get("repositories") or [])
+            if isinstance(row, Mapping)
+        ]
         if (
-            {str(row.get("repo_id") or "") for row in repositories}
-            != expected_ids
+            len(repositories) != len(result.get("repositories") or [])
+            or len({str(row.get("repo_id") or "") for row in repositories})
+            != len(repositories)
             or any(
-                row.get("setup_status") not in {"ready", "missing", "invalid"}
+                not str(row.get("repo_id") or "")
+                or not str(row.get("canonical_root") or "")
+                or not str(row.get("display_name") or "")
+                or row.get("setup_status") not in {"ready", "missing", "invalid"}
                 for row in repositories
             )
         ):
@@ -22862,7 +22911,7 @@ def _main_parsed(
             clear_exec_capability_inheritance()
             serve_broker(
                 args,
-                observe_before_lifecycle_plan=observe_broker_service_store_for_enrollment,
+                observe_before_lifecycle_plan=observe_broker_service_store_for_configuration,
             )
             return 0
         except Exception as exc:

@@ -10,6 +10,7 @@ import re
 import sqlite3
 import stat
 from typing import Any, Mapping
+import uuid
 
 from .store import (
     AccountStore,
@@ -276,21 +277,20 @@ def upsert_database_backup(
     repo_id = None
     source_id = None
     if docker_resource_id is not None:
-        membership = connection.execute(
-            """
-            SELECT repo_id, control_binding_id FROM repository_memberships
-            WHERE resource_kind = 'container' AND host_resource_id = ?
-            """,
+        association = connection.execute(
+            "SELECT repo_id, full_container_id FROM docker_resources "
+            "WHERE docker_resource_id = ?",
             (docker_resource_id,),
         ).fetchone()
-        if membership is not None:
-            repo_id = str(membership["repo_id"])
-            if membership["control_binding_id"] is not None:
-                source = connection.execute(
-                    "SELECT source_id FROM control_bindings WHERE binding_id = ?",
-                    (membership["control_binding_id"],),
-                ).fetchone()
-                source_id = str(source[0]) if source is not None else None
+        if association is not None and association["repo_id"] is not None:
+            repo_id = str(association["repo_id"])
+        source = connection.execute(
+            "SELECT source_id FROM source_resources "
+            "WHERE resource_kind = 'container' AND native_id = ? "
+            "ORDER BY created_at DESC, source_resource_id DESC LIMIT 1",
+            (container_id,),
+        ).fetchone()
+        source_id = str(source[0]) if source is not None else None
     backup_id = deterministic_id(
         "database-backup",
         descriptor["artifact_path"],
@@ -377,6 +377,7 @@ def record_successful_restore(
     target_database_name: str,
     result: Mapping[str, Any],
     safety_database_backup_id: str | None = None,
+    operation_id: str | None = None,
 ) -> str:
     """Persist one completed transactional restore; failures never enter the ledger."""
 
@@ -455,19 +456,31 @@ def record_successful_restore(
             (docker_resource_id, target_database_name),
         ).fetchone()
     database_binding_id = str(binding[0]) if binding is not None else None
-    restored_at = utc_timestamp()
     result_fingerprint = "sha256:" + fingerprint(dict(result))
-    restore_event_id = deterministic_id(
-        "database-restore",
-        database_backup_id,
-        target_id,
-        target_database_name,
-        restored_at,
-        result_fingerprint,
-    )
-    connection.execute(
+    if operation_id is not None:
+        try:
+            canonical_operation_id = str(uuid.UUID(operation_id))
+        except (ValueError, AttributeError) as exc:
+            raise ValueError("restore operation ID must be a canonical UUID") from exc
+        if canonical_operation_id != operation_id:
+            raise ValueError("restore operation ID must be a canonical UUID")
+        restore_event_id = deterministic_id(
+            "database-restore-operation", operation_id
+        )
+    else:
+        restored_at_seed = utc_timestamp()
+        restore_event_id = deterministic_id(
+            "database-restore",
+            database_backup_id,
+            target_id,
+            target_database_name,
+            restored_at_seed,
+            result_fingerprint,
+        )
+    restored_at = utc_timestamp()
+    inserted = connection.execute(
         """
-        INSERT INTO database_restore_events(
+        INSERT OR IGNORE INTO database_restore_events(
             restore_event_id, database_backup_id, target_database_binding_id,
             target_docker_resource_id, target_container_id,
             target_database_name, artifact_sha256,
@@ -487,6 +500,32 @@ def record_successful_restore(
             restored_at,
         ),
     )
+    if inserted.rowcount == 0:
+        existing = connection.execute(
+            """
+            SELECT database_backup_id, target_database_binding_id,
+                   target_docker_resource_id, target_container_id,
+                   target_database_name, artifact_sha256,
+                   safety_database_backup_id, result_fingerprint
+            FROM database_restore_events WHERE restore_event_id = ?
+            """,
+            (restore_event_id,),
+        ).fetchone()
+        expected = (
+            database_backup_id,
+            database_binding_id,
+            docker_resource_id,
+            target_id,
+            target_database_name,
+            backup["artifact_sha256"],
+            safety_database_backup_id,
+            result_fingerprint,
+        )
+        if existing is None or tuple(existing) != expected:
+            raise ValueError(
+                "restore operation ID conflicts with another durable restore result"
+            )
+        return restore_event_id
     connection.execute(
         """
         UPDATE database_backups

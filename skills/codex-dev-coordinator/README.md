@@ -13,6 +13,7 @@ devcoordinator capabilities
 devcoordinator targets web --kind service
 devcoordinator runtime status web --kind service
 devcoordinator runtime ensure web --kind service --desired ready
+devcoordinator storage remove container EXACT_RESOURCE_ID --reason "obsolete container"
 devcoordinator test enqueue --intent change
 ```
 
@@ -47,6 +48,12 @@ release return an immutable plan for review and require a separate exact
 `devcoordinator test submit dc1:plan:…` decision. `devcoordinator-mcp` stdio
 tools expose the same contract and accept only MCP protocol `2025-11-25`.
 
+Local tests are narrow feedback only: one invocation must be proven before
+launch to collect at most 20 cases, enforce at most 10 seconds of execution,
+need no shared runtime, and not be one fragment of a suite split across local
+commands. Unknown or larger scope, an unenforceable deadline, and durable
+evidence use one governed enqueue. Static checks remain local.
+
 See [the agent-client reference](references/agent-client.md) for call counts,
 bounds, timing/token-proxy evidence, outcomes, MCP, and ownership.
 
@@ -59,9 +66,12 @@ root → temporary → resource tree. Names, paths, ports, images, and UI heuris
 never establish ownership.
 
 On the confirmed single-developer host, local accounts are attribution and
-failure domains, not mutually distrusting principals. Exact identities,
-generation fencing, bounds, containment, idempotent operation IDs, public
-authorization, and separate secret transports remain enforced.
+failure domains, not mutually distrusting principals. Developer-directed
+container removal is deliberately one direct `docker rm -f` call with no
+ownership, cleanup-grant, archive, state, fingerprint, plan, or confirmation
+gate and never removes volumes. Other runtime and data paths retain their
+documented identity, generation, containment, public-authorization, and secret
+transport controls.
 
 Python owns mechanical context/target resolution, validation, runtime no-op and
 convergence, schema-3-only test planning/submission/follow, safe pre-launch

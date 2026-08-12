@@ -34,9 +34,8 @@ struct RepositoryDecommissionTarget: Decodable, Hashable, Sendable, Identifiable
     let kind: String
     let hostResourceID: String
     let immutableFingerprint: String
-    let controlBindingID: String
-    let ownershipFingerprint: String?
-    let controlContractFingerprint: String?
+    let observationFingerprint: String?
+    let stableIdentityFingerprint: String?
     let displayName: String?
     let currentState: String?
     let policies: [RepositoryLifecyclePolicy]
@@ -47,9 +46,8 @@ struct RepositoryDecommissionTarget: Decodable, Hashable, Sendable, Identifiable
         case kind
         case hostResourceID = "host_resource_id"
         case immutableFingerprint = "immutable_fingerprint"
-        case controlBindingID = "control_binding_id"
-        case ownershipFingerprint = "ownership_fingerprint"
-        case controlContractFingerprint = "control_contract_fingerprint"
+        case observationFingerprint = "observation_fingerprint"
+        case stableIdentityFingerprint = "stable_identity_fingerprint"
         case displayName = "display_name"
         case currentState = "current_state"
         case policies
@@ -57,16 +55,15 @@ struct RepositoryDecommissionTarget: Decodable, Hashable, Sendable, Identifiable
     }
 
     var identityArguments: [String]? {
-        guard let ownershipFingerprint = ownershipFingerprint?
+        guard let observationFingerprint = observationFingerprint?
             .trimmingCharacters(in: .whitespacesAndNewlines),
-            !ownershipFingerprint.isEmpty
+            !observationFingerprint.isEmpty
         else { return nil }
         return [
             "--resource-kind", kind,
             "--resource-id", hostResourceID,
             "--immutable-fingerprint", immutableFingerprint,
-            "--control-binding-id", controlBindingID,
-            "--ownership-fingerprint", ownershipFingerprint,
+            "--association-fingerprint", observationFingerprint,
         ]
     }
 }
@@ -264,8 +261,7 @@ struct ExactUnassignedResource: Identifiable, Hashable, Sendable {
     let kind: String
     let hostResourceID: String
     let immutableFingerprint: String
-    let controlBindingID: String
-    let ownershipFingerprint: String
+    let observationFingerprint: String
     let displayName: String
 
     var identityArguments: [String] {
@@ -273,8 +269,7 @@ struct ExactUnassignedResource: Identifiable, Hashable, Sendable {
             "--resource-kind", kind,
             "--resource-id", hostResourceID,
             "--immutable-fingerprint", immutableFingerprint,
-            "--control-binding-id", controlBindingID,
-            "--ownership-fingerprint", ownershipFingerprint,
+            "--association-fingerprint", observationFingerprint,
         ]
     }
 }

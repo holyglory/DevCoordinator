@@ -1198,7 +1198,7 @@ def restore_store_backup(
             != incoming["summary"]["metadata"]["database_generation"]
         ):
             raise ValueError(
-                "store backup belongs to another database generation; reenroll/reinstall instead"
+                "store backup belongs to another database generation; reconfigure/reinstall instead"
             )
         _copy_private_source(
             incoming["artifact"], staging, expected_uid=uid
@@ -1277,7 +1277,7 @@ def restore_store_export(
             != incoming["summary"]["metadata"]["database_generation"]
         ):
             raise ValueError(
-                "store export belongs to another database generation; reenroll/reinstall instead"
+                "store export belongs to another database generation; reconfigure/reinstall instead"
             )
         try:
             staging = _build_export_staging(database, incoming)

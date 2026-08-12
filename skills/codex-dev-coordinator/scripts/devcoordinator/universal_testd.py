@@ -185,7 +185,7 @@ def _stable_operation_id(kind: str, *values: object) -> str:
 
 @dataclass(frozen=True)
 class BrokerLaunchTicket:
-    """OS-peer-authorized, generation-fenced launch material.
+    """OS-peer-accepted, generation-fenced launch material.
 
     This is a bounded descriptor, not a bearer capability.  The broker and
     testd communicate over a Unix socket authenticated by ``SO_PEERCRED``;
@@ -706,6 +706,32 @@ def _attempt_result_chunk(value: Mapping[str, object]) -> AttemptResultChunk:
     )
 
 
+def _attempt_scoped_result_chunk(
+    attempt_id: str, value: Mapping[str, object]
+) -> AttemptResultChunk:
+    """Bind reporter-local failure identities to one durable attempt."""
+
+    attempt_id = _safe_id("attempt_id", attempt_id)
+    chunk = _attempt_result_chunk(value)
+    failures = tuple(
+        replace(
+            failure,
+            failure_id=(
+                "failure-"
+                + hashlib.sha256(
+                    (
+                        attempt_id
+                        + "\0"
+                        + _safe_id("failure_id", failure.failure_id)
+                    ).encode("utf-8")
+                ).hexdigest()[:32]
+            ),
+        )
+        for failure in chunk.failures
+    )
+    return replace(chunk, failures=failures)
+
+
 @dataclass
 class _ActiveAttempt:
     candidate: RunnableTarget
@@ -717,6 +743,7 @@ class _ActiveAttempt:
     result_chunk_ids: list[str] = field(default_factory=list)
     current_memory_bytes: int | None = None
     runtime_active: bool = True
+    terminal_envelope: AttemptExitEnvelope | None = None
 
 
 class TestdEngine:
@@ -787,6 +814,11 @@ class TestdEngine:
             launch_operation_id=active.handle.launch_operation_id,
             launch_timeout_seconds=active.handle.launch_timeout_seconds,
             launch_confirmed=active.handle.launch_confirmed,
+            terminal_envelope=(
+                None
+                if active.terminal_envelope is None
+                else active.terminal_envelope.to_document()
+            ),
         )
 
     def _retain_active(self, active: _ActiveAttempt) -> None:
@@ -876,6 +908,29 @@ class TestdEngine:
                 next_source_check_at=envelope.next_source_check_at,
                 repository_generation=envelope.repository_generation,
                 result_chunk_ids=list(envelope.result_chunk_ids),
+                terminal_envelope=(
+                    None
+                    if envelope.terminal_envelope is None
+                    else AttemptExitEnvelope.from_document(
+                        envelope.terminal_envelope
+                    )
+                ),
+            )
+            active = self._active[envelope.attempt_id]
+            # The native runner is independently supervised and can outlive a
+            # same-schema testd replacement.  Renew the exact private spool
+            # binding before the ordinary heartbeat/reaper turn so downtime
+            # beyond the short lease cannot falsely abandon live work.
+            self.store.recover_attempt_lease(
+                envelope.attempt_id,
+                generation=envelope.generation,
+                lease_owner=lease.lease_owner,
+                lease_seconds=(
+                    self.lease_seconds
+                    if handle.launch_confirmed
+                    else self._pending_launch_lease_seconds(active)
+                ),
+                operation_id=str(uuid.uuid4()),
             )
 
     def _acknowledge_active(self, active: _ActiveAttempt) -> None:
@@ -1369,8 +1424,14 @@ class TestdEngine:
                             if state == "cancelling"
                             else AttemptConclusion.SUPERSEDED
                         )
-                        self._spool_terminal(active, conclusion)
-                        completed.append(attempt_id)
+                        if self._spool_terminal(active, conclusion):
+                            completed.append(attempt_id)
+                        else:
+                            failed.append({
+                                "attempt_id": attempt_id,
+                                "error_type": "TestStoreConflict",
+                                "stage": "terminal_replay",
+                            })
                         continue
                 observation = self.launcher.observe(active.handle)
                 if observation.launch_confirmed and not active.handle.launch_confirmed:
@@ -1461,7 +1522,7 @@ class TestdEngine:
                                 observed_source_fingerprint=observed,
                                 operation_id=str(uuid.uuid4()),
                             )
-                            self._spool_terminal(
+                            terminalized = self._spool_terminal(
                                 active,
                                 AttemptConclusion.SUPERSEDED,
                                 peak_memory_bytes=(
@@ -1469,7 +1530,14 @@ class TestdEngine:
                                 ),
                                 cpu_seconds=observation.exit_envelope.cpu_seconds,
                             )
-                            completed.append(attempt_id)
+                            if terminalized:
+                                completed.append(attempt_id)
+                            else:
+                                failed.append({
+                                    "attempt_id": attempt_id,
+                                    "error_type": "TestStoreConflict",
+                                    "stage": "terminal_replay",
+                                })
                             continue
                     self._validate_exit(active, observation.exit_envelope)
                     if observation.result_chunk is not None:
@@ -1482,9 +1550,23 @@ class TestdEngine:
                         raise TestStoreConflict(
                             "runner exit references contradictory result chunks"
                         )
-                    self.spool.append(observation.exit_envelope)
-                    self.replay_spool()
-                    completed.append(attempt_id)
+                    terminal_path = self.spool.append(observation.exit_envelope)
+                    self.replay_spool(priority_exit_names=(terminal_path.name,))
+                    attempt = self.store.get_attempt(attempt_id)
+                    if str(attempt["state"]) in {"leased", "running"}:
+                        self.store.heartbeat_attempt(
+                            attempt_id,
+                            generation=active.lease.generation,
+                            lease_seconds=self.lease_seconds,
+                            operation_id=str(uuid.uuid4()),
+                        )
+                        failed.append({
+                            "attempt_id": attempt_id,
+                            "error_type": "TestStoreConflict",
+                            "stage": "terminal_replay",
+                        })
+                    else:
+                        completed.append(attempt_id)
                 else:
                     raise TestStoreContractError("runner observation is incomplete")
             except Exception as error:
@@ -1494,6 +1576,13 @@ class TestdEngine:
     def cancel_run(
         self, *, run_id: str, actor: str, reason: str, operation_id: str
     ) -> dict[str, object]:
+        # A native runner can publish its terminal envelope immediately before
+        # a replacement testd receives cancellation.  Import durable terminal
+        # evidence (and expire any already-dead lease) before changing run
+        # state so cancellation never strands an attempt that has in fact
+        # finished and no longer has an in-memory worker binding.
+        self.replay_spool()
+        self.reap()
         result = self.store.request_cancel(
             run_id, actor=actor, reason=reason, operation_id=operation_id
         )
@@ -1505,8 +1594,10 @@ class TestdEngine:
                 unresolved.append(str(attempt_id))
                 continue
             if self.launcher.cancel(active.handle, reason=reason):
-                self._spool_terminal(active, AttemptConclusion.CANCELLED)
-                cancelled.append(str(attempt_id))
+                if self._spool_terminal(active, AttemptConclusion.CANCELLED):
+                    cancelled.append(str(attempt_id))
+                else:
+                    unresolved.append(str(attempt_id))
             else:
                 unresolved.append(str(attempt_id))
         return {**result, "cancelled_attempt_ids": cancelled, "unresolved_attempt_ids": unresolved}
@@ -1518,38 +1609,56 @@ class TestdEngine:
         *,
         peak_memory_bytes: int | None = None,
         cpu_seconds: float | None = None,
-    ) -> None:
-        duration = max(0.0, float(self.clock()) - active.launched_at)
-        identity = hashlib.sha256(
-            (
-                active.lease.attempt_id
-                + "\0"
-                + str(active.lease.generation)
-                + "\0"
-                + conclusion.value
-                + "\0"
-                + ",".join(active.result_chunk_ids)
-            ).encode("utf-8")
-        ).hexdigest()
-        envelope = AttemptExitEnvelope(
-            envelope_id="exit-" + identity[:32],
-            attempt_id=active.lease.attempt_id,
-            generation=active.lease.generation,
-            operation_id=_stable_operation_id(
-                "terminal",
+    ) -> bool:
+        envelope = active.terminal_envelope
+        if envelope is None:
+            duration = max(0.0, float(self.clock()) - active.launched_at)
+            identity = hashlib.sha256(
+                (
+                    active.lease.attempt_id
+                    + "\0"
+                    + str(active.lease.generation)
+                    + "\0"
+                    + conclusion.value
+                    + "\0"
+                    + ",".join(active.result_chunk_ids)
+                ).encode("utf-8")
+            ).hexdigest()
+            envelope = AttemptExitEnvelope(
+                envelope_id="exit-" + identity[:32],
+                attempt_id=active.lease.attempt_id,
+                generation=active.lease.generation,
+                operation_id=_stable_operation_id(
+                    "terminal",
+                    active.lease.attempt_id,
+                    active.lease.generation,
+                    conclusion.value,
+                    identity,
+                ),
+                conclusion=conclusion,
+                duration_seconds=duration,
+                result_chunk_ids=tuple(active.result_chunk_ids),
+                peak_memory_bytes=peak_memory_bytes,
+                cpu_seconds=cpu_seconds,
+            )
+            active.terminal_envelope = envelope
+            self._retain_active(active)
+        elif envelope.conclusion is not conclusion:
+            raise TestStoreConflict(
+                "active attempt terminal conclusion changed during replay"
+            )
+        terminal_path = self.spool.append(envelope)
+        self.replay_spool(priority_exit_names=(terminal_path.name,))
+        attempt = self.store.get_attempt(active.lease.attempt_id)
+        if str(attempt["state"]) in {"leased", "running"}:
+            self.store.heartbeat_attempt(
                 active.lease.attempt_id,
-                active.lease.generation,
-                conclusion.value,
-                identity,
-            ),
-            conclusion=conclusion,
-            duration_seconds=duration,
-            result_chunk_ids=tuple(active.result_chunk_ids),
-            peak_memory_bytes=peak_memory_bytes,
-            cpu_seconds=cpu_seconds,
-        )
-        self.spool.append(envelope)
-        self.replay_spool()
+                generation=active.lease.generation,
+                lease_seconds=self.lease_seconds,
+                operation_id=str(uuid.uuid4()),
+            )
+            return False
+        return True
 
     @staticmethod
     def _validate_exit(active: _ActiveAttempt, envelope: AttemptExitEnvelope) -> None:
@@ -1559,10 +1668,26 @@ class TestdEngine:
         ):
             raise TestStoreConflict("runner exit envelope is stale or mismatched")
 
-    def replay_spool(self, *, limit: int = 1_000) -> dict[str, object]:
+    def replay_spool(
+        self,
+        *,
+        limit: int = 1_000,
+        priority_exit_names: tuple[str, ...] = (),
+    ) -> dict[str, object]:
         chunks = self.replay_result_spool(limit=limit)
         exits = self.spool.replay(
-            lambda envelope: self.store.terminalize_attempt(
+            self._import_terminal_envelope,
+            limit=limit,
+            priority_names=priority_exit_names,
+        )
+        self._prune_terminal_recovery()
+        return {**exits, "result_chunks": chunks}
+
+    def _import_terminal_envelope(
+        self, envelope: AttemptExitEnvelope
+    ) -> dict[str, object]:
+        try:
+            return self.store.terminalize_attempt(
                 envelope.attempt_id,
                 generation=envelope.generation,
                 conclusion=envelope.conclusion,
@@ -1571,21 +1696,51 @@ class TestdEngine:
                 expected_result_chunk_ids=envelope.result_chunk_ids,
                 peak_memory_bytes=envelope.peak_memory_bytes,
                 cpu_seconds=envelope.cpu_seconds,
-            ),
-            limit=limit,
-        )
-        self._prune_terminal_recovery()
-        return {**exits, "result_chunks": chunks}
+            )
+        except TestStoreConflict:
+            attempt = self.store.get_attempt(envelope.attempt_id)
+            if (
+                int(attempt["generation"]) == envelope.generation
+                and str(attempt["state"]) not in {"leased", "running"}
+                and attempt["terminal_operation_id"] is not None
+            ):
+                return {
+                    "attempt_id": envelope.attempt_id,
+                    "state": str(attempt["state"]),
+                    "replayed_terminal_transport": True,
+                }
+            raise
 
     def replay_result_spool(self, *, limit: int = 1_000) -> dict[str, object]:
         return self.spool.replay_result_chunks(
-            lambda envelope: self.store.append_result_chunk(
-                envelope.attempt_id,
-                generation=envelope.generation,
-                chunk=_attempt_result_chunk(envelope.chunk),
-            ),
+            self._import_result_envelope,
             limit=limit,
         )
+
+    def _import_result_envelope(
+        self, envelope: AttemptResultChunkEnvelope
+    ) -> dict[str, object]:
+        try:
+            return self.store.append_result_chunk(
+                envelope.attempt_id,
+                generation=envelope.generation,
+                chunk=_attempt_scoped_result_chunk(
+                    envelope.attempt_id, envelope.chunk
+                ),
+            )
+        except TestStoreConflict:
+            attempt = self.store.get_attempt(envelope.attempt_id)
+            if (
+                int(attempt["generation"]) == envelope.generation
+                and str(attempt["state"]) not in {"leased", "running"}
+                and attempt["terminal_operation_id"] is not None
+            ):
+                return {
+                    "attempt_id": envelope.attempt_id,
+                    "state": str(attempt["state"]),
+                    "replayed_result_transport": True,
+                }
+            raise
 
     def reap(self) -> dict[str, object]:
         return self.store.reap_expired_attempts(now=float(self.clock()))

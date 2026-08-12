@@ -4,12 +4,13 @@ The reversible archive fence remains owned by :mod:`repository_lifecycle`.
 This module owns the deliberately narrower permanent-cleanup boundary:
 
 * every target is a normalized opaque ID resolved by the service;
-* planning and applying both perform live authorization and fresh observation;
+* planning and applying both perform fresh identity and state validation;
 * a UUID plan and SHA-256 fingerprint are durable before host mutation;
 * apply requires the exact generated confirmation phrase;
 * phase evidence and tombstones make replay and response loss inspectable;
-* Docker removal is exact-ID only and never uses force, ``-v``, image, or
-  volume deletion; and
+* Docker removal is exact-identity only and never uses force, ``-v``, image
+  deletion, or broad pruning; exact named-volume removal additionally requires
+  exclusive project attribution and zero container references; and
 * unsafe worktrees remain blocked instead of being force-removed.
 """
 
@@ -37,12 +38,12 @@ from .repository_lifecycle import (
     RunningState,
 )
 from .sqlite_lifecycle import SQLiteLifecyclePersistence
-from .schema import advance_repository_owner_generation
 from .store import CoordinatorStore, canonical_json, fingerprint, utc_timestamp
 
 
-TARGET_KINDS = frozenset({"project", "server", "container", "worktree"})
+TARGET_KINDS = frozenset({"project", "server", "container", "volume", "worktree"})
 _FULL_CONTAINER_ID = re.compile(r"^[0-9a-f]{64}$")
+_VOLUME_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,254}$")
 _GIT_OID = re.compile(r"^[0-9a-f]{40,64}$")
 RETAINED_AUDIT = ("audit_history", "cleanup_tombstone", "operation_evidence")
 
@@ -106,7 +107,7 @@ class CleanupPlan:
 
 
 class DockerCleanupBackend:
-    """Bounded exact-container inspection and removal."""
+    """Bounded exact-container and exact-volume inspection and removal."""
 
     def __init__(self, *, timeout: float = 15.0) -> None:
         self.timeout = float(timeout)
@@ -171,7 +172,7 @@ class DockerCleanupBackend:
     def remove(self, full_container_id: str) -> Mapping[str, Any]:
         _require_full_container_id(full_container_id)
         result = subprocess.run(
-            [self._executable(), "rm", full_container_id],
+            [self._executable(), "rm", "-f", full_container_id],
             check=False,
             capture_output=True,
             text=True,
@@ -182,13 +183,106 @@ class DockerCleanupBackend:
             diagnostic = (result.stderr + "\n" + result.stdout).strip()
             if "No such container" in diagnostic or "No such object" in diagnostic:
                 return {"already_absent": True, "full_container_id": full_container_id}
-            raise CleanupError("Docker refused exact stopped-container removal")
-        if self.inspect(full_container_id) is not None:
-            raise CleanupError("Docker reported removal but the exact container remains present")
+            raise CleanupError("Docker refused direct container removal")
         return {
             "already_absent": False,
             "full_container_id": full_container_id,
-            "docker_argv_contract": ["docker", "rm", "<exact-full-container-id>"],
+            "docker_argv_contract": [
+                "docker",
+                "rm",
+                "-f",
+                "<exact-full-container-id>",
+            ],
+        }
+
+    def inspect_volume(self, volume_name: str) -> Mapping[str, Any] | None:
+        _require_volume_name(volume_name)
+        result = subprocess.run(
+            [self._executable(), "volume", "inspect", volume_name],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=self.timeout,
+            env=_sanitized_env(),
+        )
+        if result.returncode != 0:
+            diagnostic = (result.stderr + "\n" + result.stdout).strip().lower()
+            if "no such volume" in diagnostic:
+                return None
+            raise CleanupError("Docker inspect failed for the exact volume identity")
+        try:
+            payload = json.loads(result.stdout)
+        except json.JSONDecodeError as error:
+            raise CleanupError("Docker returned invalid volume inspect JSON") from error
+        if not isinstance(payload, list) or len(payload) != 1 or not isinstance(payload[0], dict):
+            raise CleanupError("Docker inspect did not return exactly one volume")
+        item = payload[0]
+        observed_name = str(item.get("Name") or "")
+        if observed_name != volume_name:
+            raise PlanDriftError("Docker resolved the target to another volume identity")
+        labels = item.get("Labels") if isinstance(item.get("Labels"), dict) else {}
+        options = item.get("Options") if isinstance(item.get("Options"), dict) else {}
+        references_result = subprocess.run(
+            [
+                self._executable(),
+                "ps",
+                "--all",
+                "--quiet",
+                "--no-trunc",
+                "--filter",
+                f"volume={volume_name}",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=self.timeout,
+            env=_sanitized_env(),
+        )
+        if references_result.returncode != 0:
+            raise CleanupError("Docker could not prove exact volume references")
+        references = sorted(
+            {
+                line.strip().lower()
+                for line in references_result.stdout.splitlines()
+                if line.strip()
+            }
+        )
+        if any(_FULL_CONTAINER_ID.fullmatch(value) is None for value in references):
+            raise CleanupError("Docker returned an invalid volume-reference identity")
+        return {
+            "volume_name": observed_name,
+            "created_at": str(item.get("CreatedAt") or ""),
+            "driver": str(item.get("Driver") or ""),
+            "scope": str(item.get("Scope") or ""),
+            "labels_fingerprint": "sha256:" + fingerprint(dict(labels)),
+            "options_fingerprint": "sha256:" + fingerprint(dict(options)),
+            "compose_project": str(labels.get("com.docker.compose.project") or ""),
+            "compose_volume": str(labels.get("com.docker.compose.volume") or ""),
+            "reference_count": len(references),
+            "references_fingerprint": "sha256:" + fingerprint(references),
+        }
+
+    def remove_volume(self, volume_name: str) -> Mapping[str, Any]:
+        _require_volume_name(volume_name)
+        result = subprocess.run(
+            [self._executable(), "volume", "rm", volume_name],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=self.timeout,
+            env=_sanitized_env(),
+        )
+        if result.returncode != 0:
+            diagnostic = (result.stderr + "\n" + result.stdout).strip().lower()
+            if "no such volume" in diagnostic:
+                return {"already_absent": True, "volume_name": volume_name}
+            raise CleanupError("Docker refused exact detached-volume removal")
+        if self.inspect_volume(volume_name) is not None:
+            raise CleanupError("Docker reported removal but the exact volume remains present")
+        return {
+            "already_absent": False,
+            "volume_name": volume_name,
+            "docker_argv_contract": ["docker", "volume", "rm", "<exact-volume-name>"],
         }
 
 
@@ -201,7 +295,6 @@ class CleanupLifecycle:
         *,
         lifecycle_adapter: CoordinatorHostLifecycleAdapter | None = None,
         docker_backend: DockerCleanupBackend | None = None,
-        authorize: Callable[[str, str, str, str], None] | None = None,
         prepare_apply: PrepareApplyCallback | None = None,
     ) -> None:
         if prepare_apply is not None and not callable(prepare_apply):
@@ -210,11 +303,9 @@ class CleanupLifecycle:
         self.persistence = SQLiteLifecyclePersistence(store)
         self.lifecycle_adapter = lifecycle_adapter or CoordinatorHostLifecycleAdapter()
         self.docker_backend = docker_backend or DockerCleanupBackend()
-        self._authorize = authorize or (lambda _cap, _kind, _target, _actor: None)
         self._prepare_apply = prepare_apply
 
     def list_archives(self, *, actor: str) -> dict[str, Any]:
-        self._authorize("archives.read", "project", "*", actor)
         with self.store.read_transaction() as connection:
             rows: list[dict[str, Any]] = []
             for row in connection.execute(
@@ -498,7 +589,6 @@ class CleanupLifecycle:
     ) -> CleanupPlan:
         target_kind = _canonical_target_kind(target_kind)
         _require_target(target_kind, target_id)
-        self._authorize("cleanup.plan", target_kind, target_id, actor)
         snapshot = self._snapshot(target_kind, target_id)
         target_fingerprint = "sha256:" + fingerprint(snapshot["identity"])
         material = {
@@ -556,16 +646,13 @@ class CleanupLifecycle:
             raise CleanupError("durable cleanup confirmation is not target-bound")
         if not hmac.compare_digest(str(confirmation_phrase), expected_confirmation):
             raise CleanupError("exact cleanup confirmation phrase is required")
-        # Authorization is deliberately rechecked at apply.  A grant revoked
-        # after planning therefore fails before host or catalogue mutation.
-        self._authorize("cleanup.apply", plan.target_kind, plan.target_id, actor)
         status = self._plan_status(plan.plan_id)
         if status == "succeeded":
             return self._apply_result(plan, partial=False, needs_attention=False)
         current = self._snapshot(plan.target_kind, plan.target_id, allow_absent=True)
         if current.get("absent"):
             host_phase = self._phase_status(plan.plan_id, "host_remove")
-            if plan.target_kind not in {"container", "worktree"} or host_phase not in {
+            if plan.target_kind not in {"container", "volume", "worktree"} or host_phase not in {
                 "running",
                 "succeeded",
             }:
@@ -607,6 +694,17 @@ class CleanupLifecycle:
                     evidence = self.docker_backend.remove(full_id)
                     self._finish_phase(plan.plan_id, "host_remove", evidence)
                 self._finalize_container(plan, actor)
+            elif plan.target_kind == "volume":
+                if not self._phase_succeeded(plan.plan_id, "host_remove"):
+                    volume_name = str(plan.snapshot["identity"]["volume_name"])
+                    self._begin_phase(
+                        plan.plan_id,
+                        "host_remove",
+                        {"target_kind": "volume", "volume_name": volume_name},
+                    )
+                    evidence = self.docker_backend.remove_volume(volume_name)
+                    self._finish_phase(plan.plan_id, "host_remove", evidence)
+                self._finalize_volume(plan, actor)
             elif plan.target_kind == "worktree":
                 if not self._phase_succeeded(plan.plan_id, "host_remove"):
                     self._begin_phase(
@@ -662,6 +760,8 @@ class CleanupLifecycle:
             return self._project_snapshot(target_id)
         if target_kind == "worktree":
             return self._worktree_snapshot(target_id, allow_absent=allow_absent)
+        if target_kind == "volume":
+            return self._volume_snapshot(target_id, allow_absent=allow_absent)
         return self._resource_snapshot(target_kind, target_id, allow_absent=allow_absent)
 
     def _project_snapshot(self, repo_id: str) -> dict[str, Any]:
@@ -738,24 +838,12 @@ class CleanupLifecycle:
                 raise CleanupError("resource must be archived before permanent removal")
             if str(retirement["status"]) != "retired":
                 raise CleanupError("resource archive must complete before permanent removal")
-            binding = connection.execute(
-                """
-                SELECT binding_id FROM control_bindings
-                WHERE resource_kind = ? AND resource_id = ?
-                  AND authority_state = 'authoritative'
-                ORDER BY priority DESC, binding_id LIMIT 1
-                """,
-                (target_kind, target_id),
-            ).fetchone()
-            if binding is None:
-                raise OwnershipError("archived resource has no authoritative exact controller")
-            control_binding_id = str(binding["binding_id"])
         exact, repo_id = self.persistence.resolve_resource(
-            kind, target_id, control_binding_id, include_archived=True
+            kind, target_id, include_archived=True
         )
         observation = self.lifecycle_adapter.observe_exact(exact)
-        if not observation.identity_observable or not observation.ownership_observable:
-            raise OwnershipError("current exact resource ownership is unobservable")
+        if not observation.identity_observable:
+            raise OwnershipError("current exact resource identity is unobservable")
         if observation.immutable_fingerprint != exact.immutable_fingerprint:
             raise PlanDriftError("archived resource immutable identity changed")
         blockers: list[dict[str, Any]] = []
@@ -772,8 +860,7 @@ class CleanupLifecycle:
             "resource_kind": target_kind,
             "resource_id": target_id,
             "immutable_fingerprint": exact.immutable_fingerprint,
-            "control_binding_id": exact.control_binding_id,
-            "ownership_fingerprint": exact.ownership_fingerprint,
+            "observation_fingerprint": exact.observation_fingerprint,
             "native_identity": dict(exact.native_identity),
             "running_state": observation.running_state.value,
             "listener_active": observation.listener_active,
@@ -822,16 +909,22 @@ class CleanupLifecycle:
                             status=str(docker["status"]),
                         )
                     )
-                if any(
-                    key.startswith("com.docker.compose.")
-                    for key in dict(docker["labels"])
-                ):
+                docker_labels = dict(docker["labels"])
+                compose_owned = any(
+                    key.startswith("com.docker.compose.") for key in docker_labels
+                )
+                compose_oneoff = (
+                    str(docker_labels.get("com.docker.compose.oneoff") or "").lower()
+                    == "true"
+                )
+                if compose_owned and not compose_oneoff:
                     blockers.append(
                         _blocker(
                             "compose_owned",
-                            "Compose-labelled containers require project-level Compose cleanup",
+                            "ordinary Compose services require project-level Compose cleanup; only stopped, unmounted Compose one-offs are exact-container reclaimable",
                         )
                     )
+                identity["compose_oneoff"] = compose_oneoff
         else:
             with self.store.read_transaction() as connection:
                 row = connection.execute(
@@ -874,6 +967,144 @@ class CleanupLifecycle:
                 if target_kind == "container"
                 else ["server_command", "server_environment", "active_server_projection"]
             ),
+            "blockers": _deduplicate_blockers(blockers),
+        }
+
+    def _volume_snapshot(
+        self, volume_name: str, *, allow_absent: bool
+    ) -> dict[str, Any]:
+        _require_volume_name(volume_name)
+        native = self.docker_backend.inspect_volume(volume_name)
+        if native is None:
+            if allow_absent:
+                return {"absent": True}
+            raise CleanupError("exact Docker volume is already absent")
+        if str(native.get("volume_name") or "") != volume_name:
+            raise PlanDriftError("Docker volume identity changed during inspection")
+        with self.store.read_transaction() as connection:
+            ownership_rows = list(
+                connection.execute(
+                    """
+                    SELECT asset.snapshot_id, asset.project_name,
+                           asset.working_dir, asset.observation_fingerprint,
+                           definition.compose_definition_id,
+                           definition.definition_fingerprint,
+                           definition.cwd, definition.repo_id,
+                           repository.display_name
+                    FROM observation_snapshots snapshot
+                    JOIN observation_capabilities capability USING(snapshot_id)
+                    JOIN broker_observation_compose_scope scope USING(snapshot_id)
+                    JOIN broker_observed_compose_assets asset USING(snapshot_id)
+                    JOIN repositories repository
+                      ON repository.host_id = snapshot.host_id
+                    JOIN broker_compose_definitions definition
+                      ON definition.repo_id = repository.repo_id
+                     AND definition.project_name = asset.project_name
+                    LEFT JOIN broker_compose_project_claims claim
+                      USING(compose_definition_id)
+                    WHERE asset.asset_kind = 'volume'
+                      AND asset.asset_id = ?
+                      AND repository.state = 'active'
+                      AND (definition.enabled = 1 OR claim.claimed = 1)
+                      AND snapshot.observer_domain = 'host-runtime-v2:full-docker'
+                      AND snapshot.status = 'completed'
+                      AND capability.docker_available = 1
+                      AND scope.assets_complete = 1
+                      AND snapshot.snapshot_id = (
+                          SELECT newer.snapshot_id
+                          FROM observation_snapshots newer
+                          WHERE newer.host_id = snapshot.host_id
+                            AND newer.observer_domain = 'host-runtime-v2:full-docker'
+                            AND newer.status = 'completed'
+                          ORDER BY newer.completed_at DESC, newer.snapshot_id DESC
+                          LIMIT 1
+                      )
+                    ORDER BY definition.repo_id, definition.compose_definition_id
+                    """,
+                    (volume_name,),
+                )
+            )
+        if len(ownership_rows) != 1:
+            raise OwnershipError(
+                "fresh complete Compose observation does not prove one exclusive project owner for this volume"
+            )
+        owner = ownership_rows[0]
+        compose_project = str(native.get("compose_project") or "")
+        compose_volume = str(native.get("compose_volume") or "")
+        if not compose_project or compose_project != str(owner["project_name"]):
+            raise PlanDriftError(
+                "native volume labels do not match its observed Compose project owner"
+            )
+        blockers: list[dict[str, Any]] = []
+        required_native_fields = ("created_at", "driver", "scope")
+        if any(not str(native.get(field) or "") for field in required_native_fields):
+            blockers.append(
+                _blocker(
+                    "volume_identity_incomplete",
+                    "Docker did not expose a complete exact volume identity",
+                )
+            )
+        if not compose_volume:
+            blockers.append(
+                _blocker(
+                    "compose_volume_label_missing",
+                    "the exact volume lacks its Compose logical-volume identity",
+                )
+            )
+        reference_count = native.get("reference_count")
+        if type(reference_count) is not int or reference_count < 0:
+            blockers.append(
+                _blocker(
+                    "volume_references_unobservable",
+                    "Docker did not prove the exact volume reference count",
+                )
+            )
+        elif reference_count:
+            blockers.append(
+                _blocker(
+                    "volume_referenced",
+                    "one or more containers still reference the exact volume",
+                    reference_count=reference_count,
+                )
+            )
+        observed_working_dir = str(owner["working_dir"] or "")
+        definition_cwd = str(owner["cwd"] or "")
+        if observed_working_dir and observed_working_dir != definition_cwd:
+            blockers.append(
+                _blocker(
+                    "compose_working_directory_drift",
+                    "the observed Compose volume working directory no longer matches its definition",
+                )
+            )
+        identity = {
+            "volume_name": volume_name,
+            "created_at": str(native.get("created_at") or ""),
+            "driver": str(native.get("driver") or ""),
+            "scope": str(native.get("scope") or ""),
+            "labels_fingerprint": str(native.get("labels_fingerprint") or ""),
+            "options_fingerprint": str(native.get("options_fingerprint") or ""),
+            "compose_project": compose_project,
+            "compose_volume": compose_volume,
+            "compose_asset_fingerprint": str(owner["observation_fingerprint"]),
+            "compose_definition_id": str(owner["compose_definition_id"]),
+            "compose_definition_fingerprint": str(owner["definition_fingerprint"]),
+            "repo_id": str(owner["repo_id"]),
+        }
+        return {
+            "identity": identity,
+            "repo_id": str(owner["repo_id"]),
+            "target": {
+                "display_name": volume_name,
+                "project_id": str(owner["repo_id"]),
+                "project_display_name": str(owner["display_name"]),
+                "target_kind": "volume",
+            },
+            "effects": [
+                "docker_volume_rm_exact_detached_volume",
+                "retire_exact_project_volume_identity",
+            ],
+            "retained": list(RETAINED_AUDIT),
+            "deleted": ["volume_object", "volume_data"],
             "blockers": _deduplicate_blockers(blockers),
         }
 
@@ -1018,13 +1249,13 @@ class CleanupLifecycle:
                 """
                 INSERT INTO cleanup_phase_evidence(
                     plan_id, phase, status, evidence_json, started_at
-                ) VALUES (?, 'apply_authorized', 'succeeded', ?, ?)
+                ) VALUES (?, 'apply_confirmed', 'succeeded', ?, ?)
                 ON CONFLICT(plan_id, phase) DO UPDATE SET
                     status = 'succeeded', evidence_json = excluded.evidence_json
                 """,
                 (
                     plan.plan_id,
-                    canonical_json({"applier": actor, "authorized_at": timestamp}),
+                    canonical_json({"applier": actor, "confirmed_at": timestamp}),
                     timestamp,
                 ),
             )
@@ -1097,9 +1328,9 @@ class CleanupLifecycle:
     def _run_prepare_apply(self, plan: CleanupPlan, actor: str) -> None:
         """Run and durably record the optional last pre-mutation hook.
 
-        Apply has already revalidated the durable plan, confirmation,
-        authorization, exact current identity, and blockers before reaching
-        this method.  The callback therefore may perform an idempotent
+        Apply has already revalidated the durable plan, confirmation, exact
+        current identity, and blockers before reaching this method. The
+        callback therefore may perform an idempotent
         prerequisite such as unregistering a native worker.  Its evidence is
         committed only after it returns successfully; an exception or invalid
         result leaves the cleanup plan and target catalogue unapplied.
@@ -1133,10 +1364,6 @@ class CleanupLifecycle:
             ).fetchone() is not None:
                 raise CleanupBlocked([_blocker("database_container", "database-bound containers cannot be removed")])
             connection.execute(
-                "DELETE FROM repository_memberships WHERE resource_kind = 'container' AND host_resource_id = ?",
-                (plan.target_id,),
-            )
-            connection.execute(
                 "DELETE FROM unassigned_resources WHERE resource_kind = 'container' AND resource_id = ?",
                 (plan.target_id,),
             )
@@ -1145,12 +1372,8 @@ class CleanupLifecycle:
                 (plan.target_id,),
             )
             connection.execute(
-                "DELETE FROM docker_ownership_claims WHERE docker_resource_id = ?",
+                "DELETE FROM docker_repository_hints WHERE docker_resource_id = ?",
                 (plan.target_id,),
-            )
-            connection.execute(
-                "UPDATE control_bindings SET authority_state = 'retired', generation = generation + 1, updated_at = ? WHERE resource_kind = 'container' AND resource_id = ?",
-                (timestamp, plan.target_id),
             )
             connection.execute(
                 "DELETE FROM resource_retirements WHERE resource_kind = 'container' AND host_resource_id = ?",
@@ -1161,6 +1384,29 @@ class CleanupLifecycle:
                 (plan.target_id,),
             )
             self._insert_tombstone(connection, plan, actor, timestamp)
+            self._complete_in_transaction(connection, plan, timestamp)
+
+    def _finalize_volume(self, plan: CleanupPlan, actor: str) -> None:
+        timestamp = utc_timestamp()
+        with self.store.immediate_transaction() as connection:
+            if self._tombstone_exists(connection, plan):
+                self._complete_in_transaction(connection, plan, timestamp)
+                return
+            current = self.docker_backend.inspect_volume(plan.target_id)
+            if current is not None:
+                raise PlanDriftError(
+                    "exact Docker volume reappeared before cleanup finalization"
+                )
+            self._insert_tombstone(
+                connection,
+                plan,
+                actor,
+                timestamp,
+                extra={
+                    "catalog_retirement": "compose_asset_absent_on_next_fresh_observation",
+                    "native_target": "exact_named_volume",
+                },
+            )
             self._complete_in_transaction(connection, plan, timestamp)
 
     def _finalize_server(self, plan: CleanupPlan, actor: str) -> None:
@@ -1328,66 +1574,14 @@ class CleanupLifecycle:
                 (plan.target_id,),
             )
 
-            # Broker-private ACL/ownership tables exist only in service-owned
-            # stores.  Remove their exact projections when present without
-            # making account-local cleanup depend on broker schema bootstrap.
+            # Optional broker catalog tables exist only in service-owned
+            # stores. Remove their exact routing projections when present.
             conditional_deletes = (
                 (
-                    "broker_runtime_acl",
+                    "broker_port_ranges",
                     """
-                    DELETE FROM broker_runtime_acl
-                    WHERE repo_id = ? AND resource_kind = 'service'
-                      AND resource_id = ?
-                    """,
-                    (plan.repo_id, plan.target_id),
-                ),
-                (
-                    "broker_resource_acl",
-                    """
-                    DELETE FROM broker_resource_acl
-                    WHERE repo_id = ? AND resource_kind = 'server'
-                      AND resource_id = ?
-                    """,
-                    (plan.repo_id, plan.target_id),
-                ),
-                (
-                    "broker_assignment_acl",
-                    """
-                    DELETE FROM broker_assignment_acl
+                    DELETE FROM broker_port_ranges
                     WHERE repo_id = ? AND server_definition_id = ?
-                    """,
-                    (plan.repo_id, plan.target_id),
-                ),
-                (
-                    "broker_port_policies",
-                    """
-                    DELETE FROM broker_port_policies
-                    WHERE repo_id = ? AND server_definition_id = ?
-                    """,
-                    (plan.repo_id, plan.target_id),
-                ),
-                (
-                    "broker_lease_owners",
-                    """
-                    DELETE FROM broker_lease_owners
-                    WHERE repo_id = ? AND server_definition_id = ?
-                    """,
-                    (plan.repo_id, plan.target_id),
-                ),
-                (
-                    "broker_assignment_owners",
-                    """
-                    DELETE FROM broker_assignment_owners
-                    WHERE repo_id = ? AND server_definition_id = ?
-                    """,
-                    (plan.repo_id, plan.target_id),
-                ),
-                (
-                    "broker_cleanup_resource_acl",
-                    """
-                    DELETE FROM broker_cleanup_resource_acl
-                    WHERE repo_id = ? AND resource_kind = 'server'
-                      AND resource_id = ?
                     """,
                     (plan.repo_id, plan.target_id),
                 ),
@@ -1414,14 +1608,6 @@ class CleanupLifecycle:
                 (plan.repo_id, str(definition["name"])),
             )
             delete(
-                "repository_memberships",
-                """
-                DELETE FROM repository_memberships
-                WHERE resource_kind = 'server' AND host_resource_id = ?
-                """,
-                (plan.target_id,),
-            )
-            delete(
                 "unassigned_resources",
                 """
                 DELETE FROM unassigned_resources
@@ -1441,14 +1627,6 @@ class CleanupLifecycle:
                 "startup_policy_restore_states",
                 """
                 DELETE FROM startup_policy_restore_states
-                WHERE resource_kind = 'server' AND resource_id = ?
-                """,
-                (plan.target_id,),
-            )
-            delete(
-                "control_bindings",
-                """
-                DELETE FROM control_bindings
                 WHERE resource_kind = 'server' AND resource_id = ?
                 """,
                 (plan.target_id,),
@@ -1494,18 +1672,6 @@ class CleanupLifecycle:
             if blockers:
                 raise CleanupBlocked(blockers)
             planned_generation = _cleanup_target_generation(plan)
-            owner = connection.execute(
-                """
-                SELECT owner_uid, repository_generation
-                FROM repository_owners WHERE repo_id = ?
-                """,
-                (plan.target_id,),
-            ).fetchone()
-            if (
-                owner is None
-                or int(owner["repository_generation"]) != planned_generation
-            ):
-                raise PlanDriftError("project owner authority is missing or stale")
             changed = connection.execute(
                 """
                 UPDATE repositories
@@ -1517,26 +1683,6 @@ class CleanupLifecycle:
             ).rowcount
             if changed != 1:
                 raise PlanDriftError("project catalog identity changed before removal")
-            advance_repository_owner_generation(
-                connection,
-                repository_id=plan.target_id,
-                owner_uid=int(owner["owner_uid"]),
-                prior_repository_generation=planned_generation,
-                repository_generation=planned_generation + 1,
-                operation_id=plan.plan_id,
-                actor=actor,
-                reason="permanent project cleanup generation fence",
-                timestamp=timestamp,
-                evidence={
-                    "kind": "repository-project-cleanup",
-                    "plan_id": plan.plan_id,
-                    "repository_id": plan.target_id,
-                    "prior_repository_generation": planned_generation,
-                    "repository_generation": planned_generation + 1,
-                    "owner_uid": int(owner["owner_uid"]),
-                    "target_fingerprint": plan.target_fingerprint,
-                },
-            )
             self._insert_tombstone(connection, plan, actor, timestamp)
             self._complete_in_transaction(connection, plan, timestamp)
 
@@ -1634,21 +1780,13 @@ class CleanupLifecycle:
             if self._tombstone_exists(connection, plan):
                 self._complete_in_transaction(connection, plan, timestamp)
                 return
-            owner = connection.execute(
-                """
-                SELECT repository.generation, authority.owner_uid,
-                       authority.repository_generation
-                FROM repositories repository
-                JOIN repository_owners authority USING(repo_id)
-                WHERE repository.repo_id = ?
-                """,
+            repository = connection.execute(
+                "SELECT generation FROM repositories WHERE repo_id = ?",
                 (plan.target_id,),
             ).fetchone()
-            if owner is None or int(owner["generation"]) != int(
-                owner["repository_generation"]
-            ):
-                raise PlanDriftError("worktree owner authority is missing or stale")
-            prior_generation = int(owner["generation"])
+            if repository is None:
+                raise PlanDriftError("worktree repository is missing")
+            prior_generation = int(repository["generation"])
             changed = connection.execute(
                 """
                 UPDATE repositories
@@ -1659,26 +1797,6 @@ class CleanupLifecycle:
             ).rowcount
             if changed != 1:
                 raise PlanDriftError("worktree repository generation changed")
-            advance_repository_owner_generation(
-                connection,
-                repository_id=plan.target_id,
-                owner_uid=int(owner["owner_uid"]),
-                prior_repository_generation=prior_generation,
-                repository_generation=prior_generation + 1,
-                operation_id=plan.plan_id,
-                actor=actor,
-                reason="permanent worktree cleanup generation fence",
-                timestamp=timestamp,
-                evidence={
-                    "kind": "repository-worktree-cleanup",
-                    "plan_id": plan.plan_id,
-                    "repository_id": plan.target_id,
-                    "prior_repository_generation": prior_generation,
-                    "repository_generation": prior_generation + 1,
-                    "owner_uid": int(owner["owner_uid"]),
-                    "target_fingerprint": plan.target_fingerprint,
-                },
-            )
             self._insert_tombstone(connection, plan, actor, timestamp)
             self._complete_in_transaction(connection, plan, timestamp)
 
@@ -1906,20 +2024,6 @@ class CleanupLifecycle:
                         "database-bound containers require a separately proven backup/removal workflow",
                     )
                 )
-            if connection.execute(
-                """
-                SELECT 1 FROM docker_ownership_claims
-                WHERE docker_resource_id = ? AND provenance = 'compose'
-                  AND conflict_state != 'retired' LIMIT 1
-                """,
-                (target_id,),
-            ).fetchone() is not None:
-                blockers.append(
-                    _blocker(
-                        "compose_owned",
-                        "Compose-owned containers must be removed through a proven Compose project cleanup",
-                    )
-                )
             mounts = connection.execute(
                 "SELECT full_container_id FROM docker_resources WHERE docker_resource_id = ?",
                 (target_id,),
@@ -1949,24 +2053,28 @@ class CleanupLifecycle:
             blockers.append(_blocker("active_assignment", "project still has an active port assignment"))
         if connection.execute(
             """
-            SELECT 1 FROM repository_memberships m
-            LEFT JOIN resource_retirements rr
-              ON rr.resource_kind = m.resource_kind
-             AND rr.host_resource_id = m.host_resource_id
-            WHERE m.repo_id = ? AND rr.host_resource_id IS NULL
-              AND EXISTS (
-                SELECT 1 FROM server_observations so
-                WHERE m.resource_kind = 'server'
-                  AND so.server_definition_id = m.host_resource_id
-                  AND so.lifecycle IN ('running','starting','unhealthy')
-                UNION ALL
-                SELECT 1 FROM docker_observations do
-                WHERE m.resource_kind = 'container'
-                  AND do.docker_resource_id = m.host_resource_id
-                  AND do.lifecycle = 'running'
-              ) LIMIT 1
+            SELECT 1
+            FROM server_definitions definition
+            JOIN server_observations observation USING(server_definition_id)
+            LEFT JOIN resource_retirements retirement
+              ON retirement.resource_kind = 'server'
+             AND retirement.host_resource_id = definition.server_definition_id
+            WHERE definition.repo_id = ?
+              AND retirement.host_resource_id IS NULL
+              AND observation.lifecycle IN ('running','starting','unhealthy')
+            UNION ALL
+            SELECT 1
+            FROM docker_resources resource
+            JOIN docker_observations observation USING(docker_resource_id)
+            LEFT JOIN resource_retirements retirement
+              ON retirement.resource_kind = 'container'
+             AND retirement.host_resource_id = resource.docker_resource_id
+            WHERE resource.repo_id = ?
+              AND retirement.host_resource_id IS NULL
+              AND observation.lifecycle = 'running'
+            LIMIT 1
             """,
-            (repo_id,),
+            (repo_id, repo_id),
         ).fetchone() is not None:
             blockers.append(_blocker("active_child", "project still has a running child resource"))
         return blockers
@@ -1977,11 +2085,17 @@ def _canonical_target_kind(value: str) -> str:
     if normalized == "repository":
         return "project"
     if normalized not in TARGET_KINDS:
-        raise CleanupError("target_kind must be project, server, container, or worktree")
+        raise CleanupError(
+            "target_kind must be project, server, container, volume, or worktree"
+        )
     return normalized
 
 
 def _cleanup_target_generation(plan: CleanupPlan) -> int:
+    if plan.target_kind == "volume":
+        if not re.fullmatch(r"sha256:[0-9a-f]{64}", plan.target_fingerprint):
+            raise PlanDriftError("volume cleanup plan lacks an exact identity fingerprint")
+        return int(plan.target_fingerprint.removeprefix("sha256:")[:15], 16)
     if plan.target_kind != "project":
         return 0
     identity = plan.snapshot.get("identity")
@@ -1999,6 +2113,11 @@ def _require_target(kind: str, target_id: str) -> None:
     value = str(target_id or "")
     if not value or len(value) > 512 or any(ord(character) < 32 for character in value):
         raise CleanupError("target_id is invalid")
+
+
+def _require_volume_name(value: str) -> None:
+    if _VOLUME_NAME.fullmatch(str(value or "")) is None:
+        raise CleanupError("volume target must be one exact Docker volume name")
 
 
 def _require_canonical_uuid(value: str) -> None:

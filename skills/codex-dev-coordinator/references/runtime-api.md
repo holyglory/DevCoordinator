@@ -95,21 +95,37 @@ stored repository/resource IDs to the peer-authenticated broker, and supports
 classification, and exact-membership revalidation. Shared `start`, `stop`, and
 `restart` are enabled for existing enrolled Docker and database-stack targets;
 they use an exact underlying container ID, durable replay, fresh final
-observation, and terminal state/readiness proof. Enrolled worker-role services
-also support peer-UID status/start/stop/restart and structured,
-generation-checked replacement through a fixed native runner. Other persistent
-service roles return `runtime_supervisor_required`. The dedicated `runtime
-serve` temporary-service path is broker supervised and owns durable expiry
-cleanup.
+observation, and terminal state/readiness proof. A positive test/temporary TTL
+on shared Docker or database-stack `start`/`restart` precommits an exact
+broker-owned borrowed-resource session before mutation. The independent broker
+reaper stops only the same immutable container at expiry and retains the
+catalog/database binding; a newer session for that resource supersedes the
+older cleanup. Every enrolled service role supports peer-UID
+status/start/stop/restart through the same fixed native supervisor. A first
+non-worker start records `keep_alive=false` unless an explicit policy is
+provided; worker-role services additionally support structured,
+generation-checked replacement and the explicit crash-loop policy. A service
+with a health endpoint must have one exact active port binding. Start/restart
+proves that port belongs to the supervised PID identity at the sealed cwd;
+failure stops the exact supervised service. Stop proves both the pre-stop
+process identity absent (including PID reuse) and the bound port free. The
+dedicated `runtime serve` temporary-service path is broker supervised and owns
+durable expiry cleanup.
 An ambiguous restart remains `operation_outcome_uncertain` when observing the
-container running cannot prove that the restart transition occurred. Generic
-`run`, arbitrary client-authored service definitions, and Docker/database
-replacement are rejected; `runtime serve` is the narrow exact-port exception
-with structured argv, repository-relative cwd, positive TTL, and systemd-owned
-cleanup.
+container running cannot prove that the restart transition occurred. Path-free
+Docker and database-stack `replace` is available only for one enrolled,
+administrator-sealed, single-replica Compose service. The broker strongly
+verifies the old database backup before recreation, proves one new immutable
+container and exact old-ID absence, atomically rebinds authority, restores the
+same logical database binding, and returns both physical identities. It never
+accepts client Compose paths or definitions. Generic `run` and arbitrary
+client-authored service definitions remain rejected; `runtime serve` is the
+narrow exact-port exception with structured argv, repository-relative cwd,
+positive TTL, and systemd-owned cleanup.
 Do not create a private shadow store to bypass that boundary. Explicit isolated
-account authority retains the full source implementation; its detached TTL
-lifecycle requires the long-lived authenticated `api serve` owner.
+account authority retains the full source implementation for structured
+definitions and `run`; its detached non-broker lifecycle requires the
+long-lived authenticated `api serve` owner.
 
 ## Advanced: governed Compose run-once
 
@@ -240,12 +256,16 @@ rejects combinations that cannot preserve identity or data. Service
 replacement is rollback-capable; shared authority restricts it to an enrolled
 worker, exact peer UID, repository-contained cwd, structured argv/environment,
 and an expected definition generation. Docker and database-stack replacement
-return `unsupported_safe_replace` before store or host access. Compose options
-cannot enable it; the required recreate/rebind and verified PostgreSQL
-backup/restore transaction remains in `CompletionLedger.md`.
+accept only the existing enrolled immutable target ID. Broker authority derives
+the sealed Compose definition and service, force-recreates only that service,
+preserves declared volumes and dependencies, proves identity transition, and
+publishes created-resource cleanup ownership. Database replacement additionally
+requires a strongly verified old-ID backup, transactional restore, integrity
+check, exact completion receipt, and fail-closed lost-reply reconciliation.
 
 `purpose` is `development`, `test`, or `temporary`. Every request includes an
-explicit boolean `kill_after_run`; only `run` may set it true. Test and
+explicit boolean `kill_after_run`; bounded `run` and Docker/database replacement
+may set it true. Test and
 temporary start, restart, replace, and run actions require a positive bounded
 `ttl_seconds`. Read-only status requires null, and explicit stop may also use
 null. A `run` request supplies structured `run_argv`; the API starts the
@@ -511,7 +531,8 @@ preserves the old evidence.
 ## Temporary cleanup
 
 Runtime sessions persist their expiry and exact resource fingerprints before a
-mutation. `kill_after_run=true` performs synchronous cleanup when `run` ends;
+mutation. `kill_after_run=true` performs synchronous cleanup when bounded `run`
+or Docker/database replacement ends;
 the TTL reaper is the crash fallback. Cleanup is idempotent and exact-identity
 bound. After exact stop, listener, lease, and assignment proof, one transaction
 deletes a session-created service's active definition, command/environment,
@@ -522,8 +543,12 @@ repository is startup-fenced and omitted from active repository trees; its
 proved Git-family scope identity is retained so explicit Coordinator reinstall
 can safely reactivate it. Pre-existing services, Docker resources, and database
 targets are borrowed: cleanup stops them when required but retains their
-catalog, membership, and repository presentation. The current API cannot create
-Docker/database targets and rejects a `removed` disposition for either kind.
+catalog, membership, and repository presentation. A successful Docker/database
+replacement changes the session resource to `created` only after the new
+immutable identity is proved. TTL or KillAfterRun cleanup then removes that
+exact new container and deletes its active membership/database binding only
+after a fresh exact-absence observation; retained development replacement keeps
+the new catalog identity.
 
 ## Lower-level and operator interfaces
 

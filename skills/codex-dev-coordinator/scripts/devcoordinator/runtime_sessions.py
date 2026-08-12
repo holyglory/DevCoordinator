@@ -309,28 +309,11 @@ def _delete_created_service_catalog(
             result={**cleanup_result, "catalog_blockers": sorted(set(blockers))},
         )
 
-    membership = connection.execute(
-        """
-        SELECT membership_id, repo_id, control_binding_id
-        FROM repository_memberships
-        WHERE resource_kind = 'server' AND host_resource_id = ?
-        """,
-        (resource_id,),
-    ).fetchone()
-    if membership is None or str(membership["repo_id"]) != repo_id:
+    if str(definition["repo_id"] or "") != repo_id:
         raise RuntimeCatalogCleanupError(
-            "runtime-created service has no exact repository membership",
+            "runtime-created service catalog association changed",
             result=cleanup_result,
         )
-    foreign_control = _one_value(
-        connection,
-        """
-        SELECT 1 FROM control_bindings
-        WHERE resource_kind = 'server' AND resource_id = ?
-          AND repo_id IS NOT NULL AND repo_id != ? LIMIT 1
-        """,
-        (resource_id, repo_id),
-    )
     foreign_policy = _one_value(
         connection,
         """
@@ -340,9 +323,9 @@ def _delete_created_service_catalog(
         """,
         (resource_id, repo_id),
     )
-    if foreign_control or foreign_policy:
+    if foreign_policy:
         raise RuntimeCatalogCleanupError(
-            "runtime-created service active catalog crosses repository authority",
+            "runtime-created service policy crosses its catalog association",
             result=cleanup_result,
         )
 
@@ -383,16 +366,6 @@ def _delete_created_service_catalog(
         (resource_id,),
     )
     delete(
-        "repository_memberships",
-        "DELETE FROM repository_memberships WHERE membership_id = ?",
-        (str(membership["membership_id"]),),
-    )
-    delete(
-        "control_bindings",
-        "DELETE FROM control_bindings WHERE resource_kind = 'server' AND resource_id = ?",
-        (resource_id,),
-    )
-    delete(
         "server_definitions",
         "DELETE FROM server_definitions WHERE server_definition_id = ? AND repo_id = ?",
         (resource_id, repo_id),
@@ -416,11 +389,9 @@ def _empty_temporary_scope_blockers(
 ) -> list[str]:
     checks = (
         ("server_definitions", "SELECT 1 FROM server_definitions WHERE repo_id = ? LIMIT 1"),
-        ("memberships", "SELECT 1 FROM repository_memberships WHERE repo_id = ? LIMIT 1"),
         ("database_bindings", "SELECT 1 FROM database_bindings WHERE repo_id = ? LIMIT 1"),
-        ("docker_claims", "SELECT 1 FROM docker_ownership_claims WHERE repo_id = ? AND conflict_state != 'retired' LIMIT 1"),
+        ("docker_claims", "SELECT 1 FROM docker_repository_hints WHERE repo_id = ? AND conflict_state != 'retired' LIMIT 1"),
         ("source_resources", "SELECT 1 FROM source_resources WHERE repo_id = ? LIMIT 1"),
-        ("control_bindings", "SELECT 1 FROM control_bindings WHERE repo_id = ? AND authority_state != 'retired' LIMIT 1"),
         ("startup_policies", "SELECT 1 FROM startup_policies WHERE repo_id = ? LIMIT 1"),
         ("port_assignments", "SELECT 1 FROM port_assignments WHERE repo_id = ? LIMIT 1"),
         ("leases", "SELECT 1 FROM leases WHERE repo_id = ? LIMIT 1"),
@@ -511,6 +482,106 @@ def _remove_empty_temporary_scope(
     }
 
 
+def _delete_created_docker_catalog(
+    connection: Any,
+    *,
+    session: Any,
+    resource: dict[str, Any],
+    cleanup_result: dict[str, Any],
+    timestamp: str,
+) -> dict[str, Any]:
+    """Hide one proved-absent session-created Docker incarnation."""
+
+    kind = str(resource.get("resource_kind") or "")
+    resource_id = str(resource.get("resource_id") or "")
+    if kind not in {"docker", "database_stack"}:
+        raise RuntimeCatalogCleanupError(
+            "runtime-created Docker catalog target has an invalid kind",
+            result=cleanup_result,
+        )
+    try:
+        identity = json.loads(str(resource.get("identity_json") or ""))
+    except json.JSONDecodeError as exc:
+        raise RuntimeCatalogCleanupError(
+            "runtime-created Docker catalog identity is invalid",
+            result=cleanup_result,
+        ) from exc
+    terminal = cleanup_result.get("terminal")
+    if (
+        not isinstance(identity, dict)
+        or identity.get("state") != "created"
+        or identity.get("disposition") != "session_created"
+        or identity.get("resource_kind") != kind
+        or identity.get("resource_id") != resource_id
+        or not isinstance(terminal, dict)
+        or terminal.get("lifecycle") != "absent"
+        or terminal.get("resource_kind") != kind
+        or terminal.get("resource_id") != resource_id
+        or terminal.get("docker_resource_id")
+        != identity.get("docker_resource_id")
+        or terminal.get("full_container_id")
+        != identity.get("full_container_id")
+    ):
+        raise RuntimeCatalogCleanupError(
+            "runtime-created Docker cleanup lacks exact terminal absence evidence",
+            result=cleanup_result,
+        )
+    docker_resource_id = str(identity["docker_resource_id"])
+    association = connection.execute(
+        "SELECT repo_id FROM docker_resources WHERE docker_resource_id = ?",
+        (docker_resource_id,),
+    ).fetchone()
+    if association is None or str(association["repo_id"] or "") != str(session["repo_id"]):
+        raise RuntimeCatalogCleanupError(
+            "runtime-created Docker catalog association changed before cleanup",
+            result=cleanup_result,
+        )
+    if kind == "database_stack":
+        database_binding_id = str(identity.get("database_binding_id") or "")
+        if database_binding_id != resource_id:
+            raise RuntimeCatalogCleanupError(
+                "runtime-created database binding changed before cleanup",
+                result=cleanup_result,
+            )
+        binding = connection.execute(
+            """
+            SELECT docker_resource_id, repo_id FROM database_bindings
+            WHERE database_binding_id = ?
+            """,
+            (database_binding_id,),
+        ).fetchone()
+        if (
+            binding is None
+            or str(binding["docker_resource_id"]) != docker_resource_id
+            or str(binding["repo_id"] or "") != str(session["repo_id"])
+        ):
+            raise RuntimeCatalogCleanupError(
+                "runtime-created database binding lost its exact container authority",
+                result=cleanup_result,
+            )
+        connection.execute(
+            "DELETE FROM database_observations WHERE database_binding_id = ?",
+            (database_binding_id,),
+        )
+        connection.execute(
+            "DELETE FROM database_bindings WHERE database_binding_id = ?",
+            (database_binding_id,),
+        )
+    connection.execute(
+        "UPDATE docker_resources SET repo_id = NULL, updated_at = ? "
+        "WHERE docker_resource_id = ?",
+        (timestamp, docker_resource_id),
+    )
+    return {
+        "resource_kind": kind,
+        "resource_id": resource_id,
+        "docker_resource_id": docker_resource_id,
+        "ownership": "session_created",
+        "active_catalog_deleted": True,
+        "historical_identity_retained": True,
+    }
+
+
 def _finalize_active_catalog_cleanup(
     connection: Any,
     *,
@@ -545,21 +616,28 @@ def _finalize_active_catalog_cleanup(
         for resource in resources
         if str(resource.get("cleanup_disposition") or "") == "retained"
     ]
-    if any(str(item.get("resource_kind")) != "service" for item in removed):
-        raise RuntimeCatalogCleanupError(
-            "current runtime API cannot classify Docker/database targets as created",
-            result=cleanup_result,
-        )
-    removed_evidence = [
-        _delete_created_service_catalog(
-            connection,
-            session=session,
-            request=request,
-            resource=resource,
-            cleanup_result=cleanup_result,
-        )
-        for resource in removed
-    ]
+    removed_evidence = []
+    for resource in removed:
+        if str(resource.get("resource_kind")) == "service":
+            removed_evidence.append(
+                _delete_created_service_catalog(
+                    connection,
+                    session=session,
+                    request=request,
+                    resource=resource,
+                    cleanup_result=cleanup_result,
+                )
+            )
+        else:
+            removed_evidence.append(
+                _delete_created_docker_catalog(
+                    connection,
+                    session=session,
+                    resource=resource,
+                    cleanup_result=cleanup_result,
+                    timestamp=timestamp,
+                )
+            )
     temporary_scope = _remove_empty_temporary_scope(
         connection,
         session=session,
@@ -623,6 +701,12 @@ def _process_identity(pid: int) -> str | None:
     if not separator or state.startswith("Z") or not started.strip():
         return None
     return "ps-start:" + started.strip()
+
+
+def runtime_process_identity(pid: int | None = None) -> str | None:
+    """Return the stable identity used by durable runtime-session ownership."""
+
+    return _process_identity(os.getpid() if pid is None else int(pid))
 
 
 def create_runtime_session(
@@ -711,10 +795,17 @@ def link_runtime_resource(
         raise ValueError("runtime cleanup disposition must be removed or retained")
     if resource_kind not in {"service", "docker", "database_stack"}:
         raise ValueError("runtime resource kind is unsupported")
-    if resource_kind != "service" and cleanup_disposition == "removed":
+    if (
+        resource_kind in {"docker", "database_stack"}
+        and cleanup_disposition == "removed"
+        and (
+            not isinstance(identity, dict)
+            or identity.get("state") != "created"
+            or identity.get("disposition") != "session_created"
+        )
+    ):
         raise ValueError(
-            "current runtime API targets pre-existing Docker/database resources; "
-            "their cleanup disposition must be retained"
+            "pre-existing Docker/database resources must use retained cleanup"
         )
     linked_at = timestamp or utc_timestamp()
     identity_fingerprint = immutable_fingerprint or (
@@ -928,7 +1019,8 @@ def _claim_cleanup(
                 WHERE newer.resource_kind = ? AND newer.resource_id = ?
                   AND newer.rowid > ?
                   AND newer.cleanup_state IN (
-                      'active', 'cleanup_pending', 'cleaning', 'failed'
+                      'active', 'cleanup_pending', 'cleaning', 'failed',
+                      'retained'
                   )
                   AND newer_session.status NOT IN ('cleaned', 'expired')
                 LIMIT 1

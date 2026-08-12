@@ -70,33 +70,10 @@ def broker_capabilities(
             "cli": "devcoordinator",
             "mcp_stdio": "devcoordinator-mcp",
         },
-        "approval_classes": {
-            "read_only": [
-                "capabilities",
-                "operation.follow",
-                "repository.resolve",
-                "runtime.capture_logs",
-                "runtime.status",
-                "targets",
-                "test.follow",
-            ],
-            "mutating": [
-                "repository.ensure",
-                "runtime.ensure",
-                "runtime.restart",
-                "runtime.serve",
-                "runtime.start",
-                "runtime.stop",
-                "test.enqueue",
-                "test.submit",
-            ],
-            "explicit_review": ["test.enqueue.handoff", "test.enqueue.release"],
-        },
         "runtime": {
             "target_kinds": ["service", "docker", "database_stack"],
             "actions": [
                 "capture_logs",
-                "remove",
                 "replace",
                 "restart",
                 "serve",
@@ -113,27 +90,44 @@ def broker_capabilities(
             "ensure_operation": "repository.ensure",
             "resolve_operation": "repository.resolve",
         },
+        "storage": {
+            "actions": ["apply", "inventory", "plan", "remove"],
+            "target_kinds": ["container", "image", "volume", "build_cache"],
+            "direct_remove_target_kinds": ["container"],
+            "plan_apply_target_kinds": ["volume"],
+            "project_attribution": True,
+            "exact_reclaim_plans": True,
+            "durable_confirmation_bound_apply": True,
+        },
         "tests": {
             "actions": [
                 "artifact",
                 "cancel",
-                "catalog",
                 "enqueue",
                 "failures",
                 "follow",
-                "plan",
-                "policy",
                 "retry",
-                "stats",
                 "status",
                 "submit",
                 "summary",
                 "wait",
             ],
-            "enqueue_intents": ["change", "checkpoint", "manual"],
-            "explicit_review_intents": ["handoff", "release"],
+            "enqueue_intents": [
+                "change",
+                "checkpoint",
+                "handoff",
+                "release",
+                "manual",
+            ],
         },
         "continuations": {"operation_follow": True, "run_follow": True},
+        "administration": {
+            "systemd_unit": {
+                "cli": "devcoordinator-systemd-unit",
+                "confirmation_bound": True,
+                "project_sealed": True,
+            }
+        },
     }
 
 

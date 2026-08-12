@@ -334,8 +334,8 @@ func usageRank(_ usage: ProjectUsage) -> (Double, Double, Int) {
 
 func projectGroupStatus(_ group: ProjectGroup) -> String {
     if !group.serverConflicts.isEmpty
-        || !group.serverMembershipConflicts.isEmpty
-        || !group.dockerMembershipConflicts.isEmpty {
+        || !group.serverAssociationConflicts.isEmpty
+        || !group.dockerAssociationConflicts.isEmpty {
         return "unhealthy"
     }
     if group.servers.contains(where: { ($0.status ?? "").lowercased() == "unhealthy" }) { return "unhealthy" }
@@ -377,11 +377,11 @@ func projectConflictOrigins(_ conflict: RepositoryServerConflict) -> [Coordinato
 
 func projectGroupConflictSummary(_ group: ProjectGroup) -> String? {
     let messages = group.serverConflicts.map(\.message)
-        + group.serverMembershipConflicts.map(\.message)
-        + group.dockerMembershipConflicts.map(\.message)
+        + group.serverAssociationConflicts.map(\.message)
+        + group.dockerAssociationConflicts.map(\.message)
     guard let first = messages.first else { return nil }
     guard messages.count > 1 else { return first }
-    return "\(messages.count) ownership conflicts block project actions until repository and resource evidence agree."
+    return "\(messages.count) association conflicts block project actions until repository and resource evidence agree."
 }
 
 func projectGroupCanStop(_ group: ProjectGroup) -> Bool {
@@ -1792,7 +1792,7 @@ struct ResourceAttributionPresentation: Hashable {
     let reasonCode: AttributionReasonCode
     let explanation: String
     let observedBy: [String]
-    let controller: String?
+    let route: String?
     let canAttach: Bool
     let canRetire: Bool
     let recommendedNextStep: String?
@@ -1807,7 +1807,7 @@ struct ResourceAttributionPresentation: Hashable {
             return "If this resource belongs to an installed repository, attach it there. Otherwise retire it to stop it, block future automatic starts, and hide it without deleting its data."
         }
         if canAttach {
-            return "Choose the installed repository that owns this exact resource. Attaching records ownership but does not start it."
+            return "Choose the installed repository that owns this exact resource. Attaching records association but does not start it."
         }
         if canRetire {
             return "Retire this exact standalone resource to stop it, block future automatic starts, and hide it without deleting its data."
@@ -1819,10 +1819,10 @@ struct ResourceAttributionPresentation: Hashable {
             return "Choose a real local Git repository and install it with the Coordinator skill."
         case .conflictingClaims:
             return "Resolve the conflicting repository claims before any lifecycle action can run."
-        case .nameOnly, .ambiguousControl, .unknown:
-            return "Register or explicitly attach this exact resource through the Coordinator skill. Lifecycle controls stay unavailable until one controller is proved."
+        case .nameOnly, .ambiguousAssociation, .unknown:
+            return "Register or explicitly attach this exact resource through the Coordinator skill. Lifecycle controls stay unavailable until its repository association is known."
         case .staleObservation:
-            return "Refresh host observations, then review the current controller evidence."
+            return "Refresh host observations, then review the current route evidence."
         case .startFenceViolated:
             return "Keep this resource stopped and use the Coordinator skill to resume the retained removal operation before trusting the hidden state again."
         }
@@ -1837,26 +1837,26 @@ func attributionPresentation(for server: ManagedServer) -> ResourceAttributionPr
             observedBy: attribution.observedBy.isEmpty
                 ? server.observationOrigins.map(\.label)
                 : attribution.observedBy,
-            controller: attribution.controller,
+            route: server.origin?.label,
             canAttach: attribution.canAttach,
             canRetire: attribution.canRetire,
             recommendedNextStep: attribution.recommendedNextStep
         )
     }
-    guard server.project == nil || server.ownershipError != nil else { return nil }
-    let explanation = server.ownershipError
+    guard server.project == nil || server.associationError != nil else { return nil }
+    let explanation = server.associationError
         ?? "No validated Git repository path was recorded for this server."
     return ResourceAttributionPresentation(
         reasonCode: explanation.localizedCaseInsensitiveContains("conflict")
             || explanation.localizedCaseInsensitiveContains("several")
             ? .conflictingClaims
-            : (server.origin == nil ? .ambiguousControl : .nameOnly),
+            : (server.origin == nil ? .ambiguousAssociation : .nameOnly),
         explanation: explanation,
         observedBy: resourceObservationOrigins(
             primary: server.origin,
             candidates: server.observationOrigins
         ).map(\.label),
-        controller: server.ownershipError == nil ? server.origin?.label : nil,
+        route: server.origin?.label,
         canAttach: false,
         canRetire: false,
         recommendedNextStep: nil
@@ -1871,26 +1871,26 @@ func attributionPresentation(for container: DockerContainer) -> ResourceAttribut
             observedBy: attribution.observedBy.isEmpty
                 ? container.observationOrigins.map(\.label)
                 : attribution.observedBy,
-            controller: attribution.controller,
+            route: container.origin?.label,
             canAttach: attribution.canAttach,
             canRetire: attribution.canRetire,
             recommendedNextStep: attribution.recommendedNextStep
         )
     }
-    guard container.project == nil || container.ownershipError != nil else { return nil }
-    let explanation = container.ownershipError
+    guard container.project == nil || container.associationError != nil else { return nil }
+    let explanation = container.associationError
         ?? "No Coordinator registration or Docker Compose repository path was found."
     return ResourceAttributionPresentation(
         reasonCode: explanation.localizedCaseInsensitiveContains("conflict")
             || explanation.localizedCaseInsensitiveContains("several")
             ? .conflictingClaims
-            : (container.origin == nil ? .ambiguousControl : .nameOnly),
+            : (container.origin == nil ? .ambiguousAssociation : .nameOnly),
         explanation: explanation,
         observedBy: resourceObservationOrigins(
             primary: container.origin,
             candidates: container.observationOrigins
         ).map(\.label),
-        controller: container.ownershipError == nil ? container.origin?.label : nil,
+        route: container.origin?.label,
         canAttach: false,
         canRetire: false,
         recommendedNextStep: nil
@@ -1924,7 +1924,7 @@ struct ResourceAttributionCallout: View {
                     ? "No current source"
                     : attribution.observedBy.sorted().joined(separator: ", ")
             )
-            DetailLine(label: "Controller", value: attribution.controller ?? "No authoritative controller")
+            DetailLine(label: "Command route", value: attribution.route ?? "No current route")
             Text(attribution.nextStep)
                 .font(.system(size: 11, weight: .semibold))
                 .fixedSize(horizontal: false, vertical: true)
@@ -2018,12 +2018,12 @@ struct SelectedServerPanel: View {
             if let supervision = server.supervision {
                 WorkerSupervisionPanel(store: store, server: server, supervision: supervision)
             }
-            if let ownershipError = server.ownershipError {
-                Label(ownershipError, systemImage: "exclamationmark.triangle.fill")
+            if let associationError = server.associationError {
+                Label(associationError, systemImage: "exclamationmark.triangle.fill")
                     .font(.system(size: 11, weight: .semibold))
                     .foregroundStyle(Theme.orange)
                     .fixedSize(horizontal: false, vertical: true)
-                    .accessibilityIdentifier("server-ownership-conflict")
+                    .accessibilityIdentifier("server-association-conflict")
             }
             Button {
                 store.showServerLogs(server)
@@ -2269,7 +2269,7 @@ struct SelectedDockerPanel: View {
                 DetailLine(label: "Project", value: container.project ?? "Unavailable")
                 DetailLine(label: "Container ID", value: container.id ?? "Unavailable")
                 DetailLine(label: "Metadata source", value: container.metadataSource ?? "Unavailable")
-                if let error = container.ownershipError { DetailLine(label: "Ownership", value: error) }
+                if let error = container.associationError { DetailLine(label: "Association", value: error) }
                 ForEach(
                     resourceObservationOrigins(
                         primary: container.origin,
@@ -2399,7 +2399,7 @@ struct SelectedDatabasePanel: View {
                 DetailLine(label: "Immutable container ID", value: database.id ?? "Unavailable")
                 DetailLine(label: "Ports", value: database.ports?.isEmpty == false ? database.ports! : "none")
                 DetailLine(label: "PIDs", value: database.stats?.pids.map(String.init) ?? "—")
-                if let error = database.ownershipError { DetailLine(label: "Ownership", value: error) }
+                if let error = database.associationError { DetailLine(label: "Association", value: error) }
                 ForEach(
                     resourceObservationOrigins(
                         primary: database.origin,
@@ -2634,10 +2634,10 @@ struct SelectedProjectPanel: View {
                 .disabled(!projectActionAllowed(store, group: group, kind: .projectStatus))
             } else {
                 VStack(alignment: .leading, spacing: 7) {
-                    Label("Repository ownership is not proved", systemImage: "exclamationmark.triangle.fill")
+                    Label("Repository association is not known", systemImage: "exclamationmark.triangle.fill")
                         .font(.system(size: 11, weight: .bold))
                         .foregroundStyle(Theme.orange)
-                    Text("Each item below is real host evidence, but it cannot be assigned to exactly one validated local Git repository. Select an item to see the precise reason, observed sources, controller status, and safe next step.")
+                    Text("Each item below is real host evidence, but it cannot be associated with exactly one validated local Git repository. Select an item to see the precise reason, observed sources, command route, and safe next step.")
                         .font(.system(size: 11))
                         .foregroundStyle(Theme.secondary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -2683,15 +2683,15 @@ struct SelectedProjectPanel: View {
                         value: projectConflictOrigins(conflict).map(\.label).joined(separator: ", ")
                     )
                 }
-                ForEach(group.serverMembershipConflicts) { conflict in
-                    DetailLine(label: "Server ownership", value: conflict.message)
+                ForEach(group.serverAssociationConflicts) { conflict in
+                    DetailLine(label: "Server association", value: conflict.message)
                     DetailLine(
                         label: "Candidate repositories",
                         value: conflict.repositories.map(\.displayName).joined(separator: ", ")
                     )
                 }
-                ForEach(group.dockerMembershipConflicts) { conflict in
-                    DetailLine(label: "Docker ownership", value: conflict.message)
+                ForEach(group.dockerAssociationConflicts) { conflict in
+                    DetailLine(label: "Docker association", value: conflict.message)
                     DetailLine(
                         label: "Candidate repositories",
                         value: conflict.repositories.map(\.displayName).joined(separator: ", ")
@@ -2711,7 +2711,7 @@ func unassignedAttributionSummary(_ group: ProjectGroup) -> String {
     guard !values.isEmpty else {
         return group.unassignedEvidenceCount > 0
             ? "\(group.unassignedEvidenceCount) record\(group.unassignedEvidenceCount == 1 ? "" : "s") lack a validated repository path"
-            : "No validated repository path or authoritative controller"
+            : "No validated repository path or current command route"
     }
     let grouped = Dictionary(grouping: values, by: \.reasonCode)
     return grouped
@@ -2987,7 +2987,7 @@ struct ResourceAttachSheet: View {
                 .font(.title2.bold())
             Text(prompt.target.displayName)
                 .font(.headline)
-            Text("Choose the one local Git repository that owns this exact resource. The coordinator records membership but does not start it.")
+            Text("Choose the one local Git repository that owns this exact resource. The coordinator records association but does not start it.")
                 .font(.system(size: 12))
                 .foregroundStyle(Theme.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -3010,7 +3010,7 @@ struct ResourceAttachSheet: View {
 
             if repositories.isEmpty {
                 Label(
-                    "No installed repository is controlled by this coordinator source.",
+                    "No installed repository is available through this Coordinator endpoint.",
                     systemImage: "exclamationmark.triangle.fill"
                 )
                 .font(.system(size: 11, weight: .semibold))
@@ -3065,7 +3065,6 @@ struct ResourceRetirementSheet: View {
                 VStack(alignment: .leading, spacing: 6) {
                     DetailLine(label: "Resource kind", value: prompt.target.kind)
                     DetailLine(label: "Exact host ID", value: prompt.target.hostResourceID)
-                    DetailLine(label: "Controller binding", value: prompt.target.controlBindingID)
                     if let target {
                         DetailLine(label: "Start policies", value: "\(target.policies.count)")
                         DetailLine(label: "Active allocations", value: "\(target.allocations.count)")
@@ -4547,7 +4546,7 @@ func databaseProtectionActionAllowed(
     kind: ActionKind,
     database: DockerContainer
 ) -> Bool {
-    guard database.ownershipError == nil,
+    guard database.associationError == nil,
           let identity = database.databaseIdentity,
           identity.containerID?.isEmpty == false,
           !identity.container.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
@@ -4923,7 +4922,7 @@ func environmentSubtitle(_ path: String) -> String {
 }
 
 /// Table columns show the same project a container is grouped (and acted on)
-/// under; the fallbacks only cover containers absent from every membership row.
+/// under; the fallbacks only cover containers absent from every association row.
 func projectLabel(for container: DockerContainer, in groups: [ProjectGroup]) -> String {
     let member = groups.first { group in
         group.containers.contains { $0.containerSelectionID == container.containerSelectionID }

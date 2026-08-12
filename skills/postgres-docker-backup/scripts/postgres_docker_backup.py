@@ -593,6 +593,29 @@ def manifest_path_for(path: Path) -> Path:
     return Path(f"{path}.manifest.json")
 
 
+def restore_receipt_path(
+    safety_root: Path,
+    *,
+    container_id: str,
+    database: str,
+    source_sha256: str,
+) -> Path:
+    material = json.dumps(
+        {
+            "container_id": container_id,
+            "database": database,
+            "source_sha256": source_sha256,
+        },
+        ensure_ascii=True,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return safety_root / (
+        "restore-" + hashlib.sha256(material).hexdigest() + ".receipt.json"
+    )
+
+
 def load_manifest(path: Path) -> dict[str, Any] | None:
     manifest_path = manifest_path_for(path)
     if not manifest_path.exists():
@@ -1448,7 +1471,7 @@ def do_restore(args: argparse.Namespace) -> dict[str, Any]:
         raise RuntimeError(
             f"post-restore catalog signature does not match the verified source; safety backup retained at {(safety_backup or {}).get('backup', 'not created')}"
         )
-    return {
+    result = {
         "restored": str(path),
         "container": container,
         "database": database,
@@ -1461,6 +1484,190 @@ def do_restore(args: argparse.Namespace) -> dict[str, Any]:
         "safety_verification": safety_verification,
         "restored_catalog_signature": restored_signature,
         "container_identity_preflights": [initial_identity, post_incoming_identity, final_identity],
+    }
+    if safety_backup is not None and safety_verification is not None:
+        receipt_path = restore_receipt_path(
+            Path(args.safety_out_dir).expanduser().resolve(),
+            container_id=immutable_target,
+            database=database,
+            source_sha256=checksum,
+        )
+        atomic_json_write(
+            receipt_path,
+            {
+                "schema_version": 1,
+                "completed": True,
+                "target_container_id": immutable_target,
+                "target_database": database,
+                "source_sha256": checksum,
+                "source_catalog_signature": expected_signature,
+                "restored_catalog_signature": restored_signature,
+                "safety_backup_sha256": safety_backup["sha256"],
+                "safety_catalog_signature": safety_verification.get(
+                    "catalog_signature"
+                ),
+            },
+            exclusive=False,
+        )
+        result["restore_receipt"] = str(receipt_path)
+    return result
+
+
+def do_reconcile_restore(args: argparse.Namespace) -> dict[str, Any]:
+    """Prove a lost-reply restore completed without executing it again."""
+
+    path = Path(args.file).expanduser().resolve()
+    manifest, backup_format, scope, checksum = descriptor_for(
+        args, path, require_manifest=True
+    )
+    if scope != DATABASE_SCOPE:
+        raise RuntimeError("restore reconciliation requires a database-scoped backup")
+    expected_container_id = require_expected_container_id(
+        getattr(args, "expect_container_id", None),
+        operation="restore reconciliation",
+    )
+    container_hint = args.container or manifest_container_name(manifest)
+    container, _inspected, _environment = select_container(container_hint)
+    _current, env, identity = container_identity_preflight(
+        container,
+        expected_container_id,
+        phase="restore reconciliation",
+    )
+    source_database = manifest_database_name(manifest)
+    user, database, password, _password_source = postgres_identity(
+        args, env, database_default=source_database
+    )
+    secrets = (password,) if password else ()
+    immutable_target = identity["actual_id"]
+    expected_signature = manifest_database_signature(manifest)
+    if expected_signature is None:
+        raise RuntimeError("restore reconciliation backup lacks a source catalog signature")
+    with postgres_auth(immutable_target, password) as auth:
+        current_signature = database_signature(
+            immutable_target,
+            user,
+            database,
+            auth,
+            secrets=secrets,
+        )
+    if current_signature != expected_signature:
+        return {
+            "matched": False,
+            "container": immutable_target,
+            "database": database,
+            "expected_catalog_signature": expected_signature,
+            "current_catalog_signature": current_signature,
+            "container_identity_preflight": identity,
+        }
+
+    safety_root = Path(args.safety_out_dir).expanduser().resolve()
+    receipt_path = restore_receipt_path(
+        safety_root,
+        container_id=immutable_target,
+        database=database,
+        source_sha256=checksum,
+    )
+    try:
+        receipt_metadata = receipt_path.lstat()
+        if (
+            not stat.S_ISREG(receipt_metadata.st_mode)
+            or receipt_path.is_symlink()
+            or stat.S_IMODE(receipt_metadata.st_mode) != 0o600
+        ):
+            raise RuntimeError(
+                "restore reconciliation completion receipt is not a private regular file"
+            )
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            "restore reconciliation found no valid exact completion receipt"
+        ) from exc
+    if (
+        not isinstance(receipt, dict)
+        or receipt.get("schema_version") != 1
+        or receipt.get("completed") is not True
+        or str(receipt.get("target_container_id") or "").lower()
+        != immutable_target
+        or str(receipt.get("target_database") or "") != database
+        or str(receipt.get("source_sha256") or "").lower() != checksum
+        or receipt.get("source_catalog_signature") != expected_signature
+        or receipt.get("restored_catalog_signature") != current_signature
+        or receipt.get("safety_catalog_signature") != current_signature
+    ):
+        raise RuntimeError(
+            "restore reconciliation completion receipt does not match the exact restore"
+        )
+    safety_sha256 = str(receipt.get("safety_backup_sha256") or "").lower()
+    if re.fullmatch(r"[0-9a-f]{64}", safety_sha256) is None:
+        raise RuntimeError(
+            "restore reconciliation completion receipt lacks an exact safety backup"
+        )
+    candidates: list[tuple[int, Path, dict[str, Any]]] = []
+    if safety_root.is_dir():
+        for manifest_path in safety_root.glob("*.manifest.json"):
+            artifact = Path(str(manifest_path)[: -len(".manifest.json")])
+            if not artifact.is_file():
+                continue
+            try:
+                safety_manifest = load_manifest(artifact)
+                source = (safety_manifest or {}).get("source") or {}
+                source_container = (source.get("container") or {}).get("id")
+                source_postgres = source.get("postgres") or {}
+                verification = (safety_manifest or {}).get("verification") or {}
+                if (
+                    str(source_container or "").lower() != immutable_target
+                    or str(source_postgres.get("database") or "") != database
+                    or verification.get("ok") is not True
+                    or verification.get("mode") != "test_restore"
+                    or verification.get("verification_target")
+                    != "scratch_database"
+                    or verification.get("catalog_signature")
+                    != current_signature
+                    or str((safety_manifest or {}).get("sha256") or "").lower()
+                    != sha256_file(artifact)
+                    or str((safety_manifest or {}).get("sha256") or "").lower()
+                    != safety_sha256
+                ):
+                    continue
+                candidates.append(
+                    (manifest_path.stat().st_mtime_ns, artifact, safety_manifest)
+                )
+            except (OSError, RuntimeError, ValueError, json.JSONDecodeError):
+                continue
+    if not candidates:
+        raise RuntimeError(
+            "restore reconciliation matched target data but found no strongly verified exact safety backup"
+        )
+    _mtime, safety_artifact, safety_manifest = max(candidates, key=lambda item: item[0])
+    incoming_verification = (manifest or {}).get("verification") or {}
+    if (
+        incoming_verification.get("ok") is not True
+        or incoming_verification.get("mode") != "test_restore"
+        or incoming_verification.get("catalog_signature") != expected_signature
+    ):
+        raise RuntimeError(
+            "restore reconciliation source backup is not strongly verified"
+        )
+    return {
+        "matched": True,
+        "reconciled_without_reexecution": True,
+        "restore_receipt": str(receipt_path),
+        "restored": str(path),
+        "container": immutable_target,
+        "database": database,
+        "format": backup_format,
+        "scope": scope,
+        "sha256": checksum,
+        "transactional": True,
+        "incoming_verification": incoming_verification,
+        "safety_backup": {
+            "backup": str(safety_artifact),
+            "manifest": str(manifest_path_for(safety_artifact)),
+            "sha256": str(safety_manifest["sha256"]),
+        },
+        "safety_verification": safety_manifest["verification"],
+        "restored_catalog_signature": current_signature,
+        "container_identity_preflights": [identity, identity, identity],
     }
 
 
@@ -1549,6 +1756,16 @@ def build_parser() -> argparse.ArgumentParser:
     restore.add_argument("--no-safety-backup", action="store_true")
     restore.add_argument("--safety-out-dir", default=f"{DEFAULT_OUT_DIR}/pre-restore")
     restore.add_argument("--dry-run", action="store_true")
+
+    reconcile = sub.add_parser("reconcile-restore")
+    reconcile.add_argument("--container")
+    add_container_identity_argument(reconcile)
+    reconcile.add_argument("--database")
+    add_auth_arguments(reconcile)
+    reconcile.add_argument("--file", required=True)
+    reconcile.add_argument("--format", choices=["custom", "plain"])
+    reconcile.add_argument("--scope", choices=[DATABASE_SCOPE])
+    reconcile.add_argument("--safety-out-dir", required=True)
     return parser
 
 
@@ -1610,7 +1827,7 @@ def database_action_route() -> dict[str, Any]:
 def _brokered_database_action(
     args: argparse.Namespace, raw_argv: list[str]
 ) -> dict[str, Any] | None:
-    """Route backup/restore through a configured service authority.
+    """Route inventory, backup, and restore through a configured authority.
 
     The service subprocess sets ``DEVCOORDINATOR_BROKER_INTERNAL`` so its own
     fixed executable can perform the already-authorized host action without
@@ -1618,7 +1835,7 @@ def _brokered_database_action(
     deliberately an error, never permission to fall back to direct Docker.
     """
 
-    if args.command not in {"backup", "restore"}:
+    if args.command not in {"list", "backup", "restore"}:
         return None
     configured = _configured_broker_repository()
     if configured is None:
@@ -1627,6 +1844,22 @@ def _brokered_database_action(
 
     profile, repository = configured
     from devcoordinator.broker import BrokerOperation  # type: ignore[import-not-found]
+
+    if args.command == "list":
+        inventory = profile.inventory(canonical_root=repository.canonical_root)
+        resources = inventory.get("resources")
+        resources = resources if isinstance(resources, dict) else {}
+        bindings = [
+            dict(item)
+            for item in resources.get("databases") or []
+            if isinstance(item, dict)
+            and str(item.get("repo_id") or "") == str(repository.repo_id)
+        ]
+        return {
+            "execution_authority": "broker",
+            "repository_id": str(repository.repo_id),
+            "database_bindings": bindings,
+        }
 
     if not args.database:
         raise RuntimeError(
@@ -1762,12 +1995,15 @@ def main(argv: list[str] | None = None) -> int:
                         "direct restore requires --file; --database-backup-id is valid only with a configured host broker"
                     )
                 result = do_restore(args)
+            elif args.command == "reconcile-restore":
+                result = do_reconcile_restore(args)
             else:
                 raise RuntimeError(f"unsupported command: {args.command}")
             try:
                 registry = (
                     None
-                    if brokered is not None or args.command == "route"
+                    if brokered is not None
+                    or args.command in {"route", "reconcile-restore"}
                     else persist_coordinator_registry(args.command, args, result)
                 )
             except Exception as registry_error:

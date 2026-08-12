@@ -1888,7 +1888,7 @@ def main() -> int:
             "temporary_repo",
             "kill_after_run",
             "ok=false",
-            "status/start/stop/restart/remove",
+            "status/start/stop/restart/replace/remove",
             "server register",
             "docker register",
             "try the default port",

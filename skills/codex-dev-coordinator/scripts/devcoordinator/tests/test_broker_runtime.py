@@ -25,7 +25,7 @@ from devcoordinator.broker import (  # noqa: E402
 )
 from devcoordinator.broker_backend import StoreBackedMutationBackend  # noqa: E402
 from devcoordinator import broker_backend as broker_backend_module  # noqa: E402
-from devcoordinator.broker_persistence import StoreBackedAuthorizer  # noqa: E402
+from devcoordinator.broker_persistence import StoreBackedRequestAcceptor  # noqa: E402
 from devcoordinator.store import CoordinatorStore, utc_timestamp  # noqa: E402
 from devcoordinator.worker_control import WorkerReplaceError  # noqa: E402
 from devcoordinator.worker_supervision import WorkerSupervision  # noqa: E402
@@ -37,12 +37,69 @@ from devcoordinator.tests.test_broker import (  # noqa: E402
     PROJECT_ID,
     SERVER_ID,
     CanonicalTemporaryDirectory,
+    RecordingPostgresHostActions,
     _committed_available_observer,
     peer_for,
     request_for,
     seed_postgres_database,
     seed_store_backed_broker,
 )
+from devcoordinator.tests.test_broker_assignment_compose import (  # noqa: E402
+    rendered_fixture_model,
+)
+
+
+REPLACEMENT_COMPOSE_ID = "compose-runtime-replacement"
+REPLACEMENT_RESOURCE_ID = "container-runtime-replacement"
+REPLACEMENT_FULL_ID = "c" * 64
+
+
+class RuntimeReplacementHostActions(RecordingPostgresHostActions):
+    """Host fixture that exposes one exact Compose identity transition."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.recreated = False
+        self.removed = False
+        self.compose_calls: list[str] = []
+
+    def compose_up(self, _target: object) -> dict[str, object]:
+        self.compose_calls.append("up")
+        self.recreated = True
+        return {
+            "action": "up",
+            "returncode": 0,
+            "phases": ["compose_up"],
+        }
+
+    def compose_stop(self, _target: object) -> dict[str, object]:
+        raise AssertionError("replacement must not stop the Compose project")
+
+    def compose_restart(self, _target: object) -> dict[str, object]:
+        raise AssertionError("replacement must use exact service recreation")
+
+    def compose_down(self, _target: object) -> dict[str, object]:
+        raise AssertionError("replacement must not remove the Compose project")
+
+    def postgres_reconcile_restore(
+        self,
+        _target: object,
+        _backup: object,
+        *,
+        safety_output_root: str,
+    ) -> None:
+        del safety_output_root
+        return None
+
+    def remove(self, full_container_id: str) -> dict[str, object]:
+        if full_container_id != REPLACEMENT_FULL_ID:
+            raise AssertionError("cleanup selected another container identity")
+        self.removed = True
+        return {
+            "action": "remove",
+            "full_container_id": full_container_id,
+            "removed": True,
+        }
 
 
 def runtime_arguments(
@@ -52,6 +109,7 @@ def runtime_arguments(
     ttl_seconds: int | None = None,
     temporary_repo_id: str | None = None,
     target_kind: str = "docker",
+    kill_after_run: bool = False,
 ) -> dict[str, object]:
     return {
         "action": action,
@@ -61,7 +119,7 @@ def runtime_arguments(
         "target_kind": target_kind,
         "purpose": purpose,
         "ttl_seconds": ttl_seconds,
-        "kill_after_run": False,
+        "kill_after_run": kill_after_run,
     }
 
 
@@ -170,6 +228,29 @@ class BrokerRuntimeWireTests(unittest.TestCase):
                 },
                 )
 
+    def test_wire_accepts_path_free_docker_replacement_only(self) -> None:
+        for target_kind, resource_id in (
+            ("docker", CONTAINER_ID),
+            ("database_stack", DATABASE_ID),
+        ):
+            with self.subTest(target_kind=target_kind):
+                arguments = runtime_arguments(
+                    action="replace", target_kind=target_kind
+                )
+                request = request_for(
+                    BrokerOperation.RUNTIME_REQUEST,
+                    resource_id=resource_id,
+                    arguments=arguments,
+                )
+                self.assertEqual(request.arguments, arguments)
+                with self.assertRaises(BrokerError) as raised:
+                    request_for(
+                        BrokerOperation.RUNTIME_REQUEST,
+                        resource_id=resource_id,
+                        arguments={**arguments, "cwd": "/client/path"},
+                    )
+                self.assertEqual(raised.exception.code, "invalid_arguments")
+
 
 class BrokerRuntimeOperationIdentityTests(unittest.TestCase):
     operation_id = "44444444-4444-4444-8444-444444444444"
@@ -251,6 +332,53 @@ class BrokerRuntimeOperationIdentityTests(unittest.TestCase):
         self.assertTrue(result["ok"], result)
         profile.resolve_repository.assert_called_once_with("/repositories/alpha")
         profile.repository.assert_not_called()
+
+    def test_account_docker_replace_delegates_without_opening_account_store(
+        self,
+    ) -> None:
+        payload = self.request()
+        payload["action"] = "replace"
+        profile = self.profile()
+        profile.call.return_value = (
+            self.operation_id,
+            {
+                "schema_version": 1,
+                "ok": True,
+                "action": "replace",
+                "repository": {
+                    "root_repo_id": PROJECT_ID,
+                    "effective_repo_id": PROJECT_ID,
+                },
+                "target": {"kind": "docker", "id": CONTAINER_ID},
+                "replacement": {
+                    "current": {"docker_resource_id": "container-new"}
+                },
+            },
+        )
+        with mock.patch.object(
+            dev_coordinator, "state_backend", return_value="sqlite"
+        ), mock.patch.object(
+            dev_coordinator, "authority_mode", return_value="account"
+        ), mock.patch.object(
+            dev_coordinator, "configured_broker_profile", return_value=profile
+        ), mock.patch.object(
+            dev_coordinator.AccountStore,
+            "open_default",
+            side_effect=AssertionError(
+                "Docker replacement must not open mutable account state"
+            ),
+        ):
+            result = dev_coordinator.coordinated_runtime_request(
+                payload, operation_id=self.operation_id
+            )
+
+        self.assertTrue(result["ok"], result)
+        arguments = profile.call.call_args.kwargs["arguments"]
+        self.assertEqual(arguments["action"], "replace")
+        self.assertEqual(arguments["target_kind"], "docker")
+        self.assertNotIn("cwd", arguments)
+        self.assertNotIn("argv", arguments)
+        self.assertNotIn("environment", arguments)
 
     def test_broker_failure_envelope_preserves_submitted_operation_id(self) -> None:
         profile = self.profile()
@@ -390,7 +518,7 @@ class BrokerWorkerCleanupPreparationTests(unittest.TestCase):
         self.persistence.revoke_server_for_permanent_cleanup.assert_not_called()
 
 
-class BrokerRuntimeAuthorizationTests(unittest.TestCase):
+class BrokerRuntimeTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = CanonicalTemporaryDirectory()
         self.root = self.temporary.__enter__()
@@ -403,27 +531,9 @@ class BrokerRuntimeAuthorizationTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary.__exit__(None, None, None)
 
-    def _grant(
-        self,
-        action: str,
-        *,
-        uid: int | None = None,
-        enabled: bool = True,
-        resource_kind: str = "docker",
-        resource_id: str = CONTAINER_ID,
-    ) -> None:
-        self.persistence.grant_runtime(
-            uid=os.geteuid() if uid is None else uid,
-            repo_id=PROJECT_ID,
-            resource_kind=resource_kind,
-            resource_id=resource_id,
-            action=action,
-            enabled=enabled,
-        )
-
     @staticmethod
     def _seed_stopped_worker_observation(connection) -> None:
-        """Make the worker a concrete member of the repository runtime tree."""
+        """Make the worker a concrete part of the repository runtime tree."""
 
         timestamp = utc_timestamp()
         connection.execute(
@@ -471,7 +581,6 @@ class BrokerRuntimeAuthorizationTests(unittest.TestCase):
                 ),
                 keep_alive=True,
             )
-        self._grant("replace", resource_kind="service", resource_id=SERVER_ID)
         return repository
 
     def _runtime_observer(
@@ -567,6 +676,245 @@ class BrokerRuntimeAuthorizationTests(unittest.TestCase):
             )
         return evidence
 
+    def _prepare_compose_replacement(
+        self, *, database: bool = False
+    ) -> tuple[
+        RuntimeReplacementHostActions,
+        BrokerService,
+        StoreBackedMutationBackend,
+    ]:
+        repository = self.root / "replacement-repository"
+        repository.mkdir(mode=0o700, exist_ok=True)
+        compose_file = repository / "compose.yml"
+        service_name = "db" if database else "web"
+        compose_file.write_text(
+            f"services:\n  {service_name}:\n    image: example.invalid/{service_name}:test\n",
+            encoding="utf-8",
+        )
+        self.persistence.compose_model_renderer = rendered_fixture_model
+        with CoordinatorStore.open(
+            self.persistence.database_path, expected_uid=os.geteuid()
+        ) as store:
+            with store.immediate_transaction() as connection:
+                connection.execute(
+                    "UPDATE repositories SET canonical_root = ? WHERE repo_id = ?",
+                    (str(repository), PROJECT_ID),
+                )
+                connection.execute(
+                    """
+                    UPDATE docker_observations
+                    SET lifecycle = 'running', health = 'healthy',
+                        sampled_at = ?, observation_fingerprint = ?
+                    WHERE docker_resource_id = ?
+                    """,
+                    (utc_timestamp(), "replacement-old-running", CONTAINER_ID),
+                )
+        self.persistence.provision_compose_definition(
+            compose_definition_id=REPLACEMENT_COMPOSE_ID,
+            repo_id=PROJECT_ID,
+            cwd=repository,
+            files=(compose_file,),
+            services=(service_name,),
+            project_name="runtime-replacement-stack",
+        )
+        if database:
+            seed_postgres_database(self.persistence)
+
+        actions = RuntimeReplacementHostActions()
+
+        def observer(store: CoordinatorStore) -> dict[str, object]:
+            evidence = dict(_committed_available_observer(store))
+            snapshot_id = str(evidence["snapshot_id"])
+            now = str(evidence["completed_at"])
+            with store.immediate_transaction(
+                revision_kind="observation"
+            ) as connection:
+                connection.execute(
+                    """
+                    INSERT INTO broker_observation_compose_scope(
+                        snapshot_id, assets_complete, observed_asset_count,
+                        evidence_fingerprint, recorded_at
+                    ) VALUES (?, 1, 0, ?, ?)
+                    """,
+                    (snapshot_id, "replacement-compose-scope", now),
+                )
+                if actions.recreated:
+                    connection.execute(
+                        """
+                        INSERT INTO docker_resources(
+                            docker_resource_id, engine_id, repo_id, full_container_id,
+                            current_name, image, created_at, updated_at
+                        ) SELECT ?, engine_id, ?, ?, ?, image, ?, ?
+                          FROM docker_resources WHERE docker_resource_id = ?
+                        ON CONFLICT(docker_resource_id) DO UPDATE SET
+                            current_name = excluded.current_name,
+                            updated_at = excluded.updated_at
+                        """,
+                        (
+                            REPLACEMENT_RESOURCE_ID,
+                            PROJECT_ID,
+                            REPLACEMENT_FULL_ID,
+                            service_name + "-replacement",
+                            now,
+                            now,
+                            CONTAINER_ID,
+                        ),
+                    )
+                    connection.execute(
+                        """
+                        INSERT INTO docker_observations(
+                            docker_resource_id, lifecycle, health, sampled_at,
+                            observation_fingerprint
+                        ) VALUES (?, 'running', 'healthy', ?, ?)
+                        ON CONFLICT(docker_resource_id) DO UPDATE SET
+                            lifecycle = excluded.lifecycle,
+                            health = excluded.health,
+                            sampled_at = excluded.sampled_at,
+                            observation_fingerprint =
+                                excluded.observation_fingerprint
+                        """,
+                        (
+                            REPLACEMENT_RESOURCE_ID,
+                            now,
+                            "replacement-new-running",
+                        ),
+                    )
+                    if database:
+                        database_name = connection.execute(
+                            """
+                            SELECT database_name FROM database_bindings
+                            WHERE database_binding_id = ?
+                            """,
+                            (DATABASE_ID,),
+                        ).fetchone()[0]
+                        connection.execute(
+                            """
+                            INSERT INTO database_bindings(
+                                database_binding_id, docker_resource_id,
+                                repo_id, database_name, engine_kind,
+                                created_at, updated_at
+                            ) VALUES (
+                                'database-runtime-replacement', ?, ?, ?,
+                                'postgresql', ?, ?
+                            ) ON CONFLICT(database_binding_id) DO UPDATE SET
+                                docker_resource_id =
+                                    excluded.docker_resource_id,
+                                repo_id = excluded.repo_id,
+                                updated_at = excluded.updated_at
+                            """,
+                            (
+                                REPLACEMENT_RESOURCE_ID,
+                                PROJECT_ID,
+                                database_name,
+                                now,
+                                now,
+                            ),
+                        )
+                        connection.execute(
+                            """
+                            INSERT INTO database_observations(
+                                database_binding_id, docker_resource_id,
+                                available, size_bytes, error_code,
+                                error_message, sampled_at,
+                                observation_fingerprint
+                            ) VALUES (
+                                'database-runtime-replacement', ?, 1, 4096,
+                                NULL, NULL, ?, ?
+                            ) ON CONFLICT(database_binding_id) DO UPDATE SET
+                                docker_resource_id =
+                                    excluded.docker_resource_id,
+                                available = 1, size_bytes = 4096,
+                                error_code = NULL, error_message = NULL,
+                                sampled_at = excluded.sampled_at,
+                                observation_fingerprint =
+                                    excluded.observation_fingerprint
+                            """,
+                            (
+                                REPLACEMENT_RESOURCE_ID,
+                                now,
+                                "replacement-database-available",
+                            ),
+                        )
+                connection.execute(
+                    """
+                    DELETE FROM observation_snapshot_resources
+                    WHERE snapshot_id = ? AND resource_kind = 'container'
+                      AND resource_id IN (?, ?)
+                    """,
+                    (
+                        snapshot_id,
+                        CONTAINER_ID,
+                        REPLACEMENT_RESOURCE_ID,
+                    ),
+                )
+                if not actions.removed:
+                    resource_id = (
+                        REPLACEMENT_RESOURCE_ID
+                        if actions.recreated
+                        else CONTAINER_ID
+                    )
+                    full_id = (
+                        REPLACEMENT_FULL_ID
+                        if actions.recreated
+                        else "a" * 64
+                    )
+                    observation = connection.execute(
+                        """
+                        SELECT observation_fingerprint
+                        FROM docker_observations
+                        WHERE docker_resource_id = ?
+                        """,
+                        (resource_id,),
+                    ).fetchone()
+                    connection.execute(
+                        """
+                        INSERT INTO observation_snapshot_resources(
+                            snapshot_id, resource_kind, resource_id,
+                            observation_fingerprint
+                        ) VALUES (?, 'container', ?, ?)
+                        """,
+                        (
+                            snapshot_id,
+                            resource_id,
+                            str(observation["observation_fingerprint"]),
+                        ),
+                    )
+                    connection.execute(
+                        """
+                        INSERT INTO broker_observed_compose_containers(
+                            snapshot_id, docker_resource_id,
+                            full_container_id, project_name, service_name,
+                            lifecycle, association_state,
+                            associated_repo_id,
+                            observation_fingerprint
+                        ) VALUES (
+                            ?, ?, ?, 'runtime-replacement-stack', ?,
+                            'running', 'exclusive', ?, ?
+                        )
+                        """,
+                        (
+                            snapshot_id,
+                            resource_id,
+                            full_id,
+                            service_name,
+                            PROJECT_ID,
+                            "replacement-compose-container",
+                        ),
+                    )
+            return evidence
+
+        backend = StoreBackedMutationBackend(
+            self.persistence,
+            actions,
+            observe_before_lifecycle_plan=observer,
+            container_remover=actions.remove,
+        )
+        service = BrokerService(
+            StoreBackedRequestAcceptor(self.persistence),
+            SerializedMutationWriter(backend),
+        )
+        return actions, service, backend
+
     def _service(self, *, observer=None, actions=None) -> BrokerService:
         backend = StoreBackedMutationBackend(
             self.persistence,
@@ -574,7 +922,7 @@ class BrokerRuntimeAuthorizationTests(unittest.TestCase):
             observe_before_lifecycle_plan=(observer or self._runtime_observer),
         )
         return BrokerService(
-            StoreBackedAuthorizer(self.persistence),
+            StoreBackedRequestAcceptor(self.persistence),
             SerializedMutationWriter(backend),
         )
 
@@ -590,6 +938,7 @@ class BrokerRuntimeAuthorizationTests(unittest.TestCase):
         target_kind: str = "docker",
         resource_id: str = CONTAINER_ID,
         operation_id: str | None = None,
+        kill_after_run: bool = False,
     ) -> BrokerRequest:
         return BrokerRequest.create(
             account_id=account_id,
@@ -602,6 +951,7 @@ class BrokerRuntimeAuthorizationTests(unittest.TestCase):
                 ttl_seconds=ttl_seconds,
                 temporary_repo_id=temporary_repo_id,
                 target_kind=target_kind,
+                kill_after_run=kill_after_run,
             ),
             operation_id=operation_id,
             authority_generation=self.authority_generation,
@@ -621,7 +971,6 @@ class BrokerRuntimeAuthorizationTests(unittest.TestCase):
         )
 
     def test_authorized_status_returns_concise_rich_repository_report(self) -> None:
-        self._grant("status")
 
         reply = self._reply()
 
@@ -665,7 +1014,6 @@ class BrokerRuntimeAuthorizationTests(unittest.TestCase):
             self.assertIn(key, report)
 
     def test_status_observes_before_reading_the_shared_snapshot(self) -> None:
-        self._grant("status")
 
         def observe_running(store: CoordinatorStore) -> dict[str, object]:
             return self._runtime_observer(store, lifecycle="running")
@@ -691,7 +1039,6 @@ class BrokerRuntimeAuthorizationTests(unittest.TestCase):
         self.assertTrue(report["result"]["observation"]["observed"])
 
     def test_family_unclassified_resource_blocks_shared_status(self) -> None:
-        self._grant("status")
         now = utc_timestamp()
         with CoordinatorStore.open(
             self.persistence.database_path, expected_uid=os.geteuid()
@@ -722,7 +1069,6 @@ class BrokerRuntimeAuthorizationTests(unittest.TestCase):
         self.assertEqual(self.actions.calls, [])
 
     def test_stopped_unassigned_container_does_not_block_shared_status(self) -> None:
-        self._grant("status")
         now = utc_timestamp()
         with CoordinatorStore.open(
             self.persistence.database_path, expected_uid=os.geteuid()
@@ -772,7 +1118,6 @@ class BrokerRuntimeAuthorizationTests(unittest.TestCase):
         self.assertEqual(reply["result"]["classification"], "observed_not_ready")
 
     def test_explicit_foreign_path_unassigned_is_not_a_family_false_positive(self) -> None:
-        self._grant("status")
         now = utc_timestamp()
         with CoordinatorStore.open(
             self.persistence.database_path, expected_uid=os.geteuid()
@@ -798,7 +1143,6 @@ class BrokerRuntimeAuthorizationTests(unittest.TestCase):
         self.assertFalse(reply["result"]["result"]["ready"])
 
     def test_relative_unassigned_path_fails_closed(self) -> None:
-        self._grant("status")
         now = utc_timestamp()
         with CoordinatorStore.open(
             self.persistence.database_path, expected_uid=os.geteuid()
@@ -825,48 +1169,14 @@ class BrokerRuntimeAuthorizationTests(unittest.TestCase):
             reply["result"]["classification"], "unclassified_resource"
         )
 
-    def test_runtime_grant_is_live_and_revocation_takes_effect_immediately(self) -> None:
-        self._grant("status")
-        self.assertTrue(self._reply()["ok"])
 
-        self._grant("status", enabled=False)
-        rejected = self._reply()
+    def test_unknown_optional_temporary_route_does_not_gate_root_status(self) -> None:
+        reply = self._reply(temporary_repo_id="not-a-configured-worktree")
 
-        self.assertFalse(rejected["ok"], rejected)
-        self.assertEqual(rejected["error"]["code"], "operation_access_denied")
-
-    def test_ungranted_and_cross_uid_requests_do_not_inherit_access(self) -> None:
-        ungranted = self._reply()
-        self.assertFalse(ungranted["ok"], ungranted)
-        self.assertEqual(ungranted["error"]["code"], "operation_access_denied")
-
-        other_uid = os.geteuid() + 10_000
-        other_account = "runtime-other-account"
-        self.persistence.provision_principal(uid=other_uid, account_id=other_account)
-        self.persistence.provision_repository_enrollment(
-            uid=other_uid,
-            repo_id=PROJECT_ID,
-            account_id=other_account,
-            issued_at=utc_timestamp(),
-            valid_until_epoch=int(time.time()) + 3_600,
-        )
-        cross_uid = self._reply(uid=other_uid, account_id=other_account)
-
-        self.assertFalse(cross_uid["ok"], cross_uid)
-        self.assertEqual(cross_uid["error"]["code"], "operation_access_denied")
-
-    def test_root_temporary_family_mismatch_fails_closed(self) -> None:
-        self._grant("status")
-
-        rejected = self._reply(temporary_repo_id="not-an-enrolled-worktree")
-
-        self.assertFalse(rejected["ok"], rejected)
-        self.assertEqual(
-            rejected["error"]["code"], "runtime_repository_context_mismatch"
-        )
+        self.assertTrue(reply["ok"], reply)
+        self.assertTrue(reply["result"]["ok"], reply)
 
     def test_status_survives_broker_writer_reconstruction(self) -> None:
-        self._grant("status")
 
         first = self._reply()
         second = self._reply()
@@ -875,40 +1185,421 @@ class BrokerRuntimeAuthorizationTests(unittest.TestCase):
         self.assertTrue(second["ok"], second)
         self.assertEqual(first["result"]["resources"], second["result"]["resources"])
 
-    def test_non_worker_service_status_uses_fresh_broker_observation(self) -> None:
-        self._grant(
-            "status", resource_kind="service", resource_id=SERVER_ID
-        )
+    def test_nonworker_service_uses_exact_peer_uid_supervisor(self) -> None:
+        calls: list[tuple[object, ...]] = []
 
-        reply = self._reply(
-            action="status", target_kind="service", resource_id=SERVER_ID
-        )
+        class FakeController:
+            def __init__(self, _store, **kwargs):
+                calls.append(("init", kwargs["execution_uid"]))
+
+            def start(self, **kwargs):
+                calls.append(
+                    (
+                        "start",
+                        kwargs["worker_id"],
+                        kwargs["name"],
+                        kwargs["keep_alive"],
+                    )
+                )
+                return {
+                    "ok": True,
+                    "id": kwargs["worker_id"],
+                    "name": kwargs["name"],
+                    "project": kwargs["canonical_repository"],
+                    "status": "running",
+                    "health": {
+                        "ok": True,
+                        "classification": "supervised_process_running",
+                    },
+                    "supervision": {
+                        "keep_alive": False,
+                        "supervisor_state": "running",
+                    },
+                    "native_runner": {"active": True},
+                }
+
+        with mock.patch.object(
+            broker_backend_module, "WorkerController", FakeController
+        ):
+            reply = self._reply(
+                action="start", target_kind="service", resource_id=SERVER_ID
+            )
 
         self.assertTrue(reply["ok"], reply)
-        report = reply["result"]
-        self.assertEqual(report["target"], {"kind": "service", "id": SERVER_ID})
-        self.assertEqual(report["result"]["authority"], "broker")
-        self.assertEqual(report["result"]["state"], "unobserved")
-        self.assertEqual(report["classification"], "observed_not_ready")
+        self.assertTrue(reply["result"]["ok"], reply)
+        self.assertEqual(
+            reply["result"]["result"]["authority"],
+            "broker_service_supervisor",
+        )
+        self.assertEqual(
+            calls,
+            [
+                ("init", os.geteuid()),
+                ("start", SERVER_ID, "web", False),
+            ],
+        )
         self.assertEqual(self.actions.calls, [])
 
-    def test_service_lifecycle_still_requires_peer_uid_supervisor(self) -> None:
-        self._grant(
-            "start", resource_kind="service", resource_id=SERVER_ID
+    def test_network_service_start_proves_listener_pid_identity_and_exact_cwd(
+        self,
+    ) -> None:
+        with CoordinatorStore.open(
+            self.persistence.database_path, expected_uid=os.geteuid()
+        ) as store:
+            with store.immediate_transaction() as connection:
+                connection.execute(
+                    """
+                    INSERT INTO port_assignments(
+                        assignment_id, host_id, repo_id, server_name, port,
+                        status, generation, created_at, updated_at
+                    ) VALUES ('runtime-network-web', ?, ?, 'web', 3105,
+                              'active', 0, ?, ?)
+                    """,
+                    (HOST_ID, PROJECT_ID, utc_timestamp(), utc_timestamp()),
+                )
+        self.actions.listener_evidence = {
+            "pid": 42_001,
+            "process_identity": "linux:42001:listener-start-1",
+            "cwd": "/repos/alpha",
+            "canonical_root": "/repos/alpha",
+            "port": 3105,
+            "protocol": "tcp",
+        }
+
+        class FakeController:
+            def __init__(self, _store, **_kwargs):
+                pass
+
+            def start(self, **kwargs):
+                return {
+                    "ok": True,
+                    "id": kwargs["worker_id"],
+                    "name": kwargs["name"],
+                    "project": kwargs["canonical_repository"],
+                    "status": "running",
+                    "pid": 42_001,
+                    "process_start_time": "listener-start-1",
+                    "process_fingerprint": "listener-process-1",
+                    "health": {
+                        "ok": True,
+                        "classification": "supervised_process_running",
+                    },
+                    "supervision": {
+                        "keep_alive": False,
+                        "supervisor_state": "running",
+                    },
+                    "native_runner": {"active": True},
+                }
+
+        with mock.patch.object(
+            broker_backend_module, "WorkerController", FakeController
+        ):
+            reply = self._reply(
+                action="start", target_kind="service", resource_id=SERVER_ID
+            )
+
+        self.assertTrue(reply["ok"], reply)
+        proof = reply["result"]["result"]["endpoint_proof"]
+        self.assertEqual(
+            proof,
+            {
+                "certain": True,
+                "listener_required": True,
+                "state": "listening",
+                "port": 3105,
+                "pid": 42_001,
+                "process_identity": "linux:42001:listener-start-1",
+                "cwd_binding": "exact",
+            },
+        )
+        self.assertEqual(
+            self.actions.listener_observations,
+            [(3105, "/repos/alpha", "tcp")],
         )
 
-        reply = self._reply(
-            action="start", target_kind="service", resource_id=SERVER_ID
-        )
+    def test_network_service_without_exact_port_binding_fails_before_launch(self) -> None:
+        with CoordinatorStore.open(
+            self.persistence.database_path, expected_uid=os.geteuid()
+        ) as store:
+            with store.immediate_transaction() as connection:
+                connection.execute(
+                    """
+                    UPDATE server_definitions
+                    SET health_url_template = 'http://127.0.0.1:3109/health'
+                    WHERE server_definition_id = ?
+                    """,
+                    (SERVER_ID,),
+                )
+
+        class MustNotLaunch:
+            def __init__(self, *_args, **_kwargs):
+                raise AssertionError("network service launched without a port binding")
+
+        with mock.patch.object(
+            broker_backend_module, "WorkerController", MustNotLaunch
+        ):
+            reply = self._reply(
+                action="start", target_kind="service", resource_id=SERVER_ID
+            )
 
         self.assertFalse(reply["ok"], reply)
-        self.assertEqual(reply["error"]["code"], "runtime_supervisor_required")
-        self.assertEqual(self.actions.calls, [])
+        self.assertEqual(
+            reply["error"]["code"], "service_endpoint_binding_unavailable"
+        )
+
+    def test_network_health_endpoint_must_match_exact_port_binding(self) -> None:
+        with CoordinatorStore.open(
+            self.persistence.database_path, expected_uid=os.geteuid()
+        ) as store:
+            with store.immediate_transaction() as connection:
+                now = utc_timestamp()
+                connection.execute(
+                    """
+                    UPDATE server_definitions
+                    SET health_url_template = 'http://127.0.0.1:3111/health'
+                    WHERE server_definition_id = ?
+                    """,
+                    (SERVER_ID,),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO port_assignments(
+                        assignment_id, host_id, repo_id, server_name, port,
+                        status, generation, created_at, updated_at
+                    ) VALUES ('runtime-health-web', ?, ?, 'web', 3110,
+                              'active', 0, ?, ?)
+                    """,
+                    (HOST_ID, PROJECT_ID, now, now),
+                )
+
+        class MustNotLaunch:
+            def __init__(self, *_args, **_kwargs):
+                raise AssertionError("mismatched health endpoint launched")
+
+        with mock.patch.object(
+            broker_backend_module, "WorkerController", MustNotLaunch
+        ):
+            reply = self._reply(
+                action="start", target_kind="service", resource_id=SERVER_ID
+            )
+
+        self.assertFalse(reply["ok"], reply)
+        self.assertEqual(
+            reply["error"]["code"], "service_endpoint_binding_conflict"
+        )
+
+    def test_wrong_network_listener_rolls_back_exact_service_and_replays(self) -> None:
+        with CoordinatorStore.open(
+            self.persistence.database_path, expected_uid=os.geteuid()
+        ) as store:
+            with store.immediate_transaction() as connection:
+                now = utc_timestamp()
+                connection.execute(
+                    """
+                    INSERT INTO port_assignments(
+                        assignment_id, host_id, repo_id, server_name, port,
+                        status, generation, created_at, updated_at
+                    ) VALUES ('runtime-wrong-web', ?, ?, 'web', 3106,
+                              'active', 0, ?, ?)
+                    """,
+                    (HOST_ID, PROJECT_ID, now, now),
+                )
+        self.actions.listener_evidence = {
+            "pid": 99_999,
+            "process_identity": "linux:99999:unrelated-start",
+            "cwd": "/repos/alpha",
+            "canonical_root": "/repos/alpha",
+            "port": 3106,
+            "protocol": "tcp",
+        }
+        calls: list[str] = []
+
+        class FakeController:
+            def __init__(self, _store, **_kwargs):
+                pass
+
+            def start(self, **kwargs):
+                calls.append("start")
+                return {
+                    "ok": True,
+                    "id": kwargs["worker_id"],
+                    "name": kwargs["name"],
+                    "status": "running",
+                    "pid": 42_002,
+                    "process_start_time": "listener-start-2",
+                    "health": {"ok": True},
+                    "supervision": {"supervisor_state": "running"},
+                }
+
+            def stop(self, **_kwargs):
+                calls.append("stop")
+                return {
+                    "ok": True,
+                    "status": "stopped",
+                    "health": {"ok": False},
+                    "terminal_process_proof": {
+                        "certain": True,
+                        "state": "absent",
+                        "pid": 42_002,
+                    },
+                }
+
+        request = self._request(
+            action="start",
+            target_kind="service",
+            resource_id=SERVER_ID,
+        )
+        with mock.patch.object(
+            broker_backend_module, "WorkerController", FakeController
+        ):
+            first = self._reply(request=request)
+            replay = self._reply(request=request)
+
+        self.assertTrue(first["ok"], first)
+        self.assertEqual(first, replay)
+        result = first["result"]["result"]
+        self.assertFalse(result["ok"])
+        self.assertEqual(
+            result["classification"], "service_endpoint_identity_unproven"
+        )
+        self.assertEqual(result["rollback"]["status"], "stopped")
+        self.assertEqual(calls, ["start", "stop"])
+
+    def test_network_endpoint_proof_rejects_wrong_exact_cwd(self) -> None:
+        self.actions.listener_evidence = {
+            "pid": 42_003,
+            "process_identity": "linux:42003:listener-start-3",
+            "cwd": "/repos/alpha/other",
+            "canonical_root": "/repos/alpha",
+            "port": 3107,
+            "protocol": "tcp",
+        }
+        backend = StoreBackedMutationBackend(self.persistence, self.actions)
+
+        with self.assertRaises(
+            broker_backend_module.BrokerBackendError
+        ) as raised:
+            backend._runtime_service_endpoint_proof(
+                endpoint_target=SimpleNamespace(
+                    listener_required=True,
+                    listener_port=3107,
+                    canonical_root="/repos/alpha",
+                    cwd="/repos/alpha",
+                ),
+                action="start",
+                controlled={
+                    "pid": 42_003,
+                    "process_start_time": "listener-start-3",
+                },
+                operation_id="runtime-wrong-cwd",
+            )
+
+        self.assertEqual(
+            raised.exception.code, "service_endpoint_identity_mismatch"
+        )
+
+    def test_network_stop_requires_listener_and_exact_process_absence(self) -> None:
+        backend = StoreBackedMutationBackend(self.persistence, self.actions)
+        endpoint = SimpleNamespace(
+            listener_required=True,
+            listener_port=3108,
+            canonical_root="/repos/alpha",
+            cwd="/repos/alpha",
+        )
+
+        proof = backend._runtime_service_endpoint_proof(
+            endpoint_target=endpoint,
+            action="stop",
+            controlled={
+                "terminal_process_proof": {
+                    "certain": True,
+                    "state": "pid_reused",
+                    "pid": 42_004,
+                }
+            },
+            operation_id="runtime-stop-proof",
+        )
+
+        self.assertEqual(proof["listener"], "absent")
+        self.assertEqual(proof["process"]["state"], "pid_reused")
+        blocked = StoreBackedMutationBackend(
+            self.persistence,
+            type(self.actions)(occupied_ports={3108}),
+        )
+        with self.assertRaises(
+            broker_backend_module.BrokerBackendError
+        ) as raised:
+            blocked._runtime_service_endpoint_proof(
+                endpoint_target=endpoint,
+                action="stop",
+                controlled={
+                    "terminal_process_proof": {
+                        "certain": True,
+                        "state": "absent",
+                    }
+                },
+                operation_id="runtime-stop-listener-still-bound",
+            )
+        self.assertEqual(raised.exception.code, "service_stop_identity_unproven")
+
+    def test_network_service_stop_proves_process_and_assigned_port_absent(self) -> None:
+        with CoordinatorStore.open(
+            self.persistence.database_path, expected_uid=os.geteuid()
+        ) as store:
+            with store.immediate_transaction() as connection:
+                now = utc_timestamp()
+                self._seed_stopped_worker_observation(connection)
+                connection.execute(
+                    """
+                    INSERT INTO port_assignments(
+                        assignment_id, host_id, repo_id, server_name, port,
+                        status, generation, created_at, updated_at
+                    ) VALUES ('runtime-stop-web', ?, ?, 'web', 3109,
+                              'active', 0, ?, ?)
+                    """,
+                    (HOST_ID, PROJECT_ID, now, now),
+                )
+            WorkerSupervision(store).configure_policy(
+                server_definition_id=SERVER_ID,
+                actor="fixture",
+                execution_uid=os.geteuid(),
+                keep_alive=False,
+            )
+
+        class FakeController:
+            def __init__(self, _store, **_kwargs):
+                pass
+
+            def stop(self, **_kwargs):
+                return {
+                    "ok": True,
+                    "status": "stopped",
+                    "health": {"ok": False, "classification": "stopped"},
+                    "supervision": {"supervisor_state": "stopped"},
+                    "terminal_process_proof": {
+                        "certain": True,
+                        "state": "absent",
+                        "pid": 42_005,
+                    },
+                }
+
+        with mock.patch.object(
+            broker_backend_module, "WorkerController", FakeController
+        ):
+            reply = self._reply(
+                action="stop", target_kind="service", resource_id=SERVER_ID
+            )
+
+        self.assertTrue(reply["ok"], reply)
+        proof = reply["result"]["result"]["endpoint_proof"]
+        self.assertEqual(proof["state"], "stopped")
+        self.assertEqual(proof["listener"], "absent")
+        self.assertEqual(proof["process"]["state"], "absent")
+        self.assertIn(((3109,), "tcp"), self.actions.port_observations)
 
     def test_worker_service_lifecycle_uses_exact_worker_authority_and_replays(
         self,
     ) -> None:
-        self._grant("start", resource_kind="service", resource_id=SERVER_ID)
         with CoordinatorStore.open(
             self.persistence.database_path, expected_uid=os.geteuid()
         ) as store:
@@ -1102,12 +1793,12 @@ class BrokerRuntimeAuthorizationTests(unittest.TestCase):
         )
         self.assertEqual(
             self.persistence.worker_execution_uid(
-                self.persistence.authorize(peer_for(), request)
+                self.persistence.accept(peer_for(), request)
             ),
             os.geteuid() + 1,
         )
 
-        # Reconfigure the enrolled execution owner for the independent path
+        # Reconfigure the configured execution owner for the independent path
         # and generation guards; the caller UID remains attribution only.
         with CoordinatorStore.open(
             self.persistence.database_path, expected_uid=os.geteuid()
@@ -1244,40 +1935,624 @@ class BrokerRuntimeAuthorizationTests(unittest.TestCase):
             {"ok": True, "restored_generation": 0},
         )
 
-    def test_ttl_start_is_rejected_before_reservation_or_host_mutation(self) -> None:
-        self._grant("start")
-
-        reply = self._reply(
-            action="start", purpose="test", ttl_seconds=30
+    def test_database_replace_backs_up_restores_and_preserves_logical_id(self) -> None:
+        actions, service, _backend = self._prepare_compose_replacement(
+            database=True
         )
+        request = self._request(
+            action="replace",
+            target_kind="database_stack",
+            resource_id=DATABASE_ID,
+        )
+
+        reply = self._reply(request=request, service=service)
+        replay = self._reply(request=request, service=service)
+
+        self.assertTrue(reply["ok"], reply)
+        self.assertEqual(reply, replay)
+        replacement = reply["result"]["replacement"]
+        self.assertEqual(replacement["current"]["resource_id"], DATABASE_ID)
+        self.assertTrue(replacement["data_preservation_verified"])
+        self.assertEqual(
+            [item[0] for item in actions.postgres_calls],
+            ["backup", "restore"],
+        )
+        with CoordinatorStore.open(
+            self.persistence.database_path, expected_uid=os.geteuid()
+        ) as store:
+            with store.read_transaction() as connection:
+                binding = connection.execute(
+                    """
+                    SELECT docker_resource_id FROM database_bindings
+                    WHERE database_binding_id = ?
+                    """,
+                    (DATABASE_ID,),
+                ).fetchone()
+                self.assertEqual(
+                    binding["docker_resource_id"], REPLACEMENT_RESOURCE_ID
+                )
+                restore = connection.execute(
+                    """
+                    SELECT target_container_id FROM database_restore_events
+                    WHERE restore_event_id = ?
+                    """,
+                    (
+                        "database-restore-operation-"
+                        + request.operation_id,
+                    ),
+                ).fetchone()
+                if restore is None:
+                    restore = connection.execute(
+                        """
+                        SELECT target_container_id
+                        FROM database_restore_events
+                        WHERE target_container_id = ?
+                        """,
+                        (REPLACEMENT_FULL_ID,),
+                    ).fetchone()
+                self.assertEqual(restore["target_container_id"], REPLACEMENT_FULL_ID)
+
+    def test_replace_recovers_lost_terminal_commit_without_recreation(self) -> None:
+        actions, service, _backend = self._prepare_compose_replacement()
+        request = self._request(action="replace")
+        original_finish = self.persistence.finish_runtime_replacement
+        attempts = 0
+
+        def finish_once_lost(*args: object, **kwargs: object) -> None:
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise RuntimeError("injected lost terminal commit")
+            original_finish(*args, **kwargs)
+
+        with mock.patch.object(
+            self.persistence,
+            "finish_runtime_replacement",
+            side_effect=finish_once_lost,
+        ):
+            first = self._reply(request=request, service=service)
+            replay = self._reply(request=request, service=service)
+
+        self.assertFalse(first["ok"], first)
+        self.assertTrue(replay["ok"], replay)
+        self.assertEqual(actions.compose_calls, ["up"])
+        self.assertEqual(attempts, 2)
+
+    def test_database_replace_reconciles_lost_restore_result_without_reexecution(
+        self,
+    ) -> None:
+        actions, service, backend = self._prepare_compose_replacement(
+            database=True
+        )
+        request = self._request(
+            action="replace",
+            target_kind="database_stack",
+            resource_id=DATABASE_ID,
+        )
+        original_restore = actions.postgres_restore
+        recovered_result: dict[str, object] = {}
+
+        def capture_restore(*args: object, **kwargs: object) -> dict[str, object]:
+            result = dict(original_restore(*args, **kwargs))
+            recovered_result.update(result)
+            return result
+
+        def reconcile_restore(
+            _target: object,
+            _backup: object,
+            *,
+            safety_output_root: str,
+        ) -> dict[str, object]:
+            del safety_output_root
+            if not recovered_result:
+                raise AssertionError("restore reconciliation ran before restore")
+            return dict(recovered_result)
+
+        original_save = self.persistence.save_runtime_replacement_restore_result
+        save_attempts = 0
+
+        def save_once_lost(*args: object, **kwargs: object) -> object:
+            nonlocal save_attempts
+            save_attempts += 1
+            if save_attempts == 1:
+                raise RuntimeError("injected lost restore-result commit")
+            return original_save(*args, **kwargs)
+
+        actions.postgres_restore = capture_restore  # type: ignore[method-assign]
+        actions.postgres_reconcile_restore = (  # type: ignore[method-assign]
+            reconcile_restore
+        )
+        with mock.patch.object(
+            self.persistence,
+            "save_runtime_replacement_restore_result",
+            side_effect=save_once_lost,
+        ):
+            first = self._reply(request=request, service=service)
+            restarted_service = BrokerService(
+                StoreBackedRequestAcceptor(self.persistence),
+                SerializedMutationWriter(backend),
+            )
+            replay = self._reply(request=request, service=restarted_service)
+
+        self.assertFalse(first["ok"], first)
+        self.assertTrue(replay["ok"], replay)
+        self.assertEqual(actions.compose_calls, ["up"])
+        self.assertEqual(
+            [item[0] for item in actions.postgres_calls],
+            ["backup", "restore"],
+        )
+        self.assertEqual(save_attempts, 2)
+
+    def test_database_replace_never_reexecutes_unproved_prior_restore(self) -> None:
+        actions, service, backend = self._prepare_compose_replacement(
+            database=True
+        )
+        request = self._request(
+            action="replace",
+            target_kind="database_stack",
+            resource_id=DATABASE_ID,
+        )
+        original_save = self.persistence.save_runtime_replacement_restore_result
+        save_attempts = 0
+
+        def lose_first_save(*args: object, **kwargs: object) -> object:
+            nonlocal save_attempts
+            save_attempts += 1
+            if save_attempts == 1:
+                raise RuntimeError("injected lost restore-result commit")
+            return original_save(*args, **kwargs)
+
+        with mock.patch.object(
+            self.persistence,
+            "save_runtime_replacement_restore_result",
+            side_effect=lose_first_save,
+        ):
+            first = self._reply(request=request, service=service)
+            restarted_service = BrokerService(
+                StoreBackedRequestAcceptor(self.persistence),
+                SerializedMutationWriter(backend),
+            )
+            replay = self._reply(request=request, service=restarted_service)
+
+        self.assertFalse(first["ok"], first)
+        self.assertFalse(replay["ok"], replay)
+        self.assertEqual(
+            replay["error"]["code"], "operation_outcome_uncertain"
+        )
+        self.assertEqual(
+            [item[0] for item in actions.postgres_calls],
+            ["backup", "restore"],
+        )
+        self.assertEqual(save_attempts, 1)
+
+    def test_replace_preflight_rejects_unsealed_container_before_host_mutation(
+        self,
+    ) -> None:
+        actions = RuntimeReplacementHostActions()
+        service = self._service(actions=actions)
+
+        reply = self._reply(action="replace", service=service)
 
         self.assertFalse(reply["ok"], reply)
         self.assertEqual(
-            reply["error"]["code"], "runtime_cleanup_owner_required"
+            reply["error"]["code"],
+            "compose_collision_observation_incomplete",
         )
+        self.assertEqual(actions.compose_calls, [])
+        self.assertEqual(actions.postgres_calls, [])
+
+    def test_ttl_start_is_durably_reaped_and_retains_borrowed_catalog(self) -> None:
+        backend = StoreBackedMutationBackend(
+            self.persistence,
+            self.actions,
+            observe_before_lifecycle_plan=self._runtime_observer,
+        )
+        service = BrokerService(
+            StoreBackedRequestAcceptor(self.persistence),
+            SerializedMutationWriter(backend),
+        )
+        request = self._request(
+            action="start", purpose="test", ttl_seconds=30
+        )
+        reply = self._reply(request=request, service=service)
+        replay = self._reply(request=request, service=service)
+
+        self.assertTrue(reply["ok"], reply)
+        self.assertEqual(replay, reply)
+        session_id = reply["result"]["run_id"]
+        with CoordinatorStore.open(
+            self.persistence.database_path, expected_uid=os.geteuid()
+        ) as store:
+            with store.immediate_transaction() as connection:
+                self.assertEqual(
+                    connection.execute(
+                        "SELECT status FROM runtime_sessions WHERE session_id = ?",
+                        (session_id,),
+                    ).fetchone()[0],
+                    "running",
+                )
+                resource_state = connection.execute(
+                        """
+                        SELECT cleanup_disposition, cleanup_state
+                        FROM runtime_session_resources WHERE session_id = ?
+                        """,
+                        (session_id,),
+                    ).fetchone()
+                self.assertEqual(
+                    tuple(resource_state),
+                    ("retained", "active"),
+                )
+                connection.execute(
+                    """
+                    UPDATE runtime_sessions SET expires_at = '2000-01-01T00:00:00Z'
+                    WHERE session_id = ?
+                    """,
+                    (session_id,),
+                )
+
+        reaped = backend.reap_broker_runtime_sessions_once()
+        repeated = backend.reap_broker_runtime_sessions_once()
+
+        self.assertEqual(len(reaped), 1)
+        self.assertEqual(reaped[0]["session_id"], session_id)
+        self.assertEqual(reaped[0]["status"], "expired")
+        self.assertEqual(repeated, [])
         with CoordinatorStore.open(
             self.persistence.database_path, expected_uid=os.geteuid()
         ) as store:
             with store.read_transaction() as connection:
                 self.assertEqual(
                     connection.execute(
-                        "SELECT COUNT(*) FROM runtime_sessions"
+                        "SELECT status FROM runtime_sessions WHERE session_id = ?",
+                        (session_id,),
                     ).fetchone()[0],
-                    0,
+                    "expired",
                 )
                 self.assertEqual(
                     connection.execute(
-                        "SELECT COUNT(*) FROM operations WHERE kind = 'broker.runtime.request'"
+                        """
+                        SELECT cleanup_state FROM runtime_session_resources
+                        WHERE session_id = ?
+                        """,
+                        (session_id,),
                     ).fetchone()[0],
-                    0,
+                    "retained",
                 )
-        self.assertEqual(self.actions.calls, [])
+                self.assertIsNotNone(
+                    connection.execute(
+                        "SELECT 1 FROM docker_resources WHERE docker_resource_id = ?",
+                        (CONTAINER_ID,),
+                    ).fetchone()
+                )
+        self.assertEqual(
+            [call[0] for call in self.actions.calls], ["start", "stop"]
+        )
+
+    def test_restarted_broker_background_reaper_recovers_departed_owner(self) -> None:
+        original = StoreBackedMutationBackend(
+            self.persistence,
+            self.actions,
+            observe_before_lifecycle_plan=self._runtime_observer,
+        )
+        service = BrokerService(
+            StoreBackedRequestAcceptor(self.persistence),
+            SerializedMutationWriter(original),
+        )
+        reply = self._reply(
+            action="start",
+            purpose="test",
+            ttl_seconds=30,
+            service=service,
+        )
+        self.assertTrue(reply["ok"], reply)
+        session_id = reply["result"]["run_id"]
+        with CoordinatorStore.open(
+            self.persistence.database_path, expected_uid=os.geteuid()
+        ) as store:
+            with store.immediate_transaction() as connection:
+                connection.execute(
+                    """
+                    UPDATE runtime_sessions
+                    SET expires_at = '2000-01-01T00:00:00Z',
+                        execution_owner_pid = 2147483647,
+                        execution_owner_identity = 'departed-broker-owner'
+                    WHERE session_id = ?
+                    """,
+                    (session_id,),
+                )
+
+        restarted = StoreBackedMutationBackend(
+            self.persistence,
+            self.actions,
+            observe_before_lifecycle_plan=self._runtime_observer,
+        )
+        restarted.start_ephemeral_reaper()
+        try:
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline:
+                with CoordinatorStore.open(
+                    self.persistence.database_path, expected_uid=os.geteuid()
+                ) as store:
+                    with store.read_transaction() as connection:
+                        status = connection.execute(
+                            "SELECT status FROM runtime_sessions WHERE session_id = ?",
+                            (session_id,),
+                        ).fetchone()[0]
+                if status == "expired":
+                    break
+                time.sleep(0.01)
+            self.assertEqual(status, "expired")
+        finally:
+            restarted.stop_ephemeral_reaper(timeout_seconds=2.0)
+
+        self.assertEqual(
+            [call[0] for call in self.actions.calls], ["start", "stop"]
+        )
+
+    def test_restart_recovers_crash_after_ttl_intent_before_result_commit(self) -> None:
+        request = self._request(
+            action="start", purpose="test", ttl_seconds=30
+        )
+        authorized = self.persistence.accept(peer_for(), request)
+        self.assertEqual(
+            self.persistence.reserve_operation(authorized).state, "execute"
+        )
+        target = self.persistence.runtime_docker_target(authorized)
+        session_id = self.persistence.begin_broker_runtime_session(
+            authorized, target=target
+        )
+        self.actions.docker_start(target)
+
+        recovered = self.persistence.recover_interrupted_docker_operations()
+        self.assertEqual(recovered["operation_ids"], [request.operation_id])
+        with CoordinatorStore.open(
+            self.persistence.database_path, expected_uid=os.geteuid()
+        ) as store:
+            with store.immediate_transaction() as connection:
+                session = connection.execute(
+                    """
+                    SELECT status FROM runtime_sessions WHERE session_id = ?
+                    """,
+                    (session_id,),
+                ).fetchone()
+                resource = connection.execute(
+                    """
+                    SELECT cleanup_state FROM runtime_session_resources
+                    WHERE session_id = ?
+                    """,
+                    (session_id,),
+                ).fetchone()
+                self.assertEqual(session["status"], "cleanup_pending")
+                self.assertEqual(resource["cleanup_state"], "active")
+                connection.execute(
+                    """
+                    UPDATE runtime_sessions
+                    SET expires_at = '2000-01-01T00:00:00Z'
+                    WHERE session_id = ?
+                    """,
+                    (session_id,),
+                )
+
+        restarted = StoreBackedMutationBackend(
+            self.persistence,
+            self.actions,
+            observe_before_lifecycle_plan=self._runtime_observer,
+        )
+        result = restarted.reap_broker_runtime_sessions_once()
+
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["status"], "expired")
+        self.assertEqual(
+            [call[0] for call in self.actions.calls], ["start", "stop"]
+        )
+
+    def test_newer_runtime_session_supersedes_older_ttl_cleanup(self) -> None:
+        backend = StoreBackedMutationBackend(
+            self.persistence,
+            self.actions,
+            observe_before_lifecycle_plan=self._runtime_observer,
+        )
+        service = BrokerService(
+            StoreBackedRequestAcceptor(self.persistence),
+            SerializedMutationWriter(backend),
+        )
+        expiring = self._reply(
+            action="start",
+            purpose="test",
+            ttl_seconds=30,
+            service=service,
+        )
+        persistent = self._reply(action="start", service=service)
+        self.assertTrue(expiring["ok"], expiring)
+        self.assertTrue(persistent["ok"], persistent)
+        with CoordinatorStore.open(
+            self.persistence.database_path, expected_uid=os.geteuid()
+        ) as store:
+            with store.immediate_transaction() as connection:
+                connection.execute(
+                    """
+                    UPDATE runtime_sessions SET expires_at = '2000-01-01T00:00:00Z'
+                    WHERE session_id = ?
+                    """,
+                    (expiring["result"]["run_id"],),
+                )
+
+        reaped = backend.reap_broker_runtime_sessions_once()
+
+        self.assertEqual(len(reaped), 1)
+        self.assertEqual(
+            reaped[0]["result"]["classification"],
+            "superseded_by_newer_runtime_session",
+        )
+        self.assertEqual(
+            [call[0] for call in self.actions.calls], ["start", "start"]
+        )
+
+    def test_database_ttl_cleanup_stops_container_and_retains_binding(self) -> None:
+        seed_postgres_database(self.persistence)
+
+        def observe_database(store: CoordinatorStore) -> dict[str, object]:
+            stopped = bool(
+                self.actions.calls and self.actions.calls[-1][0] == "stop"
+            )
+            return self._runtime_observer(
+                store,
+                lifecycle="stopped" if stopped else "running",
+                database_available=not stopped,
+            )
+
+        backend = StoreBackedMutationBackend(
+            self.persistence,
+            self.actions,
+            observe_before_lifecycle_plan=observe_database,
+        )
+        service = BrokerService(
+            StoreBackedRequestAcceptor(self.persistence),
+            SerializedMutationWriter(backend),
+        )
+        reply = self._reply(
+            action="start",
+            purpose="temporary",
+            ttl_seconds=30,
+            target_kind="database_stack",
+            resource_id=DATABASE_ID,
+            service=service,
+        )
+        self.assertTrue(reply["ok"], reply)
+        self.assertTrue(reply["result"]["ok"], reply)
+        with CoordinatorStore.open(
+            self.persistence.database_path, expected_uid=os.geteuid()
+        ) as store:
+            with store.immediate_transaction() as connection:
+                connection.execute(
+                    """
+                    UPDATE runtime_sessions SET expires_at = '2000-01-01T00:00:00Z'
+                    WHERE session_id = ?
+                    """,
+                    (reply["result"]["run_id"],),
+                )
+                session_state = connection.execute(
+                    """
+                    SELECT status, action, purpose, ttl_seconds, expires_at
+                    FROM runtime_sessions WHERE session_id = ?
+                    """,
+                    (reply["result"]["run_id"],),
+                ).fetchone()
+                resource_state = connection.execute(
+                    """
+                    SELECT resource_kind, resource_id, cleanup_state
+                    FROM runtime_session_resources WHERE session_id = ?
+                    """,
+                    (reply["result"]["run_id"],),
+                ).fetchone()
+                self.assertEqual(
+                    tuple(session_state),
+                    (
+                        "running",
+                        "start",
+                        "temporary",
+                        30,
+                        "2000-01-01T00:00:00Z",
+                    ),
+                )
+                self.assertEqual(
+                    tuple(resource_state),
+                    ("database_stack", DATABASE_ID, "active"),
+                )
+
+        reaped = backend.reap_broker_runtime_sessions_once()
+
+        self.assertEqual(len(reaped), 1)
+        self.assertEqual(reaped[0]["status"], "expired")
+        with CoordinatorStore.open(
+            self.persistence.database_path, expected_uid=os.geteuid()
+        ) as store:
+            with store.read_transaction() as connection:
+                self.assertIsNotNone(
+                    connection.execute(
+                        """
+                        SELECT 1 FROM database_bindings
+                        WHERE database_binding_id = ? AND docker_resource_id = ?
+                        """,
+                        (DATABASE_ID, CONTAINER_ID),
+                    ).fetchone()
+                )
+        self.assertEqual(
+            [call[0] for call in self.actions.calls], ["start", "stop"]
+        )
+
+    def test_ttl_cleanup_fails_closed_on_immutable_container_drift(self) -> None:
+        backend = StoreBackedMutationBackend(
+            self.persistence,
+            self.actions,
+            observe_before_lifecycle_plan=self._runtime_observer,
+        )
+        service = BrokerService(
+            StoreBackedRequestAcceptor(self.persistence),
+            SerializedMutationWriter(backend),
+        )
+        reply = self._reply(
+            action="start",
+            purpose="test",
+            ttl_seconds=30,
+            service=service,
+        )
+        self.assertTrue(reply["ok"], reply)
+        self.assertTrue(reply["result"]["ok"], reply)
+        session_id = reply["result"]["run_id"]
+        with CoordinatorStore.open(
+            self.persistence.database_path, expected_uid=os.geteuid()
+        ) as store:
+            with store.immediate_transaction() as connection:
+                connection.execute(
+                    """
+                    UPDATE runtime_sessions SET expires_at = '2000-01-01T00:00:00Z'
+                    WHERE session_id = ?
+                    """,
+                    (session_id,),
+                )
+                connection.execute(
+                    """
+                    UPDATE docker_resources SET full_container_id = ?, updated_at = ?
+                    WHERE docker_resource_id = ?
+                    """,
+                    ("f" * 64, utc_timestamp(), CONTAINER_ID),
+                )
+
+        result = backend.reap_broker_runtime_sessions_once()
+
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["status"], "cleanup_pending")
+        self.assertEqual(
+            result[0]["error"]["type"], "BrokerError"
+        )
+        self.assertEqual([call[0] for call in self.actions.calls], ["start"])
+        with CoordinatorStore.open(
+            self.persistence.database_path, expected_uid=os.geteuid()
+        ) as store:
+            with store.read_transaction() as connection:
+                self.assertEqual(
+                    connection.execute(
+                        "SELECT status FROM runtime_sessions WHERE session_id = ?",
+                        (session_id,),
+                    ).fetchone()[0],
+                    "cleanup_pending",
+                )
+                self.assertEqual(
+                    connection.execute(
+                        """
+                        SELECT cleanup_state FROM runtime_session_resources
+                        WHERE session_id = ?
+                        """,
+                        (session_id,),
+                    ).fetchone()[0],
+                    "failed",
+                )
 
     def test_docker_start_stop_restart_use_exact_identity_and_terminal_proof(
         self,
     ) -> None:
         for action in ("start", "stop", "restart"):
-            self._grant(action)
             with self.subTest(action=action):
                 reply = self._reply(action=action)
                 self.assertTrue(reply["ok"], reply)
@@ -1296,53 +2571,11 @@ class BrokerRuntimeAuthorizationTests(unittest.TestCase):
             all(call[2] == "a" * 64 for call in self.actions.calls)
         )
 
-    def test_docker_start_allows_observation_only_binding_generation_refresh(
-        self,
-    ) -> None:
-        self._grant("start")
-        observations = 0
-
-        def refresh_binding_after_action(
-            store: CoordinatorStore,
-        ) -> dict[str, object]:
-            nonlocal observations
-            observations += 1
-            evidence = self._runtime_observer(store)
-            if observations == 2:
-                with store.immediate_transaction(revision_kind="observation") as connection:
-                    connection.execute(
-                        """
-                        UPDATE control_bindings
-                        SET generation = generation + 1
-                        WHERE repo_id = ?
-                        """,
-                        (PROJECT_ID,),
-                    )
-            return evidence
-
-        reply = self._reply(
-            action="start",
-            service=self._service(observer=refresh_binding_after_action),
-        )
-
-        self.assertTrue(reply["ok"], reply)
-        self.assertTrue(reply["result"]["ok"], reply)
-        self.assertEqual(
-            reply["result"]["result"]["terminal_state"]["observed_state"],
-            "running",
-        )
-        self.assertEqual(self.actions.calls, [("start", CONTAINER_ID, "a" * 64)])
-
     def test_database_lifecycle_maps_binding_to_exact_container_and_readiness(
         self,
     ) -> None:
         seed_postgres_database(self.persistence)
         for action in ("start", "stop", "restart"):
-            self._grant(
-                action,
-                resource_kind="database_stack",
-                resource_id=DATABASE_ID,
-            )
             with self.subTest(action=action):
                 call_count_before = len(self.actions.calls)
 
@@ -1398,7 +2631,6 @@ class BrokerRuntimeAuthorizationTests(unittest.TestCase):
         )
 
     def test_unclassified_family_blocks_lifecycle_before_reservation(self) -> None:
-        self._grant("start")
         now = utc_timestamp()
         with CoordinatorStore.open(
             self.persistence.database_path, expected_uid=os.geteuid()
@@ -1424,25 +2656,15 @@ class BrokerRuntimeAuthorizationTests(unittest.TestCase):
         )
         self.assertEqual(self.actions.calls, [])
 
-    def test_unauthorized_and_family_mismatch_lifecycle_never_reach_host(self) -> None:
-        unauthorized = self._reply(action="start")
-        self.assertFalse(unauthorized["ok"], unauthorized)
-        self.assertEqual(
-            unauthorized["error"]["code"], "operation_access_denied"
+    def test_unknown_optional_temporary_route_does_not_gate_root_lifecycle(self) -> None:
+        reply = self._reply(
+            action="start", temporary_repo_id="not-an-configured-worktree"
         )
-
-        self._grant("start")
-        mismatch = self._reply(
-            action="start", temporary_repo_id="not-an-enrolled-worktree"
-        )
-        self.assertFalse(mismatch["ok"], mismatch)
-        self.assertEqual(
-            mismatch["error"]["code"], "runtime_repository_context_mismatch"
-        )
-        self.assertEqual(self.actions.calls, [])
+        self.assertTrue(reply["ok"], reply)
+        self.assertTrue(reply["result"]["ok"], reply)
+        self.assertEqual(len(self.actions.calls), 1)
 
     def test_success_replays_durably_after_writer_reconstruction(self) -> None:
-        self._grant("start")
         request = self._request(action="start")
 
         first = self._reply(request=request)
@@ -1451,58 +2673,6 @@ class BrokerRuntimeAuthorizationTests(unittest.TestCase):
         self.assertTrue(first["ok"], first)
         self.assertEqual(second, first)
         self.assertEqual(len(self.actions.calls), 1)
-
-    def test_host_error_requires_reconciliation_and_is_never_reexecuted(
-        self,
-    ) -> None:
-        class FailingActions(type(self.actions)):
-            def docker_start(inner_self, target):
-                inner_self.calls.append(
-                    ("start", target.docker_resource_id, target.full_container_id)
-                )
-                raise BrokerError("docker_action_failed", "typed Docker failure")
-
-        actions = FailingActions()
-        self._grant("start")
-        request = self._request(action="start")
-
-        first = self._reply(
-            request=request, service=self._service(actions=actions)
-        )
-        second = self._reply(
-            request=request, service=self._service(actions=actions)
-        )
-        third = self._reply(
-            request=request, service=self._service(actions=actions)
-        )
-
-        self.assertFalse(first["ok"], first)
-        self.assertEqual(
-            first["error"]["code"], "operation_outcome_uncertain"
-        )
-        self.assertFalse(second["ok"], second)
-        self.assertEqual(
-            second["error"]["code"], "lifecycle_target_not_ready"
-        )
-        self.assertEqual(third, second)
-        self.assertEqual(len(actions.calls), 1)
-        with CoordinatorStore.open(
-            self.persistence.database_path, expected_uid=os.geteuid()
-        ) as store:
-            with store.read_transaction() as connection:
-                row = connection.execute(
-                    "SELECT status, phase, error_code FROM operations "
-                    "WHERE operation_id = ?",
-                    (request.operation_id,),
-                ).fetchone()
-        self.assertEqual(
-            dict(row),
-            {
-                "status": "failed",
-                "phase": "reconciliation_failed",
-                "error_code": "lifecycle_target_not_ready",
-            },
-        )
 
     def test_post_observation_failure_is_uncertain_and_replay_never_reexecutes(
         self,
@@ -1516,7 +2686,6 @@ class BrokerRuntimeAuthorizationTests(unittest.TestCase):
                 raise RuntimeError("injected post-observation failure")
             return self._runtime_observer(store)
 
-        self._grant("start")
         request = self._request(action="start")
         service = self._service(observer=fail_after_action)
 
@@ -1536,9 +2705,8 @@ class BrokerRuntimeAuthorizationTests(unittest.TestCase):
     def test_startup_recovery_reconciles_runtime_request_without_host_reexecution(
         self,
     ) -> None:
-        self._grant("start")
         request = self._request(action="start")
-        authorized = self.persistence.authorize(peer_for(), request)
+        authorized = self.persistence.accept(peer_for(), request)
         self.assertEqual(
             self.persistence.reserve_operation(authorized).state, "execute"
         )
@@ -1571,7 +2739,6 @@ class BrokerRuntimeAuthorizationTests(unittest.TestCase):
             return self._runtime_observer(store, lifecycle="running")
 
         actions = UncertainRestart()
-        self._grant("restart")
         request = self._request(action="restart")
 
         first = self._reply(
@@ -1607,10 +2774,6 @@ class BrokerRuntimeAuthorizationTests(unittest.TestCase):
 
     def test_database_alias_and_docker_id_share_one_mutation_fence(self) -> None:
         seed_postgres_database(self.persistence)
-        self._grant("start")
-        self._grant(
-            "stop", resource_kind="database_stack", resource_id=DATABASE_ID
-        )
         docker_request = self._request(action="start")
         database_request = self._request(
             action="stop",
@@ -1619,20 +2782,19 @@ class BrokerRuntimeAuthorizationTests(unittest.TestCase):
         )
         self.assertEqual(
             self.persistence.reserve_operation(
-                self.persistence.authorize(peer_for(), docker_request)
+                self.persistence.accept(peer_for(), docker_request)
             ).state,
             "execute",
         )
 
         with self.assertRaises(BrokerError) as blocked:
             self.persistence.reserve_operation(
-                self.persistence.authorize(peer_for(), database_request)
+                self.persistence.accept(peer_for(), database_request)
             )
 
         self.assertEqual(blocked.exception.code, "docker_operation_pending")
 
     def test_final_state_and_identity_mismatch_fail_durably(self) -> None:
-        self._grant("start")
 
         def remain_stopped(store: CoordinatorStore) -> dict[str, object]:
             return self._runtime_observer(store, lifecycle="stopped")

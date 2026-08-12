@@ -230,8 +230,8 @@ struct ManagedServer: Decodable, Identifiable, Hashable, Sendable {
     // Populated by the Board's repository catalog after source inventories
     // are reconciled. These are presentation/control facts, not coordinator
     // payload fields, so they deliberately have no CodingKeys.
-    var ownershipError: String? = nil
-    var ownershipCandidates: [CoordinatorOrigin] = []
+    var associationError: String? = nil
+    var routeCandidates: [CoordinatorOrigin] = []
     var observationOrigins: [CoordinatorOrigin] = []
 
     enum CodingKeys: String, CodingKey {
@@ -399,7 +399,7 @@ enum AttributionReasonCode: String, Codable, Hashable, Sendable {
     case missingRepository = "missing_repo"
     case nonGitRepository = "not_git"
     case conflictingClaims = "conflicting_claims"
-    case ambiguousControl = "ambiguous_control"
+    case ambiguousAssociation = "ambiguous_control"
     case staleObservation = "stale_observation"
     case startFenceViolated = "start_fence_violated"
     case unknown
@@ -410,8 +410,8 @@ enum AttributionReasonCode: String, Codable, Hashable, Sendable {
         case .missingRepository: return "The linked repository is missing"
         case .nonGitRepository: return "The path is not a Git repository"
         case .conflictingClaims: return "Several repositories claim this resource"
-        case .ambiguousControl: return "No single controller is authoritative"
-        case .staleObservation: return "The ownership observation is stale"
+        case .ambiguousAssociation: return "Repository association is ambiguous"
+        case .staleObservation: return "The association observation is stale"
         case .startFenceViolated: return "A removed resource is running again"
         case .unknown: return "Repository attribution is unavailable"
         }
@@ -422,11 +422,9 @@ struct ResourceAttribution: Decodable, Hashable, Sendable {
     let reasonCode: AttributionReasonCode
     let explanation: String
     let observedBy: [String]
-    let controller: String?
     let hostResourceID: String?
     let immutableFingerprint: String?
-    let controlBindingID: String?
-    let ownershipFingerprint: String?
+    let observationFingerprint: String?
     let canAttach: Bool
     let canRetire: Bool
     let lifecycleViolation: Bool
@@ -436,11 +434,9 @@ struct ResourceAttribution: Decodable, Hashable, Sendable {
         case reasonCode = "reason_code"
         case explanation
         case observedBy = "observed_by"
-        case controller
         case hostResourceID = "host_resource_id"
         case immutableFingerprint = "immutable_fingerprint"
-        case controlBindingID = "control_binding_id"
-        case ownershipFingerprint = "ownership_fingerprint"
+        case observationFingerprint = "observation_fingerprint"
         case canAttach = "can_attach"
         case canRetire = "can_retire"
         case lifecycleViolation = "lifecycle_violation"
@@ -451,11 +447,9 @@ struct ResourceAttribution: Decodable, Hashable, Sendable {
         reasonCode: AttributionReasonCode,
         explanation: String,
         observedBy: [String],
-        controller: String?,
         hostResourceID: String?,
         immutableFingerprint: String?,
-        controlBindingID: String?,
-        ownershipFingerprint: String?,
+        observationFingerprint: String?,
         canAttach: Bool,
         canRetire: Bool,
         lifecycleViolation: Bool,
@@ -464,11 +458,9 @@ struct ResourceAttribution: Decodable, Hashable, Sendable {
         self.reasonCode = reasonCode
         self.explanation = explanation
         self.observedBy = observedBy
-        self.controller = controller
         self.hostResourceID = hostResourceID
         self.immutableFingerprint = immutableFingerprint
-        self.controlBindingID = controlBindingID
-        self.ownershipFingerprint = ownershipFingerprint
+        self.observationFingerprint = observationFingerprint
         self.canAttach = canAttach
         self.canRetire = canRetire
         self.lifecycleViolation = lifecycleViolation
@@ -480,11 +472,9 @@ struct ResourceAttribution: Decodable, Hashable, Sendable {
         reasonCode = try values.decodeIfPresent(AttributionReasonCode.self, forKey: .reasonCode) ?? .unknown
         explanation = try values.decodeIfPresent(String.self, forKey: .explanation) ?? reasonCode.title
         observedBy = try values.decodeIfPresent([String].self, forKey: .observedBy) ?? []
-        controller = try values.decodeIfPresent(String.self, forKey: .controller)
         hostResourceID = try values.decodeIfPresent(String.self, forKey: .hostResourceID)
         immutableFingerprint = try values.decodeIfPresent(String.self, forKey: .immutableFingerprint)
-        controlBindingID = try values.decodeIfPresent(String.self, forKey: .controlBindingID)
-        ownershipFingerprint = try values.decodeIfPresent(String.self, forKey: .ownershipFingerprint)
+        observationFingerprint = try values.decodeIfPresent(String.self, forKey: .observationFingerprint)
         canAttach = try values.decodeIfPresent(Bool.self, forKey: .canAttach) ?? false
         canRetire = try values.decodeIfPresent(Bool.self, forKey: .canRetire) ?? false
         lifecycleViolation = try values.decodeIfPresent(Bool.self, forKey: .lifecycleViolation) ?? false
@@ -539,7 +529,7 @@ struct ProjectUsage: Decodable, Hashable, Identifiable, Sendable {
     var project: String?
     var projectKey: String?
     var name: String?
-    // Authoritative membership from the coordinator: the servers/containers a
+    // Authoritative association from the coordinator: the servers/containers a
     // row claims are exactly the ones whole-project actions act on.
     var serverIDs: [String]? = nil
     var containerNames: [String]? = nil
@@ -646,8 +636,8 @@ struct DockerContainer: Decodable, Identifiable, Hashable, Sendable {
     var databaseSizeBytes: Int64? = nil
     var databaseDiscoveryError: String? = nil
     var startedAt: String? = nil
-    var ownershipError: String? = nil
-    var ownershipCandidates: [CoordinatorOrigin] = []
+    var associationError: String? = nil
+    var routeCandidates: [CoordinatorOrigin] = []
     var observationOrigins: [CoordinatorOrigin] = []
     var attribution: ResourceAttribution? = nil
 
@@ -1013,7 +1003,7 @@ extension DockerContainer {
     }
 
     var resourceIdentity: ResourceIdentity? {
-        guard ownershipError == nil else { return nil }
+        guard associationError == nil else { return nil }
         return origin.map {
             ResourceIdentity(
                 origin: $0,
@@ -1024,7 +1014,7 @@ extension DockerContainer {
     }
 
     var databaseIdentity: DatabaseIdentity? {
-        guard ownershipError == nil,
+        guard associationError == nil,
               let origin,
               let container = name,
               let database,
@@ -1100,7 +1090,7 @@ extension ManagedServer {
     }
 
     var resourceIdentity: ResourceIdentity? {
-        guard ownershipError == nil else { return nil }
+        guard associationError == nil else { return nil }
         return origin.map { ResourceIdentity(origin: $0, kind: .server, nativeID: coordinatorID ?? id) }
     }
 
@@ -1109,16 +1099,14 @@ extension ManagedServer {
               let attribution,
               let hostResourceID = attribution.hostResourceID?.nilIfBlank,
               let immutableFingerprint = attribution.immutableFingerprint?.nilIfBlank,
-              let controlBindingID = attribution.controlBindingID?.nilIfBlank,
-              let ownershipFingerprint = attribution.ownershipFingerprint?.nilIfBlank
+              let observationFingerprint = attribution.observationFingerprint?.nilIfBlank
         else { return nil }
         return ExactUnassignedResource(
             origin: origin,
             kind: "server",
             hostResourceID: hostResourceID,
             immutableFingerprint: immutableFingerprint,
-            controlBindingID: controlBindingID,
-            ownershipFingerprint: ownershipFingerprint,
+            observationFingerprint: observationFingerprint,
             displayName: name
         )
     }
@@ -1134,16 +1122,14 @@ extension DockerContainer {
               let attribution,
               let hostResourceID = attribution.hostResourceID?.nilIfBlank,
               let immutableFingerprint = attribution.immutableFingerprint?.nilIfBlank,
-              let controlBindingID = attribution.controlBindingID?.nilIfBlank,
-              let ownershipFingerprint = attribution.ownershipFingerprint?.nilIfBlank
+              let observationFingerprint = attribution.observationFingerprint?.nilIfBlank
         else { return nil }
         return ExactUnassignedResource(
             origin: origin,
             kind: "container",
             hostResourceID: hostResourceID,
             immutableFingerprint: immutableFingerprint,
-            controlBindingID: controlBindingID,
-            ownershipFingerprint: ownershipFingerprint,
+            observationFingerprint: observationFingerprint,
             displayName: name ?? database ?? hostResourceID
         )
     }

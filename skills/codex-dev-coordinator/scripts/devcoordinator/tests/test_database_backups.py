@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import tempfile
 import unittest
+import uuid
 from unittest import mock
 
 import devcoordinator.database_backups as backup_registry
@@ -111,33 +112,11 @@ class DatabaseBackupRegistryTests(unittest.TestCase):
                 connection.execute(
                     """
                     INSERT INTO docker_resources(
-                        docker_resource_id, engine_id, full_container_id,
+                        docker_resource_id, engine_id, repo_id, full_container_id,
                         current_name, created_at, updated_at
-                    ) VALUES ('container', 'engine', ?, 'postgres', ?, ?)
+                    ) VALUES ('container', 'engine', 'repo', ?, 'postgres', ?, ?)
                     """,
                     (self.container_id, now, now),
-                )
-                connection.execute(
-                    """
-                    INSERT INTO control_bindings(
-                        binding_id, repo_id, resource_kind, resource_id,
-                        source_id, capability, provenance, authority_state,
-                        priority, generation, created_at, updated_at
-                    ) VALUES ('control', 'repo', 'container', 'container',
-                              'source', 'lifecycle', 'test', 'authoritative',
-                              100, 0, ?, ?)
-                    """,
-                    (now, now),
-                )
-                connection.execute(
-                    """
-                    INSERT INTO repository_memberships(
-                        membership_id, repo_id, resource_kind, host_resource_id,
-                        immutable_fingerprint, control_binding_id, created_at
-                    ) VALUES ('membership', 'repo', 'container', 'container',
-                              'immutable', 'control', ?)
-                    """,
-                    (now,),
                 )
                 connection.execute(
                     """
@@ -219,7 +198,7 @@ class DatabaseBackupRegistryTests(unittest.TestCase):
         backup = graph["database_backups"][0]
         self.assertEqual(backup["database_binding_id"], "database")
         self.assertEqual(backup["repo_id"], "repo")
-        self.assertEqual(backup["source_id"], "source")
+        self.assertIsNone(backup["source_id"])
         self.assertEqual(backup["verification_status"], "strong")
         self.assertEqual(backup["restore_count"], 1)
         self.assertEqual(graph["database_restore_events"][0]["restore_event_id"], event_id)
@@ -237,6 +216,83 @@ class DatabaseBackupRegistryTests(unittest.TestCase):
             backups = store.inventory_v2()["database_backups"]
         self.assertEqual(len(backups), 1)
         self.assertEqual(backups[0]["artifact_sha256"], hashlib.sha256(self.artifact.read_bytes()).hexdigest())
+
+    def test_operation_bound_restore_registration_is_exactly_once(self) -> None:
+        self._write_manifest(
+            verification={
+                "ok": True,
+                "mode": "test_restore",
+                "sha256": hashlib.sha256(self.artifact.read_bytes()).hexdigest(),
+                "verified_at": "2026-07-15T12:05:00Z",
+                "verification_target": "scratch_database",
+                "catalog_signature": {
+                    "tables": 2,
+                    "sequences": 1,
+                    "views": 0,
+                    "functions": 3,
+                },
+                "container_identity_preflight": {
+                    "actual_id": self.container_id,
+                    "match": "exact_full",
+                },
+            }
+        )
+        verified = inspect_database_backup(self.artifact, self.manifest_path)
+        checksum = hashlib.sha256(self.artifact.read_bytes()).hexdigest()
+        result = {
+            "restored": str(self.artifact),
+            "database": "app",
+            "scope": "database",
+            "sha256": checksum,
+            "transactional": True,
+            "incoming_verification": {
+                "test_restore": True,
+                "verification_target": "scratch_database",
+                "restore_returncode": 0,
+                "scratch_created": True,
+                "catalog_signature": {
+                    "tables": 2,
+                    "sequences": 1,
+                    "views": 0,
+                    "functions": 3,
+                },
+            },
+            "restored_catalog_signature": {
+                "tables": 2,
+                "sequences": 1,
+                "views": 0,
+                "functions": 3,
+            },
+            "container_identity_preflights": [
+                {"actual_id": self.container_id, "phase": phase}
+                for phase in ("selection", "post-incoming", "final")
+            ],
+        }
+        operation_id = str(uuid.uuid4())
+        with AccountStore.open(self.database, expected_uid=os.geteuid()) as store:
+            with store.immediate_transaction() as connection:
+                backup_id = upsert_database_backup(connection, verified)
+                first = record_successful_restore(
+                    connection,
+                    database_backup_id=backup_id,
+                    target_container_id=self.container_id,
+                    target_database_name="app",
+                    result=result,
+                    operation_id=operation_id,
+                )
+                second = record_successful_restore(
+                    connection,
+                    database_backup_id=backup_id,
+                    target_container_id=self.container_id,
+                    target_database_name="app",
+                    result=result,
+                    operation_id=operation_id,
+                )
+            inventory = store.inventory_v2()
+
+        self.assertEqual(first, second)
+        self.assertEqual(len(inventory["database_restore_events"]), 1)
+        self.assertEqual(inventory["database_backups"][0]["restore_count"], 1)
 
     def test_tampered_artifact_is_never_registered(self) -> None:
         self.artifact.write_bytes(b"tampered\n")

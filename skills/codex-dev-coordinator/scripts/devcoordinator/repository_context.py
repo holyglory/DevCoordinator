@@ -408,9 +408,22 @@ def _open_inspected_path(
             "repository inspection requires O_NOFOLLOW and O_DIRECTORY support"
         )
     directory_flags = os.O_RDONLY | close_on_exec | no_follow | directory
+    # Exact-path admission must work below intentionally non-listable shared
+    # ancestors such as the native test attempt root (0711, root-owned).  A
+    # read-only directory descriptor requires read permission and therefore
+    # defeats that contract.  Linux O_PATH preserves anchored no-follow
+    # traversal and fstat identity checks without granting or requiring list
+    # access.  Other supported platforms retain the prior O_RDONLY behavior.
+    path_only = getattr(os, "O_PATH", 0)
+    traversal_directory_flags = (
+        (path_only if path_only else os.O_RDONLY)
+        | close_on_exec
+        | no_follow
+        | directory
+    )
     file_flags = os.O_RDONLY | close_on_exec | no_follow
     try:
-        descriptor = os.open(path.anchor, directory_flags)
+        descriptor = os.open(path.anchor, traversal_directory_flags)
     except (OSError, ValueError) as error:
         raise RepositoryContextError(
             f"{field} is unavailable at {path.anchor}: {error}"
@@ -428,11 +441,12 @@ def _open_inspected_path(
         for index, part in enumerate(parts):
             current /= part
             is_final = index == len(parts) - 1
-            flags = (
-                directory_flags
-                if not is_final or expected_kind == "directory"
-                else file_flags
-            )
+            if not is_final:
+                flags = traversal_directory_flags
+            elif expected_kind == "directory":
+                flags = directory_flags
+            else:
+                flags = file_flags
             try:
                 next_descriptor = os.open(part, flags, dir_fd=descriptor)
             except (OSError, ValueError) as error:
@@ -1236,7 +1250,7 @@ def persist_repository_context(
         )
         if root_identity_match not in {None, str(root_repo_id)}:
             raise RepositoryContextError(
-                "root worktree is already enrolled under repository ID "
+                "root worktree is already configured under repository ID "
                 f"{root_identity_match}"
             )
         effective_identity_match = find_repository_id_by_filesystem_identity(
@@ -1246,7 +1260,7 @@ def persist_repository_context(
         )
         if effective_identity_match not in {None, str(effective_repo_id)}:
             raise RepositoryContextError(
-                "effective worktree is already enrolled under repository ID "
+                "effective worktree is already configured under repository ID "
                 f"{effective_identity_match}"
             )
 
@@ -1268,7 +1282,7 @@ def persist_repository_context(
             family_row, context.root
         ):
             raise RepositoryContextError(
-                "root repository family identity changed since enrollment"
+                "root repository family identity changed since configuration"
             )
 
         root_scope = connection.execute(
@@ -1290,7 +1304,7 @@ def persist_repository_context(
             root_scope, context.root
         ):
             raise RepositoryContextError(
-                "root repository scope identity changed since enrollment"
+                "root repository scope identity changed since configuration"
             )
 
         prior = None
@@ -1313,7 +1327,7 @@ def persist_repository_context(
                 prior, context.temporary
             ):
                 raise RepositoryContextError(
-                    "temporary repository scope identity changed since enrollment"
+                    "temporary repository scope identity changed since configuration"
                 )
 
         family_exact = bool(

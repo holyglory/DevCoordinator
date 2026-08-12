@@ -152,6 +152,73 @@ def exercise_edge_health_uses_live_generation() -> None:
     expect(observed["document"]["generation"] == 4, "stale edge generation was accepted")
 
 
+def exercise_stopped_published_console_recovers_exactly() -> None:
+    published_digest = "b" * 64
+
+    class RecoveryRunner(FakeRunner):
+        def __init__(self) -> None:
+            super().__init__()
+            self.discovery_count = 0
+
+        def require(self, argv: list[str], _label: str) -> str:
+            self.commands.append(list(argv))
+            if "list-units" in argv:
+                self.discovery_count += 1
+                if self.discovery_count == 1:
+                    return ""
+                return f"devcoordinator-console@{published_digest}.service loaded active running\n"
+            return ""
+
+    with tempfile.TemporaryDirectory(prefix="same-schema-console-recovery-") as raw:
+        slots = Path(raw)
+        (slots / f"{published_digest}.env").write_bytes(
+            switch.candidate_slot_payload(published_digest, 35001, 35002)
+        )
+        runner = RecoveryRunner()
+        with (
+            mock.patch.object(switch, "SLOT_ROOT", slots),
+            mock.patch.object(
+                switch,
+                "publication_snapshot",
+                return_value={
+                    "payload_sha256": "c" * 64,
+                    "release_digest": published_digest,
+                    "generation": 7,
+                    "port": 35001,
+                },
+            ),
+        ):
+            unit, digest = switch.active_console(runner)
+    expected_unit = f"devcoordinator-console@{published_digest}.service"
+    expect((unit, digest) == (expected_unit, published_digest), "published slot was not recovered")
+    expect(
+        ["/usr/bin/systemctl", "start", switch.API_SOCKET] in runner.commands,
+        "stable API socket was not recovered before the Console",
+    )
+    expect(
+        ["/usr/bin/systemctl", "start", expected_unit] in runner.commands,
+        "published Console instance was not recovered",
+    )
+
+
+def exercise_ambiguous_console_topology_never_recovers() -> None:
+    runner = FakeRunner()
+    runner.require = mock.Mock(
+        return_value=(
+            f"devcoordinator-console@{'b' * 64}.service loaded active running\n"
+            f"devcoordinator-console@{'c' * 64}.service loaded active running\n"
+        )
+    )
+    with mock.patch.object(switch, "recover_published_console") as recover:
+        try:
+            switch.active_console(runner)
+        except switch.SwitchError as error:
+            expect("exactly one active" in str(error), "ambiguous topology error lost its cause")
+        else:
+            raise AssertionError("ambiguous Console topology was accepted")
+    recover.assert_not_called()
+
+
 def exercise_local_path_materialization() -> None:
     with tempfile.TemporaryDirectory(prefix="same-schema-paths-") as raw:
         root = Path(raw)
@@ -162,6 +229,20 @@ def exercise_local_path_materialization() -> None:
         maintenance_root.mkdir()
         maintenance_marker = maintenance_root / "maintenance.json"
         maintenance_marker.write_text("stale\n", encoding="utf-8")
+        private_runtime_lock = root / "private-runtime-lock.json"
+        public_runtime_lock = root / "public" / "browser-runtime-lock.json"
+        runtime_document = {"document_sha256": "d" * 64}
+        runtime_payload = json.dumps(runtime_document).encode("utf-8") + b"\n"
+        private_runtime_lock.write_bytes(runtime_payload)
+        private_runtime_lock.chmod(0o600)
+        authority_state = root / "authority-state"
+        authority_state.mkdir(mode=0o700)
+        lifecycle_state = authority_state / "browser-lifecycle.json"
+        lifecycle_lock = authority_state / "browser-lifecycle.json.lock"
+        lifecycle_state.write_text("{}\n", encoding="utf-8")
+        lifecycle_lock.write_text("", encoding="utf-8")
+        lifecycle_state.chmod(0o600)
+        lifecycle_lock.chmod(0o600)
         runner = FakeRunner()
         with (
             mock.patch.object(switch, "CLIENT_PROFILE", profile),
@@ -169,14 +250,59 @@ def exercise_local_path_materialization() -> None:
             mock.patch.object(switch, "TMPFILES_ROOT", root / "tmpfiles"),
             mock.patch.object(switch, "MAINTENANCE_ROOT", maintenance_root),
             mock.patch.object(switch, "MAINTENANCE_MARKER", maintenance_marker),
+            mock.patch.object(
+                switch, "BROWSER_RUNTIME_LOCK_PRIVATE", private_runtime_lock
+            ),
+            mock.patch.object(
+                switch, "BROWSER_RUNTIME_LOCK_PUBLIC", public_runtime_lock
+            ),
+            mock.patch.object(switch, "BROWSER_LIFECYCLE_ROOT", authority_state),
+            mock.patch.object(switch, "BROWSER_LIFECYCLE_STATE", lifecycle_state),
+            mock.patch.object(switch, "BROWSER_LIFECYCLE_LOCK", lifecycle_lock),
+            mock.patch.object(
+                switch.activation.browser_lcp,
+                "verify_runtime_lock_document",
+                return_value=runtime_document,
+            ),
         ):
             switch.normalize_local_paths(runner)
+            runtime_evidence = switch.verify_public_browser_runtime_inventory()
+            publication_evidence = switch.verify_browser_lifecycle_publication()
+            authority_state.chmod(0o700)
+            private_publication_evidence = switch.verify_browser_lifecycle_publication()
+            authority_state.chmod(0o755)
         expect(stat.S_IMODE(profile.stat().st_mode) == 0o644, "non-secret profile was not published read-only")
         expect(not maintenance_marker.exists(), "abandoned maintenance marker was retained")
         expect(stat.S_IMODE(maintenance_root.stat().st_mode) == 0o755, "maintenance directory stayed private")
+        expect(
+            stat.S_IMODE(authority_state.stat().st_mode) == 0o755
+            and stat.S_IMODE(lifecycle_state.stat().st_mode) == 0o644
+            and stat.S_IMODE(lifecycle_lock.stat().st_mode) == 0o644,
+            "actual-caller lifecycle telemetry remained inaccessible",
+        )
+        expect(
+            public_runtime_lock.read_bytes() == runtime_payload
+            and stat.S_IMODE(public_runtime_lock.stat().st_mode) == 0o644
+            and runtime_evidence["document_sha256"] == "d" * 64,
+            "non-secret browser runtime inventory was not published read-only",
+        )
+        expect(
+            publication_evidence["ok"] is True,
+            "actual-caller lifecycle publication was not verified",
+        )
+        expect(
+            private_publication_evidence["ok"] is False,
+            "private lifecycle parent was accepted by health verification",
+        )
         flattened = [item for command in runner.commands for item in command]
         expect("/usr/bin/systemd-sysusers" in flattened, "sysusers was not materialized")
         expect("/usr/bin/systemd-tmpfiles" in flattened, "tmpfiles was not materialized")
+        expect(
+            str(root / "tmpfiles/devcoordinator.conf") in flattened
+            and str(root / "tmpfiles/devcoordinator-availability.tmpfiles.conf")
+            in flattened,
+            "canonical and availability tmpfiles policies were not applied together",
+        )
 
 
 def exercise_blue_green_order() -> None:
@@ -478,8 +604,10 @@ def exercise_browser_cleanup_activation_order() -> None:
         "same-schema prepare does not bind browser cleanup for both active and candidate paths",
     )
     positions = [
+        source.index("retire_legacy_control_plane("),
         source.index("install_rendered_destinations("),
         source.index("perform_headless_browser_cleanup("),
+        source.index("migrate_trusted_local_authority("),
         source.index("restart_services("),
         source.index("candidate Console start"),
     ]
@@ -487,6 +615,60 @@ def exercise_browser_cleanup_activation_order() -> None:
         positions == sorted(positions),
         "browser cleanup is not candidate-stage-first and pre-activation",
     )
+    rollback_source = inspect.getsource(switch.rollback)
+    expect(
+        rollback_source.index("restore_authority_migration(")
+        < rollback_source.index("restore_rollback_control_plane("),
+        "rollback can start the prior release before restoring its authority schema",
+    )
+
+
+def exercise_already_active_health_has_rendered_contract() -> None:
+    source = inspect.getsource(switch.prepare)
+    expect(
+        source.index("rendered = render_release(release, transaction_root)")
+        < source.index("if current_digest == release.name:"),
+        "already-active preparation does not render the immutable health contract",
+    )
+    expect(
+        source.count('"rendered_units": rendered["rendered_units"]') == 2
+        and '"rendered_units": None' not in source,
+        "already-active health can receive an absent rendered-unit contract",
+    )
+
+
+def exercise_legacy_control_plane_is_durably_retired() -> None:
+    with tempfile.TemporaryDirectory(prefix="legacy-control-plane-retirement-") as raw:
+        root = Path(raw)
+        marker = root / "enable-legacy"
+        marker.write_text("stale\n", encoding="utf-8")
+        runner = FakeRunner()
+        with (
+            mock.patch.object(switch, "UNIT_ROOT", root / "systemd"),
+            mock.patch.object(switch, "LEGACY_ENABLE_MARKER", marker),
+        ):
+            switch.retire_legacy_control_plane(runner)
+            guards = {
+                unit: switch.legacy_retirement_path(unit).read_bytes()
+                for unit in switch.LEGACY_CONTROL_PLANE_SERVICES
+            }
+        expected_commands = [["/usr/bin/systemctl", "daemon-reload"]]
+        for unit in switch.LEGACY_CONTROL_PLANE_SERVICES:
+            expected_commands.extend(
+                [
+                    ["/usr/bin/systemctl", "disable", "--now", unit],
+                    ["/usr/bin/systemctl", "reset-failed", unit],
+                ]
+            )
+        expect(
+            runner.commands == expected_commands,
+            "same-schema delivery did not stop and disable both obsolete units",
+        )
+        expect(not marker.exists(), "legacy enable marker survived retirement")
+        expect(
+            all(payload == switch.LEGACY_RETIREMENT_PAYLOAD for payload in guards.values()),
+            "stale reverse dependencies can reactivate the obsolete control plane",
+        )
 
 
 def exercise_internal_socket_rebind_order() -> None:
@@ -494,12 +676,76 @@ def exercise_internal_socket_rebind_order() -> None:
 
     switch.restart_services(runner)
 
-    units = [command[-1] for command in runner.commands]
+    enable_count = len(switch.REQUIRED_SOCKETS) + len(switch.SERVICE_ORDER)
+    enable_commands = runner.commands[:enable_count]
+    restart_commands = runner.commands[enable_count:]
+    enabled_units = [command[-1] for command in enable_commands]
+    units = [command[-1] for command in restart_commands]
+    expect(
+        enabled_units == [*switch.REQUIRED_SOCKETS, *switch.SERVICE_ORDER],
+        "required sockets and services were not repaired for boot",
+    )
+    expect(
+        all(command[1:3] == ["enable", "--now"] for command in enable_commands),
+        "required unit repair did not make activation durable",
+    )
     expected = [*switch.RUNTIME_SOCKET_REBIND_ORDER, *switch.SERVICE_ORDER]
     expect(units == expected, "internal sockets were not rebound before services")
     expect(
-        all(command[1] == "restart" for command in runner.commands),
+        all(command[1] == "restart" for command in restart_commands),
         "socket/service replacement did not use one deterministic restart path",
+    )
+
+
+def exercise_rollback_restores_control_plane_before_background_services() -> None:
+    class BackgroundFailureRunner(FakeRunner):
+        def require(self, argv: list[str], _label: str) -> str:
+            self.commands.append(list(argv))
+            if argv[-1] == "devcoordinator-observer.service":
+                raise switch.SwitchError("observer start deadline exceeded")
+            return ""
+
+    runner = BackgroundFailureRunner()
+    switch.restore_rollback_control_plane(runner)
+    try:
+        switch.restore_rollback_background_services(runner)
+    except switch.SwitchError:
+        pass
+    else:
+        raise AssertionError("background rollback failure was not injected")
+
+    authority_restart = [
+        "/usr/bin/systemctl",
+        "restart",
+        "devcoordinator-authority.service",
+    ]
+    api_restart = [
+        "/usr/bin/systemctl",
+        "restart",
+        "devcoordinator-api.service",
+    ]
+    observer_failure = next(
+        index
+        for index, command in enumerate(runner.commands)
+        if command[-1] == "devcoordinator-observer.service"
+    )
+    expect(
+        runner.commands.index(authority_restart) < observer_failure
+        and runner.commands.index(api_restart) < observer_failure,
+        "background rollback failure occurred before stable authority/API recovery",
+    )
+
+    rollback_source = inspect.getsource(switch.rollback)
+    ordering = [
+        rollback_source.index("restore_destination_backups(backups)"),
+        rollback_source.index("restore_rollback_control_plane(runner)"),
+        rollback_source.index('"previous Console restore"'),
+        rollback_source.index('"rollback-control-plane-restored"'),
+        rollback_source.index("restore_rollback_background_services(runner)"),
+    ]
+    expect(
+        ordering == sorted(ordering),
+        "rollback does not checkpoint a coherent previous control plane before background restore",
     )
 
 
@@ -624,6 +870,8 @@ def exercise_release_packaging_contract() -> None:
         and switch.TEST_LAUNCHER == Path("/usr/local/bin/devcoordinator-test")
         and switch.CALL_LOG_LAUNCHER
         == Path("/usr/local/bin/devcoordinator-call-log")
+        and switch.SYSTEMD_UNIT_LAUNCHER
+        == Path("/usr/local/bin/devcoordinator-systemd-unit")
         and switch.READ_ONLY_RULE
         == Path("/etc/codex/rules/devcoordinator-read-only.rules")
         and switch.TEST_RULE == Path("/etc/codex/rules/devcoordinator-test.rules"),
@@ -638,6 +886,13 @@ def exercise_release_packaging_contract() -> None:
         switch.STABLE_LAUNCHERS.get(switch.BUG_LAUNCHER_RENDERED)
         == (switch.BUG_LAUNCHER, "devcoordinator-bug"),
         "bug launcher is absent from the stable activation transaction",
+    )
+    expect(
+        switch.STABLE_LAUNCHERS.get(
+            switch.SYSTEMD_UNIT_LAUNCHER_RENDERED
+        )
+        == (switch.SYSTEMD_UNIT_LAUNCHER, "devcoordinator-systemd-unit"),
+        "systemd commissioning launcher is absent from the stable activation transaction",
     )
     expect(
         all(
@@ -702,6 +957,7 @@ def exercise_stable_client_destination_transaction() -> None:
             *stable,
             "devcoordinator-availability.sysusers.conf",
             "devcoordinator-availability.tmpfiles.conf",
+            switch.MAIN_TMPFILES_RENDERED,
             switch.READ_ONLY_RULE_RENDERED,
             switch.TEST_RULE_RENDERED,
         )
@@ -720,6 +976,8 @@ def exercise_stable_client_destination_transaction() -> None:
             expect(
                 {
                     *stable,
+                    switch.MAIN_TMPFILES_RENDERED,
+                    "devcoordinator-availability.tmpfiles.conf",
                     switch.READ_ONLY_RULE_RENDERED,
                     switch.TEST_RULE_RENDERED,
                 }.issubset(mapping),
@@ -1100,17 +1358,77 @@ def exercise_reset_cli_is_explicit() -> None:
         expect(parsed.reset_test_history is True, f"{action} lost explicit reset flag")
 
 
+def exercise_verification_requires_boot_enablement() -> None:
+    source = inspect.getsource(switch.verify)
+    rollback_source = inspect.getsource(switch.rollback)
+    main_source = inspect.getsource(switch.main)
+    expect(
+        "enabled_states = {unit: unit_enabled" in source
+        and "all(enabled_states.values())" in source
+        and '"services_enabled": enabled_states' in source,
+        "same-schema verification can accept active but boot-disabled units",
+    )
+    unit = (ROOT / "deploy/devcoordinator-console@.service").read_text(
+        encoding="utf-8"
+    )
+    expect(
+        "[Install]\nWantedBy=multi-user.target" in unit,
+        "promoted Console instance has no reboot activation contract",
+    )
+    expect(
+        "verify_public_browser_runtime_inventory()" in source
+        and '"browser_runtime_inventory": browser_runtime_inventory' in source,
+        "same-schema verification omits actual-caller browser runtime inventory",
+    )
+    expect(
+        "verify_browser_lifecycle_publication()" in source
+        and '"browser_lifecycle_publication": browser_lifecycle_publication' in source
+        and '"installed_host_contracts": installed_host_contracts' in source,
+        "same-schema health can omit live telemetry modes or installed tmpfiles identity",
+    )
+    expect(
+        "d /var/lib/devcoordinator 0711 root root -"
+        in (ROOT / "deploy/devcoordinator.tmpfiles.conf").read_text(encoding="utf-8"),
+        "canonical server-wide tmpfiles policy still re-privatizes shared telemetry",
+    )
+    expect(
+        "legacy_control_plane_retired = (" in source
+        and "and legacy_control_plane_retired" in source
+        and '"legacy_broker_retired": legacy_broker_retired' in source,
+        "same-schema verification can accept an active, enabled, or unguarded legacy unit",
+    )
+    expect(
+        "retire_legacy_control_plane(runner)" in rollback_source,
+        "post-promotion rollback can revive the obsolete control plane",
+    )
+    expect(
+        'promotion.extend(["--old-socket", candidate_control])' in rollback_source,
+        "post-promotion rollback does not transfer the candidate writer lease",
+    )
+    expect(
+        'args.action == "verify" and value.get("ok") is not True' in main_source
+        and 'raise SwitchError("same-schema control-plane health failed")'
+        not in source,
+        "failed health verification hides its structured invariant evidence",
+    )
+
+
 def main() -> int:
     exercise_slot_payload()
     exercise_http_is_strict_2xx()
     exercise_edge_health_uses_live_generation()
+    exercise_stopped_published_console_recovers_exactly()
+    exercise_ambiguous_console_topology_never_recovers()
     exercise_local_path_materialization()
     exercise_blue_green_order()
     exercise_first_capable_browser_cleanup()
     exercise_retiring_release_ignores_generated_bytecode()
     exercise_browser_cleanup_skip_failure_and_malformed_result()
     exercise_browser_cleanup_activation_order()
+    exercise_already_active_health_has_rendered_contract()
+    exercise_legacy_control_plane_is_durably_retired()
     exercise_internal_socket_rebind_order()
+    exercise_rollback_restores_control_plane_before_background_services()
     exercise_slot_readiness_waits_for_supervisor_socket()
     exercise_release_packaging_contract()
     exercise_stable_client_destination_transaction()
@@ -1118,6 +1436,7 @@ def main() -> int:
     exercise_codex_directory_transaction()
     exercise_opt_in_test_history_reset_and_previous_release_rollback()
     exercise_reset_cli_is_explicit()
+    exercise_verification_requires_boot_enablement()
     print("same-schema release switch self-test ok")
     return 0
 

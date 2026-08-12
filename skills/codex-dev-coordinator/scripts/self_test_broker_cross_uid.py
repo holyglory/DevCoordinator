@@ -36,9 +36,9 @@ from devcoordinator.broker import (  # noqa: E402
     BrokerRequest,
 )
 from devcoordinator.broker_backend import build_store_backed_broker_runtime  # noqa: E402
-from devcoordinator.broker_enrollment import (  # noqa: E402
+from devcoordinator.broker_configuration import (  # noqa: E402
     _merge_profile,
-    enroll_repository,
+    configure_repository,
 )
 from devcoordinator.broker_host import LocalBrokerHostMutations  # noqa: E402
 from devcoordinator.broker_persistence import BrokerPersistence  # noqa: E402
@@ -520,8 +520,8 @@ class CrossUIDRuntimeFixture:
                 """
                 INSERT INTO broker_observed_compose_containers(
                     snapshot_id, docker_resource_id, full_container_id,
-                    project_name, service_name, lifecycle, ownership_state,
-                    authoritative_owner_repo_id, observation_fingerprint
+                    project_name, service_name, lifecycle, association_state,
+                    associated_repo_id, observation_fingerprint
                 ) VALUES (?, ?, ?, 'crossuid', 'app', ?, 'exclusive', ?, ?)
                 """,
                 (
@@ -636,7 +636,7 @@ class CrossUIDRuntimeFixture:
             identity_observable=True,
             immutable_fingerprint=target.immutable_fingerprint,
             ownership_observable=True,
-            ownership_fingerprint=target.ownership_fingerprint,
+            observation_fingerprint=target.observation_fingerprint,
             running_state=RunningState.RUNNING if running else RunningState.STOPPED,
             container_running=running,
             policies=policies,
@@ -767,7 +767,7 @@ def _seed_local_retirement_mirror(
         )
         if (
             resolved.immutable_fingerprint != exact["immutable_fingerprint"]
-            or resolved.ownership_fingerprint != exact["ownership_fingerprint"]
+            or resolved.observation_fingerprint != exact["observation_fingerprint"]
         ):
             raise RuntimeError(
                 "client lifecycle mirror identity differs from service authority"
@@ -898,10 +898,8 @@ def _spawn_public_journey(
                 ORPHAN_CONTAINER_ID,
                 "--immutable-fingerprint",
                 exact["immutable_fingerprint"],
-                "--control-binding-id",
-                ORPHAN_CONTROL_ID,
-                "--ownership-fingerprint",
-                exact["ownership_fingerprint"],
+                "--observation-fingerprint",
+                exact["observation_fingerprint"],
                 "--request-project",
                 str(project_root),
                 "--agent",
@@ -1236,7 +1234,7 @@ class CrossUIDBrokerAcceptanceTests(unittest.TestCase):
 
             port = _free_tcp_port()
             fixture = CrossUIDRuntimeFixture()
-            enrollment = enroll_repository(
+            enrollment = configure_repository(
                 database_path=database_path,
                 socket_path=socket_path,
                 socket_gid=ACCESS_GID,
@@ -1265,7 +1263,7 @@ class CrossUIDBrokerAcceptanceTests(unittest.TestCase):
             )
             protected_profile_before = profile_path.read_bytes()
             with self.assertRaises(BrokerError) as account_conflict:
-                enroll_repository(
+                configure_repository(
                     database_path=database_path,
                     socket_path=socket_path,
                     socket_gid=ACCESS_GID,
@@ -1324,7 +1322,7 @@ class CrossUIDBrokerAcceptanceTests(unittest.TestCase):
             exact = {
                 "resource_kind": exact_ref.kind.value,
                 "immutable_fingerprint": exact_ref.immutable_fingerprint,
-                "ownership_fingerprint": exact_ref.ownership_fingerprint,
+                "observation_fingerprint": exact_ref.observation_fingerprint,
             }
 
             child = _spawn_public_journey(

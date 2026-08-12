@@ -100,7 +100,7 @@ class SourceIdentity:
             or not self.repository_id
             or len(self.repository_id) > 256
         ):
-            raise TestPlanError("repository_id must identify one enrolled repository")
+            raise TestPlanError("repository_id must identify one configured repository")
         if not isinstance(self.content_fingerprint, str) or not is_sha256(
             self.content_fingerprint
         ):

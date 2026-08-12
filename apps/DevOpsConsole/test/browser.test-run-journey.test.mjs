@@ -225,10 +225,6 @@ function setupFixture(repoId) {
       { name: 'lint', depends_on: [], network: 'none', fixtures: [] },
       { name: 'unit', depends_on: [], network: 'none', fixtures: [] },
     ],
-    capability_policy: {
-      requested: ['network.loopback'],
-      missing: [],
-    },
     evidence_policies: {},
     fixtures: {},
   };

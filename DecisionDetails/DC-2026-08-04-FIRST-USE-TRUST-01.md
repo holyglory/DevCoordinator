@@ -17,6 +17,15 @@ actions, enrollments, repositories, and lifecycle states remain disabled.
 Deploying this established behavior does not require another security-posture
 approval each time.
 
+A sealed effective Compose model may publish declared ports without separate
+administrator approval only when every published host address is a numeric
+loopback address (`127.0.0.0/8` or `::1`). The evidence still records the
+published-port feature. An omitted, wildcard, malformed, or non-loopback host
+address remains approval-required, as do privileged mode, host namespaces,
+host bind mounts, devices, added capabilities, the Docker socket, and other
+host-equivalent features. This keeps ordinary local previews fast without
+turning first use into implicit public exposure.
+
 A protected read-only control-plane client may use any one current installed
 repository as its transport anchor and dynamically merge the broker-issued
 route for a newer adopted repository. If that protected account has no row for
@@ -99,6 +108,11 @@ capabilities, and public/secret boundaries remain in force.
   home was rejected because it reintroduced account enrollment as an execution
   prerequisite and caused the fixed normalizer to fail inside the authority's
   otherwise read-only home sandbox.
+- Requiring administrator approval for a port explicitly bound only to
+  loopback was rejected because it treated local development reachability like
+  public host exposure and blocked valid first use. Silently approving an
+  omitted, wildcard, malformed, or non-loopback address was rejected because
+  that can expose a repository service beyond the trusted local-host boundary.
 
 ## Verification
 
@@ -124,6 +138,10 @@ It must never execute the service as the filesystem owner, root, or a
 control-plane account. Explicit disabled action/lifecycle state must still fail
 with a typed, actionable error, and no local trust rule may weaken public
 identity or secret handling.
+Exercise both IPv4 and IPv6 loopback-only published ports without administrator
+approval and require the retained evidence to report `published_host_ports`.
+Then prove an absent host address, a wildcard, a non-loopback address, and every
+other host-equivalent feature still fail without explicit approval.
 Use a long-lived protected API identity with an anchor enrollment but no row
 for a repository adopted later by another local account. Prove it resolves the
 exact broker-issued repository and server IDs, captures logs through the other

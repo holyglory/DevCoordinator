@@ -122,7 +122,7 @@ class UniversalTestFaultContainmentTests(unittest.TestCase):
             )
         )
         self.assertIn("--property=KillMode=control-group", properties)
-        self.assertIn("--property=RuntimeMaxSec=37s", properties)
+        self.assertIn("--property=RuntimeMaxSec=67s", properties)
         self.assertIn("--property=CPUAccounting=yes", properties)
         self.assertIn("--property=MemoryAccounting=yes", properties)
         self.assertFalse(any("CPUQuota=" in value for value in properties))
@@ -325,7 +325,6 @@ class UniversalTestFaultContainmentTests(unittest.TestCase):
             testd["ReadWritePaths"],
             ["/var/lib/devcoordinator-testd /run/devcoordinator-testd"],
         )
-
         edge_unit = _directives(deploy / "devcoordinator-edge.service", "Unit")
         api_unit = _directives(deploy / "devcoordinator-api.service", "Unit")
         testd_unit = _directives(deploy / "devcoordinator-testd.service", "Unit")

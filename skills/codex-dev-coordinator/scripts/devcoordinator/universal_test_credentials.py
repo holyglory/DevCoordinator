@@ -1006,7 +1006,7 @@ class BrokerOperationalCredentialProvider:
             binding = registry.bindings.get(alias)
             if binding is None or not self._binding_matches(binding, descriptor):
                 raise TestStoreConflict(
-                    "operational credential binding is not authorized for this attempt"
+                    "operational credential binding is not accepted for this attempt"
                 )
             if binding.credential_name in names:
                 raise TestStoreConflict(

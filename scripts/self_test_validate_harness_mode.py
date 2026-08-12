@@ -209,6 +209,14 @@ def exercise_dogfood_partition_contract() -> None:
             == {"change", "checkpoint", "handoff", "release", "manual"},
             f"{name} does not retain full immutable evidence intents",
         )
+    expect(
+        manifest.targets["coordinator-universal-harness"].network == "loopback",
+        "universal harness must permit isolated loopback for preflight socket cases",
+    )
+    expect(
+        manifest.targets["coordinator-runtime-lifecycle"].network == "loopback",
+        "runtime lifecycle partition must permit isolated loopback for socket cases",
+    )
     for name in ("handoff", "release"):
         expect(
             set(manifest.evidence_policies[name].required_targets) == expected_all,

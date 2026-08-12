@@ -157,17 +157,15 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         required=True,
     )
+    parser.add_argument(
+        "--execution-uid",
+        type=int,
+        required=True,
+        help="positive local account used for repository-side file changes",
+    )
     actions = parser.add_subparsers(dest="action", required=True)
     catalog = actions.add_parser("catalog")
     catalog.add_argument("--authority-export", type=Path, required=True)
-    safety = actions.add_parser("plan-safety-repair")
-    safety.add_argument("--authority-export", type=Path, required=True)
-    safety_apply = actions.add_parser("apply-safety-repair")
-    safety_apply.add_argument("--plan-id", required=True)
-    safety_apply.add_argument("--plan-sha256", required=True)
-    safety_rollback = actions.add_parser("rollback-safety-repair")
-    safety_rollback.add_argument("--plan-id", required=True)
-    safety_rollback.add_argument("--result-sha256", required=True)
     prepare = actions.add_parser("prepare-request")
     prepare.add_argument("--authority-export", type=Path, required=True)
     prepare.add_argument("--manifest-set", type=Path, required=True)
@@ -191,23 +189,12 @@ def run(arguments: argparse.Namespace) -> Mapping[str, object]:
         authority=SnapshotAuthority(arguments.authority_database, expected_uid=uid),
         helper=UIDHelperRunner(arguments.helper, expected_helper_uid=uid),
         evidence_root=arguments.evidence_root,
+        execution_uid=arguments.execution_uid,
         expected_evidence_uid=uid,
     )
     if arguments.action == "catalog":
         return manager.catalog(
             _private_request(arguments.authority_export, expected_uid=uid)
-        )
-    if arguments.action == "plan-safety-repair":
-        return manager.plan_safety_repair(
-            _private_request(arguments.authority_export, expected_uid=uid)
-        )
-    if arguments.action == "apply-safety-repair":
-        return manager.apply_safety_repair(
-            plan_id=arguments.plan_id, plan_sha256=arguments.plan_sha256
-        )
-    if arguments.action == "rollback-safety-repair":
-        return manager.rollback_safety_repair(
-            plan_id=arguments.plan_id, result_sha256=arguments.result_sha256
         )
     if arguments.action == "prepare-request":
         request = manager.prepare_request(

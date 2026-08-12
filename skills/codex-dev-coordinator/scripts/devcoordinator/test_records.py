@@ -9,7 +9,7 @@ import math
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
-from .broker import AuthorizedBrokerRequest, BrokerBackendError
+from .broker import AcceptedBrokerRequest, BrokerBackendError
 from .store import CoordinatorStore, utc_timestamp
 
 
@@ -155,7 +155,7 @@ def _empty_avoided_work() -> dict[str, Any]:
 class CoordinatorTestRecords:
     """Typed access to the service-owned test tables.
 
-    Test processes use enrolled repository execution authority. The broker
+    Test processes use configured repository execution authority. The broker
     retains the local caller UID only as audit attribution and owns admission,
     repository attribution, lifecycle, idempotency, and every durable result
     row; no client receives a database handle.
@@ -172,8 +172,8 @@ class CoordinatorTestRecords:
         self.expected_uid = expected_uid
         self.busy_timeout_ms = busy_timeout_ms
 
-    def start(self, authorized: AuthorizedBrokerRequest) -> dict[str, Any]:
-        request = authorized.request
+    def start(self, accepted: AcceptedBrokerRequest) -> dict[str, Any]:
+        request = accepted.request
         arguments = request.arguments
         run_id = request.operation_id
         now = utc_timestamp()
@@ -250,7 +250,7 @@ class CoordinatorTestRecords:
                         run_id,
                         request.project_id,
                         parent_run_id,
-                        authorized.peer.uid,
+                        accepted.peer.uid,
                         request.account_id,
                         f"broker:{request.account_id}:client-agent:{arguments['agent']}",
                         arguments["suite"],
@@ -268,8 +268,8 @@ class CoordinatorTestRecords:
                 ).fetchone()
                 return self._run_result(row)
 
-    def finish(self, authorized: AuthorizedBrokerRequest) -> dict[str, Any]:
-        request = authorized.request
+    def finish(self, accepted: AcceptedBrokerRequest) -> dict[str, Any]:
+        request = accepted.request
         arguments = request.arguments
         run_id = str(arguments["run_id"])
         finished_at = _parsed_timestamp(arguments["finished_at"], "finished_at")
@@ -392,16 +392,16 @@ class CoordinatorTestRecords:
                 ).fetchone()
                 return self._run_result(completed)
 
-    def stats(self, authorized: AuthorizedBrokerRequest) -> dict[str, Any]:
-        request = authorized.request
+    def stats(self, accepted: AcceptedBrokerRequest) -> dict[str, Any]:
+        request = accepted.request
         return self.stats_for_repository(
             repo_id=request.project_id,
             days=int(request.arguments.get("days", 30)),
             limit=int(request.arguments.get("limit", 25)),
         )
 
-    def fleet(self, authorized: AuthorizedBrokerRequest) -> dict[str, Any]:
-        request = authorized.request
+    def fleet(self, accepted: AcceptedBrokerRequest) -> dict[str, Any]:
+        request = accepted.request
         with CoordinatorStore.open_read_only(
             self.database_path,
             expected_uid=self.expected_uid,
@@ -412,20 +412,11 @@ class CoordinatorTestRecords:
                     str(row["repo_id"])
                     for row in connection.execute(
                         """
-                        SELECT DISTINCT enrollment.repo_id
-                        FROM broker_repository_enrollments AS enrollment
-                        JOIN broker_acl_principals AS principal
-                          ON principal.uid = enrollment.uid
-                         AND principal.account_id = enrollment.account_id
-                        JOIN repositories AS repository
-                          ON repository.repo_id = enrollment.repo_id
-                        WHERE enrollment.account_id = ?
-                          AND enrollment.enabled = 1
-                          AND principal.enabled = 1
-                          AND repository.state = 'active'
-                        ORDER BY enrollment.repo_id
+                        SELECT repository.repo_id
+                        FROM repositories AS repository
+                        WHERE repository.state = 'active'
+                        ORDER BY repository.repo_id
                         """,
-                        (request.account_id,),
                     )
                 )
         return self.fleet_overview(

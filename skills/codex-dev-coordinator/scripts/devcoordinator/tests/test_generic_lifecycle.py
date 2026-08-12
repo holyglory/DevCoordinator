@@ -2,30 +2,37 @@
 
 from __future__ import annotations
 
+import argparse
+import json
 import os
 from pathlib import Path
+import subprocess
 import time
 import unittest
 from unittest import mock
 
 from devcoordinator import broker_backend as broker_backend_module
+from devcoordinator import lifecycle_cli as lifecycle_cli_module
 from devcoordinator.broker import (
-    AuthorizedBrokerRequest,
+    AcceptedBrokerRequest,
     BrokerOperation,
     BrokerRequest,
     BrokerService,
     SerializedMutationWriter,
 )
 from devcoordinator.broker_backend import StoreBackedMutationBackend
-from devcoordinator.broker_persistence import StoreBackedAuthorizer
+from devcoordinator.broker_persistence import StoreBackedRequestAcceptor
 from devcoordinator.broker_profile import (
     BrokerClientProfile,
     BrokerRepositoryProfile,
     BrokerServiceProfile,
 )
-from devcoordinator.cleanup_lifecycle import DockerCleanupBackend
-from devcoordinator.repository_lifecycle import ResourceKind
-from devcoordinator.schema import establish_repository_owner_authority
+from devcoordinator.cleanup_lifecycle import CleanupLifecycle, DockerCleanupBackend
+from devcoordinator.repository_lifecycle import (
+    ResourceKind,
+    ResourceObservation,
+    RunningState,
+)
 from devcoordinator.sqlite_lifecycle import SQLiteLifecyclePersistence
 from devcoordinator.store import CoordinatorStore, fingerprint, utc_timestamp
 from devcoordinator.tests import test_broker as fixtures
@@ -37,6 +44,164 @@ class RestorableLifecycleAdapter(fixtures.ExactLifecycleAdapter):
         self.calls.append("restore_policy")
         self.policy_disabled = False
         return {"status": "restored", "started": False}
+
+
+class BrokerCleanupProjectionTests(unittest.TestCase):
+    def test_cleanup_target_deduplicates_selected_same_repository_configurations(self) -> None:
+        selected = mock.Mock(
+            canonical_root="/repos/shared",
+            repo_id="repo-shared",
+            server_ids={"fixture": "service-shared"},
+            container_ids={},
+        )
+        profile = mock.Mock()
+        profile.repositories = {
+            "account-a:/repos/shared": mock.Mock(canonical_root="/repos/shared"),
+            "account-b:/repos/shared": mock.Mock(canonical_root="/repos/shared"),
+        }
+        profile.repository.return_value = selected
+        profile.inventory.return_value = {
+            "repository_trees": [
+                {
+                    "family_id": "family-shared",
+                    "scopes": [
+                        {
+                            "repo_id": "repo-shared",
+                            "kind": "root",
+                            "canonical_root": "/repos/shared",
+                            "server_ids": ["service-shared"],
+                            "container_resource_ids": [],
+                            "database_binding_ids": [],
+                        }
+                    ],
+                }
+            ],
+            "resources": {
+                "servers": [
+                    {
+                        "server_definition_id": "service-shared",
+                        "name": "fixture",
+                    }
+                ],
+                "docker": [],
+                "databases": [],
+            },
+            "observations": {
+                "servers": [
+                    {
+                        "server_definition_id": "service-shared",
+                        "lifecycle": "running",
+                    }
+                ],
+                "docker": [],
+                "databases": [],
+            },
+        }
+
+        repositories = dev_coordinator._cleanup_profile_repositories(profile)
+        resolved = dev_coordinator._cleanup_profile_target_repository(
+            profile,
+            target_kind="server",
+            target_id="service-shared",
+        )
+
+        self.assertEqual(repositories, (selected,))
+        self.assertIs(resolved, selected)
+        self.assertEqual(profile.repository.call_count, 4)
+        profile.inventory.assert_called_once_with(canonical_root="/repos/shared")
+
+    def test_cleanup_plan_resolves_current_inventory_not_stale_profile_ids(self) -> None:
+        repository_a = mock.Mock(canonical_root="/repos/a", repo_id="repo-a")
+        repository_b = mock.Mock(canonical_root="/repos/b", repo_id="repo-b")
+        profile = mock.Mock()
+        profile.repositories = {
+            repository_a.canonical_root: repository_a,
+            repository_b.canonical_root: repository_b,
+        }
+        profile.repository.side_effect = lambda root: profile.repositories[root]
+        profile.inventory.return_value = {
+            "repository_trees": [
+                {
+                    "family_id": "family-a",
+                    "root_repository": {
+                        "repo_id": repository_a.repo_id,
+                        "canonical_root": repository_a.canonical_root,
+                    },
+                    "scopes": [
+                        {
+                            "repo_id": repository_a.repo_id,
+                            "kind": "root",
+                            "canonical_root": repository_a.canonical_root,
+                            "server_ids": [],
+                            "container_resource_ids": [],
+                            "database_binding_ids": [],
+                        }
+                    ],
+                },
+                {
+                    "family_id": "family-b",
+                    "root_repository": {
+                        "repo_id": repository_b.repo_id,
+                        "canonical_root": repository_b.canonical_root,
+                    },
+                    "scopes": [
+                        {
+                            "repo_id": repository_b.repo_id,
+                            "kind": "root",
+                            "canonical_root": repository_b.canonical_root,
+                            "server_ids": [],
+                            "container_resource_ids": ["docker-current"],
+                            "database_binding_ids": [],
+                        }
+                    ],
+                },
+            ],
+            "resources": {
+                "servers": [],
+                "docker": [
+                    {
+                        "docker_resource_id": "docker-current",
+                        "current_name": "current-container",
+                    }
+                ],
+                "databases": [],
+            },
+            "observations": {
+                "servers": [],
+                "docker": [
+                    {
+                        "docker_resource_id": "docker-current",
+                        "lifecycle": "stopped",
+                    }
+                ],
+                "databases": [],
+            },
+        }
+        profile.call.return_value = (
+            "00000000-0000-4000-8000-000000000001",
+            {"status": "planned"},
+        )
+        args = argparse.Namespace(
+            group="cleanup",
+            action="plan",
+            target_kind="container",
+            target_id="docker-current",
+            lifecycle_action="purge",
+            reason="obsolete exact container",
+        )
+
+        result = lifecycle_cli_module._handle_broker_cleanup(args, profile=profile)
+
+        self.assertEqual(result["status"], "planned")
+        self.assertIs(
+            profile.call.call_args.kwargs["repository"], repository_b
+        )
+        self.assertEqual(
+            profile.call.call_args.kwargs["resource_id"], "docker-current"
+        )
+        profile.inventory.assert_called_once_with(
+            canonical_root=repository_a.canonical_root
+        )
 
 
 def _service(
@@ -53,93 +218,362 @@ def _service(
         observe_before_lifecycle_plan=observer,
     )
     return BrokerService(
-        StoreBackedAuthorizer(persistence), SerializedMutationWriter(backend)
+        StoreBackedRequestAcceptor(persistence), SerializedMutationWriter(backend)
     )
 
 
-def _grant_project_archive(persistence: object) -> None:
-    for operation in (
-        BrokerOperation.CLEANUP_PLAN,
-        BrokerOperation.CLEANUP_APPLY,
-        BrokerOperation.LIFECYCLE_RESTORE,
-        BrokerOperation.REPOSITORY_PLAN_REMOVE,
-        BrokerOperation.REPOSITORY_REMOVE,
-        BrokerOperation.REPOSITORY_REINSTALL,
-    ):
-        persistence.grant_cleanup(
-            uid=os.geteuid(), repo_id=fixtures.PROJECT_ID, operation=operation
-        )
-    for operation in (
-        BrokerOperation.REPOSITORY_PLAN_REMOVE,
-        BrokerOperation.REPOSITORY_REMOVE,
-        BrokerOperation.REPOSITORY_REINSTALL,
-    ):
-        persistence.grant_lifecycle(
-            uid=os.geteuid(), repo_id=fixtures.PROJECT_ID, operation=operation
-        )
-
-
 class GenericLifecycleBrokerTests(unittest.TestCase):
-    def test_service_observed_repository_member_can_receive_exact_cleanup_grant(
+    def test_direct_container_backend_uses_one_forced_rm_without_volume_flag(self) -> None:
+        full_container_id = "a" * 64
+        backend = DockerCleanupBackend()
+        backend.executable = "/usr/bin/docker"
+        response = subprocess.CompletedProcess(
+            ["/usr/bin/docker", "rm", "-f", full_container_id],
+            0,
+            full_container_id + "\n",
+            "",
+        )
+        with mock.patch(
+            "devcoordinator.cleanup_lifecycle.subprocess.run",
+            return_value=response,
+        ) as run:
+            result = backend.remove(full_container_id)
+
+        self.assertFalse(result["already_absent"])
+        self.assertEqual(
+            result["docker_argv_contract"],
+            ["docker", "rm", "-f", "<exact-full-container-id>"],
+        )
+        run.assert_called_once()
+        self.assertEqual(
+            run.call_args.args[0],
+            ["/usr/bin/docker", "rm", "-f", full_container_id],
+        )
+        self.assertNotIn("-v", run.call_args.args[0])
+
+    def test_direct_container_backend_treats_already_absent_as_success(self) -> None:
+        full_container_id = "a" * 64
+        backend = DockerCleanupBackend()
+        backend.executable = "/usr/bin/docker"
+        response = subprocess.CompletedProcess(
+            ["/usr/bin/docker", "rm", "-f", full_container_id],
+            1,
+            "",
+            "Error: No such container: " + full_container_id,
+        )
+        with mock.patch(
+            "devcoordinator.cleanup_lifecycle.subprocess.run",
+            return_value=response,
+        ) as run:
+            result = backend.remove(full_container_id)
+
+        self.assertTrue(result["already_absent"])
+        self.assertEqual(result["full_container_id"], full_container_id)
+        run.assert_called_once()
+
+    def test_direct_container_removal_rejects_unresolved_target_before_docker(
         self,
     ) -> None:
         with fixtures.CanonicalTemporaryDirectory() as root:
+            persistence, actions = fixtures.seed_store_backed_broker(root)
+            remover = mock.Mock()
+            backend = StoreBackedMutationBackend(
+                persistence, actions, container_remover=remover
+            )
+            service = BrokerService(
+                StoreBackedRequestAcceptor(persistence),
+                SerializedMutationWriter(backend),
+            )
+
+            reply = service.reply_for_document(
+                fixtures.peer_for(),
+                fixtures.request_for(
+                    BrokerOperation.CONTAINER_REMOVE,
+                    resource_id="missing-container",
+                    arguments={
+                        "target_id": "missing-container",
+                        "reason": "obsolete historical initializer",
+                    },
+                ).to_wire(),
+            )
+
+            self.assertFalse(reply["ok"], reply)
+            self.assertEqual(reply["error"]["code"], "resource_unavailable")
+            remover.assert_not_called()
+
+    def test_exact_volume_backend_uses_only_volume_rm_and_verifies_absence(self) -> None:
+        volume_name = "alpha_data"
+        backend = DockerCleanupBackend()
+        backend.executable = "/usr/bin/docker"
+        responses = [
+            subprocess.CompletedProcess(
+                ["/usr/bin/docker", "volume", "rm", volume_name],
+                0,
+                volume_name + "\n",
+                "",
+            ),
+            subprocess.CompletedProcess(
+                ["/usr/bin/docker", "volume", "inspect", volume_name],
+                1,
+                "",
+                "Error: No such volume: alpha_data",
+            ),
+        ]
+        with mock.patch(
+            "devcoordinator.cleanup_lifecycle.subprocess.run",
+            side_effect=responses,
+        ) as run:
+            result = backend.remove_volume(volume_name)
+
+        self.assertFalse(result["already_absent"])
+        self.assertEqual(
+            result["docker_argv_contract"],
+            ["docker", "volume", "rm", "<exact-volume-name>"],
+        )
+        self.assertEqual(
+            [call.args[0] for call in run.call_args_list],
+            [
+                ["/usr/bin/docker", "volume", "rm", volume_name],
+                ["/usr/bin/docker", "volume", "inspect", volume_name],
+            ],
+        )
+
+    def test_exact_detached_compose_volume_plan_apply_and_replay(self) -> None:
+        volume_name = "alpha_data"
+        with fixtures.CanonicalTemporaryDirectory() as root:
             persistence, _actions = fixtures.seed_store_backed_broker(root)
+            now = utc_timestamp()
+            snapshot_id = "00000000-0000-4000-8000-000000000501"
             with CoordinatorStore.open(
                 persistence.database_path, expected_uid=os.geteuid()
             ) as store:
                 with store.immediate_transaction() as connection:
                     connection.execute(
-                        "UPDATE coordinator_sources SET effective_uid = 0"
+                        """
+                        INSERT INTO broker_compose_definitions(
+                            compose_definition_id, repo_id, cwd, project_name,
+                            definition_fingerprint, enabled, generation,
+                            created_at, updated_at
+                        ) VALUES ('compose-alpha', ?, '/repos/alpha', 'alpha',
+                                  'compose-definition', 1, 0, ?, ?)
+                        """,
+                        (fixtures.PROJECT_ID, now, now),
                     )
                     connection.execute(
-                        "UPDATE repository_memberships SET immutable_fingerprint = ? "
-                        "WHERE host_resource_id = ?",
-                        ("sha256:" + "a" * 64, fixtures.CONTAINER_ID),
+                        """
+                        INSERT INTO observation_snapshots(
+                            snapshot_id, host_id, observer_domain, status,
+                            material_fingerprint, started_at, completed_at
+                        ) VALUES (?, ?, 'host-runtime-v2:full-docker', 'completed',
+                                  'volume-material', ?, ?)
+                        """,
+                        (snapshot_id, fixtures.HOST_ID, now, now),
                     )
-                exact, repo_id = SQLiteLifecyclePersistence(store).resolve_resource(
-                    ResourceKind.CONTAINER,
-                    fixtures.CONTAINER_ID,
-                    fixtures.CONTROL_ID,
-                )
+                    connection.execute(
+                        """
+                        INSERT INTO observation_capabilities(
+                            snapshot_id, observer_domain, docker_available,
+                            capability_fingerprint, committed_at
+                        ) VALUES (?, 'host-runtime-v2:full-docker', 1,
+                                  'volume-capability', ?)
+                        """,
+                        (snapshot_id, now),
+                    )
+                    connection.execute(
+                        """
+                        INSERT INTO broker_observation_compose_scope(
+                            snapshot_id, assets_complete, observed_asset_count,
+                            evidence_fingerprint, recorded_at
+                        ) VALUES (?, 1, 1, 'volume-scope', ?)
+                        """,
+                        (snapshot_id, now),
+                    )
+                    connection.execute(
+                        """
+                        INSERT INTO broker_observed_compose_assets(
+                            snapshot_id, asset_kind, asset_id, project_name,
+                            working_dir, observation_fingerprint
+                        ) VALUES (?, 'volume', ?, 'alpha', '/repos/alpha',
+                                  'volume-observation')
+                        """,
+                        (snapshot_id, volume_name),
+                    )
 
-            persistence.grant_cleanup_resource(
-                uid=os.geteuid(),
-                repo_id=repo_id,
-                resource_kind=exact.kind.value,
-                resource_id=exact.resource_id,
-                control_binding_id=exact.control_binding_id,
-                immutable_fingerprint=exact.immutable_fingerprint,
-                ownership_fingerprint=exact.control_contract_fingerprint,
-                operation=BrokerOperation.CLEANUP_PLAN,
-            )
-            persistence.grant_cleanup(
-                uid=os.geteuid(),
-                repo_id=repo_id,
-                operation=BrokerOperation.CLEANUP_PLAN,
-            )
-            persistence.authorize_cleanup_resource(
-                AuthorizedBrokerRequest(
-                    peer=fixtures.peer_for(),
-                    request=fixtures.request_for(
+                authorized = persistence.accept(
+                    fixtures.peer_for(),
+                    fixtures.request_for(
                         BrokerOperation.CLEANUP_PLAN,
-                        resource_id=exact.resource_id,
+                        resource_id=volume_name,
                         arguments={
                             "action": "purge",
-                            "target_kind": "container",
-                            "target_id": exact.resource_id,
-                            "reason": "service-observed project cleanup",
+                            "target_kind": "volume",
+                            "target_id": volume_name,
+                            "reason": "retired exact Compose volume",
                         },
                     ),
-                ),
-                repo_id=repo_id,
-                resource_kind=exact.kind.value,
-                resource_id=exact.resource_id,
-                control_binding_id=exact.control_binding_id,
-                immutable_fingerprint=exact.immutable_fingerprint,
-                ownership_fingerprint=exact.control_contract_fingerprint,
-                operation=BrokerOperation.CLEANUP_PLAN,
-            )
+                )
+                self.assertEqual(authorized.request.resource_id, volume_name)
+
+                docker = mock.Mock(spec=DockerCleanupBackend)
+                exact_identity = {
+                    "volume_name": volume_name,
+                    "created_at": "2026-08-09T20:00:00Z",
+                    "driver": "local",
+                    "scope": "local",
+                    "labels_fingerprint": "sha256:" + "1" * 64,
+                    "options_fingerprint": "sha256:" + "2" * 64,
+                    "compose_project": "alpha",
+                    "compose_volume": "data",
+                    "reference_count": 0,
+                    "references_fingerprint": "sha256:" + "3" * 64,
+                }
+                docker.inspect_volume.return_value = exact_identity
+
+                def remove_volume(_name: str):
+                    docker.inspect_volume.return_value = None
+                    return {
+                        "already_absent": False,
+                        "volume_name": volume_name,
+                        "docker_argv_contract": [
+                            "docker",
+                            "volume",
+                            "rm",
+                            "<exact-volume-name>",
+                        ],
+                    }
+
+                docker.remove_volume.side_effect = remove_volume
+                lifecycle = CleanupLifecycle(store, docker_backend=docker)
+                plan = lifecycle.plan(
+                    target_kind="volume",
+                    target_id=volume_name,
+                    actor="fixture",
+                    reason="retired exact Compose volume",
+                )
+                self.assertEqual(plan.repo_id, fixtures.PROJECT_ID)
+                self.assertEqual(plan.blockers, ())
+                self.assertEqual(plan.confirmation_phrase, "PURGE VOLUME alpha_data")
+
+                applied = lifecycle.apply(
+                    plan_id=plan.plan_id,
+                    plan_fingerprint=plan.plan_fingerprint,
+                    confirmation_phrase=plan.confirmation_phrase,
+                    actor="fixture",
+                )
+                replayed = lifecycle.apply(
+                    plan_id=plan.plan_id,
+                    plan_fingerprint=plan.plan_fingerprint,
+                    confirmation_phrase=plan.confirmation_phrase,
+                    actor="fixture",
+                )
+
+                self.assertTrue(applied["ok"])
+                self.assertTrue(replayed["ok"])
+                docker.remove_volume.assert_called_once_with(volume_name)
+                tombstone = store.connection.execute(
+                    """
+                    SELECT immutable_fingerprint FROM cleanup_tombstones
+                    WHERE target_kind = 'volume' AND target_id = ?
+                    """,
+                    (volume_name,),
+                ).fetchone()
+                self.assertIsNotNone(tombstone)
+                self.assertEqual(tombstone["immutable_fingerprint"], plan.target_fingerprint)
+
+    def test_exact_compose_volume_revalidates_zero_references_before_apply(self) -> None:
+        volume_name = "alpha_data"
+        with fixtures.CanonicalTemporaryDirectory() as root:
+            persistence, _actions = fixtures.seed_store_backed_broker(root)
+            now = utc_timestamp()
+            snapshot_id = "00000000-0000-4000-8000-000000000502"
+            with CoordinatorStore.open(
+                persistence.database_path, expected_uid=os.geteuid()
+            ) as store:
+                with store.immediate_transaction() as connection:
+                    connection.execute(
+                        """
+                        INSERT INTO broker_compose_definitions(
+                            compose_definition_id, repo_id, cwd, project_name,
+                            definition_fingerprint, enabled, generation,
+                            created_at, updated_at
+                        ) VALUES ('compose-alpha', ?, '/repos/alpha', 'alpha',
+                                  'compose-definition', 1, 0, ?, ?)
+                        """,
+                        (fixtures.PROJECT_ID, now, now),
+                    )
+                    connection.execute(
+                        """
+                        INSERT INTO observation_snapshots(
+                            snapshot_id, host_id, observer_domain, status,
+                            material_fingerprint, started_at, completed_at
+                        ) VALUES (?, ?, 'host-runtime-v2:full-docker', 'completed',
+                                  'volume-material', ?, ?)
+                        """,
+                        (snapshot_id, fixtures.HOST_ID, now, now),
+                    )
+                    connection.execute(
+                        """
+                        INSERT INTO observation_capabilities(
+                            snapshot_id, observer_domain, docker_available,
+                            capability_fingerprint, committed_at
+                        ) VALUES (?, 'host-runtime-v2:full-docker', 1,
+                                  'volume-capability', ?)
+                        """,
+                        (snapshot_id, now),
+                    )
+                    connection.execute(
+                        """
+                        INSERT INTO broker_observation_compose_scope(
+                            snapshot_id, assets_complete, observed_asset_count,
+                            evidence_fingerprint, recorded_at
+                        ) VALUES (?, 1, 1, 'volume-scope', ?)
+                        """,
+                        (snapshot_id, now),
+                    )
+                    connection.execute(
+                        """
+                        INSERT INTO broker_observed_compose_assets(
+                            snapshot_id, asset_kind, asset_id, project_name,
+                            working_dir, observation_fingerprint
+                        ) VALUES (?, 'volume', ?, 'alpha', '/repos/alpha',
+                                  'volume-observation')
+                        """,
+                        (snapshot_id, volume_name),
+                    )
+                docker = mock.Mock(spec=DockerCleanupBackend)
+                base = {
+                    "volume_name": volume_name,
+                    "created_at": "2026-08-09T20:00:00Z",
+                    "driver": "local",
+                    "scope": "local",
+                    "labels_fingerprint": "sha256:" + "1" * 64,
+                    "options_fingerprint": "sha256:" + "2" * 64,
+                    "compose_project": "alpha",
+                    "compose_volume": "data",
+                    "reference_count": 0,
+                    "references_fingerprint": "sha256:" + "3" * 64,
+                }
+                docker.inspect_volume.return_value = base
+                lifecycle = CleanupLifecycle(store, docker_backend=docker)
+                plan = lifecycle.plan(
+                    target_kind="volume",
+                    target_id=volume_name,
+                    actor="fixture",
+                    reason="retired exact Compose volume",
+                )
+                docker.inspect_volume.return_value = {
+                    **base,
+                    "reference_count": 1,
+                    "references_fingerprint": "sha256:" + "4" * 64,
+                }
+                with self.assertRaisesRegex(Exception, "identity changed|reference"):
+                    lifecycle.apply(
+                        plan_id=plan.plan_id,
+                        plan_fingerprint=plan.plan_fingerprint,
+                        confirmation_phrase=plan.confirmation_phrase,
+                        actor="fixture",
+                    )
+                docker.remove_volume.assert_not_called()
 
     def test_completed_permanent_cleanup_replay_does_not_resolve_deleted_resource(self) -> None:
         with fixtures.CanonicalTemporaryDirectory() as root:
@@ -206,7 +640,7 @@ class GenericLifecycleBrokerTests(unittest.TestCase):
                         "confirmation_phrase": confirmation,
                     },
                 )
-                authorized = AuthorizedBrokerRequest(
+                authorized = AcceptedBrokerRequest(
                     peer=fixtures.peer_for(), request=request
                 )
                 cleanup = mock.Mock()
@@ -217,7 +651,7 @@ class GenericLifecycleBrokerTests(unittest.TestCase):
                 }
                 with mock.patch.object(
                     backend,
-                    "_authorize_generic_cleanup_resource",
+                    "_resolve_generic_cleanup_resource",
                     side_effect=AssertionError("deleted resource must not be resolved"),
                 ), mock.patch.object(
                     backend,
@@ -239,111 +673,6 @@ class GenericLifecycleBrokerTests(unittest.TestCase):
                 confirmation_phrase=confirmation,
                 actor="fixture-replayer",
             )
-
-    def test_project_purge_observes_fresh_host_at_plan_and_apply(self) -> None:
-        with fixtures.CanonicalTemporaryDirectory() as root:
-            persistence, actions = fixtures.seed_store_backed_broker(root)
-            now = utc_timestamp()
-            with CoordinatorStore.open(
-                persistence.database_path, expected_uid=os.geteuid()
-            ) as store:
-                with store.immediate_transaction() as connection:
-                    connection.execute(
-                        "DELETE FROM repository_memberships WHERE repo_id = ?",
-                        (fixtures.PROJECT_ID,),
-                    )
-                    connection.execute(
-                        "UPDATE leases SET status='released', updated_at=? WHERE repo_id=?",
-                        (now, fixtures.PROJECT_ID),
-                    )
-                    connection.execute(
-                        "UPDATE port_assignments SET status='inactive', updated_at=? WHERE repo_id=?",
-                        (now, fixtures.PROJECT_ID),
-                    )
-                    connection.execute(
-                        """
-                        UPDATE repository_installations
-                        SET status='disabled', startup_fenced=1,
-                            disabled_at=?, reason='archived fixture', updated_at=?
-                        WHERE repo_id=?
-                        """,
-                        (now, now, fixtures.PROJECT_ID),
-                    )
-            for operation in (
-                BrokerOperation.CLEANUP_PLAN,
-                BrokerOperation.CLEANUP_APPLY,
-            ):
-                persistence.grant_cleanup(
-                    uid=os.geteuid(), repo_id=fixtures.PROJECT_ID, operation=operation
-                )
-            observations = 0
-
-            def observe(store: CoordinatorStore) -> object:
-                nonlocal observations
-                observations += 1
-                return fixtures._committed_available_observer(store)
-
-            service = _service(
-                persistence,
-                actions,
-                RestorableLifecycleAdapter(),
-                observer=observe,
-            )
-            planned = service.reply_for_document(
-                fixtures.peer_for(),
-                fixtures.request_for(
-                    BrokerOperation.CLEANUP_PLAN,
-                    resource_id=fixtures.PROJECT_ID,
-                    arguments={
-                        "action": "purge",
-                        "target_kind": "project",
-                        "target_id": fixtures.PROJECT_ID,
-                        "reason": "catalog cleanup",
-                    },
-                ).to_wire(),
-            )
-            self.assertTrue(planned["ok"], planned)
-            self.assertEqual(observations, 1)
-            self.assertTrue(planned["result"]["broker_observation"]["observed"])
-
-            with (
-                mock.patch.object(
-                    broker_backend_module,
-                    "configured_profile_path",
-                    return_value=Path("/protected/profile.json"),
-                ),
-                mock.patch.object(
-                    broker_backend_module,
-                    "revoke_repository_from_protected_profile",
-                    side_effect=lambda **arguments: {
-                        "status": "revoked",
-                        "repo_id": arguments["repo_id"],
-                        "repository_generation": arguments[
-                            "repository_generation"
-                        ],
-                        "cleanup_operation_id": arguments[
-                            "cleanup_operation_id"
-                        ],
-                        "affected_client_uids": [os.geteuid()],
-                        "profile_path": str(arguments["profile_path"]),
-                    },
-                ),
-            ):
-                applied = service.reply_for_document(
-                    fixtures.peer_for(),
-                    fixtures.request_for(
-                        BrokerOperation.CLEANUP_APPLY,
-                        resource_id=fixtures.PROJECT_ID,
-                        arguments={
-                            "plan_id": planned["result"]["plan_id"],
-                            "plan_fingerprint": planned["result"]["plan_fingerprint"],
-                            "confirmation_phrase": planned["result"]["confirmation_phrase"],
-                        },
-                    ).to_wire(),
-                )
-            self.assertTrue(applied["ok"], applied)
-            self.assertEqual(observations, 2)
-            self.assertTrue(applied["result"]["pre_apply_observation"]["observed"])
 
     def test_project_archive_apply_resolves_plan_after_inactive_transport_anchor(self) -> None:
         with fixtures.CanonicalTemporaryDirectory() as root:
@@ -396,35 +725,6 @@ class GenericLifecycleBrokerTests(unittest.TestCase):
                         """,
                         (now, now),
                     )
-                    establish_repository_owner_authority(
-                        connection,
-                        repository_id="repo-inactive-anchor",
-                        owner_uid=os.geteuid(),
-                        repository_generation=1,
-                        operation_id="generic-inactive-anchor-owner-fixture",
-                        actor="generic-lifecycle-fixture",
-                        reason="explicit inactive transport anchor owner",
-                        timestamp=now,
-                        evidence={
-                            "kind": "generic-inactive-anchor-owner-fixture",
-                            "repository_id": "repo-inactive-anchor",
-                            "repository_generation": 1,
-                            "owner_uid": os.geteuid(),
-                        },
-                    )
-            persistence.provision_repository_enrollment(
-                uid=os.geteuid(),
-                repo_id="repo-inactive-anchor",
-                account_id=fixtures.ACCOUNT_ID,
-                issued_at=utc_timestamp(),
-                valid_until_epoch=int(time.time()) + 3_600,
-            )
-            persistence.grant_cleanup(
-                uid=os.geteuid(),
-                repo_id="repo-inactive-anchor",
-                operation=BrokerOperation.CLEANUP_APPLY,
-            )
-            _grant_project_archive(persistence)
             adapter = RestorableLifecycleAdapter()
             service = _service(persistence, actions, adapter)
 
@@ -479,393 +779,61 @@ class GenericLifecycleBrokerTests(unittest.TestCase):
             self.assertFalse(restored["result"]["started"])
             self.assertFalse(adapter.running)
 
-    @mock.patch.object(
-        DockerCleanupBackend,
-        "inspect",
-        return_value={
-            "full_container_id": "a" * 64,
-            "running": False,
-            "status": "exited",
-            "mounts": [],
-            "labels": {},
-        },
-    )
-    def test_resource_archive_restore_and_purge_require_distinct_exact_grants(
-        self, _inspect: object
-    ) -> None:
-        with fixtures.CanonicalTemporaryDirectory() as root:
-            persistence, actions = fixtures.seed_store_backed_broker(root)
-            now = utc_timestamp()
-            immutable = "sha256:" + fingerprint(
-                {
-                    "resource_kind": "container",
-                    "resource_id": fixtures.CONTAINER_ID,
-                    "native_identity": {
-                        "docker_resource_id": fixtures.CONTAINER_ID,
-                        "engine_id": fixtures.ENGINE_ID,
-                        "full_container_id": "a" * 64,
-                    },
-                }
-            )
-            with CoordinatorStore.open(
-                persistence.database_path, expected_uid=os.geteuid()
-            ) as store:
-                with store.immediate_transaction() as connection:
-                    connection.execute(
-                        "UPDATE repository_memberships SET immutable_fingerprint = ? WHERE host_resource_id = ?",
-                        (immutable, fixtures.CONTAINER_ID),
-                    )
-                    connection.execute(
-                        "UPDATE docker_observations SET restart_policy = 'always' WHERE docker_resource_id = ?",
-                        (fixtures.CONTAINER_ID,),
-                    )
-                    connection.execute(
-                        """
-                        INSERT INTO startup_policies(
-                            policy_id, repo_id, resource_kind, resource_id,
-                            policy_kind, current_value, desired_disabled_value,
-                            immutable_fingerprint, generation, updated_at
-                        ) VALUES ('generic-resource-policy', ?, 'container', ?,
-                                  'docker_restart', 'always', 'no', ?, 0, ?)
-                        """,
-                        (
-                            fixtures.PROJECT_ID,
-                            fixtures.CONTAINER_ID,
-                            "sha256:" + "a" * 64,
-                            now,
-                        ),
-                    )
-                exact, repo_id = SQLiteLifecyclePersistence(store).resolve_resource(
-                    ResourceKind.CONTAINER,
-                    fixtures.CONTAINER_ID,
-                    fixtures.CONTROL_ID,
-                )
-            self.assertEqual(repo_id, fixtures.PROJECT_ID)
-            for operation in (
-                BrokerOperation.CLEANUP_PLAN,
-                BrokerOperation.CLEANUP_APPLY,
-                BrokerOperation.LIFECYCLE_RESTORE,
-                BrokerOperation.RESOURCE_PLAN_ARCHIVE,
-                BrokerOperation.RESOURCE_ARCHIVE,
-                BrokerOperation.RESOURCE_RESTORE,
-            ):
-                persistence.grant_cleanup(
-                    uid=os.geteuid(), repo_id=fixtures.PROJECT_ID, operation=operation
-                )
-            for operation in (
-                BrokerOperation.RESOURCE_PLAN_ARCHIVE,
-                BrokerOperation.RESOURCE_ARCHIVE,
-                BrokerOperation.RESOURCE_RESTORE,
-            ):
-                persistence.grant_cleanup_resource(
-                    uid=os.geteuid(),
-                    repo_id=fixtures.PROJECT_ID,
-                    resource_kind="container",
-                    resource_id=fixtures.CONTAINER_ID,
-                    control_binding_id=exact.control_binding_id,
-                    immutable_fingerprint=exact.immutable_fingerprint,
-                    ownership_fingerprint=(
-                        exact.control_contract_fingerprint
-                        if operation is BrokerOperation.RESOURCE_RESTORE
-                        else exact.ownership_fingerprint
-                    ),
-                    operation=operation,
-                )
-            adapter = RestorableLifecycleAdapter()
-            service = _service(persistence, actions, adapter)
-
-            archive_plan = service.reply_for_document(
-                fixtures.peer_for(),
-                fixtures.request_for(
-                    BrokerOperation.CLEANUP_PLAN,
-                    resource_id=fixtures.CONTAINER_ID,
-                    arguments={
-                        "action": "archive",
-                        "target_kind": "container",
-                        "target_id": fixtures.CONTAINER_ID,
-                        "reason": "generic resource archive",
-                    },
-                ).to_wire(),
-            )
-            self.assertTrue(archive_plan["ok"], archive_plan)
-            archived = service.reply_for_document(
-                fixtures.peer_for(),
-                fixtures.request_for(
-                    BrokerOperation.CLEANUP_APPLY,
-                    resource_id=fixtures.PROJECT_ID,
-                    arguments={
-                        "plan_id": archive_plan["result"]["plan_id"],
-                        "plan_fingerprint": archive_plan["result"]["plan_fingerprint"],
-                        "confirmation_phrase": "",
-                    },
-                ).to_wire(),
-            )
-            self.assertTrue(archived["ok"], archived)
-            self.assertFalse(archived["result"]["started"])
-
-            purge_arguments = {
-                "action": "purge",
-                "target_kind": "container",
-                "target_id": fixtures.CONTAINER_ID,
-                "reason": "exact cleanup grant regression",
-            }
-            denied_plan = service.reply_for_document(
-                fixtures.peer_for(),
-                fixtures.request_for(
-                    BrokerOperation.CLEANUP_PLAN,
-                    resource_id=fixtures.CONTAINER_ID,
-                    arguments=purge_arguments,
-                ).to_wire(),
-            )
-            self.assertFalse(denied_plan["ok"], denied_plan)
-            self.assertEqual(denied_plan["error"]["code"], "resource_access_denied")
-
-            persistence.grant_cleanup_resource(
-                uid=os.geteuid(),
-                repo_id=fixtures.PROJECT_ID,
-                resource_kind="container",
-                resource_id=fixtures.CONTAINER_ID,
-                control_binding_id=exact.control_binding_id,
-                immutable_fingerprint=exact.immutable_fingerprint,
-                ownership_fingerprint=exact.control_contract_fingerprint,
-                operation=BrokerOperation.CLEANUP_PLAN,
-            )
-            persistence.grant_cleanup_resource(
-                uid=os.geteuid(),
-                repo_id=fixtures.PROJECT_ID,
-                resource_kind="container",
-                resource_id=fixtures.CONTAINER_ID,
-                control_binding_id=exact.control_binding_id,
-                immutable_fingerprint=exact.immutable_fingerprint,
-                ownership_fingerprint=exact.control_contract_fingerprint,
-                operation=BrokerOperation.CLEANUP_APPLY,
-            )
-            purge_plan = service.reply_for_document(
-                fixtures.peer_for(),
-                fixtures.request_for(
-                    BrokerOperation.CLEANUP_PLAN,
-                    resource_id=fixtures.CONTAINER_ID,
-                    arguments=purge_arguments,
-                ).to_wire(),
-            )
-            self.assertTrue(purge_plan["ok"], purge_plan)
-            persistence.grant_cleanup_resource(
-                uid=os.geteuid(),
-                repo_id=fixtures.PROJECT_ID,
-                resource_kind="container",
-                resource_id=fixtures.CONTAINER_ID,
-                control_binding_id=exact.control_binding_id,
-                immutable_fingerprint=exact.immutable_fingerprint,
-                ownership_fingerprint=exact.control_contract_fingerprint,
-                operation=BrokerOperation.CLEANUP_APPLY,
-                enabled=False,
-            )
-            denied_apply = service.reply_for_document(
-                fixtures.peer_for(),
-                fixtures.request_for(
-                    BrokerOperation.CLEANUP_APPLY,
-                    resource_id=fixtures.PROJECT_ID,
-                    arguments={
-                        "plan_id": purge_plan["result"]["plan_id"],
-                        "plan_fingerprint": purge_plan["result"]["plan_fingerprint"],
-                        "confirmation_phrase": purge_plan["result"]["confirmation_phrase"],
-                    },
-                ).to_wire(),
-            )
-            self.assertFalse(denied_apply["ok"], denied_apply)
-            self.assertEqual(denied_apply["error"]["code"], "resource_access_denied")
-
-            with CoordinatorStore.open(
-                persistence.database_path, expected_uid=os.geteuid()
-            ) as store:
-                with store.immediate_transaction() as connection:
-                    connection.execute(
-                        """
-                        UPDATE broker_cleanup_resource_acl
-                        SET ownership_fingerprint = ?
-                        WHERE uid = ? AND repo_id = ?
-                          AND resource_kind = 'container' AND resource_id = ?
-                          AND operation = 'resource.restore'
-                        """,
-                        (
-                            "sha256:" + "f" * 64,
-                            os.geteuid(),
-                            fixtures.PROJECT_ID,
-                            fixtures.CONTAINER_ID,
-                        ),
-                    )
-            denied_restore = service.reply_for_document(
-                fixtures.peer_for(),
-                fixtures.request_for(
-                    BrokerOperation.LIFECYCLE_RESTORE,
-                    resource_id=fixtures.CONTAINER_ID,
-                    arguments={
-                        "target_kind": "container",
-                        "target_id": fixtures.CONTAINER_ID,
-                        "reason": "stale exact restore grant must fail",
-                    },
-                ).to_wire(),
-            )
-            self.assertFalse(denied_restore["ok"], denied_restore)
-            self.assertEqual(denied_restore["error"]["code"], "resource_access_denied")
-            persistence.grant_cleanup_resource(
-                uid=os.geteuid(),
-                repo_id=fixtures.PROJECT_ID,
-                resource_kind="container",
-                resource_id=fixtures.CONTAINER_ID,
-                control_binding_id=exact.control_binding_id,
-                immutable_fingerprint=exact.immutable_fingerprint,
-                ownership_fingerprint=exact.control_contract_fingerprint,
-                operation=BrokerOperation.RESOURCE_RESTORE,
-            )
-            restored = service.reply_for_document(
-                fixtures.peer_for(),
-                fixtures.request_for(
-                    BrokerOperation.LIFECYCLE_RESTORE,
-                    resource_id=fixtures.CONTAINER_ID,
-                    arguments={
-                        "target_kind": "container",
-                        "target_id": fixtures.CONTAINER_ID,
-                        "reason": "restore without starting",
-                    },
-                ).to_wire(),
-            )
-            self.assertTrue(restored["ok"], restored)
-            self.assertFalse(restored["result"]["started"])
-            self.assertFalse(adapter.running)
-            self.assertFalse(adapter.policy_disabled)
-
-
 class GenericLifecycleHttpTests(unittest.TestCase):
-    def test_account_http_purge_observes_at_plan_and_apply(self) -> None:
-        with fixtures.CanonicalTemporaryDirectory() as root:
-            persistence, _actions = fixtures.seed_store_backed_broker(root)
-            project_root = root / "project"
-            project_root.mkdir()
-            now = utc_timestamp()
-            with CoordinatorStore.open(
-                persistence.database_path, expected_uid=os.geteuid()
-            ) as store:
-                with store.immediate_transaction() as connection:
-                    connection.execute(
-                        "UPDATE repositories SET canonical_root=? WHERE repo_id=?",
-                        (str(project_root), fixtures.PROJECT_ID),
-                    )
-                    connection.execute(
-                        "DELETE FROM repository_memberships WHERE repo_id=?",
-                        (fixtures.PROJECT_ID,),
-                    )
-                    connection.execute(
-                        "UPDATE leases SET status='released', updated_at=? WHERE repo_id=?",
-                        (now, fixtures.PROJECT_ID),
-                    )
-                    connection.execute(
-                        "UPDATE port_assignments SET status='inactive', updated_at=? WHERE repo_id=?",
-                        (now, fixtures.PROJECT_ID),
-                    )
-                    connection.execute(
-                        """
-                        UPDATE repository_installations
-                        SET status='disabled', startup_fenced=1, disabled_at=?, updated_at=?
-                        WHERE repo_id=?
-                        """,
-                        (now, now, fixtures.PROJECT_ID),
-                    )
-            observations = 0
-
-            def observe(options: dict[str, object]) -> dict[str, object]:
-                nonlocal observations
-                observations += 1
-                with CoordinatorStore.open(
-                    persistence.database_path, expected_uid=os.geteuid()
-                ) as observed_store:
-                    evidence = dict(fixtures._committed_available_observer(observed_store))
-                return {
-                    **evidence,
-                    "status": "completed",
-                    "observed": True,
-                    "joined": False,
-                    "max_age_seconds": 0.0,
-                    "request": {
-                        "project": options["project"],
-                        "agent": options["agent"],
-                    },
-                }
-
-            patches = (
-                mock.patch.object(dev_coordinator, "configured_broker_profile", return_value=None),
-                mock.patch.object(dev_coordinator, "authority_mode", return_value="account"),
-                mock.patch.object(
-                    dev_coordinator,
-                    "coordinator_home",
-                    return_value=persistence.database_path.parent,
-                ),
-                mock.patch.object(dev_coordinator, "coordinated_observe_host", side_effect=observe),
-            )
-            with patches[0], patches[1], patches[2], patches[3]:
-                planned = dev_coordinator.coordinated_lifecycle_plan(
-                    {
-                        "action": "purge",
-                        "target_kind": "project",
-                        "target_id": fixtures.PROJECT_ID,
-                        "reason": "account HTTP cleanup",
-                    }
-                )
-                self.assertEqual(observations, 1)
-                applied = dev_coordinator.coordinated_lifecycle_apply(
-                    {
-                        "plan_id": planned["plan_id"],
-                        "plan_fingerprint": planned["plan_fingerprint"],
-                        "confirmation_phrase": planned["confirmation_phrase"],
-                    }
-                )
-            self.assertTrue(applied["ok"])
-            self.assertEqual(observations, 2)
-            self.assertTrue(applied["pre_apply_observation"]["docker_available"])
-
     def test_profile_expiry_is_informational_for_local_archive_reads(self) -> None:
         root = str(Path("/repos/expired").resolve())
         repository = BrokerRepositoryProfile(
             canonical_root=root,
             repo_id="repo-expired",
             generation=1,
-            owner_uid=1000,
             server_ids={},
             container_ids={},
             compose_definition_id=None,
             compose_container_ids=frozenset(),
             compose_run_once_services={},
             ephemeral_templates={},
-            ephemeral_image_prefetch_template_ids=frozenset(),
             ephemeral_secret_policies={},
-            account_id="account-expired",
-            enabled=True,
-            issued_at="2026-07-18T00:00:00Z",
-            valid_until_epoch=int(time.time()) - 1,
+        )
+        other = BrokerRepositoryProfile(
+            canonical_root=str(Path("/repos/other").resolve()),
+            repo_id="repo-other",
+            generation=1,
+            server_ids={},
+            container_ids={},
+            compose_definition_id=None,
+            compose_container_ids=frozenset(),
+            compose_run_once_services={},
+            ephemeral_templates={},
+            ephemeral_secret_policies={},
         )
         profile = BrokerClientProfile(
             service=BrokerServiceProfile(
                 socket_path=Path("/run/devcoordinator-authority.sock"),
-                service_uid=0,
-                socket_gid=0,
-                socket_mode=0o666,
                 database_generation="generation-expired",
             ),
-            client_uid=os.geteuid(),
-            account_id="account-expired",
-            issued_at="2026-07-18T00:00:00Z",
-            valid_until_epoch=int(time.time()) - 1,
-            repositories={root: repository},
+            repositories={root: repository, other.canonical_root: other},
         )
         with mock.patch.object(
             dev_coordinator, "configured_broker_profile", return_value=profile
         ), mock.patch.object(
             BrokerClientProfile,
             "call",
-            return_value=("archive-read-operation", {"archives": []}),
+            return_value=(
+                "archive-read-operation",
+                {
+                    "archives": [
+                        {
+                            "target_kind": "project",
+                            "target_id": other.repo_id,
+                            "project_id": other.repo_id,
+                            "archived_at": "2026-08-12T00:00:00Z",
+                        }
+                    ]
+                },
+            ),
         ) as broker_call:
             result = dev_coordinator.coordinated_list_archives()
-        self.assertEqual(result, {"archives": []})
+        self.assertEqual(result["archives"][0]["target_id"], other.repo_id)
         broker_call.assert_called_once()
 
 

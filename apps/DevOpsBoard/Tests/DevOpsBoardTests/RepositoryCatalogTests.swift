@@ -113,7 +113,7 @@ final class RepositoryCatalogTests: XCTestCase {
         XCTAssertEqual(repository.usage.containerCount, 2)
         XCTAssertEqual(repository.usage.cpuPercent, 2.6, accuracy: 0.0001)
         XCTAssertEqual(repository.usage.memoryBytes, 3_700_000_000, accuracy: 0.1)
-        XCTAssertEqual(repository.controlOrigin, codexTT)
+        XCTAssertEqual(repository.routeOrigin, codexTT)
         XCTAssertFalse(repository.projectActionsBlocked)
         XCTAssertTrue(repository.serverConflicts.isEmpty)
 
@@ -298,7 +298,7 @@ final class RepositoryCatalogTests: XCTestCase {
         XCTAssertEqual(catalog.unassigned.usageObservations.count, 3)
     }
 
-    func testDockerOnlyRepositoryUsesItsSingleProvenSourceAsProjectController() throws {
+    func testDockerOnlyRepositoryUsesItsAvailableSourceAsProjectRoute() throws {
         let project = try repositoryPath(named: "docker-only")
         let container = try dockerContainer(
             origin: account,
@@ -328,7 +328,7 @@ final class RepositoryCatalogTests: XCTestCase {
         let repository = try XCTUnwrap(catalog.repositories.first)
         let resource = try XCTUnwrap(repository.docker.first)
         XCTAssertEqual(resource.sourceIdentities.map(\.origin), [account])
-        XCTAssertEqual(repository.controlOrigin, account)
+        XCTAssertEqual(repository.routeOrigin, account)
         XCTAssertFalse(repository.projectActionsBlocked)
         XCTAssertEqual(repository.usage.cpuPercent, 1.5, accuracy: 0.0001)
         XCTAssertEqual(repository.usage.memoryBytes, 256_000_000, accuracy: 0.1)
@@ -375,7 +375,7 @@ final class RepositoryCatalogTests: XCTestCase {
         XCTAssertEqual(service.observations.count, 2)
         XCTAssertEqual(Set(conflict.activeSourceIdentities.map(\.origin)), Set([account, chatGPT]))
         XCTAssertTrue(service.isActionBlocked)
-        XCTAssertNil(repository.controlOrigin)
+        XCTAssertNil(repository.routeOrigin)
         XCTAssertTrue(repository.projectActionsBlocked)
     }
 
@@ -408,7 +408,7 @@ final class RepositoryCatalogTests: XCTestCase {
         XCTAssertEqual(catalog.repositories.count, 1)
         XCTAssertEqual(repository.servers.count, 1)
         XCTAssertEqual(repository.servers.first?.identity.serviceKey, "web")
-        XCTAssertEqual(repository.controlOrigin, account)
+        XCTAssertEqual(repository.routeOrigin, account)
         XCTAssertTrue(catalog.unassigned.servers.isEmpty)
     }
 
@@ -451,13 +451,13 @@ final class RepositoryCatalogTests: XCTestCase {
         XCTAssertEqual(Set(catalog.repositories.map(\.identity.canonicalRoot)), Set([usageProject, explicitProject]))
         XCTAssertEqual(catalog.unassigned.servers.count, 1)
         XCTAssertEqual(catalog.unassigned.docker.count, 1)
-        XCTAssertNotNil(catalog.unassigned.servers.first?.server.ownershipError)
-        XCTAssertNotNil(catalog.unassigned.docker.first?.membershipError)
+        XCTAssertNotNil(catalog.unassigned.servers.first?.server.associationError)
+        XCTAssertNotNil(catalog.unassigned.docker.first?.associationError)
         for repository in catalog.repositories {
             XCTAssertTrue(repository.servers.isEmpty)
             XCTAssertTrue(repository.docker.isEmpty)
-            XCTAssertEqual(repository.serverMembershipConflicts.count, 1)
-            XCTAssertEqual(repository.dockerMembershipConflicts.count, 1)
+            XCTAssertEqual(repository.serverAssociationConflicts.count, 1)
+            XCTAssertEqual(repository.dockerAssociationConflicts.count, 1)
             XCTAssertEqual(repository.usage.serverCount, 0)
             XCTAssertEqual(repository.usage.containerCount, 0)
             XCTAssertTrue(repository.projectActionsBlocked)
@@ -474,7 +474,7 @@ final class RepositoryCatalogTests: XCTestCase {
     }
 
     func testRootAndNestedResourceClaimsResolveToOneRepositoryWithoutFalseConflict() throws {
-        let project = try repositoryPath(named: "nested-membership")
+        let project = try repositoryPath(named: "nested-association")
         let nested = URL(fileURLWithPath: project, isDirectory: true)
             .appendingPathComponent("packages/web", isDirectory: true)
         try FileManager.default.createDirectory(at: nested, withIntermediateDirectories: true)
@@ -494,7 +494,7 @@ final class RepositoryCatalogTests: XCTestCase {
                     origin: account,
                     key: "path:\(project)",
                     project: project,
-                    name: "nested-membership",
+                    name: "nested-association",
                     serverIDs: ["nested-web"]
                 )
             )
@@ -504,8 +504,8 @@ final class RepositoryCatalogTests: XCTestCase {
         XCTAssertEqual(catalog.repositories.count, 1)
         XCTAssertEqual(repository.identity.canonicalRoot, project)
         XCTAssertEqual(repository.servers.count, 1)
-        XCTAssertTrue(repository.serverMembershipConflicts.isEmpty)
-        XCTAssertEqual(repository.controlOrigin, account)
+        XCTAssertTrue(repository.serverAssociationConflicts.isEmpty)
+        XCTAssertEqual(repository.routeOrigin, account)
     }
 
     func testSamePhysicalAndStoppedServicesCollapseWithoutLosingRoutingProvenance() throws {
@@ -570,14 +570,14 @@ final class RepositoryCatalogTests: XCTestCase {
         XCTAssertTrue(repository.servers.allSatisfy { $0.observations.count == 2 })
         XCTAssertTrue(
             repository.servers.allSatisfy(\.isActionBlocked),
-            "two state homes retaining one definition must not make an arbitrary resource controller actionable"
+            "two state homes retaining one definition must not make an arbitrary resource route actionable"
         )
         XCTAssertEqual(
             Set(repository.servers.flatMap(\.sourceIdentities).map(\.origin)),
             Set([account, chatGPT])
         )
         XCTAssertNil(
-            repository.controlOrigin,
+            repository.routeOrigin,
             "two complete source controllers are ambiguous, so repository actions must not guess"
         )
         XCTAssertEqual(repository.usage.processCount, 1)
@@ -636,7 +636,7 @@ final class RepositoryCatalogTests: XCTestCase {
         XCTAssertNil(service.conflict)
         XCTAssertEqual(service.actionOrigin, account)
         XCTAssertFalse(service.isActionBlocked)
-        XCTAssertEqual(repository.controlOrigin, account)
+        XCTAssertEqual(repository.routeOrigin, account)
     }
 
     func testUniqueWholeRepositoryControllerSurvivesPartialStoppedLegacyOverlap() throws {
@@ -673,13 +673,13 @@ final class RepositoryCatalogTests: XCTestCase {
         let web = try XCTUnwrap(repository.servers.first { $0.identity.serviceKey == "web" })
         let worker = try XCTUnwrap(repository.servers.first { $0.identity.serviceKey == "worker" })
         XCTAssertNil(web.actionOrigin, "the duplicated stopped web definition remains unsafe as a resource action")
-        XCTAssertEqual(Set(web.controlCandidates), Set([account, chatGPT]))
+        XCTAssertEqual(Set(web.routeCandidates), Set([account, chatGPT]))
         XCTAssertEqual(worker.actionOrigin, account)
-        XCTAssertEqual(repository.controlOrigin, account, "only the account source covers the complete repository runtime")
+        XCTAssertEqual(repository.routeOrigin, account, "only the account source covers the complete repository runtime")
         XCTAssertFalse(repository.projectActionsBlocked)
     }
 
-    func testDatabaseObservedWithoutProjectIsNotDuplicatedIntoUnassignedWhenContainerMembershipIsKnown() throws {
+    func testDatabaseObservedWithoutProjectIsNotDuplicatedIntoUnassignedWhenContainerAssociationIsKnown() throws {
         let project = try repositoryPath(named: "database-owner")
         let database = try dockerContainer(
             origin: account,
@@ -788,7 +788,7 @@ final class RepositoryCatalogTests: XCTestCase {
         XCTAssertEqual(visibleContainer.origin, chatGPT)
         XCTAssertEqual(visibleContainer.stableID, owned.stableID)
         XCTAssertEqual(visibleContainer.resourceIdentity?.origin, chatGPT)
-        XCTAssertEqual(Set(visibleContainer.ownershipCandidates), Set([chatGPT]))
+        XCTAssertEqual(Set(visibleContainer.routeCandidates), Set([chatGPT]))
         XCTAssertEqual(Set(visibleContainer.observationOrigins), Set([account, chatGPT]))
     }
 
@@ -847,7 +847,7 @@ final class RepositoryCatalogTests: XCTestCase {
         let conflict = try XCTUnwrap(catalog.unassigned.docker.first)
         XCTAssertEqual(catalog.unassigned.docker.count, 1)
         XCTAssertEqual(Set(conflict.repositoryCandidates), Set([RepositoryIdentity(projectPath: leftProject)!, RepositoryIdentity(projectPath: rightProject)!]))
-        XCTAssertNotNil(conflict.membershipError)
+        XCTAssertNotNil(conflict.associationError)
 
         var presentation = sources[0].inventory
         presentation.docker.containers = [left]
@@ -856,7 +856,7 @@ final class RepositoryCatalogTests: XCTestCase {
         let unassigned = try XCTUnwrap(groups.first { $0.kind == .unassigned })
         let visibleContainer = try XCTUnwrap(unassigned.containers.first)
         XCTAssertEqual(groups.flatMap(\.containers).count, 1)
-        XCTAssertNotNil(visibleContainer.ownershipError)
+        XCTAssertNotNil(visibleContainer.associationError)
         XCTAssertNil(visibleContainer.resourceIdentity)
     }
 
@@ -906,9 +906,9 @@ final class RepositoryCatalogTests: XCTestCase {
         ])
 
         let repository = try XCTUnwrap(catalog.repositories.first)
-        XCTAssertEqual(repository.servers.first?.controlCandidates, [account])
-        XCTAssertEqual(repository.docker.first?.controlCandidates, [chatGPT])
-        XCTAssertNil(repository.controlOrigin)
+        XCTAssertEqual(repository.servers.first?.routeCandidates, [account])
+        XCTAssertEqual(repository.docker.first?.routeCandidates, [chatGPT])
+        XCTAssertNil(repository.routeOrigin)
         XCTAssertTrue(repository.projectActionsBlocked)
     }
 
@@ -966,9 +966,9 @@ final class RepositoryCatalogTests: XCTestCase {
 
         XCTAssertEqual(catalog.repositories.count, 2)
         for repository in catalog.repositories {
-            XCTAssertEqual(repository.serverMembershipConflicts.count, 1)
+            XCTAssertEqual(repository.serverAssociationConflicts.count, 1)
             XCTAssertTrue(repository.projectActionsBlocked)
-            XCTAssertNil(repository.controlOrigin)
+            XCTAssertNil(repository.routeOrigin)
             XCTAssertTrue(repository.servers.isEmpty)
             XCTAssertEqual(repository.usage.serverCount, 0)
             XCTAssertEqual(repository.usage.processCount, 0)
@@ -979,12 +979,12 @@ final class RepositoryCatalogTests: XCTestCase {
         let groups = makeProjectGroups(from: catalog, inventory: .empty)
         let unassigned = try XCTUnwrap(groups.first { !$0.isRepository })
         XCTAssertEqual(unassigned.servers.count, 1, "one physical conflict must render as one unassigned resource")
-        XCTAssertNotNil(unassigned.servers.first?.ownershipError)
+        XCTAssertNotNil(unassigned.servers.first?.associationError)
         XCTAssertEqual(repositoryCatalogConflictHealthSignals(catalog).count, 1)
     }
 
     @MainActor
-    func testDockerMembershipConflictBlocksBothOtherwiseControlledProjectActionsAndHealthIsNotNominal() throws {
+    func testDockerAssociationConflictBlocksAmbiguousProjectActionsAndHealthIsNotNominal() throws {
         let containerID = "project-action-conflict-id"
         let leftProject = try repositoryPath(named: "action-left")
         let rightProject = try repositoryPath(named: "action-right")
@@ -1041,7 +1041,7 @@ final class RepositoryCatalogTests: XCTestCase {
 
         XCTAssertEqual(groups.count, 2)
         for group in groups {
-            XCTAssertEqual(group.dockerMembershipConflicts.count, 1)
+            XCTAssertEqual(group.dockerAssociationConflicts.count, 1)
             XCTAssertFalse(store.projectMutationAvailability(kind: .projectStart, group: group).isAllowed)
         }
         let signals = repositoryCatalogConflictHealthSignals(catalog)

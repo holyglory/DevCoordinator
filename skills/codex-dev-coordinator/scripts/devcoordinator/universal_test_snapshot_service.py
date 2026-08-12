@@ -452,15 +452,9 @@ class SnapshotAuthority:
         self.expected_uid = expected_uid
 
     def repository(
-        self, *, repository_id: str, owner_uid: int | None = None
+        self, *, repository_id: str
     ) -> Mapping[str, object]:
-        """Resolve execution identity from owner authority, not request grants.
-
-        Broker principals and repository enrollments authorize callers before
-        this internal snapshot boundary. The repository owner authority alone
-        selects the operating-system UID used to inspect and execute repository
-        content, so that owner need not also be a broker principal.
-        """
+        """Resolve one current repository from the trusted local catalog."""
 
         with CoordinatorStore.open_read_only(
             self.database, expected_uid=self.expected_uid
@@ -476,28 +470,9 @@ class SnapshotAuthority:
                     """
                     SELECT repository.canonical_root, repository.generation,
                            repository.state, installation.status,
-                           installation.startup_fenced,
-                           owner.owner_uid, owner.repository_generation,
-                           owner.evidence_sha256,
-                           enrollment.enabled,
-                           principal.enabled AS principal_enabled,
-                           enrollment.valid_until_epoch,
-                           transfer.owner_uid AS ledger_owner_uid,
-                           transfer.repository_generation AS ledger_repository_generation,
-                           transfer.evidence_sha256 AS ledger_evidence_sha256
+                           installation.startup_fenced
                     FROM repositories repository
                     JOIN repository_installations installation USING(repo_id)
-                    JOIN repository_owners owner
-                      ON owner.repo_id = repository.repo_id
-                    JOIN broker_repository_enrollments enrollment
-                      ON enrollment.repo_id = repository.repo_id
-                     AND enrollment.uid = owner.owner_uid
-                    JOIN broker_acl_principals principal
-                      ON principal.uid = enrollment.uid
-                     AND principal.account_id = enrollment.account_id
-                    JOIN repository_owner_transfers transfer
-                      ON transfer.repo_id = owner.repo_id
-                     AND transfer.authority_generation = owner.authority_generation
                     WHERE repository.repo_id = ?
                     """,
                     (repository_id,),
@@ -511,49 +486,13 @@ class SnapshotAuthority:
             or str(row["state"]) != "active"
             or str(row["status"]) != "installed"
             or bool(row["startup_fenced"])
-            or int(row["owner_uid"]) <= 0
-            or int(row["repository_generation"]) != int(row["generation"])
-            or int(row["ledger_owner_uid"]) != int(row["owner_uid"])
-            or int(row["ledger_repository_generation"])
-            != int(row["repository_generation"])
-            or str(row["ledger_evidence_sha256"])
-            != str(row["evidence_sha256"])
-            or not bool(row["enabled"])
-            or not bool(row["principal_enabled"])
-            or int(row["valid_until_epoch"]) <= int(__import__("time").time())
-            or (
-                owner_uid is not None
-                and (type(owner_uid) is not int or owner_uid != int(row["owner_uid"]))
-            )
         ):
-            raise TestStoreContractError("test_execution_owner_unavailable")
+            raise TestStoreContractError("test_repository_unavailable")
         return {
             "repository_id": repository_id,
             "canonical_root": str(row["canonical_root"]),
             "generation": int(row["generation"]),
-            "owner_uid": int(row["owner_uid"]),
         }
-
-    def enrolled_account_uids(self) -> tuple[int, ...]:
-        """Return enabled local developer accounts in deterministic order."""
-
-        with CoordinatorStore.open_read_only(
-            self.database, expected_uid=self.expected_uid
-        ) as store:
-            with store.read_transaction() as connection:
-                rows = connection.execute(
-                    """
-                    SELECT DISTINCT uid
-                    FROM broker_acl_principals
-                    WHERE enabled = 1
-                    ORDER BY uid
-                    """
-                ).fetchall()
-        return tuple(
-            int(row["uid"])
-            for row in rows
-            if type(row["uid"]) is int and int(row["uid"]) > 0
-        )
 
     def live_execution_root(
         self,
@@ -562,7 +501,9 @@ class SnapshotAuthority:
         owner_uid: int,
         temporary_root: str | None,
     ) -> Mapping[str, object]:
-        root = self.repository(repository_id=repository_id, owner_uid=owner_uid)
+        if type(owner_uid) is not int or owner_uid <= 0:
+            raise TestStoreContractError("test execution UID is invalid")
+        root = self.repository(repository_id=repository_id)
         if temporary_root is None:
             return {**root, "execution_root": root["canonical_root"]}
         with CoordinatorStore.open_read_only(
@@ -623,7 +564,7 @@ class RootSnapshotService:
             self.snapshot_root,
             source=UIDDelegatedSnapshotSource(helper),
         )
-        # Owners may traverse only an already-authorized content-addressed
+        # Owners may traverse only an already-accepted content-addressed
         # path; they cannot list or mutate the root-owned store.
         self.snapshot_root.chmod(0o711)
 
@@ -636,9 +577,7 @@ class RootSnapshotService:
             raise TestStoreContractError("snapshot setup repository is invalid")
         if type(owner_uid) is not int:
             raise TestStoreContractError("snapshot setup owner is invalid")
-        authority = self.authority.repository(
-            repository_id=repository_id, owner_uid=owner_uid
-        )
+        authority = self.authority.repository(repository_id=repository_id)
         setup = self.helper.call(
             "setup",
             owner_uid=owner_uid,
@@ -1508,8 +1447,38 @@ class RootSnapshotService:
         ):
             return None, None, None
         ordered_uids = tuple(dict.fromkeys((owner_uid, *sorted(account_uids))))
+        requested_sdk: str | None = None
+        global_json_paths = sorted(
+            (
+                PurePosixPath(path)
+                for path in dependency_locks
+                if PurePosixPath(path).name.lower() == "global.json"
+            ),
+            key=lambda path: (-len(path.parts), str(path)),
+        )
+        for global_json_path in global_json_paths:
+            try:
+                payload, _metadata = cls._dependency_file_bytes(
+                    original_root,
+                    global_json_path,
+                    field="immutable .NET SDK policy",
+                )
+                document = json.loads(payload)
+            except (TestStoreConflict, ValueError):
+                continue
+            sdk = document.get("sdk") if isinstance(document, Mapping) else None
+            version = sdk.get("version") if isinstance(sdk, Mapping) else None
+            if (
+                isinstance(version, str)
+                and 0 < len(version) <= 128
+                and PurePosixPath(version).name == version
+                and version not in {".", ".."}
+            ):
+                requested_sdk = version
+                break
         dotnet_executable: str | None = None
         dotnet_toolchain: Mapping[str, object] | None = None
+        candidates: list[tuple[Path, bool]] = []
         for uid in ordered_uids:
             try:
                 candidate = Path(pwd.getpwuid(uid).pw_dir) / ".dotnet" / "dotnet"
@@ -1527,30 +1496,46 @@ class RootSnapshotService:
                     and resolved == candidate
                     and os.access(candidate, os.X_OK)
                 ):
-                    dotnet_executable = str(candidate)
-                    toolchain_root = candidate.parent
-                    toolchain_metadata = cls._real_dependency_directory(
-                        toolchain_root, field="immutable .NET toolchain root"
-                    )
-                    (
-                        toolchain_sha256,
-                        toolchain_files,
-                        toolchain_bytes,
-                    ) = cls._installation_manifest_identity(
-                        toolchain_root, kind="dotnet-toolchain"
-                    )
-                    dotnet_toolchain = {
-                        "link_target": None,
-                        "resolved_executable": str(candidate),
-                        "source_root": str(toolchain_root),
-                        "source_device": toolchain_metadata.st_dev,
-                        "source_inode": toolchain_metadata.st_ino,
-                        "installation_kind": "dotnet-toolchain",
-                        "installation_sha256": toolchain_sha256,
-                        "installation_files": toolchain_files,
-                        "installation_bytes": toolchain_bytes,
-                    }
-                    break
+                    exact_sdk = requested_sdk is None
+                    if requested_sdk is not None:
+                        try:
+                            cls._real_dependency_directory(
+                                candidate.parent / "sdk" / requested_sdk,
+                                field="requested .NET SDK",
+                            )
+                        except TestStoreConflict:
+                            exact_sdk = False
+                        else:
+                            exact_sdk = True
+                    candidates.append((candidate, exact_sdk))
+        if candidates:
+            candidate = next(
+                (path for path, exact in candidates if exact),
+                candidates[0][0],
+            )
+            dotnet_executable = str(candidate)
+            toolchain_root = candidate.parent
+            toolchain_metadata = cls._real_dependency_directory(
+                toolchain_root, field="immutable .NET toolchain root"
+            )
+            (
+                toolchain_sha256,
+                toolchain_files,
+                toolchain_bytes,
+            ) = cls._installation_manifest_identity(
+                toolchain_root, kind="dotnet-toolchain"
+            )
+            dotnet_toolchain = {
+                "link_target": None,
+                "resolved_executable": str(candidate),
+                "source_root": str(toolchain_root),
+                "source_device": toolchain_metadata.st_dev,
+                "source_inode": toolchain_metadata.st_ino,
+                "installation_kind": "dotnet-toolchain",
+                "installation_sha256": toolchain_sha256,
+                "installation_files": toolchain_files,
+                "installation_bytes": toolchain_bytes,
+            }
         lock_paths = [
             PurePosixPath(path)
             for path in dependency_locks
@@ -1925,17 +1910,7 @@ class RootSnapshotService:
         toolchain_bindings: tuple[Mapping[str, object], ...] = ()
         python_executable: str | None = None
         dotnet_executable: str | None = None
-        enrolled_uids_resolver = getattr(
-            self.authority, "enrolled_account_uids", None
-        )
-        enrolled_uids = (
-            tuple(enrolled_uids_resolver())
-            if callable(enrolled_uids_resolver)
-            else ()
-        )
-        account_uids = tuple(
-            dict.fromkeys((candidate.owner_uid, *sorted(enrolled_uids)))
-        )
+        account_uids = (candidate.owner_uid,)
         supplementary_gids = self._supplementary_developer_gids(account_uids)
         if plan.source.mode.value == "immutable":
             (

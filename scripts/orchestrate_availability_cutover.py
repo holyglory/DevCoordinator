@@ -4,9 +4,9 @@
 This program owns the durable cutover ledger, split-UID SQLite backups, and
 the small set of explicit maintenance-fenced broker transactions required for
 authority readiness, exact listener-port reservation, and stale-repository
-repair.  It validates artifacts produced by the existing history migrator and
-broker drain, and refuses activation unless the exact migration seal, API
-delegation, candidate topology, and socket-inode continuity are proved.
+repair. It validates artifacts produced by the existing history migrator and
+broker drain, and refuses activation unless the exact migration seal,
+candidate topology, and socket-inode continuity are proved.
 """
 
 from __future__ import annotations
@@ -57,20 +57,7 @@ from devcoordinator.universal_test_admission import (  # noqa: E402
     normalize_legacy_test_admission_drain_proof,
     verify_legacy_test_admission_drain_proof,
 )
-from devcoordinator.universal_test_capabilities import (  # noqa: E402
-    SealedTestCapabilityRegistry,
-)
-from devcoordinator.universal_test_service import (  # noqa: E402
-    decode_repository_setup_document,
-)
-from devcoordinator.universal_test_snapshot_service import (  # noqa: E402
-    UnixSnapshotServiceClient,
-)
-from devcoordinator.universal_test_store import (  # noqa: E402
-    TestStoreConflict,
-    TestStoreContractError,
-    UniversalTestStore,
-)
+from devcoordinator.universal_test_store import UniversalTestStore  # noqa: E402
 from devcoordinator.broker_profile import (  # noqa: E402
     BrokerProfileError,
     profile_from_document,
@@ -81,15 +68,9 @@ from devcoordinator.broker_cli import (  # noqa: E402
     exclusive_broker_service_lock,
 )
 from devcoordinator.broker_host import LocalBrokerHostMutations  # noqa: E402
-from devcoordinator.schema import invariant_violations  # noqa: E402
-from devcoordinator.shared_root_positive_absence import (  # noqa: E402
-    SharedRootPositiveAbsenceError,
-    apply_shared_root_positive_absence,
-    latest_shared_root_full_docker_observation,
-    plan_shared_root_positive_absence,
-    validate_shared_root_positive_absence_plan,
-    validate_shared_root_positive_absence_result,
-    verify_shared_root_positive_absence_terminal,
+from devcoordinator.schema import (  # noqa: E402
+    SCHEMA_VERSION as COORDINATOR_SCHEMA_VERSION,
+    invariant_violations,
 )
 from devcoordinator.maintenance import (  # noqa: E402
     CONTROL_PLANE_MAINTENANCE_SCOPE,
@@ -107,33 +88,12 @@ STATE_KIND = "devcoordinator-availability-cutover"
 BACKUP_KIND = "devcoordinator-cutover-database-backup"
 INITIAL_IMPORT_KIND = "legacy-test-history-import-attestation"
 SEAL_KIND = "universal-test-history-split-cutover-seal"
-DELEGATION_KIND = "devcoordinator-api-actor-delegation-attestation"
 CANDIDATE_KIND = "devcoordinator-cutover-candidate-attestation"
 CANDIDATE_PREPARATION_KIND = "devcoordinator-candidate-preparation-attestation"
 BACKGROUND_CONFIG_KIND = "devcoordinator-background-config-transaction"
-CAPABILITY_POLICY_KIND = "devcoordinator-test-capability-policy-attestation"
-AUTHORITY_REPOSITORY_EXPORT_KIND = "devcoordinator-authority-repository-export"
-AUTHORITY_REPOSITORY_DISABLE_PLAN_KIND = (
-    "devcoordinator-authority-repository-disable-plan"
-)
-AUTHORITY_REPOSITORY_DISABLE_RESULT_KIND = (
-    "devcoordinator-authority-repository-disable-result"
-)
-AUTHORITY_REPOSITORY_POLICY_RECONCILIATION_PLAN_KIND = (
-    "devcoordinator-authority-repository-startup-policy-reconciliation-plan"
-)
-AUTHORITY_REPOSITORY_POLICY_RECONCILIATION_RESULT_KIND = (
-    "devcoordinator-authority-repository-startup-policy-reconciliation-result"
-)
-AUTHORITY_REPOSITORY_LIFECYCLE_RECOVERY_PLAN_KIND = (
-    "devcoordinator-authority-repository-lifecycle-recovery-plan"
-)
-AUTHORITY_REPOSITORY_LIFECYCLE_RECOVERY_RESULT_KIND = (
-    "devcoordinator-authority-repository-lifecycle-recovery-result"
-)
 PROFILE_REPAIR_KIND = "devcoordinator-api-profile-repair-attestation"
 PROFILE_INVENTORY_READINESS_KIND = (
-    "devcoordinator-post-v13-profile-inventory-readiness-attestation"
+    "devcoordinator-local-routing-inventory-readiness-attestation"
 )
 ACTIVATION_KIND = "devcoordinator-cutover-activation-attestation"
 RETENTION_KIND = "devcoordinator-cutover-retention-attestation"
@@ -178,23 +138,11 @@ ATOMIC_FIRST_ADOPTION_BINDING_TRANSACTION_KIND = (
 ATOMIC_FIRST_ADOPTION_BINDING_RESULT_KIND = (
     "devcoordinator-atomic-first-adoption-binding-service-attestation"
 )
-SCHEMA13_FIRST_ADOPTION_INSTALLER_OWNER_KIND = (
+FIRST_ADOPTION_INSTALLER_CLAIM_KIND = (
     "schema13-first-adoption-executor"
 )
 ATOMIC_FIRST_ADOPTION_FINALIZATION_INTENT_KIND = (
     "devcoordinator-atomic-first-adoption-binding-finalization-intent"
-)
-AUTHORITY_REPOSITORY_DISABLE_TRANSACTION_KIND = (
-    "devcoordinator-authority-repository-disable-service-transaction"
-)
-AUTHORITY_REPOSITORY_DISABLE_TRANSACTION_RESULT_KIND = (
-    "devcoordinator-authority-repository-disable-service-transaction-attestation"
-)
-AUTHORITY_REPOSITORY_LIFECYCLE_RECOVERY_TRANSACTION_KIND = (
-    "devcoordinator-authority-repository-lifecycle-recovery-service-transaction"
-)
-AUTHORITY_REPOSITORY_LIFECYCLE_RECOVERY_TRANSACTION_RESULT_KIND = (
-    "devcoordinator-authority-repository-lifecycle-recovery-service-attestation"
 )
 FIRST_ADOPTION_PORT_RESERVATION_INTENT_KIND = (
     "devcoordinator-first-adoption-port-reservation-intent"
@@ -219,7 +167,6 @@ FIRST_ADOPTION_AUTHORITY_ADOPTION_FIELDS = frozenset(
         "authority",
         "inventory",
         "storage_split",
-        "owner_authority",
         "pointer_path",
         "legacy_source_original_path",
         "source_rotated",
@@ -268,26 +215,9 @@ REQUIRED_READY_UNITS = frozenset(
 CONTROL_SLICE = "devcoordinator-control.slice"
 BACKGROUND_SLICE = "devcoordinator-background.slice"
 PROTECTED_PROFILE_PATH = "/etc/devcoordinator/client-profiles.json"
-TEST_CAPABILITY_POLICY_PATH = "/etc/devcoordinator/test-execution-capabilities.json"
-PROTECTED_PROFILE_GROUP = "devcoordinator-clients"
-API_BROKER_ACCOUNT = "devcoordinator-api"
-GOOGLE_ACTOR_POLICY = "normalized-lowercase-google-email-only"
 AUTHORITY_SOCKET_PATH = "/run/devcoordinator-authority.sock"
 IMMUTABLE_RELEASE_ROOT = Path("/opt/devcoordinator/releases")
 FINAL_AUTHORITY_DATABASE_PATH = "/var/lib/devcoordinator/authority.sqlite3"
-MAX_REPOSITORY_DIAGNOSTIC_ENROLLMENTS = 1024
-MAX_REPOSITORY_STARTUP_POLICIES = 4096
-SHARED_TEMPORARY_REPOSITORY_ROOTS = frozenset({"/tmp"})
-AUTHORITY_REPOSITORY_REPAIR_ACTOR = "devcoordinator-authority-repair"
-AUTHORITY_REPOSITORY_REPAIR_REASON = (
-    "shared temporary directory is not a canonical Git repository"
-)
-AUTHORITY_REPOSITORY_POLICY_RECONCILIATION_REASON = (
-    "disable startup policies left enabled by repository authority repair"
-)
-AUTHORITY_REPOSITORY_LIFECYCLE_RECOVERY_REASON = (
-    "restore repository lifecycle authority after incomplete shared-root repair"
-)
 FIRST_ADOPTION_PORT_ROLES = (
     "console_outer",
     "console_inner",
@@ -313,7 +243,6 @@ EVIDENCE_KEYS = frozenset(
         "final-import",
         "migration-seal",
         "test-history-discard",
-        "api-delegation",
         "profile-inventory-readiness",
         "candidate",
         "activation",
@@ -369,13 +298,8 @@ AUTHORITY_READINESS_TABLES = frozenset(
         "hosts",
         "repositories",
         "repository_installations",
-        "broker_acl_principals",
-        "broker_repository_enrollments",
         "migration_conflicts",
     }
-)
-AUTHORITY_READINESS_PARTIAL_V13_TABLES = frozenset(
-    {"repository_owners", "repository_owner_transfers"}
 )
 AUTHORITY_READINESS_TRANSACTION_FIELDS = frozenset(
     {
@@ -567,74 +491,6 @@ ATOMIC_FIRST_ADOPTION_BINDING_RESULT_FIELDS = frozenset(
     }
 )
 
-AUTHORITY_REPOSITORY_DISABLE_TRANSACTION_FIELDS = frozenset(
-    {
-        "operation_id",
-        "release",
-        "release_digest",
-        "plan",
-        "plan_document_sha256",
-        "database",
-        "service_unit",
-        "service_baseline",
-        "readiness",
-        "maintenance",
-        "repair_attestation",
-        "created_at",
-    }
-)
-AUTHORITY_REPOSITORY_DISABLE_TRANSACTION_RESULT_FIELDS = frozenset(
-    {
-        "operation_id",
-        "transaction_journal_sha256",
-        "repair_result_sha256",
-        "release_digest",
-        "database",
-        "service_unit",
-        "readiness_proof",
-        "service_restored",
-        "maintenance_cleared",
-        "completed_at",
-    }
-)
-AUTHORITY_REPOSITORY_LIFECYCLE_RECOVERY_TRANSACTION_FIELDS = frozenset(
-    {
-        "operation_id",
-        "release",
-        "release_digest",
-        "canary_release",
-        "canary_release_digest",
-        "plan",
-        "plan_document_sha256",
-        "database",
-        "service_unit",
-        "service_baseline",
-        "readiness",
-        "predecessor",
-        "maintenance",
-        "recovery_attestation",
-        "created_at",
-    }
-)
-AUTHORITY_REPOSITORY_LIFECYCLE_RECOVERY_TRANSACTION_RESULT_FIELDS = frozenset(
-    {
-        "operation_id",
-        "transaction_journal_sha256",
-        "recovery_result_sha256",
-        "release_digest",
-        "canary_release_digest",
-        "database",
-        "service_unit",
-        "maintenance",
-        "predecessor_proof",
-        "preclear_readiness",
-        "service_restored",
-        "maintenance_cleared",
-        "successor_handoff_required",
-        "completed_at",
-    }
-)
-
 FIRST_ADOPTION_PORT_RESERVATION_INTENT_FIELDS = frozenset(
     {
         "operation_id",
@@ -714,7 +570,6 @@ AUTHORITY_FIRST_ADOPTION_FIELDS = frozenset(
         "authority",
         "inventory",
         "storage_split",
-        "owner_authority",
         "pointer_path",
         "legacy_source_original_path",
         "source_rotated",
@@ -762,20 +617,14 @@ PROFILE_REPAIR_FIELDS = frozenset(
     {
         "profile_path",
         "profile_owner_uid",
-        "profile_group_gid",
         "profile_mode",
         "profile_sha256",
-        "source_authority_generation",
         "authority_generation",
         "authority_source_sha256",
-        "api_uid",
-        "broker_account_id",
+        "validation_uid",
         "repository_ids",
-        "client_uids",
         "repository_bindings",
         "parser_verified",
-        "all_clients_parser_verified",
-        "existing_profile_contents_reused",
         "atomic_publication_verified",
         "created_at",
     }
@@ -784,28 +633,24 @@ PROFILE_REPAIR_FIELDS = frozenset(
 PROFILE_INVENTORY_READINESS_FIELDS = frozenset(
     {
         "profile_repair_sha256",
-        "api_delegation_sha256",
         "release_digest",
         "executor_release",
         "inventory_client_sha256",
         "authority_database",
-        "source_authority_generation",
         "authority_generation",
         "authority_schema_version",
         "authority_migration_state",
         "profile_path",
         "profile_sha256",
         "profile_owner_uid",
-        "profile_group_gid",
         "profile_mode",
         "full_regeneration",
         "strict_profile_parse",
         "project",
-        "owner_uid",
-        "owner_account_id",
+        "execution_uid",
         "repository_id",
         "repository_generation",
-        "owner_bound_grant",
+        "route_verified",
         "inventory_command",
         "inventory_sha256",
         "inventory_schema_version",
@@ -817,177 +662,188 @@ PROFILE_INVENTORY_READINESS_FIELDS = frozenset(
     }
 )
 
-AUTHORITY_REPOSITORY_DISABLE_PLAN_FIELDS = frozenset(
+IMPORT_FIELDS = frozenset(
     {
-        "plan_id",
-        "authority_database",
-        "authority_uid",
+        "migration_id",
+        "pass_kind",
         "authority_generation",
-        "authority_state_revision",
-        "database_identity",
-        "repository",
-        "startup_policies",
-        "enrollment_count",
-        "shared_temporary_root",
-        "git_metadata_absent",
-        "target",
-        "reason",
+        "watermark_fingerprint",
+        "export_fingerprint",
+        "test_store_generation",
+        "chunk_count",
+        "final_chunk_sha256",
+        "run_count",
+        "case_count",
+        "destination_projection_chain_sha256",
+        "source_retained",
+    }
+)
+SEAL_FIELDS = frozenset(
+    {
+        "migration_id",
+        "authority_database",
+        "authority_generation",
+        "test_database",
+        "test_store_generation",
+        "drain_proof_fingerprint",
+        "final_export_fingerprint",
+        "final_watermark_fingerprint",
+        "destination_attestation_fingerprint",
+        "legacy_source_retained",
+        "activation_ready",
+        "rollback",
+    }
+)
+CANDIDATE_FIELDS = frozenset(
+    {
+        "release_digest",
+        "ready_units",
+        "service_uids",
+        "service_slices",
+        "socket_inodes",
+        "authority_database",
+        "test_database",
+        "migration_seal_sha256",
+        "checks_passed",
+        "preparation",
         "created_at",
     }
 )
-
-LEGACY_AUTHORITY_REPOSITORY_DISABLE_PLAN_FIELDS = frozenset(
-    AUTHORITY_REPOSITORY_DISABLE_PLAN_FIELDS - {"startup_policies"}
-)
-
-AUTHORITY_REPOSITORY_DISABLE_RESULT_FIELDS = frozenset(
+CANDIDATE_PREPARATION_FIELDS = frozenset(
     {
-        "plan_id",
-        "plan_document_sha256",
-        "authority_database",
-        "authority_uid",
-        "authority_generation",
-        "maintenance_deployment_id",
-        "database_identity_before",
-        "database_identity_after",
-        "repository_id",
-        "repository_generation_before",
-        "repository_generation_after",
-        "installation_generation_before",
-        "installation_generation_after",
-        "state_revision_before",
-        "state_revision_after",
-        "repository_state",
-        "installation_status",
-        "startup_fenced",
-        "startup_policy_count",
-        "startup_policy_update_count",
-        "startup_policies",
-        "enrollment_count",
-        "reason",
-        "actor",
-        "applied_at",
-    }
-)
-
-LEGACY_AUTHORITY_REPOSITORY_DISABLE_RESULT_FIELDS = frozenset(
-    AUTHORITY_REPOSITORY_DISABLE_RESULT_FIELDS
-    - {
-        "startup_policy_count",
-        "startup_policy_update_count",
-        "startup_policies",
-    }
-)
-
-AUTHORITY_REPOSITORY_POLICY_RECONCILIATION_PLAN_FIELDS = frozenset(
-    {
-        "plan_id",
-        "source_repair_plan_sha256",
-        "source_repair_result_sha256",
-        "source_repair_plan_id",
-        "authority_database",
-        "authority_uid",
-        "authority_generation",
-        "authority_state_revision",
-        "database_identity",
-        "repository",
-        "startup_policies",
-        "enrollment_count",
-        "shared_temporary_root",
-        "git_metadata_absent",
-        "mutation_updated_at",
-        "reason",
+        "release_digest",
+        "executor_release",
+        "credential_preflight_sha256",
+        "host_preflight_sha256",
+        "background_config",
+        "project_isolation",
+        "console_slot_ports",
+        "prior_units",
+        "prior_files",
+        "installed_files",
+        "ready_units",
+        "socket_inodes",
         "created_at",
     }
 )
-
-AUTHORITY_REPOSITORY_POLICY_RECONCILIATION_RESULT_FIELDS = frozenset(
+ACTIVATION_FIELDS = frozenset(
     {
-        "plan_id",
-        "plan_document_sha256",
-        "source_repair_plan_sha256",
-        "source_repair_result_sha256",
-        "source_repair_plan_id",
-        "authority_database",
-        "authority_uid",
-        "authority_generation",
-        "maintenance_deployment_id",
-        "database_identity_before",
-        "database_identity_after",
-        "repository_id",
-        "repository_generation",
-        "installation_generation",
-        "state_revision_before",
-        "state_revision_after",
-        "startup_policy_count",
-        "startup_policy_update_count",
-        "startup_policies",
-        "enrollment_count",
-        "reason",
-        "actor",
-        "applied_at",
+        "release_digest",
+        "migration_seal_sha256",
+        "profile_inventory_readiness_sha256",
+        "executor_release",
+        "credential_preflight_sha256",
+        "publication_switch",
+        "continuity_probe",
+        "socket_inodes_before",
+        "socket_inodes_after",
+        "connection_refused_count",
+        "project_route_failures",
+        "legacy_units_active",
+        "authority_ready",
+        "testd_ready",
+        "console_ready",
+        "browser_lcp_attestation_sha256",
+        "browser_lcp_consumption_sha256",
+        "created_at",
     }
 )
-
-AUTHORITY_REPOSITORY_LIFECYCLE_RECOVERY_PLAN_FIELDS = frozenset(
+RETENTION_FIELDS = frozenset(
     {
-        "plan_id",
+        "authority_backup_sha256",
+        "test_backup_sha256",
+        "legacy_source_retained",
+        "retain_until",
+        "rollback_rehearsal_sha256",
+        "live_rollback_rehearsal_sha256",
+        "profile_inventory_readiness_sha256",
+        "profile_inventory_reverification",
+        "browser_lcp_attestation_sha256",
+        "browser_lcp_consumption_sha256",
+        "created_at",
+    }
+)
+CONTINUITY_PROBE_FIELDS = frozenset(
+    {
         "operation_id",
-        "source_repair_plan_sha256",
-        "source_repair_result_sha256",
-        "source_repair_plan_id",
-        "authority_database",
-        "authority_uid",
-        "authority_generation",
-        "authority_schema_version",
-        "authority_migration_state",
-        "authority_state_revision",
-        "database_identity",
-        "repository",
-        "protected_rows",
-        "owner_authority",
-        "target",
-        "mutation_updated_at",
-        "reason",
+        "release_digest",
+        "started_at",
+        "completed_at",
+        "sample_interval_ms",
+        "round_count",
+        "sample_count",
+        "http_sample_count",
+        "websocket_sample_count",
+        "connection_refused_count",
+        "project_route_failures",
+        "failed_sample_count",
+        "ttfb_p99_ms",
+        "control_plane_p99_ms",
+        "targets",
+        "samples_sha256",
+        "slo",
+        "passed",
+    }
+)
+ROLLBACK_REHEARSAL_FIELDS = frozenset(
+    {
+        "operation_id",
+        "activation_sha256",
+        "executor_release",
+        "authority_backup_sha256",
+        "test_backup_sha256",
+        "restores",
+        "publication_inverse_plan",
+        "continuity_probe_sha256",
+        "legacy_source_retained",
+        "private_scratch",
+        "rehearsed_at",
+    }
+)
+LIVE_ROLLBACK_REHEARSAL_FIELDS = frozenset(
+    {
+        "operation_id",
+        "activation_sha256",
+        "activation_state_generation",
+        "release_digest",
+        "executor_release",
+        "journal_sha256",
+        "publication_before",
+        "rollback_slot",
+        "rollback_switch",
+        "publication_rollback",
+        "rollback_continuity_probe",
+        "reactivation_slot",
+        "reactivation_switch",
+        "publication_reactivated",
+        "reactivation_continuity_probe",
+        "supported_rollback_head",
+        "socket_inodes_before",
+        "socket_inodes_after",
+        "continuity_probe",
+        "profile_health",
+        "data_health",
+        "recovery_count",
+        "browser_lcp_attestation_sha256",
+        "browser_lcp_consumption_sha256",
+        "completed_at",
+    }
+)
+ROLLBACK_FIELDS = frozenset(
+    {
+        "activation_sha256",
+        "executor_release",
+        "credential_preflight_sha256",
+        "publication_switch",
+        "authority_backup_sha256",
+        "test_backup_sha256",
+        "socket_inodes_before",
+        "socket_inodes_after",
+        "connection_refused_count",
+        "legacy_authority_ready",
         "created_at",
     }
 )
-
-AUTHORITY_REPOSITORY_LIFECYCLE_RECOVERY_RESULT_FIELDS = frozenset(
-    {
-        "plan_id",
-        "operation_id",
-        "plan_document_sha256",
-        "source_repair_plan_sha256",
-        "source_repair_result_sha256",
-        "authority_database",
-        "authority_uid",
-        "authority_generation",
-        "authority_schema_version",
-        "authority_migration_state",
-        "maintenance_deployment_id",
-        "database_identity_before",
-        "database_identity_after",
-        "repository_id",
-        "repository_generation_before",
-        "repository_generation_after",
-        "installation_generation_before",
-        "installation_generation_after",
-        "state_revision_before",
-        "state_revision_after",
-        "protected_rows",
-        "owner_authority_before",
-        "owner_authority_after",
-        "repository_state",
-        "installation_status",
-        "startup_fenced",
-        "enrollment_count",
-        "reason",
-        "actor",
-        "applied_at",
-    }
-)
-
 
 class CutoverError(RuntimeError):
     pass
@@ -1990,4888 +1846,11 @@ def _authoritative_repository_root_proof(
         proof["git_metadata_absent"] = git_metadata_absent is True
     return proof
 
-
-def _authoritative_repository_identity(raw_root: object) -> dict[str, object]:
-    """Anchor-open one canonical repository without following symlinks."""
-
-    return _authoritative_repository_root_proof(raw_root)
-
-
-def _authoritative_repository_owner_uid(raw_root: object) -> int:
-    owner_uid = int(_authoritative_repository_identity(raw_root)["owner_uid"])
-    if owner_uid <= 0:
-        raise CutoverError(
-            "authority repository root requires a non-root filesystem owner"
-        )
-    return owner_uid
-
-
-def diagnose_authority_repository(
-    *,
-    authority_database: Path,
-    repository_id: str,
-    authority_uid: int = 0,
-    now_epoch: int | None = None,
-    database_identity_reader=_database_identity,
-    repository_identity_reader=_authoritative_repository_identity,
-) -> dict[str, object]:
-    """Read one bounded authority row without consulting client profiles."""
-
-    if os.geteuid() != 0 or authority_uid != 0:
-        raise CutoverError("authority repository diagnostic requires the root authority")
-    if (
-        not isinstance(repository_id, str)
-        or not repository_id
-        or len(repository_id.encode("utf-8")) > 256
-        or any(character in repository_id for character in "\x00\r\n")
-    ):
-        raise CutoverError("repository diagnostic ID is invalid")
-    database = _absolute(authority_database, "authority database")
-    before_identity = database_identity_reader(database, uid=authority_uid)
-    before_metadata = database.lstat()
-    current_epoch = int(time.time()) if now_epoch is None else int(now_epoch)
-    connection = sqlite3.connect(f"{database.as_uri()}?mode=ro", uri=True)
-    connection.row_factory = sqlite3.Row
-    try:
-        connection.execute("PRAGMA query_only = ON")
-        connection.execute("BEGIN")
-        generation = connection.execute(
-            "SELECT database_generation FROM schema_metadata WHERE singleton = 1"
-        ).fetchone()
-        repository = connection.execute(
-            """
-            SELECT r.repo_id, r.display_name, r.canonical_root, r.generation,
-                   r.state, i.status AS installation_status,
-                   i.startup_fenced AS installation_startup_fenced
-            FROM repositories r
-            LEFT JOIN repository_installations i ON i.repo_id = r.repo_id
-            WHERE r.repo_id = ?
-            """,
-            (repository_id,),
-        ).fetchone()
-        if repository is None:
-            raise CutoverError("authority repository does not exist")
-        rows = connection.execute(
-            """
-            SELECT e.uid, e.account_id,
-                   e.enabled AS enrollment_enabled,
-                   e.valid_until_epoch,
-                   p.enabled AS principal_enabled
-            FROM broker_repository_enrollments e
-            LEFT JOIN broker_acl_principals p
-              ON p.uid = e.uid AND p.account_id = e.account_id
-            WHERE e.repo_id = ?
-            ORDER BY e.uid, e.account_id
-            LIMIT ?
-            """,
-            (repository_id, MAX_REPOSITORY_DIAGNOSTIC_ENROLLMENTS + 1),
-        ).fetchall()
-        startup_policies = _authority_repository_startup_policy_snapshot(
-            connection, repository_id
-        )
-        connection.execute("ROLLBACK")
-    finally:
-        connection.close()
-    if generation is None or not isinstance(generation[0], str) or not generation[0]:
-        raise CutoverError("authority database generation is unavailable")
-    if len(rows) > MAX_REPOSITORY_DIAGNOSTIC_ENROLLMENTS:
-        raise CutoverError("repository diagnostic enrollment set exceeds its bound")
-    display_name = repository["display_name"]
-    canonical_root = repository["canonical_root"]
-    if (
-        not isinstance(display_name, str)
-        or not display_name
-        or len(display_name.encode("utf-8")) > 512
-        or not isinstance(canonical_root, str)
-        or not canonical_root
-        or len(canonical_root.encode("utf-8")) > 4096
-    ):
-        raise CutoverError("authority repository diagnostic fields are invalid")
-    root_error = None
-    try:
-        root_identity = repository_identity_reader(canonical_root)
-        if (
-            not isinstance(root_identity, Mapping)
-            or set(root_identity) != {"device", "inode", "mode", "owner_uid"}
-            or type(root_identity["owner_uid"]) is not int
-            or int(root_identity["owner_uid"]) < 0
-        ):
-            raise CutoverError("authority repository root identity is invalid")
-    except CutoverError as error:
-        root_identity = None
-        root_error = str(error)
-        owner_account = None
-    else:
-        try:
-            owner_account = pwd.getpwuid(int(root_identity["owner_uid"])).pw_name
-        except KeyError:
-            owner_account = None
-    enrollments = [
-        {
-            "uid": int(row["uid"]),
-            "account_id": str(row["account_id"]),
-            "principal_present": row["principal_enabled"] is not None,
-            "principal_enabled": bool(row["principal_enabled"]),
-            "enrollment_enabled": bool(row["enrollment_enabled"]),
-            "valid_until_epoch": int(row["valid_until_epoch"]),
-            "current": bool(
-                row["principal_enabled"]
-                and row["enrollment_enabled"]
-                and int(row["valid_until_epoch"]) > current_epoch
-            ),
-        }
-        for row in rows
-    ]
-    after_identity = database_identity_reader(database, uid=authority_uid)
-    after_metadata = database.lstat()
-    stable_metadata = (
-        before_metadata.st_dev,
-        before_metadata.st_ino,
-        before_metadata.st_size,
-        before_metadata.st_mtime_ns,
-    ) == (
-        after_metadata.st_dev,
-        after_metadata.st_ino,
-        after_metadata.st_size,
-        after_metadata.st_mtime_ns,
-    )
-    if before_identity != after_identity or not stable_metadata:
-        raise CutoverError("authority database changed during repository diagnostic")
-    return {
-        "ok": True,
-        "kind": "devcoordinator-authority-repository-diagnostic",
-        "authority_generation": str(generation[0]),
-        "database_identity": before_identity,
-        "repository": {
-            "repository_id": repository_id,
-            "display_name": display_name,
-            "canonical_root": canonical_root,
-            "generation": int(repository["generation"]),
-            "state": str(repository["state"]),
-            "installation_status": (
-                None
-                if repository["installation_status"] is None
-                else str(repository["installation_status"])
-            ),
-            "installation_startup_fenced": (
-                None
-                if repository["installation_startup_fenced"] is None
-                else bool(repository["installation_startup_fenced"])
-            ),
-            "root_observation": (
-                "available" if root_identity is not None else "unavailable"
-            ),
-            "root_identity": (
-                None if root_identity is None else dict(root_identity)
-            ),
-            "root_error": root_error,
-            "owner_account": owner_account,
-        },
-        "enrollments": enrollments,
-        "startup_policies": [
-            {
-                "policy_id": policy["policy_id"],
-                "resource_kind": policy["resource_kind"],
-                "resource_id": policy["resource_id"],
-                "policy_kind": policy["policy_kind"],
-                "current_value": policy["current_value"],
-                "desired_disabled_value": policy["desired_disabled_value"],
-                "enabled": policy["requires_update"],
-                "generation": policy["generation"],
-                "immutable_fingerprint": policy["immutable_fingerprint"],
-                "updated_at": policy["updated_at"],
-                "offline_reconciliation": (
-                    "authority"
-                    if policy["policy_kind"] in {"coordinator", "compose"}
-                    else "native_absence_proof_required"
-                ),
-            }
-            for policy in startup_policies
-        ],
-        "startup_policy_count": len(startup_policies),
-        "observed_at": _now(),
-    }
-
-
-def _authority_repair_schema(connection: sqlite3.Connection) -> None:
-    required = {
-        "schema_metadata": {
-            "singleton",
-            "database_generation",
-            "state_revision",
-            "updated_at",
-        },
-        "repositories": {
-            "repo_id",
-            "display_name",
-            "canonical_root",
-            "generation",
-            "state",
-            "updated_at",
-        },
-        "repository_installations": {
-            "repo_id",
-            "status",
-            "startup_fenced",
-            "generation",
-            "operation_id",
-            "disabled_at",
-            "reason",
-            "actor",
-            "updated_at",
-        },
-        "broker_repository_enrollments": {"repo_id"},
-        "startup_policies": {
-            "policy_id",
-            "repo_id",
-            "resource_kind",
-            "resource_id",
-            "policy_kind",
-            "current_value",
-            "desired_disabled_value",
-            "immutable_fingerprint",
-            "generation",
-            "updated_at",
-        },
-        "startup_policy_restore_states": {
-            "policy_id",
-            "repo_id",
-            "resource_kind",
-            "resource_id",
-            "policy_kind",
-            "policy_immutable_fingerprint",
-            "target_immutable_fingerprint",
-            "control_binding_id",
-            "ownership_fingerprint",
-            "native_identity_fingerprint",
-            "captured_value",
-            "restore_required",
-            "status",
-            "docker_restart_policy",
-            "supervisor_manager",
-            "supervisor_unit_file_state",
-            "supervisor_loaded",
-            "supervisor_enabled",
-            "captured_operation_id",
-            "last_restore_permit_id",
-            "capture_generation",
-            "captured_at",
-            "restored_at",
-            "updated_at",
-        },
-    }
-    for table, expected in required.items():
-        if re.fullmatch(r"[a-z_]+", table) is None:
-            raise CutoverError("authority repair schema contract is invalid")
-        rows = connection.execute(f"PRAGMA table_info({table})").fetchall()
-        columns = {str(row[1]) for row in rows}
-        if not expected.issubset(columns):
-            raise CutoverError(
-                f"authority repair requires the current {table} contract"
-            )
-
-
-AUTHORITY_STARTUP_POLICY_FIELDS = frozenset(
-    {
-        "policy_id",
-        "resource_kind",
-        "resource_id",
-        "policy_kind",
-        "current_value",
-        "desired_disabled_value",
-        "immutable_fingerprint",
-        "generation",
-        "updated_at",
-        "target_current_value",
-        "target_generation",
-        "requires_update",
-        "restore_state",
-    }
-)
-
-AUTHORITY_STARTUP_POLICY_RESULT_FIELDS = frozenset(
-    {
-        *AUTHORITY_STARTUP_POLICY_FIELDS,
-        "current_value_after",
-        "generation_after",
-        "updated_at_after",
-    }
-)
-
-AUTHORITY_STARTUP_POLICY_RESTORE_FIELDS = frozenset(
-    {
-        "policy_id",
-        "repo_id",
-        "resource_kind",
-        "resource_id",
-        "policy_kind",
-        "policy_immutable_fingerprint",
-        "target_immutable_fingerprint",
-        "control_binding_id",
-        "ownership_fingerprint",
-        "native_identity_fingerprint",
-        "captured_value",
-        "restore_required",
-        "status",
-        "docker_restart_policy",
-        "supervisor_manager",
-        "supervisor_unit_file_state",
-        "supervisor_loaded",
-        "supervisor_enabled",
-        "captured_operation_id",
-        "last_restore_permit_id",
-        "capture_generation",
-        "captured_at",
-        "restored_at",
-        "updated_at",
-    }
-)
-
-
-def _authority_startup_policy_restore_state(
-    row: sqlite3.Row,
-) -> dict[str, object] | None:
-    if row["restore_policy_id"] is None:
-        return None
-    state = {
-        "policy_id": row["restore_policy_id"],
-        "repo_id": row["restore_repo_id"],
-        "resource_kind": row["restore_resource_kind"],
-        "resource_id": row["restore_resource_id"],
-        "policy_kind": row["restore_policy_kind"],
-        "policy_immutable_fingerprint": row["policy_immutable_fingerprint"],
-        "target_immutable_fingerprint": row["target_immutable_fingerprint"],
-        "control_binding_id": row["control_binding_id"],
-        "ownership_fingerprint": row["ownership_fingerprint"],
-        "native_identity_fingerprint": row["native_identity_fingerprint"],
-        "captured_value": row["captured_value"],
-        "restore_required": bool(row["restore_required"]),
-        "status": row["restore_status"],
-        "docker_restart_policy": row["docker_restart_policy"],
-        "supervisor_manager": row["supervisor_manager"],
-        "supervisor_unit_file_state": row["supervisor_unit_file_state"],
-        "supervisor_loaded": (
-            None
-            if row["supervisor_loaded"] is None
-            else bool(row["supervisor_loaded"])
-        ),
-        "supervisor_enabled": (
-            None
-            if row["supervisor_enabled"] is None
-            else bool(row["supervisor_enabled"])
-        ),
-        "captured_operation_id": row["captured_operation_id"],
-        "last_restore_permit_id": row["last_restore_permit_id"],
-        "capture_generation": row["capture_generation"],
-        "captured_at": row["captured_at"],
-        "restored_at": row["restored_at"],
-        "updated_at": row["restore_updated_at"],
-    }
-    return _validate_authority_startup_policy_restore_state(state)
-
-
-def _validate_authority_startup_policy_restore_state(
-    value: object,
-) -> dict[str, object]:
-    if (
-        not isinstance(value, Mapping)
-        or set(value) != AUTHORITY_STARTUP_POLICY_RESTORE_FIELDS
-    ):
-        raise CutoverError("authority repair startup policy restore state is invalid")
-    state = dict(value)
-    required_strings = (
-        "policy_id",
-        "repo_id",
-        "resource_kind",
-        "resource_id",
-        "policy_kind",
-        "policy_immutable_fingerprint",
-        "target_immutable_fingerprint",
-        "control_binding_id",
-        "ownership_fingerprint",
-        "native_identity_fingerprint",
-        "captured_value",
-        "status",
-        "captured_operation_id",
-        "captured_at",
-        "updated_at",
-    )
-    optional_strings = (
-        "docker_restart_policy",
-        "supervisor_manager",
-        "supervisor_unit_file_state",
-        "last_restore_permit_id",
-        "restored_at",
-    )
-    if (
-        any(
-            not isinstance(state[field], str)
-            or not state[field]
-            or len(str(state[field]).encode("utf-8")) > 4096
-            or any(character in str(state[field]) for character in "\x00\r\n")
-            for field in required_strings
-        )
-        or any(
-            state[field] is not None
-            and (
-                not isinstance(state[field], str)
-                or not state[field]
-                or len(str(state[field]).encode("utf-8")) > 4096
-                or any(character in str(state[field]) for character in "\x00\r\n")
-            )
-            for field in optional_strings
-        )
-        or state["policy_kind"]
-        not in {"docker_restart", "compose", "supervisor", "coordinator"}
-        or type(state["restore_required"]) is not bool
-        or state["status"] not in {"captured", "restored", "not_required"}
-        or (
-            state["restore_required"]
-            and state["status"] not in {"captured", "restored"}
-        )
-        or (not state["restore_required"] and state["status"] != "not_required")
-        or type(state["capture_generation"]) is not int
-        or int(state["capture_generation"]) < 0
-        or (
-            state["supervisor_loaded"] is not None
-            and type(state["supervisor_loaded"]) is not bool
-        )
-        or (
-            state["supervisor_enabled"] is not None
-            and type(state["supervisor_enabled"]) is not bool
-        )
-    ):
-        raise CutoverError(
-            "authority repair startup policy restore state contract is invalid"
-        )
-    return state
-
-
-def _authority_repository_startup_policy_snapshot(
-    connection: sqlite3.Connection, repository_id: str
-) -> list[dict[str, object]]:
-    rows = connection.execute(
-        """
-        SELECT policy.policy_id, policy.resource_kind, policy.resource_id,
-               policy.policy_kind, policy.current_value,
-               policy.desired_disabled_value, policy.immutable_fingerprint,
-               policy.generation, policy.updated_at,
-               restore.policy_id AS restore_policy_id,
-               restore.repo_id AS restore_repo_id,
-               restore.resource_kind AS restore_resource_kind,
-               restore.resource_id AS restore_resource_id,
-               restore.policy_kind AS restore_policy_kind,
-               restore.policy_immutable_fingerprint,
-               restore.target_immutable_fingerprint,
-               restore.control_binding_id,
-               restore.ownership_fingerprint,
-               restore.native_identity_fingerprint,
-               restore.captured_value,
-               restore.restore_required,
-               restore.status AS restore_status,
-               restore.docker_restart_policy,
-               restore.supervisor_manager,
-               restore.supervisor_unit_file_state,
-               restore.supervisor_loaded,
-               restore.supervisor_enabled,
-               restore.captured_operation_id,
-               restore.last_restore_permit_id,
-               restore.capture_generation,
-               restore.captured_at,
-               restore.restored_at,
-               restore.updated_at AS restore_updated_at
-        FROM startup_policies policy
-        LEFT JOIN startup_policy_restore_states restore
-          ON restore.policy_id = policy.policy_id
-        WHERE policy.repo_id = ?
-        ORDER BY policy.policy_id
-        LIMIT ?
-        """,
-        (repository_id, MAX_REPOSITORY_STARTUP_POLICIES + 1),
-    ).fetchall()
-    if len(rows) > MAX_REPOSITORY_STARTUP_POLICIES:
-        raise CutoverError("authority repository startup policy set exceeds its bound")
-    policies: list[dict[str, object]] = []
-    for row in rows:
-        current_value = row["current_value"]
-        desired_disabled_value = row["desired_disabled_value"]
-        generation = row["generation"]
-        policy = {
-            "policy_id": row["policy_id"],
-            "resource_kind": row["resource_kind"],
-            "resource_id": row["resource_id"],
-            "policy_kind": row["policy_kind"],
-            "current_value": current_value,
-            "desired_disabled_value": desired_disabled_value,
-            "immutable_fingerprint": row["immutable_fingerprint"],
-            "generation": generation,
-            "updated_at": row["updated_at"],
-            "target_current_value": desired_disabled_value,
-            "target_generation": (
-                int(generation) + 1
-                if current_value != desired_disabled_value
-                else int(generation)
-            ),
-            "requires_update": current_value != desired_disabled_value,
-            "restore_state": _authority_startup_policy_restore_state(row),
-        }
-        policies.append(policy)
-    validated = _validate_authority_startup_policies(policies)
-    if any(
-        policy["restore_state"] is not None
-        and policy["restore_state"]["repo_id"] != repository_id
-        for policy in validated
-    ):
-        raise CutoverError(
-            "authority repair startup policy restore repository binding is invalid"
-        )
-    return validated
-
-
-def _validate_authority_startup_policies(
-    value: object,
-) -> list[dict[str, object]]:
-    if not isinstance(value, list):
-        raise CutoverError("authority repair startup policies are invalid")
-    policies: list[dict[str, object]] = []
-    previous_id: str | None = None
-    for raw in value:
-        if not isinstance(raw, Mapping) or set(raw) != AUTHORITY_STARTUP_POLICY_FIELDS:
-            raise CutoverError("authority repair startup policy fields are invalid")
-        policy = dict(raw)
-        string_fields = (
-            "policy_id",
-            "resource_kind",
-            "resource_id",
-            "policy_kind",
-            "current_value",
-            "desired_disabled_value",
-            "immutable_fingerprint",
-            "updated_at",
-            "target_current_value",
-        )
-        if any(
-            not isinstance(policy[field], str)
-            or not policy[field]
-            or len(str(policy[field]).encode("utf-8")) > 4096
-            or any(character in str(policy[field]) for character in "\x00\r\n")
-            for field in string_fields
-        ):
-            raise CutoverError("authority repair startup policy values are invalid")
-        if (
-            policy["policy_kind"]
-            not in {"docker_restart", "compose", "supervisor", "coordinator"}
-            or re.fullmatch(
-                r"sha256:[0-9a-f]{64}", str(policy["immutable_fingerprint"])
-            )
-            is None
-            or type(policy["generation"]) is not int
-            or int(policy["generation"]) < 0
-            or type(policy["target_generation"]) is not int
-            or int(policy["target_generation"]) < 0
-            or type(policy["requires_update"]) is not bool
-            or policy["target_current_value"] != policy["desired_disabled_value"]
-            or policy["requires_update"]
-            is (policy["current_value"] == policy["desired_disabled_value"])
-            or policy["target_generation"]
-            != int(policy["generation"]) + int(bool(policy["requires_update"]))
-            or (previous_id is not None and str(policy["policy_id"]) <= previous_id)
-        ):
-            raise CutoverError("authority repair startup policy contract is invalid")
-        restore_state = policy["restore_state"]
-        if restore_state is not None:
-            restore = _validate_authority_startup_policy_restore_state(restore_state)
-            if (
-                restore["policy_id"] != policy["policy_id"]
-                or restore["resource_kind"] != policy["resource_kind"]
-                or restore["resource_id"] != policy["resource_id"]
-                or restore["policy_kind"] != policy["policy_kind"]
-                or restore["policy_immutable_fingerprint"]
-                != policy["immutable_fingerprint"]
-            ):
-                raise CutoverError(
-                    "authority repair startup policy restore binding is invalid"
-                )
-            policy["restore_state"] = restore
-        previous_id = str(policy["policy_id"])
-        policies.append(policy)
-    return policies
-
-
-def _authority_startup_policies_match_initial(
-    planned: object, current: object
-) -> bool:
-    try:
-        return _validate_authority_startup_policies(planned) == (
-            _validate_authority_startup_policies(current)
-        )
-    except CutoverError:
-        return False
-
-
-def _authority_startup_policy_results(
-    *,
-    planned: object,
-    current: object,
-    applied_at: str,
-) -> list[dict[str, object]]:
-    expected = _validate_authority_startup_policies(planned)
-    observed = _validate_authority_startup_policies(current)
-    if len(expected) != len(observed):
-        raise CutoverError("authority repair startup policy membership changed")
-    results: list[dict[str, object]] = []
-    for before, after in zip(expected, observed, strict=True):
-        unchanged_fields = {
-            "policy_id",
-            "resource_kind",
-            "resource_id",
-            "policy_kind",
-            "desired_disabled_value",
-            "immutable_fingerprint",
-            "restore_state",
-        }
-        expected_updated_at = applied_at if before["requires_update"] else before["updated_at"]
-        if (
-            any(after[field] != before[field] for field in unchanged_fields)
-            or after["current_value"] != before["target_current_value"]
-            or after["generation"] != before["target_generation"]
-            or after["updated_at"] != expected_updated_at
-            or after["target_current_value"] != before["target_current_value"]
-            or after["target_generation"] != before["target_generation"]
-            or after["requires_update"] is not False
-        ):
-            raise CutoverError("authority repair startup policy terminal state changed")
-        results.append(
-            {
-                **before,
-                "current_value_after": after["current_value"],
-                "generation_after": after["generation"],
-                "updated_at_after": after["updated_at"],
-            }
-        )
-    return results
-
-
-def _authority_startup_policies_match_terminal(
-    planned: object, current: object, *, applied_at: object
-) -> bool:
-    if not isinstance(applied_at, str) or not applied_at:
-        return False
-    try:
-        _authority_startup_policy_results(
-            planned=planned,
-            current=current,
-            applied_at=applied_at,
-        )
-    except CutoverError:
-        return False
-    return True
-
-
-def _validate_authority_startup_policy_results(
-    value: object,
-) -> list[dict[str, object]]:
-    if not isinstance(value, list):
-        raise CutoverError("authority repair startup policy results are invalid")
-    planned: list[dict[str, object]] = []
-    for raw in value:
-        if (
-            not isinstance(raw, Mapping)
-            or set(raw) != AUTHORITY_STARTUP_POLICY_RESULT_FIELDS
-        ):
-            raise CutoverError("authority repair startup policy result fields are invalid")
-        planned.append(
-            {field: raw[field] for field in AUTHORITY_STARTUP_POLICY_FIELDS}
-        )
-    normalized = _validate_authority_startup_policies(planned)
-    results: list[dict[str, object]] = []
-    for before, raw in zip(normalized, value, strict=True):
-        result = dict(raw)
-        expected_updated_at = (
-            result["updated_at_after"]
-            if before["requires_update"]
-            else before["updated_at"]
-        )
-        if (
-            result["current_value_after"] != before["target_current_value"]
-            or result["generation_after"] != before["target_generation"]
-            or not isinstance(result["updated_at_after"], str)
-            or not result["updated_at_after"]
-            or (not before["requires_update"] and result["updated_at_after"] != expected_updated_at)
-        ):
-            raise CutoverError("authority repair startup policy result is invalid")
-        results.append(result)
-    return results
-
-
-def _authority_repository_repair_snapshot(
-    connection: sqlite3.Connection, repository_id: str
-) -> tuple[dict[str, object], dict[str, object], list[dict[str, object]]]:
-    metadata = connection.execute(
-        """
-        SELECT database_generation, state_revision
-        FROM schema_metadata WHERE singleton = 1
-        """
-    ).fetchone()
-    repository = connection.execute(
-        """
-        SELECT r.repo_id, r.display_name, r.canonical_root, r.generation,
-               r.state, r.updated_at AS repository_updated_at,
-               i.status AS installation_status,
-               i.startup_fenced AS installation_startup_fenced,
-               i.generation AS installation_generation,
-               i.operation_id AS installation_operation_id,
-               i.disabled_at AS installation_disabled_at,
-               i.reason AS installation_reason,
-               i.actor AS installation_actor,
-               i.updated_at AS installation_updated_at
-        FROM repositories r
-        JOIN repository_installations i ON i.repo_id = r.repo_id
-        WHERE r.repo_id = ?
-        """,
-        (repository_id,),
-    ).fetchone()
-    if metadata is None or repository is None:
-        raise CutoverError("authority repair target or generation is unavailable")
-    enrollment = connection.execute(
-        "SELECT COUNT(*) FROM broker_repository_enrollments WHERE repo_id = ?",
-        (repository_id,),
-    ).fetchone()
-    if enrollment is None:
-        raise CutoverError("authority repair enrollment count is unavailable")
-    authority_generation = metadata["database_generation"]
-    state_revision = metadata["state_revision"]
-    if (
-        not isinstance(authority_generation, str)
-        or not authority_generation
-        or len(authority_generation.encode("utf-8")) > 256
-        or type(state_revision) is not int
-        or int(state_revision) < 0
-    ):
-        raise CutoverError("authority repair generation fields are invalid")
-    snapshot = {
-        "repository_id": str(repository["repo_id"]),
-        "display_name": str(repository["display_name"]),
-        "canonical_root": str(repository["canonical_root"]),
-        "generation": int(repository["generation"]),
-        "state": str(repository["state"]),
-        "repository_updated_at": str(repository["repository_updated_at"]),
-        "installation_status": str(repository["installation_status"]),
-        "installation_startup_fenced": bool(
-            repository["installation_startup_fenced"]
-        ),
-        "installation_generation": int(repository["installation_generation"]),
-        "installation_operation_id": repository["installation_operation_id"],
-        "installation_disabled_at": repository["installation_disabled_at"],
-        "installation_reason": repository["installation_reason"],
-        "installation_actor": str(repository["installation_actor"]),
-        "installation_updated_at": str(repository["installation_updated_at"]),
-        "enrollment_count": int(enrollment[0]),
-    }
-    if (
-        snapshot["repository_id"] != repository_id
-        or not snapshot["display_name"]
-        or len(str(snapshot["display_name"]).encode("utf-8")) > 512
-        or type(snapshot["generation"]) is not int
-        or int(snapshot["generation"]) < 0
-        or type(snapshot["installation_generation"]) is not int
-        or int(snapshot["installation_generation"]) < 0
-        or int(snapshot["enrollment_count"]) < 0
-    ):
-        raise CutoverError("authority repair repository fields are invalid")
-    return (
-        {
-            "authority_generation": authority_generation,
-            "state_revision": int(state_revision),
-        },
-        snapshot,
-        _authority_repository_startup_policy_snapshot(connection, repository_id),
-    )
-
-
-def _validate_authority_repository_disable_plan(
-    value: object, *, allow_legacy: bool = False
-) -> dict[str, object]:
-    if not isinstance(value, Mapping):
-        raise CutoverError("authority repository disable plan must be an object")
-    unsigned_fields = set(value) - {"schema_version", "kind", "document_sha256"}
-    legacy = unsigned_fields == set(LEGACY_AUTHORITY_REPOSITORY_DISABLE_PLAN_FIELDS)
-    if legacy and not allow_legacy:
-        raise CutoverError("legacy authority repository disable plan is not accepted")
-    fields = (
-        LEGACY_AUTHORITY_REPOSITORY_DISABLE_PLAN_FIELDS
-        if legacy
-        else AUTHORITY_REPOSITORY_DISABLE_PLAN_FIELDS
-    )
-    plan = verify_seal(
-        value,
-        kind=AUTHORITY_REPOSITORY_DISABLE_PLAN_KIND,
-        fields=fields,
-    )
-    try:
-        plan_id = str(uuid.UUID(str(plan["plan_id"])))
-    except (ValueError, TypeError, AttributeError) as error:
-        raise CutoverError("authority repair plan ID is invalid") from error
-    database_identity = plan["database_identity"]
-    repository = plan["repository"]
-    target = plan["target"]
-    startup_policies = (
-        []
-        if legacy
-        else _validate_authority_startup_policies(plan["startup_policies"])
-    )
-    if (
-        plan_id != plan["plan_id"]
-        or not isinstance(plan["authority_database"], str)
-        or str(_absolute(str(plan["authority_database"]), "authority database"))
-        != plan["authority_database"]
-        or type(plan["authority_uid"]) is not int
-        or int(plan["authority_uid"]) < 0
-        or not isinstance(plan["authority_generation"], str)
-        or not plan["authority_generation"]
-        or type(plan["authority_state_revision"]) is not int
-        or int(plan["authority_state_revision"]) < 0
-        or not isinstance(database_identity, Mapping)
-        or set(database_identity) != {"device", "inode", "size"}
-        or any(type(database_identity[field]) is not int for field in database_identity)
-        or int(database_identity["device"]) < 0
-        or int(database_identity["inode"]) <= 0
-        or int(database_identity["size"]) <= 0
-        or type(plan["enrollment_count"]) is not int
-        or plan["enrollment_count"] != 0
-        or plan["shared_temporary_root"] is not True
-        or plan["git_metadata_absent"] is not True
-        or plan["reason"] != AUTHORITY_REPOSITORY_REPAIR_REASON
-        or not isinstance(plan["created_at"], str)
-        or not isinstance(repository, Mapping)
-        or set(repository)
-        != {
-            "repository_id",
-            "display_name",
-            "canonical_root",
-            "generation",
-            "state",
-            "repository_updated_at",
-            "installation_status",
-            "installation_startup_fenced",
-            "installation_generation",
-            "installation_operation_id",
-            "installation_disabled_at",
-            "installation_reason",
-            "installation_actor",
-            "installation_updated_at",
-            "root_identity",
-        }
-        or not isinstance(repository["repository_id"], str)
-        or not repository["repository_id"]
-        or repository["canonical_root"] not in SHARED_TEMPORARY_REPOSITORY_ROOTS
-        or type(repository["generation"]) is not int
-        or int(repository["generation"]) < 0
-        or repository["state"] != "active"
-        or not isinstance(repository["repository_updated_at"], str)
-        or not repository["repository_updated_at"]
-        or repository["installation_status"] != "installed"
-        or repository["installation_startup_fenced"] is not False
-        or type(repository["installation_generation"]) is not int
-        or int(repository["installation_generation"]) < 0
-        or repository["installation_operation_id"] is not None
-        or repository["installation_disabled_at"] is not None
-        or (
-            repository["installation_reason"] is not None
-            and (
-                not isinstance(repository["installation_reason"], str)
-                or len(repository["installation_reason"].encode("utf-8")) > 4096
-            )
-        )
-        or not isinstance(repository["installation_actor"], str)
-        or not repository["installation_actor"]
-        or not isinstance(repository["installation_updated_at"], str)
-        or not repository["installation_updated_at"]
-        or not isinstance(target, Mapping)
-        or dict(target)
-        != {
-            "repository_state": "missing",
-            "installation_status": "disabled",
-            "startup_fenced": True,
-        }
-    ):
-        raise CutoverError("authority repository disable plan is invalid")
-    unsupported = [
-        str(policy["policy_id"])
-        for policy in startup_policies
-        if policy["requires_update"]
-        and policy["policy_kind"] not in {"coordinator", "compose"}
-    ]
-    if unsupported:
-        raise CutoverError(
-            "authority repository disable plan requires native lifecycle "
-            f"decommission for startup policy {unsupported[0]}"
-        )
-    root_identity = repository["root_identity"]
-    if (
-        not isinstance(root_identity, Mapping)
-        or set(root_identity) != {"device", "inode", "mode", "owner_uid"}
-        or type(root_identity["device"]) is not int
-        or int(root_identity["device"]) < 0
-        or type(root_identity["inode"]) is not int
-        or int(root_identity["inode"]) <= 0
-        or root_identity["mode"] != "1777"
-        or root_identity["owner_uid"] != 0
-    ):
-        raise CutoverError("authority repair shared-root identity is invalid")
-    return plan
-
-
-def plan_authority_shared_root_positive_absence(
-    *,
-    authority_database: Path,
-    repository_id: str,
-    operation_id: str,
-    plan_path: Path,
-    authority_uid: int = 0,
-    effective_uid_reader=None,
-    database_identity_reader=None,
-    evidence_publisher=None,
-) -> dict[str, object]:
-    """Publish the core sealed plan for the exact schema-12 ``/tmp`` census."""
-
-    uid_reader = effective_uid_reader or os.geteuid
-    if authority_uid != 0 or uid_reader() != 0:
-        raise CutoverError(
-            "shared-root positive-absence planning requires the root authority owner"
-        )
-    database = _absolute(authority_database, "authority database")
-    output = _absolute(plan_path, "shared-root positive-absence plan")
-    identity_reader = database_identity_reader or _database_identity
-    publisher = evidence_publisher or _publish_evidence
-    identity_before = identity_reader(database, uid=authority_uid)
-    connection = sqlite3.connect(f"{database.as_uri()}?mode=ro", uri=True)
-    connection.row_factory = sqlite3.Row
-    try:
-        connection.execute("PRAGMA foreign_keys = ON")
-        connection.execute("PRAGMA query_only = ON")
-        connection.execute("PRAGMA trusted_schema = OFF")
-        connection.execute("PRAGMA busy_timeout = 5000")
-        try:
-            observation = latest_shared_root_full_docker_observation(
-                connection, repository_id=repository_id
-            )
-            plan = plan_shared_root_positive_absence(
-                connection,
-                repository_id=repository_id,
-                operation_id=operation_id,
-                observation_evidence=observation,
-                created_at=_now(),
-            )
-        except SharedRootPositiveAbsenceError as error:
-            raise CutoverError(
-                f"shared-root positive-absence plan refused: {error}"
-            ) from error
-    finally:
-        connection.close()
-    identity_after = identity_reader(database, uid=authority_uid)
-    if identity_before != identity_after:
-        raise CutoverError(
-            "authority database changed while the shared-root plan was read"
-        )
-    publisher(output, plan, uid=authority_uid)
-    return {
-        "ok": True,
-        "plan": str(output),
-        "plan_id": plan["plan_id"],
-        "operation_id": plan["operation_id"],
-        "document_sha256": plan["document_sha256"],
-        "repository_id": plan["repository"]["repository_id"],
-        "observation_snapshot_id": plan["observation"]["snapshot_id"],
-        "absent_resource_count": len(plan["absent_resources"]),
-        "present_resource_count": len(plan["present_resources"]),
-        "database_binding_count": len(plan["database_bindings"]),
-        "writes_performed": False,
-    }
-
-
-def apply_authority_shared_root_positive_absence(
-    *,
-    authority_database: Path,
-    plan_path: Path,
-    plan_document_sha256: str,
-    attestation: Path,
-    maintenance_root: Path,
-    maintenance_gid: int,
-    maintenance_deployment_id: str,
-    authority_uid: int = 0,
-    effective_uid_reader=None,
-    database_identity_reader=None,
-    evidence_reader=None,
-    evidence_publisher=None,
-    maintenance_state_reader=None,
-    maintenance_lock_factory=None,
-    broker_lock_factory=None,
-    before_commit_hook=None,
-    after_commit_hook=None,
-) -> dict[str, object]:
-    """Apply the sealed DB-only transition behind both production write locks."""
-
-    uid_reader = effective_uid_reader or os.geteuid
-    if authority_uid != 0 or uid_reader() != 0:
-        raise CutoverError(
-            "shared-root positive-absence apply requires the root authority owner"
-        )
-    database = _absolute(authority_database, "authority database")
-    plan_location = _absolute(plan_path, "shared-root positive-absence plan")
-    output = _absolute(attestation, "shared-root positive-absence attestation")
-    reader = evidence_reader or read_private_json
-    publisher = evidence_publisher or _publish_evidence
-    plan = reader(plan_location, uid=authority_uid)
-    if (
-        re.fullmatch(r"[0-9a-f]{64}", plan_document_sha256 or "") is None
-        or plan.get("document_sha256") != plan_document_sha256
-    ):
-        raise CutoverError(
-            "shared-root positive-absence plan digest does not match"
-        )
-    try:
-        deployment_id = str(uuid.UUID(maintenance_deployment_id))
-    except (ValueError, TypeError, AttributeError) as error:
-        raise CutoverError(
-            "shared-root positive-absence maintenance identity is invalid"
-        ) from error
-    if deployment_id != maintenance_deployment_id:
-        raise CutoverError(
-            "shared-root positive-absence maintenance identity is invalid"
-        )
-    maintenance_reader = maintenance_state_reader or load_maintenance_state
-    maintenance_locker = maintenance_lock_factory or maintenance_writer_lock
-    maintenance_root = _absolute(maintenance_root, "maintenance root")
-
-    def require_maintenance() -> object:
-        try:
-            current = maintenance_reader(
-                expected_uid=authority_uid,
-                expected_gid=maintenance_gid,
-                maintenance_root=maintenance_root,
-            )
-        except MaintenanceMarkerError as error:
-            raise CutoverError(
-                "shared-root positive-absence maintenance marker is invalid"
-            ) from error
-        if (
-            current is None
-            or current.deployment_id != deployment_id
-            or current.message != PUBLIC_MAINTENANCE_MESSAGE
-        ):
-            raise CutoverError(
-                "shared-root positive-absence requires the exact active maintenance fence"
-            )
-        return current
-
-    require_maintenance()
-    identity_reader = database_identity_reader or _database_identity
-    lock_factory = broker_lock_factory or exclusive_broker_service_lock
-    mutated = False
-    result: dict[str, object] | None = None
-    with lock_factory(database), maintenance_locker(
-        maintenance_root=maintenance_root,
-        expected_uid=authority_uid,
-        expected_gid=maintenance_gid,
-    ):
-        require_maintenance()
-        identity_before = identity_reader(database, uid=authority_uid)
-        connection = sqlite3.connect(database)
-        connection.row_factory = sqlite3.Row
-        try:
-            connection.execute("PRAGMA foreign_keys = ON")
-            connection.execute("PRAGMA trusted_schema = OFF")
-            connection.execute("PRAGMA busy_timeout = 5000")
-            connection.execute("BEGIN IMMEDIATE")
-            changes_before = connection.total_changes
-            try:
-                result = apply_shared_root_positive_absence(
-                    connection,
-                    plan=plan,
-                    plan_document_sha256=plan_document_sha256,
-                )
-            except SharedRootPositiveAbsenceError as error:
-                raise CutoverError(
-                    f"shared-root positive-absence apply refused: {error}"
-                ) from error
-            mutated = connection.total_changes != changes_before
-            if before_commit_hook is not None:
-                before_commit_hook()
-            require_maintenance()
-            connection.commit()
-            if after_commit_hook is not None:
-                after_commit_hook()
-            connection.execute("BEGIN")
-            try:
-                committed = apply_shared_root_positive_absence(
-                    connection,
-                    plan=plan,
-                    plan_document_sha256=plan_document_sha256,
-                )
-            except SharedRootPositiveAbsenceError as error:
-                raise CutoverError(
-                    f"shared-root positive-absence committed state is invalid: {error}"
-                ) from error
-            finally:
-                connection.rollback()
-            if committed != result:
-                raise CutoverError(
-                    "shared-root positive-absence committed result changed"
-                )
-        except BaseException:
-            try:
-                connection.rollback()
-            except sqlite3.Error:
-                pass
-            raise
-        finally:
-            connection.close()
-        identity_after = identity_reader(database, uid=authority_uid)
-        if not _authority_repair_same_database(
-            planned=identity_before, current=identity_after
-        ):
-            raise CutoverError(
-                "authority database identity changed during shared-root apply"
-            )
-    if result is None:
-        raise CutoverError("shared-root positive-absence result is unavailable")
-    publisher(output, result, uid=authority_uid)
-    return {
-        "ok": True,
-        "attestation": str(output),
-        "document_sha256": result["document_sha256"],
-        "plan_id": result["plan_id"],
-        "operation_id": result["operation_id"],
-        "repository_id": result["repository_id"],
-        "observation_snapshot_id": result["observation_snapshot_id"],
-        "absent_resource_count": result["absent_resource_count"],
-        "present_resource_count": result["present_resource_count"],
-        "detached_database_binding_count": result[
-            "detached_database_binding_count"
-        ],
-        "writes_performed": mutated,
-    }
-
-
-def execute_authority_shared_root_positive_absence(
-    *,
-    release: Path,
-    authority_database: Path,
-    plan_path: Path,
-    plan_document_sha256: str,
-    attestation: Path,
-    transaction_journal: Path,
-    transaction_attestation: Path,
-    maintenance_root: Path,
-    maintenance_gid: int,
-    maintenance_deployment_id: str,
-    broker_socket: Path,
-    canary_user: str,
-    canary_uid: int,
-    canary_project: Path,
-    canary_repository_id: str,
-    canary_repository_generation: int,
-    readiness_wait_seconds: int = 30,
-    authority_uid: int = 0,
-    release_verifier=None,
-    command_status=_bounded_command_status,
-    command_output=None,
-    effective_uid_reader=None,
-    maintenance_activator=activate_maintenance,
-    maintenance_clearer=clear_maintenance,
-    maintenance_state_reader=load_maintenance_state,
-    evidence_reader=read_private_json,
-    evidence_publisher=None,
-    now_reader=_now,
-    applier=apply_authority_shared_root_positive_absence,
-    applier_options: Mapping[str, object] | None = None,
-    service_state_reader=None,
-    service_readiness_verifier=None,
-    phase_hook=None,
-) -> dict[str, object]:
-    """Own the broker lifecycle around the DB-only positive-absence repair.
-
-    An uncertain failure deliberately retains the marker.  Re-running this
-    exact command with the same deployment and sealed plan deterministically
-    replays the core result, restores the broker, proves the sealed repository
-    inventory canary, and clears the marker only after readiness.
-    """
-
-    uid_reader = effective_uid_reader or os.geteuid
-    publisher = evidence_publisher or _publish_evidence
-    if authority_uid != 0 or uid_reader() != 0:
-        raise CutoverError(
-            "shared-root positive-absence execution requires root"
-        )
-    try:
-        deployment_id = str(uuid.UUID(maintenance_deployment_id))
-    except (ValueError, TypeError, AttributeError) as error:
-        raise CutoverError(
-            "shared-root positive-absence maintenance identity is invalid"
-        ) from error
-    if deployment_id != maintenance_deployment_id:
-        raise CutoverError(
-            "shared-root positive-absence maintenance identity is invalid"
-        )
-    release = _absolute(release, "shared-root positive-absence release")
-    database = _absolute(authority_database, "authority database")
-    plan_location = _absolute(plan_path, "shared-root positive-absence plan")
-    result_location = _absolute(
-        attestation, "shared-root positive-absence attestation"
-    )
-    transaction_journal = _absolute(
-        transaction_journal, "shared-root positive-absence transaction journal"
-    )
-    transaction_attestation = _absolute(
-        transaction_attestation,
-        "shared-root positive-absence transaction attestation",
-    )
-    if len(
-        {plan_location, result_location, transaction_journal, transaction_attestation}
-    ) != 4:
-        raise CutoverError(
-            "shared-root positive-absence evidence paths must be distinct"
-        )
-    maintenance_root = _absolute(maintenance_root, "maintenance root")
-    broker_socket = _absolute(broker_socket, "broker socket")
-    canary_project = _absolute(canary_project, "inventory canary project")
-    binding = _authority_repository_service_readiness_binding(
-        {
-            "broker_socket": str(broker_socket),
-            "canary_user": canary_user,
-            "canary_uid": canary_uid,
-            "canary_project": str(canary_project),
-            "canary_repository_id": canary_repository_id,
-            "canary_repository_generation": canary_repository_generation,
-            "wait_seconds": readiness_wait_seconds,
-        }
-    )
-    try:
-        plan = validate_shared_root_positive_absence_plan(
-            evidence_reader(plan_location, uid=authority_uid)
-        )
-    except SharedRootPositiveAbsenceError as error:
-        raise CutoverError(
-            f"shared-root positive-absence plan is invalid: {error}"
-        ) from error
-    if (
-        re.fullmatch(r"[0-9a-f]{64}", plan_document_sha256 or "") is None
-        or plan["document_sha256"] != plan_document_sha256
-    ):
-        raise CutoverError(
-            "shared-root positive-absence plan digest does not match"
-        )
-    authority_generation = str(plan["authority"]["database_generation"])
-    verifier = _load_release_verifier() if release_verifier is None else release_verifier
-    verified_release = (
-        verifier.verify_release(release)
-        if hasattr(verifier, "verify_release")
-        else verifier(release)
-    )
-    release_digest = str(verified_release.get("release_digest", ""))
-    if (
-        re.fullmatch(r"[0-9a-f]{64}", release_digest) is None
-        or not isinstance(verified_release.get("capabilities"), Mapping)
-        or not all(verified_release["capabilities"].values())
-        or (
-            release_verifier is None
-            and release != IMMUTABLE_RELEASE_ROOT / release_digest
-        )
-    ):
-        raise CutoverError(
-            "shared-root positive-absence immutable release is invalid"
-        )
-    readiness_verifier = (
-        _authority_repository_service_readiness_proof
-        if service_readiness_verifier is None
-        else service_readiness_verifier
-    )
-    output_reader = command_output or _bounded_command_output
-    state_reader = service_state_reader or (
-        lambda unit: _shared_root_broker_service_state(
-            output_reader, unit, broker_socket
-        )
-    )
-    unit = "devcoordinator-broker.service"
-
-    def phase(name: str) -> None:
-        if phase_hook is not None:
-            phase_hook(name)
-
-    def service_state() -> dict[str, object]:
-        return _validate_shared_root_broker_service_state(state_reader(unit))
-
-    def wait_for_service(predicate, description: str) -> dict[str, object]:
-        deadline = time.monotonic() + readiness_wait_seconds
-        while time.monotonic() < deadline:
-            current = service_state()
-            if predicate(current):
-                return current
-            time.sleep(0.05)
-        raise CutoverError(
-            f"shared-root broker did not become {description}"
-        )
-
-    def completed_result() -> dict[str, object] | None:
-        if not (result_location.exists() or result_location.is_symlink()):
-            return None
-        try:
-            retained = validate_shared_root_positive_absence_result(
-                evidence_reader(result_location, uid=authority_uid), plan=plan
-            )
-            connection = sqlite3.connect(f"{database.as_uri()}?mode=ro", uri=True)
-            connection.row_factory = sqlite3.Row
-            try:
-                connection.execute("PRAGMA foreign_keys = ON")
-                connection.execute("PRAGMA query_only = ON")
-                connection.execute("PRAGMA trusted_schema = OFF")
-                connection.execute("PRAGMA busy_timeout = 5000")
-                connection.execute("BEGIN")
-                try:
-                    verified = verify_shared_root_positive_absence_terminal(
-                        connection,
-                        plan=plan,
-                        plan_document_sha256=plan_document_sha256,
-                        result=retained,
-                    )
-                finally:
-                    connection.rollback()
-            finally:
-                connection.close()
-            return verified
-        except (SharedRootPositiveAbsenceError, sqlite3.Error) as error:
-            raise CutoverError(
-                "shared-root positive-absence retained authority state is invalid: "
-                f"{error}"
-            ) from error
-
-    def read_marker() -> object:
-        try:
-            return maintenance_state_reader(
-                expected_uid=authority_uid,
-                expected_gid=maintenance_gid,
-                maintenance_root=maintenance_root,
-            )
-        except MaintenanceMarkerError as error:
-            raise CutoverError(
-                "shared-root positive-absence maintenance marker is invalid"
-            ) from error
-
-    marker = read_marker()
-    existing_maintenance: dict[str, object] | None = None
-    if marker is not None:
-        existing_maintenance = _normalize_maintenance_state(
-            marker,
-            root=maintenance_root,
-            gid=maintenance_gid,
-            deployment_id=deployment_id,
-        )
-    started_at = (
-        str(existing_maintenance["started_at"])
-        if existing_maintenance is not None
-        else now_reader()
-    )
-    planned_maintenance = {
-        "root": str(maintenance_root),
-        "gid": maintenance_gid,
-        "deployment_id": deployment_id,
-        "message": PUBLIC_MAINTENANCE_MESSAGE,
-        "retry_after_seconds": 5,
-        "started_at": started_at,
-    }
-    if transaction_journal.exists() or transaction_journal.is_symlink():
-        transaction = _authority_repository_disable_transaction(
-            evidence_reader(transaction_journal, uid=authority_uid)
-        )
-        if (
-            transaction["operation_id"] != plan["operation_id"]
-            or transaction["release"] != str(release)
-            or transaction["release_digest"] != release_digest
-            or transaction["plan"] != str(plan_location)
-            or transaction["plan_document_sha256"] != plan_document_sha256
-            or transaction["database"] != str(database)
-            or transaction["repair_attestation"] != str(result_location)
-            or transaction["readiness"] != binding
-            or transaction["maintenance"]["root"] != str(maintenance_root)
-            or transaction["maintenance"]["gid"] != maintenance_gid
-            or transaction["maintenance"]["deployment_id"] != deployment_id
-        ):
-            raise CutoverError(
-                "shared-root positive-absence transaction belongs to another operation"
-            )
-        planned_maintenance = dict(transaction["maintenance"])
-        started_at = str(planned_maintenance["started_at"])
-    else:
-        baseline = service_state()
-        if not _shared_root_broker_is_healthy(baseline):
-            raise CutoverError(
-                "shared-root positive-absence transaction requires the healthy broker baseline"
-            )
-        transaction = _authority_repository_disable_transaction(
-            seal(
-                AUTHORITY_REPOSITORY_DISABLE_TRANSACTION_KIND,
-                {
-                    "operation_id": plan["operation_id"],
-                    "release": str(release),
-                    "release_digest": release_digest,
-                    "plan": str(plan_location),
-                    "plan_document_sha256": plan_document_sha256,
-                    "database": str(database),
-                    "service_unit": unit,
-                    "service_baseline": {"active": True, "enabled": True},
-                    "readiness": binding,
-                    "maintenance": planned_maintenance,
-                    "repair_attestation": str(result_location),
-                    "created_at": started_at,
-                },
-            )
-        )
-        publisher(transaction_journal, transaction, uid=authority_uid)
-    if existing_maintenance is not None and existing_maintenance != transaction[
-        "maintenance"
-    ]:
-        raise CutoverError(
-            "shared-root positive-absence retained maintenance changed"
-        )
-    phase("after-journal")
-    repair = completed_result()
-    current_service = service_state()
-
-    def publish_terminal(
-        readiness: Mapping[str, object], repair_result: Mapping[str, object]
-    ) -> dict[str, object]:
-        terminal = _authority_repository_disable_transaction_result(
-            seal(
-                AUTHORITY_REPOSITORY_DISABLE_TRANSACTION_RESULT_KIND,
-                {
-                    "operation_id": plan["operation_id"],
-                    "transaction_journal_sha256": transaction[
-                        "document_sha256"
-                    ],
-                    "repair_result_sha256": repair_result["document_sha256"],
-                    "release_digest": release_digest,
-                    "database": str(database),
-                    "service_unit": unit,
-                    "readiness_proof": dict(readiness),
-                    "service_restored": True,
-                    "maintenance_cleared": True,
-                    "completed_at": now_reader(),
-                },
-            ),
-            readiness=binding,
-            authority_generation=authority_generation,
-        )
-        publisher(
-            transaction_attestation, terminal, uid=authority_uid
-        )
-        phase("after-terminal")
-        return terminal
-
-    if transaction_attestation.exists() or transaction_attestation.is_symlink():
-        terminal = _authority_repository_disable_transaction_result(
-            evidence_reader(transaction_attestation, uid=authority_uid),
-            readiness=binding,
-            authority_generation=authority_generation,
-        )
-        if (
-            repair is None
-            or terminal["operation_id"] != plan["operation_id"]
-            or terminal["transaction_journal_sha256"]
-            != transaction["document_sha256"]
-            or terminal["repair_result_sha256"] != repair["document_sha256"]
-            or terminal["release_digest"] != release_digest
-            or terminal["database"] != str(database)
-            or marker is not None
-            or not _shared_root_broker_is_healthy(current_service)
-        ):
-            raise CutoverError(
-                "shared-root positive-absence terminal is contradictory"
-            )
-        readiness = _validate_authority_repository_service_readiness_proof(
-            readiness_verifier(
-                phase="authenticated",
-                release=release,
-                database=database,
-                authority_uid=authority_uid,
-                authority_generation=authority_generation,
-                binding=binding,
-                now_reader=now_reader,
-            ),
-            phase="authenticated",
-            binding=binding,
-            generation=authority_generation,
-        )
-        if (
-            readiness["socket_peer"]["pid"] != current_service["main_pid"]
-            or readiness["invariants"]["database_identity"]["device"]
-            != terminal["readiness_proof"]["invariants"]["database_identity"][
-                "device"
-            ]
-            or readiness["invariants"]["database_identity"]["inode"]
-            != terminal["readiness_proof"]["invariants"]["database_identity"][
-                "inode"
-            ]
-        ):
-            raise CutoverError(
-                "shared-root positive-absence terminal readiness changed"
-            )
-        return {
-            "ok": True,
-            "replayed": True,
-            "attestation": str(result_location),
-            "transaction_attestation": str(transaction_attestation),
-            "document_sha256": repair["document_sha256"],
-            "terminal_document_sha256": terminal["document_sha256"],
-            "plan_id": repair["plan_id"],
-            "operation_id": repair["operation_id"],
-            "repository_id": repair["repository_id"],
-            "observation_snapshot_id": repair["observation_snapshot_id"],
-            "release_digest": release_digest,
-            "readiness": readiness,
-            "writes_performed": False,
-            "maintenance_deployment_id": deployment_id,
-            "maintenance_cleared": True,
-        }
-    if (
-        marker is None
-        and repair is not None
-        and _shared_root_broker_is_healthy(current_service)
-    ):
-        try:
-            readiness = _validate_authority_repository_service_readiness_proof(
-                readiness_verifier(
-                    phase="authenticated",
-                    release=release,
-                    database=database,
-                    authority_uid=authority_uid,
-                    authority_generation=authority_generation,
-                    binding=binding,
-                    now_reader=now_reader,
-                ),
-                phase="authenticated",
-                binding=binding,
-                generation=authority_generation,
-            )
-            if readiness["socket_peer"]["pid"] != current_service["main_pid"]:
-                raise CutoverError(
-                    "shared-root inventory canary reached an unexpected broker PID"
-                )
-        except BaseException:
-            maintenance_activator(
-                expected_uid=authority_uid,
-                expected_gid=maintenance_gid,
-                deployment_id=deployment_id,
-                scope=CONTROL_PLANE_MAINTENANCE_SCOPE,
-                message=PUBLIC_MAINTENANCE_MESSAGE,
-                retry_after_seconds=5,
-                started_at=started_at,
-                maintenance_root=maintenance_root,
-            )
-            raise
-        terminal = publish_terminal(readiness, repair)
-        return {
-            "ok": True,
-            "replayed": True,
-            "attestation": str(result_location),
-            "transaction_attestation": str(transaction_attestation),
-            "document_sha256": repair["document_sha256"],
-            "terminal_document_sha256": terminal["document_sha256"],
-            "plan_id": repair["plan_id"],
-            "operation_id": repair["operation_id"],
-            "repository_id": repair["repository_id"],
-            "observation_snapshot_id": repair["observation_snapshot_id"],
-            "release_digest": release_digest,
-            "readiness": readiness,
-            "writes_performed": False,
-            "maintenance_deployment_id": deployment_id,
-            "maintenance_cleared": True,
-        }
-    if marker is None:
-        try:
-            maintenance_activator(
-                expected_uid=authority_uid,
-                expected_gid=maintenance_gid,
-                deployment_id=deployment_id,
-                scope=CONTROL_PLANE_MAINTENANCE_SCOPE,
-                message=PUBLIC_MAINTENANCE_MESSAGE,
-                retry_after_seconds=5,
-                started_at=started_at,
-                maintenance_root=maintenance_root,
-            )
-        except MaintenanceMarkerError as error:
-            raise CutoverError(
-                "shared-root positive-absence maintenance activation failed"
-            ) from error
-        marker = read_marker()
-        planned_maintenance = _normalize_maintenance_state(
-            marker,
-            root=maintenance_root,
-            gid=maintenance_gid,
-            deployment_id=deployment_id,
-        )
-    if planned_maintenance is None:
-        raise CutoverError(
-            "shared-root positive-absence maintenance belongs to another operation"
-        )
-    phase("after-maintenance")
-
-    repair_error: BaseException | None = None
-    writes_performed = False
-    if repair is None:
-        try:
-            current_service = service_state()
-            if _shared_root_broker_is_healthy(current_service):
-                if command_status(["/usr/bin/systemctl", "stop", unit]) != 0:
-                    raise CutoverError(
-                        "shared-root broker did not stop behind maintenance"
-                    )
-            elif not _shared_root_broker_is_stopped(current_service):
-                raise CutoverError(
-                    "shared-root broker is neither healthy nor safely stopped"
-                )
-            stopped = wait_for_service(_shared_root_broker_is_stopped, "stopped")
-            time.sleep(0.1)
-            if service_state() != stopped:
-                raise CutoverError(
-                    "shared-root broker stop proof did not remain stable"
-                )
-            phase("after-stop")
-            apply_summary = applier(
-                authority_database=database,
-                plan_path=plan_location,
-                plan_document_sha256=plan_document_sha256,
-                attestation=result_location,
-                maintenance_root=maintenance_root,
-                maintenance_gid=maintenance_gid,
-                maintenance_deployment_id=deployment_id,
-                authority_uid=authority_uid,
-                **dict(applier_options or {}),
-            )
-            writes_performed = bool(
-                isinstance(apply_summary, Mapping)
-                and apply_summary.get("writes_performed") is True
-            )
-            repair = completed_result()
-            if repair is None:
-                raise CutoverError(
-                    "shared-root positive-absence result was not published"
-                )
-            phase("after-apply")
-        except BaseException as error:
-            repair_error = error
-
-    current_service = service_state()
-    if not _shared_root_broker_is_healthy(current_service):
-        if not _shared_root_broker_is_stopped(current_service):
-            raise CutoverError(
-                "shared-root broker cannot be safely restarted"
-            ) from repair_error
-        if command_status(["/usr/bin/systemctl", "start", unit]) != 0:
-            raise CutoverError(
-                "shared-root broker did not restart after positive-absence repair"
-            ) from repair_error
-    healthy_service = wait_for_service(_shared_root_broker_is_healthy, "healthy")
-    time.sleep(0.1)
-    if service_state() != healthy_service:
-        raise CutoverError(
-            "shared-root broker readiness did not remain stable"
-        ) from repair_error
-    phase("after-restart")
-    if repair_error is not None:
-        raise repair_error
-    if repair is None:
-        raise CutoverError(
-            "shared-root positive-absence result was not published"
-        )
-    marker = read_marker()
-    if (
-        _normalize_maintenance_state(
-            marker,
-            root=maintenance_root,
-            gid=maintenance_gid,
-            deployment_id=deployment_id,
-        )
-        != planned_maintenance
-    ):
-        raise CutoverError(
-            "shared-root positive-absence maintenance marker changed"
-        )
-    preclear = _validate_authority_repository_service_readiness_proof(
-        readiness_verifier(
-            phase="preclear",
-            release=release,
-            database=database,
-            authority_uid=authority_uid,
-            authority_generation=authority_generation,
-            binding=binding,
-            now_reader=now_reader,
-        ),
-        phase="preclear",
-        binding=binding,
-        generation=authority_generation,
-    )
-    if preclear["socket_peer"]["pid"] != healthy_service["main_pid"]:
-        raise CutoverError(
-            "shared-root preclear readiness reached an unexpected broker PID"
-        )
-    phase("after-preclear")
-    try:
-        cleared = maintenance_clearer(
-            expected_uid=authority_uid,
-            expected_gid=maintenance_gid,
-            deployment_id=deployment_id,
-            maintenance_root=maintenance_root,
-        )
-    except MaintenanceMarkerError as error:
-        raise CutoverError(
-            "shared-root positive-absence maintenance clear failed"
-        ) from error
-    if cleared is not True or read_marker() is not None:
-        raise CutoverError(
-            "shared-root positive-absence maintenance was not cleared"
-        )
-    try:
-        phase("after-clear")
-        readiness = _validate_authority_repository_service_readiness_proof(
-            readiness_verifier(
-                phase="authenticated",
-                release=release,
-                database=database,
-                authority_uid=authority_uid,
-                authority_generation=authority_generation,
-                binding=binding,
-                now_reader=now_reader,
-            ),
-            phase="authenticated",
-            binding=binding,
-            generation=authority_generation,
-        )
-        if (
-            readiness["socket_identity"] != preclear["socket_identity"]
-            or readiness["socket_peer"] != preclear["socket_peer"]
-            or readiness["socket_peer"]["pid"] != healthy_service["main_pid"]
-            or readiness["invariants"]["database_identity"]
-            != preclear["invariants"]["database_identity"]
-        ):
-            raise CutoverError(
-                "shared-root broker changed across authenticated readiness"
-            )
-        phase("after-authenticated")
-    except BaseException:
-        maintenance_activator(
-            expected_uid=authority_uid,
-            expected_gid=maintenance_gid,
-            deployment_id=deployment_id,
-            scope=CONTROL_PLANE_MAINTENANCE_SCOPE,
-            message=PUBLIC_MAINTENANCE_MESSAGE,
-            retry_after_seconds=5,
-            started_at=str(planned_maintenance["started_at"]),
-            maintenance_root=maintenance_root,
-        )
-        raise
-    terminal = publish_terminal(readiness, repair)
-    return {
-        "ok": True,
-        "replayed": not writes_performed,
-        "attestation": str(result_location),
-        "transaction_attestation": str(transaction_attestation),
-        "document_sha256": repair["document_sha256"],
-        "terminal_document_sha256": terminal["document_sha256"],
-        "plan_id": repair["plan_id"],
-        "operation_id": repair["operation_id"],
-        "repository_id": repair["repository_id"],
-        "observation_snapshot_id": repair["observation_snapshot_id"],
-        "release_digest": release_digest,
-        "readiness": readiness,
-        "writes_performed": writes_performed,
-        "maintenance_deployment_id": deployment_id,
-        "maintenance_cleared": True,
-    }
-
-
-def plan_authority_repository_disable(
-    *,
-    authority_database: Path,
-    repository_id: str,
-    plan_path: Path,
-    authority_uid: int = 0,
-    database_identity_reader=None,
-    repository_root_proof_reader=None,
-) -> dict[str, object]:
-    """Seal a no-write plan for one provably bogus shared-root repository."""
-
-    if os.geteuid() != authority_uid:
-        raise CutoverError("authority repair planning requires the authority owner")
-    if (
-        not isinstance(repository_id, str)
-        or not repository_id
-        or len(repository_id.encode("utf-8")) > 256
-        or any(character in repository_id for character in "\x00\r\n")
-    ):
-        raise CutoverError("authority repair repository ID is invalid")
-    identity_reader = database_identity_reader or _database_identity
-    root_reader = repository_root_proof_reader or (
-        lambda root: _authoritative_repository_root_proof(
-            root, prove_git_metadata_absent=True
-        )
-    )
-    database = _absolute(authority_database, "authority database")
-    before_identity = identity_reader(database, uid=authority_uid)
-    connection = sqlite3.connect(f"{database.as_uri()}?mode=ro", uri=True)
-    connection.row_factory = sqlite3.Row
-    try:
-        connection.execute("PRAGMA query_only = ON")
-        connection.execute("BEGIN")
-        _authority_repair_schema(connection)
-        schema_row = connection.execute(
-            "SELECT schema_version FROM schema_metadata WHERE singleton = 1"
-        ).fetchone()
-        if schema_row is None or int(schema_row[0]) != 12:
-            raise CutoverError(
-                "authority repository disable supports only schema-12 authority"
-            )
-        metadata, snapshot, startup_policies = _authority_repository_repair_snapshot(
-            connection, repository_id
-        )
-        connection.execute("ROLLBACK")
-    finally:
-        connection.close()
-    after_identity = identity_reader(database, uid=authority_uid)
-    if before_identity != after_identity:
-        raise CutoverError("authority database changed while the repair plan was read")
-    if (
-        snapshot["canonical_root"] not in SHARED_TEMPORARY_REPOSITORY_ROOTS
-        or snapshot["state"] != "active"
-        or snapshot["installation_status"] != "installed"
-        or snapshot["installation_startup_fenced"] is not False
-        or snapshot["installation_operation_id"] is not None
-        or snapshot["enrollment_count"] != 0
-    ):
-        raise CutoverError(
-            "authority repository is not the exact unfenced, unenrolled stale target"
-        )
-    unsupported = [
-        str(policy["policy_id"])
-        for policy in startup_policies
-        if policy["requires_update"]
-        and policy["policy_kind"] not in {"coordinator", "compose"}
-    ]
-    if unsupported:
-        raise CutoverError(
-            "authority repository contains an enabled native startup policy; "
-            "restore repository lifecycle authority and decommission it through "
-            f"the normal lifecycle: {unsupported[0]}"
-        )
-    root_proof = root_reader(snapshot["canonical_root"])
-    if (
-        not isinstance(root_proof, Mapping)
-        or set(root_proof)
-        != {"device", "inode", "mode", "owner_uid", "git_metadata_absent"}
-        or root_proof["owner_uid"] != 0
-        or root_proof["mode"] != "1777"
-        or root_proof["git_metadata_absent"] is not True
-    ):
-        raise CutoverError("authority shared temporary root proof is invalid")
-    document = seal(
-        AUTHORITY_REPOSITORY_DISABLE_PLAN_KIND,
-        {
-            "plan_id": str(uuid.uuid4()),
-            "authority_database": str(database),
-            "authority_uid": authority_uid,
-            "authority_generation": metadata["authority_generation"],
-            "authority_state_revision": metadata["state_revision"],
-            "database_identity": dict(before_identity),
-            "repository": {
-                "repository_id": repository_id,
-                "display_name": snapshot["display_name"],
-                "canonical_root": snapshot["canonical_root"],
-                "generation": snapshot["generation"],
-                "state": snapshot["state"],
-                "repository_updated_at": snapshot["repository_updated_at"],
-                "installation_status": snapshot["installation_status"],
-                "installation_startup_fenced": snapshot[
-                    "installation_startup_fenced"
-                ],
-                "installation_generation": snapshot[
-                    "installation_generation"
-                ],
-                "installation_operation_id": snapshot[
-                    "installation_operation_id"
-                ],
-                "installation_disabled_at": snapshot[
-                    "installation_disabled_at"
-                ],
-                "installation_reason": snapshot["installation_reason"],
-                "installation_actor": snapshot["installation_actor"],
-                "installation_updated_at": snapshot[
-                    "installation_updated_at"
-                ],
-                "root_identity": {
-                    field: root_proof[field]
-                    for field in ("device", "inode", "mode", "owner_uid")
-                },
-            },
-            "startup_policies": startup_policies,
-            "enrollment_count": 0,
-            "shared_temporary_root": True,
-            "git_metadata_absent": True,
-            "target": {
-                "repository_state": "missing",
-                "installation_status": "disabled",
-                "startup_fenced": True,
-            },
-            "reason": AUTHORITY_REPOSITORY_REPAIR_REASON,
-            "created_at": _now(),
-        },
-    )
-    verified = _validate_authority_repository_disable_plan(document)
-    _publish_evidence(_absolute(plan_path, "authority repair plan"), verified, uid=authority_uid)
-    return {
-        "ok": True,
-        "plan": str(plan_path),
-        "plan_id": verified["plan_id"],
-        "document_sha256": verified["document_sha256"],
-        "repository_id": repository_id,
-        "writes_performed": False,
-    }
-
-
-def _authority_repair_expected_snapshot(
-    *,
-    plan: Mapping[str, object],
-    snapshot: Mapping[str, object],
-    startup_policies: object,
-) -> bool:
-    repository = plan["repository"]
-    return bool(
-        isinstance(repository, Mapping)
-        and snapshot["repository_id"] == repository["repository_id"]
-        and snapshot["display_name"] == repository["display_name"]
-        and snapshot["canonical_root"] == repository["canonical_root"]
-        and snapshot["generation"] == repository["generation"]
-        and snapshot["state"] == repository["state"]
-        and snapshot["repository_updated_at"]
-        == repository["repository_updated_at"]
-        and snapshot["installation_status"] == repository["installation_status"]
-        and snapshot["installation_startup_fenced"]
-        is repository["installation_startup_fenced"]
-        and snapshot["installation_generation"]
-        == repository["installation_generation"]
-        and snapshot["installation_operation_id"]
-        == repository["installation_operation_id"]
-        and snapshot["installation_disabled_at"]
-        == repository["installation_disabled_at"]
-        and snapshot["installation_reason"] == repository["installation_reason"]
-        and snapshot["installation_actor"] == repository["installation_actor"]
-        and snapshot["installation_updated_at"]
-        == repository["installation_updated_at"]
-        and snapshot["enrollment_count"] == 0
-        and _authority_startup_policies_match_initial(
-            plan["startup_policies"], startup_policies
-        )
-    )
-
-
-def _authority_repair_same_database(
-    *, planned: Mapping[str, object], current: Mapping[str, object]
-) -> bool:
-    """Bind a descendant authority state to the same database inode.
-
-    SQLite's main-file size is mutable authority state, not identity.  An
-    unrelated committed write may therefore grow the file after planning.
-    Device and inode remain the fail-closed identity boundary.
-    """
-
-    return bool(
-        set(current) == {"device", "inode", "size"}
-        and all(type(current[field]) is int for field in current)
-        and int(current["device"]) == int(planned["device"])
-        and int(current["inode"]) == int(planned["inode"])
-        and int(current["size"]) > 0
-    )
-
-
-def _authority_repair_mutation_reason(
-    *, plan_id: str, deployment_id: str, state_revision_before: int
-) -> str:
-    return (
-        f"{AUTHORITY_REPOSITORY_REPAIR_REASON}; plan={plan_id}; "
-        f"maintenance={deployment_id}; "
-        f"state_revision_before={state_revision_before}"
-    )
-
-
-def _authority_repair_reason_revision(
-    *, reason: object, plan_id: str, deployment_id: str
-) -> int | None:
-    prefix = (
-        f"{AUTHORITY_REPOSITORY_REPAIR_REASON}; plan={plan_id}; "
-        f"maintenance={deployment_id}; state_revision_before="
-    )
-    if not isinstance(reason, str) or not reason.startswith(prefix):
-        return None
-    raw_revision = reason[len(prefix) :]
-    if re.fullmatch(r"0|[1-9][0-9]*", raw_revision) is None:
-        return None
-    revision = int(raw_revision)
-    return revision if revision >= 0 else None
-
-
-def _validate_authority_repository_disable_result(
-    value: object, *, allow_legacy: bool = False
-) -> dict[str, object]:
-    if not isinstance(value, Mapping):
-        raise CutoverError("authority repository repair result must be an object")
-    unsigned_fields = set(value) - {"schema_version", "kind", "document_sha256"}
-    legacy = unsigned_fields == set(LEGACY_AUTHORITY_REPOSITORY_DISABLE_RESULT_FIELDS)
-    if legacy and not allow_legacy:
-        raise CutoverError("legacy authority repository repair result is not accepted")
-    fields = (
-        LEGACY_AUTHORITY_REPOSITORY_DISABLE_RESULT_FIELDS
-        if legacy
-        else AUTHORITY_REPOSITORY_DISABLE_RESULT_FIELDS
-    )
-    result = verify_seal(
-        value,
-        kind=AUTHORITY_REPOSITORY_DISABLE_RESULT_KIND,
-        fields=fields,
-    )
-    try:
-        plan_id = str(uuid.UUID(str(result["plan_id"])))
-        deployment_id = str(uuid.UUID(str(result["maintenance_deployment_id"])))
-    except (ValueError, TypeError, AttributeError) as error:
-        raise CutoverError("authority repository repair result identity is invalid") from error
-    identities = (
-        result["database_identity_before"],
-        result["database_identity_after"],
-    )
-    reason_revision = _authority_repair_reason_revision(
-        reason=result["reason"], plan_id=plan_id, deployment_id=deployment_id
-    )
-    if (
-        plan_id != result["plan_id"]
-        or deployment_id != result["maintenance_deployment_id"]
-        or re.fullmatch(r"[0-9a-f]{64}", str(result["plan_document_sha256"]))
-        is None
-        or not isinstance(result["authority_database"], str)
-        or str(_absolute(str(result["authority_database"]), "authority database"))
-        != result["authority_database"]
-        or type(result["authority_uid"]) is not int
-        or int(result["authority_uid"]) < 0
-        or not isinstance(result["authority_generation"], str)
-        or not result["authority_generation"]
-        or any(
-            not isinstance(identity, Mapping)
-            or set(identity) != {"device", "inode", "size"}
-            or any(type(identity[field]) is not int for field in identity)
-            or int(identity["device"]) < 0
-            or int(identity["inode"]) <= 0
-            or int(identity["size"]) <= 0
-            for identity in identities
-        )
-        or identities[0]["device"] != identities[1]["device"]
-        or identities[0]["inode"] != identities[1]["inode"]
-        or not isinstance(result["repository_id"], str)
-        or not result["repository_id"]
-        or type(result["repository_generation_before"]) is not int
-        or result["repository_generation_after"]
-        != int(result["repository_generation_before"]) + 1
-        or type(result["installation_generation_before"]) is not int
-        or result["installation_generation_after"]
-        != int(result["installation_generation_before"]) + 1
-        or type(result["state_revision_before"]) is not int
-        or result["state_revision_after"] != int(result["state_revision_before"]) + 1
-        or reason_revision != result["state_revision_before"]
-        or result["repository_state"] != "missing"
-        or result["installation_status"] != "disabled"
-        or result["startup_fenced"] is not True
-        or result["enrollment_count"] != 0
-        or result["actor"] != AUTHORITY_REPOSITORY_REPAIR_ACTOR
-        or not isinstance(result["applied_at"], str)
-        or not result["applied_at"]
-    ):
-        raise CutoverError("authority repository repair result is invalid")
-    if not legacy:
-        policies = _validate_authority_startup_policy_results(
-            result["startup_policies"]
-        )
-        if (
-            type(result["startup_policy_count"]) is not int
-            or result["startup_policy_count"] != len(policies)
-            or type(result["startup_policy_update_count"]) is not int
-            or result["startup_policy_update_count"]
-            != sum(int(bool(policy["requires_update"])) for policy in policies)
-            or any(
-                policy["requires_update"]
-                and policy["updated_at_after"] != result["applied_at"]
-                for policy in policies
-            )
-        ):
-            raise CutoverError("authority repository repair policy result is invalid")
-    return result
-
-
-def apply_authority_repository_disable(
-    *,
-    plan_path: Path,
-    plan_document_sha256: str,
-    attestation: Path,
-    maintenance_root: Path,
-    maintenance_gid: int,
-    maintenance_deployment_id: str,
-    authority_uid: int = 0,
-    database_identity_reader=None,
-    repository_root_proof_reader=None,
-    maintenance_state_reader=None,
-    maintenance_lock_factory=None,
-    broker_lock_factory=None,
-    before_commit_hook=None,
-    after_commit_hook=None,
-) -> dict[str, object]:
-    """Apply one exact sealed repair behind maintenance and the writer lock."""
-
-    if os.geteuid() != authority_uid:
-        raise CutoverError("authority repair apply requires the authority owner")
-    plan_document = read_private_json(
-        _absolute(plan_path, "authority repair plan"), uid=authority_uid
-    )
-    plan = _validate_authority_repository_disable_plan(plan_document)
-    if (
-        re.fullmatch(r"[0-9a-f]{64}", plan_document_sha256 or "") is None
-        or plan["document_sha256"] != plan_document_sha256
-    ):
-        raise CutoverError("authority repair plan digest does not match")
-    try:
-        deployment_id = str(uuid.UUID(maintenance_deployment_id))
-    except (ValueError, TypeError, AttributeError) as error:
-        raise CutoverError("authority repair maintenance identity is invalid") from error
-    if deployment_id != maintenance_deployment_id:
-        raise CutoverError("authority repair maintenance identity is invalid")
-    maintenance_reader = maintenance_state_reader or load_maintenance_state
-    maintenance_locker = maintenance_lock_factory or maintenance_writer_lock
-    maintenance_root = _absolute(maintenance_root, "maintenance root")
-
-    def require_maintenance() -> object:
-        try:
-            current = maintenance_reader(
-                expected_uid=authority_uid,
-                expected_gid=maintenance_gid,
-                maintenance_root=maintenance_root,
-            )
-        except MaintenanceMarkerError as error:
-            raise CutoverError(
-                "authority repair maintenance marker is invalid"
-            ) from error
-        if (
-            current is None
-            or current.deployment_id != deployment_id
-            or current.message != PUBLIC_MAINTENANCE_MESSAGE
-        ):
-            raise CutoverError(
-                "authority repair requires the exact active maintenance fence"
-            )
-        return current
-
-    require_maintenance()
-    identity_reader = database_identity_reader or _database_identity
-    root_reader = repository_root_proof_reader or (
-        lambda root: _authoritative_repository_root_proof(
-            root, prove_git_metadata_absent=True
-        )
-    )
-    lock_factory = broker_lock_factory or exclusive_broker_service_lock
-    database = _absolute(str(plan["authority_database"]), "authority database")
-    if authority_uid != plan["authority_uid"]:
-        raise CutoverError("authority repair owner differs from the sealed plan")
-    expected_repository = plan["repository"]
-    if not isinstance(expected_repository, Mapping):
-        raise CutoverError("authority repair repository plan is invalid")
-    mutated = False
-    state_revision_before: int | None = None
-    state_revision_after: int | None = None
-    mutation_reason: str | None = None
-    with lock_factory(database), maintenance_locker(
-        maintenance_root=maintenance_root,
-        expected_uid=authority_uid,
-        expected_gid=maintenance_gid,
-    ):
-        require_maintenance()
-        identity_before = identity_reader(database, uid=authority_uid)
-        connection = sqlite3.connect(database)
-        connection.row_factory = sqlite3.Row
-        try:
-            connection.execute("PRAGMA foreign_keys = ON")
-            connection.execute("PRAGMA busy_timeout = 5000")
-            connection.execute("BEGIN IMMEDIATE")
-            _authority_repair_schema(connection)
-            schema_row = connection.execute(
-                "SELECT schema_version FROM schema_metadata WHERE singleton = 1"
-            ).fetchone()
-            if schema_row is None or int(schema_row[0]) != 12:
-                raise CutoverError(
-                    "authority repository disable supports only schema-12 authority"
-                )
-            metadata, snapshot, startup_policies = _authority_repository_repair_snapshot(
-                connection, str(expected_repository["repository_id"])
-            )
-            root_proof = root_reader(snapshot["canonical_root"])
-            if (
-                not isinstance(root_proof, Mapping)
-                or set(root_proof)
-                != {"device", "inode", "mode", "owner_uid", "git_metadata_absent"}
-                or root_proof["git_metadata_absent"] is not True
-                or {
-                    key: root_proof[key]
-                    for key in ("device", "inode", "mode", "owner_uid")
-                }
-                != expected_repository["root_identity"]
-            ):
-                raise CutoverError("authority repair root proof changed after planning")
-            same_database = _authority_repair_same_database(
-                planned=plan["database_identity"], current=identity_before
-            )
-            initial = (
-                metadata["authority_generation"] == plan["authority_generation"]
-                and metadata["state_revision"] >= plan["authority_state_revision"]
-                and same_database
-                and _authority_repair_expected_snapshot(
-                    plan=plan,
-                    snapshot=snapshot,
-                    startup_policies=startup_policies,
-                )
-            )
-            recovered_state_revision = _authority_repair_reason_revision(
-                reason=snapshot["installation_reason"],
-                plan_id=str(plan["plan_id"]),
-                deployment_id=deployment_id,
-            )
-            recovered_reason = (
-                None
-                if recovered_state_revision is None
-                else _authority_repair_mutation_reason(
-                    plan_id=str(plan["plan_id"]),
-                    deployment_id=deployment_id,
-                    state_revision_before=recovered_state_revision,
-                )
-            )
-            recovered = bool(
-                metadata["authority_generation"] == plan["authority_generation"]
-                and same_database
-                and recovered_state_revision is not None
-                and recovered_state_revision >= int(plan["authority_state_revision"])
-                and metadata["state_revision"] >= recovered_state_revision + 1
-                and snapshot["repository_id"] == expected_repository["repository_id"]
-                and snapshot["canonical_root"] == expected_repository["canonical_root"]
-                and snapshot["generation"]
-                == int(expected_repository["generation"]) + 1
-                and snapshot["state"] == "missing"
-                and snapshot["installation_status"] == "disabled"
-                and snapshot["installation_startup_fenced"] is True
-                and snapshot["installation_generation"]
-                == int(expected_repository["installation_generation"]) + 1
-                and snapshot["installation_operation_id"] is None
-                and snapshot["installation_reason"] == recovered_reason
-                and snapshot["installation_actor"]
-                == AUTHORITY_REPOSITORY_REPAIR_ACTOR
-                and snapshot["installation_disabled_at"]
-                == snapshot["installation_updated_at"]
-                and snapshot["repository_updated_at"]
-                == snapshot["installation_updated_at"]
-                and snapshot["enrollment_count"] == 0
-            )
-            if recovered:
-                try:
-                    _authority_startup_policy_results(
-                        planned=plan["startup_policies"],
-                        current=startup_policies,
-                        applied_at=str(snapshot["installation_disabled_at"]),
-                    )
-                except CutoverError:
-                    recovered = False
-            if not initial and not recovered:
-                raise CutoverError("authority repair plan drifted before apply")
-            if initial:
-                state_revision_before = int(metadata["state_revision"])
-                state_revision_after = state_revision_before + 1
-                mutation_reason = _authority_repair_mutation_reason(
-                    plan_id=str(plan["plan_id"]),
-                    deployment_id=deployment_id,
-                    state_revision_before=state_revision_before,
-                )
-                applied_at = _now()
-                changed_policy_count = 0
-                for policy in _validate_authority_startup_policies(
-                    plan["startup_policies"]
-                ):
-                    if not policy["requires_update"]:
-                        continue
-                    changed_policy_count += connection.execute(
-                        """
-                        UPDATE startup_policies
-                        SET current_value = desired_disabled_value,
-                            generation = generation + 1, updated_at = ?
-                        WHERE policy_id = ? AND repo_id = ?
-                          AND resource_kind = ? AND resource_id = ?
-                          AND policy_kind = ? AND current_value = ?
-                          AND desired_disabled_value = ?
-                          AND immutable_fingerprint = ? AND generation = ?
-                          AND updated_at = ?
-                        """,
-                        (
-                            applied_at,
-                            policy["policy_id"],
-                            expected_repository["repository_id"],
-                            policy["resource_kind"],
-                            policy["resource_id"],
-                            policy["policy_kind"],
-                            policy["current_value"],
-                            policy["desired_disabled_value"],
-                            policy["immutable_fingerprint"],
-                            policy["generation"],
-                            policy["updated_at"],
-                        ),
-                    ).rowcount
-                expected_policy_updates = sum(
-                    int(bool(policy["requires_update"]))
-                    for policy in _validate_authority_startup_policies(
-                        plan["startup_policies"]
-                    )
-                )
-                changed_installation = connection.execute(
-                    """
-                    UPDATE repository_installations
-                    SET status = 'disabled', startup_fenced = 1,
-                        generation = generation + 1, operation_id = NULL,
-                        disabled_at = ?, reason = ?, actor = ?, updated_at = ?
-                    WHERE repo_id = ? AND status = 'installed'
-                      AND startup_fenced = 0 AND generation = ?
-                      AND operation_id IS NULL
-                    """,
-                    (
-                        applied_at,
-                        mutation_reason,
-                        AUTHORITY_REPOSITORY_REPAIR_ACTOR,
-                        applied_at,
-                        expected_repository["repository_id"],
-                        expected_repository["installation_generation"],
-                    ),
-                ).rowcount
-                changed_repository = connection.execute(
-                    """
-                    UPDATE repositories
-                    SET state = 'missing', generation = generation + 1,
-                        updated_at = ?
-                    WHERE repo_id = ? AND state = 'active' AND generation = ?
-                    """,
-                    (
-                        applied_at,
-                        expected_repository["repository_id"],
-                        expected_repository["generation"],
-                    ),
-                ).rowcount
-                changed_metadata = connection.execute(
-                    """
-                    UPDATE schema_metadata
-                    SET state_revision = state_revision + 1, updated_at = ?
-                    WHERE singleton = 1 AND database_generation = ?
-                      AND state_revision = ?
-                    """,
-                    (
-                        applied_at,
-                        plan["authority_generation"],
-                        state_revision_before,
-                    ),
-                ).rowcount
-                if (changed_installation, changed_repository, changed_metadata) != (
-                    1,
-                    1,
-                    1,
-                ):
-                    raise CutoverError("authority repair exact-ID mutation was incomplete")
-                if changed_policy_count != expected_policy_updates:
-                    raise CutoverError(
-                        "authority repair exact startup-policy mutation was incomplete"
-                    )
-                terminal_metadata, terminal_snapshot, terminal_policies = (
-                    _authority_repository_repair_snapshot(
-                        connection,
-                        str(expected_repository["repository_id"]),
-                    )
-                )
-                if (
-                    terminal_metadata["state_revision"] != state_revision_after
-                    or terminal_snapshot["state"] != "missing"
-                    or terminal_snapshot["installation_status"] != "disabled"
-                    or terminal_snapshot["installation_startup_fenced"] is not True
-                    or not _authority_startup_policies_match_terminal(
-                        plan["startup_policies"],
-                        terminal_policies,
-                        applied_at=applied_at,
-                    )
-                ):
-                    raise CutoverError(
-                        "authority repair precommit terminal state is incomplete"
-                    )
-                if before_commit_hook is not None:
-                    before_commit_hook()
-                require_maintenance()
-                connection.commit()
-                mutated = True
-                if after_commit_hook is not None:
-                    after_commit_hook()
-                connection.execute("BEGIN")
-                metadata, snapshot, startup_policies = _authority_repository_repair_snapshot(
-                    connection, str(expected_repository["repository_id"])
-                )
-                connection.execute("ROLLBACK")
-            else:
-                state_revision_before = recovered_state_revision
-                if state_revision_before is None or recovered_reason is None:
-                    raise CutoverError("authority repair recovery evidence is invalid")
-                state_revision_after = state_revision_before + 1
-                mutation_reason = recovered_reason
-                connection.execute("ROLLBACK")
-        except BaseException:
-            try:
-                connection.rollback()
-            except sqlite3.Error:
-                pass
-            raise
-        finally:
-            connection.close()
-        identity_after = identity_reader(database, uid=authority_uid)
-    if (
-        state_revision_before is None
-        or state_revision_after is None
-        or mutation_reason is None
-        or metadata["authority_generation"] != plan["authority_generation"]
-        or metadata["state_revision"] < state_revision_after
-        or not _authority_repair_same_database(
-            planned=plan["database_identity"], current=identity_after
-        )
-        or snapshot["state"] != "missing"
-        or snapshot["installation_status"] != "disabled"
-        or snapshot["installation_startup_fenced"] is not True
-        or snapshot["installation_reason"] != mutation_reason
-        or snapshot["installation_actor"] != AUTHORITY_REPOSITORY_REPAIR_ACTOR
-    ):
-        raise CutoverError("authority repair terminal state did not verify")
-    policy_results = _authority_startup_policy_results(
-        planned=plan["startup_policies"],
-        current=startup_policies,
-        applied_at=str(snapshot["installation_disabled_at"]),
-    )
-    result = seal(
-        AUTHORITY_REPOSITORY_DISABLE_RESULT_KIND,
-        {
-            "plan_id": plan["plan_id"],
-            "plan_document_sha256": plan["document_sha256"],
-            "authority_database": str(database),
-            "authority_uid": authority_uid,
-            "authority_generation": plan["authority_generation"],
-            "maintenance_deployment_id": deployment_id,
-            "database_identity_before": dict(identity_before),
-            "database_identity_after": dict(identity_after),
-            "repository_id": expected_repository["repository_id"],
-            "repository_generation_before": expected_repository["generation"],
-            "repository_generation_after": snapshot["generation"],
-            "installation_generation_before": expected_repository[
-                "installation_generation"
-            ],
-            "installation_generation_after": snapshot["installation_generation"],
-            "state_revision_before": state_revision_before,
-            "state_revision_after": state_revision_after,
-            "repository_state": snapshot["state"],
-            "installation_status": snapshot["installation_status"],
-            "startup_fenced": snapshot["installation_startup_fenced"],
-            "startup_policy_count": len(policy_results),
-            "startup_policy_update_count": sum(
-                int(bool(policy["requires_update"])) for policy in policy_results
-            ),
-            "startup_policies": policy_results,
-            "enrollment_count": snapshot["enrollment_count"],
-            "reason": snapshot["installation_reason"],
-            "actor": snapshot["installation_actor"],
-            "applied_at": snapshot["installation_disabled_at"],
-        },
-    )
-    verified_result = _validate_authority_repository_disable_result(result)
-    _publish_evidence(
-        _absolute(attestation, "authority repair attestation"),
-        verified_result,
-        uid=authority_uid,
-    )
-    return {
-        "ok": True,
-        "attestation": str(attestation),
-        "document_sha256": verified_result["document_sha256"],
-        "repository_id": verified_result["repository_id"],
-        "replayed": not mutated,
-    }
-
-
-def _authority_repository_matches_repair_result(
-    *, repair: Mapping[str, object], snapshot: Mapping[str, object]
-) -> bool:
-    return bool(
-        snapshot["repository_id"] == repair["repository_id"]
-        and snapshot["generation"] == repair["repository_generation_after"]
-        and snapshot["state"] == "missing"
-        and snapshot["installation_status"] == "disabled"
-        and snapshot["installation_startup_fenced"] is True
-        and snapshot["installation_generation"]
-        == repair["installation_generation_after"]
-        and snapshot["installation_operation_id"] is None
-        and snapshot["installation_disabled_at"] == repair["applied_at"]
-        and snapshot["installation_updated_at"] == repair["applied_at"]
-        and snapshot["repository_updated_at"] == repair["applied_at"]
-        and snapshot["installation_reason"] == repair["reason"]
-        and snapshot["installation_actor"] == repair["actor"]
-        and snapshot["enrollment_count"] == 0
-    )
-
-
-AUTHORITY_REPOSITORY_PROTECTED_TABLES = (
-    "broker_repository_enrollments",
-    "repository_aliases",
-    "repository_families",
-    "repository_scopes",
-    "operations",
-    "runtime_sessions",
-    "source_resources",
-    "server_definitions",
-    "worker_policies",
-    "worker_supervisor_states",
-    "startup_policies",
-    "startup_policy_restore_states",
-    "repository_memberships",
-    "control_bindings",
-    "port_assignments",
-    "leases",
-    "broker_lease_links",
-    "broker_assignment_links",
-    "broker_reconciliation_queue",
-    "broker_lifecycle_links",
-    "broker_server_materialization_revocations",
-    "broker_repository_materialization_revocations",
-    "resource_lifecycle_history",
-    "cleanup_plans",
-    "cleanup_tombstones",
-    "worktree_cleanup_identities",
-    "docker_ownership_claims",
-    "ephemeral_container_templates",
-    "ephemeral_container_runs",
-    "database_bindings",
-)
-AUTHORITY_REPOSITORY_INTENTIONALLY_SEPARATE_TABLES = frozenset(
-    {
-        "repositories",
-        "repository_installations",
-        "repository_owners",
-        "repository_owner_transfers",
-        # Historical/result planes do not govern repository lifecycle.
-        "worker_attempts",
-        "database_backups",
-        "backup_evidence",
-        "events",
-        "test_runs",
-    }
-)
-MAX_AUTHORITY_REPOSITORY_PROTECTED_ROWS = 16384
-
-AUTHORITY_REPOSITORY_PENDING_LIFECYCLE = (
-    (
-        "operations",
-        "status IN ('planned','running','partial','needs_attention')",
-    ),
-    (
-        "runtime_sessions",
-        "status IN ('planned','running','cleanup_pending','cleaning')",
-    ),
-    (
-        "broker_lease_links",
-        "status IN ('reserved','release_pending','rollback_failed','reconciliation_required')",
-    ),
-    (
-        "broker_assignment_links",
-        "status IN ('reserved','release_pending','rollback_failed','reconciliation_required')",
-    ),
-    (
-        "broker_reconciliation_queue",
-        "status IN ('pending','operator_required')",
-    ),
-    (
-        "broker_lifecycle_links",
-        "status IN ('pending','reconciliation_required','operator_required')",
-    ),
-    (
-        "cleanup_plans",
-        "status IN ('planned','running','needs_attention')",
-    ),
-    (
-        "ephemeral_container_runs",
-        "status NOT IN ('cleaned','failed')",
-    ),
-)
-
-
-def _authority_repository_reject_pending_lifecycle(
-    connection: sqlite3.Connection, repository_id: str
-) -> None:
-    for table, predicate in AUTHORITY_REPOSITORY_PENDING_LIFECYCLE:
-        columns = {
-            str(row[1])
-            for row in connection.execute(f"PRAGMA table_info({table})").fetchall()
-        }
-        if "repo_id" not in columns or "status" not in columns:
-            raise CutoverError(
-                f"lifecycle recovery pending-state contract for {table} is unavailable"
-            )
-        row = connection.execute(
-            f"SELECT COUNT(*) FROM {table} WHERE repo_id = ? AND ({predicate})",
-            (repository_id,),
-        ).fetchone()
-        if row is None or type(row[0]) is not int:
-            raise CutoverError(
-                f"lifecycle recovery pending-state evidence for {table} is invalid"
-            )
-        if int(row[0]) != 0:
-            raise CutoverError(
-                f"lifecycle recovery rejects pending lifecycle rows in {table}"
-            )
-
-
-def _authority_repository_protected_rows(
-    connection: sqlite3.Connection, repository_id: str
-) -> dict[str, object]:
-    """Fingerprint every lifecycle/native row the compensation must not alter."""
-
-    _authority_repository_reject_pending_lifecycle(connection, repository_id)
-
-    schema_tables = [
-        str(table_row[0])
-        for table_row in connection.execute(
-        """
-        SELECT name FROM sqlite_schema
-        WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
-        ORDER BY name
-        """
-        ).fetchall()
-    ]
-    if any(re.fullmatch(r"[a-z_]+", table) is None for table in schema_tables):
-        raise CutoverError("lifecycle recovery schema table name is invalid")
-    columns_by_table = {
-        table: [
-            str(row[1])
-            for row in connection.execute(
-                f"PRAGMA table_info({table})"
-            ).fetchall()
-        ]
-        for table in schema_tables
-    }
-    if any(
-        not columns
-        or any(
-            re.fullmatch(r"[a-z][a-z0-9_]*", column) is None
-            for column in columns
-        )
-        for columns in columns_by_table.values()
-    ):
-        raise CutoverError("lifecycle recovery schema column name is invalid")
-    discovered_repo_tables = {
-        table for table, columns in columns_by_table.items() if "repo_id" in columns
-    }
-    missing_required_tables = set(AUTHORITY_REPOSITORY_PROTECTED_TABLES) - (
-        discovered_repo_tables | {"repository_families"}
-    )
-    if missing_required_tables:
-        raise CutoverError(
-            "lifecycle recovery required table coverage is incomplete: "
-            + ", ".join(sorted(missing_required_tables))
-        )
-    protected_table_set = (
-        (discovered_repo_tables - AUTHORITY_REPOSITORY_INTENTIONALLY_SEPARATE_TABLES)
-        | {"repository_families"}
-    )
-    foreign_keys: dict[str, list[tuple[str, tuple[str, ...], tuple[str, ...]]]] = {}
-    for child in schema_tables:
-        grouped: dict[int, list[tuple[int, str, str, str]]] = {}
-        for row in connection.execute(f"PRAGMA foreign_key_list({child})").fetchall():
-            grouped.setdefault(int(row[0]), []).append(
-                (int(row[1]), str(row[2]), str(row[3]), str(row[4]))
-            )
-        relationships: list[tuple[str, tuple[str, ...], tuple[str, ...]]] = []
-        for parts in grouped.values():
-            ordered = sorted(parts)
-            parent = ordered[0][1]
-            if (
-                parent not in columns_by_table
-                or any(
-                    part[1] != parent
-                    or part[2] not in columns_by_table[child]
-                    or part[3] not in columns_by_table[parent]
-                    for part in ordered
-                )
-            ):
-                raise CutoverError(
-                    f"lifecycle recovery foreign-key contract for {child} is invalid"
-                )
-            relationships.append(
-                (
-                    parent,
-                    tuple(part[2] for part in ordered),
-                    tuple(part[3] for part in ordered),
-                )
-            )
-        foreign_keys[child] = relationships
-    changed = True
-    while changed:
-        changed = False
-        for child, relationships in foreign_keys.items():
-            if child in AUTHORITY_REPOSITORY_INTENTIONALLY_SEPARATE_TABLES:
-                continue
-            if child in protected_table_set:
-                continue
-            if any(parent in protected_table_set for parent, _child, _parent in relationships):
-                protected_table_set.add(child)
-                changed = True
-    protected_tables = sorted(protected_table_set)
-    selected: dict[str, dict[bytes, dict[str, object]]] = {
-        table: {} for table in protected_tables
-    }
-
-    def normalize_rows(table: str, rows: list[object]) -> list[dict[str, object]]:
-        columns = columns_by_table[table]
-        normalized: list[dict[str, object]] = []
-        for row in rows:
-            document = {
-                column: row[column] if isinstance(row, sqlite3.Row) else row[index]
-                for index, column in enumerate(columns)
-            }
-            if any(
-                value is not None
-                and (isinstance(value, bool) or not isinstance(value, (str, int)))
-                for value in document.values()
-            ):
-                raise CutoverError(
-                    f"lifecycle recovery protected table {table} has unsafe values"
-                )
-            normalized.append(document)
-        return normalized
-
-    for table in protected_tables:
-        if re.fullmatch(r"[a-z_]+", table) is None or not columns_by_table[table]:
-            raise CutoverError("lifecycle recovery protected table is invalid")
-        if table == "repository_families":
-            rows = connection.execute(
-                """
-                SELECT * FROM repository_families
-                WHERE root_repo_id = ? OR family_id IN (
-                    SELECT family_id FROM repository_scopes WHERE repo_id = ?
-                )
-                LIMIT ?
-                """,
-                (repository_id, repository_id, MAX_REPOSITORY_STARTUP_POLICIES + 1),
-            ).fetchall()
-        elif "repo_id" in columns_by_table[table]:
-            rows = connection.execute(
-                f"SELECT * FROM {table} WHERE repo_id = ? LIMIT ?",
-                (repository_id, MAX_REPOSITORY_STARTUP_POLICIES + 1),
-            ).fetchall()
-        else:
-            rows = []
-        if len(rows) > MAX_REPOSITORY_STARTUP_POLICIES:
-            raise CutoverError(
-                f"lifecycle recovery protected table {table} exceeds its bound"
-            )
-        for document in normalize_rows(table, rows):
-            selected[table][_canonical(document)] = document
-
-    changed = True
-    while changed:
-        changed = False
-        for child in protected_tables:
-            for parent, child_columns, parent_columns in foreign_keys[child]:
-                if parent not in selected or not selected[parent]:
-                    continue
-                parent_keys = sorted(
-                    {
-                        tuple(document[column] for column in parent_columns)
-                        for document in selected[parent].values()
-                        if all(document[column] is not None for column in parent_columns)
-                    },
-                    key=_canonical,
-                )
-                for offset in range(0, len(parent_keys), 100):
-                    chunk = parent_keys[offset : offset + 100]
-                    clauses = " OR ".join(
-                        "(" + " AND ".join(f"{column} = ?" for column in child_columns) + ")"
-                        for _key in chunk
-                    )
-                    parameters = [value for key in chunk for value in key]
-                    rows = connection.execute(
-                        f"SELECT * FROM {child} WHERE {clauses} LIMIT ?",
-                        (*parameters, MAX_REPOSITORY_STARTUP_POLICIES + 1),
-                    ).fetchall()
-                    if len(rows) > MAX_REPOSITORY_STARTUP_POLICIES:
-                        raise CutoverError(
-                            f"lifecycle recovery protected table {child} exceeds its bound"
-                        )
-                    for document in normalize_rows(child, rows):
-                        key = _canonical(document)
-                        if key not in selected[child]:
-                            selected[child][key] = document
-                            changed = True
-                            if len(selected[child]) > MAX_REPOSITORY_STARTUP_POLICIES:
-                                raise CutoverError(
-                                    f"lifecycle recovery protected table {child} exceeds its bound"
-                                )
-
-    total_rows = sum(len(rows) for rows in selected.values())
-    if total_rows > MAX_AUTHORITY_REPOSITORY_PROTECTED_ROWS:
-        raise CutoverError(
-            "lifecycle recovery protected-row closure exceeds its bound"
-        )
-    tables: dict[str, object] = {}
-    for table in protected_tables:
-        normalized = sorted(selected[table].values(), key=_canonical)
-        tables[table] = {
-            "count": len(normalized),
-            "rows_sha256": _digest(normalized),
-        }
-    return {
-        "tables": tables,
-        "document_sha256": _digest(tables),
-    }
-
-
-def _validate_authority_repository_protected_rows(
-    value: object,
-) -> dict[str, object]:
-    if (
-        not isinstance(value, Mapping)
-        or set(value) != {"tables", "document_sha256"}
-        or not isinstance(value["tables"], Mapping)
-        or not set(AUTHORITY_REPOSITORY_PROTECTED_TABLES).issubset(
-            set(value["tables"])
-        )
-        or any(
-            re.fullmatch(r"[a-z_]+", str(table)) is None
-            for table in value["tables"]
-        )
-        or re.fullmatch(r"[0-9a-f]{64}", str(value["document_sha256"])) is None
-        or value["document_sha256"] != _digest(value["tables"])
-    ):
-        raise CutoverError("lifecycle recovery protected-row evidence is invalid")
-    total_rows = 0
-    for table in value["tables"]:
-        evidence = value["tables"][table]
-        if (
-            not isinstance(evidence, Mapping)
-            or set(evidence) != {"count", "rows_sha256"}
-            or type(evidence["count"]) is not int
-            or not 0 <= int(evidence["count"]) <= MAX_REPOSITORY_STARTUP_POLICIES
-            or re.fullmatch(r"[0-9a-f]{64}", str(evidence["rows_sha256"]))
-            is None
-        ):
-            raise CutoverError(
-                f"lifecycle recovery protected-row evidence for {table} is invalid"
-            )
-        total_rows += int(evidence["count"])
-    if total_rows > MAX_AUTHORITY_REPOSITORY_PROTECTED_ROWS:
-        raise CutoverError("lifecycle recovery protected-row evidence exceeds its bound")
-    return {
-        "tables": {
-            table: dict(value["tables"][table])
-            for table in sorted(value["tables"])
-        },
-        "document_sha256": str(value["document_sha256"]),
-    }
-
-
-def _authority_repository_owner_snapshot(
-    connection: sqlite3.Connection,
-    *,
-    repository_id: str,
-    repository_generation: int,
-    schema_version: int,
-) -> dict[str, object]:
-    owner_columns = connection.execute("PRAGMA table_info(repository_owners)").fetchall()
-    transfer_columns = connection.execute(
-        "PRAGMA table_info(repository_owner_transfers)"
-    ).fetchall()
-    if not owner_columns and not transfer_columns:
-        if schema_version >= 13:
-            raise CutoverError(
-                "schema-13 lifecycle recovery requires repository owner authority"
-            )
-        return {"mode": "schema12_absent"}
-    if not owner_columns or not transfer_columns:
-        raise CutoverError("repository owner authority schema is partial")
-    connection.row_factory = sqlite3.Row
-    owner = connection.execute(
-        "SELECT * FROM repository_owners WHERE repo_id = ?", (repository_id,)
-    ).fetchone()
-    transfers = connection.execute(
-        """
-        SELECT * FROM repository_owner_transfers
-        WHERE repo_id = ? ORDER BY authority_generation, transfer_id
-        LIMIT ?
-        """,
-        (repository_id, MAX_REPOSITORY_STARTUP_POLICIES + 1),
-    ).fetchall()
-    if owner is None or not transfers or len(transfers) > MAX_REPOSITORY_STARTUP_POLICIES:
-        raise CutoverError("repository owner authority is incomplete")
-    owner_document = dict(owner)
-    transfer_documents = [dict(row) for row in transfers]
-    head = transfer_documents[-1]
-    if (
-        owner_document.get("repo_id") != repository_id
-        or owner_document.get("repository_generation") != repository_generation
-        or head.get("repo_id") != repository_id
-        or head.get("owner_uid") != owner_document.get("owner_uid")
-        or head.get("repository_generation") != repository_generation
-        or head.get("authority_generation")
-        != owner_document.get("authority_generation")
-        or head.get("evidence_sha256") != owner_document.get("evidence_sha256")
-    ):
-        raise CutoverError("repository owner authority generation is stale")
-    return {
-        "mode": "explicit",
-        "owner": owner_document,
-        "transfer_count": len(transfer_documents),
-        "transfers_sha256": _digest(transfer_documents),
-        "head": head,
-    }
-
-
-def _validate_authority_repository_owner_snapshot(
-    value: object,
-) -> dict[str, object]:
-    if not isinstance(value, Mapping) or value.get("mode") not in {
-        "schema12_absent",
-        "explicit",
-    }:
-        raise CutoverError("lifecycle recovery owner evidence is invalid")
-    if value["mode"] == "schema12_absent":
-        if set(value) != {"mode"}:
-            raise CutoverError("schema-12 owner absence evidence is invalid")
-        return {"mode": "schema12_absent"}
-    if (
-        set(value) != {"mode", "owner", "transfer_count", "transfers_sha256", "head"}
-        or not isinstance(value["owner"], Mapping)
-        or not isinstance(value["head"], Mapping)
-        or type(value["transfer_count"]) is not int
-        or int(value["transfer_count"]) <= 0
-        or re.fullmatch(r"[0-9a-f]{64}", str(value["transfers_sha256"])) is None
-        or type(value["owner"].get("repository_generation")) is not int
-        or type(value["owner"].get("authority_generation")) is not int
-        or type(value["head"].get("repository_generation")) is not int
-        or type(value["head"].get("authority_generation")) is not int
-        or value["owner"].get("repo_id") != value["head"].get("repo_id")
-        or value["owner"].get("owner_uid") != value["head"].get("owner_uid")
-        or value["owner"].get("repository_generation")
-        != value["head"].get("repository_generation")
-        or value["owner"].get("authority_generation")
-        != value["head"].get("authority_generation")
-        or value["owner"].get("evidence_sha256")
-        != value["head"].get("evidence_sha256")
-    ):
-        raise CutoverError("explicit owner authority evidence is invalid")
-    return {
-        "mode": "explicit",
-        "owner": dict(value["owner"]),
-        "transfer_count": int(value["transfer_count"]),
-        "transfers_sha256": str(value["transfers_sha256"]),
-        "head": dict(value["head"]),
-    }
-
-
-def _authority_repository_lifecycle_recovery_reason(
-    *, plan_id: str, source_result_sha256: str, state_revision_before: int
-) -> str:
-    return (
-        f"{AUTHORITY_REPOSITORY_LIFECYCLE_RECOVERY_REASON}; plan={plan_id}; "
-        f"source_repair={source_result_sha256}; "
-        f"state_revision_before={state_revision_before}"
-    )
-
-
-def _authority_repository_lifecycle_root_matches(
-    *, plan: Mapping[str, object], proof: object
-) -> bool:
-    return bool(
-        isinstance(proof, Mapping)
-        and set(proof)
-        == {"device", "inode", "mode", "owner_uid", "git_metadata_absent"}
-        and proof["git_metadata_absent"] is True
-        and {
-            key: proof[key]
-            for key in ("device", "inode", "mode", "owner_uid")
-        }
-        == plan["repository"]["root_identity"]
-    )
-
-
-def _validate_authority_repository_lifecycle_recovery_plan(
-    value: object,
-) -> dict[str, object]:
-    plan = verify_seal(
-        value,
-        kind=AUTHORITY_REPOSITORY_LIFECYCLE_RECOVERY_PLAN_KIND,
-        fields=AUTHORITY_REPOSITORY_LIFECYCLE_RECOVERY_PLAN_FIELDS,
-    )
-    try:
-        plan_id = str(uuid.UUID(str(plan["plan_id"])))
-        operation_id = str(uuid.UUID(str(plan["operation_id"])))
-        source_plan_id = str(uuid.UUID(str(plan["source_repair_plan_id"])))
-    except (ValueError, TypeError, AttributeError) as error:
-        raise CutoverError("lifecycle recovery plan identity is invalid") from error
-    repository = plan["repository"]
-    target = plan["target"]
-    identity = plan["database_identity"]
-    protected = _validate_authority_repository_protected_rows(
-        plan["protected_rows"]
-    )
-    owner = _validate_authority_repository_owner_snapshot(plan["owner_authority"])
-    if (
-        plan_id != plan["plan_id"]
-        or operation_id != plan["operation_id"]
-        or source_plan_id != plan["source_repair_plan_id"]
-        or any(
-            re.fullmatch(r"[0-9a-f]{64}", str(plan[field])) is None
-            for field in (
-                "source_repair_plan_sha256",
-                "source_repair_result_sha256",
-            )
-        )
-        or not isinstance(plan["authority_database"], str)
-        or str(_absolute(str(plan["authority_database"]), "authority database"))
-        != plan["authority_database"]
-        or plan["authority_uid"] != 0
-        or not isinstance(plan["authority_generation"], str)
-        or not plan["authority_generation"]
-        or type(plan["authority_schema_version"]) is not int
-        or int(plan["authority_schema_version"]) != 12
-        or plan["authority_migration_state"] != "ready"
-        or type(plan["authority_state_revision"]) is not int
-        or int(plan["authority_state_revision"]) < 0
-        or not isinstance(identity, Mapping)
-        or set(identity) != {"device", "inode", "size"}
-        or any(type(identity[field]) is not int for field in identity)
-        or int(identity["inode"]) <= 0
-        or int(identity["size"]) <= 0
-        or not isinstance(repository, Mapping)
-        or set(repository)
-        != {
-            "repository_id",
-            "display_name",
-            "canonical_root",
-            "generation",
-            "state",
-            "repository_updated_at",
-            "installation_status",
-            "installation_startup_fenced",
-            "installation_generation",
-            "installation_operation_id",
-            "installation_disabled_at",
-            "installation_reason",
-            "installation_actor",
-            "installation_updated_at",
-            "enrollment_count",
-            "root_identity",
-        }
-        or repository["canonical_root"] not in SHARED_TEMPORARY_REPOSITORY_ROOTS
-        or repository["state"] != "missing"
-        or repository["installation_status"] != "disabled"
-        or repository["installation_startup_fenced"] is not True
-        or repository["installation_operation_id"] is not None
-        or repository["enrollment_count"] != 0
-        or repository["installation_actor"] != AUTHORITY_REPOSITORY_REPAIR_ACTOR
-        or not isinstance(repository["installation_reason"], str)
-        or not repository["installation_reason"]
-        or not isinstance(target, Mapping)
-        or dict(target)
-        != {
-            "repository_state": "active",
-            "repository_generation": int(repository["generation"]) + 1,
-            "installation_status": "installed",
-            "installation_startup_fenced": False,
-            "installation_generation": int(repository["installation_generation"])
-            + 1,
-            "state_revision": int(plan["authority_state_revision"]) + 1,
-        }
-        or not isinstance(plan["mutation_updated_at"], str)
-        or not plan["mutation_updated_at"]
-        or plan["reason"]
-        != _authority_repository_lifecycle_recovery_reason(
-            plan_id=plan_id,
-            source_result_sha256=str(plan["source_repair_result_sha256"]),
-            state_revision_before=int(plan["authority_state_revision"]),
-        )
-        or not isinstance(plan["created_at"], str)
-        or not plan["created_at"]
-        or owner["mode"] != "schema12_absent"
-        or protected != plan["protected_rows"]
-    ):
-        raise CutoverError("lifecycle recovery plan is invalid")
-    root_identity = repository["root_identity"]
-    if (
-        not isinstance(root_identity, Mapping)
-        or set(root_identity) != {"device", "inode", "mode", "owner_uid"}
-        or root_identity["mode"] != "1777"
-        or root_identity["owner_uid"] != 0
-    ):
-        raise CutoverError("lifecycle recovery root identity is invalid")
-    return plan
-
-
-def plan_authority_repository_lifecycle_recovery(
-    *,
-    repair_plan: Path,
-    repair_plan_document_sha256: str,
-    repair_attestation: Path,
-    repair_attestation_document_sha256: str,
-    plan_path: Path,
-    operation_id: str,
-    authority_uid: int = 0,
-    database_identity_reader=None,
-    repository_root_proof_reader=None,
-    now_reader=_now,
-    effective_uid_reader=os.geteuid,
-    evidence_reader=None,
-    evidence_publisher=None,
-) -> dict[str, object]:
-    """Seal a compensating re-enable without touching native lifecycle rows."""
-
-    if effective_uid_reader() != authority_uid or authority_uid != 0:
-        raise CutoverError("lifecycle recovery planning requires root authority")
-    reader = read_private_json if evidence_reader is None else evidence_reader
-    publisher = _publish_evidence if evidence_publisher is None else evidence_publisher
-    try:
-        operation_id = str(uuid.UUID(operation_id))
-    except (ValueError, TypeError, AttributeError) as error:
-        raise CutoverError("lifecycle recovery operation ID is invalid") from error
-    source_plan = _validate_authority_repository_disable_plan(
-        reader(_absolute(repair_plan, "source repair plan"), uid=0),
-        allow_legacy=True,
-    )
-    repair = _validate_authority_repository_disable_result(
-        reader(
-            _absolute(repair_attestation, "source repair attestation"), uid=0
-        ),
-        allow_legacy=True,
-    )
-    if (
-        source_plan["document_sha256"] != repair_plan_document_sha256
-        or repair["document_sha256"] != repair_attestation_document_sha256
-        or repair["plan_id"] != source_plan["plan_id"]
-        or repair["plan_document_sha256"] != source_plan["document_sha256"]
-        or repair["authority_database"] != source_plan["authority_database"]
-        or repair["authority_generation"] != source_plan["authority_generation"]
-        or repair["repository_id"] != source_plan["repository"]["repository_id"]
-    ):
-        raise CutoverError("lifecycle recovery source repair binding changed")
-    database = _absolute(str(repair["authority_database"]), "authority database")
-    identity_reader = database_identity_reader or _database_identity
-    root_reader = repository_root_proof_reader or (
-        lambda root: _authoritative_repository_root_proof(
-            root, prove_git_metadata_absent=True
-        )
-    )
-    before_identity = identity_reader(database, uid=0)
-    if not _authority_repair_same_database(
-        planned=repair["database_identity_after"], current=before_identity
-    ):
-        raise CutoverError("lifecycle recovery database identity changed")
-    connection = sqlite3.connect(f"{database.as_uri()}?mode=ro", uri=True)
-    connection.row_factory = sqlite3.Row
-    try:
-        connection.execute("PRAGMA query_only = ON")
-        connection.execute("BEGIN")
-        _authority_repair_schema(connection)
-        schema_row = connection.execute(
-            """
-            SELECT schema_version, migration_state
-            FROM schema_metadata WHERE singleton = 1
-            """
-        ).fetchone()
-        metadata, snapshot, policies = _authority_repository_repair_snapshot(
-            connection, str(repair["repository_id"])
-        )
-        if schema_row is None:
-            raise CutoverError("lifecycle recovery schema version is unavailable")
-        schema_version = int(schema_row[0])
-        migration_state = str(schema_row[1])
-        if schema_version != 12 or migration_state != "ready":
-            raise CutoverError(
-                "lifecycle recovery requires ready schema-12 authority"
-            )
-        protected = _authority_repository_protected_rows(
-            connection, str(repair["repository_id"])
-        )
-        owner = _authority_repository_owner_snapshot(
-            connection,
-            repository_id=str(repair["repository_id"]),
-            repository_generation=int(snapshot["generation"]),
-            schema_version=schema_version,
-        )
-        connection.execute("ROLLBACK")
-    finally:
-        connection.close()
-    if identity_reader(database, uid=0) != before_identity:
-        raise CutoverError("authority changed during lifecycle recovery planning")
-    if (
-        schema_version != 12
-        or migration_state != "ready"
-        or metadata["authority_generation"] != repair["authority_generation"]
-        or metadata["state_revision"] < repair["state_revision_after"]
-        or not _authority_repository_matches_repair_result(
-            repair=repair, snapshot=snapshot
-        )
-        or not any(
-            policy["requires_update"]
-            and policy["policy_kind"] in {"docker_restart", "supervisor"}
-            for policy in policies
-        )
-    ):
-        raise CutoverError(
-            "lifecycle recovery requires the exact disabled repository with an "
-            "enabled native startup policy"
-        )
-    root_proof = root_reader(snapshot["canonical_root"])
-    if (
-        not isinstance(root_proof, Mapping)
-        or set(root_proof)
-        != {"device", "inode", "mode", "owner_uid", "git_metadata_absent"}
-        or root_proof["git_metadata_absent"] is not True
-        or root_proof["mode"] != "1777"
-        or root_proof["owner_uid"] != 0
-        or {
-            key: root_proof[key]
-            for key in ("device", "inode", "mode", "owner_uid")
-        }
-        != source_plan["repository"]["root_identity"]
-    ):
-        raise CutoverError("lifecycle recovery shared-root proof changed")
-    timestamp = now_reader()
-    plan_id = str(uuid.uuid4())
-    reason = _authority_repository_lifecycle_recovery_reason(
-        plan_id=plan_id,
-        source_result_sha256=str(repair["document_sha256"]),
-        state_revision_before=int(metadata["state_revision"]),
-    )
-    document = _validate_authority_repository_lifecycle_recovery_plan(
-        seal(
-            AUTHORITY_REPOSITORY_LIFECYCLE_RECOVERY_PLAN_KIND,
-            {
-                "plan_id": plan_id,
-                "operation_id": operation_id,
-                "source_repair_plan_sha256": source_plan["document_sha256"],
-                "source_repair_result_sha256": repair["document_sha256"],
-                "source_repair_plan_id": source_plan["plan_id"],
-                "authority_database": str(database),
-                "authority_uid": 0,
-                "authority_generation": metadata["authority_generation"],
-                "authority_schema_version": schema_version,
-                "authority_migration_state": migration_state,
-                "authority_state_revision": metadata["state_revision"],
-                "database_identity": dict(before_identity),
-                "repository": {
-                    **snapshot,
-                    "root_identity": {
-                        key: root_proof[key]
-                        for key in ("device", "inode", "mode", "owner_uid")
-                    },
-                },
-                "protected_rows": protected,
-                "owner_authority": owner,
-                "target": {
-                    "repository_state": "active",
-                    "repository_generation": int(snapshot["generation"]) + 1,
-                    "installation_status": "installed",
-                    "installation_startup_fenced": False,
-                    "installation_generation": int(
-                        snapshot["installation_generation"]
-                    )
-                    + 1,
-                    "state_revision": int(metadata["state_revision"]) + 1,
-                },
-                "mutation_updated_at": timestamp,
-                "reason": reason,
-                "created_at": timestamp,
-            },
-        )
-    )
-    publisher(
-        _absolute(plan_path, "lifecycle recovery plan"), document, uid=0
-    )
-    return {
-        "ok": True,
-        "plan": str(plan_path),
-        "plan_id": plan_id,
-        "operation_id": operation_id,
-        "document_sha256": document["document_sha256"],
-        "repository_id": repair["repository_id"],
-        "protected_rows_sha256": protected["document_sha256"],
-        "writes_performed": False,
-    }
-
-
-def _authority_repository_owner_is_recovered(
-    *,
-    before: Mapping[str, object],
-    current: Mapping[str, object],
-    plan: Mapping[str, object],
-) -> bool:
-    if before["mode"] == "schema12_absent":
-        return current == {"mode": "schema12_absent"}
-    if current.get("mode") != "explicit":
-        return False
-    before_owner = before["owner"]
-    owner = current["owner"]
-    head = current["head"]
-    return bool(
-        owner.get("repo_id") == before_owner.get("repo_id")
-        and owner.get("owner_uid") == before_owner.get("owner_uid")
-        and owner.get("repository_generation")
-        == plan["target"]["repository_generation"]
-        and owner.get("authority_generation")
-        == int(before_owner.get("authority_generation")) + 1
-        and owner.get("operation_id") == plan["operation_id"]
-        and owner.get("established_by") == AUTHORITY_REPOSITORY_REPAIR_ACTOR
-        and owner.get("established_at") == plan["mutation_updated_at"]
-        and current.get("transfer_count") == int(before["transfer_count"]) + 1
-        and head.get("repository_generation")
-        == plan["target"]["repository_generation"]
-        and head.get("authority_generation") == owner.get("authority_generation")
-        and head.get("operation_id") == plan["operation_id"]
-        and head.get("actor") == AUTHORITY_REPOSITORY_REPAIR_ACTOR
-        and head.get("reason") == plan["reason"]
-        and head.get("transferred_at") == plan["mutation_updated_at"]
-        and head.get("evidence_sha256") == owner.get("evidence_sha256")
-    )
-
-
-def _authority_repository_lifecycle_recovery_terminal(
-    *,
-    plan: Mapping[str, object],
-    metadata: Mapping[str, object],
-    snapshot: Mapping[str, object],
-    protected: Mapping[str, object],
-    owner: Mapping[str, object],
-) -> bool:
-    return bool(
-        metadata["authority_generation"] == plan["authority_generation"]
-        and metadata["state_revision"] >= plan["target"]["state_revision"]
-        and snapshot["repository_id"] == plan["repository"]["repository_id"]
-        and snapshot["canonical_root"] == plan["repository"]["canonical_root"]
-        and snapshot["generation"] == plan["target"]["repository_generation"]
-        and snapshot["state"] == "active"
-        and snapshot["repository_updated_at"] == plan["mutation_updated_at"]
-        and snapshot["installation_status"] == "installed"
-        and snapshot["installation_startup_fenced"] is False
-        and snapshot["installation_generation"]
-        == plan["target"]["installation_generation"]
-        and snapshot["installation_operation_id"] is None
-        and snapshot["installation_disabled_at"] is None
-        and snapshot["installation_reason"] == plan["reason"]
-        and snapshot["installation_actor"] == AUTHORITY_REPOSITORY_REPAIR_ACTOR
-        and snapshot["installation_updated_at"] == plan["mutation_updated_at"]
-        and snapshot["enrollment_count"] == 0
-        and protected == plan["protected_rows"]
-        and _authority_repository_owner_is_recovered(
-            before=plan["owner_authority"], current=owner, plan=plan
-        )
-    )
-
-
-def _validate_authority_repository_lifecycle_recovery_result(
-    value: object,
-) -> dict[str, object]:
-    result = verify_seal(
-        value,
-        kind=AUTHORITY_REPOSITORY_LIFECYCLE_RECOVERY_RESULT_KIND,
-        fields=AUTHORITY_REPOSITORY_LIFECYCLE_RECOVERY_RESULT_FIELDS,
-    )
-    try:
-        plan_id = str(uuid.UUID(str(result["plan_id"])))
-        operation_id = str(uuid.UUID(str(result["operation_id"])))
-        deployment_id = str(uuid.UUID(str(result["maintenance_deployment_id"])))
-    except (ValueError, TypeError, AttributeError) as error:
-        raise CutoverError("lifecycle recovery result identity is invalid") from error
-    identities = (
-        result["database_identity_before"],
-        result["database_identity_after"],
-    )
-    if (
-        plan_id != result["plan_id"]
-        or operation_id != result["operation_id"]
-        or deployment_id != result["maintenance_deployment_id"]
-        or any(
-            re.fullmatch(r"[0-9a-f]{64}", str(result[field])) is None
-            for field in (
-                "plan_document_sha256",
-                "source_repair_plan_sha256",
-                "source_repair_result_sha256",
-            )
-        )
-        or not isinstance(result["authority_database"], str)
-        or str(_absolute(str(result["authority_database"]), "authority database"))
-        != result["authority_database"]
-        or result["authority_uid"] != 0
-        or not isinstance(result["authority_generation"], str)
-        or not result["authority_generation"]
-        or result["authority_schema_version"] != 12
-        or result["authority_migration_state"] != "ready"
-        or any(
-            not isinstance(identity, Mapping)
-            or set(identity) != {"device", "inode", "size"}
-            or any(type(identity[field]) is not int for field in identity)
-            or int(identity["inode"]) <= 0
-            or int(identity["size"]) <= 0
-            for identity in identities
-        )
-        or identities[0]["device"] != identities[1]["device"]
-        or identities[0]["inode"] != identities[1]["inode"]
-        or result["repository_generation_after"]
-        != int(result["repository_generation_before"]) + 1
-        or result["installation_generation_after"]
-        != int(result["installation_generation_before"]) + 1
-        or result["state_revision_after"] != int(result["state_revision_before"]) + 1
-        or _validate_authority_repository_protected_rows(result["protected_rows"])
-        != result["protected_rows"]
-        or _validate_authority_repository_owner_snapshot(
-            result["owner_authority_before"]
-        )
-        != result["owner_authority_before"]
-        or _validate_authority_repository_owner_snapshot(
-            result["owner_authority_after"]
-        )
-        != result["owner_authority_after"]
-        or result["repository_state"] != "active"
-        or result["installation_status"] != "installed"
-        or result["startup_fenced"] is not False
-        or result["enrollment_count"] != 0
-        or result["actor"] != AUTHORITY_REPOSITORY_REPAIR_ACTOR
-        or not isinstance(result["reason"], str)
-        or not result["reason"]
-        or not isinstance(result["applied_at"], str)
-        or not result["applied_at"]
-    ):
-        raise CutoverError("lifecycle recovery result is invalid")
-    return result
-
-
-def apply_authority_repository_lifecycle_recovery(
-    *,
-    plan_path: Path,
-    plan_document_sha256: str,
-    attestation: Path,
-    maintenance_root: Path,
-    maintenance_gid: int,
-    maintenance_deployment_id: str,
-    authority_uid: int = 0,
-    database_identity_reader=None,
-    repository_root_proof_reader=None,
-    maintenance_state_reader=None,
-    maintenance_lock_factory=None,
-    broker_lock_factory=None,
-    before_commit_hook=None,
-    after_commit_hook=None,
-    effective_uid_reader=os.geteuid,
-    evidence_reader=None,
-    evidence_publisher=None,
-) -> dict[str, object]:
-    """Atomically re-enable authority while preserving every native row."""
-
-    if effective_uid_reader() != authority_uid or authority_uid != 0:
-        raise CutoverError("lifecycle recovery apply requires root authority")
-    reader = read_private_json if evidence_reader is None else evidence_reader
-    publisher = _publish_evidence if evidence_publisher is None else evidence_publisher
-    plan = _validate_authority_repository_lifecycle_recovery_plan(
-        reader(_absolute(plan_path, "lifecycle recovery plan"), uid=0)
-    )
-    if plan["document_sha256"] != plan_document_sha256:
-        raise CutoverError("lifecycle recovery plan digest changed")
-    try:
-        deployment_id = str(uuid.UUID(maintenance_deployment_id))
-    except (ValueError, TypeError, AttributeError) as error:
-        raise CutoverError("lifecycle recovery maintenance ID is invalid") from error
-    if deployment_id != maintenance_deployment_id:
-        raise CutoverError("lifecycle recovery maintenance ID is invalid")
-    maintenance_reader = maintenance_state_reader or load_maintenance_state
-    maintenance_locker = maintenance_lock_factory or maintenance_writer_lock
-    maintenance_root = _absolute(maintenance_root, "maintenance root")
-
-    def require_maintenance() -> object:
-        try:
-            current = maintenance_reader(
-                expected_uid=0,
-                expected_gid=maintenance_gid,
-                maintenance_root=maintenance_root,
-            )
-        except MaintenanceMarkerError as error:
-            raise CutoverError(
-                "lifecycle recovery maintenance marker is invalid"
-            ) from error
-        if (
-            current is None
-            or current.deployment_id != deployment_id
-            or current.message != PUBLIC_MAINTENANCE_MESSAGE
-        ):
-            raise CutoverError(
-                "lifecycle recovery requires the exact maintenance fence"
-            )
-        return current
-
-    require_maintenance()
-    identity_reader = database_identity_reader or _database_identity
-    root_reader = repository_root_proof_reader or (
-        lambda root: _authoritative_repository_root_proof(
-            root, prove_git_metadata_absent=True
-        )
-    )
-    lock_factory = broker_lock_factory or exclusive_broker_service_lock
-    database = _absolute(str(plan["authority_database"]), "authority database")
-    mutated = False
-    with lock_factory(database), maintenance_locker(
-        maintenance_root=maintenance_root,
-        expected_uid=0,
-        expected_gid=maintenance_gid,
-    ):
-        require_maintenance()
-        identity_before = identity_reader(database, uid=0)
-        connection = sqlite3.connect(database)
-        connection.row_factory = sqlite3.Row
-        try:
-            connection.execute("PRAGMA foreign_keys = ON")
-            connection.execute("PRAGMA busy_timeout = 5000")
-            connection.execute("BEGIN IMMEDIATE")
-            _authority_repair_schema(connection)
-            schema_row = connection.execute(
-                """
-                SELECT schema_version, migration_state
-                FROM schema_metadata WHERE singleton = 1
-                """
-            ).fetchone()
-            metadata, snapshot, _policies = _authority_repository_repair_snapshot(
-                connection, str(plan["repository"]["repository_id"])
-            )
-            if (
-                schema_row is None
-                or int(schema_row[0]) != plan["authority_schema_version"]
-                or str(schema_row[1]) != plan["authority_migration_state"]
-                or str(schema_row[1]) != "ready"
-            ):
-                raise CutoverError("lifecycle recovery schema changed")
-            protected = _authority_repository_protected_rows(
-                connection, str(plan["repository"]["repository_id"])
-            )
-            owner = _authority_repository_owner_snapshot(
-                connection,
-                repository_id=str(plan["repository"]["repository_id"]),
-                repository_generation=int(snapshot["generation"]),
-                schema_version=int(schema_row[0]),
-            )
-            root_proof = root_reader(snapshot["canonical_root"])
-            repository_initial = all(
-                snapshot[key] == plan["repository"][key]
-                for key in snapshot
-            )
-            same_database = _authority_repair_same_database(
-                planned=plan["database_identity"], current=identity_before
-            )
-            root_matches = _authority_repository_lifecycle_root_matches(
-                plan=plan, proof=root_proof
-            )
-            initial = bool(
-                metadata["authority_generation"] == plan["authority_generation"]
-                and metadata["state_revision"] == plan["authority_state_revision"]
-                and same_database
-                and repository_initial
-                and protected == plan["protected_rows"]
-                and owner == plan["owner_authority"]
-                and root_matches
-            )
-            recovered = _authority_repository_lifecycle_recovery_terminal(
-                plan=plan,
-                metadata=metadata,
-                snapshot=snapshot,
-                protected=protected,
-                owner=owner,
-            ) and root_matches
-            if not initial and not recovered:
-                raise CutoverError("lifecycle recovery plan drifted before apply")
-            if initial:
-                changed_repository = connection.execute(
-                    """
-                    UPDATE repositories
-                    SET state = 'active', generation = generation + 1,
-                        updated_at = ?
-                    WHERE repo_id = ? AND state = 'missing' AND generation = ?
-                      AND updated_at = ?
-                    """,
-                    (
-                        plan["mutation_updated_at"],
-                        plan["repository"]["repository_id"],
-                        plan["repository"]["generation"],
-                        plan["repository"]["repository_updated_at"],
-                    ),
-                ).rowcount
-                changed_installation = connection.execute(
-                    """
-                    UPDATE repository_installations
-                    SET status = 'installed', startup_fenced = 0,
-                        generation = generation + 1, operation_id = NULL,
-                        disabled_at = NULL, reason = ?, actor = ?, updated_at = ?
-                    WHERE repo_id = ? AND status = 'disabled'
-                      AND startup_fenced = 1 AND generation = ?
-                      AND operation_id IS NULL AND disabled_at IS ?
-                      AND reason = ? AND actor = ? AND updated_at = ?
-                    """,
-                    (
-                        plan["reason"],
-                        AUTHORITY_REPOSITORY_REPAIR_ACTOR,
-                        plan["mutation_updated_at"],
-                        plan["repository"]["repository_id"],
-                        plan["repository"]["installation_generation"],
-                        plan["repository"]["installation_disabled_at"],
-                        plan["repository"]["installation_reason"],
-                        plan["repository"]["installation_actor"],
-                        plan["repository"]["installation_updated_at"],
-                    ),
-                ).rowcount
-                changed_revision = connection.execute(
-                    """
-                    UPDATE schema_metadata
-                    SET state_revision = state_revision + 1, updated_at = ?
-                    WHERE singleton = 1 AND database_generation = ?
-                      AND state_revision = ? AND migration_state = 'ready'
-                    """,
-                    (
-                        plan["mutation_updated_at"],
-                        plan["authority_generation"],
-                        plan["authority_state_revision"],
-                    ),
-                ).rowcount
-                if (changed_repository, changed_installation, changed_revision) != (
-                    1,
-                    1,
-                    1,
-                ):
-                    raise CutoverError("lifecycle recovery exact mutation was incomplete")
-                terminal_metadata, terminal_snapshot, _ = (
-                    _authority_repository_repair_snapshot(
-                        connection, str(plan["repository"]["repository_id"])
-                    )
-                )
-                terminal_protected = _authority_repository_protected_rows(
-                    connection, str(plan["repository"]["repository_id"])
-                )
-                terminal_owner = _authority_repository_owner_snapshot(
-                    connection,
-                    repository_id=str(plan["repository"]["repository_id"]),
-                    repository_generation=int(terminal_snapshot["generation"]),
-                    schema_version=int(schema_row[0]),
-                )
-                if not _authority_repository_lifecycle_recovery_terminal(
-                    plan=plan,
-                    metadata=terminal_metadata,
-                    snapshot=terminal_snapshot,
-                    protected=terminal_protected,
-                    owner=terminal_owner,
-                ):
-                    raise CutoverError("lifecycle recovery precommit state is incomplete")
-                if not _authority_repository_lifecycle_root_matches(
-                    plan=plan,
-                    proof=root_reader(terminal_snapshot["canonical_root"]),
-                ):
-                    raise CutoverError(
-                        "lifecycle recovery root proof changed before commit"
-                    )
-                if before_commit_hook is not None:
-                    before_commit_hook()
-                require_maintenance()
-                connection.commit()
-                mutated = True
-                if after_commit_hook is not None:
-                    after_commit_hook()
-                connection.execute("BEGIN")
-                metadata, snapshot, _ = _authority_repository_repair_snapshot(
-                    connection, str(plan["repository"]["repository_id"])
-                )
-                terminal_schema_row = connection.execute(
-                    """
-                    SELECT schema_version, migration_state
-                    FROM schema_metadata WHERE singleton = 1
-                    """
-                ).fetchone()
-                if (
-                    terminal_schema_row is None
-                    or int(terminal_schema_row[0])
-                    != plan["authority_schema_version"]
-                    or str(terminal_schema_row[1])
-                    != plan["authority_migration_state"]
-                    or str(terminal_schema_row[1]) != "ready"
-                ):
-                    raise CutoverError(
-                        "lifecycle recovery migration state changed after commit"
-                    )
-                protected = _authority_repository_protected_rows(
-                    connection, str(plan["repository"]["repository_id"])
-                )
-                owner = _authority_repository_owner_snapshot(
-                    connection,
-                    repository_id=str(plan["repository"]["repository_id"]),
-                    repository_generation=int(snapshot["generation"]),
-                    schema_version=int(schema_row[0]),
-                )
-                connection.execute("ROLLBACK")
-            else:
-                connection.execute("ROLLBACK")
-        except BaseException:
-            try:
-                connection.rollback()
-            except sqlite3.Error:
-                pass
-            raise
-        finally:
-            connection.close()
-        identity_after = identity_reader(database, uid=0)
-    if not _authority_repository_lifecycle_recovery_terminal(
-        plan=plan,
-        metadata=metadata,
-        snapshot=snapshot,
-        protected=protected,
-        owner=owner,
-    ):
-        raise CutoverError("lifecycle recovery terminal state did not verify")
-    if not _authority_repository_lifecycle_root_matches(
-        plan=plan, proof=root_reader(snapshot["canonical_root"])
-    ):
-        raise CutoverError(
-            "lifecycle recovery root proof changed before attestation"
-        )
-    result = _validate_authority_repository_lifecycle_recovery_result(
-        seal(
-            AUTHORITY_REPOSITORY_LIFECYCLE_RECOVERY_RESULT_KIND,
-            {
-                "plan_id": plan["plan_id"],
-                "operation_id": plan["operation_id"],
-                "plan_document_sha256": plan["document_sha256"],
-                "source_repair_plan_sha256": plan[
-                    "source_repair_plan_sha256"
-                ],
-                "source_repair_result_sha256": plan[
-                    "source_repair_result_sha256"
-                ],
-                "authority_database": str(database),
-                "authority_uid": 0,
-                "authority_generation": plan["authority_generation"],
-                "authority_schema_version": plan["authority_schema_version"],
-                "authority_migration_state": plan["authority_migration_state"],
-                "maintenance_deployment_id": deployment_id,
-                "database_identity_before": plan["database_identity"],
-                "database_identity_after": dict(identity_after),
-                "repository_id": plan["repository"]["repository_id"],
-                "repository_generation_before": plan["repository"]["generation"],
-                "repository_generation_after": snapshot["generation"],
-                "installation_generation_before": plan["repository"][
-                    "installation_generation"
-                ],
-                "installation_generation_after": snapshot[
-                    "installation_generation"
-                ],
-                "state_revision_before": plan["authority_state_revision"],
-                "state_revision_after": plan["target"]["state_revision"],
-                "protected_rows": protected,
-                "owner_authority_before": plan["owner_authority"],
-                "owner_authority_after": owner,
-                "repository_state": snapshot["state"],
-                "installation_status": snapshot["installation_status"],
-                "startup_fenced": snapshot["installation_startup_fenced"],
-                "enrollment_count": snapshot["enrollment_count"],
-                "reason": snapshot["installation_reason"],
-                "actor": snapshot["installation_actor"],
-                "applied_at": snapshot["installation_updated_at"],
-            },
-        )
-    )
-    publisher(
-        _absolute(attestation, "lifecycle recovery attestation"), result, uid=0
-    )
-    return {
-        "ok": True,
-        "attestation": str(attestation),
-        "document_sha256": result["document_sha256"],
-        "repository_id": result["repository_id"],
-        "replayed": not mutated,
-    }
-
-
-def _validate_authority_repository_policy_reconciliation_plan(
-    value: object,
-) -> dict[str, object]:
-    plan = verify_seal(
-        value,
-        kind=AUTHORITY_REPOSITORY_POLICY_RECONCILIATION_PLAN_KIND,
-        fields=AUTHORITY_REPOSITORY_POLICY_RECONCILIATION_PLAN_FIELDS,
-    )
-    try:
-        plan_id = str(uuid.UUID(str(plan["plan_id"])))
-        source_plan_id = str(uuid.UUID(str(plan["source_repair_plan_id"])))
-    except (ValueError, TypeError, AttributeError) as error:
-        raise CutoverError("startup-policy reconciliation plan identity is invalid") from error
-    database_identity = plan["database_identity"]
-    repository = plan["repository"]
-    policies = _validate_authority_startup_policies(plan["startup_policies"])
-    if (
-        plan_id != plan["plan_id"]
-        or source_plan_id != plan["source_repair_plan_id"]
-        or re.fullmatch(r"[0-9a-f]{64}", str(plan["source_repair_plan_sha256"]))
-        is None
-        or re.fullmatch(r"[0-9a-f]{64}", str(plan["source_repair_result_sha256"]))
-        is None
-        or not isinstance(plan["authority_database"], str)
-        or str(_absolute(str(plan["authority_database"]), "authority database"))
-        != plan["authority_database"]
-        or type(plan["authority_uid"]) is not int
-        or int(plan["authority_uid"]) < 0
-        or not isinstance(plan["authority_generation"], str)
-        or not plan["authority_generation"]
-        or type(plan["authority_state_revision"]) is not int
-        or int(plan["authority_state_revision"]) < 0
-        or not isinstance(database_identity, Mapping)
-        or set(database_identity) != {"device", "inode", "size"}
-        or any(type(database_identity[field]) is not int for field in database_identity)
-        or int(database_identity["device"]) < 0
-        or int(database_identity["inode"]) <= 0
-        or int(database_identity["size"]) <= 0
-        or not isinstance(repository, Mapping)
-        or set(repository)
-        != {
-            "repository_id",
-            "display_name",
-            "canonical_root",
-            "generation",
-            "state",
-            "repository_updated_at",
-            "installation_status",
-            "installation_startup_fenced",
-            "installation_generation",
-            "installation_operation_id",
-            "installation_disabled_at",
-            "installation_reason",
-            "installation_actor",
-            "installation_updated_at",
-            "root_identity",
-        }
-        or not isinstance(repository["repository_id"], str)
-        or not repository["repository_id"]
-        or repository["canonical_root"] not in SHARED_TEMPORARY_REPOSITORY_ROOTS
-        or repository["state"] != "missing"
-        or repository["installation_status"] != "disabled"
-        or repository["installation_startup_fenced"] is not True
-        or repository["installation_operation_id"] is not None
-        or type(repository["generation"]) is not int
-        or int(repository["generation"]) < 1
-        or type(repository["installation_generation"]) is not int
-        or int(repository["installation_generation"]) < 1
-        or not isinstance(repository["installation_reason"], str)
-        or not repository["installation_reason"]
-        or repository["installation_actor"] != AUTHORITY_REPOSITORY_REPAIR_ACTOR
-        or repository["installation_disabled_at"]
-        != repository["installation_updated_at"]
-        or repository["repository_updated_at"]
-        != repository["installation_updated_at"]
-        or plan["enrollment_count"] != 0
-        or plan["shared_temporary_root"] is not True
-        or plan["git_metadata_absent"] is not True
-        or not isinstance(plan["mutation_updated_at"], str)
-        or not plan["mutation_updated_at"]
-        or plan["reason"] != AUTHORITY_REPOSITORY_POLICY_RECONCILIATION_REASON
-        or not isinstance(plan["created_at"], str)
-        or not plan["created_at"]
-        or not policies
-        or not any(policy["requires_update"] for policy in policies)
-    ):
-        raise CutoverError("startup-policy reconciliation plan is invalid")
-    root_identity = repository["root_identity"]
-    if (
-        not isinstance(root_identity, Mapping)
-        or set(root_identity) != {"device", "inode", "mode", "owner_uid"}
-        or root_identity["mode"] != "1777"
-        or root_identity["owner_uid"] != 0
-        or type(root_identity["device"]) is not int
-        or int(root_identity["device"]) < 0
-        or type(root_identity["inode"]) is not int
-        or int(root_identity["inode"]) <= 0
-    ):
-        raise CutoverError("startup-policy reconciliation root identity is invalid")
-    unsafe = [
-        policy["policy_id"]
-        for policy in policies
-        if policy["requires_update"]
-        and policy["policy_kind"] not in {"coordinator", "compose"}
-    ]
-    if unsafe:
-        raise CutoverError(
-            "startup-policy reconciliation requires native absence proof or "
-            f"lifecycle recovery for policy {unsafe[0]}"
-        )
-    return plan
-
-
-def plan_authority_repository_startup_policy_reconciliation(
-    *,
-    repair_plan: Path,
-    repair_plan_document_sha256: str,
-    repair_attestation: Path,
-    repair_attestation_document_sha256: str,
-    plan_path: Path,
-    authority_uid: int = 0,
-    database_identity_reader=None,
-    repository_root_proof_reader=None,
-    now_reader=_now,
-) -> dict[str, object]:
-    """Seal the exact logical-policy correction for a prior terminal repair."""
-
-    if os.geteuid() != authority_uid:
-        raise CutoverError("startup-policy reconciliation planning requires authority")
-    source_plan = _validate_authority_repository_disable_plan(
-        read_private_json(
-            _absolute(repair_plan, "authority repair source plan"),
-            uid=authority_uid,
-        ),
-        allow_legacy=True,
-    )
-    repair = _validate_authority_repository_disable_result(
-        read_private_json(
-            _absolute(repair_attestation, "authority repair attestation"),
-            uid=authority_uid,
-        ),
-        allow_legacy=True,
-    )
-    if (
-        re.fullmatch(r"[0-9a-f]{64}", repair_plan_document_sha256 or "") is None
-        or source_plan["document_sha256"] != repair_plan_document_sha256
-        or re.fullmatch(
-            r"[0-9a-f]{64}", repair_attestation_document_sha256 or ""
-        )
-        is None
-        or repair["document_sha256"] != repair_attestation_document_sha256
-        or repair["plan_id"] != source_plan["plan_id"]
-        or repair["plan_document_sha256"] != source_plan["document_sha256"]
-        or repair["authority_database"] != source_plan["authority_database"]
-        or repair["authority_uid"] != source_plan["authority_uid"]
-        or repair["authority_uid"] != authority_uid
-        or repair["authority_generation"] != source_plan["authority_generation"]
-        or repair["repository_id"]
-        != source_plan["repository"]["repository_id"]
-        or repair["repository_generation_before"]
-        != source_plan["repository"]["generation"]
-        or repair["installation_generation_before"]
-        != source_plan["repository"]["installation_generation"]
-        or repair["state_revision_before"]
-        < int(source_plan["authority_state_revision"])
-    ):
-        raise CutoverError(
-            "startup-policy reconciliation source repair lineage changed"
-        )
-    database = _absolute(str(repair["authority_database"]), "authority database")
-    identity_reader = database_identity_reader or _database_identity
-    root_reader = repository_root_proof_reader or (
-        lambda root: _authoritative_repository_root_proof(
-            root, prove_git_metadata_absent=True
-        )
-    )
-    before_identity = identity_reader(database, uid=authority_uid)
-    if not _authority_repair_same_database(
-        planned=repair["database_identity_after"], current=before_identity
-    ):
-        raise CutoverError("startup-policy reconciliation database identity changed")
-    connection = sqlite3.connect(f"{database.as_uri()}?mode=ro", uri=True)
-    connection.row_factory = sqlite3.Row
-    try:
-        connection.execute("PRAGMA query_only = ON")
-        connection.execute("BEGIN")
-        _authority_repair_schema(connection)
-        metadata, snapshot, policies = _authority_repository_repair_snapshot(
-            connection, str(repair["repository_id"])
-        )
-        connection.execute("ROLLBACK")
-    finally:
-        connection.close()
-    after_identity = identity_reader(database, uid=authority_uid)
-    if before_identity != after_identity:
-        raise CutoverError("authority database changed during reconciliation planning")
-    if (
-        metadata["authority_generation"] != repair["authority_generation"]
-        or metadata["state_revision"] < repair["state_revision_after"]
-        or not _authority_repository_matches_repair_result(
-            repair=repair, snapshot=snapshot
-        )
-    ):
-        raise CutoverError("startup-policy reconciliation repair state changed")
-    root_proof = root_reader(snapshot["canonical_root"])
-    if (
-        not isinstance(root_proof, Mapping)
-        or set(root_proof)
-        != {"device", "inode", "mode", "owner_uid", "git_metadata_absent"}
-        or root_proof["mode"] != "1777"
-        or root_proof["owner_uid"] != 0
-        or root_proof["git_metadata_absent"] is not True
-    ):
-        raise CutoverError("startup-policy reconciliation root proof is invalid")
-    unsafe = [
-        policy["policy_id"]
-        for policy in policies
-        if policy["requires_update"]
-        and policy["policy_kind"] not in {"coordinator", "compose"}
-    ]
-    if unsafe:
-        raise CutoverError(
-            "startup-policy reconciliation cannot mutate native policy; use the "
-            f"sealed lifecycle recovery path for {unsafe[0]}"
-        )
-    if not any(policy["requires_update"] for policy in policies):
-        raise CutoverError("startup-policy reconciliation is not required")
-    timestamp = now_reader()
-    document = _validate_authority_repository_policy_reconciliation_plan(
-        seal(
-            AUTHORITY_REPOSITORY_POLICY_RECONCILIATION_PLAN_KIND,
-            {
-                "plan_id": str(uuid.uuid4()),
-                "source_repair_plan_sha256": source_plan["document_sha256"],
-                "source_repair_result_sha256": repair["document_sha256"],
-                "source_repair_plan_id": repair["plan_id"],
-                "authority_database": str(database),
-                "authority_uid": authority_uid,
-                "authority_generation": metadata["authority_generation"],
-                "authority_state_revision": metadata["state_revision"],
-                "database_identity": dict(before_identity),
-                "repository": {
-                    key: snapshot[key]
-                    for key in (
-                        "repository_id",
-                        "display_name",
-                        "canonical_root",
-                        "generation",
-                        "state",
-                        "repository_updated_at",
-                        "installation_status",
-                        "installation_startup_fenced",
-                        "installation_generation",
-                        "installation_operation_id",
-                        "installation_disabled_at",
-                        "installation_reason",
-                        "installation_actor",
-                        "installation_updated_at",
-                    )
-                }
-                | {
-                    "root_identity": {
-                        key: root_proof[key]
-                        for key in ("device", "inode", "mode", "owner_uid")
-                    }
-                },
-                "startup_policies": policies,
-                "enrollment_count": 0,
-                "shared_temporary_root": True,
-                "git_metadata_absent": True,
-                "mutation_updated_at": timestamp,
-                "reason": AUTHORITY_REPOSITORY_POLICY_RECONCILIATION_REASON,
-                "created_at": timestamp,
-            },
-        )
-    )
-    _publish_evidence(
-        _absolute(plan_path, "startup-policy reconciliation plan"),
-        document,
-        uid=authority_uid,
-    )
-    return {
-        "ok": True,
-        "plan": str(plan_path),
-        "plan_id": document["plan_id"],
-        "document_sha256": document["document_sha256"],
-        "repository_id": repair["repository_id"],
-        "startup_policy_count": len(policies),
-        "startup_policy_update_count": sum(
-            int(bool(policy["requires_update"])) for policy in policies
-        ),
-        "writes_performed": False,
-    }
-
-
-def _validate_authority_repository_policy_reconciliation_result(
-    value: object,
-) -> dict[str, object]:
-    result = verify_seal(
-        value,
-        kind=AUTHORITY_REPOSITORY_POLICY_RECONCILIATION_RESULT_KIND,
-        fields=AUTHORITY_REPOSITORY_POLICY_RECONCILIATION_RESULT_FIELDS,
-    )
-    try:
-        plan_id = str(uuid.UUID(str(result["plan_id"])))
-        source_plan_id = str(uuid.UUID(str(result["source_repair_plan_id"])))
-        deployment_id = str(uuid.UUID(str(result["maintenance_deployment_id"])))
-    except (ValueError, TypeError, AttributeError) as error:
-        raise CutoverError("startup-policy reconciliation result identity is invalid") from error
-    policies = _validate_authority_startup_policy_results(
-        result["startup_policies"]
-    )
-    identities = (
-        result["database_identity_before"],
-        result["database_identity_after"],
-    )
-    if (
-        plan_id != result["plan_id"]
-        or source_plan_id != result["source_repair_plan_id"]
-        or deployment_id != result["maintenance_deployment_id"]
-        or re.fullmatch(r"[0-9a-f]{64}", str(result["plan_document_sha256"]))
-        is None
-        or re.fullmatch(r"[0-9a-f]{64}", str(result["source_repair_result_sha256"]))
-        is None
-        or re.fullmatch(r"[0-9a-f]{64}", str(result["source_repair_plan_sha256"]))
-        is None
-        or not isinstance(result["authority_database"], str)
-        or str(_absolute(str(result["authority_database"]), "authority database"))
-        != result["authority_database"]
-        or type(result["authority_uid"]) is not int
-        or int(result["authority_uid"]) < 0
-        or not isinstance(result["authority_generation"], str)
-        or not result["authority_generation"]
-        or any(
-            not isinstance(identity, Mapping)
-            or set(identity) != {"device", "inode", "size"}
-            or any(type(identity[field]) is not int for field in identity)
-            for identity in identities
-        )
-        or identities[0]["device"] != identities[1]["device"]
-        or identities[0]["inode"] != identities[1]["inode"]
-        or type(result["repository_generation"]) is not int
-        or type(result["installation_generation"]) is not int
-        or type(result["state_revision_before"]) is not int
-        or result["state_revision_after"] != int(result["state_revision_before"]) + 1
-        or type(result["startup_policy_count"]) is not int
-        or result["startup_policy_count"] != len(policies)
-        or type(result["startup_policy_update_count"]) is not int
-        or result["startup_policy_update_count"]
-        != sum(int(bool(policy["requires_update"])) for policy in policies)
-        or result["enrollment_count"] != 0
-        or result["reason"] != AUTHORITY_REPOSITORY_POLICY_RECONCILIATION_REASON
-        or result["actor"] != AUTHORITY_REPOSITORY_REPAIR_ACTOR
-        or not isinstance(result["applied_at"], str)
-        or not result["applied_at"]
-        or any(
-            policy["requires_update"]
-            and policy["updated_at_after"] != result["applied_at"]
-            for policy in policies
-        )
-    ):
-        raise CutoverError("startup-policy reconciliation result is invalid")
-    return result
-
-
-def apply_authority_repository_startup_policy_reconciliation(
-    *,
-    plan_path: Path,
-    plan_document_sha256: str,
-    attestation: Path,
-    maintenance_root: Path,
-    maintenance_gid: int,
-    maintenance_deployment_id: str,
-    authority_uid: int = 0,
-    database_identity_reader=None,
-    repository_root_proof_reader=None,
-    maintenance_state_reader=None,
-    maintenance_lock_factory=None,
-    broker_lock_factory=None,
-    before_commit_hook=None,
-    after_commit_hook=None,
-) -> dict[str, object]:
-    """Apply the sealed logical-only policy correction in one revision."""
-
-    if os.geteuid() != authority_uid:
-        raise CutoverError("startup-policy reconciliation apply requires authority")
-    plan = _validate_authority_repository_policy_reconciliation_plan(
-        read_private_json(
-            _absolute(plan_path, "startup-policy reconciliation plan"),
-            uid=authority_uid,
-        )
-    )
-    if (
-        re.fullmatch(r"[0-9a-f]{64}", plan_document_sha256 or "") is None
-        or plan["document_sha256"] != plan_document_sha256
-    ):
-        raise CutoverError("startup-policy reconciliation plan digest changed")
-    try:
-        deployment_id = str(uuid.UUID(maintenance_deployment_id))
-    except (ValueError, TypeError, AttributeError) as error:
-        raise CutoverError("startup-policy reconciliation maintenance ID is invalid") from error
-    if deployment_id != maintenance_deployment_id:
-        raise CutoverError("startup-policy reconciliation maintenance ID is invalid")
-    maintenance_reader = maintenance_state_reader or load_maintenance_state
-    maintenance_locker = maintenance_lock_factory or maintenance_writer_lock
-    maintenance_root = _absolute(maintenance_root, "maintenance root")
-
-    def require_maintenance() -> object:
-        try:
-            current = maintenance_reader(
-                expected_uid=authority_uid,
-                expected_gid=maintenance_gid,
-                maintenance_root=maintenance_root,
-            )
-        except MaintenanceMarkerError as error:
-            raise CutoverError(
-                "startup-policy reconciliation maintenance is invalid"
-            ) from error
-        if (
-            current is None
-            or current.deployment_id != deployment_id
-            or current.message != PUBLIC_MAINTENANCE_MESSAGE
-        ):
-            raise CutoverError(
-                "startup-policy reconciliation requires exact active maintenance"
-            )
-        return current
-
-    require_maintenance()
-    identity_reader = database_identity_reader or _database_identity
-    root_reader = repository_root_proof_reader or (
-        lambda root: _authoritative_repository_root_proof(
-            root, prove_git_metadata_absent=True
-        )
-    )
-    database = _absolute(str(plan["authority_database"]), "authority database")
-    if authority_uid != plan["authority_uid"]:
-        raise CutoverError("startup-policy reconciliation owner changed")
-    lock_factory = broker_lock_factory or exclusive_broker_service_lock
-    mutated = False
-    with lock_factory(database), maintenance_locker(
-        maintenance_root=maintenance_root,
-        expected_uid=authority_uid,
-        expected_gid=maintenance_gid,
-    ):
-        require_maintenance()
-        identity_before = identity_reader(database, uid=authority_uid)
-        connection = sqlite3.connect(database)
-        connection.row_factory = sqlite3.Row
-        try:
-            connection.execute("PRAGMA foreign_keys = ON")
-            connection.execute("PRAGMA busy_timeout = 5000")
-            connection.execute("BEGIN IMMEDIATE")
-            _authority_repair_schema(connection)
-            metadata, snapshot, policies = _authority_repository_repair_snapshot(
-                connection, str(plan["repository"]["repository_id"])
-            )
-            root_proof = root_reader(snapshot["canonical_root"])
-            if (
-                not isinstance(root_proof, Mapping)
-                or root_proof.get("git_metadata_absent") is not True
-                or {
-                    key: root_proof[key]
-                    for key in ("device", "inode", "mode", "owner_uid")
-                }
-                != plan["repository"]["root_identity"]
-            ):
-                raise CutoverError("startup-policy reconciliation root proof changed")
-            repository_matches = all(
-                snapshot[key] == plan["repository"][key]
-                for key in plan["repository"]
-                if key != "root_identity"
-            ) and snapshot["enrollment_count"] == 0
-            same_database = _authority_repair_same_database(
-                planned=plan["database_identity"], current=identity_before
-            )
-            initial = bool(
-                metadata["authority_generation"] == plan["authority_generation"]
-                and metadata["state_revision"] == plan["authority_state_revision"]
-                and same_database
-                and repository_matches
-                and _authority_startup_policies_match_initial(
-                    plan["startup_policies"], policies
-                )
-            )
-            recovered = False
-            if (
-                metadata["authority_generation"] == plan["authority_generation"]
-                and metadata["state_revision"]
-                == int(plan["authority_state_revision"]) + 1
-                and same_database
-                and repository_matches
-            ):
-                try:
-                    _authority_startup_policy_results(
-                        planned=plan["startup_policies"],
-                        current=policies,
-                        applied_at=str(plan["mutation_updated_at"]),
-                    )
-                except CutoverError:
-                    pass
-                else:
-                    recovered = True
-            if not initial and not recovered:
-                raise CutoverError("startup-policy reconciliation plan drifted")
-            if initial:
-                changed = 0
-                for policy in _validate_authority_startup_policies(
-                    plan["startup_policies"]
-                ):
-                    if not policy["requires_update"]:
-                        continue
-                    changed += connection.execute(
-                        """
-                        UPDATE startup_policies
-                        SET current_value = desired_disabled_value,
-                            generation = generation + 1, updated_at = ?
-                        WHERE policy_id = ? AND repo_id = ?
-                          AND resource_kind = ? AND resource_id = ?
-                          AND policy_kind = ? AND current_value = ?
-                          AND desired_disabled_value = ?
-                          AND immutable_fingerprint = ? AND generation = ?
-                          AND updated_at = ?
-                        """,
-                        (
-                            plan["mutation_updated_at"],
-                            policy["policy_id"],
-                            plan["repository"]["repository_id"],
-                            policy["resource_kind"],
-                            policy["resource_id"],
-                            policy["policy_kind"],
-                            policy["current_value"],
-                            policy["desired_disabled_value"],
-                            policy["immutable_fingerprint"],
-                            policy["generation"],
-                            policy["updated_at"],
-                        ),
-                    ).rowcount
-                expected_updates = sum(
-                    int(bool(policy["requires_update"]))
-                    for policy in plan["startup_policies"]
-                )
-                changed_revision = connection.execute(
-                    """
-                    UPDATE schema_metadata
-                    SET state_revision = state_revision + 1, updated_at = ?
-                    WHERE singleton = 1 AND database_generation = ?
-                      AND state_revision = ?
-                    """,
-                    (
-                        plan["mutation_updated_at"],
-                        plan["authority_generation"],
-                        plan["authority_state_revision"],
-                    ),
-                ).rowcount
-                if changed != expected_updates or changed_revision != 1:
-                    raise CutoverError(
-                        "startup-policy reconciliation exact mutation was incomplete"
-                    )
-                terminal_metadata, terminal_snapshot, terminal_policies = (
-                    _authority_repository_repair_snapshot(
-                        connection,
-                        str(plan["repository"]["repository_id"]),
-                    )
-                )
-                if (
-                    terminal_metadata["state_revision"]
-                    != int(plan["authority_state_revision"]) + 1
-                    or terminal_snapshot["state"] != "missing"
-                    or terminal_snapshot["installation_status"] != "disabled"
-                    or terminal_snapshot["installation_startup_fenced"] is not True
-                    or not _authority_startup_policies_match_terminal(
-                        plan["startup_policies"],
-                        terminal_policies,
-                        applied_at=plan["mutation_updated_at"],
-                    )
-                ):
-                    raise CutoverError(
-                        "startup-policy reconciliation precommit state is incomplete"
-                    )
-                if before_commit_hook is not None:
-                    before_commit_hook()
-                require_maintenance()
-                connection.commit()
-                mutated = True
-                if after_commit_hook is not None:
-                    after_commit_hook()
-                connection.execute("BEGIN")
-                metadata, snapshot, policies = _authority_repository_repair_snapshot(
-                    connection, str(plan["repository"]["repository_id"])
-                )
-                connection.execute("ROLLBACK")
-            else:
-                connection.execute("ROLLBACK")
-        except BaseException:
-            try:
-                connection.rollback()
-            except sqlite3.Error:
-                pass
-            raise
-        finally:
-            connection.close()
-        identity_after = identity_reader(database, uid=authority_uid)
-    policy_results = _authority_startup_policy_results(
-        planned=plan["startup_policies"],
-        current=policies,
-        applied_at=str(plan["mutation_updated_at"]),
-    )
-    if (
-        metadata["authority_generation"] != plan["authority_generation"]
-        or metadata["state_revision"]
-        != int(plan["authority_state_revision"]) + 1
-        or not _authority_repair_same_database(
-            planned=plan["database_identity"], current=identity_after
-        )
-        or snapshot["state"] != "missing"
-        or snapshot["installation_status"] != "disabled"
-        or snapshot["installation_startup_fenced"] is not True
-        or snapshot["enrollment_count"] != 0
-    ):
-        raise CutoverError("startup-policy reconciliation terminal state failed")
-    result = _validate_authority_repository_policy_reconciliation_result(
-        seal(
-            AUTHORITY_REPOSITORY_POLICY_RECONCILIATION_RESULT_KIND,
-            {
-                "plan_id": plan["plan_id"],
-                "plan_document_sha256": plan["document_sha256"],
-                "source_repair_plan_sha256": plan[
-                    "source_repair_plan_sha256"
-                ],
-                "source_repair_result_sha256": plan[
-                    "source_repair_result_sha256"
-                ],
-                "source_repair_plan_id": plan["source_repair_plan_id"],
-                "authority_database": str(database),
-                "authority_uid": authority_uid,
-                "authority_generation": plan["authority_generation"],
-                "maintenance_deployment_id": deployment_id,
-                "database_identity_before": dict(identity_before),
-                "database_identity_after": dict(identity_after),
-                "repository_id": plan["repository"]["repository_id"],
-                "repository_generation": plan["repository"]["generation"],
-                "installation_generation": plan["repository"][
-                    "installation_generation"
-                ],
-                "state_revision_before": plan["authority_state_revision"],
-                "state_revision_after": int(plan["authority_state_revision"]) + 1,
-                "startup_policy_count": len(policy_results),
-                "startup_policy_update_count": sum(
-                    int(bool(policy["requires_update"]))
-                    for policy in policy_results
-                ),
-                "startup_policies": policy_results,
-                "enrollment_count": 0,
-                "reason": AUTHORITY_REPOSITORY_POLICY_RECONCILIATION_REASON,
-                "actor": AUTHORITY_REPOSITORY_REPAIR_ACTOR,
-                "applied_at": plan["mutation_updated_at"],
-            },
-        )
-    )
-    _publish_evidence(
-        _absolute(attestation, "startup-policy reconciliation attestation"),
-        result,
-        uid=authority_uid,
-    )
-    return {
-        "ok": True,
-        "attestation": str(attestation),
-        "document_sha256": result["document_sha256"],
-        "repository_id": result["repository_id"],
-        "replayed": not mutated,
-    }
-
-
-def export_authority_test_repositories(
-    database: Path,
-    *,
-    authority_uid: int,
-    now_epoch: int | None = None,
-) -> dict[str, object]:
-    """Export exact v13 execution owners without path or caller inference."""
-
-    database = _absolute(database, "authority database")
-    _database_identity(database, uid=authority_uid)
-    current_epoch = int(time.time()) if now_epoch is None else int(now_epoch)
-    connection = sqlite3.connect(f"{database.as_uri()}?mode=ro", uri=True)
-    connection.row_factory = sqlite3.Row
-    try:
-        connection.execute("PRAGMA query_only = ON")
-        generation = connection.execute(
-            """
-            SELECT schema_version, database_generation, migration_state
-            FROM schema_metadata WHERE singleton = 1
-            """
-        ).fetchone()
-        rows = connection.execute(
-            """
-            SELECT r.repo_id, r.canonical_root, r.generation,
-                   owner.owner_uid, owner.repository_generation,
-                   owner.evidence_sha256,
-                   transfer.owner_uid AS ledger_owner_uid,
-                   transfer.repository_generation AS ledger_repository_generation,
-                   transfer.evidence_sha256 AS ledger_evidence_sha256,
-                   enrollment.enabled AS enrollment_enabled,
-                   enrollment.valid_until_epoch,
-                   principal.enabled AS principal_enabled
-            FROM repositories r
-            JOIN repository_installations i ON i.repo_id = r.repo_id
-            JOIN repository_owners owner ON owner.repo_id = r.repo_id
-            JOIN repository_owner_transfers transfer
-              ON transfer.repo_id = owner.repo_id
-             AND transfer.authority_generation = owner.authority_generation
-            LEFT JOIN broker_repository_enrollments enrollment
-              ON enrollment.repo_id = r.repo_id
-             AND enrollment.uid = owner.owner_uid
-            LEFT JOIN broker_acl_principals principal
-              ON principal.uid = enrollment.uid
-             AND principal.account_id = enrollment.account_id
-            WHERE r.state = 'active'
-              AND i.status = 'installed'
-              AND i.startup_fenced = 0
-              AND owner.repository_generation = r.generation
-            ORDER BY r.repo_id
-            """,
-        ).fetchall()
-        if (
-            generation is None
-            or int(generation["schema_version"]) != 13
-            or str(generation["migration_state"]) != "ready"
-            or not isinstance(generation["database_generation"], str)
-            or not generation["database_generation"]
-        ):
-            raise CutoverError("authority database generation is unavailable")
-        repositories: list[dict[str, object]] = []
-        seen: set[str] = set()
-        for row in rows:
-            repository_id = str(row["repo_id"])
-            repository_generation = int(row["generation"])
-            owner_uid = int(row["owner_uid"])
-            if (
-                not repository_id
-                or len(repository_id.encode("utf-8")) > 256
-                or repository_generation < 0
-                or owner_uid <= 0
-                or repository_id in seen
-                or int(row["repository_generation"]) != repository_generation
-                or int(row["ledger_owner_uid"]) != owner_uid
-                or int(row["ledger_repository_generation"])
-                != repository_generation
-                or str(row["ledger_evidence_sha256"])
-                != str(row["evidence_sha256"])
-                or row["enrollment_enabled"] is None
-                or not bool(row["enrollment_enabled"])
-                or row["principal_enabled"] is None
-                or not bool(row["principal_enabled"])
-                or int(row["valid_until_epoch"] or 0) <= current_epoch
-            ):
-                raise CutoverError("authority repository identity is invalid or ambiguous")
-            seen.add(repository_id)
-            repositories.append(
-                {
-                    "repository_id": repository_id,
-                    "owner_uid": owner_uid,
-                    "repository_generation": repository_generation,
-                }
-            )
-    finally:
-        connection.close()
-    if not repositories:
-        raise CutoverError("authority export contains no active repository enrollments")
-    return seal(
-        AUTHORITY_REPOSITORY_EXPORT_KIND,
-        {
-            "authority_generation": str(generation["database_generation"]),
-            "repositories": repositories,
-            "exported_at": _now(),
-        },
-    )
-
-
-def publish_authority_repository_export(
-    *,
-    authority_database: Path,
-    attestation: Path,
-    authority_uid: int,
-    now_epoch: int | None = None,
-) -> dict[str, object]:
-    """Publish the exact sealed authority enrollment catalog for adopters.
-
-    The export contains immutable repository IDs, owner UIDs, repository
-    generations, and the authority generation only.  It is intentionally
-    root-private and no-clobber so fleet adoption cannot infer ownership from
-    checkout paths or names and cannot silently consume a newer generation.
-    """
-
-    document = export_authority_test_repositories(
-        authority_database,
-        authority_uid=authority_uid,
-        now_epoch=now_epoch,
-    )
-    verified = verify_seal(
-        document,
-        kind=AUTHORITY_REPOSITORY_EXPORT_KIND,
-        fields=AUTHORITY_REPOSITORY_EXPORT_FIELDS,
-    )
-    _publish_evidence(attestation, verified, uid=authority_uid)
-    return {
-        "ok": True,
-        "attestation": str(attestation),
-        "authority_generation": verified["authority_generation"],
-        "repository_count": len(verified["repositories"]),
-        "document_sha256": verified["document_sha256"],
-    }
-
-
-def build_test_capability_policy(
-    authority_export: Mapping[str, object],
-    *,
-    setup_reader,
-    dogfood_repository_id: str,
-) -> tuple[dict[str, object], list[dict[str, object]]]:
-    """Build least-privilege grants from UID-parsed setup projections."""
-
-    exported = verify_seal(
-        authority_export,
-        kind=AUTHORITY_REPOSITORY_EXPORT_KIND,
-        fields=AUTHORITY_REPOSITORY_EXPORT_FIELDS,
-    )
-    rows = exported["repositories"]
-    if not isinstance(rows, list) or not rows or len(rows) > 10_000:
-        raise CutoverError("authority repository export is invalid")
-    if not isinstance(dogfood_repository_id, str) or not dogfood_repository_id:
-        raise CutoverError("dogfood repository ID is required")
-    policy_rows: list[dict[str, object]] = []
-    grants: list[dict[str, object]] = []
-    seen: set[str] = set()
-    for item in rows:
-        if (
-            not isinstance(item, Mapping)
-            or set(item)
-            != {"repository_id", "owner_uid", "repository_generation"}
-            or not isinstance(item["repository_id"], str)
-            or not item["repository_id"]
-            or type(item["owner_uid"]) is not int
-            or int(item["owner_uid"]) <= 0
-            or type(item["repository_generation"]) is not int
-            or int(item["repository_generation"]) < 0
-            or item["repository_id"] in seen
-        ):
-            raise CutoverError("authority repository export entry is invalid")
-        repository_id = str(item["repository_id"])
-        seen.add(repository_id)
-        raw_setup = setup_reader(repository_id, int(item["owner_uid"]))
-        if not isinstance(raw_setup, Mapping):
-            raise CutoverError("repository UID setup parser returned invalid evidence")
-        setup = decode_repository_setup_document(
-            raw_setup,
-            expected_repository_id=repository_id,
-        )
-        requested = sorted(
-            {
-                *(f"network.{network}" for network in setup["network_requirements"] if network != "none"),
-                *(f"fixture.{fixture}" for fixture in setup["fixtures"]),
-                *(f"credential.{credential}" for credential in setup["credentials"]),
-            }
-        )
-        generation = int(item["repository_generation"])
-        policy_rows.append(
-            {
-                "repository_id": repository_id,
-                "generation": generation,
-                "capabilities": requested,
-            }
-        )
-        grants.append(
-            {
-                "repository_id": repository_id,
-                "generation": generation,
-                "setup_status": setup["status"],
-                "manifest_fingerprint": setup["manifest_fingerprint"],
-                "requested": requested,
-                "granted": requested,
-            }
-        )
-    dogfood = next(
-        (item for item in grants if item["repository_id"] == dogfood_repository_id),
-        None,
-    )
-    if (
-        dogfood is None
-        or dogfood["setup_status"] != "ready"
-        or "network.loopback" not in dogfood["requested"]
-    ):
-        raise CutoverError(
-            "DevCoordinator dogfood repository is not ready with explicit loopback testing"
-        )
-    policy_rows.sort(key=lambda item: str(item["repository_id"]))
-    grants.sort(key=lambda item: str(item["repository_id"]))
-    return {"schema_version": 1, "repositories": policy_rows}, grants
-
-
-def _publish_test_capability_document(
-    destination: Path,
-    document: Mapping[str, object],
-    *,
-    owner_uid: int,
-    owner_gid: int,
-) -> tuple[bytes, bool]:
-    destination = _absolute(destination, "test capability policy")
-    parent = destination.parent.lstat()
-    if (
-        stat.S_ISLNK(parent.st_mode)
-        or not stat.S_ISDIR(parent.st_mode)
-        or destination.parent.resolve(strict=True) != destination.parent
-        or parent.st_uid != owner_uid
-        or stat.S_IMODE(parent.st_mode) & 0o022
-        or os.geteuid() != owner_uid
-    ):
-        raise CutoverError("test capability policy parent is unsafe")
-    payload = json.dumps(document, indent=2, sort_keys=True).encode("utf-8") + b"\n"
-    if len(payload) > MAX_DOCUMENT_BYTES:
-        raise CutoverError("test capability policy exceeds its byte bound")
-    existed = destination.exists() or destination.is_symlink()
-    if existed:
-        info = destination.lstat()
-        if (
-            stat.S_ISLNK(info.st_mode)
-            or not stat.S_ISREG(info.st_mode)
-            or info.st_uid != owner_uid
-            or info.st_gid != owner_gid
-            or stat.S_IMODE(info.st_mode) != 0o600
-        ):
-            raise CutoverError("existing test capability policy is unsafe")
-        if destination.read_bytes() == payload:
-            return payload, False
-    temporary = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.partial")
-    descriptor = os.open(
-        temporary,
-        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
-        0o600,
-    )
-    try:
-        os.write(descriptor, payload)
-        os.fsync(descriptor)
-        os.fchown(descriptor, owner_uid, owner_gid)
-        os.fchmod(descriptor, 0o600)
-    finally:
-        os.close(descriptor)
-    try:
-        os.replace(temporary, destination)
-        parent_descriptor = os.open(
-            destination.parent,
-            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
-        )
-        try:
-            os.fsync(parent_descriptor)
-        finally:
-            os.close(parent_descriptor)
-    finally:
-        temporary.unlink(missing_ok=True)
-    return payload, True
-
-
-def publish_test_capability_policy(
-    *,
-    authority_database: Path,
-    snapshot_socket: Path,
-    destination: Path,
-    dogfood_repository_id: str,
-    authority_uid: int,
-    owner_gid: int,
-    expected_snapshot_uid: int = 0,
-    now_epoch: int | None = None,
-    setup_reader=None,
-) -> dict[str, object]:
-    authority_export = export_authority_test_repositories(
-        authority_database,
-        authority_uid=authority_uid,
-        now_epoch=now_epoch,
-    )
-    if setup_reader is None:
-        client = UnixSnapshotServiceClient(
-            _absolute(snapshot_socket, "snapshot service socket"),
-            expected_server_uid=expected_snapshot_uid,
-        )
-        setup_reader = lambda repository_id, owner_uid: client.setup_as_owner(
-            repository_id=repository_id,
-            owner_uid=owner_uid,
-        )
-    try:
-        policy, grants = build_test_capability_policy(
-            authority_export,
-            setup_reader=setup_reader,
-            dogfood_repository_id=dogfood_repository_id,
-        )
-    except (TestStoreConflict, TestStoreContractError) as error:
-        raise CutoverError(
-            "repository capability policy cannot be derived from setup evidence"
-        ) from error
-    payload, created = _publish_test_capability_document(
-        destination,
-        policy,
-        owner_uid=authority_uid,
-        owner_gid=owner_gid,
-    )
-    registry = SealedTestCapabilityRegistry.load(
-        _absolute(destination, "test capability policy"),
-        expected_uid=authority_uid,
-        allow_missing=False,
-    )
-    for grant in grants:
-        networks = tuple(
-            capability.split(".", 1)[1]
-            for capability in grant["requested"]
-            if str(capability).startswith("network.")
-        )
-        fixtures = tuple(
-            capability.split(".", 1)[1]
-            for capability in grant["requested"]
-            if str(capability).startswith("fixture.")
-        )
-        credentials = tuple(
-            capability.split(".", 1)[1]
-            for capability in grant["requested"]
-            if str(capability).startswith("credential.")
-        )
-        checked = registry.check_requests(
-            repository_id=str(grant["repository_id"]),
-            repository_generation=int(grant["generation"]),
-            networks=networks,
-            fixtures=fixtures,
-            credentials=credentials,
-        )
-        if checked["ok"] is not True:
-            raise CutoverError("published test capability policy failed broker validation")
-    attestation = seal(
-        CAPABILITY_POLICY_KIND,
-        {
-            "policy_path": str(_absolute(destination, "test capability policy")),
-            "policy_owner_uid": authority_uid,
-            "policy_mode": "0600",
-            "policy_file_sha256": hashlib.sha256(payload).hexdigest(),
-            "policy_fingerprint": registry.policy_fingerprint,
-            "authority_generation": authority_export["authority_generation"],
-            "authority_export_sha256": authority_export["document_sha256"],
-            "dogfood_repository_id": dogfood_repository_id,
-            "repository_grants": grants,
-            "coverage_complete": True,
-            "broker_contract_verified": True,
-            "created_at": _now(),
-        },
-    )
-    return {"ok": True, "created": created, "attestation": attestation}
-
-
 def _publish_reconstructed_profile(
     destination: Path,
     document: Mapping[str, object],
     *,
     owner_uid: int,
-    access_gid: int,
 ) -> tuple[bytes, bool]:
     """Replace even an incorrectly owned regular profile without trusting it."""
 
@@ -6884,7 +1863,6 @@ def _publish_reconstructed_profile(
         or destination.parent.resolve(strict=True) != destination.parent
         or parent.st_uid != owner_uid
         or stat.S_IMODE(parent.st_mode) & 0o022
-        or access_gid <= 0
     ):
         raise CutoverError("protected API profile parent or publisher is unsafe")
     payload = json.dumps(document, indent=2, sort_keys=True).encode("utf-8") + b"\n"
@@ -6897,8 +1875,7 @@ def _publish_reconstructed_profile(
             raise CutoverError("existing API profile is not a replaceable regular file")
         if (
             info.st_uid == owner_uid
-            and info.st_gid == access_gid
-            and stat.S_IMODE(info.st_mode) == 0o640
+            and stat.S_IMODE(info.st_mode) == 0o644
             and info.st_size <= MAX_DOCUMENT_BYTES
             and destination.read_bytes() == payload
         ):
@@ -6910,13 +1887,13 @@ def _publish_reconstructed_profile(
         descriptor = os.open(
             temporary,
             os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
-            0o640,
+            0o644,
         )
         try:
             os.write(descriptor, payload)
             os.fsync(descriptor)
-            os.fchown(descriptor, owner_uid, access_gid)
-            os.fchmod(descriptor, 0o640)
+            os.fchown(descriptor, owner_uid, -1)
+            os.fchmod(descriptor, 0o644)
         finally:
             os.close(descriptor)
         try:
@@ -6936,8 +1913,7 @@ def _publish_reconstructed_profile(
         stat.S_ISLNK(after.st_mode)
         or not stat.S_ISREG(after.st_mode)
         or after.st_uid != owner_uid
-        or after.st_gid != access_gid
-        or stat.S_IMODE(after.st_mode) != 0o640
+        or stat.S_IMODE(after.st_mode) != 0o644
         or destination.read_bytes() != payload
     ):
         raise CutoverError("reconstructed API profile publication did not verify")
@@ -6948,27 +1924,15 @@ def reconstruct_api_profile_from_authority(
     *,
     authority_database: Path,
     destination: Path,
-    api_uid: int,
-    access_gid: int,
+    validation_uid: int,
     authority_uid: int = 0,
-    account_id: str = API_BROKER_ACCOUNT,
-    source_authority_generation: str | None = None,
-    target_authority_generation: str | None = None,
-    now_epoch: int | None = None,
 ) -> dict[str, object]:
-    """Rebuild every protected client profile exclusively from v13 authority.
+    """Rebuild the host routing profile from the current trusted-local catalog."""
 
-    The pre-v13 file is deliberately neither parsed nor merged.  It may have
-    any historical repository shape and is treated only as a replaceable
-    regular-file destination.  This is the cutover bridge that makes the
-    owner-authority migration and the stricter client parser one transaction.
-    """
-
-    if api_uid <= 0 or authority_uid != os.geteuid() or account_id != API_BROKER_ACCOUNT:
-        raise CutoverError("API profile reconstruction identity is invalid")
-    database = _absolute(authority_database, "authority database")
+    if validation_uid <= 0 or authority_uid != os.geteuid():
+        raise CutoverError("routing profile validation identity is invalid")
+    database = _absolute(authority_database, "coordinator database")
     before = _database_identity(database, uid=authority_uid)
-    now = int(time.time()) if now_epoch is None else int(now_epoch)
     connection = sqlite3.connect(f"{database.as_uri()}?mode=ro", uri=True)
     connection.row_factory = sqlite3.Row
     try:
@@ -6979,351 +1943,213 @@ def reconstruct_api_profile_from_authority(
             FROM schema_metadata WHERE singleton = 1
             """
         ).fetchone()
-        rows = connection.execute(
+        repository_rows = connection.execute(
             """
-            SELECT enrollment.uid, enrollment.account_id,
-                   enrollment.repo_id, enrollment.issued_at,
-                   enrollment.valid_until_epoch, repository.canonical_root,
-                   repository.generation, owner.owner_uid,
-                   owner.repository_generation
-            FROM broker_repository_enrollments enrollment
-            JOIN broker_acl_principals principal
-              ON principal.uid = enrollment.uid
-             AND principal.account_id = enrollment.account_id
-            JOIN repositories repository USING(repo_id)
-            JOIN repository_installations installation USING(repo_id)
-            LEFT JOIN repository_owners owner USING(repo_id)
-            WHERE principal.enabled = 1
-              AND enrollment.enabled = 1
-              AND enrollment.valid_until_epoch > ?
-              AND repository.state = 'active'
+            SELECT repository.repo_id, repository.canonical_root,
+                   repository.generation
+            FROM repositories AS repository
+            JOIN repository_installations AS installation USING(repo_id)
+            WHERE repository.state = 'active'
               AND installation.status = 'installed'
               AND installation.startup_fenced = 0
-            ORDER BY enrollment.uid, repository.canonical_root,
-                     enrollment.repo_id
-            """,
-            (now,),
+            ORDER BY repository.canonical_root, repository.repo_id
+            """
         ).fetchall()
         if (
             metadata is None
-            or int(metadata[0]) != 13
-            or not isinstance(metadata[1], str)
-            or not metadata[1]
-            or str(metadata[2]) != "ready"
-            or not rows
-            or len(rows) > 10_000
+            or int(metadata["schema_version"]) != COORDINATOR_SCHEMA_VERSION
+            or str(metadata["migration_state"]) != "ready"
+            or not isinstance(metadata["database_generation"], str)
+            or not metadata["database_generation"]
+            or not repository_rows
+            or len(repository_rows) > 10_000
         ):
             raise CutoverError(
-                "v13 authority has no exact active protected-profile enrollment"
+                "current coordinator database has no routable repository catalog"
             )
 
-        clients: dict[str, dict[str, object]] = {}
-        repository_bindings: list[dict[str, object]] = []
-
-        def add_mapping(
-            mapping: dict[str, str], key: object, value: object, *, label: str
-        ) -> None:
-            name = str(key)
-            resource_id = str(value)
-            previous = mapping.get(name)
-            if not name or not resource_id or (
-                previous is not None and previous != resource_id
-            ):
-                raise CutoverError(
-                    f"authority-derived {label} profile mapping is ambiguous"
-                )
-            mapping[name] = resource_id
-
-        for row in rows:
-            client_uid = int(row["uid"])
-            client_account = str(row["account_id"])
-            repository_id = str(row["repo_id"])
+        repositories: list[dict[str, object]] = []
+        bindings: list[dict[str, object]] = []
+        for row in repository_rows:
+            repo_id = str(row["repo_id"])
             canonical_root = str(row["canonical_root"])
-            issued_at = str(row["issued_at"])
-            valid_until = int(row["valid_until_epoch"])
             generation = int(row["generation"])
-            owner_value = row["owner_uid"]
-            owner_generation = row["repository_generation"]
-            if (
-                client_uid < 0
-                or not client_account
-                or not repository_id
-                or not Path(canonical_root).is_absolute()
-                or not issued_at
-                or valid_until <= now
-                or generation < 0
-                or owner_value is None
-                or int(owner_value) <= 0
-                or owner_generation is None
-                or int(owner_generation) != generation
-            ):
-                raise CutoverError(
-                    "active protected-profile enrollment lacks exact owner authority"
-                )
-            owner_uid = int(owner_value)
-            client = clients.setdefault(
-                str(client_uid),
-                {
-                    "account_id": client_account,
-                    "issued_at": issued_at,
-                    "valid_until_epoch": valid_until,
-                    "repositories": [],
-                },
-            )
-            if client["account_id"] != client_account:
-                raise CutoverError(
-                    "one protected client UID has conflicting authority accounts"
-                )
-            repositories = client["repositories"]
-            if not isinstance(repositories, list) or any(
-                isinstance(item, Mapping)
-                and item.get("repo_id") == repository_id
-                for item in repositories
-            ):
-                raise CutoverError(
-                    "protected client authority repeats a repository enrollment"
-                )
+            if not repo_id or not Path(canonical_root).is_absolute() or generation < 0:
+                raise CutoverError("repository routing identity is invalid")
 
-            servers: dict[str, str] = {}
-            for resource in connection.execute(
-                """
-                SELECT DISTINCT definition.name, acl.resource_id
-                FROM broker_resource_acl acl
-                JOIN server_definitions definition
-                  ON definition.server_definition_id = acl.resource_id
-                 AND definition.repo_id = acl.repo_id
-                WHERE acl.uid = ? AND acl.repo_id = ?
-                  AND acl.resource_kind = 'server' AND acl.enabled = 1
-                ORDER BY definition.name, acl.resource_id
-                """,
-                (client_uid, repository_id),
-            ):
-                add_mapping(
-                    servers, resource["name"], resource["resource_id"], label="server"
-                )
-
-            containers: dict[str, str] = {}
-            for resource in connection.execute(
-                """
-                SELECT DISTINCT docker.current_name, docker.full_container_id,
-                                acl.resource_id
-                FROM broker_resource_acl acl
-                JOIN docker_resources docker
-                  ON docker.docker_resource_id = acl.resource_id
-                WHERE acl.uid = ? AND acl.repo_id = ?
-                  AND acl.resource_kind = 'container' AND acl.enabled = 1
-                ORDER BY docker.current_name, docker.full_container_id,
-                         acl.resource_id
-                """,
-                (client_uid, repository_id),
-            ):
-                add_mapping(
-                    containers,
-                    resource["current_name"],
-                    resource["resource_id"],
-                    label="container",
-                )
-                add_mapping(
-                    containers,
-                    resource["full_container_id"],
-                    resource["resource_id"],
-                    label="container",
-                )
-
-            compose_ids = [
-                str(resource[0])
-                for resource in connection.execute(
+            servers = {
+                str(server["name"]): str(server["server_definition_id"])
+                for server in connection.execute(
                     """
-                    SELECT DISTINCT acl.compose_definition_id
-                    FROM broker_compose_acl acl
-                    JOIN broker_compose_definitions definition
-                      ON definition.compose_definition_id = acl.compose_definition_id
-                     AND definition.repo_id = acl.repo_id
-                    WHERE acl.uid = ? AND acl.repo_id = ?
-                      AND acl.enabled = 1 AND definition.enabled = 1
-                    ORDER BY acl.compose_definition_id
+                    SELECT name, server_definition_id
+                    FROM server_definitions
+                    WHERE repo_id = ?
+                    ORDER BY name, server_definition_id
                     """,
-                    (client_uid, repository_id),
+                    (repo_id,),
                 )
-            ]
-            if len(compose_ids) > 1:
-                raise CutoverError(
-                    "protected client has ambiguous enabled Compose grants"
-                )
+            }
+            container_aliases: dict[str, set[str]] = {}
+            container_resource_ids: set[str] = set()
+            for resource in connection.execute(
+                """
+                SELECT docker_resource_id, current_name, full_container_id
+                FROM docker_resources
+                WHERE repo_id = ?
+                ORDER BY docker_resource_id
+                """,
+                (repo_id,),
+            ):
+                resource_id = str(resource["docker_resource_id"])
+                container_resource_ids.add(resource_id)
+                for alias in (
+                    str(resource["current_name"] or ""),
+                    str(resource["full_container_id"] or ""),
+                ):
+                    if alias:
+                        container_aliases.setdefault(alias, set()).add(resource_id)
+            # Container names are reusable display aliases, not authority.  A
+            # stale container and its replacement may therefore share a name.
+            # Retain aliases only when they resolve uniquely, then guarantee
+            # every resource remains addressable by its immutable Coordinator
+            # identity.  The latter deliberately wins over any pathological
+            # display/native alias collision.
+            containers = {
+                alias: next(iter(resource_ids))
+                for alias, resource_ids in container_aliases.items()
+                if len(resource_ids) == 1
+            }
+            containers.update(
+                {resource_id: resource_id for resource_id in container_resource_ids}
+            )
 
+            compose_rows = connection.execute(
+                """
+                SELECT compose_definition_id
+                FROM broker_compose_definitions
+                WHERE repo_id = ? AND enabled = 1
+                ORDER BY compose_definition_id
+                """,
+                (repo_id,),
+            ).fetchall()
+            if len(compose_rows) > 1:
+                raise CutoverError(
+                    "repository has multiple current Compose definitions"
+                )
+            compose_id = (
+                None
+                if not compose_rows
+                else str(compose_rows[0]["compose_definition_id"])
+            )
+            run_once = (
+                {}
+                if compose_id is None
+                else {
+                    str(service["service_name"]): int(
+                        service["max_timeout_seconds"]
+                    )
+                    for service in connection.execute(
+                        """
+                        SELECT service_name, max_timeout_seconds
+                        FROM broker_compose_run_once_services
+                        WHERE compose_definition_id = ?
+                        ORDER BY ordinal
+                        """,
+                        (compose_id,),
+                    )
+                }
+            )
             templates: dict[str, str] = {}
             secret_policies: dict[str, dict[str, str]] = {}
-            prefetch: list[str] = []
-            template_rows = connection.execute(
+            for template in connection.execute(
                 """
-                SELECT template.name, template.template_id,
-                       template.secret_policy_kind, template.secret_binding_id,
-                       MAX(CASE WHEN acl.operation = 'ephemeral.image_prefetch'
-                                AND acl.enabled = 1 THEN 1 ELSE 0 END) AS prefetch
-                FROM broker_ephemeral_acl acl
-                JOIN ephemeral_container_templates template
-                  ON template.template_id = acl.template_id
-                 AND template.repo_id = acl.repo_id
-                WHERE acl.uid = ? AND acl.repo_id = ?
-                  AND acl.enabled = 1 AND template.enabled = 1
-                GROUP BY template.name, template.template_id,
-                         template.secret_policy_kind, template.secret_binding_id
-                ORDER BY template.name, template.template_id
+                SELECT name, template_id, secret_policy_kind, secret_binding_id
+                FROM ephemeral_container_templates
+                WHERE repo_id = ? AND enabled = 1
+                ORDER BY name, template_id
                 """,
-                (client_uid, repository_id),
-            ).fetchall()
-            for resource in template_rows:
-                add_mapping(
-                    templates,
-                    resource["name"],
-                    resource["template_id"],
-                    label="ephemeral template",
-                )
-                if bool(resource["prefetch"]):
-                    prefetch.append(str(resource["template_id"]))
-                policy = resource["secret_policy_kind"]
-                binding = resource["secret_binding_id"]
-                if (policy is None) != (binding is None):
-                    raise CutoverError(
-                        "ephemeral template credential authority is incomplete"
-                    )
-                if policy is not None:
-                    secret_policies[str(resource["name"])] = {
-                        "policy": str(policy),
-                        "binding_id": str(binding),
+                (repo_id,),
+            ):
+                name = str(template["name"])
+                templates[name] = str(template["template_id"])
+                if template["secret_policy_kind"] is not None:
+                    secret_policies[name] = {
+                        "policy": str(template["secret_policy_kind"]),
+                        "binding_id": str(template["secret_binding_id"]),
                     }
 
             repositories.append(
                 {
                     "canonical_root": canonical_root,
-                    "repo_id": repository_id,
+                    "repo_id": repo_id,
                     "generation": generation,
-                    "owner_uid": owner_uid,
                     "servers": servers,
                     "containers": containers,
-                    "compose_definition_id": compose_ids[0] if compose_ids else None,
-                    "account_id": client_account,
-                    "enabled": True,
-                    "issued_at": issued_at,
-                    "valid_until_epoch": valid_until,
+                    "compose_definition_id": compose_id,
+                    "compose_container_ids": [],
+                    "compose_run_once_services": run_once,
                     "ephemeral_templates": templates,
-                    "ephemeral_image_prefetch_templates": sorted(prefetch),
                     "ephemeral_secret_policies": secret_policies,
                 }
             )
-            client["issued_at"] = min(str(client["issued_at"]), issued_at)
-            client["valid_until_epoch"] = max(
-                int(client["valid_until_epoch"]), valid_until
-            )
-            repository_bindings.append(
+            bindings.append(
                 {
-                    "client_uid": client_uid,
-                    "account_id": client_account,
-                    "repository_id": repository_id,
+                    "repository_id": repo_id,
                     "generation": generation,
-                    "owner_uid": owner_uid,
-                    "issued_at": issued_at,
-                    "valid_until_epoch": valid_until,
+                    "canonical_root": canonical_root,
                 }
             )
     finally:
         connection.close()
     after = _database_identity(database, uid=authority_uid)
     if before != after:
-        raise CutoverError("authority database identity changed during profile export")
-    api_client = clients.get(str(api_uid))
-    if (
-        not isinstance(api_client, Mapping)
-        or api_client.get("account_id") != account_id
-    ):
-        raise CutoverError("authority has no exact active API repository enrollment")
-    source_generation = (
-        str(source_authority_generation)
-        if source_authority_generation is not None
-        else ""
-    )
-    target_generation = (
-        str(target_authority_generation)
-        if target_authority_generation is not None
-        else ""
-    )
-    if (
-        not source_generation
-        or not target_generation
-        or source_generation == target_generation
-        or str(metadata[1]) != target_generation
-        or len(source_generation.encode("utf-8")) > 256
-        or len(target_generation.encode("utf-8")) > 256
-    ):
-        raise CutoverError(
-            "protected profile reconstruction requires the exact sealed target generation"
-        )
+        raise CutoverError("coordinator database changed during profile export")
+
     document = {
-        "version": 1,
+        "version": 2,
         "service": {
             "socket": AUTHORITY_SOCKET_PATH,
-            "uid": authority_uid,
-            "gid": access_gid,
-            "mode": "0660",
-            "database_generation": str(metadata[1]),
+            "database_generation": str(metadata["database_generation"]),
         },
-        "clients": clients,
+        "repositories": repositories,
     }
-    for client_uid in sorted(int(value) for value in clients):
-        try:
-            parsed = profile_from_document(document, effective_uid=client_uid)
-        except BrokerProfileError as error:
-            raise CutoverError(
-                "authority-derived protected profile failed strict parsing"
-            ) from error
-        expected = {
-            str(item["repository_id"])
-            for item in repository_bindings
-            if int(item["client_uid"]) == client_uid
-        }
-        if (
-            parsed.account_id != clients[str(client_uid)]["account_id"]
-            or parsed.service.database_generation != str(metadata[1])
-            or {item.repo_id for item in parsed.repositories.values()} != expected
-        ):
-            raise CutoverError("authority-derived protected profile is contradictory")
-    repository_ids = {
-        str(item["repository_id"])
-        for item in repository_bindings
-        if int(item["client_uid"]) == api_uid
-    }
+    try:
+        parsed = profile_from_document(document, effective_uid=validation_uid)
+    except BrokerProfileError as error:
+        raise CutoverError(
+            "coordinator-derived routing profile failed strict parsing"
+        ) from error
+    if (
+        parsed.service.database_generation != str(metadata["database_generation"])
+        or {item.repo_id for item in parsed.repositories.values()}
+        != {str(item["repository_id"]) for item in bindings}
+    ):
+        raise CutoverError("coordinator-derived routing profile is contradictory")
+
     payload, changed = _publish_reconstructed_profile(
         destination,
         document,
         owner_uid=authority_uid,
-        access_gid=access_gid,
     )
     source = {
-        "authority_generation": str(metadata[1]),
-        "source_authority_generation": source_generation,
-        "api_uid": api_uid,
-        "account_id": account_id,
-        "repository_bindings": repository_bindings,
+        "database_generation": str(metadata["database_generation"]),
+        "repository_bindings": bindings,
     }
     attestation = seal(
         PROFILE_REPAIR_KIND,
         {
             "profile_path": str(_absolute(destination, "protected API profile")),
             "profile_owner_uid": authority_uid,
-            "profile_group_gid": access_gid,
-            "profile_mode": "0640",
+            "profile_mode": "0644",
             "profile_sha256": hashlib.sha256(payload).hexdigest(),
-            "source_authority_generation": source_generation,
-            "authority_generation": str(metadata[1]),
+            "authority_generation": str(metadata["database_generation"]),
             "authority_source_sha256": _digest(source),
-            "api_uid": api_uid,
-            "broker_account_id": account_id,
-            "repository_ids": sorted(repository_ids),
-            "client_uids": sorted(int(value) for value in clients),
-            "repository_bindings": repository_bindings,
+            "validation_uid": validation_uid,
+            "repository_ids": sorted(
+                str(item["repository_id"]) for item in bindings
+            ),
+            "repository_bindings": bindings,
             "parser_verified": True,
-            "all_clients_parser_verified": True,
-            "existing_profile_contents_reused": False,
             "atomic_publication_verified": True,
             "created_at": _now(),
         },
@@ -7331,10 +2157,10 @@ def reconstruct_api_profile_from_authority(
     return {"ok": True, "changed": changed, "attestation": attestation}
 
 
-def _post_v13_authority_metadata(
+def _authority_metadata(
     database: Path, *, authority_uid: int
 ) -> dict[str, object]:
-    """Read the final authority generation without accepting an inode swap."""
+    """Read the current catalog generation without accepting an inode swap."""
 
     before = _database_identity(database, uid=authority_uid)
     with closing(
@@ -7348,7 +2174,7 @@ def _post_v13_authority_metadata(
     after = _database_identity(database, uid=authority_uid)
     if before != after or row is None or len(row) != 3:
         raise CutoverError(
-            "post-v13 authority identity changed during readiness verification"
+            "coordinator catalog changed during readiness verification"
         )
     return {
         "schema_version": int(row[0]),
@@ -7359,11 +2185,8 @@ def _post_v13_authority_metadata(
 
 
 def _immutable_inventory_client(release: Path) -> tuple[Path, str]:
-    release = _absolute(release, "post-v13 immutable release")
-    client = (
-        release
-        / "skills/codex-dev-coordinator/scripts/dev_coordinator.py"
-    )
+    release = _absolute(release, "immutable release")
+    client = release / "skills/codex-dev-coordinator/scripts/dev_coordinator.py"
     if (
         not client.is_file()
         or client.is_symlink()
@@ -7374,20 +2197,22 @@ def _immutable_inventory_client(release: Path) -> tuple[Path, str]:
     return client, _file_digest(client)
 
 
-def _inventory_as_repository_owner(
-    *, release: Path, project: str, owner_uid: int
+def _inventory_as_execution_uid(
+    *, release: Path, project: str, execution_uid: int
 ) -> dict[str, object]:
-    """Run the immutable inventory client as the repository owner."""
+    """Run one cross-repository inventory read as an explicit local account."""
 
+    if type(execution_uid) is not int or execution_uid <= 0:
+        raise CutoverError("inventory execution UID must be positive")
     try:
-        account = pwd.getpwuid(owner_uid)
+        account = pwd.getpwuid(execution_uid)
     except KeyError as error:
-        raise CutoverError("repository owner account is unavailable") from error
+        raise CutoverError("inventory execution account is unavailable") from error
     client, _client_sha256 = _immutable_inventory_client(release)
     command = [
         "/usr/bin/setpriv",
         "--reuid",
-        str(owner_uid),
+        str(execution_uid),
         "--regid",
         str(account.pw_gid),
         "--init-groups",
@@ -7415,24 +2240,24 @@ def _inventory_as_repository_owner(
             },
         )
     except (OSError, subprocess.TimeoutExpired) as error:
-        raise CutoverError("owner-scoped inventory proof could not run") from error
+        raise CutoverError("local routing inventory proof could not run") from error
     if (
         completed.returncode != 0
         or not completed.stdout
         or len(completed.stdout) > MAX_DOCUMENT_BYTES
         or len(completed.stderr) > 64 * 1024
     ):
-        raise CutoverError("owner-scoped inventory proof failed")
+        raise CutoverError("local routing inventory proof failed")
     try:
         document = json.loads(completed.stdout)
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise CutoverError("owner-scoped inventory proof is invalid JSON") from error
+        raise CutoverError("local routing inventory proof is invalid JSON") from error
     if not isinstance(document, dict):
-        raise CutoverError("owner-scoped inventory proof is invalid")
+        raise CutoverError("local routing inventory proof is invalid")
     return document
 
 
-def _validate_owner_inventory_document(
+def _validate_routing_inventory(
     inventory: Mapping[str, object],
     *,
     project: str,
@@ -7443,19 +2268,23 @@ def _validate_owner_inventory_document(
 ) -> None:
     authority = inventory.get("authority")
     repositories = inventory.get("repositories")
-    matching = [
-        item
-        for item in repositories
-        if isinstance(item, Mapping)
-        and item.get("canonical_root") == project
-        and item.get("repo_id") == repository_id
-        and item.get("generation") == repository_generation
-    ] if isinstance(repositories, list) else []
+    matching = (
+        [
+            item
+            for item in repositories
+            if isinstance(item, Mapping)
+            and item.get("canonical_root") == project
+            and item.get("repo_id") == repository_id
+            and item.get("generation") == repository_generation
+        ]
+        if isinstance(repositories, list)
+        else []
+    )
     if (
         inventory.get("schema_version") != 2
         or not isinstance(authority, Mapping)
         or authority.get("scope") != "server-wide"
-        or authority.get("transport") != "authenticated-unix-socket"
+        or authority.get("transport") != "trusted-local-unix-socket"
         or authority.get("socket") != AUTHORITY_SOCKET_PATH
         or authority.get("service_uid") != authority_uid
         or authority.get("database_generation") != authority_generation
@@ -7464,11 +2293,11 @@ def _validate_owner_inventory_document(
         or len(matching) != 1
     ):
         raise CutoverError(
-            "owner-scoped inventory does not prove the exact post-v13 grant"
+            "local routing inventory does not prove the selected repository"
         )
 
 
-def verify_post_v13_profile_inventory_readiness(
+def verify_profile_inventory_readiness(
     *,
     state: Mapping[str, object],
     profile_repair: Mapping[str, object],
@@ -7477,140 +2306,92 @@ def verify_post_v13_profile_inventory_readiness(
     inventory_fetcher: Any = None,
     verified_at: str | None = None,
 ) -> dict[str, object]:
-    """Prove the regenerated profile works for one exact owner-scoped read."""
+    """Prove one local account can route to any selected repository."""
 
     current = validate_state(state)
-    delegation = _recorded(current, "api-delegation")
-    if current["phase"] != "sealed" or delegation is None:
-        raise CutoverError(
-            "post-v13 profile readiness requires the recorded API delegation"
-        )
-    delegation = verify_seal(
-        delegation, kind=DELEGATION_KIND, fields=DELEGATION_FIELDS
-    )
+    if current["phase"] != "sealed":
+        raise CutoverError("routing readiness requires the sealed migration")
     repair = verify_seal(
         profile_repair,
         kind=PROFILE_REPAIR_KIND,
         fields=PROFILE_REPAIR_FIELDS,
     )
-    database = _absolute(authority_database, "post-v13 authority database")
-    release = _absolute(current["release"], "post-v13 immutable release")
+    database = _absolute(authority_database, "authority database")
+    release = _absolute(current["release"], "immutable release")
     _inventory_client, inventory_client_sha256 = _immutable_inventory_client(release)
     project_path = str(
-        _absolute(current["inventory_canary_project"], "owner inventory project")
+        _absolute(current["inventory_canary_project"], "inventory project")
     )
-    completion = _test_store_cutover_completion(current)
-    metadata = _post_v13_authority_metadata(
-        database, authority_uid=authority_uid
-    )
+    metadata = _authority_metadata(database, authority_uid=authority_uid)
     if (
         authority_uid != os.geteuid()
         or str(database) != current["authority_database"]
-        or int(metadata["schema_version"]) != 13
+        or int(metadata["schema_version"]) != COORDINATOR_SCHEMA_VERSION
         or metadata["migration_state"] != "ready"
         or metadata["database_generation"] != repair["authority_generation"]
-        or repair["source_authority_generation"]
-        != completion["authority_generation"]
-        or repair["source_authority_generation"]
-        == repair["authority_generation"]
-        or delegation["source_authority_generation"]
-        != repair["source_authority_generation"]
-        or delegation["authority_generation"]
-        != repair["authority_generation"]
-        or delegation["profile_fingerprint"] != repair["profile_sha256"]
         or repair["profile_path"] != PROTECTED_PROFILE_PATH
         or repair["profile_owner_uid"] != authority_uid
-        or repair["profile_mode"] != "0640"
+        or repair["profile_mode"] != "0644"
         or repair["parser_verified"] is not True
-        or repair["all_clients_parser_verified"] is not True
         or repair["atomic_publication_verified"] is not True
-        or repair["existing_profile_contents_reused"] is not False
+        or type(repair["validation_uid"]) is not int
+        or int(repair["validation_uid"]) <= 0
     ):
-        raise CutoverError(
-            "post-v13 profile does not match the rotated authority generation"
-        )
+        raise CutoverError("routing profile does not match the current catalog")
 
-    profile = _absolute(repair["profile_path"], "post-v13 protected profile")
+    profile = _absolute(repair["profile_path"], "protected routing profile")
     info = profile.lstat()
     if (
         stat.S_ISLNK(info.st_mode)
         or not stat.S_ISREG(info.st_mode)
         or info.st_uid != authority_uid
-        or info.st_gid != int(repair["profile_group_gid"])
-        or stat.S_IMODE(info.st_mode) != 0o640
+        or stat.S_IMODE(info.st_mode) != 0o644
         or _file_digest(profile) != repair["profile_sha256"]
     ):
-        raise CutoverError("installed post-v13 profile changed after regeneration")
+        raise CutoverError("installed routing profile changed after publication")
     try:
         profile_document = json.loads(profile.read_bytes())
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise CutoverError("installed post-v13 profile is not strict JSON") from error
-
-    owner_matches: list[tuple[object, Mapping[str, object]]] = []
-    bindings = repair["repository_bindings"]
-    client_uids = repair["client_uids"]
-    if (
-        not isinstance(bindings, list)
-        or not isinstance(client_uids, list)
-        or not client_uids
-        or any(type(item) is not int or item < 0 for item in client_uids)
-    ):
-        raise CutoverError("post-v13 profile authority bindings are invalid")
-    for client_uid in client_uids:
-        try:
-            parsed = profile_from_document(
-                profile_document, effective_uid=int(client_uid)
-            )
-        except BrokerProfileError as error:
-            raise CutoverError(
-                "installed post-v13 profile failed strict parsing"
-            ) from error
-        repository = parsed.repositories.get(project_path)
-        if repository is None or int(client_uid) != repository.owner_uid:
-            continue
-        exact = [
-            item
-            for item in bindings
-            if isinstance(item, Mapping)
-            and item.get("client_uid") == int(client_uid)
-            and item.get("owner_uid") == int(client_uid)
-            and item.get("account_id") == parsed.account_id
-            and item.get("repository_id") == repository.repo_id
-            and item.get("generation") == repository.generation
-        ]
-        if len(exact) == 1:
-            owner_matches.append((parsed, exact[0]))
-    if len(owner_matches) != 1:
-        raise CutoverError(
-            "post-v13 profile lacks one exact owner-bound project grant"
+        parsed = profile_from_document(
+            profile_document, effective_uid=int(repair["validation_uid"])
         )
-    owner_profile, owner_binding = owner_matches[0]
-    owner_uid = int(owner_binding["owner_uid"])
-    repository_id = str(owner_binding["repository_id"])
-    repository_generation = int(owner_binding["generation"])
-    delegated_ids = {
-        str(item["repository_id"])
-        for item in delegation["repository_grants"]
+    except (UnicodeDecodeError, json.JSONDecodeError, BrokerProfileError) as error:
+        raise CutoverError("installed routing profile is invalid") from error
+
+    bindings = repair["repository_bindings"]
+    if not isinstance(bindings, list) or not bindings:
+        raise CutoverError("routing profile has no repository catalog")
+    by_root = {
+        str(item.get("canonical_root")): item
+        for item in bindings
         if isinstance(item, Mapping)
     }
-    if repository_id not in delegated_ids:
-        raise CutoverError(
-            "owner-bound project grant is absent from API delegation"
-        )
+    binding = by_root.get(project_path)
+    repository = parsed.repositories.get(project_path)
+    if (
+        len(by_root) != len(bindings)
+        or binding is None
+        or repository is None
+        or repository.repo_id != binding.get("repository_id")
+        or repository.generation != binding.get("generation")
+        or set(repair["repository_ids"])
+        != {item.repo_id for item in parsed.repositories.values()}
+    ):
+        raise CutoverError("routing profile does not contain the selected repository")
 
-    fetch = inventory_fetcher or _inventory_as_repository_owner
+    execution_uid = int(repair["validation_uid"])
+    fetch = inventory_fetcher or _inventory_as_execution_uid
     inventory = fetch(
         release=release,
         project=project_path,
-        owner_uid=owner_uid,
+        execution_uid=execution_uid,
     )
     if not isinstance(inventory, Mapping):
-        raise CutoverError("owner-scoped inventory proof is invalid")
-    _validate_owner_inventory_document(
+        raise CutoverError("local routing inventory proof is invalid")
+    _validate_routing_inventory(
         inventory,
         project=project_path,
-        repository_id=repository_id,
-        repository_generation=repository_generation,
+        repository_id=repository.repo_id,
+        repository_generation=repository.generation,
         authority_generation=str(repair["authority_generation"]),
         authority_uid=authority_uid,
     )
@@ -7618,30 +2399,24 @@ def verify_post_v13_profile_inventory_readiness(
         PROFILE_INVENTORY_READINESS_KIND,
         {
             "profile_repair_sha256": repair["document_sha256"],
-            "api_delegation_sha256": delegation["document_sha256"],
             "release_digest": current["release_digest"],
             "executor_release": str(release),
             "inventory_client_sha256": inventory_client_sha256,
             "authority_database": str(database),
-            "source_authority_generation": repair[
-                "source_authority_generation"
-            ],
             "authority_generation": repair["authority_generation"],
             "authority_schema_version": metadata["schema_version"],
             "authority_migration_state": metadata["migration_state"],
             "profile_path": str(profile),
             "profile_sha256": repair["profile_sha256"],
             "profile_owner_uid": authority_uid,
-            "profile_group_gid": int(repair["profile_group_gid"]),
-            "profile_mode": "0640",
+            "profile_mode": "0644",
             "full_regeneration": True,
             "strict_profile_parse": True,
             "project": project_path,
-            "owner_uid": owner_uid,
-            "owner_account_id": owner_profile.account_id,
-            "repository_id": repository_id,
-            "repository_generation": repository_generation,
-            "owner_bound_grant": True,
+            "execution_uid": execution_uid,
+            "repository_id": repository.repo_id,
+            "repository_generation": repository.generation,
+            "route_verified": True,
             "inventory_command": [
                 "inventory",
                 "--project",
@@ -7652,43 +2427,36 @@ def verify_post_v13_profile_inventory_readiness(
             "inventory_sha256": _digest(inventory),
             "inventory_schema_version": 2,
             "inventory_scope": "server-wide",
-            "inventory_transport": "authenticated-unix-socket",
+            "inventory_transport": "trusted-local-unix-socket",
             "inventory_service_uid": authority_uid,
-            "inventory_database_generation": repair[
-                "authority_generation"
-            ],
+            "inventory_database_generation": repair["authority_generation"],
             "verified_at": _now() if verified_at is None else verified_at,
         },
     )
 
 
-def reverify_post_v13_profile_inventory_readiness(
+def reverify_profile_inventory_readiness(
     *,
     state: Mapping[str, object],
     authority_uid: int = 0,
     inventory_fetcher: Any = None,
     verified_at: str | None = None,
 ) -> dict[str, object]:
-    """Re-run the installed owner-scoped profile/inventory proof for retention."""
+    """Re-run the installed local-routing proof before retention."""
 
     current = validate_state(state)
     recorded = _recorded(current, "profile-inventory-readiness")
-    delegation = _recorded(current, "api-delegation")
     if current["phase"] not in {"activated", "retained"} or recorded is None:
-        raise CutoverError(
-            "fresh profile inventory verification requires completed activation"
-        )
-    if delegation is None:
-        raise CutoverError("fresh profile inventory verification lacks delegation")
+        raise CutoverError("fresh routing verification requires activation")
     readiness = verify_seal(
         recorded,
         kind=PROFILE_INVENTORY_READINESS_KIND,
         fields=PROFILE_INVENTORY_READINESS_FIELDS,
     )
-    database = _absolute(current["authority_database"], "post-v13 authority database")
-    release = _absolute(current["release"], "post-v13 immutable release")
+    database = _absolute(current["authority_database"], "authority database")
+    release = _absolute(current["release"], "immutable release")
     _client, inventory_client_sha256 = _immutable_inventory_client(release)
-    metadata = _post_v13_authority_metadata(database, authority_uid=authority_uid)
+    metadata = _authority_metadata(database, authority_uid=authority_uid)
     if (
         authority_uid != os.geteuid()
         or readiness["authority_database"] != str(database)
@@ -7696,72 +2464,46 @@ def reverify_post_v13_profile_inventory_readiness(
         or readiness["executor_release"] != str(release)
         or readiness["inventory_client_sha256"] != inventory_client_sha256
         or readiness["project"] != current["inventory_canary_project"]
-        or readiness["api_delegation_sha256"] != delegation["document_sha256"]
-        or metadata["schema_version"] != 13
+        or metadata["schema_version"] != COORDINATOR_SCHEMA_VERSION
         or metadata["migration_state"] != "ready"
         or metadata["database_generation"] != readiness["authority_generation"]
     ):
-        raise CutoverError("fresh profile inventory authority binding changed")
+        raise CutoverError("fresh routing catalog binding changed")
 
-    profile = _absolute(readiness["profile_path"], "post-v13 protected profile")
+    profile = _absolute(readiness["profile_path"], "protected routing profile")
     info = profile.lstat()
     if (
         str(profile) != PROTECTED_PROFILE_PATH
         or stat.S_ISLNK(info.st_mode)
         or not stat.S_ISREG(info.st_mode)
         or info.st_uid != authority_uid
-        or info.st_gid != int(readiness["profile_group_gid"])
-        or stat.S_IMODE(info.st_mode) != 0o640
+        or stat.S_IMODE(info.st_mode) != 0o644
         or _file_digest(profile) != readiness["profile_sha256"]
     ):
-        raise CutoverError("installed post-v13 profile changed before retention")
+        raise CutoverError("installed routing profile changed before retention")
     try:
-        profile_document = json.loads(profile.read_bytes())
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise CutoverError("installed post-v13 profile is not strict JSON") from error
-    clients = profile_document.get("clients") if isinstance(profile_document, dict) else None
-    if not isinstance(clients, Mapping) or not clients:
-        raise CutoverError("installed post-v13 profile clients are invalid")
-    parsed_owner = None
-    for client_uid in clients:
-        if not isinstance(client_uid, str) or re.fullmatch(r"[0-9]+", client_uid) is None:
-            raise CutoverError("installed post-v13 profile client UID is invalid")
-        try:
-            parsed = profile_from_document(
-                profile_document, effective_uid=int(client_uid)
-            )
-        except BrokerProfileError as error:
-            raise CutoverError(
-                "installed post-v13 profile failed strict parsing"
-            ) from error
-        if int(client_uid) == readiness["owner_uid"]:
-            if parsed_owner is not None:
-                raise CutoverError("installed profile duplicates repository owner")
-            parsed_owner = parsed
-    repository = (
-        parsed_owner.repositories.get(str(readiness["project"]))
-        if parsed_owner is not None
-        else None
-    )
+        parsed = profile_from_document(
+            json.loads(profile.read_bytes()),
+            effective_uid=int(readiness["execution_uid"]),
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, BrokerProfileError) as error:
+        raise CutoverError("installed routing profile is invalid") from error
+    repository = parsed.repositories.get(str(readiness["project"]))
     if (
-        parsed_owner is None
-        or parsed_owner.account_id != readiness["owner_account_id"]
-        or repository is None
-        or repository.owner_uid != readiness["owner_uid"]
+        repository is None
         or repository.repo_id != readiness["repository_id"]
         or repository.generation != readiness["repository_generation"]
     ):
-        raise CutoverError("installed post-v13 owner grant changed before retention")
-
-    fetch = inventory_fetcher or _inventory_as_repository_owner
+        raise CutoverError("installed routing catalog changed before retention")
+    fetch = inventory_fetcher or _inventory_as_execution_uid
     inventory = fetch(
         release=release,
         project=str(readiness["project"]),
-        owner_uid=int(readiness["owner_uid"]),
+        execution_uid=int(readiness["execution_uid"]),
     )
     if not isinstance(inventory, Mapping):
-        raise CutoverError("owner-scoped inventory proof is invalid")
-    _validate_owner_inventory_document(
+        raise CutoverError("local routing inventory proof is invalid")
+    _validate_routing_inventory(
         inventory,
         project=str(readiness["project"]),
         repository_id=str(readiness["repository_id"]),
@@ -7777,7 +2519,6 @@ def reverify_post_v13_profile_inventory_readiness(
     unsigned["inventory_sha256"] = _digest(inventory)
     unsigned["verified_at"] = _now() if verified_at is None else verified_at
     return seal(PROFILE_INVENTORY_READINESS_KIND, unsigned)
-
 
 def _validate_first_adoption_port_readiness_binding(
     *,
@@ -8663,22 +3404,16 @@ def _authority_readiness_snapshot(
         "foreign_key_violations",
         "repositories",
         "installations",
-        "principals",
-        "enrollments",
         "hosts",
         "open_blocking_conflicts",
         "missing_installations",
         "orphan_installations",
-        "orphan_repository_enrollments",
-        "orphan_principal_enrollments",
-        "partial_v13_tables",
     }
     if not isinstance(invariants, Mapping) or set(invariants) != invariant_fields:
         raise CutoverError("authority readiness invariant fields are invalid")
-    numeric_fields = invariant_fields - {"quick_check", "partial_v13_tables"}
+    numeric_fields = invariant_fields - {"quick_check"}
     if (
         invariants["quick_check"] != "ok"
-        or invariants["partial_v13_tables"] != []
         or any(
             isinstance(invariants[field], bool)
             or not isinstance(invariants[field], int)
@@ -8687,8 +3422,6 @@ def _authority_readiness_snapshot(
         )
         or int(invariants["repositories"]) <= 0
         or int(invariants["installations"]) != int(invariants["repositories"])
-        or int(invariants["principals"]) <= 0
-        or int(invariants["enrollments"]) <= 0
         or int(invariants["hosts"]) <= 0
         or any(
             int(invariants[field]) != 0
@@ -8697,8 +3430,6 @@ def _authority_readiness_snapshot(
                 "open_blocking_conflicts",
                 "missing_installations",
                 "orphan_installations",
-                "orphan_repository_enrollments",
-                "orphan_principal_enrollments",
             )
         )
     ):
@@ -8733,7 +3464,6 @@ def _read_authority_readiness_snapshot(
                 "authority readiness database is missing required tables: "
                 + ", ".join(missing)
             )
-        partial_v13 = sorted(AUTHORITY_READINESS_PARTIAL_V13_TABLES & tables)
         quick_rows = [str(row[0]) for row in active.execute("PRAGMA quick_check")]
         metadata = active.execute(
             """
@@ -8774,10 +3504,6 @@ def _read_authority_readiness_snapshot(
                 "installations": count(
                     "SELECT COUNT(*) FROM repository_installations"
                 ),
-                "principals": count("SELECT COUNT(*) FROM broker_acl_principals"),
-                "enrollments": count(
-                    "SELECT COUNT(*) FROM broker_repository_enrollments"
-                ),
                 "hosts": count("SELECT COUNT(*) FROM hosts"),
                 "open_blocking_conflicts": count(
                     "SELECT COUNT(*) FROM migration_conflicts "
@@ -8791,16 +3517,6 @@ def _read_authority_readiness_snapshot(
                     "SELECT COUNT(*) FROM repository_installations i LEFT JOIN "
                     "repositories r USING(repo_id) WHERE r.repo_id IS NULL"
                 ),
-                "orphan_repository_enrollments": count(
-                    "SELECT COUNT(*) FROM broker_repository_enrollments e LEFT JOIN "
-                    "repositories r USING(repo_id) WHERE r.repo_id IS NULL"
-                ),
-                "orphan_principal_enrollments": count(
-                    "SELECT COUNT(*) FROM broker_repository_enrollments e LEFT JOIN "
-                    "broker_acl_principals p ON p.uid=e.uid AND "
-                    "p.account_id=e.account_id WHERE p.uid IS NULL"
-                ),
-                "partial_v13_tables": partial_v13,
             },
         }
         state = str(snapshot["metadata"]["migration_state"])
@@ -15198,2095 +9914,6 @@ def abort_atomic_first_adoption_bindings(
     return {"ok": True, "replayed": False, "attestation": result}
 
 
-AUTHORITY_REPOSITORY_SERVICE_READINESS_FIELDS = frozenset(
-    {
-        "broker_socket",
-        "canary_user",
-        "canary_uid",
-        "canary_project",
-        "canary_repository_id",
-        "canary_repository_generation",
-        "wait_seconds",
-    }
-)
-AUTHORITY_REPOSITORY_SERVICE_PROOF_FIELDS = frozenset(
-    {
-        "phase",
-        "broker_socket",
-        "socket_identity",
-        "socket_peer",
-        "authority_generation",
-        "canary",
-        "invariants",
-        "verified_at",
-    }
-)
-
-
-def _authority_repository_service_readiness_binding(
-    value: object,
-) -> dict[str, object]:
-    if (
-        not isinstance(value, Mapping)
-        or set(value) != AUTHORITY_REPOSITORY_SERVICE_READINESS_FIELDS
-    ):
-        raise CutoverError("authority repository service readiness binding is invalid")
-    try:
-        account = pwd.getpwnam(str(value["canary_user"]))
-    except KeyError as error:
-        raise CutoverError("authority repository canary account is unavailable") from error
-    broker_socket = _absolute(
-        str(value["broker_socket"]), "authority repository broker socket"
-    )
-    canary_project = _absolute(
-        str(value["canary_project"]), "authority repository canary project"
-    )
-    if (
-        not isinstance(value["canary_user"], str)
-        or not value["canary_user"]
-        or account.pw_uid != value["canary_uid"]
-        or isinstance(value["canary_uid"], bool)
-        or not isinstance(value["canary_uid"], int)
-        or int(value["canary_uid"]) <= 0
-        or not isinstance(value["canary_repository_id"], str)
-        or not value["canary_repository_id"]
-        or len(str(value["canary_repository_id"]).encode("utf-8")) > 256
-        or isinstance(value["canary_repository_generation"], bool)
-        or not isinstance(value["canary_repository_generation"], int)
-        or int(value["canary_repository_generation"]) < 0
-        or isinstance(value["wait_seconds"], bool)
-        or not isinstance(value["wait_seconds"], int)
-        or not 1 <= int(value["wait_seconds"]) <= 120
-    ):
-        raise CutoverError("authority repository service readiness values are invalid")
-    return {
-        "broker_socket": str(broker_socket),
-        "canary_user": account.pw_name,
-        "canary_uid": account.pw_uid,
-        "canary_project": str(canary_project),
-        "canary_repository_id": str(value["canary_repository_id"]),
-        "canary_repository_generation": int(
-            value["canary_repository_generation"]
-        ),
-        "wait_seconds": int(value["wait_seconds"]),
-    }
-
-
-def _authority_repository_socket_observation(
-    broker_socket: Path,
-) -> tuple[dict[str, int], dict[str, int]]:
-    path = _absolute(broker_socket, "authority repository broker socket")
-    try:
-        before = path.lstat()
-    except FileNotFoundError as error:
-        raise CutoverError("authority repository broker socket is unavailable") from error
-    if (
-        not stat.S_ISSOCK(before.st_mode)
-        or before.st_uid != 0
-        or before.st_gid != 0
-        or stat.S_IMODE(before.st_mode) != 0o666
-    ):
-        raise CutoverError("authority repository broker socket identity is unsafe")
-    credentials_size = 12
-    try:
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
-            client.settimeout(0.5)
-            client.connect(str(path))
-            credentials = client.getsockopt(
-                socket.SOL_SOCKET, socket.SO_PEERCRED, credentials_size
-            )
-    except (ConnectionRefusedError, FileNotFoundError, socket.timeout, OSError) as error:
-        raise CutoverError("authority repository broker socket is not ready") from error
-    if len(credentials) != credentials_size:
-        raise CutoverError("authority repository broker peer proof is invalid")
-    pid, uid, gid = struct.unpack("3i", credentials)
-    after = path.lstat()
-    identity = {
-        "device": int(before.st_dev),
-        "inode": int(before.st_ino),
-        "uid": int(before.st_uid),
-        "gid": int(before.st_gid),
-        "mode": stat.S_IMODE(before.st_mode),
-    }
-    if (
-        (after.st_dev, after.st_ino, after.st_uid, after.st_gid, stat.S_IMODE(after.st_mode))
-        != (
-            before.st_dev,
-            before.st_ino,
-            before.st_uid,
-            before.st_gid,
-            stat.S_IMODE(before.st_mode),
-        )
-        or pid <= 0
-        or uid != 0
-    ):
-        raise CutoverError("authority repository broker socket changed during proof")
-    return identity, {"pid": pid, "uid": uid, "gid": gid}
-
-
-def _authority_repository_full_schema12_invariant_proof(
-    *,
-    database: Path,
-    authority_uid: int,
-    expected_generation: str,
-    identity_reader=_database_identity,
-) -> dict[str, object]:
-    before = identity_reader(database, uid=authority_uid)
-    connection = sqlite3.connect(f"{database.as_uri()}?mode=ro", uri=True)
-    try:
-        connection.execute("PRAGMA query_only = ON")
-        connection.execute("BEGIN")
-        row = connection.execute(
-            """
-            SELECT schema_version, database_generation, state_revision,
-                   authority_mode, migration_state
-            FROM schema_metadata WHERE singleton = 1
-            """
-        ).fetchone()
-        quick = [str(item[0]) for item in connection.execute("PRAGMA quick_check")]
-        violations = invariant_violations(
-            connection,
-            include_foreign_keys=True,
-            include_owner_authority=False,
-        )
-        connection.execute("ROLLBACK")
-    finally:
-        connection.close()
-    after = identity_reader(database, uid=authority_uid)
-    if before != after:
-        raise CutoverError("authority database changed during full invariant proof")
-    if (
-        row is None
-        or int(row[0]) != 12
-        or str(row[1]) != expected_generation
-        or int(row[2]) < 0
-        or str(row[3]) != "sqlite"
-        or str(row[4]) != "ready"
-        or quick != ["ok"]
-    ):
-        raise CutoverError("authority schema-12 readiness contract is not satisfied")
-    if violations:
-        first = violations[0]
-        raise CutoverError(
-            f"authority full invariant proof failed: {first.code}"
-        )
-    return {
-        "contract": "schema12-pre-owner-authority-complete-v1",
-        "schema_version": 12,
-        "database_generation": str(row[1]),
-        "state_revision": int(row[2]),
-        "quick_check": "ok",
-        "semantic_violation_count": 0,
-        "database_identity": dict(after),
-    }
-
-
-def _authority_repository_inventory_canary(
-    *,
-    release: Path,
-    binding: Mapping[str, object],
-    expected_generation: str,
-) -> dict[str, object]:
-    account = pwd.getpwnam(str(binding["canary_user"]))
-    entry = release / "skills/codex-dev-coordinator/scripts/dev_coordinator.py"
-    if not entry.is_file():
-        raise CutoverError("authority repository canary client is unavailable")
-    try:
-        completed = subprocess.run(
-            [
-                "/usr/bin/setpriv",
-                "--reuid",
-                str(account.pw_uid),
-                "--regid",
-                str(account.pw_gid),
-                "--init-groups",
-                "--reset-env",
-                "/usr/bin/python3",
-                "-B",
-                "-I",
-                str(entry),
-                "inventory",
-                "--project",
-                str(binding["canary_project"]),
-                "--no-docker",
-                "--compact-json",
-            ],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env={
-                "HOME": account.pw_dir,
-                "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-                "LANG": "C.UTF-8",
-                "LC_ALL": "C.UTF-8",
-            },
-            timeout=int(binding["wait_seconds"]),
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError) as error:
-        raise CutoverError(
-            "authority repository authenticated canary could not execute"
-        ) from error
-    if (
-        completed.returncode != 0
-        or len(completed.stdout) > 1024 * 1024
-        or len(completed.stderr) > 8192
-    ):
-        raise CutoverError("authority repository authenticated canary failed")
-    try:
-        result = json.loads(completed.stdout)
-    except (UnicodeError, json.JSONDecodeError) as error:
-        raise CutoverError(
-            "authority repository authenticated canary returned invalid JSON"
-        ) from error
-    authority = result.get("authority") if isinstance(result, Mapping) else None
-    repositories = result.get("repositories") if isinstance(result, Mapping) else None
-    matching = (
-        [
-            repository
-            for repository in repositories
-            if isinstance(repository, Mapping)
-            and repository.get("repo_id") == binding["canary_repository_id"]
-            and repository.get("canonical_root") == binding["canary_project"]
-            and repository.get("generation")
-            == binding["canary_repository_generation"]
-        ]
-        if isinstance(repositories, list)
-        else []
-    )
-    if (
-        not isinstance(result, Mapping)
-        or result.get("schema_version") != 2
-        or not isinstance(authority, Mapping)
-        or authority.get("scope") != "server-wide"
-        or authority.get("transport") != "authenticated-unix-socket"
-        or authority.get("socket") != binding["broker_socket"]
-        or authority.get("service_uid") != 0
-        or authority.get("database_generation") != expected_generation
-        or not isinstance(repositories, list)
-        or len(repositories) != 1
-        or len(matching) != 1
-    ):
-        raise CutoverError(
-            "authority repository authenticated canary binding is invalid"
-        )
-    return {
-        "user": account.pw_name,
-        "uid": account.pw_uid,
-        "project": binding["canary_project"],
-        "repository_id": binding["canary_repository_id"],
-        "repository_generation": binding["canary_repository_generation"],
-        "inventory_sha256": _digest(result),
-    }
-
-
-def _authority_repository_service_readiness_proof(
-    *,
-    phase: str,
-    release: Path,
-    database: Path,
-    authority_uid: int,
-    authority_generation: str,
-    binding: Mapping[str, object],
-    now_reader=_now,
-) -> dict[str, object]:
-    normalized = _authority_repository_service_readiness_binding(binding)
-    if phase not in {"preclear", "authenticated"}:
-        raise CutoverError("authority repository readiness phase is invalid")
-    deadline = time.monotonic() + int(normalized["wait_seconds"])
-    last_error: CutoverError | None = None
-    first_identity: dict[str, int] | None = None
-    first_peer: dict[str, int] | None = None
-    while time.monotonic() < deadline:
-        try:
-            first_identity, first_peer = _authority_repository_socket_observation(
-                Path(str(normalized["broker_socket"]))
-            )
-            time.sleep(0.1)
-            second_identity, second_peer = _authority_repository_socket_observation(
-                Path(str(normalized["broker_socket"]))
-            )
-            if first_identity != second_identity or first_peer != second_peer:
-                raise CutoverError(
-                    "authority repository broker socket did not remain stable"
-                )
-            break
-        except CutoverError as error:
-            last_error = error
-            time.sleep(0.05)
-    else:
-        raise CutoverError(
-            "authority repository broker socket never became stably ready"
-        ) from last_error
-    invariants = _authority_repository_full_schema12_invariant_proof(
-        database=database,
-        authority_uid=authority_uid,
-        expected_generation=authority_generation,
-    )
-    canary = (
-        None
-        if phase == "preclear"
-        else _authority_repository_inventory_canary(
-            release=release,
-            binding=normalized,
-            expected_generation=authority_generation,
-        )
-    )
-    final_identity, final_peer = _authority_repository_socket_observation(
-        Path(str(normalized["broker_socket"]))
-    )
-    if final_identity != first_identity or final_peer != first_peer:
-        raise CutoverError(
-            "authority repository broker changed during readiness proof"
-        )
-    return {
-        "phase": phase,
-        "broker_socket": normalized["broker_socket"],
-        "socket_identity": final_identity,
-        "socket_peer": final_peer,
-        "authority_generation": authority_generation,
-        "canary": canary,
-        "invariants": invariants,
-        "verified_at": now_reader(),
-    }
-
-
-def _validate_authority_repository_service_readiness_proof(
-    value: object, *, phase: str, binding: Mapping[str, object], generation: str
-) -> dict[str, object]:
-    invariant_fields = {
-        "contract",
-        "schema_version",
-        "database_generation",
-        "state_revision",
-        "quick_check",
-        "semantic_violation_count",
-        "database_identity",
-    }
-    database_identity = (
-        value["invariants"].get("database_identity")
-        if isinstance(value, Mapping)
-        and isinstance(value.get("invariants"), Mapping)
-        else None
-    )
-    if (
-        not isinstance(value, Mapping)
-        or set(value) != AUTHORITY_REPOSITORY_SERVICE_PROOF_FIELDS
-        or value["phase"] != phase
-        or value["broker_socket"] != binding["broker_socket"]
-        or value["authority_generation"] != generation
-        or not isinstance(value["socket_identity"], Mapping)
-        or set(value["socket_identity"])
-        != {"device", "inode", "uid", "gid", "mode"}
-        or any(
-            type(value["socket_identity"][field]) is not int
-            for field in ("device", "inode", "uid", "gid", "mode")
-        )
-        or value["socket_identity"]["device"] < 0
-        or value["socket_identity"]["inode"] <= 0
-        or value["socket_identity"]["uid"] != 0
-        or value["socket_identity"]["gid"] < 0
-        or value["socket_identity"]["mode"] != 0o660
-        or not isinstance(value["socket_peer"], Mapping)
-        or set(value["socket_peer"]) != {"pid", "uid", "gid"}
-        or any(
-            type(value["socket_peer"][field]) is not int
-            for field in ("pid", "uid", "gid")
-        )
-        or value["socket_peer"]["uid"] != 0
-        or int(value["socket_peer"]["pid"]) <= 0
-        or value["socket_peer"]["gid"] < 0
-        or not isinstance(value["invariants"], Mapping)
-        or set(value["invariants"]) != invariant_fields
-        or value["invariants"].get("contract")
-        != "schema12-pre-owner-authority-complete-v1"
-        or value["invariants"].get("schema_version") != 12
-        or value["invariants"].get("database_generation") != generation
-        or type(value["invariants"].get("state_revision")) is not int
-        or int(value["invariants"].get("state_revision", -1)) < 0
-        or value["invariants"].get("quick_check") != "ok"
-        or value["invariants"].get("semantic_violation_count") != 0
-        or not isinstance(database_identity, Mapping)
-        or set(database_identity) != {"device", "inode", "size"}
-        or any(type(database_identity[field]) is not int for field in database_identity)
-        or database_identity["device"] < 0
-        or database_identity["inode"] <= 0
-        or database_identity["size"] <= 0
-        or not isinstance(value["verified_at"], str)
-        or not value["verified_at"]
-    ):
-        raise CutoverError("authority repository service readiness proof is invalid")
-    if phase == "preclear":
-        if value["canary"] is not None:
-            raise CutoverError("preclear readiness proof unexpectedly contains a canary")
-    else:
-        canary = value["canary"]
-        if (
-            not isinstance(canary, Mapping)
-            or canary.get("user") != binding["canary_user"]
-            or canary.get("uid") != binding["canary_uid"]
-            or canary.get("project") != binding["canary_project"]
-            or canary.get("repository_id") != binding["canary_repository_id"]
-            or canary.get("repository_generation")
-            != binding["canary_repository_generation"]
-            or re.fullmatch(r"[0-9a-f]{64}", str(canary.get("inventory_sha256")))
-            is None
-        ):
-            raise CutoverError(
-                "authority repository authenticated readiness proof is invalid"
-            )
-    return dict(value)
-
-
-def _authority_repository_readiness_stable_binding(
-    value: Mapping[str, object],
-) -> dict[str, object]:
-    """Discard only the descriptive verification timestamp from a proof."""
-
-    return {
-        key: item
-        for key, item in value.items()
-        if key != "verified_at"
-    }
-
-
-def _authority_repository_disable_transaction(
-    value: object,
-) -> dict[str, object]:
-    document = verify_seal(
-        value,
-        kind=AUTHORITY_REPOSITORY_DISABLE_TRANSACTION_KIND,
-        fields=AUTHORITY_REPOSITORY_DISABLE_TRANSACTION_FIELDS,
-    )
-    try:
-        document["operation_id"] = str(uuid.UUID(str(document["operation_id"])))
-    except (ValueError, TypeError, AttributeError) as error:
-        raise CutoverError(
-            "authority repository repair transaction operation ID is invalid"
-        ) from error
-    for field in ("release", "plan", "database", "repair_attestation"):
-        document[field] = str(
-            _absolute(
-                str(document[field]),
-                f"authority repository repair transaction {field}",
-            )
-        )
-    if (
-        re.fullmatch(r"[0-9a-f]{64}", str(document["release_digest"])) is None
-        or re.fullmatch(
-            r"[0-9a-f]{64}", str(document["plan_document_sha256"])
-        )
-        is None
-        or document["service_unit"] != "devcoordinator-broker.service"
-        or not isinstance(document["created_at"], str)
-        or not document["created_at"]
-    ):
-        raise CutoverError("authority repository repair transaction binding is invalid")
-    baseline = document["service_baseline"]
-    if (
-        not isinstance(baseline, Mapping)
-        or set(baseline) != {"active", "enabled"}
-        or baseline["active"] is not True
-        or type(baseline["enabled"]) is not bool
-    ):
-        raise CutoverError(
-            "authority repository repair requires the active legacy broker baseline"
-        )
-    document["service_baseline"] = dict(baseline)
-    document["readiness"] = _authority_repository_service_readiness_binding(
-        document["readiness"]
-    )
-    document["maintenance"] = _authority_readiness_maintenance(
-        document["maintenance"]
-    )
-    return document
-
-
-def _authority_repository_disable_transaction_result(
-    value: object,
-    *,
-    readiness: Mapping[str, object] | None = None,
-    authority_generation: str | None = None,
-) -> dict[str, object]:
-    document = verify_seal(
-        value,
-        kind=AUTHORITY_REPOSITORY_DISABLE_TRANSACTION_RESULT_KIND,
-        fields=AUTHORITY_REPOSITORY_DISABLE_TRANSACTION_RESULT_FIELDS,
-    )
-    try:
-        document["operation_id"] = str(uuid.UUID(str(document["operation_id"])))
-    except (ValueError, TypeError, AttributeError) as error:
-        raise CutoverError(
-            "authority repository repair transaction result operation ID is invalid"
-        ) from error
-    document["database"] = str(
-        _absolute(
-            str(document["database"]),
-            "authority repository repair transaction result database",
-        )
-    )
-    if (
-        re.fullmatch(
-            r"[0-9a-f]{64}", str(document["transaction_journal_sha256"])
-        )
-        is None
-        or re.fullmatch(r"[0-9a-f]{64}", str(document["repair_result_sha256"]))
-        is None
-        or re.fullmatch(r"[0-9a-f]{64}", str(document["release_digest"])) is None
-        or document["service_unit"] != "devcoordinator-broker.service"
-        or document["service_restored"] is not True
-        or document["maintenance_cleared"] is not True
-        or not isinstance(document["completed_at"], str)
-        or not document["completed_at"]
-    ):
-        raise CutoverError(
-            "authority repository repair transaction result is invalid"
-        )
-    if readiness is not None and authority_generation is not None:
-        document["readiness_proof"] = (
-            _validate_authority_repository_service_readiness_proof(
-                document["readiness_proof"],
-                phase="authenticated",
-                binding=readiness,
-                generation=authority_generation,
-            )
-        )
-    elif not isinstance(document["readiness_proof"], Mapping):
-        raise CutoverError(
-            "authority repository repair readiness proof is unavailable"
-        )
-    return document
-
-
-def recover_authority_repository_disable(
-    *,
-    release: Path,
-    plan_path: Path,
-    plan_document_sha256: str,
-    repair_attestation: Path,
-    transaction_journal: Path,
-    transaction_attestation: Path,
-    maintenance_root: Path,
-    maintenance_gid: int,
-    maintenance_deployment_id: str,
-    operation_id: str,
-    broker_socket: Path,
-    canary_user: str,
-    canary_uid: int,
-    canary_project: Path,
-    canary_repository_id: str,
-    canary_repository_generation: int,
-    readiness_wait_seconds: int = 30,
-    authority_uid: int = 0,
-    release_verifier=None,
-    command_status=_bounded_command_status,
-    maintenance_activator=activate_maintenance,
-    maintenance_clearer=clear_maintenance,
-    maintenance_state_reader=load_maintenance_state,
-    evidence_reader=read_private_json,
-    evidence_publisher=_publish_evidence,
-    effective_uid_reader=os.geteuid,
-    now_reader=_now,
-    repairer=apply_authority_repository_disable,
-    repairer_options: Mapping[str, object] | None = None,
-    service_readiness_verifier=None,
-) -> dict[str, object]:
-    """Fence only the legacy broker around one sealed shared-root repair."""
-
-    if effective_uid_reader() != 0 or authority_uid != 0:
-        raise CutoverError(
-            "authority repository repair service transaction must run as root"
-        )
-    try:
-        operation_id = str(uuid.UUID(str(operation_id)))
-        maintenance_deployment_id = str(uuid.UUID(str(maintenance_deployment_id)))
-    except (ValueError, TypeError, AttributeError) as error:
-        raise CutoverError(
-            "authority repository repair transaction identity is invalid"
-        ) from error
-    release = _absolute(release, "authority repository repair transaction release")
-    plan_path = _absolute(plan_path, "authority repository repair transaction plan")
-    repair_attestation = _absolute(
-        repair_attestation, "authority repository repair transaction result"
-    )
-    transaction_journal = _absolute(
-        transaction_journal, "authority repository repair service journal"
-    )
-    transaction_attestation = _absolute(
-        transaction_attestation, "authority repository repair service attestation"
-    )
-    maintenance_root = _absolute(
-        maintenance_root, "authority repository repair transaction maintenance root"
-    )
-    readiness_binding = _authority_repository_service_readiness_binding(
-        {
-            "broker_socket": str(broker_socket),
-            "canary_user": canary_user,
-            "canary_uid": canary_uid,
-            "canary_project": str(canary_project),
-            "canary_repository_id": canary_repository_id,
-            "canary_repository_generation": canary_repository_generation,
-            "wait_seconds": readiness_wait_seconds,
-        }
-    )
-    if len(
-        {plan_path, repair_attestation, transaction_journal, transaction_attestation}
-    ) != 4:
-        raise CutoverError(
-            "authority repository repair transaction paths must be distinct"
-        )
-    plan = _validate_authority_repository_disable_plan(
-        evidence_reader(plan_path, uid=authority_uid)
-    )
-    if (
-        plan["authority_uid"] != authority_uid
-        or re.fullmatch(r"[0-9a-f]{64}", plan_document_sha256 or "") is None
-        or plan["document_sha256"] != plan_document_sha256
-    ):
-        raise CutoverError(
-            "authority repository repair transaction plan digest does not match"
-        )
-    database = _absolute(
-        str(plan["authority_database"]),
-        "authority repository repair transaction database",
-    )
-    verifier = _load_release_verifier() if release_verifier is None else release_verifier
-    verified_release = (
-        verifier.verify_release(release)
-        if hasattr(verifier, "verify_release")
-        else verifier(release)
-    )
-    release_digest = str(verified_release.get("release_digest", ""))
-    if (
-        re.fullmatch(r"[0-9a-f]{64}", release_digest) is None
-        or not isinstance(verified_release.get("capabilities"), Mapping)
-        or not all(verified_release["capabilities"].values())
-        or (release_verifier is None and release != IMMUTABLE_RELEASE_ROOT / release_digest)
-    ):
-        raise CutoverError(
-            "authority repository repair service transaction release is invalid"
-        )
-    unit = "devcoordinator-broker.service"
-    started_at = now_reader()
-    planned_maintenance = {
-        "root": str(maintenance_root),
-        "gid": maintenance_gid,
-        "deployment_id": maintenance_deployment_id,
-        "message": PUBLIC_MAINTENANCE_MESSAGE,
-        "retry_after_seconds": 5,
-        "started_at": started_at,
-    }
-    if transaction_journal.exists() or transaction_journal.is_symlink():
-        transaction = _authority_repository_disable_transaction(
-            evidence_reader(transaction_journal, uid=authority_uid)
-        )
-        if (
-            transaction["operation_id"] != operation_id
-            or transaction["release"] != str(release)
-            or transaction["release_digest"] != release_digest
-            or transaction["plan"] != str(plan_path)
-            or transaction["plan_document_sha256"] != plan_document_sha256
-            or transaction["database"] != str(database)
-            or transaction["repair_attestation"] != str(repair_attestation)
-            or transaction["readiness"] != readiness_binding
-            or transaction["maintenance"]["root"] != str(maintenance_root)
-            or transaction["maintenance"]["gid"] != maintenance_gid
-            or transaction["maintenance"]["deployment_id"]
-            != maintenance_deployment_id
-        ):
-            raise CutoverError(
-                "authority repository repair service journal belongs to another operation"
-            )
-    else:
-        baseline = _systemd_service_state(command_status, unit)
-        if baseline["active"] is not True:
-            raise CutoverError(
-                "authority repository repair requires the active legacy broker"
-            )
-        transaction = _authority_repository_disable_transaction(
-            seal(
-                AUTHORITY_REPOSITORY_DISABLE_TRANSACTION_KIND,
-                {
-                    "operation_id": operation_id,
-                    "release": str(release),
-                    "release_digest": release_digest,
-                    "plan": str(plan_path),
-                    "plan_document_sha256": plan_document_sha256,
-                    "database": str(database),
-                    "service_unit": unit,
-                    "service_baseline": baseline,
-                    "readiness": readiness_binding,
-                    "maintenance": planned_maintenance,
-                    "repair_attestation": str(repair_attestation),
-                    "created_at": started_at,
-                },
-            )
-        )
-        evidence_publisher(transaction_journal, transaction, uid=authority_uid)
-
-    readiness_verifier = (
-        _authority_repository_service_readiness_proof
-        if service_readiness_verifier is None
-        else service_readiness_verifier
-    )
-
-    def completed_repair() -> dict[str, object] | None:
-        if not (repair_attestation.exists() or repair_attestation.is_symlink()):
-            return None
-        result = _validate_authority_repository_disable_result(
-            evidence_reader(repair_attestation, uid=authority_uid)
-        )
-        if (
-            result["plan_id"] != plan["plan_id"]
-            or result["plan_document_sha256"] != plan_document_sha256
-            or result["authority_database"] != str(database)
-            or result["maintenance_deployment_id"] != maintenance_deployment_id
-            or result["repository_id"] != plan["repository"]["repository_id"]
-            or result["repository_state"] != "missing"
-            or result["installation_status"] != "disabled"
-            or result["startup_fenced"] is not True
-            or result["enrollment_count"] != 0
-        ):
-            raise CutoverError("authority repository repair result changed")
-        return result
-
-    repair = completed_repair()
-    if transaction_attestation.exists() or transaction_attestation.is_symlink():
-        result = _authority_repository_disable_transaction_result(
-            evidence_reader(transaction_attestation, uid=authority_uid),
-            readiness=transaction["readiness"],
-            authority_generation=str(plan["authority_generation"]),
-        )
-        state = _systemd_service_state(command_status, unit)
-        marker = maintenance_state_reader(
-            expected_uid=authority_uid,
-            expected_gid=maintenance_gid,
-            maintenance_root=maintenance_root,
-        )
-        if (
-            repair is None
-            or result["operation_id"] != operation_id
-            or result["transaction_journal_sha256"]
-            != transaction["document_sha256"]
-            or result["repair_result_sha256"] != repair["document_sha256"]
-            or result["release_digest"] != release_digest
-            or result["database"] != str(database)
-            or state != transaction["service_baseline"]
-            or marker is not None
-        ):
-            raise CutoverError(
-                "authority repository repair service result is contradictory"
-            )
-        current_readiness = _validate_authority_repository_service_readiness_proof(
-            readiness_verifier(
-                phase="authenticated",
-                release=release,
-                database=database,
-                authority_uid=authority_uid,
-                authority_generation=str(plan["authority_generation"]),
-                binding=transaction["readiness"],
-                now_reader=now_reader,
-            ),
-            phase="authenticated",
-            binding=transaction["readiness"],
-            generation=str(plan["authority_generation"]),
-        )
-        if (
-            current_readiness["invariants"]["database_identity"]["device"]
-            != result["readiness_proof"]["invariants"]["database_identity"]["device"]
-            or current_readiness["invariants"]["database_identity"]["inode"]
-            != result["readiness_proof"]["invariants"]["database_identity"]["inode"]
-        ):
-            raise CutoverError(
-                "authority repository repair replay database identity changed"
-            )
-        return {"ok": True, "replayed": True, "attestation": result}
-
-    repair_error: BaseException | None = None
-    if repair is None:
-        try:
-            maintenance_activator(
-                expected_uid=authority_uid,
-                expected_gid=maintenance_gid,
-                deployment_id=maintenance_deployment_id,
-                scope=CONTROL_PLANE_MAINTENANCE_SCOPE,
-                message=PUBLIC_MAINTENANCE_MESSAGE,
-                retry_after_seconds=5,
-                started_at=str(transaction["maintenance"]["started_at"]),
-                maintenance_root=maintenance_root,
-            )
-            state = _systemd_service_state(command_status, unit)
-            if state["enabled"] != transaction["service_baseline"]["enabled"]:
-                raise CutoverError("legacy broker enabled state changed")
-            if state["active"] and command_status(
-                ["/usr/bin/systemctl", "stop", unit]
-            ) != 0:
-                raise CutoverError("legacy broker did not stop behind maintenance")
-            if _systemd_service_state(command_status, unit)["active"]:
-                raise CutoverError("legacy broker remains active behind maintenance")
-            options = dict(repairer_options or {})
-            repairer(
-                plan_path=plan_path,
-                plan_document_sha256=plan_document_sha256,
-                attestation=repair_attestation,
-                maintenance_root=maintenance_root,
-                maintenance_gid=maintenance_gid,
-                maintenance_deployment_id=maintenance_deployment_id,
-                authority_uid=authority_uid,
-                maintenance_state_reader=maintenance_state_reader,
-                **options,
-            )
-            repair = completed_repair()
-            if repair is None:
-                raise CutoverError(
-                    "authority repository repair result was not published"
-                )
-        except BaseException as error:
-            repair_error = error
-
-    service_state = _systemd_service_state(command_status, unit)
-    if service_state["enabled"] != transaction["service_baseline"]["enabled"]:
-        raise CutoverError("legacy broker enabled state changed during repair")
-    if not service_state["active"]:
-        if command_status(["/usr/bin/systemctl", "start", unit]) != 0:
-            raise CutoverError(
-                "legacy broker did not restart after authority repository repair"
-            )
-    if _systemd_service_state(command_status, unit) != transaction["service_baseline"]:
-        raise CutoverError("legacy broker baseline was not restored")
-    marker = maintenance_state_reader(
-        expected_uid=authority_uid,
-        expected_gid=maintenance_gid,
-        maintenance_root=maintenance_root,
-    )
-    if marker is None:
-        maintenance_activator(
-            expected_uid=authority_uid,
-            expected_gid=maintenance_gid,
-            deployment_id=maintenance_deployment_id,
-            scope=CONTROL_PLANE_MAINTENANCE_SCOPE,
-            message=PUBLIC_MAINTENANCE_MESSAGE,
-            retry_after_seconds=5,
-            started_at=str(transaction["maintenance"]["started_at"]),
-            maintenance_root=maintenance_root,
-        )
-        marker = maintenance_state_reader(
-            expected_uid=authority_uid,
-            expected_gid=maintenance_gid,
-            maintenance_root=maintenance_root,
-        )
-    normalized = _normalize_maintenance_state(
-        marker,
-        root=maintenance_root,
-        gid=maintenance_gid,
-        deployment_id=maintenance_deployment_id,
-    )
-    if normalized != transaction["maintenance"]:
-        raise CutoverError("authority repository repair maintenance marker changed")
-    preclear = _validate_authority_repository_service_readiness_proof(
-        readiness_verifier(
-            phase="preclear",
-            release=release,
-            database=database,
-            authority_uid=authority_uid,
-            authority_generation=str(plan["authority_generation"]),
-            binding=transaction["readiness"],
-            now_reader=now_reader,
-        ),
-        phase="preclear",
-        binding=transaction["readiness"],
-        generation=str(plan["authority_generation"]),
-    )
-    maintenance_clearer(
-        expected_uid=authority_uid,
-        expected_gid=maintenance_gid,
-        deployment_id=maintenance_deployment_id,
-        maintenance_root=maintenance_root,
-    )
-    if maintenance_state_reader(
-        expected_uid=authority_uid,
-        expected_gid=maintenance_gid,
-        maintenance_root=maintenance_root,
-    ) is not None:
-        raise CutoverError(
-            "authority repository repair maintenance marker did not clear"
-        )
-    try:
-        readiness_proof = _validate_authority_repository_service_readiness_proof(
-            readiness_verifier(
-                phase="authenticated",
-                release=release,
-                database=database,
-                authority_uid=authority_uid,
-                authority_generation=str(plan["authority_generation"]),
-                binding=transaction["readiness"],
-                now_reader=now_reader,
-            ),
-            phase="authenticated",
-            binding=transaction["readiness"],
-            generation=str(plan["authority_generation"]),
-        )
-        if (
-            readiness_proof["socket_identity"] != preclear["socket_identity"]
-            or readiness_proof["socket_peer"] != preclear["socket_peer"]
-            or readiness_proof["invariants"]["database_identity"]
-            != preclear["invariants"]["database_identity"]
-        ):
-            raise CutoverError(
-                "authority repository service changed across authenticated readiness"
-            )
-    except BaseException:
-        maintenance_activator(
-            expected_uid=authority_uid,
-            expected_gid=maintenance_gid,
-            deployment_id=maintenance_deployment_id,
-            scope=CONTROL_PLANE_MAINTENANCE_SCOPE,
-            message=PUBLIC_MAINTENANCE_MESSAGE,
-            retry_after_seconds=5,
-            started_at=str(transaction["maintenance"]["started_at"]),
-            maintenance_root=maintenance_root,
-        )
-        raise
-    if repair_error is not None:
-        raise repair_error
-    if repair is None:
-        raise CutoverError("authority repository repair result was not published")
-    result = _authority_repository_disable_transaction_result(
-        seal(
-            AUTHORITY_REPOSITORY_DISABLE_TRANSACTION_RESULT_KIND,
-            {
-                "operation_id": operation_id,
-                "transaction_journal_sha256": transaction["document_sha256"],
-                "repair_result_sha256": repair["document_sha256"],
-                "release_digest": release_digest,
-                "database": str(database),
-                "service_unit": unit,
-                "readiness_proof": readiness_proof,
-                "service_restored": True,
-                "maintenance_cleared": True,
-                "completed_at": now_reader(),
-            },
-        ),
-        readiness=transaction["readiness"],
-        authority_generation=str(plan["authority_generation"]),
-    )
-    evidence_publisher(transaction_attestation, result, uid=authority_uid)
-    return {"ok": True, "replayed": False, "attestation": result}
-
-
-def _authority_repository_predecessor_binding(
-    value: object,
-) -> dict[str, object]:
-    fields = {
-        "transaction",
-        "operation_id",
-        "journal_sha256",
-        "journal_document_sha256",
-        "profile",
-        "dropin",
-    }
-    if not isinstance(value, Mapping) or set(value) != fields:
-        raise CutoverError(
-            "authority repository predecessor binding is invalid"
-        )
-    try:
-        operation_id = str(uuid.UUID(str(value["operation_id"])))
-    except (ValueError, TypeError, AttributeError) as error:
-        raise CutoverError(
-            "authority repository predecessor operation is invalid"
-        ) from error
-    document = dict(value)
-    document["operation_id"] = operation_id
-    for field in ("transaction", "profile", "dropin"):
-        document[field] = str(
-            _absolute(
-                str(document[field]),
-                f"authority repository predecessor {field}",
-            )
-        )
-    if any(
-        re.fullmatch(r"[0-9a-f]{64}", str(document[field])) is None
-        for field in ("journal_sha256", "journal_document_sha256")
-    ):
-        raise CutoverError(
-            "authority repository predecessor digest is invalid"
-        )
-    return document
-
-
-def _authority_repository_lifecycle_recovery_transaction(
-    value: object,
-) -> dict[str, object]:
-    document = verify_seal(
-        value,
-        kind=AUTHORITY_REPOSITORY_LIFECYCLE_RECOVERY_TRANSACTION_KIND,
-        fields=AUTHORITY_REPOSITORY_LIFECYCLE_RECOVERY_TRANSACTION_FIELDS,
-    )
-    try:
-        document["operation_id"] = str(uuid.UUID(str(document["operation_id"])))
-    except (ValueError, TypeError, AttributeError) as error:
-        raise CutoverError(
-            "authority repository lifecycle transaction operation ID is invalid"
-        ) from error
-    for field in (
-        "release",
-        "canary_release",
-        "plan",
-        "database",
-        "recovery_attestation",
-    ):
-        document[field] = str(
-            _absolute(
-                str(document[field]),
-                f"authority repository lifecycle transaction {field}",
-            )
-        )
-    if (
-        re.fullmatch(r"[0-9a-f]{64}", str(document["release_digest"])) is None
-        or re.fullmatch(
-            r"[0-9a-f]{64}", str(document["canary_release_digest"])
-        )
-        is None
-        or re.fullmatch(
-            r"[0-9a-f]{64}", str(document["plan_document_sha256"])
-        )
-        is None
-        or document["service_unit"] != "devcoordinator-broker.service"
-        or not isinstance(document["created_at"], str)
-        or not document["created_at"]
-    ):
-        raise CutoverError(
-            "authority repository lifecycle transaction binding is invalid"
-        )
-    document["service_baseline"] = _validate_systemd_recovery_service_state(
-        document["service_baseline"]
-    )
-    document["readiness"] = _authority_repository_service_readiness_binding(
-        document["readiness"]
-    )
-    document["predecessor"] = _authority_repository_predecessor_binding(
-        document["predecessor"]
-    )
-    document["maintenance"] = _authority_readiness_maintenance(
-        document["maintenance"]
-    )
-    return document
-
-
-def _authority_repository_bound_predecessor_proof(
-    value: object,
-    *,
-    transaction: Mapping[str, object],
-    plan: Mapping[str, object],
-    proof_validator=None,
-) -> dict[str, object]:
-    try:
-        validator = proof_validator or (
-            _load_schema12_bridge_verifier()._verify_successor_predecessor_proof
-        )
-        proof = validator(value)
-    except Exception as error:
-        raise CutoverError(
-            "authority repository predecessor proof is invalid"
-        ) from error
-    if not isinstance(proof, Mapping):
-        raise CutoverError("authority repository predecessor proof is invalid")
-    predecessor = transaction["predecessor"]
-    readiness = transaction["readiness"]
-    legacy = proof.get("legacy_profile_repository")
-    canary = proof.get("canary")
-    authority = canary.get("authority") if isinstance(canary, Mapping) else None
-    repository = canary.get("repository") if isinstance(canary, Mapping) else None
-    bridge_journal = Path(str(proof.get("bridge_journal", "")))
-    if (
-        proof.get("operation_id") != predecessor["operation_id"]
-        or bridge_journal.parent != Path(str(predecessor["transaction"]))
-        or proof.get("bridge_journal_sha256") != predecessor["journal_sha256"]
-        or proof.get("bridge_document_sha256")
-        != predecessor["journal_document_sha256"]
-        or proof.get("historical_client_release")
-        != transaction["canary_release"]
-        or proof.get("historical_client_release_digest")
-        != transaction["canary_release_digest"]
-        or proof.get("broker_release_digest")
-        != transaction["canary_release_digest"]
-        or proof.get("broker_release") == transaction["canary_release"]
-        or proof.get("database") != transaction["database"]
-        or proof.get("database_generation") != plan["authority_generation"]
-        or proof.get("profile") != predecessor["profile"]
-        or proof.get("broker_socket") != readiness["broker_socket"]
-        or proof.get("dropin") != predecessor["dropin"]
-        or not isinstance(legacy, Mapping)
-        or legacy.get("client_uid") != readiness["canary_uid"]
-        or legacy.get("repository_id") != readiness["canary_repository_id"]
-        or legacy.get("canonical_root") != readiness["canary_project"]
-        or legacy.get("generation")
-        != readiness["canary_repository_generation"]
-        or legacy.get("owner_uid_present") is not False
-        or not isinstance(canary, Mapping)
-        or canary.get("user") != readiness["canary_user"]
-        or canary.get("uid") != readiness["canary_uid"]
-        or canary.get("project") != readiness["canary_project"]
-        or not isinstance(authority, Mapping)
-        or authority.get("database_generation") != plan["authority_generation"]
-        or authority.get("socket") != readiness["broker_socket"]
-        or not isinstance(repository, Mapping)
-        or repository.get("repository_id")
-        != readiness["canary_repository_id"]
-        or repository.get("canonical_root") != readiness["canary_project"]
-        or repository.get("generation")
-        != readiness["canary_repository_generation"]
-    ):
-        raise CutoverError(
-            "authority repository predecessor proof binding changed"
-        )
-    return dict(proof)
-
-
-def _authority_repository_lifecycle_recovery_transaction_result(
-    value: object,
-    *,
-    transaction: Mapping[str, object] | None = None,
-    plan: Mapping[str, object] | None = None,
-    predecessor_proof_validator=None,
-) -> dict[str, object]:
-    document = verify_seal(
-        value,
-        kind=AUTHORITY_REPOSITORY_LIFECYCLE_RECOVERY_TRANSACTION_RESULT_KIND,
-        fields=AUTHORITY_REPOSITORY_LIFECYCLE_RECOVERY_TRANSACTION_RESULT_FIELDS,
-    )
-    try:
-        document["operation_id"] = str(uuid.UUID(str(document["operation_id"])))
-    except (ValueError, TypeError, AttributeError) as error:
-        raise CutoverError(
-            "authority repository lifecycle result operation ID is invalid"
-        ) from error
-    document["database"] = str(
-        _absolute(
-            str(document["database"]),
-            "authority repository lifecycle result database",
-        )
-    )
-    document["maintenance"] = _authority_readiness_maintenance(
-        document["maintenance"]
-    )
-    if (
-        re.fullmatch(
-            r"[0-9a-f]{64}", str(document["transaction_journal_sha256"])
-        )
-        is None
-        or re.fullmatch(
-            r"[0-9a-f]{64}", str(document["recovery_result_sha256"])
-        )
-        is None
-        or re.fullmatch(r"[0-9a-f]{64}", str(document["release_digest"])) is None
-        or re.fullmatch(
-            r"[0-9a-f]{64}", str(document["canary_release_digest"])
-        )
-        is None
-        or document["service_unit"] != "devcoordinator-broker.service"
-        or document["service_restored"] is not True
-        or document["maintenance_cleared"] is not False
-        or document["successor_handoff_required"] is not True
-        or not isinstance(document["completed_at"], str)
-        or not document["completed_at"]
-    ):
-        raise CutoverError("authority repository lifecycle result is invalid")
-    if transaction is not None and plan is not None:
-        document["preclear_readiness"] = (
-            _validate_authority_repository_service_readiness_proof(
-                document["preclear_readiness"],
-                phase="preclear",
-                binding=transaction["readiness"],
-                generation=str(plan["authority_generation"]),
-            )
-        )
-        if (
-            document["preclear_readiness"]["invariants"]["state_revision"]
-            < int(plan["target"]["state_revision"])
-        ):
-            raise CutoverError(
-                "authority repository lifecycle preclear predates recovery"
-            )
-        document["predecessor_proof"] = (
-            _authority_repository_bound_predecessor_proof(
-                document["predecessor_proof"],
-                transaction=transaction,
-                plan=plan,
-                proof_validator=predecessor_proof_validator,
-            )
-        )
-    elif (
-        not isinstance(document["predecessor_proof"], Mapping)
-        or not isinstance(document["preclear_readiness"], Mapping)
-    ):
-        raise CutoverError(
-            "authority repository lifecycle readiness evidence is unavailable"
-        )
-    return document
-
-
-def recover_authority_repository_lifecycle(
-    *,
-    release: Path,
-    canary_release: Path,
-    predecessor_transaction: Path,
-    predecessor_operation_id: str,
-    predecessor_journal_sha256: str,
-    predecessor_journal_document_sha256: str,
-    predecessor_profile: Path,
-    predecessor_dropin: Path,
-    plan_path: Path,
-    plan_document_sha256: str,
-    recovery_attestation: Path,
-    transaction_journal: Path,
-    transaction_attestation: Path,
-    maintenance_root: Path,
-    maintenance_gid: int,
-    maintenance_deployment_id: str,
-    operation_id: str,
-    broker_socket: Path,
-    canary_user: str,
-    canary_uid: int,
-    canary_project: Path,
-    canary_repository_id: str,
-    canary_repository_generation: int,
-    readiness_wait_seconds: int = 30,
-    authority_uid: int = 0,
-    release_verifier=None,
-    canary_release_verifier=None,
-    command_status=_bounded_command_status,
-    command_output=_bounded_command_output,
-    service_state_reader=None,
-    maintenance_activator=activate_maintenance,
-    maintenance_clearer=clear_maintenance,
-    maintenance_state_reader=load_maintenance_state,
-    evidence_reader=read_private_json,
-    evidence_publisher=_publish_evidence,
-    effective_uid_reader=os.geteuid,
-    now_reader=_now,
-    recoverer=apply_authority_repository_lifecycle_recovery,
-    recoverer_options: Mapping[str, object] | None = None,
-    service_readiness_verifier=None,
-    predecessor_verifier=None,
-    predecessor_proof_validator=None,
-    predecessor_preflight=None,
-    predecessor_rearmer=None,
-) -> dict[str, object]:
-    """Recover partial authority state behind a stable maintenance fence."""
-
-    if effective_uid_reader() != 0 or authority_uid != 0:
-        raise CutoverError(
-            "authority repository lifecycle service transaction must run as root"
-        )
-    try:
-        operation_id = str(uuid.UUID(str(operation_id)))
-        maintenance_deployment_id = str(uuid.UUID(str(maintenance_deployment_id)))
-        predecessor_operation_id = str(
-            uuid.UUID(str(predecessor_operation_id))
-        )
-    except (ValueError, TypeError, AttributeError) as error:
-        raise CutoverError(
-            "authority repository lifecycle transaction identity is invalid"
-        ) from error
-    release = _absolute(release, "authority repository lifecycle release")
-    canary_release = _absolute(
-        canary_release, "authority repository lifecycle canary release"
-    )
-    predecessor_transaction = _absolute(
-        predecessor_transaction,
-        "authority repository predecessor transaction",
-    )
-    predecessor_profile = _absolute(
-        predecessor_profile, "authority repository predecessor profile"
-    )
-    predecessor_dropin = _absolute(
-        predecessor_dropin, "authority repository predecessor drop-in"
-    )
-    plan_path = _absolute(plan_path, "authority repository lifecycle plan")
-    recovery_attestation = _absolute(
-        recovery_attestation, "authority repository lifecycle result"
-    )
-    transaction_journal = _absolute(
-        transaction_journal, "authority repository lifecycle service journal"
-    )
-    transaction_attestation = _absolute(
-        transaction_attestation, "authority repository lifecycle service result"
-    )
-    maintenance_root = _absolute(
-        maintenance_root, "authority repository lifecycle maintenance root"
-    )
-    if len(
-        {plan_path, recovery_attestation, transaction_journal, transaction_attestation}
-    ) != 4:
-        raise CutoverError(
-            "authority repository lifecycle transaction paths must be distinct"
-        )
-    plan = _validate_authority_repository_lifecycle_recovery_plan(
-        evidence_reader(plan_path, uid=authority_uid)
-    )
-    if (
-        plan["authority_uid"] != authority_uid
-        or re.fullmatch(r"[0-9a-f]{64}", plan_document_sha256 or "") is None
-        or plan["document_sha256"] != plan_document_sha256
-        or plan["operation_id"] != operation_id
-    ):
-        mismatches = []
-        if plan["authority_uid"] != authority_uid:
-            mismatches.append("authority_uid")
-        if re.fullmatch(r"[0-9a-f]{64}", plan_document_sha256 or "") is None:
-            mismatches.append("plan_digest_format")
-        elif plan["document_sha256"] != plan_document_sha256:
-            mismatches.append("plan_digest")
-        if plan["operation_id"] != operation_id:
-            mismatches.append("operation_id")
-        raise CutoverError(
-            "authority repository lifecycle transaction plan binding changed: "
-            + ",".join(mismatches)
-        )
-    database = _absolute(
-        str(plan["authority_database"]),
-        "authority repository lifecycle transaction database",
-    )
-    verifier = _load_release_verifier() if release_verifier is None else release_verifier
-    verified_release = (
-        verifier.verify_release(release)
-        if hasattr(verifier, "verify_release")
-        else verifier(release)
-    )
-    release_digest = str(verified_release.get("release_digest", ""))
-    if (
-        re.fullmatch(r"[0-9a-f]{64}", release_digest) is None
-        or not isinstance(verified_release.get("capabilities"), Mapping)
-        or not all(verified_release["capabilities"].values())
-        or (release_verifier is None and release != IMMUTABLE_RELEASE_ROOT / release_digest)
-    ):
-        raise CutoverError(
-            "authority repository lifecycle transaction release is invalid"
-        )
-    if canary_release_verifier is None:
-        try:
-            verified_canary_release = _load_schema12_bridge_verifier().verify_release(
-                canary_release, release_root=canary_release.parent
-            )
-        except Exception as error:
-            raise CutoverError(
-                "authority repository historical canary release is invalid"
-            ) from error
-    else:
-        verified_canary_release = (
-            canary_release_verifier.verify_release(canary_release)
-            if hasattr(canary_release_verifier, "verify_release")
-            else canary_release_verifier(canary_release)
-        )
-    canary_release_digest = str(
-        verified_canary_release.get("release_digest", "")
-        if isinstance(verified_canary_release, Mapping)
-        else ""
-    )
-    if (
-        re.fullmatch(r"[0-9a-f]{64}", canary_release_digest) is None
-        or not isinstance(verified_canary_release, Mapping)
-        or verified_canary_release.get("authority_schema_version") != 12
-        or (
-            canary_release_verifier is None
-            and canary_release.name != canary_release_digest
-        )
-    ):
-        raise CutoverError(
-            "authority repository historical canary release is invalid"
-        )
-    readiness = _authority_repository_service_readiness_binding(
-        {
-            "broker_socket": str(broker_socket),
-            "canary_user": canary_user,
-            "canary_uid": canary_uid,
-            "canary_project": str(canary_project),
-            "canary_repository_id": canary_repository_id,
-            "canary_repository_generation": canary_repository_generation,
-            "wait_seconds": readiness_wait_seconds,
-        }
-    )
-    predecessor = _authority_repository_predecessor_binding(
-        {
-            "transaction": str(predecessor_transaction),
-            "operation_id": predecessor_operation_id,
-            "journal_sha256": predecessor_journal_sha256,
-            "journal_document_sha256": predecessor_journal_document_sha256,
-            "profile": str(predecessor_profile),
-            "dropin": str(predecessor_dropin),
-        }
-    )
-    state_reader = service_state_reader or (
-        lambda unit: _systemd_recovery_service_state(command_output, unit)
-    )
-    unit = "devcoordinator-broker.service"
-    started_at = now_reader()
-    planned_maintenance = {
-        "root": str(maintenance_root),
-        "gid": maintenance_gid,
-        "deployment_id": maintenance_deployment_id,
-        "message": PUBLIC_MAINTENANCE_MESSAGE,
-        "retry_after_seconds": 5,
-        "started_at": started_at,
-    }
-    if transaction_journal.exists() or transaction_journal.is_symlink():
-        transaction = _authority_repository_lifecycle_recovery_transaction(
-            evidence_reader(transaction_journal, uid=authority_uid)
-        )
-        if (
-            transaction["operation_id"] != operation_id
-            or transaction["release"] != str(release)
-            or transaction["release_digest"] != release_digest
-            or transaction["canary_release"] != str(canary_release)
-            or transaction["canary_release_digest"] != canary_release_digest
-            or transaction["plan"] != str(plan_path)
-            or transaction["plan_document_sha256"] != plan_document_sha256
-            or transaction["database"] != str(database)
-            or transaction["recovery_attestation"] != str(recovery_attestation)
-            or transaction["readiness"] != readiness
-            or transaction["predecessor"] != predecessor
-            or transaction["maintenance"]["root"] != str(maintenance_root)
-            or transaction["maintenance"]["gid"] != maintenance_gid
-            or transaction["maintenance"]["deployment_id"]
-            != maintenance_deployment_id
-        ):
-            raise CutoverError(
-                "authority repository lifecycle journal belongs to another operation"
-            )
-    else:
-        baseline = _validate_systemd_recovery_service_state(state_reader(unit))
-        transaction = _authority_repository_lifecycle_recovery_transaction(
-            seal(
-                AUTHORITY_REPOSITORY_LIFECYCLE_RECOVERY_TRANSACTION_KIND,
-                {
-                    "operation_id": operation_id,
-                    "release": str(release),
-                    "release_digest": release_digest,
-                    "canary_release": str(canary_release),
-                    "canary_release_digest": canary_release_digest,
-                    "plan": str(plan_path),
-                    "plan_document_sha256": plan_document_sha256,
-                    "database": str(database),
-                    "service_unit": unit,
-                    "service_baseline": baseline,
-                    "readiness": readiness,
-                    "predecessor": predecessor,
-                    "maintenance": planned_maintenance,
-                    "recovery_attestation": str(recovery_attestation),
-                    "created_at": started_at,
-                },
-            )
-        )
-        evidence_publisher(transaction_journal, transaction, uid=authority_uid)
-
-    readiness_verifier = (
-        _authority_repository_service_readiness_proof
-        if service_readiness_verifier is None
-        else service_readiness_verifier
-    )
-
-    bridge_module = None
-    if (
-        predecessor_verifier is None
-        or predecessor_proof_validator is None
-        or predecessor_preflight is None
-        or predecessor_rearmer is None
-    ):
-        bridge_module = _load_schema12_bridge_verifier()
-    active_predecessor_verifier = (
-        bridge_module._verify_active_predecessor_for_successor
-        if predecessor_verifier is None
-        else predecessor_verifier
-    )
-    active_predecessor_validator = (
-        bridge_module._verify_successor_predecessor_proof
-        if predecessor_proof_validator is None
-        else predecessor_proof_validator
-    )
-    lifecycle_predecessor_preflight = (
-        bridge_module._preflight_lifecycle_predecessor
-        if predecessor_preflight is None
-        else predecessor_preflight
-    )
-    lifecycle_predecessor_rearmer = (
-        bridge_module._rearm_restored_predecessor_for_lifecycle
-        if predecessor_rearmer is None
-        else predecessor_rearmer
-    )
-
-    predecessor_call = {
-        "transaction": predecessor_transaction,
-        "operation_id": predecessor_operation_id,
-        "expected_journal_sha256": predecessor_journal_sha256,
-        "expected_journal_document_sha256": (
-            predecessor_journal_document_sha256
-        ),
-        "historical_client_release": canary_release,
-        "database": database,
-        "profile": predecessor_profile,
-        "broker_socket": Path(str(readiness["broker_socket"])),
-        "dropin": predecessor_dropin,
-        "expected_database_generation": str(plan["authority_generation"]),
-        "canary_user": str(readiness["canary_user"]),
-        "expected_canary_uid": int(readiness["canary_uid"]),
-        "canary_project": Path(str(readiness["canary_project"])),
-        "canary_repository_id": str(readiness["canary_repository_id"]),
-        "canary_repository_generation": int(
-            readiness["canary_repository_generation"]
-        ),
-        "expected_uid": authority_uid,
-    }
-    predecessor_rearm_journal = transaction_journal.with_name(
-        "lifecycle-predecessor-rearm.json"
-    )
-
-    try:
-        predecessor_state = lifecycle_predecessor_preflight(
-            **predecessor_call,
-            _allow_rearmed_dropin=(
-                predecessor_rearm_journal.exists()
-                or predecessor_rearm_journal.is_symlink()
-            ),
-        )
-    except Exception as error:
-        raw_detail = str(error)
-        detail = " ".join(raw_detail.replace("\x00", "").split())[:480]
-        if not detail:
-            detail = type(error).__name__
-        raise CutoverError(
-            f"authority repository predecessor preflight failed: {detail}"
-        ) from error
-    predecessor_mode = (
-        predecessor_state.get("mode")
-        if isinstance(predecessor_state, Mapping)
-        else None
-    )
-    if predecessor_mode not in {"ready", "restored"}:
-        raise CutoverError(
-            "authority repository predecessor state is unsupported"
-        )
-
-    def bind_predecessor_proof(proof: object) -> dict[str, object]:
-        return _authority_repository_bound_predecessor_proof(
-            proof,
-            transaction=transaction,
-            plan=plan,
-            proof_validator=active_predecessor_validator,
-        )
-
-    def prove_predecessor() -> dict[str, object]:
-        try:
-            proof = active_predecessor_verifier(
-                **predecessor_call,
-                wait_seconds=int(readiness["wait_seconds"]),
-            )
-        except Exception as error:
-            raise CutoverError(
-                "authority repository exact predecessor proof failed"
-            ) from error
-        return bind_predecessor_proof(proof)
-
-    def rearm_predecessor(*, terminal_bound: bool = False) -> dict[str, object]:
-        try:
-            proof = lifecycle_predecessor_rearmer(
-                outer_operation_id=operation_id,
-                outer_transaction_journal=transaction_journal,
-                outer_transaction_document_sha256=transaction[
-                    "document_sha256"
-                ],
-                rearm_journal=predecessor_rearm_journal,
-                **predecessor_call,
-                wait_seconds=int(readiness["wait_seconds"]),
-                terminal_bound=terminal_bound,
-            )
-        except Exception as error:
-            raw_detail = str(error)
-            detail = " ".join(raw_detail.replace("\x00", "").split())[:480]
-            if not detail:
-                detail = type(error).__name__
-            raise CutoverError(
-                "authority repository restored predecessor rearm failed: "
-                + detail
-            ) from error
-        return bind_predecessor_proof(proof)
-
-    def completed_recovery() -> dict[str, object] | None:
-        if not (recovery_attestation.exists() or recovery_attestation.is_symlink()):
-            return None
-        result = _validate_authority_repository_lifecycle_recovery_result(
-            evidence_reader(recovery_attestation, uid=authority_uid)
-        )
-        if (
-            result["plan_id"] != plan["plan_id"]
-            or result["operation_id"] != operation_id
-            or result["plan_document_sha256"] != plan_document_sha256
-            or result["authority_database"] != str(database)
-            or result["maintenance_deployment_id"] != maintenance_deployment_id
-            or result["repository_id"] != plan["repository"]["repository_id"]
-            or result["repository_state"] != "active"
-            or result["installation_status"] != "installed"
-            or result["startup_fenced"] is not False
-        ):
-            raise CutoverError("authority repository lifecycle result changed")
-        return result
-
-    recovery = completed_recovery()
-    initial_predecessor_proof = (
-        prove_predecessor() if predecessor_mode == "ready" else None
-    )
-    if transaction_attestation.exists() or transaction_attestation.is_symlink():
-        result = _authority_repository_lifecycle_recovery_transaction_result(
-            evidence_reader(transaction_attestation, uid=authority_uid),
-            transaction=transaction,
-            plan=plan,
-            predecessor_proof_validator=active_predecessor_validator,
-        )
-        marker = maintenance_state_reader(
-            expected_uid=authority_uid,
-            expected_gid=maintenance_gid,
-            maintenance_root=maintenance_root,
-        )
-        service = _validate_systemd_recovery_service_state(state_reader(unit))
-        if (
-            recovery is None
-            or result["operation_id"] != operation_id
-            or result["transaction_journal_sha256"]
-            != transaction["document_sha256"]
-            or result["recovery_result_sha256"] != recovery["document_sha256"]
-            or result["release_digest"] != release_digest
-            or result["canary_release_digest"] != canary_release_digest
-            or result["database"] != str(database)
-            or result["maintenance"] != transaction["maintenance"]
-            or not _systemd_recovery_service_is_healthy(service)
-            or _normalize_maintenance_state(
-                marker,
-                root=maintenance_root,
-                gid=maintenance_gid,
-                deployment_id=maintenance_deployment_id,
-            )
-            != transaction["maintenance"]
-        ):
-            raise CutoverError(
-                "authority repository lifecycle service result is contradictory"
-            )
-        if predecessor_mode == "restored":
-            replay_predecessor = rearm_predecessor(terminal_bound=True)
-        else:
-            replay_predecessor = prove_predecessor()
-        replay_preclear = _validate_authority_repository_service_readiness_proof(
-            readiness_verifier(
-                phase="preclear",
-                release=canary_release,
-                database=database,
-                authority_uid=authority_uid,
-                authority_generation=str(plan["authority_generation"]),
-                binding=transaction["readiness"],
-                now_reader=now_reader,
-            ),
-            phase="preclear",
-            binding=transaction["readiness"],
-            generation=str(plan["authority_generation"]),
-        )
-        if (
-            _authority_repository_readiness_stable_binding(replay_preclear)
-            != _authority_repository_readiness_stable_binding(
-                result["preclear_readiness"]
-            )
-            or replay_predecessor["socket_identity"]
-            != replay_preclear["socket_identity"]
-            or replay_predecessor["socket_peer"]
-            != replay_preclear["socket_peer"]
-        ):
-            raise CutoverError(
-                "authority repository lifecycle readiness changed after handoff"
-            )
-        return {"ok": True, "replayed": True, "attestation": result}
-
-    maintenance_activator(
-        expected_uid=authority_uid,
-        expected_gid=maintenance_gid,
-        deployment_id=maintenance_deployment_id,
-        scope=CONTROL_PLANE_MAINTENANCE_SCOPE,
-        message=PUBLIC_MAINTENANCE_MESSAGE,
-        retry_after_seconds=5,
-        started_at=str(transaction["maintenance"]["started_at"]),
-        maintenance_root=maintenance_root,
-    )
-    marker = maintenance_state_reader(
-        expected_uid=authority_uid,
-        expected_gid=maintenance_gid,
-        maintenance_root=maintenance_root,
-    )
-    if (
-        _normalize_maintenance_state(
-            marker,
-            root=maintenance_root,
-            gid=maintenance_gid,
-            deployment_id=maintenance_deployment_id,
-        )
-        != transaction["maintenance"]
-    ):
-        raise CutoverError("authority repository lifecycle maintenance marker changed")
-    service_before_recovery = _validate_systemd_recovery_service_state(
-        state_reader(unit)
-    )
-    predecessor_proof: dict[str, object] | None = None
-    can_fast_forward = (
-        recovery is not None
-        and _systemd_recovery_service_is_healthy(service_before_recovery)
-    )
-    if can_fast_forward:
-        # A crash after the repository commit and predecessor rearm must not
-        # manufacture another stop/start cycle merely to publish the missing
-        # outer handoff. Re-prove the exact live predecessor in place, then
-        # seal its current revision below.
-        predecessor_proof = (
-            rearm_predecessor()
-            if predecessor_mode == "restored"
-            else initial_predecessor_proof
-        )
-    else:
-        if command_status(["/usr/bin/systemctl", "stop", unit]) != 0:
-            raise CutoverError("legacy broker did not stop behind maintenance")
-        stopped = _validate_systemd_recovery_service_state(state_reader(unit))
-        if not _systemd_recovery_service_is_stopped(stopped):
-            raise CutoverError("legacy broker remains active behind maintenance")
-        if recovery is None:
-            options = dict(recoverer_options or {})
-            recoverer(
-                plan_path=plan_path,
-                plan_document_sha256=plan_document_sha256,
-                attestation=recovery_attestation,
-                maintenance_root=maintenance_root,
-                maintenance_gid=maintenance_gid,
-                maintenance_deployment_id=maintenance_deployment_id,
-                authority_uid=authority_uid,
-                maintenance_state_reader=maintenance_state_reader,
-                **options,
-            )
-            recovery = completed_recovery()
-        if recovery is None:
-            raise CutoverError(
-                "authority repository lifecycle result was not published"
-            )
-        if predecessor_mode == "restored":
-            predecessor_proof = rearm_predecessor()
-        elif command_status(["/usr/bin/systemctl", "start", unit]) != 0:
-            raise CutoverError(
-                "legacy broker did not restart after lifecycle recovery"
-            )
-    preclear = _validate_authority_repository_service_readiness_proof(
-        readiness_verifier(
-            phase="preclear",
-            release=canary_release,
-            database=database,
-            authority_uid=authority_uid,
-            authority_generation=str(plan["authority_generation"]),
-            binding=transaction["readiness"],
-            now_reader=now_reader,
-        ),
-        phase="preclear",
-        binding=transaction["readiness"],
-        generation=str(plan["authority_generation"]),
-    )
-    healthy = _validate_systemd_recovery_service_state(state_reader(unit))
-    if not _systemd_recovery_service_is_healthy(healthy):
-        raise CutoverError("legacy broker is not healthy after lifecycle recovery")
-    predecessor_proof = (
-        predecessor_proof
-        if predecessor_proof is not None
-        else prove_predecessor()
-    )
-    if (
-        initial_predecessor_proof is not None
-        and _authority_repository_bound_predecessor_proof(
-            initial_predecessor_proof,
-            transaction=transaction,
-            plan=plan,
-            proof_validator=active_predecessor_validator,
-        )["bridge_journal_sha256"]
-        != predecessor_proof["bridge_journal_sha256"]
-    ):
-        raise CutoverError("authority repository predecessor identity changed")
-    final_service = _validate_systemd_recovery_service_state(state_reader(unit))
-    final_marker = maintenance_state_reader(
-        expected_uid=authority_uid,
-        expected_gid=maintenance_gid,
-        maintenance_root=maintenance_root,
-    )
-    if (
-        not _systemd_recovery_service_is_healthy(final_service)
-        or _normalize_maintenance_state(
-            final_marker,
-            root=maintenance_root,
-            gid=maintenance_gid,
-            deployment_id=maintenance_deployment_id,
-        )
-        != transaction["maintenance"]
-        or predecessor_proof["socket_identity"] != preclear["socket_identity"]
-        or predecessor_proof["socket_peer"] != preclear["socket_peer"]
-    ):
-        raise CutoverError(
-            "authority repository predecessor readiness changed before handoff"
-        )
-    result = _authority_repository_lifecycle_recovery_transaction_result(
-        seal(
-            AUTHORITY_REPOSITORY_LIFECYCLE_RECOVERY_TRANSACTION_RESULT_KIND,
-            {
-                "operation_id": operation_id,
-                "transaction_journal_sha256": transaction["document_sha256"],
-                "recovery_result_sha256": recovery["document_sha256"],
-                "release_digest": release_digest,
-                "canary_release_digest": canary_release_digest,
-                "database": str(database),
-                "service_unit": unit,
-                "maintenance": transaction["maintenance"],
-                "predecessor_proof": predecessor_proof,
-                "preclear_readiness": preclear,
-                "service_restored": True,
-                "maintenance_cleared": False,
-                "successor_handoff_required": True,
-                "completed_at": now_reader(),
-            },
-        ),
-        transaction=transaction,
-        plan=plan,
-        predecessor_proof_validator=active_predecessor_validator,
-    )
-    evidence_publisher(transaction_attestation, result, uid=authority_uid)
-    return {"ok": True, "replayed": False, "attestation": result}
-
-
-IMPORT_FIELDS = frozenset(
-    {
-        "migration_id",
-        "pass_kind",
-        "authority_generation",
-        "watermark_fingerprint",
-        "export_fingerprint",
-        "test_store_generation",
-        "chunk_count",
-        "final_chunk_sha256",
-        "run_count",
-        "case_count",
-        "destination_projection_chain_sha256",
-        "source_retained",
-    }
-)
-SEAL_FIELDS = frozenset(
-    {
-        "migration_id",
-        "authority_database",
-        "authority_generation",
-        "test_database",
-        "test_store_generation",
-        "drain_proof_fingerprint",
-        "final_export_fingerprint",
-        "final_watermark_fingerprint",
-        "destination_attestation_fingerprint",
-        "legacy_source_retained",
-        "activation_ready",
-        "rollback",
-    }
-)
-DELEGATION_FIELDS = frozenset(
-    {
-        "api_uid",
-        "broker_account_id",
-        "source_authority_generation",
-        "authority_generation",
-        "profile_fingerprint",
-        "profile_path",
-        "profile_owner_uid",
-        "profile_group_name",
-        "profile_group_gid",
-        "profile_mode",
-        "profile_source_kind",
-        "profile_source_sha256",
-        "profile_authority_reconciled",
-        "profile_generation_matches_authority",
-        "atomic_publication_verified",
-        "existing_profile_contents_reused",
-        "google_actor_prefix",
-        "google_actor_policy",
-        "repository_grants",
-        "broker_verified",
-        "created_at",
-    }
-)
-CANDIDATE_FIELDS = frozenset(
-    {
-        "release_digest",
-        "ready_units",
-        "service_uids",
-        "service_slices",
-        "socket_inodes",
-        "authority_database",
-        "test_database",
-        "migration_seal_sha256",
-        "checks_passed",
-        "test_capability_policy",
-        "preparation",
-        "created_at",
-    }
-)
-CANDIDATE_PREPARATION_FIELDS = frozenset(
-    {
-        "release_digest",
-        "executor_release",
-        "credential_preflight_sha256",
-        "host_preflight_sha256",
-        "background_config",
-        "project_isolation",
-        "console_slot_ports",
-        "prior_units",
-        "prior_files",
-        "installed_files",
-        "ready_units",
-        "socket_inodes",
-        "created_at",
-    }
-)
-CAPABILITY_POLICY_FIELDS = frozenset(
-    {
-        "policy_path",
-        "policy_owner_uid",
-        "policy_mode",
-        "policy_file_sha256",
-        "policy_fingerprint",
-        "authority_generation",
-        "authority_export_sha256",
-        "dogfood_repository_id",
-        "repository_grants",
-        "coverage_complete",
-        "broker_contract_verified",
-        "created_at",
-    }
-)
-AUTHORITY_REPOSITORY_EXPORT_FIELDS = frozenset(
-    {"authority_generation", "repositories", "exported_at"}
-)
-ACTIVATION_FIELDS = frozenset(
-    {
-        "release_digest",
-        "migration_seal_sha256",
-        "profile_inventory_readiness_sha256",
-        "executor_release",
-        "credential_preflight_sha256",
-        "publication_switch",
-        "continuity_probe",
-        "socket_inodes_before",
-        "socket_inodes_after",
-        "connection_refused_count",
-        "project_route_failures",
-        "legacy_units_active",
-        "authority_ready",
-        "testd_ready",
-        "console_ready",
-        "browser_lcp_attestation_sha256",
-        "browser_lcp_consumption_sha256",
-        "created_at",
-    }
-)
-RETENTION_FIELDS = frozenset(
-    {
-        "authority_backup_sha256",
-        "test_backup_sha256",
-        "legacy_source_retained",
-        "retain_until",
-        "rollback_rehearsal_sha256",
-        "live_rollback_rehearsal_sha256",
-        "profile_inventory_readiness_sha256",
-        "profile_inventory_reverification",
-        "browser_lcp_attestation_sha256",
-        "browser_lcp_consumption_sha256",
-        "created_at",
-    }
-)
-CONTINUITY_PROBE_FIELDS = frozenset(
-    {
-        "operation_id",
-        "release_digest",
-        "started_at",
-        "completed_at",
-        "sample_interval_ms",
-        "round_count",
-        "sample_count",
-        "http_sample_count",
-        "websocket_sample_count",
-        "connection_refused_count",
-        "project_route_failures",
-        "failed_sample_count",
-        "ttfb_p99_ms",
-        "control_plane_p99_ms",
-        "targets",
-        "samples_sha256",
-        "slo",
-        "passed",
-    }
-)
-ROLLBACK_REHEARSAL_FIELDS = frozenset(
-    {
-        "operation_id",
-        "activation_sha256",
-        "executor_release",
-        "authority_backup_sha256",
-        "test_backup_sha256",
-        "restores",
-        "publication_inverse_plan",
-        "continuity_probe_sha256",
-        "legacy_source_retained",
-        "private_scratch",
-        "rehearsed_at",
-    }
-)
-LIVE_ROLLBACK_REHEARSAL_FIELDS = frozenset(
-    {
-        "operation_id",
-        "activation_sha256",
-        "activation_state_generation",
-        "release_digest",
-        "executor_release",
-        "journal_sha256",
-        "publication_before",
-        "rollback_slot",
-        "rollback_switch",
-        "publication_rollback",
-        "rollback_continuity_probe",
-        "reactivation_slot",
-        "reactivation_switch",
-        "publication_reactivated",
-        "reactivation_continuity_probe",
-        "supported_rollback_head",
-        "socket_inodes_before",
-        "socket_inodes_after",
-        "continuity_probe",
-        "profile_health",
-        "data_health",
-        "recovery_count",
-        "browser_lcp_attestation_sha256",
-        "browser_lcp_consumption_sha256",
-        "completed_at",
-    }
-)
-ROLLBACK_FIELDS = frozenset(
-    {
-        "activation_sha256",
-        "executor_release",
-        "credential_preflight_sha256",
-        "publication_switch",
-        "authority_backup_sha256",
-        "test_backup_sha256",
-        "socket_inodes_before",
-        "socket_inodes_after",
-        "connection_refused_count",
-        "legacy_authority_ready",
-        "created_at",
-    }
-)
-
-
 def _socket_map(value: object) -> dict[str, int]:
     if (
         not isinstance(value, Mapping)
@@ -17599,7 +10226,6 @@ def _candidate_service_identity(
     release_digest: str,
     authority_uid: int,
     testd_uid: int,
-    api_uid: int,
 ) -> None:
     units = _candidate_units(release_digest)
     raw_uids = value.get("service_uids")
@@ -17628,7 +10254,6 @@ def _candidate_service_identity(
     if (
         raw_uids["devcoordinator-authority.service"] != authority_uid
         or raw_uids["devcoordinator-testd.service"] != testd_uid
-        or raw_uids["devcoordinator-api.service"] != api_uid
         or raw_uids["devcoordinator-test-snapshotd.service"] != 0
         or any(
             int(raw_uids[unit]) <= 0
@@ -17655,97 +10280,6 @@ def _candidate_service_identity(
     if len(dedicated) != 5:
         raise CutoverError("candidate dedicated services share an operating-system UID")
 
-
-def _capability_policy_attestation(
-    value: object,
-    *,
-    delegation: Mapping[str, object],
-) -> dict[str, object]:
-    if not isinstance(value, Mapping):
-        raise CutoverError("candidate capability policy evidence is missing")
-    policy = verify_seal(
-        value,
-        kind=CAPABILITY_POLICY_KIND,
-        fields=CAPABILITY_POLICY_FIELDS,
-    )
-    if (
-        policy["policy_path"] != TEST_CAPABILITY_POLICY_PATH
-        or policy["policy_owner_uid"] != 0
-        or policy["policy_mode"] != "0600"
-        or re.fullmatch(r"[0-9a-f]{64}", str(policy["policy_file_sha256"])) is None
-        or re.fullmatch(r"[0-9a-f]{64}", str(policy["policy_fingerprint"])) is None
-        or re.fullmatch(r"[0-9a-f]{64}", str(policy["authority_export_sha256"])) is None
-        or policy["authority_generation"] != delegation["authority_generation"]
-        or policy["coverage_complete"] is not True
-        or policy["broker_contract_verified"] is not True
-        or not isinstance(policy["dogfood_repository_id"], str)
-        or not policy["dogfood_repository_id"]
-    ):
-        raise CutoverError("candidate capability policy metadata is invalid")
-    grants = policy["repository_grants"]
-    if not isinstance(grants, list) or not grants or len(grants) > 10_000:
-        raise CutoverError("candidate capability policy grants are invalid")
-    repository_ids: list[str] = []
-    dogfood = None
-    capability_pattern = re.compile(
-        r"^(?:network\.(?:loopback|host-loopback|external)|fixture\.[A-Za-z0-9][A-Za-z0-9_.:@/-]{0,255}|credential\.[a-z][a-z0-9_.-]{0,127})$"
-    )
-    for grant in grants:
-        if (
-            not isinstance(grant, Mapping)
-            or set(grant)
-            != {
-                "repository_id",
-                "generation",
-                "setup_status",
-                "manifest_fingerprint",
-                "requested",
-                "granted",
-            }
-            or not isinstance(grant["repository_id"], str)
-            or not grant["repository_id"]
-            or type(grant["generation"]) is not int
-            or int(grant["generation"]) < 0
-            or grant["setup_status"] not in {"ready", "missing", "invalid"}
-            or (
-                grant["setup_status"] == "ready"
-                and re.fullmatch(r"[0-9a-f]{64}", str(grant["manifest_fingerprint"])) is None
-            )
-            or (
-                grant["setup_status"] != "ready"
-                and grant["manifest_fingerprint"] is not None
-            )
-            or not isinstance(grant["requested"], list)
-            or not isinstance(grant["granted"], list)
-            or any(
-                not isinstance(item, str) or capability_pattern.fullmatch(item) is None
-                for item in grant["requested"]
-            )
-            or grant["requested"] != sorted(set(grant["requested"]))
-            or grant["granted"] != grant["requested"]
-        ):
-            raise CutoverError("candidate capability policy grant is invalid")
-        repository_id = str(grant["repository_id"])
-        repository_ids.append(repository_id)
-        if repository_id == policy["dogfood_repository_id"]:
-            dogfood = grant
-    if len(repository_ids) != len(set(repository_ids)):
-        raise CutoverError("candidate capability policy repeats a repository")
-    delegated_ids = {
-        str(item["repository_id"])
-        for item in delegation["repository_grants"]  # type: ignore[union-attr]
-    }
-    if set(repository_ids) != delegated_ids:
-        raise CutoverError("candidate capability policy does not cover every delegated repository")
-    if (
-        dogfood is None
-        or dogfood["setup_status"] != "ready"
-        or "network.loopback" not in dogfood["granted"]
-    ):
-        raise CutoverError("candidate dogfood test capability is incomplete")
-    return policy
-
-
 def _normalize_replay(
     evidence_kind: str, evidence: Mapping[str, object]
 ) -> dict[str, object]:
@@ -17756,7 +10290,6 @@ def _normalize_replay(
         "final-import": (INITIAL_IMPORT_KIND, IMPORT_FIELDS),
         "migration-seal": (SEAL_KIND, SEAL_FIELDS),
         "test-history-discard": (SCHEMA_READINESS_KIND, SCHEMA_READINESS_FIELDS),
-        "api-delegation": (DELEGATION_KIND, DELEGATION_FIELDS),
         "profile-inventory-readiness": (
             PROFILE_INVENTORY_READINESS_KIND,
             PROFILE_INVENTORY_READINESS_FIELDS,
@@ -17957,157 +10490,52 @@ def transition(
         ):
             raise CutoverError("migration seal contradicts the imported destination")
         next_phase = "sealed"
-    elif evidence_kind == "api-delegation":
-        if phase != "sealed":
-            raise CutoverError("API delegation is bound only after Test Store cutover")
-        normalized = verify_seal(evidence, kind=DELEGATION_KIND, fields=DELEGATION_FIELDS)
-        grants = normalized["repository_grants"]
-        completion = _test_store_cutover_completion(current)
-        repository_ids = [
-            str(item.get("repository_id") or "")
-            for item in grants
-            if isinstance(item, Mapping)
-        ] if isinstance(grants, list) else []
-        if (
-            type(normalized["api_uid"]) is not int
-            or normalized["api_uid"] <= 0
-            or normalized["broker_account_id"] != API_BROKER_ACCOUNT
-            or normalized["source_authority_generation"]
-            != completion["authority_generation"]
-            or normalized["authority_generation"]
-            == normalized["source_authority_generation"]
-            or normalized["profile_path"] != PROTECTED_PROFILE_PATH
-            or normalized["profile_owner_uid"] != 0
-            or normalized["profile_group_name"] != PROTECTED_PROFILE_GROUP
-            or type(normalized["profile_group_gid"]) is not int
-            or normalized["profile_group_gid"] <= 0
-            or normalized["profile_mode"] != "0640"
-            or normalized["profile_source_kind"]
-            not in {"authority-reconstructed", "administrator-sealed"}
-            or re.fullmatch(r"[0-9a-f]{64}", str(normalized["profile_source_sha256"]))
-            is None
-            or re.fullmatch(r"[0-9a-f]{64}", str(normalized["profile_fingerprint"]))
-            is None
-            or normalized["profile_authority_reconciled"] is not True
-            or normalized["profile_generation_matches_authority"] is not True
-            or normalized["atomic_publication_verified"] is not True
-            or normalized["existing_profile_contents_reused"] is not False
-            or normalized["google_actor_prefix"] != "google:"
-            or normalized["google_actor_policy"] != GOOGLE_ACTOR_POLICY
-            or normalized["broker_verified"] is not True
-            or not isinstance(grants, list)
-            or not grants
-            or len(repository_ids) != len(set(repository_ids))
-            or any(
-                not isinstance(item, Mapping)
-                or set(item) != {"repository_id", "permissions"}
-                or not isinstance(item["repository_id"], str)
-                or not item["repository_id"]
-                or len(item["repository_id"].encode("utf-8")) > 256
-                or not isinstance(item["permissions"], list)
-                or len(item["permissions"]) != 3
-                or set(item["permissions"])
-                != {"tests:read", "tests:run", "tests:operate"}
-                for item in grants
-            )
-        ):
-            raise CutoverError("API actor delegation evidence is invalid")
     elif evidence_kind == "profile-inventory-readiness":
         if phase != "sealed":
-            raise CutoverError(
-                "post-v13 profile readiness requires the sealed migration"
-            )
+            raise CutoverError("routing readiness requires the sealed migration")
         normalized = verify_seal(
             evidence,
             kind=PROFILE_INVENTORY_READINESS_KIND,
             fields=PROFILE_INVENTORY_READINESS_FIELDS,
         )
-        completion = _test_store_cutover_completion(current)
-        delegation = _recorded(current, "api-delegation")
-        grants = delegation.get("repository_grants") if delegation else None
-        delegated_ids = {
-            str(item.get("repository_id"))
-            for item in grants
-            if isinstance(item, Mapping)
-        } if isinstance(grants, list) else set()
         if (
-            delegation is None
-            or normalized["api_delegation_sha256"]
-            != delegation["document_sha256"]
-            or normalized["release_digest"] != current["release_digest"]
+            normalized["release_digest"] != current["release_digest"]
             or normalized["executor_release"] != current["release"]
-            or re.fullmatch(
-                r"[0-9a-f]{64}", str(normalized["inventory_client_sha256"])
-            )
-            is None
-            or re.fullmatch(
-                r"[0-9a-f]{64}", str(normalized["profile_repair_sha256"])
-            )
-            is None
-            or normalized["authority_database"]
-            != current["authority_database"]
-            or normalized["source_authority_generation"]
-            != completion["authority_generation"]
-            or normalized["authority_generation"]
-            != delegation["authority_generation"]
-            or normalized["source_authority_generation"]
-            == normalized["authority_generation"]
-            or normalized["authority_schema_version"] != 13
+            or re.fullmatch(r"[0-9a-f]{64}", str(normalized["inventory_client_sha256"])) is None
+            or re.fullmatch(r"[0-9a-f]{64}", str(normalized["profile_repair_sha256"])) is None
+            or normalized["authority_database"] != current["authority_database"]
+            or normalized["authority_schema_version"] != COORDINATOR_SCHEMA_VERSION
             or normalized["authority_migration_state"] != "ready"
             or normalized["profile_path"] != PROTECTED_PROFILE_PATH
-            or re.fullmatch(
-                r"[0-9a-f]{64}", str(normalized["profile_sha256"])
-            )
-            is None
+            or re.fullmatch(r"[0-9a-f]{64}", str(normalized["profile_sha256"])) is None
             or normalized["profile_owner_uid"] != current["authority_uid"]
-            or type(normalized["profile_group_gid"]) is not int
-            or int(normalized["profile_group_gid"]) <= 0
-            or normalized["profile_mode"] != "0640"
+            or normalized["profile_mode"] != "0644"
             or normalized["full_regeneration"] is not True
             or normalized["strict_profile_parse"] is not True
             or normalized["project"] != current["inventory_canary_project"]
-            or type(normalized["owner_uid"]) is not int
-            or int(normalized["owner_uid"]) <= 0
-            or not isinstance(normalized["owner_account_id"], str)
-            or not normalized["owner_account_id"]
+            or type(normalized["execution_uid"]) is not int
+            or int(normalized["execution_uid"]) <= 0
             or not isinstance(normalized["repository_id"], str)
             or not normalized["repository_id"]
-            or normalized["repository_id"] not in delegated_ids
             or type(normalized["repository_generation"]) is not int
             or int(normalized["repository_generation"]) < 0
-            or normalized["owner_bound_grant"] is not True
-            or normalized["inventory_command"]
-            != [
-                "inventory",
-                "--project",
-                current["inventory_canary_project"],
-                "--no-docker",
-                "--compact-json",
-            ]
-            or re.fullmatch(
-                r"[0-9a-f]{64}", str(normalized["inventory_sha256"])
-            )
-            is None
+            or normalized["route_verified"] is not True
+            or normalized["inventory_command"] != ["inventory", "--project", current["inventory_canary_project"], "--no-docker", "--compact-json"]
+            or re.fullmatch(r"[0-9a-f]{64}", str(normalized["inventory_sha256"])) is None
             or normalized["inventory_schema_version"] != 2
             or normalized["inventory_scope"] != "server-wide"
-            or normalized["inventory_transport"]
-            != "authenticated-unix-socket"
-            or normalized["inventory_service_uid"]
-            != current["authority_uid"]
-            or normalized["inventory_database_generation"]
-            != normalized["authority_generation"]
+            or normalized["inventory_transport"] != "trusted-local-unix-socket"
+            or normalized["inventory_service_uid"] != current["authority_uid"]
+            or normalized["inventory_database_generation"] != normalized["authority_generation"]
         ):
-            raise CutoverError(
-                "post-v13 profile inventory readiness evidence is invalid"
-            )
+            raise CutoverError("local routing inventory readiness evidence is invalid")
     elif evidence_kind == "candidate":
         if (
             phase != "sealed"
-            or "api-delegation" not in indexed
             or "profile-inventory-readiness" not in indexed
         ):
             raise CutoverError(
-                "candidate activation requires API delegation and post-v13 inventory readiness"
+                "candidate activation requires local routing inventory readiness"
             )
         normalized = verify_seal(evidence, kind=CANDIDATE_KIND, fields=CANDIDATE_FIELDS)
         completion = _test_store_cutover_completion(current)
@@ -18126,13 +10554,6 @@ def transition(
         ):
             raise CutoverError("candidate attestation contradicts the cutover plan")
         _socket_map(normalized["socket_inodes"])
-        delegation = _recorded(current, "api-delegation")
-        if delegation is None:
-            raise CutoverError("candidate activation lacks API delegation evidence")
-        _capability_policy_attestation(
-            normalized["test_capability_policy"],
-            delegation=delegation,
-        )
         preparation = verify_seal(
             normalized["preparation"],
             kind=CANDIDATE_PREPARATION_KIND,
@@ -18182,7 +10603,6 @@ def transition(
             "kind",
             "audit_sha256",
             "source_schema_version",
-            "repository_owner_map_sha256",
             "audit_counts",
             "project_isolation_complete",
             "authority_database",
@@ -18201,7 +10621,6 @@ def transition(
                 "kind",
                 "audit_sha256",
                 "source_schema_version",
-                "repository_owner_map_sha256",
                 "audit_counts",
                 "project_isolation_complete",
                 "authority_database",
@@ -18211,8 +10630,8 @@ def transition(
             <= set(isolation)
             and isolation.get("ok") is True
             and isolation.get("kind") == "project-runtime-isolation-verification"
-            and isolation.get("source_schema_version") == 13
-            and isolation.get("repository_owner_map_sha256") is None
+            and isolation.get("source_schema_version")
+            == COORDINATOR_SCHEMA_VERSION
             and isinstance(isolation.get("authority_database"), str)
             and Path(str(isolation.get("authority_database"))).is_absolute()
             and isinstance(isolation.get("audit_sha256"), str)
@@ -18296,7 +10715,6 @@ def transition(
             release_digest=str(current["release_digest"]),
             authority_uid=int(current["authority_uid"]),
             testd_uid=int(current["testd_uid"]),
-            api_uid=int(delegation["api_uid"]),
         )
         next_phase = "candidate_verified"
     elif evidence_kind == "activation":
@@ -19196,7 +11614,7 @@ def produce_retention_attestation(
     )
     if now > retain_until:
         raise CutoverError("rollback retention window already expired")
-    fresh_readiness = reverify_post_v13_profile_inventory_readiness(
+    fresh_readiness = reverify_profile_inventory_readiness(
         state=state,
         authority_uid=authority_uid,
         verified_at=now.isoformat(timespec="milliseconds").replace(
@@ -19423,7 +11841,7 @@ def next_actions(state: Mapping[str, object]) -> dict[str, object]:
                     "then": "retain this exact attestation and pass the migrated root-owned credential paths to the first-adoption request",
                 },
                 {
-                    "purpose": "install the listener-free first-adoption graph only while holding the exact schema-13 successor installer claim transferred by binding finalization",
+                    "purpose": "install the listener-free first-adoption graph only while holding the exact schema-14 successor installer claim transferred by binding finalization",
                     "executable": f"{state['release']}/bin/devcoordinator-availability-activate",
                     "argv_prefix": [
                         "prepare-first-adoption",
@@ -19433,29 +11851,21 @@ def next_actions(state: Mapping[str, object]) -> dict[str, object]:
                         "<root-private-first-adoption-bindings-result>",
                         "--operation-id",
                         "<same-first-adoption-operation-uuid>",
-                        "--hard-gate-attestation",
-                        "<root-private-first-adoption-installation-hard-gate>",
-                        "--canonical-project",
-                        "<canonical-global-finance-project-root>",
-                        "--canonical-repository-id",
-                        "<global-finance-repository-id>",
-                        "--owner-user",
-                        "<global-finance-owner-user>",
-                        "--collaborator-user",
-                        "<global-finance-collaborator-user>",
+                        "--first-adoption-attestation",
+                        "<root-private-first-adoption-attestation>",
                     ],
                     "required_argument_groups": {
                         "candidate": "--candidate-slot-source, --rollback-directory, --graph-evidence, --graph-journal, --credential-evidence",
                         "legacy": "--legacy-console-env, --legacy-console-uid, --legacy-authority-database",
                         "background": "--background-project-root, --background-config-transaction",
-                        "isolation": "--project-isolation-audit, --project-isolation-ledger, --repository-owner-map",
+                        "isolation": "--project-isolation-audit, --project-isolation-ledger",
                         "ports": "--port-reservations, --port-reservations-sha256",
                     },
-                    "claim_contract": "the completed binding result, operation UUID, and future hard-gate path must exactly match the durable schema13-first-adoption-executor claim; preparation retains that claim",
+                    "claim_contract": "the completed binding result, operation UUID, and first-adoption completion path must exactly match the durable installer claim; preparation retains that claim",
                     "then": "pass the graph and credential evidence to build-first-adoption-request",
                 },
                 {
-                    "purpose": "compile every first-adoption source/final path, identity, listener, post-authority fleet request, and background handoff into one validated root-private sealed request; the transaction derives policy and API profiles only after the storage split",
+                    "purpose": "compile every first-adoption source/final path, identity, listener, post-authority fleet request, and background handoff into one validated root-private sealed request; the transaction derives API routing profiles only after the storage split",
                     "executable": f"{state['release']}/bin/devcoordinator-availability-activate",
                     "argv_prefix": [
                         "build-first-adoption-request",
@@ -19470,10 +11880,10 @@ def next_actions(state: Mapping[str, object]) -> dict[str, object]:
                     "required_argument_groups": {
                         "ports": "--port-reservations, --port-reservations-sha256",
                         "legacy_writer": "--legacy-bridge-transaction, --legacy-bridge-operation-id, --legacy-bridge-journal-sha256, --legacy-bridge-database, --legacy-bridge-profile, --legacy-bridge-socket, --legacy-bridge-dropin, --legacy-broker-retirement-guard, --legacy-writer-handoff-journal",
-                        "candidate": "--candidate-slot-source, --test-capability-policy, --test-capability-policy-evidence, --test-capability-policy-journal, --dogfood-repository-id, --candidate-rollback-directory, --legacy-console-env, --background-project-root, --background-config-transaction, --project-isolation-audit, --project-isolation-ledger, --graph-evidence, --candidate-graph-journal, --credential-evidence, --candidate-evidence, --activation-evidence",
+                        "candidate": "--candidate-slot-source, --candidate-rollback-directory, --legacy-console-env, --background-project-root, --background-config-transaction, --project-isolation-audit, --project-isolation-ledger, --graph-evidence, --candidate-graph-journal, --credential-evidence, --candidate-evidence, --activation-evidence",
                         "console": "--legacy-console-state, --console-state, --edge-identity-state, --console-config, --route-resolution, --publication-input, --console-port, --console-uid, --console-gid, --edge-uid, --edge-gid, --legacy-console-uid, --console-rollback-directory, --console-migration-journal",
-                        "authority": "--legacy-authority-database, --authority-database, --inventory-database, --inventory-publication, --storage-split-attestation, --authority-adoption-pointer, --authority-operation-journal, --repository-owner-map, --repository-owner-map-sha256, --maintenance-root, --maintenance-gid, --authority-service-uid, --authority-service-gid, --inventory-uid, --inventory-gid",
-                        "handoffs": "--api-handoff-port, --api-handoff-journal, --api-bootstrap-profile-path, --api-bootstrap-profile-journal, --api-final-profile-journal, --protected-profile-path, --protected-profile-access-gid, --api-service-uid, --api-delegation-evidence, --profile-inventory-readiness-evidence, --edge-publication, --public-handoff-journal, --http-handoff-port, --https-handoff-port",
+                        "authority": "--legacy-authority-database, --authority-database, --inventory-database, --inventory-publication, --storage-split-attestation, --authority-adoption-pointer, --authority-operation-journal, --maintenance-root, --maintenance-gid, --authority-service-uid, --authority-service-gid, --inventory-uid, --inventory-gid",
+                        "handoffs": "--api-handoff-port, --api-handoff-journal, --api-bootstrap-profile-path, --api-bootstrap-profile-journal, --api-final-profile-journal, --protected-profile-path, --protected-profile-access-gid, --api-service-uid, --profile-inventory-readiness-evidence, --edge-publication, --public-handoff-journal, --http-handoff-port, --https-handoff-port",
                         "fleet": "--fleet-authority-export, --fleet-evidence-root, --fleet-manifest-template, --fleet-manifest-template-sha256, --fleet-manifest-set, --fleet-adoption-request, --fleet-uid-helper",
                         "background": "--telegram-present or --no-telegram-present, --telegram-source, --telegram-destination, --telegram-rollback, --telegram-fence, --telegram-source-owner-uid, --telegram-destination-owner-uid, --telegram-destination-owner-gid",
                         "browser": "--browser-runtime-lock, --browser-storage-state, --browser-signing-key, --browser-journal, --browser-attestation, --browser-consumption",
@@ -19482,7 +11892,7 @@ def next_actions(state: Mapping[str, object]) -> dict[str, object]:
                     "then": "pass this exact output to the following first-adoption action",
                 },
                 {
-                    "purpose": "run the single resumable first-adoption transaction: install a listener-free graph, arm the exact legacy-writer retirement guard, split the legacy authority into distinct final authority/inventory stores, retire the bridge-owned drop-in and legacy unit before any schema-13 authority starts, start snapshotd, derive policy, start authority/testd, hand API traffic through a candidate-only profile, publish the final profile and API, journal the exact maintenance-fence release immediately before live delegation, apply fleet adoption through its own durable intent journal, and record candidate/activation only after the sealed HTTP/WebSocket continuity window passes",
+                    "purpose": "run the single resumable first-adoption transaction and release the installer claim when its completion attestation is durable",
                     "executable": f"{state['release']}/bin/devcoordinator-availability-activate",
                     "argv_prefix": [
                         "first-adoption",
@@ -19490,61 +11900,17 @@ def next_actions(state: Mapping[str, object]) -> dict[str, object]:
                         "<root-private-first-adoption-request>",
                         "--journal",
                         "<root-private-first-adoption-journal>",
-                        "--canonical-project",
-                        "<canonical-global-finance-project-root>",
-                        "--canonical-repository-id",
-                        "<global-finance-repository-id>",
-                        "--owner-user",
-                        "<global-finance-owner-user>",
-                        "--collaborator-user",
-                        "<global-finance-collaborator-user>",
                     ],
                     "required_arguments": [
                         "--attestation",
                         "--rollback-evidence",
                         "--binding-attestation",
                         "--operation-id",
-                        "--hard-gate-attestation",
                     ],
-                    "record_after_delegation": "project isolation, inventory readiness, fleet plan/apply subtransaction, Console/public handoff, candidate, then activation in one journal",
+                    "record_after_routing": "project isolation, inventory readiness, fleet setup, Console/public handoff, candidate, then activation in one journal",
                     "rollback_order": "re-arm the exact authority maintenance fence before reversing notifications, fleet, public handoff, cutover evidence, profiles, API, policy, and graph; restore the exact bridge drop-in while its retirement guard still blocks starts, restore schema-12 authority/unit state, prove the bridge socket ready, then clear maintenance last",
                     "request_producer": "the immediately preceding build-first-adoption-request action",
                     "first_adoption_constraint": "the transaction refuses unless project isolation pending=0/unobservable=0 and all split, route, inventory, fleet, Test Store completion, and rollback seals verify",
-                },
-                {
-                    "purpose": "release the server-wide installer claim only after the installed final units, protected all-client profile, canonical Codex/Claude skill links for the declared owner and collaborator, and an immutable-client inventory read for the declared canonical hard-gate repository all verify",
-                    "executable": f"{state['release']}/bin/devcoordinator-availability-activate",
-                    "argv_prefix": [
-                        "finalize-first-adoption-installation",
-                        "--binding-attestation",
-                        "<root-private-first-adoption-bindings-result>",
-                        "--operation-id",
-                        "<same-first-adoption-operation-uuid>",
-                        "--first-adoption-attestation",
-                        "<root-private-first-adoption-attestation>",
-                        "--release",
-                        state["release"],
-                        "--hard-gate-attestation",
-                        "<root-private-first-adoption-installation-hard-gate>",
-                        "--canonical-project",
-                        "<canonical-global-finance-project-root>",
-                        "--canonical-repository-id",
-                        "<global-finance-repository-id>",
-                        "--owner-user",
-                        "<global-finance-owner-user>",
-                        "--collaborator-user",
-                        "<global-finance-collaborator-user>",
-                    ],
-                    "hard_gate": {
-                        "scope": "server-wide",
-                        "transport": "authenticated-unix-socket",
-                        "canonical_project": "<canonical-global-finance-project-root>",
-                        "repository_id": "<global-finance-repository-id>",
-                        "users": [
-                            "<global-finance-owner-user>",
-                            "<global-finance-collaborator-user>",
-                        ],
-                    },
                 },
             ]
         )
@@ -19877,258 +12243,10 @@ def _parser() -> argparse.ArgumentParser:
     retention.add_argument("--browser-signing-key", required=True)
     retention.add_argument("--authority-uid", type=int, default=0)
 
-    policy = actions.add_parser("publish-test-policy")
-    policy.add_argument("--authority-database", required=True)
-    policy.add_argument("--snapshot-socket", required=True)
-    policy.add_argument(
-        "--destination", default=TEST_CAPABILITY_POLICY_PATH
-    )
-    policy.add_argument("--dogfood-repository-id", required=True)
-    policy.add_argument("--authority-uid", type=int, default=0)
-    policy.add_argument("--owner-gid", type=int, default=0)
-    policy.add_argument("--expected-snapshot-uid", type=int, default=0)
-
-    authority_export = actions.add_parser("export-authority-repositories")
-    authority_export.add_argument("--authority-database", required=True)
-    authority_export.add_argument("--attestation", required=True)
-    authority_export.add_argument("--authority-uid", type=int, default=0)
-
-    repository_diagnostic = actions.add_parser("diagnose-authority-repository")
-    repository_diagnostic.add_argument(
-        "--authority-database", default=FINAL_AUTHORITY_DATABASE_PATH
-    )
-    repository_diagnostic.add_argument("--repository-id", required=True)
-
-    shared_root_positive_absence_plan = actions.add_parser(
-        "plan-authority-shared-root-positive-absence"
-    )
-    shared_root_positive_absence_plan.add_argument(
-        "--authority-database", default=FINAL_AUTHORITY_DATABASE_PATH
-    )
-    shared_root_positive_absence_plan.add_argument(
-        "--repository-id", required=True
-    )
-    shared_root_positive_absence_plan.add_argument(
-        "--operation-id", required=True
-    )
-    shared_root_positive_absence_plan.add_argument("--plan", required=True)
-    shared_root_positive_absence_plan.add_argument(
-        "--authority-uid", type=int, default=0
-    )
-
-    shared_root_positive_absence_apply = actions.add_parser(
-        "apply-authority-shared-root-positive-absence"
-    )
-    shared_root_positive_absence_apply.add_argument(
-        "--authority-database", default=FINAL_AUTHORITY_DATABASE_PATH
-    )
-    shared_root_positive_absence_apply.add_argument("--plan", required=True)
-    shared_root_positive_absence_apply.add_argument(
-        "--plan-document-sha256", required=True
-    )
-    shared_root_positive_absence_apply.add_argument(
-        "--attestation", required=True
-    )
-    shared_root_positive_absence_apply.add_argument(
-        "--maintenance-root", required=True
-    )
-    shared_root_positive_absence_apply.add_argument(
-        "--maintenance-gid", type=int, required=True
-    )
-    shared_root_positive_absence_apply.add_argument(
-        "--maintenance-deployment-id", required=True
-    )
-    shared_root_positive_absence_apply.add_argument(
-        "--authority-uid", type=int, default=0
-    )
-
-    shared_root_positive_absence_execute = actions.add_parser(
-        "execute-authority-shared-root-positive-absence"
-    )
-    shared_root_positive_absence_execute.add_argument(
-        "--authority-database", default=FINAL_AUTHORITY_DATABASE_PATH
-    )
-    for name in (
-        "release",
-        "plan",
-        "transaction-journal",
-        "transaction-attestation",
-        "broker-socket",
-        "canary-user",
-        "canary-project",
-        "canary-repository-id",
-    ):
-        shared_root_positive_absence_execute.add_argument(
-            f"--{name}", required=True
-        )
-    shared_root_positive_absence_execute.add_argument(
-        "--plan-document-sha256", required=True
-    )
-    shared_root_positive_absence_execute.add_argument(
-        "--attestation", required=True
-    )
-    shared_root_positive_absence_execute.add_argument(
-        "--maintenance-root", required=True
-    )
-    shared_root_positive_absence_execute.add_argument(
-        "--maintenance-gid", type=int, required=True
-    )
-    shared_root_positive_absence_execute.add_argument(
-        "--canary-uid", type=int, required=True
-    )
-    shared_root_positive_absence_execute.add_argument(
-        "--canary-repository-generation", type=int, required=True
-    )
-    shared_root_positive_absence_execute.add_argument(
-        "--readiness-wait-seconds", type=int, default=30
-    )
-    shared_root_positive_absence_execute.add_argument(
-        "--maintenance-deployment-id", required=True
-    )
-    shared_root_positive_absence_execute.add_argument(
-        "--authority-uid", type=int, default=0
-    )
-
-    repository_disable_plan = actions.add_parser(
-        "plan-authority-repository-disable"
-    )
-    repository_disable_plan.add_argument(
-        "--authority-database", default=FINAL_AUTHORITY_DATABASE_PATH
-    )
-    repository_disable_plan.add_argument("--repository-id", required=True)
-    repository_disable_plan.add_argument("--plan", required=True)
-    repository_disable_plan.add_argument("--authority-uid", type=int, default=0)
-
-    repository_disable_apply = actions.add_parser(
-        "apply-authority-repository-disable"
-    )
-    repository_disable_apply.add_argument("--plan", required=True)
-    repository_disable_apply.add_argument(
-        "--plan-document-sha256", required=True
-    )
-    repository_disable_apply.add_argument("--attestation", required=True)
-    repository_disable_apply.add_argument("--maintenance-root", required=True)
-    repository_disable_apply.add_argument("--maintenance-gid", type=int, required=True)
-    repository_disable_apply.add_argument(
-        "--maintenance-deployment-id", required=True
-    )
-    repository_disable_apply.add_argument("--authority-uid", type=int, default=0)
-
-    repository_policy_plan = actions.add_parser(
-        "plan-authority-repository-startup-policy-reconciliation"
-    )
-    repository_policy_plan.add_argument(
-        "--source-repair-plan", dest="repair_plan", required=True
-    )
-    repository_policy_plan.add_argument(
-        "--source-repair-plan-document-sha256",
-        dest="repair_plan_document_sha256",
-        required=True,
-    )
-    repository_policy_plan.add_argument(
-        "--source-repair-attestation",
-        dest="repair_attestation",
-        required=True,
-    )
-    repository_policy_plan.add_argument(
-        "--source-repair-attestation-document-sha256",
-        dest="repair_attestation_document_sha256",
-        required=True,
-    )
-    repository_policy_plan.add_argument("--plan", required=True)
-    repository_policy_plan.add_argument(
-        "--authority-uid", type=int, default=0
-    )
-
-    repository_policy_apply = actions.add_parser(
-        "apply-authority-repository-startup-policy-reconciliation"
-    )
-    for name in (
-        "plan",
-        "plan-document-sha256",
-        "attestation",
-        "maintenance-root",
-        "maintenance-deployment-id",
-    ):
-        repository_policy_apply.add_argument(f"--{name}", required=True)
-    repository_policy_apply.add_argument(
-        "--maintenance-gid", type=int, required=True
-    )
-    repository_policy_apply.add_argument(
-        "--authority-uid", type=int, default=0
-    )
-
-    repository_lifecycle_plan = actions.add_parser(
-        "plan-authority-repository-lifecycle-recovery"
-    )
-    for name in (
-        "source-repair-plan",
-        "source-repair-plan-document-sha256",
-        "source-repair-attestation",
-        "source-repair-attestation-document-sha256",
-        "plan",
-        "operation-id",
-    ):
-        repository_lifecycle_plan.add_argument(f"--{name}", required=True)
-    repository_lifecycle_plan.add_argument(
-        "--authority-uid", type=int, default=0
-    )
-
-    repository_disable_recovery = actions.add_parser(
-        "recover-authority-repository-disable"
-    )
-    for name in (
-        "release",
-        "plan",
-        "plan-document-sha256",
-        "attestation",
-        "transaction-journal",
-        "transaction-attestation",
-        "maintenance-root",
-        "maintenance-deployment-id",
-        "operation-id",
-        "broker-socket",
-        "canary-user",
-        "canary-project",
-        "canary-repository-id",
-    ):
-        repository_disable_recovery.add_argument(f"--{name}", required=True)
-    repository_disable_recovery.add_argument(
-        "--maintenance-gid", type=int, required=True
-    )
-    repository_disable_recovery.add_argument(
-        "--authority-uid", type=int, default=0
-    )
-    repository_disable_recovery.add_argument("--canary-uid", type=int, required=True)
-    repository_disable_recovery.add_argument(
-        "--canary-repository-generation", type=int, required=True
-    )
-    repository_disable_recovery.add_argument(
-        "--readiness-wait-seconds", type=int, default=30
-    )
-    repository_disable_recovery.add_argument(
-        "--mode",
-        choices=("disable", "lifecycle-recovery"),
-        default="disable",
-    )
-    repository_disable_recovery.add_argument("--canary-release")
-    for name in (
-        "predecessor-transaction",
-        "predecessor-operation-id",
-        "predecessor-journal-sha256",
-        "predecessor-journal-document-sha256",
-        "predecessor-profile",
-        "predecessor-dropin",
-    ):
-        repository_disable_recovery.add_argument(f"--{name}")
-
     profile = actions.add_parser("publish-api-profile")
     profile.add_argument("--authority-database", required=True)
     profile.add_argument("--destination", default=PROTECTED_PROFILE_PATH)
-    profile.add_argument("--api-uid", type=int, required=True)
-    profile.add_argument("--access-gid", type=int, required=True)
-    profile.add_argument("--source-authority-generation", required=True)
-    profile.add_argument("--target-authority-generation", required=True)
+    profile.add_argument("--validation-uid", type=int, required=True)
     profile.add_argument("--authority-uid", type=int, default=0)
     profile.add_argument("--attestation")
 
@@ -20144,7 +12262,7 @@ def _parser() -> argparse.ArgumentParser:
             "admission-drain",
             "final-import",
             "migration-seal",
-            "api-delegation",
+            "profile-inventory-readiness",
             "candidate",
             "activation",
             "rollback-rehearsal",
@@ -20194,7 +12312,7 @@ def main(argv: list[str] | None = None) -> int:
                     raise
                 try:
                     installer_fence = acquire_transaction_fence(
-                        owner_kind=SCHEMA13_FIRST_ADOPTION_INSTALLER_OWNER_KIND,
+                        owner_kind=FIRST_ADOPTION_INSTALLER_CLAIM_KIND,
                         operation_id=arguments.operation_id,
                         transaction=Path(arguments.transaction_attestation),
                         terminal=Path(arguments.successor_terminal_attestation),
@@ -20206,7 +12324,7 @@ def main(argv: list[str] | None = None) -> int:
                     raise InstallerFenceError(
                         "atomic first-adoption installer claim is neither the exact "
                         f"binding predecessor ({predecessor_error}) nor its exact "
-                        f"schema-13 successor ({successor_error})"
+                        f"schema-14 successor ({successor_error})"
                     ) from successor_error
                 bindings_claim_transferred = True
         if arguments.action == "prepare-first-adoption-bindings":
@@ -20276,7 +12394,7 @@ def main(argv: list[str] | None = None) -> int:
                 successor_claim = transfer_transaction_fence(
                     installer_fence,
                     successor_owner_kind=(
-                        SCHEMA13_FIRST_ADOPTION_INSTALLER_OWNER_KIND
+                        FIRST_ADOPTION_INSTALLER_CLAIM_KIND
                     ),
                     successor_operation_id=arguments.operation_id,
                     successor_transaction=result_path,
@@ -20492,238 +12610,12 @@ def main(argv: list[str] | None = None) -> int:
                 browser_runtime_lock=Path(arguments.browser_runtime_lock),
                 browser_signing_key=Path(arguments.browser_signing_key),
             )
-        elif arguments.action == "publish-test-policy":
-            result = publish_test_capability_policy(
-                authority_database=Path(arguments.authority_database),
-                snapshot_socket=Path(arguments.snapshot_socket),
-                destination=Path(arguments.destination),
-                dogfood_repository_id=arguments.dogfood_repository_id,
-                authority_uid=arguments.authority_uid,
-                owner_gid=arguments.owner_gid,
-                expected_snapshot_uid=arguments.expected_snapshot_uid,
-            )
-        elif arguments.action == "export-authority-repositories":
-            result = publish_authority_repository_export(
-                authority_database=Path(arguments.authority_database),
-                attestation=Path(arguments.attestation),
-                authority_uid=arguments.authority_uid,
-            )
-        elif arguments.action == "diagnose-authority-repository":
-            result = diagnose_authority_repository(
-                authority_database=Path(arguments.authority_database),
-                repository_id=arguments.repository_id,
-            )
-        elif arguments.action == "plan-authority-shared-root-positive-absence":
-            result = plan_authority_shared_root_positive_absence(
-                authority_database=Path(arguments.authority_database),
-                repository_id=arguments.repository_id,
-                operation_id=arguments.operation_id,
-                plan_path=Path(arguments.plan),
-                authority_uid=arguments.authority_uid,
-            )
-        elif arguments.action == "apply-authority-shared-root-positive-absence":
-            result = apply_authority_shared_root_positive_absence(
-                authority_database=Path(arguments.authority_database),
-                plan_path=Path(arguments.plan),
-                plan_document_sha256=arguments.plan_document_sha256,
-                attestation=Path(arguments.attestation),
-                maintenance_root=Path(arguments.maintenance_root),
-                maintenance_gid=arguments.maintenance_gid,
-                maintenance_deployment_id=(
-                    arguments.maintenance_deployment_id
-                ),
-                authority_uid=arguments.authority_uid,
-            )
-        elif arguments.action == "execute-authority-shared-root-positive-absence":
-            result = execute_authority_shared_root_positive_absence(
-                release=Path(arguments.release),
-                authority_database=Path(arguments.authority_database),
-                plan_path=Path(arguments.plan),
-                plan_document_sha256=arguments.plan_document_sha256,
-                attestation=Path(arguments.attestation),
-                transaction_journal=Path(arguments.transaction_journal),
-                transaction_attestation=Path(
-                    arguments.transaction_attestation
-                ),
-                maintenance_root=Path(arguments.maintenance_root),
-                maintenance_gid=arguments.maintenance_gid,
-                maintenance_deployment_id=(
-                    arguments.maintenance_deployment_id
-                ),
-                broker_socket=Path(arguments.broker_socket),
-                canary_user=arguments.canary_user,
-                canary_uid=arguments.canary_uid,
-                canary_project=Path(arguments.canary_project),
-                canary_repository_id=arguments.canary_repository_id,
-                canary_repository_generation=(
-                    arguments.canary_repository_generation
-                ),
-                readiness_wait_seconds=arguments.readiness_wait_seconds,
-                authority_uid=arguments.authority_uid,
-            )
-        elif arguments.action == "plan-authority-repository-disable":
-            result = plan_authority_repository_disable(
-                authority_database=Path(arguments.authority_database),
-                repository_id=arguments.repository_id,
-                plan_path=Path(arguments.plan),
-                authority_uid=arguments.authority_uid,
-            )
-        elif arguments.action == "apply-authority-repository-disable":
-            result = apply_authority_repository_disable(
-                plan_path=Path(arguments.plan),
-                plan_document_sha256=arguments.plan_document_sha256,
-                attestation=Path(arguments.attestation),
-                maintenance_root=Path(arguments.maintenance_root),
-                maintenance_gid=arguments.maintenance_gid,
-                maintenance_deployment_id=arguments.maintenance_deployment_id,
-                authority_uid=arguments.authority_uid,
-            )
-        elif (
-            arguments.action
-            == "plan-authority-repository-startup-policy-reconciliation"
-        ):
-            result = plan_authority_repository_startup_policy_reconciliation(
-                repair_plan=Path(arguments.repair_plan),
-                repair_plan_document_sha256=(
-                    arguments.repair_plan_document_sha256
-                ),
-                repair_attestation=Path(arguments.repair_attestation),
-                repair_attestation_document_sha256=(
-                    arguments.repair_attestation_document_sha256
-                ),
-                plan_path=Path(arguments.plan),
-                authority_uid=arguments.authority_uid,
-            )
-        elif (
-            arguments.action
-            == "apply-authority-repository-startup-policy-reconciliation"
-        ):
-            result = apply_authority_repository_startup_policy_reconciliation(
-                plan_path=Path(arguments.plan),
-                plan_document_sha256=arguments.plan_document_sha256,
-                attestation=Path(arguments.attestation),
-                maintenance_root=Path(arguments.maintenance_root),
-                maintenance_gid=arguments.maintenance_gid,
-                maintenance_deployment_id=(
-                    arguments.maintenance_deployment_id
-                ),
-                authority_uid=arguments.authority_uid,
-            )
-        elif (
-            arguments.action
-            == "plan-authority-repository-lifecycle-recovery"
-        ):
-            result = plan_authority_repository_lifecycle_recovery(
-                repair_plan=Path(arguments.source_repair_plan),
-                repair_plan_document_sha256=(
-                    arguments.source_repair_plan_document_sha256
-                ),
-                repair_attestation=Path(arguments.source_repair_attestation),
-                repair_attestation_document_sha256=(
-                    arguments.source_repair_attestation_document_sha256
-                ),
-                plan_path=Path(arguments.plan),
-                operation_id=arguments.operation_id,
-                authority_uid=arguments.authority_uid,
-            )
-        elif arguments.action == "recover-authority-repository-disable":
-            common = {
-                "release": Path(arguments.release),
-                "plan_path": Path(arguments.plan),
-                "plan_document_sha256": arguments.plan_document_sha256,
-                "transaction_journal": Path(arguments.transaction_journal),
-                "transaction_attestation": Path(
-                    arguments.transaction_attestation
-                ),
-                "maintenance_root": Path(arguments.maintenance_root),
-                "maintenance_gid": arguments.maintenance_gid,
-                "maintenance_deployment_id": (
-                    arguments.maintenance_deployment_id
-                ),
-                "operation_id": arguments.operation_id,
-                "broker_socket": Path(arguments.broker_socket),
-                "canary_user": arguments.canary_user,
-                "canary_uid": arguments.canary_uid,
-                "canary_project": Path(arguments.canary_project),
-                "canary_repository_id": arguments.canary_repository_id,
-                "canary_repository_generation": (
-                    arguments.canary_repository_generation
-                ),
-                "readiness_wait_seconds": arguments.readiness_wait_seconds,
-                "authority_uid": arguments.authority_uid,
-            }
-            if arguments.mode == "lifecycle-recovery":
-                predecessor_values = {
-                    "predecessor_transaction": arguments.predecessor_transaction,
-                    "predecessor_operation_id": arguments.predecessor_operation_id,
-                    "predecessor_journal_sha256": (
-                        arguments.predecessor_journal_sha256
-                    ),
-                    "predecessor_journal_document_sha256": (
-                        arguments.predecessor_journal_document_sha256
-                    ),
-                    "predecessor_profile": arguments.predecessor_profile,
-                    "predecessor_dropin": arguments.predecessor_dropin,
-                }
-                if not arguments.canary_release or any(
-                    not value for value in predecessor_values.values()
-                ):
-                    raise CutoverError(
-                        "lifecycle recovery requires the exact predecessor binding"
-                    )
-                result = recover_authority_repository_lifecycle(
-                    **common,
-                    canary_release=Path(arguments.canary_release),
-                    predecessor_transaction=Path(
-                        str(predecessor_values["predecessor_transaction"])
-                    ),
-                    predecessor_operation_id=str(
-                        predecessor_values["predecessor_operation_id"]
-                    ),
-                    predecessor_journal_sha256=str(
-                        predecessor_values["predecessor_journal_sha256"]
-                    ),
-                    predecessor_journal_document_sha256=str(
-                        predecessor_values[
-                            "predecessor_journal_document_sha256"
-                        ]
-                    ),
-                    predecessor_profile=Path(
-                        str(predecessor_values["predecessor_profile"])
-                    ),
-                    predecessor_dropin=Path(
-                        str(predecessor_values["predecessor_dropin"])
-                    ),
-                    recovery_attestation=Path(arguments.attestation),
-                )
-            else:
-                if arguments.canary_release or any(
-                    getattr(arguments, name.replace("-", "_"))
-                    for name in (
-                        "predecessor-transaction",
-                        "predecessor-operation-id",
-                        "predecessor-journal-sha256",
-                        "predecessor-journal-document-sha256",
-                        "predecessor-profile",
-                        "predecessor-dropin",
-                    )
-                ):
-                    raise CutoverError(
-                        "disable recovery does not accept predecessor inputs"
-                    )
-                result = recover_authority_repository_disable(
-                    **common,
-                    repair_attestation=Path(arguments.attestation),
-                )
         elif arguments.action == "publish-api-profile":
             result = reconstruct_api_profile_from_authority(
                 authority_database=Path(arguments.authority_database),
                 destination=Path(arguments.destination),
-                api_uid=arguments.api_uid,
-                access_gid=arguments.access_gid,
+                validation_uid=arguments.validation_uid,
                 authority_uid=arguments.authority_uid,
-                source_authority_generation=arguments.source_authority_generation,
-                target_authority_generation=arguments.target_authority_generation,
             )
             if arguments.attestation:
                 _publish_evidence(

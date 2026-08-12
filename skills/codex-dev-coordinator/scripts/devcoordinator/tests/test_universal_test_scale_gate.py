@@ -174,7 +174,6 @@ class UniversalTestScaleGateTests(unittest.TestCase):
         server = UnixTestPlaneServer(
             listener,  # type: ignore[arg-type]
             StoreTestPlaneAdapter(self.store, previewer=previewer),
-            allowed_peer_uids=(os.geteuid(),),
             peer_resolver=lambda _connection: os.geteuid(),
             max_concurrent_requests=8,
         )

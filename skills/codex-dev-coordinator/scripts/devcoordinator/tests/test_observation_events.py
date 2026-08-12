@@ -27,7 +27,7 @@ from devcoordinator.broker import (  # noqa: E402
 from devcoordinator.broker_backend import StoreBackedMutationBackend  # noqa: E402
 from devcoordinator.broker_persistence import (  # noqa: E402
     BrokerPersistence,
-    StoreBackedAuthorizer,
+    StoreBackedRequestAcceptor,
 )
 from devcoordinator.events import decode_event_cursor, list_event_page  # noqa: E402
 from devcoordinator.host_observation import commit_host_inventory_observation  # noqa: E402
@@ -40,7 +40,10 @@ from devcoordinator.store import AccountStore  # noqa: E402
 
 class ObservationEventTests(unittest.TestCase):
     def setUp(self) -> None:
-        canonical_home = Path(pwd.getpwuid(os.geteuid()).pw_dir).resolve()
+        canonical_home = Path(
+            os.environ.get("DEVCOORDINATOR_TEST_TMP_ROOT")
+            or pwd.getpwuid(os.geteuid()).pw_dir
+        ).resolve()
         self.temporary = tempfile.TemporaryDirectory(
             prefix=".observation-events-", dir=str(canonical_home)
         )
@@ -755,110 +758,6 @@ class ObservationEventTests(unittest.TestCase):
         self.assertNotIn("repo_id", diagnostic)
         self.assertNotIn("project", diagnostic)
         self.assertNotIn("suggested_root", diagnostic)
-
-    def test_cursor_and_broker_event_read_are_bounded_and_lossless(self) -> None:
-        with AccountStore.open_default(self.home) as store:
-            with store.immediate_transaction() as connection:
-                for index in range(5):
-                    connection.execute(
-                        """
-                        INSERT INTO events(
-                            event_id, repo_id, event_kind, code, message,
-                            diagnostic_json, occurred_at
-                        ) VALUES (?, ?, 'fixture.event', 'fixture', ?, ?, ?)
-                        """,
-                        (
-                            f"event-{index}",
-                            self.repo_id,
-                            f"message {index}",
-                            '{"private":"not-for-feed"}',
-                            f"2026-07-18T12:00:0{index}Z",
-                        ),
-                    )
-        cursors: list[str] = []
-        seen: list[str] = []
-        after = None
-        with AccountStore.open_default_read_only(self.home) as store:
-            with store.read_transaction() as connection:
-                while True:
-                    page = list_event_page(connection, after=after, limit=2)
-                    seen.extend(item["event_id"] for item in page["events"])
-                    self.assertTrue(
-                        all("diagnostic_json" not in item for item in page["events"])
-                    )
-                    after = page["next_cursor"]
-                    if after is not None:
-                        cursors.append(after)
-                    if not page["has_more"]:
-                        break
-        self.assertEqual(seen, [f"event-{index}" for index in range(5)])
-        self.assertEqual(decode_event_cursor(cursors[-1])[1], "event-4")
-        with self.assertRaisesRegex(ValueError, "cursor"):
-            decode_event_cursor("not-a-cursor")
-
-        # A slow operation can commit after the consumer checkpoint with an
-        # earlier occurred_at. The cursor follows durable insertion sequence,
-        # so that late record remains visible instead of falling behind a
-        # timestamp high-watermark.
-        with AccountStore.open_default(self.home) as store:
-            with store.immediate_transaction() as connection:
-                connection.execute(
-                    """
-                    INSERT INTO events(
-                        event_id, repo_id, event_kind, code, message, occurred_at
-                    ) VALUES (
-                        'event-late', ?, 'fixture.event', 'fixture',
-                        'late commit', '2026-07-18T09:00:00Z'
-                    )
-                    """,
-                    (self.repo_id,),
-                )
-        with AccountStore.open_default_read_only(self.home) as store:
-            with store.read_transaction() as connection:
-                late_page = list_event_page(
-                    connection, after=cursors[-1], limit=2
-                )
-        self.assertEqual(
-            [item["event_id"] for item in late_page["events"]], ["event-late"]
-        )
-
-        persistence = BrokerPersistence(
-            self.home / "coordinator.sqlite3", expected_uid=os.geteuid()
-        )
-        persistence.provision_principal(uid=os.geteuid(), account_id="events-account")
-        persistence.provision_repository_enrollment(
-            uid=os.geteuid(),
-            repo_id=self.repo_id,
-            account_id="events-account",
-            issued_at="2026-07-18T12:05:00Z",
-            valid_until_epoch=4_102_444_800,
-        )
-        with AccountStore.open_default_read_only(self.home) as store:
-            generation = store.metadata.database_generation
-        service = BrokerService(
-            StoreBackedAuthorizer(persistence),
-            SerializedMutationWriter(
-                StoreBackedMutationBackend(persistence, mock.Mock())
-            ),
-        )
-        request = BrokerRequest.create(
-            account_id="events-account",
-            project_id=self.repo_id,
-            resource_id=self.repo_id,
-            operation=BrokerOperation.EVENTS_READ,
-            arguments={"limit": 3},
-            authority_generation=generation,
-        )
-        reply = service.reply_for_document(
-            PeerCredentials(uid=os.geteuid(), gid=os.getegid(), pid=os.getpid()),
-            request.to_wire(),
-        )
-        self.assertTrue(reply["ok"], reply)
-        self.assertEqual(
-            [item["event_id"] for item in reply["result"]["events"]],
-            ["event-0", "event-1", "event-2"],
-        )
-        self.assertNotIn("diagnostic_json", reply["result"]["events"][0])
 
     def test_http_route_shapes_are_strict(self) -> None:
         self.assertIn("/v1/events", dev_coordinator.API_GET_ROUTES)

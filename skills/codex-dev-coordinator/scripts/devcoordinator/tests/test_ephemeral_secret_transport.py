@@ -25,8 +25,7 @@ if str(SCRIPTS_ROOT) not in sys.path:
 import devcoordinator.broker as broker_module  # noqa: E402
 
 from devcoordinator.broker import (  # noqa: E402
-    AccountAccessPolicy,
-    AuthorizedBrokerRequest,
+    AcceptedBrokerRequest,
     BrokerClient,
     BrokerError,
     BrokerOperation,
@@ -35,7 +34,7 @@ from devcoordinator.broker import (  # noqa: E402
     EphemeralSecretFD,
     PeerCredentials,
     SerializedMutationWriter,
-    StaticPeerAuthorizer,
+    TrustedLocalRequestAcceptor,
     UnixBrokerServer,
     _receive_frame_rejecting_fds,
     _send_frame,
@@ -43,14 +42,13 @@ from devcoordinator.broker import (  # noqa: E402
 from devcoordinator.broker_backend import StoreBackedMutationBackend  # noqa: E402
 from devcoordinator.broker_persistence import (  # noqa: E402
     BrokerPersistence,
-    StoreBackedAuthorizer,
+    StoreBackedRequestAcceptor,
 )
 from devcoordinator.broker_cli import _request_arguments  # noqa: E402
 from devcoordinator.ephemeral_secrets import (  # noqa: E402
     POSTGRES_INITDB_PASSWORD_FILE_V1,
     VolatileRunSecretManager,
 )
-from devcoordinator.schema import establish_repository_owner_authority  # noqa: E402
 from devcoordinator.store import CoordinatorStore, utc_timestamp  # noqa: E402
 
 
@@ -72,7 +70,7 @@ class _UnusedWriterBackend:
     def __init__(self) -> None:
         self.calls = 0
 
-    def execute(self, _request: AuthorizedBrokerRequest) -> dict[str, object]:
+    def execute(self, _request: AcceptedBrokerRequest) -> dict[str, object]:
         self.calls += 1
         return {"unexpected": True}
 
@@ -112,7 +110,7 @@ class _OneTimeSecretRetriever:
 
     def acquire_ephemeral_secret_fd_delivery(
         self,
-        authorized: AuthorizedBrokerRequest,
+        authorized: AcceptedBrokerRequest,
         *,
         template_id: str,
         run_id: uuid.UUID,
@@ -122,15 +120,15 @@ class _OneTimeSecretRetriever:
             (authorized.peer.uid, template_id, str(run_id), request_id)
         )
         if template_id != TEMPLATE_ID or str(run_id) != RUN_ID:
-            raise BrokerError("resource_access_denied", "Exact run binding was not proved.")
+            raise BrokerError("resource_unavailable", "Exact run binding was not proved.")
         if self.expired:
             raise BrokerError(
-                "secret_grant_expired",
+                "secret_lease_expired",
                 "The one-time run credential has expired.",
             )
         if request_id in self._consumed:
             raise BrokerError(
-                "secret_grant_replay",
+                "secret_lease_replay",
                 "The one-time credential request was already consumed.",
             )
         self._consumed.add(request_id)
@@ -333,31 +331,10 @@ class _StoreBackedFixture:
                     """,
                     (STORE_BACKED_REPO, now),
                 )
-                establish_repository_owner_authority(
-                    connection,
-                    repository_id=STORE_BACKED_REPO,
-                    owner_uid=os.geteuid(),
-                    repository_generation=0,
-                    operation_id=str(uuid.uuid4()),
-                    actor="test",
-                    reason="store-backed secret fixture owner",
-                    timestamp=now,
-                    evidence={"kind": "ephemeral-secret-transport-fixture"},
-                )
                 connection.execute(
                     "UPDATE schema_metadata SET migration_state = 'ready' WHERE singleton = 1"
                 )
             self.generation = store.metadata.database_generation
-        self.persistence.provision_principal(
-            uid=os.geteuid(), account_id=STORE_BACKED_ACCOUNT
-        )
-        self.persistence.provision_repository_enrollment(
-            uid=os.geteuid(),
-            repo_id=STORE_BACKED_REPO,
-            account_id=STORE_BACKED_ACCOUNT,
-            issued_at=now,
-            valid_until_epoch=int(time.time()) + 3600,
-        )
         self.persistence.provision_ephemeral_template(
             template_id=STORE_BACKED_TEMPLATE,
             repo_id=STORE_BACKED_REPO,
@@ -372,16 +349,11 @@ class _StoreBackedFixture:
             memory_bytes=256 * 1024 * 1024,
             cpu_millis=750,
         )
-        self.persistence.replace_ephemeral_access(
-            uid=os.geteuid(),
-            repo_id=STORE_BACKED_REPO,
-            template_ids=(STORE_BACKED_TEMPLATE,),
-        )
-        self.authorizer = StoreBackedAuthorizer(self.persistence)
+        self.authorizer = StoreBackedRequestAcceptor(self.persistence)
 
-    def authorize(
+    def accept(
         self, operation: BrokerOperation, resource_id: str, *, arguments: dict[str, object]
-    ) -> AuthorizedBrokerRequest:
+    ) -> AcceptedBrokerRequest:
         request = BrokerRequest.create(
             account_id=STORE_BACKED_ACCOUNT,
             project_id=STORE_BACKED_REPO,
@@ -390,7 +362,7 @@ class _StoreBackedFixture:
             arguments=arguments,
             authority_generation=self.generation,
         )
-        return self.authorizer.authorize(_peer(), request)
+        return self.authorizer.accept(_peer(), request)
 
     def close(self) -> None:
         self._temporary.cleanup()
@@ -417,17 +389,9 @@ def _request(request_id: uuid.UUID | None = None) -> BrokerRequest:
 
 def _service(retriever: _OneTimeSecretRetriever) -> tuple[BrokerService, _UnusedWriterBackend]:
     backend = _UnusedWriterBackend()
-    policy = AccountAccessPolicy(
-        account_id=ACCOUNT_ID,
-        grants={
-            PROJECT_ID: {
-                RUN_ID: frozenset({BrokerOperation.EPHEMERAL_SECRET_FD}),
-            }
-        },
-    )
     return (
         BrokerService(
-            StaticPeerAuthorizer({os.geteuid(): policy}),
+            TrustedLocalRequestAcceptor(),
             SerializedMutationWriter(backend),
             secret_fd_retriever=retriever,
         ),
@@ -592,7 +556,7 @@ class EphemeralSecretTransportTests(unittest.TestCase):
                 secret_manager=manager,
             )
             started = backend.execute(
-                fixture.authorize(
+                fixture.accept(
                     BrokerOperation.EPHEMERAL_START,
                     STORE_BACKED_TEMPLATE,
                     arguments={"agent": "test-agent"},
@@ -654,7 +618,7 @@ class EphemeralSecretTransportTests(unittest.TestCase):
                 secret_manager=manager,
             )
             started = backend.execute(
-                fixture.authorize(
+                fixture.accept(
                     BrokerOperation.EPHEMERAL_START,
                     STORE_BACKED_TEMPLATE,
                     arguments={"agent": "test-agent"},
@@ -720,7 +684,7 @@ class EphemeralSecretTransportTests(unittest.TestCase):
                 with UnixBrokerServer(socket_path, service):
                     with self.assertRaises(BrokerError) as denied:
                         _client(socket_path).retrieve_ephemeral_secret_fd(request)
-            self.assertEqual(denied.exception.code, "resource_access_denied")
+            self.assertEqual(denied.exception.code, "resource_unavailable")
             after = json.loads(state_path.read_text(encoding="utf-8"))
             self.assertIsNone(after.get("consumed_request_id"))
         finally:
@@ -748,7 +712,7 @@ class EphemeralSecretTransportTests(unittest.TestCase):
                 secret_manager=manager,
             )
             started = backend.execute(
-                fixture.authorize(
+                fixture.accept(
                     BrokerOperation.EPHEMERAL_START,
                     STORE_BACKED_TEMPLATE,
                     arguments={"agent": "test-agent"},
@@ -771,7 +735,7 @@ class EphemeralSecretTransportTests(unittest.TestCase):
                 },
                 authority_generation=fixture.generation,
             )
-            finish = fixture.authorize(
+            finish = fixture.accept(
                 BrokerOperation.EPHEMERAL_FINISH,
                 run_id,
                 arguments={
@@ -904,7 +868,7 @@ class EphemeralSecretTransportTests(unittest.TestCase):
                     self.assertEqual(os.read(received.fd, 512), SECRET)
                 with self.assertRaises(BrokerError) as replay:
                     _client(socket_path).retrieve_ephemeral_secret_fd(request)
-        self.assertEqual(replay.exception.code, "secret_grant_replay")
+        self.assertEqual(replay.exception.code, "secret_lease_replay")
         self.assertNotIn(SECRET.decode("ascii"), str(replay.exception))
         self.assertEqual(len(retriever.calls), 2)
 
@@ -917,7 +881,7 @@ class EphemeralSecretTransportTests(unittest.TestCase):
             with UnixBrokerServer(socket_path, service):
                 with self.assertRaises(BrokerError) as expired:
                     _client(socket_path).retrieve_ephemeral_secret_fd(request)
-        self.assertEqual(expired.exception.code, "secret_grant_expired")
+        self.assertEqual(expired.exception.code, "secret_lease_expired")
         self.assertNotIn(SECRET.decode("ascii"), str(expired.exception))
 
     def test_ambiguous_transport_retry_fails_closed_as_replay(self) -> None:
@@ -939,7 +903,7 @@ class EphemeralSecretTransportTests(unittest.TestCase):
                 )
                 with self.assertRaises(BrokerError) as replay:
                     _client(socket_path).retrieve_ephemeral_secret_fd(request)
-        self.assertEqual(replay.exception.code, "secret_grant_replay")
+        self.assertEqual(replay.exception.code, "secret_lease_replay")
         self.assertNotIn(SECRET.decode("ascii"), str(interrupted.exception))
         self.assertNotIn(SECRET.decode("ascii"), str(replay.exception))
 

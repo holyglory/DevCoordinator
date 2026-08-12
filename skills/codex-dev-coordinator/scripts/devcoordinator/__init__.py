@@ -20,16 +20,15 @@ _LAZY_EXPORTS = {
     "AccountStore": (".store", "AccountStore"),
     "CoordinatorStore": (".store", "CoordinatorStore"),
     "StoreInvariantError": (".store", "StoreInvariantError"),
-    "AccountAccessPolicy": (".broker", "AccountAccessPolicy"),
+    "AcceptedBrokerRequest": (".broker", "AcceptedBrokerRequest"),
     "BrokerClient": (".broker", "BrokerClient"),
     "BrokerError": (".broker", "BrokerError"),
     "BrokerOperation": (".broker", "BrokerOperation"),
     "BrokerRequest": (".broker", "BrokerRequest"),
     "BrokerService": (".broker", "BrokerService"),
     "PeerCredentials": (".broker", "PeerCredentials"),
-    "PortLeasePolicy": (".broker", "PortLeasePolicy"),
     "SerializedMutationWriter": (".broker", "SerializedMutationWriter"),
-    "StaticPeerAuthorizer": (".broker", "StaticPeerAuthorizer"),
+    "TrustedLocalRequestAcceptor": (".broker", "TrustedLocalRequestAcceptor"),
     "UnixBrokerServer": (".broker", "UnixBrokerServer"),
     "StoreBackedBrokerRuntime": (".broker_backend", "StoreBackedBrokerRuntime"),
     "StoreBackedMutationBackend": (
@@ -42,12 +41,12 @@ _LAZY_EXPORTS = {
         "build_store_backed_broker_runtime",
     ),
     "BrokerPersistence": (".broker_persistence", "BrokerPersistence"),
-    "StoreBackedAuthorizer": (".broker_persistence", "StoreBackedAuthorizer"),
+    "StoreBackedRequestAcceptor": (".broker_persistence", "StoreBackedRequestAcceptor"),
 }
 
 __all__ = [
     "AccountStore",
-    "AccountAccessPolicy",
+    "AcceptedBrokerRequest",
     "BrokerClient",
     "BrokerError",
     "BrokerOperation",
@@ -60,10 +59,9 @@ __all__ = [
     "LegacyImportError",
     "LegacySourceChanged",
     "PeerCredentials",
-    "PortLeasePolicy",
     "SerializedMutationWriter",
-    "StaticPeerAuthorizer",
-    "StoreBackedAuthorizer",
+    "TrustedLocalRequestAcceptor",
+    "StoreBackedRequestAcceptor",
     "StoreBackedBrokerRuntime",
     "StoreBackedMutationBackend",
     "StoreInvariantError",
@@ -91,16 +89,15 @@ def __dir__() -> list[str]:
 
 if TYPE_CHECKING:  # pragma: no cover - imported only by static analyzers
     from .broker import (
-        AccountAccessPolicy,
+        AcceptedBrokerRequest,
         BrokerClient,
         BrokerError,
         BrokerOperation,
         BrokerRequest,
         BrokerService,
         PeerCredentials,
-        PortLeasePolicy,
         SerializedMutationWriter,
-        StaticPeerAuthorizer,
+        TrustedLocalRequestAcceptor,
         UnixBrokerServer,
     )
     from .broker_backend import (
@@ -109,7 +106,7 @@ if TYPE_CHECKING:  # pragma: no cover - imported only by static analyzers
         TypedHostMutationAPI,
         build_store_backed_broker_runtime,
     )
-    from .broker_persistence import BrokerPersistence, StoreBackedAuthorizer
+    from .broker_persistence import BrokerPersistence, StoreBackedRequestAcceptor
     from .legacy_import import (
         ImportConflict,
         ImportReport,

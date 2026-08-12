@@ -49,7 +49,7 @@ final class CoreTests: XCTestCase {
         XCTAssertNotEqual(left.rawValue, right.rawValue)
     }
 
-    func testCoordinatorClientRoutesEveryActionThroughOwningHome() async throws {
+    func testCoordinatorClientRoutesEveryActionThroughSelectedEndpoint() async throws {
         let executor = RecordingCommandExecutor(result: .init(stdout: "{}", stderr: "", exitStatus: 0))
         let service = PythonCoordinatorService(executor: executor, scriptPath: "/repo/coordinator.py")
 
@@ -156,8 +156,8 @@ final class CoreTests: XCTestCase {
         )
     }
 
-    func testDirectV2ProjectionUsesDurableIdentitiesAndIgnoresEveryPoisonedV1Field() throws {
-        let execution = try directV2InventoryExecution(home: codex.home)
+    func testDirectV3ProjectionUsesDurableIdentitiesAndIgnoresEveryPoisonedV1Field() throws {
+        let execution = try directV3InventoryExecution(home: codex.home)
         let graph = try JSONDecoder().decode(
             NormalizedInventoryGraph.self,
             from: Data(execution.stdout.utf8)
@@ -268,7 +268,7 @@ final class CoreTests: XCTestCase {
               "result":{"stage":"archive","plan":{
                 "action":"archive","plan_id":"plan-1","plan_fingerprint":"fingerprint-1",
                 "confirmation_phrase":"","effects":["stop worker"],"retained":["crash logs"],
-                "deleted":[],"blockers":[{"code":"listener_unknown","message":"Listener ownership is unknown"}]
+                "deleted":[],"blockers":[{"code":"listener_unknown","message":"Listener association is unknown"}]
               }}
             }
             """#.utf8)
@@ -277,14 +277,14 @@ final class CoreTests: XCTestCase {
         XCTAssertFalse(envelope.ok)
         XCTAssertEqual(envelope.classification, "worker_remove_blocked")
         XCTAssertEqual(envelope.result.plan?.planID, "plan-1")
-        XCTAssertEqual(envelope.result.plan?.blockers.first?.message, "Listener ownership is unknown")
+        XCTAssertEqual(envelope.result.plan?.blockers.first?.message, "Listener association is unknown")
         XCTAssertFalse(envelope.result.plan?.isPermanent == true)
     }
 
     @MainActor
     func testSupervisedWorkerActionUsesCanonicalFlagAPIAndExplicitRootContext() async throws {
-        var object = directV2GraphJSONObject(home: codex.home)
-        object["repository_trees"] = [directV2RepositoryTree(includeTemporaryScope: false)]
+        var object = directV3GraphJSONObject(home: codex.home)
+        object["repository_trees"] = [directV3RepositoryTree(includeTemporaryScope: false)]
         var resources = try XCTUnwrap(object["resources"] as? [String: Any])
         var servers = try XCTUnwrap(resources["servers"] as? [[String: Any]])
         servers[0]["supervision"] = [
@@ -351,7 +351,7 @@ final class CoreTests: XCTestCase {
     }
 
     func testAuthoritativeRepositoryTreesKeepTemporaryRepositoriesUnderTheirExactRoot() throws {
-        var object = directV2GraphJSONObject(home: codex.home)
+        var object = directV3GraphJSONObject(home: codex.home)
         var repositories = try XCTUnwrap(object["repositories"] as? [[String: Any]])
         repositories.append([
             "repo_id": "repo-temp-1",
@@ -365,9 +365,9 @@ final class CoreTests: XCTestCase {
             "installation_generation": 1,
         ])
         object["repositories"] = repositories
-        object["repository_trees"] = [directV2RepositoryTree(includeTemporaryScope: true)]
+        object["repository_trees"] = [directV3RepositoryTree(includeTemporaryScope: true)]
 
-        let projection = try directV2Projection(from: object, origin: codex)
+        let projection = try directV3Projection(from: object, origin: codex)
         let definitions = try XCTUnwrap(projection.repositoryTrees)
         let groups = makeProjectGroups(from: projection.catalog, inventory: projection.inventory)
         let trees = makeRepositoryTreePresentations(groups: groups, definitions: definitions)
@@ -387,7 +387,7 @@ final class CoreTests: XCTestCase {
     }
 
     func testAuthoritativeRepositoryTreesKeepPopulatedTemporaryResourcesOnlyUnderTemporaryScope() throws {
-        var object = directV2GraphJSONObject(home: codex.home)
+        var object = directV3GraphJSONObject(home: codex.home)
 
         var repositories = try XCTUnwrap(object["repositories"] as? [[String: Any]])
         repositories.append([
@@ -402,27 +402,6 @@ final class CoreTests: XCTestCase {
             "installation_generation": 1,
         ])
         object["repositories"] = repositories
-
-        var memberships = try XCTUnwrap(object["memberships"] as? [[String: Any]])
-        memberships.append(contentsOf: [
-            [
-                "membership_id": "server-membership-temp-1",
-                "repo_id": "repo-temp-1",
-                "resource_kind": "server",
-                "host_resource_id": "server-definition-temp-1",
-                "immutable_fingerprint": "server-temp-fingerprint",
-                "control_binding_id": "server-binding-temp-1",
-            ],
-            [
-                "membership_id": "docker-membership-temp-1",
-                "repo_id": "repo-temp-1",
-                "resource_kind": "container",
-                "host_resource_id": "docker-resource-temp-1",
-                "immutable_fingerprint": "docker-temp-fingerprint",
-                "control_binding_id": "docker-binding-temp-1",
-            ],
-        ])
-        object["memberships"] = memberships
 
         var resources = try XCTUnwrap(object["resources"] as? [String: Any])
         var servers = try XCTUnwrap(resources["servers"] as? [[String: Any]])
@@ -442,6 +421,7 @@ final class CoreTests: XCTestCase {
         var docker = try XCTUnwrap(resources["docker"] as? [[String: Any]])
         docker.append([
             "docker_resource_id": "docker-resource-temp-1",
+            "repo_id": "repo-temp-1",
             "engine_id": "engine-1",
             "full_container_id": "immutable-preview-cache-container",
             "current_name": "preview-cache",
@@ -480,42 +460,12 @@ final class CoreTests: XCTestCase {
         observations["docker"] = dockerObservations
         object["observations"] = observations
 
-        var bindings = try XCTUnwrap(object["control_bindings"] as? [[String: Any]])
-        bindings.append(contentsOf: [
-            [
-                "binding_id": "server-binding-temp-1",
-                "repo_id": "repo-temp-1",
-                "source_resource_id": "temp-server-row-1",
-                "resource_kind": "server",
-                "resource_id": "server-definition-temp-1",
-                "source_id": "imported-source",
-                "capability": "lifecycle",
-                "provenance": "runtime_session",
-                "authority_state": "authoritative",
-                "priority": 100,
-                "generation": 1,
-            ],
-            [
-                "binding_id": "docker-binding-temp-1",
-                "repo_id": "repo-temp-1",
-                "source_resource_id": "temp-docker-row-1",
-                "resource_kind": "container",
-                "resource_id": "docker-resource-temp-1",
-                "source_id": "imported-source",
-                "capability": "lifecycle",
-                "provenance": "runtime_session",
-                "authority_state": "authoritative",
-                "priority": 100,
-                "generation": 1,
-            ],
-        ])
-        object["control_bindings"] = bindings
-        object["repository_trees"] = [directV2RepositoryTree(
+        object["repository_trees"] = [directV3RepositoryTree(
             includeTemporaryScope: true,
             populatedTemporaryScope: true
         )]
 
-        let projection = try directV2Projection(from: object, origin: codex)
+        let projection = try directV3Projection(from: object, origin: codex)
         let groups = makeProjectGroups(from: projection.catalog, inventory: projection.inventory)
         let trees = makeRepositoryTreePresentations(
             groups: groups,
@@ -546,7 +496,7 @@ final class CoreTests: XCTestCase {
 
     @MainActor
     func testStorePublishesAuthoritativeRepositoryHierarchyWithoutUnassignedNode() async throws {
-        var object = directV2GraphJSONObject(home: codex.home)
+        var object = directV3GraphJSONObject(home: codex.home)
         var repositories = try XCTUnwrap(object["repositories"] as? [[String: Any]])
         repositories.append([
             "repo_id": "repo-temp-1",
@@ -560,7 +510,7 @@ final class CoreTests: XCTestCase {
             "installation_generation": 1,
         ])
         object["repositories"] = repositories
-        object["repository_trees"] = [directV2RepositoryTree(includeTemporaryScope: true)]
+        object["repository_trees"] = [directV3RepositoryTree(includeTemporaryScope: true)]
         let data = try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
         let service = OriginSequencedCoordinatorService(results: [
             codex.id: [.success(CommandExecution(
@@ -591,19 +541,19 @@ final class CoreTests: XCTestCase {
     }
 
     func testAuthoritativeRepositoryTreesRejectMissingCoverage() throws {
-        var missingCoverage = directV2GraphJSONObject(home: codex.home)
-        var tree = directV2RepositoryTree(includeTemporaryScope: false)
+        var missingCoverage = directV3GraphJSONObject(home: codex.home)
+        var tree = directV3RepositoryTree(includeTemporaryScope: false)
         var scopes = try XCTUnwrap(tree["scopes"] as? [[String: Any]])
         scopes[0]["container_resource_ids"] = []
         tree["scopes"] = scopes
         missingCoverage["repository_trees"] = [tree]
-        XCTAssertThrowsError(try directV2Projection(from: missingCoverage, origin: codex))
+        XCTAssertThrowsError(try directV3Projection(from: missingCoverage, origin: codex))
     }
 
     @MainActor
     func testAuthoritativeRepositoryTreesExposeUnassignedAsDiagnosticsWithoutSyntheticProjectAndBlockOrdinaryMutations() async throws {
-        var object = directV2GraphJSONObject(home: codex.home)
-        object["repository_trees"] = [directV2RepositoryTree(includeTemporaryScope: false)]
+        var object = directV3GraphJSONObject(home: codex.home)
+        object["repository_trees"] = [directV3RepositoryTree(includeTemporaryScope: false)]
 
         var resources = try XCTUnwrap(object["resources"] as? [String: Any])
         var dockerResources = try XCTUnwrap(resources["docker"] as? [[String: Any]])
@@ -642,15 +592,14 @@ final class CoreTests: XCTestCase {
             "controller": codex.home,
             "host_resource_id": "docker-unassigned-1",
             "immutable_fingerprint": "immutable-unassigned-fingerprint",
-            "control_binding_id": "unassigned-binding-1",
-            "ownership_fingerprint": "unassigned-ownership-1",
+            "observation_fingerprint": "unassigned-association-1",
             "can_attach": true,
             "can_retire": true,
             "lifecycle_violation": false,
             "recommended_next_step": "Rerun Coordinator installation for the root repository, or attach this exact container.",
         ]]
 
-        let projection = try directV2Projection(from: object, origin: codex)
+        let projection = try directV3Projection(from: object, origin: codex)
         XCTAssertEqual(projection.repositoryTrees?.count, 1)
         XCTAssertEqual(
             projection.catalog.unassigned.docker.first?.representative.name,
@@ -682,7 +631,7 @@ final class CoreTests: XCTestCase {
         XCTAssertEqual(store.repositoryTrees.count, 1, "the valid repository tree remains visible")
         XCTAssertNil(
             store.unassignedProjectGroup,
-            "authoritative ownership failures are diagnostics, not another project node"
+            "authoritative association failures are diagnostics, not another project node"
         )
         XCTAssertEqual(
             store.presentationSnapshot.statusTitle,
@@ -715,15 +664,16 @@ final class CoreTests: XCTestCase {
             kind: .attachResource,
             origin: codex,
             resource: exact
-        ).isAllowed, "the exact corrective ownership journey remains available")
+        ).isAllowed, "the exact corrective association journey remains available")
     }
 
     func testAuthoritativeRepositoryTreesIgnoreRetainedUnobservedDockerAliases() throws {
-        var object = directV2GraphJSONObject(home: codex.home)
+        var object = directV3GraphJSONObject(home: codex.home)
         var resources = try XCTUnwrap(object["resources"] as? [String: Any])
         var dockerResources = try XCTUnwrap(resources["docker"] as? [[String: Any]])
         dockerResources.append([
             "docker_resource_id": "docker-resource-retained-alias",
+            "repo_id": "repo-1",
             "engine_id": "engine-1",
             "full_container_id": "immutable-pg-container",
             "current_name": "immutable-pg-cont",
@@ -733,19 +683,9 @@ final class CoreTests: XCTestCase {
         ])
         resources["docker"] = dockerResources
         object["resources"] = resources
-        var memberships = try XCTUnwrap(object["memberships"] as? [[String: Any]])
-        memberships.append([
-            "membership_id": "docker-membership-retained-alias",
-            "repo_id": "repo-1",
-            "resource_kind": "container",
-            "host_resource_id": "docker-resource-retained-alias",
-            "immutable_fingerprint": "docker-fingerprint",
-            "control_binding_id": NSNull(),
-        ])
-        object["memberships"] = memberships
-        object["repository_trees"] = [directV2RepositoryTree(includeTemporaryScope: false)]
+        object["repository_trees"] = [directV3RepositoryTree(includeTemporaryScope: false)]
 
-        let projection = try directV2Projection(from: object, origin: codex)
+        let projection = try directV3Projection(from: object, origin: codex)
 
         XCTAssertEqual(projection.inventory.docker.containers.count, 1)
         XCTAssertEqual(projection.inventory.docker.containers.first?.name, "pg")
@@ -763,11 +703,11 @@ final class CoreTests: XCTestCase {
         ])
         observations["docker"] = dockerObservations
         observedAlias["observations"] = observations
-        XCTAssertThrowsError(try directV2Projection(from: observedAlias, origin: codex))
+        XCTAssertThrowsError(try directV3Projection(from: observedAlias, origin: codex))
     }
 
     func testRepositoryTreesFailClosedWhenMissingNullOrEmpty() throws {
-        var missingTree = directV2GraphJSONObject(home: codex.home)
+        var missingTree = directV3GraphJSONObject(home: codex.home)
         missingTree.removeValue(forKey: "repository_trees")
         let missingData = try JSONSerialization.data(withJSONObject: missingTree, options: [.sortedKeys])
         let missingProjection = try JSONDecoder().decode(
@@ -783,16 +723,16 @@ final class CoreTests: XCTestCase {
             definitions: []
         ).isEmpty)
 
-        var nullTree = directV2GraphJSONObject(home: codex.home)
+        var nullTree = directV3GraphJSONObject(home: codex.home)
         nullTree["repository_trees"] = NSNull()
         let nullData = try JSONSerialization.data(withJSONObject: nullTree, options: [.sortedKeys])
         XCTAssertThrowsError(
             try JSONDecoder().decode(NormalizedInventoryGraph.self, from: nullData)
         )
 
-        var emptyTree = directV2GraphJSONObject(home: codex.home)
+        var emptyTree = directV3GraphJSONObject(home: codex.home)
         emptyTree["repository_trees"] = []
-        XCTAssertThrowsError(try directV2Projection(from: emptyTree, origin: codex))
+        XCTAssertThrowsError(try directV3Projection(from: emptyTree, origin: codex))
     }
 
     @MainActor
@@ -821,8 +761,8 @@ final class CoreTests: XCTestCase {
         XCTAssertTrue(store.repositoryTreeContractUnavailable)
     }
 
-    func testDirectV2ProjectionOmitsExpiredActiveLeaseButKeepsCurrentLeases() throws {
-        var object = directV2GraphJSONObject(home: codex.home)
+    func testDirectV3ProjectionOmitsExpiredActiveLeaseButKeepsCurrentLeases() throws {
+        var object = directV3GraphJSONObject(home: codex.home)
         var leases = try XCTUnwrap(object["leases"] as? [[String: Any]])
         var expired = try XCTUnwrap(leases.first)
         expired["lease_id"] = "lease-expired"
@@ -837,7 +777,7 @@ final class CoreTests: XCTestCase {
         object["leases"] = leases
         let now = try XCTUnwrap(parseISOTimestamp("2026-07-18T12:00:00Z"))
 
-        let projection = try directV2Projection(
+        let projection = try directV3Projection(
             from: object,
             origin: codex,
             now: now
@@ -850,20 +790,20 @@ final class CoreTests: XCTestCase {
         XCTAssertEqual(projection.inventory.servers.first?.leaseID, "lease-future")
     }
 
-    func testDirectV2ProjectionDoesNotReuseAnInactivePortAssignment() throws {
-        var object = directV2GraphJSONObject(home: codex.home)
+    func testDirectV3ProjectionDoesNotReuseAnInactivePortAssignment() throws {
+        var object = directV3GraphJSONObject(home: codex.home)
         var assignments = try XCTUnwrap(object["port_assignments"] as? [[String: Any]])
         assignments[0]["status"] = "inactive"
         object["port_assignments"] = assignments
         object["leases"] = []
 
-        let projection = try directV2Projection(from: object, origin: codex)
+        let projection = try directV3Projection(from: object, origin: codex)
 
         XCTAssertNil(projection.inventory.servers.first?.port)
     }
 
-    func testDirectV2ProjectionMatchesCaseDistinctPortAssignmentsExactly() throws {
-        var object = directV2GraphJSONObject(home: codex.home)
+    func testDirectV3ProjectionMatchesCaseDistinctPortAssignmentsExactly() throws {
+        var object = directV3GraphJSONObject(home: codex.home)
 
         var resources = try XCTUnwrap(object["resources"] as? [String: Any])
         var definitions = try XCTUnwrap(resources["servers"] as? [[String: Any]])
@@ -885,33 +825,6 @@ final class CoreTests: XCTestCase {
         observations["servers"] = serverObservations
         object["observations"] = observations
 
-        var memberships = try XCTUnwrap(object["memberships"] as? [[String: Any]])
-        memberships.append([
-            "membership_id": "server-membership-2",
-            "repo_id": "repo-1",
-            "resource_kind": "server",
-            "host_resource_id": "server-definition-2",
-            "immutable_fingerprint": "server-fingerprint-2",
-            "control_binding_id": "server-binding-2",
-        ])
-        object["memberships"] = memberships
-
-        var bindings = try XCTUnwrap(object["control_bindings"] as? [[String: Any]])
-        bindings.append([
-            "binding_id": "server-binding-2",
-            "repo_id": "repo-1",
-            "source_resource_id": "legacy-server-row-78",
-            "resource_kind": "server",
-            "resource_id": "server-definition-2",
-            "source_id": "imported-source",
-            "capability": "lifecycle",
-            "provenance": "imported_legacy",
-            "authority_state": "authoritative",
-            "priority": 100,
-            "generation": 4,
-        ])
-        object["control_bindings"] = bindings
-
         var assignments = try XCTUnwrap(object["port_assignments"] as? [[String: Any]])
         assignments.append([
             "assignment_id": "assignment-2",
@@ -922,7 +835,7 @@ final class CoreTests: XCTestCase {
         ])
         object["port_assignments"] = assignments
 
-        let projection = try directV2Projection(from: object, origin: codex)
+        let projection = try directV3Projection(from: object, origin: codex)
         let portsByName = Dictionary(
             uniqueKeysWithValues: projection.inventory.servers.map { ($0.name, $0.port) }
         )
@@ -931,37 +844,25 @@ final class CoreTests: XCTestCase {
         XCTAssertEqual(portsByName["Web"], 4_318)
     }
 
-    func testRepositoryControlRequiresCompleteAuthoritativeMembershipCoverage() throws {
-        let completeProjection = try directV2Projection(
-            from: directV2GraphJSONObject(home: codex.home),
+    func testRepositoryRoutingUsesDirectResourceAssociation() throws {
+        let projection = try directV3Projection(
+            from: directV3GraphJSONObject(home: codex.home),
             origin: codex
         )
-        let completeRepository = try XCTUnwrap(completeProjection.catalog.repositories.first)
-        XCTAssertEqual(completeRepository.controlOrigin, codex)
-        XCTAssertFalse(completeRepository.projectActionsBlocked)
-
-        for missingResourceKind in ["server", "container"] {
-            var object = directV2GraphJSONObject(home: codex.home)
-            var memberships = try XCTUnwrap(object["memberships"] as? [[String: Any]])
-            memberships.removeAll { $0["resource_kind"] as? String == missingResourceKind }
-            object["memberships"] = memberships
-
-            let projection = try directV2Projection(from: object, origin: codex)
-            let repository = try XCTUnwrap(projection.catalog.repositories.first)
-            XCTAssertNil(
-                repository.controlOrigin,
-                "a missing \(missingResourceKind) membership must block whole-project control"
-            )
-            XCTAssertTrue(repository.projectActionsBlocked)
-        }
+        let repository = try XCTUnwrap(projection.catalog.repositories.first)
+        XCTAssertEqual(repository.routeOrigin, codex)
+        XCTAssertFalse(repository.projectActionsBlocked)
+        XCTAssertEqual(repository.servers.map(\.representative.name), ["web"])
+        XCTAssertEqual(repository.docker.map(\.representative.name), ["pg"])
     }
 
-    func testNonDatabaseDockerResourceRequiresMembershipBeforeProjectControl() throws {
-        var object = directV2GraphJSONObject(home: codex.home)
+    func testNonDatabaseDockerResourceUsesDirectRepositoryAssociation() throws {
+        var object = directV3GraphJSONObject(home: codex.home)
         var resources = try XCTUnwrap(object["resources"] as? [String: Any])
         var dockerResources = try XCTUnwrap(resources["docker"] as? [[String: Any]])
         dockerResources.append([
             "docker_resource_id": "docker-resource-worker",
+            "repo_id": "repo-1",
             "engine_id": "engine-1",
             "full_container_id": "immutable-worker-container",
             "current_name": "worker",
@@ -984,42 +885,11 @@ final class CoreTests: XCTestCase {
         observations["docker"] = dockerObservations
         object["observations"] = observations
 
-        var bindings = try XCTUnwrap(object["control_bindings"] as? [[String: Any]])
-        bindings.append([
-            "binding_id": "docker-binding-worker",
-            "repo_id": "repo-1",
-            "source_resource_id": "legacy-worker-row-77",
-            "resource_kind": "container",
-            "resource_id": "docker-resource-worker",
-            "source_id": "imported-source",
-            "capability": "lifecycle",
-            "provenance": "imported_legacy",
-            "authority_state": "authoritative",
-            "priority": 100,
-            "generation": 4,
-        ])
-        object["control_bindings"] = bindings
-
-        let missingMembership = try directV2Projection(from: object, origin: codex)
-        let blockedRepository = try XCTUnwrap(missingMembership.catalog.repositories.first)
-        XCTAssertNil(blockedRepository.controlOrigin)
-        XCTAssertTrue(blockedRepository.projectActionsBlocked)
-
-        var memberships = try XCTUnwrap(object["memberships"] as? [[String: Any]])
-        memberships.append([
-            "membership_id": "docker-membership-worker",
-            "repo_id": "repo-1",
-            "resource_kind": "container",
-            "host_resource_id": "docker-resource-worker",
-            "immutable_fingerprint": "worker-fingerprint",
-            "control_binding_id": "docker-binding-worker",
-        ])
-        object["memberships"] = memberships
-
-        let completeMembership = try directV2Projection(from: object, origin: codex)
-        let controlledRepository = try XCTUnwrap(completeMembership.catalog.repositories.first)
-        XCTAssertEqual(controlledRepository.controlOrigin, codex)
-        XCTAssertFalse(controlledRepository.projectActionsBlocked)
+        let projection = try directV3Projection(from: object, origin: codex)
+        let repository = try XCTUnwrap(projection.catalog.repositories.first)
+        XCTAssertEqual(repository.routeOrigin, codex)
+        XCTAssertFalse(repository.projectActionsBlocked)
+        XCTAssertEqual(Set(repository.docker.compactMap(\.representative.name)), ["pg", "worker"])
     }
 
     func testV1OnlyPayloadCannotMasqueradeAsNormalizedInventory() {
@@ -1030,7 +900,7 @@ final class CoreTests: XCTestCase {
     }
 
     func testNormalizedInventoryProjectsRepositoryTestStatistics() throws {
-        var object = directV2GraphJSONObject(home: codex.home)
+        var object = directV3GraphJSONObject(home: codex.home)
         object["test_statistics"] = [[
             "repo_id": "repo-1",
             "days": 30,
@@ -1085,7 +955,7 @@ final class CoreTests: XCTestCase {
             ]],
         ]]
 
-        let projection = try directV2Projection(from: object, origin: codex)
+        let projection = try directV3Projection(from: object, origin: codex)
         let statistics = try XCTUnwrap(projection.inventory.testStatistics.first)
         XCTAssertEqual(statistics.origin, codex)
         XCTAssertEqual(statistics.repoID, "repo-1")
@@ -1097,7 +967,7 @@ final class CoreTests: XCTestCase {
     func testRetiredImportedSourceProvenanceStillRoutesOneActionThroughCurrentAccountOrigin() async throws {
         let current = CoordinatorOrigin(label: "Current account", home: "/current/account-store")
         let legacyHome = "/retired/legacy-instance"
-        let snapshot = try directV2InventoryExecution(
+        let snapshot = try directV3InventoryExecution(
             home: current.home,
             sourceHome: legacyHome,
             sourceStatus: "retired"
@@ -1120,7 +990,7 @@ final class CoreTests: XCTestCase {
         await store.loadInventory(force: true)
         let container = try XCTUnwrap(store.inventory.docker.containers.first)
         XCTAssertEqual(container.origin, current)
-        XCTAssertNil(container.ownershipError)
+        XCTAssertNil(container.associationError)
         store.restartDocker(container)
         try await waitUntil {
             store.actionResults.values.contains { $0.request.kind == .restartDocker && $0.phase == .succeeded }
@@ -1134,13 +1004,11 @@ final class CoreTests: XCTestCase {
     }
 
     func testRunningDisabledRepositoryResourceIsOnlyAnExactUnassignedFenceViolation() throws {
-        var object = directV2GraphJSONObject(home: codex.home)
+        var object = directV3GraphJSONObject(home: codex.home)
         object["repositories"] = []
-        object["memberships"] = []
         object["leases"] = []
         object["port_assignments"] = []
         object["database_backups"] = []
-        object["control_bindings"] = []
         var resources = try XCTUnwrap(object["resources"] as? [String: Any])
         resources["servers"] = []
         resources["databases"] = []
@@ -1157,11 +1025,9 @@ final class CoreTests: XCTestCase {
             "reason_code": "start_fence_violated",
             "explanation": "A resource from a disabled repository is running.",
             "observed_by": ["host-observer"],
-            "controller": "retired-binding",
             "host_resource_id": "docker-resource-1",
             "immutable_fingerprint": "docker-fingerprint",
-            "control_binding_id": "retired-binding",
-            "ownership_fingerprint": "retired-ownership",
+            "observation_fingerprint": "retired-association",
             "can_attach": false,
             "can_retire": true,
             "lifecycle_violation": true,
@@ -1178,7 +1044,7 @@ final class CoreTests: XCTestCase {
         let unassigned = try XCTUnwrap(projection.catalog.unassigned.docker.first?.representative)
         XCTAssertEqual(unassigned.attribution?.reasonCode, .startFenceViolated)
         XCTAssertTrue(unassigned.attribution?.lifecycleViolation == true)
-        XCTAssertNotNil(unassigned.ownershipError, "ordinary lifecycle actions must stay blocked")
+        XCTAssertNotNil(unassigned.associationError, "ordinary lifecycle actions must stay blocked")
         let exact = try XCTUnwrap(unassigned.exactUnassignedResource)
         XCTAssertFalse(unassigned.attribution?.canAttach == true)
         XCTAssertTrue(unassigned.attribution?.canRetire == true)
@@ -1495,7 +1361,7 @@ final class CoreTests: XCTestCase {
     }
 
     @MainActor
-    func testDockerActionsRouteToTheOnlySidecarOwningHome() async throws {
+    func testDockerActionsRouteToTheObservedSidecarEndpoint() async throws {
         let unowned = dockerInventoryExecution(home: codex.home, metadataSource: "none", project: nil)
         let owned = dockerInventoryExecution(home: parall.home, metadataSource: "coordinator_sidecar", project: "/repo")
         let service = OriginSequencedCoordinatorService(results: [
@@ -1515,7 +1381,7 @@ final class CoreTests: XCTestCase {
         await store.loadInventory()
         let container = try XCTUnwrap(store.inventory.docker.containers.first)
         XCTAssertEqual(container.origin?.id, parall.id)
-        XCTAssertNil(container.ownershipError)
+        XCTAssertNil(container.associationError)
 
         store.restartDocker(container)
         try await waitUntil {
@@ -1527,7 +1393,7 @@ final class CoreTests: XCTestCase {
     }
 
     @MainActor
-    func testConflictingSidecarOwnershipDisablesContainerIdentity() async throws {
+    func testConflictingSidecarAssociationDisablesContainerIdentity() async throws {
         let left = dockerInventoryExecution(home: codex.home, metadataSource: "coordinator_sidecar", project: "/left")
         let right = dockerInventoryExecution(home: parall.home, metadataSource: "coordinator_sidecar", project: "/right")
         let service = OriginSequencedCoordinatorService(results: [
@@ -1544,12 +1410,12 @@ final class CoreTests: XCTestCase {
         let container = try XCTUnwrap(store.inventory.docker.containers.first)
         XCTAssertNil(container.origin)
         XCTAssertNil(container.resourceIdentity)
-        XCTAssertEqual(container.ownershipCandidates.count, 2)
-        XCTAssertEqual(container.ownershipError, "conflicting coordinator-sidecar ownership")
+        XCTAssertEqual(container.routeCandidates.count, 2)
+        XCTAssertEqual(container.associationError, "conflicting coordinator-sidecar association")
     }
 
     @MainActor
-    func testCatalogOwnershipConflictMakesPublishedHealthNonNominalEvenWithoutResourceIdentity() async throws {
+    func testCatalogAssociationConflictMakesPublishedHealthNonNominalEvenWithoutResourceIdentity() async throws {
         let fixtureRoot = FileManager.default.temporaryDirectory
             .appendingPathComponent("core-docker-conflict-\(UUID().uuidString)", isDirectory: true)
         let leftProject = fixtureRoot.appendingPathComponent("left-owner", isDirectory: true)
@@ -1586,12 +1452,12 @@ final class CoreTests: XCTestCase {
         await store.loadInventory(force: true)
 
         XCTAssertNil(store.inventory.docker.containers.first?.resourceIdentity)
-        XCTAssertEqual(store.repositoryCatalog.repositories.flatMap(\.dockerMembershipConflicts).count, 2)
+        XCTAssertEqual(store.repositoryCatalog.repositories.flatMap(\.dockerAssociationConflicts).count, 2)
         let attention = store.resourceAttentionItems
         XCTAssertEqual(attention.count, 1, "one physical conflict must produce one attention item")
         let conflictAttention = try XCTUnwrap(attention.first)
         XCTAssertEqual(conflictAttention.kind, .projectConflict)
-        XCTAssertEqual(conflictAttention.title, "shared-worker has conflicting project ownership")
+        XCTAssertEqual(conflictAttention.title, "shared-worker has conflicting project association")
         XCTAssertTrue(conflictAttention.reason.contains("left-owner"))
         XCTAssertTrue(conflictAttention.reason.contains("right-owner"))
         XCTAssertEqual(conflictAttention.reviewTarget.kind, .docker)
@@ -1613,12 +1479,12 @@ final class CoreTests: XCTestCase {
         XCTAssertEqual(
             callsAfter,
             callsBefore,
-            "a repository membership conflict must fail before any coordinator command"
+            "a repository association conflict must fail before any coordinator command"
         )
     }
 
     @MainActor
-    func testMembershipConflictWithOneStaleParticipantDoesNotAssertCurrentResourceAttention() async throws {
+    func testAssociationConflictWithOneStaleParticipantDoesNotAssertCurrentResourceAttention() async throws {
         let fixtureRoot = FileManager.default.temporaryDirectory
             .appendingPathComponent("core-stale-docker-conflict-\(UUID().uuidString)", isDirectory: true)
         let leftProject = fixtureRoot.appendingPathComponent("left-owner", isDirectory: true)
@@ -1652,7 +1518,7 @@ final class CoreTests: XCTestCase {
         await store.loadInventory(force: true)
         XCTAssertEqual(store.sourceStates.first(where: { $0.origin.id == parall.id })?.phase, .stale)
         XCTAssertEqual(
-            store.repositoryCatalog.repositories.flatMap(\.dockerMembershipConflicts).count,
+            store.repositoryCatalog.repositories.flatMap(\.dockerAssociationConflicts).count,
             2,
             "retained inventory remains visible for diagnostics"
         )
@@ -1665,7 +1531,7 @@ final class CoreTests: XCTestCase {
     }
 
     @MainActor
-    func testPhysicalServerMembershipConflictProducesOneRoutableAttentionItem() async throws {
+    func testPhysicalServerAssociationConflictProducesOneRoutableAttentionItem() async throws {
         let fixtureRoot = FileManager.default.temporaryDirectory
             .appendingPathComponent("core-server-conflict-\(UUID().uuidString)", isDirectory: true)
         let leftProject = fixtureRoot.appendingPathComponent("left-owner", isDirectory: true)
@@ -1693,10 +1559,10 @@ final class CoreTests: XCTestCase {
 
         await store.loadInventory(force: true)
 
-        XCTAssertEqual(store.repositoryCatalog.repositories.flatMap(\.serverMembershipConflicts).count, 2)
+        XCTAssertEqual(store.repositoryCatalog.repositories.flatMap(\.serverAssociationConflicts).count, 2)
         let attention = try XCTUnwrap(store.resourceAttentionItems.first)
         XCTAssertEqual(store.resourceAttentionItems.count, 1)
-        XCTAssertEqual(attention.title, "web has conflicting project ownership")
+        XCTAssertEqual(attention.title, "web has conflicting project association")
         XCTAssertEqual(attention.reviewTarget.kind, .server)
         XCTAssertEqual(store.healthSummary.unhealthyResourceCount, 1)
         XCTAssertEqual(store.presentationSnapshot.level, .unhealthy)
@@ -2756,8 +2622,8 @@ final class CoreTests: XCTestCase {
 
     @MainActor
     func testBrokerDatabaseBackupUsesRepositoryContextWithoutClientPathsOrVerification() async throws {
-        let projection = try directV2Projection(
-            from: directV2GraphJSONObject(home: codex.home),
+        let projection = try directV3Projection(
+            from: directV3GraphJSONObject(home: codex.home),
             origin: codex
         )
         let database = try XCTUnwrap(projection.inventory.postgres.first)
@@ -2855,8 +2721,8 @@ final class CoreTests: XCTestCase {
 
     @MainActor
     func testBrokerRestoreUsesOpaqueBackupIDAndNeverSendsClientArtifactPaths() async throws {
-        let projection = try directV2Projection(
-            from: directV2GraphJSONObject(home: codex.home),
+        let projection = try directV3Projection(
+            from: directV3GraphJSONObject(home: codex.home),
             origin: codex
         )
         let database = try XCTUnwrap(projection.inventory.postgres.first)
@@ -2909,58 +2775,6 @@ final class CoreTests: XCTestCase {
         XCTAssertEqual(projectRoots, ["/repo"])
         XCTAssertEqual(store.actionResults.values.first?.phase, .succeeded)
         XCTAssertNil(store.restoreEvidence[target], "broker registry evidence must not be mislabeled as a client artifact path")
-    }
-
-    @MainActor
-    func testDatabaseProtectionFailsClosedWhenCurrentOwnershipIsNotAuthoritative() async throws {
-        var object = directV2GraphJSONObject(home: codex.home)
-        var bindings = try XCTUnwrap(object["control_bindings"] as? [[String: Any]])
-        let dockerBindingIndex = try XCTUnwrap(
-            bindings.firstIndex { $0["binding_id"] as? String == "docker-binding-1" }
-        )
-        bindings[dockerBindingIndex]["authority_state"] = "candidate"
-        object["control_bindings"] = bindings
-
-        let projection = try directV2Projection(from: object, origin: codex)
-        let database = try XCTUnwrap(projection.inventory.postgres.first)
-        XCTAssertNotNil(database.ownershipError)
-        XCTAssertNil(database.databaseIdentity, "an uncontrolled database must not expose a mutable identity")
-
-        let backupService = RecordingBackupService(results: [])
-        let store = OpsStore(
-            coordinatorService: OriginSequencedCoordinatorService(results: [:]),
-            backupService: backupService,
-            commandExecutor: RecordingCommandExecutor(result: .init(stdout: "", stderr: "", exitStatus: 0)),
-            databaseDiscovery: EmptyDatabaseDiscovery(),
-            originDiscovery: StaticOriginDiscovery(values: [])
-        )
-        store.inventory = projection.inventory
-        markSourceLoaded(store, origin: codex, resourceCount: 1)
-
-        XCTAssertFalse(databaseProtectionActionAllowed(store, kind: .backupDatabase, database: database))
-        XCTAssertFalse(databaseProtectionActionAllowed(store, kind: .restoreDatabase, database: database))
-
-        var stalePreviouslyControlledDatabase = database
-        stalePreviouslyControlledDatabase.ownershipError = nil
-        let staleTarget = try XCTUnwrap(stalePreviouslyControlledDatabase.databaseIdentity)
-        let strongBackup = BackupRecord(
-            identity: staleTarget,
-            path: "/backups/app.dump",
-            createdAt: Date(),
-            checksum: .verified,
-            restoreTest: .passed
-        )
-        store.backupDatabase(container: stalePreviouslyControlledDatabase)
-        store.restoreDatabase(
-            target: staleTarget,
-            backup: strongBackup,
-            confirmation: store.restoreConfirmation(for: staleTarget)
-        )
-        try await Task.sleep(for: .milliseconds(50))
-
-        let calls = await backupService.capturedArguments()
-        XCTAssertTrue(calls.isEmpty)
-        XCTAssertTrue(store.actionResults.isEmpty, "ownership rejection must happen before an operation is reserved")
     }
 
     func testPrivateCoordinatorConfigurationIsPrivateAtomicAndRecoversLastKnownGood() throws {
@@ -3699,7 +3513,7 @@ final class CoreTests: XCTestCase {
     @MainActor
     func testNormalizedBackupRegistryLoadsInTheSameSnapshotWithoutDuplicatePolling() async throws {
         let service = OriginSequencedCoordinatorService(results: [
-            codex.id: [.success(try directV2InventoryExecution(home: codex.home))]
+            codex.id: [.success(try directV3InventoryExecution(home: codex.home))]
         ])
         let store = OpsStore(
             coordinatorService: service,
@@ -3725,7 +3539,7 @@ final class CoreTests: XCTestCase {
     @MainActor
     func testFailedDatabaseObservationRetainsRuntimeSnapshotAndDegradesOnlyDatabaseCapability() async throws {
         let service = OriginSequencedCoordinatorService(results: [
-            codex.id: [.success(try directV2InventoryExecution(
+            codex.id: [.success(try directV3InventoryExecution(
                 home: codex.home,
                 databaseAvailable: false,
                 databaseError: "database probe timed out"
@@ -3760,7 +3574,7 @@ final class CoreTests: XCTestCase {
     @MainActor
     func testDockerAndDatabaseObservationFailuresAreBothRetainedInDiagnostics() async throws {
         let service = OriginSequencedCoordinatorService(results: [
-            codex.id: [.success(try directV2InventoryExecution(
+            codex.id: [.success(try directV3InventoryExecution(
                 home: codex.home,
                 dockerCapability: "unavailable",
                 databaseAvailable: false,
@@ -3809,7 +3623,7 @@ final class CoreTests: XCTestCase {
         """
         try Data(manifestJSON.utf8).write(to: manifest)
         let service = OriginSequencedCoordinatorService(results: [
-            codex.id: [.success(try directV2InventoryExecution(
+            codex.id: [.success(try directV3InventoryExecution(
                 home: codex.home,
                 strongArtifactPath: artifact.path
             ))]
@@ -3847,7 +3661,7 @@ final class CoreTests: XCTestCase {
         """
         try Data(manifestJSON.utf8).write(to: manifest)
         let service = OriginSequencedCoordinatorService(results: [
-            codex.id: [.success(try directV2InventoryExecution(
+            codex.id: [.success(try directV3InventoryExecution(
                 home: codex.home,
                 strongArtifactPath: artifact.path
             ))]
@@ -4309,28 +4123,27 @@ final class CoreTests: XCTestCase {
                 "--resource-kind", "container",
                 "--resource-id", "docker:immutable-copy-pg",
                 "--immutable-fingerprint", "container-fingerprint-1",
-                "--control-binding-id", "docker-binding-1",
-                "--ownership-fingerprint", "ownership-fingerprint-1",
+                "--association-fingerprint", "association-fingerprint-1",
             ]
         )
 
         complete = try JSONDecoder().decode(
             DockerContainer.self,
-            from: Data(#"{"id":"immutable-copy-pg","name":"kosttracking-prod-copy-pg","status":"running","attribution":{"reason_code":"ambiguous_control","explanation":"No authoritative repository binding","observed_by":["host-observer"],"controller":"docker-binding-1","host_resource_id":"docker:immutable-copy-pg","immutable_fingerprint":"container-fingerprint-1","control_binding_id":"docker-binding-1","can_attach":true,"can_retire":true}}"#.utf8)
+            from: Data(#"{"id":"immutable-copy-pg","name":"kosttracking-prod-copy-pg","status":"running","attribution":{"reason_code":"ambiguous_control","explanation":"No authoritative repository binding","observed_by":["host-observer"],"controller":"docker-binding-1","host_resource_id":"docker:immutable-copy-pg","immutable_fingerprint":"container-fingerprint-1","can_attach":true,"can_retire":true}}"#.utf8)
         )
         complete.origin = codex
         XCTAssertNil(
             complete.exactUnassignedResource,
-            "a missing ownership fingerprint must suppress actions instead of guessing a host target"
+            "a missing association fingerprint must suppress actions instead of guessing a host target"
         )
     }
 
     func testActionableUnassignedCopyNamesTheTwoSafeUserDecisions() {
         let presentation = ResourceAttributionPresentation(
-            reasonCode: .ambiguousControl,
-            explanation: "Observed without repository membership",
+            reasonCode: .ambiguousAssociation,
+            explanation: "Observed without repository association",
             observedBy: ["host-observer"],
-            controller: "account coordinator",
+            route: "local Coordinator",
             canAttach: true,
             canRetire: true,
             recommendedNextStep: nil
@@ -4346,7 +4159,7 @@ final class CoreTests: XCTestCase {
     func testRunningRemovedResourceBecomesOneCriticalAttentionItemWithoutResurrectingProject() throws {
         var container = try JSONDecoder().decode(
             DockerContainer.self,
-            from: Data(#"{"id":"removed-container-id","name":"removed-copy-pg","status":"running","metadata_source":"normalized_store","attribution":{"reason_code":"start_fence_violated","explanation":"This exact container is running even though its retained removal fence is active.","observed_by":["account coordinator"],"controller":"binding-removed","host_resource_id":"docker:removed-container","immutable_fingerprint":"container-removed-fingerprint","control_binding_id":"binding-removed","ownership_fingerprint":"ownership-removed-fingerprint","can_attach":false,"can_retire":false,"lifecycle_violation":true,"recommended_next_step":"Stop the exact container and resume the retained removal operation."}}"#.utf8)
+            from: Data(#"{"id":"removed-container-id","name":"removed-copy-pg","status":"running","metadata_source":"normalized_store","attribution":{"reason_code":"start_fence_violated","explanation":"This exact container is running even though its retained removal fence is active.","observed_by":["account coordinator"],"controller":"binding-removed","host_resource_id":"docker:removed-container","immutable_fingerprint":"container-removed-fingerprint","observation_fingerprint":"association-removed-fingerprint","can_attach":false,"can_retire":false,"lifecycle_violation":true,"recommended_next_step":"Stop the exact container and resume the retained removal operation."}}"#.utf8)
         )
         container.origin = codex
         var inventory = Inventory.empty
@@ -4414,7 +4227,7 @@ final class CoreTests: XCTestCase {
     func testRunningRemovedServerBecomesCriticalAttentionWithoutProjectResurrection() throws {
         var server = try JSONDecoder().decode(
             ManagedServer.self,
-            from: Data(#"{"id":"removed-server-id","name":"web","status":"running","attribution":{"reason_code":"start_fence_violated","explanation":"This exact server is listening while its repository remains removed.","observed_by":["account coordinator"],"controller":"binding-server-removed","host_resource_id":"server:removed","immutable_fingerprint":"server-removed-fingerprint","control_binding_id":"binding-server-removed","ownership_fingerprint":"server-ownership-fingerprint","can_attach":false,"can_retire":false,"lifecycle_violation":true,"recommended_next_step":"Stop the exact server and resume repository removal."}}"#.utf8)
+            from: Data(#"{"id":"removed-server-id","name":"web","status":"running","attribution":{"reason_code":"start_fence_violated","explanation":"This exact server is listening while its repository remains removed.","observed_by":["account coordinator"],"controller":"binding-server-removed","host_resource_id":"server:removed","immutable_fingerprint":"server-removed-fingerprint","observation_fingerprint":"server-association-fingerprint","can_attach":false,"can_retire":false,"lifecycle_violation":true,"recommended_next_step":"Stop the exact server and resume repository removal."}}"#.utf8)
         )
         server.origin = codex
         var inventory = Inventory.empty
@@ -4491,8 +4304,8 @@ final class CoreTests: XCTestCase {
     func testStandaloneRetirementPlanRejectsStableTargetIdentityDriftBeforePresentingPrompt() async throws {
         let changedPlans = [
             standaloneRetirementPlanJSON(immutableFingerprint: "changed-container-fingerprint"),
-            standaloneRetirementPlanJSON(controlBindingID: "changed-docker-binding"),
-            standaloneRetirementPlanJSON(controlContractFingerprint: ""),
+            standaloneRetirementPlanJSON(observationFingerprint: "changed-observation"),
+            standaloneRetirementPlanJSON(stableIdentityFingerprint: ""),
             standaloneRetirementPlanJSON(planID: ""),
             standaloneRetirementPlanJSON(planFingerprint: "   "),
         ]
@@ -4514,7 +4327,7 @@ final class CoreTests: XCTestCase {
 
             XCTAssertNil(
                 store.resourceRetirementPrompt,
-                "a plan for a changed immutable resource or controller must never become confirmable"
+                "a plan for a changed immutable resource or observation must never become confirmable"
             )
             XCTAssertNotNil(store.actionIssue)
             let calls = await service.capturedCalls()
@@ -4527,7 +4340,7 @@ final class CoreTests: XCTestCase {
     func testFailedPreMutationStandaloneRetirementClosesPromptAndShowsSelectedActivityUsingPlannedIdentity() async throws {
         let preMutationFailure = CommandExecution(
             stdout: "",
-            stderr: #"{"ok":false,"code":"lifecycle_plan_stale","classification":"lifecycle_target_identity_changed","mutation_performed":false,"error":"Resource ownership generation changed after planning.","action_required":"Refresh authoritative inventory, review a newly generated lifecycle plan, and retry."}"#,
+            stderr: #"{"ok":false,"code":"lifecycle_plan_stale","classification":"lifecycle_target_identity_changed","mutation_performed":false,"error":"Resource association generation changed after planning.","action_required":"Refresh authoritative inventory, review a newly generated lifecycle plan, and retry."}"#,
             exitStatus: 1
         )
         let service = ExactLifecycleCoordinatorService(results: [
@@ -4546,11 +4359,10 @@ final class CoreTests: XCTestCase {
         let plannedIdentityArguments = try XCTUnwrap(plannedTarget.identityArguments)
         XCTAssertEqual(plannedTarget.hostResourceID, "docker:immutable-copy-pg")
         XCTAssertEqual(plannedTarget.immutableFingerprint, seeded.target.immutableFingerprint)
-        XCTAssertEqual(plannedTarget.controlBindingID, seeded.target.controlBindingID)
-        XCTAssertEqual(plannedTarget.ownershipFingerprint, "planned-ownership-generation-2")
+        XCTAssertEqual(plannedTarget.observationFingerprint, "planned-association-generation-2")
         XCTAssertNotEqual(
-            plannedTarget.ownershipFingerprint,
-            seeded.target.ownershipFingerprint,
+            plannedTarget.observationFingerprint,
+            seeded.target.observationFingerprint,
             "the apply request must use the identity frozen into the plan, not the pre-plan observation generation"
         )
 
@@ -4567,7 +4379,7 @@ final class CoreTests: XCTestCase {
         let failedAction = try XCTUnwrap(store.actionResults[failedActionID])
         XCTAssertEqual(failedAction.request.kind, .retireStandaloneResource)
         XCTAssertEqual(store.actionIssue?.relatedActionID, failedActionID)
-        XCTAssertTrue(failedAction.failure?.contains("ownership generation changed") == true)
+        XCTAssertTrue(failedAction.failure?.contains("association generation changed") == true)
         XCTAssertTrue(failedAction.stderr.contains(#""code":"lifecycle_plan_stale""#))
         XCTAssertTrue(failedAction.stderr.contains(#""classification":"lifecycle_target_identity_changed""#))
         let failurePayload = try XCTUnwrap(
@@ -4591,7 +4403,7 @@ final class CoreTests: XCTestCase {
         XCTAssertTrue(calls[1].1.containsSubsequence(plannedIdentityArguments))
         XCTAssertTrue(calls[1].1.contains("container-fingerprint-1"))
         XCTAssertTrue(calls[1].1.contains("docker-binding-1"))
-        XCTAssertFalse(calls[1].1.contains("ownership-fingerprint-1"))
+        XCTAssertFalse(calls[1].1.contains("association-fingerprint-1"))
         XCTAssertEqual(calls[2].1, ["inventory", "--compact-json", "--stats-history-limit", "30"])
     }
 
@@ -4879,8 +4691,7 @@ final class CoreTests: XCTestCase {
             kind: "container",
             hostResourceID: "docker:first",
             immutableFingerprint: "first-immutable",
-            controlBindingID: "first-binding",
-            ownershipFingerprint: "first-observation",
+            observationFingerprint: "first-observation",
             displayName: "first"
         )
         let secondTarget = ExactUnassignedResource(
@@ -4888,8 +4699,7 @@ final class CoreTests: XCTestCase {
             kind: "container",
             hostResourceID: "docker:second",
             immutableFingerprint: "second-immutable",
-            controlBindingID: "second-binding",
-            ownershipFingerprint: "second-observation",
+            observationFingerprint: "second-observation",
             displayName: "second"
         )
         let firstPlan = try JSONDecoder().decode(
@@ -4900,9 +4710,8 @@ final class CoreTests: XCTestCase {
                     planFingerprint: "first-plan-fingerprint",
                     resourceID: firstTarget.hostResourceID,
                     immutableFingerprint: firstTarget.immutableFingerprint,
-                    controlBindingID: firstTarget.controlBindingID,
-                    ownershipFingerprint: "first-planned-generation",
-                    controlContractFingerprint: "first-controller-contract",
+                    observationFingerprint: "first-planned-generation",
+                    stableIdentityFingerprint: "first-controller-contract",
                     displayName: firstTarget.displayName
                 ).utf8
             )
@@ -4915,9 +4724,8 @@ final class CoreTests: XCTestCase {
                     planFingerprint: "second-plan-fingerprint",
                     resourceID: secondTarget.hostResourceID,
                     immutableFingerprint: secondTarget.immutableFingerprint,
-                    controlBindingID: secondTarget.controlBindingID,
-                    ownershipFingerprint: "second-planned-generation",
-                    controlContractFingerprint: "second-controller-contract",
+                    observationFingerprint: "second-planned-generation",
+                    stableIdentityFingerprint: "second-controller-contract",
                     displayName: secondTarget.displayName
                 ).utf8
             )
@@ -5815,7 +5623,7 @@ private func seedExactLifecyclePresentation(
 private func exactUnassignedContainer(origin: CoordinatorOrigin) throws -> DockerContainer {
     var container = try JSONDecoder().decode(
         DockerContainer.self,
-        from: Data(#"{"id":"immutable-copy-pg","name":"kosttracking-prod-copy-pg","status":"running","metadata_source":"normalized_store","attribution":{"reason_code":"ambiguous_control","explanation":"Observed without one authoritative repository binding","observed_by":["host-observer"],"controller":"docker-binding-1","host_resource_id":"docker:immutable-copy-pg","immutable_fingerprint":"container-fingerprint-1","control_binding_id":"docker-binding-1","ownership_fingerprint":"ownership-fingerprint-1","can_attach":true,"can_retire":true}}"#.utf8)
+        from: Data(#"{"id":"immutable-copy-pg","name":"kosttracking-prod-copy-pg","status":"running","metadata_source":"normalized_store","attribution":{"reason_code":"ambiguous_control","explanation":"Observed without one authoritative repository binding","observed_by":["host-observer"],"controller":"docker-binding-1","host_resource_id":"docker:immutable-copy-pg","immutable_fingerprint":"container-fingerprint-1","observation_fingerprint":"association-fingerprint-1","can_attach":true,"can_retire":true}}"#.utf8)
     )
     container.origin = origin
     return container
@@ -5979,8 +5787,6 @@ private func normalizedInventoryJSONObject(
         ]
     }
     let sourceID = "source-\(stableFixtureID(home))"
-    var memberships: [[String: Any]] = []
-    var bindings: [[String: Any]] = []
     var serverDefinitions: [[String: Any]] = []
     var serverObservations: [[String: Any]] = []
     var dockerResources: [[String: Any]] = []
@@ -6002,35 +5808,6 @@ private func normalizedInventoryJSONObject(
         if value.contains("stop") || value.contains("exit") { return "stopped" }
         return value
     }
-    func appendMembership(
-        repoID: String,
-        kind: String,
-        resourceID: String,
-        provenance: String
-    ) {
-        let bindingID = "binding-\(kind)-\(stableFixtureID(resourceID + repoID))"
-        memberships.append([
-            "membership_id": "membership-\(kind)-\(stableFixtureID(resourceID + repoID))",
-            "repo_id": repoID,
-            "resource_kind": kind,
-            "host_resource_id": resourceID,
-            "immutable_fingerprint": "fingerprint-\(stableFixtureID(resourceID))",
-            "control_binding_id": bindingID,
-        ])
-        bindings.append([
-            "binding_id": bindingID,
-            "repo_id": repoID,
-            "source_resource_id": resourceID,
-            "resource_kind": kind,
-            "resource_id": resourceID,
-            "source_id": sourceID,
-            "capability": "lifecycle",
-            "provenance": provenance,
-            "authority_state": "authoritative",
-            "priority": 100,
-            "generation": 1,
-        ])
-    }
     func appendUnassigned(
         row: [String: Any],
         kind: String,
@@ -6047,16 +5824,13 @@ private func normalizedInventoryJSONObject(
             "display_name": displayName,
             "reason_code": reasonCode,
             "explanation": attribution["explanation"] as? String
-                ?? "The normalized fixture has no authoritative repository membership.",
+                ?? "The normalized fixture has no authoritative repository association.",
             "observed_by": attribution["observed_by"] as? [String] ?? ["fixture-observer"],
-            "controller": attribution["controller"] as? String ?? sourceID,
             "host_resource_id": attribution["host_resource_id"] as? String ?? resourceID,
             "immutable_fingerprint": attribution["immutable_fingerprint"] as? String
                 ?? "fingerprint-\(stableFixtureID(resourceID))",
-            "control_binding_id": attribution["control_binding_id"] as? String
-                ?? "unassigned-binding-\(stableFixtureID(resourceID))",
-            "ownership_fingerprint": attribution["ownership_fingerprint"] as? String
-                ?? "ownership-\(stableFixtureID(resourceID))",
+            "observation_fingerprint": attribution["observation_fingerprint"] as? String
+                ?? "association-\(stableFixtureID(resourceID))",
             "can_attach": attribution["can_attach"] as? Bool ?? true,
             "can_retire": attribution["can_retire"] as? Bool ?? true,
             "lifecycle_violation": attribution["lifecycle_violation"] as? Bool ?? running,
@@ -6083,12 +5857,6 @@ private func normalizedInventoryJSONObject(
                 "generation": 1,
                 "arguments": ["fixture-server", name],
             ])
-            appendMembership(
-                repoID: repositoryID,
-                kind: "server",
-                resourceID: resourceID,
-                provenance: "normalized_fixture"
-            )
             serverObservations.append([
                 "server_definition_id": resourceID,
                 "source_resource_id": resourceID,
@@ -6123,8 +5891,10 @@ private func normalizedInventoryJSONObject(
         guard let row = containersByID[resourceID] else { continue }
         let name = row["name"] as? String ?? resourceID
         let currentLifecycle = lifecycle(row["status"])
+        let repositoryID = canonicalProject(row).map(repoID(for:))
         dockerResources.append([
             "docker_resource_id": resourceID,
+            "repo_id": repositoryID as Any? ?? NSNull(),
             "engine_id": "engine-fixture",
             "full_container_id": resourceID,
             "current_name": name,
@@ -6139,14 +5909,7 @@ private func normalizedInventoryJSONObject(
             "restart_policy": "no",
             "sampled_at": timestamp,
         ])
-        if let path = canonicalProject(row) {
-            appendMembership(
-                repoID: repoID(for: path),
-                kind: "container",
-                resourceID: resourceID,
-                provenance: row["metadata_source"] as? String ?? "normalized_fixture"
-            )
-        } else {
+        if repositoryID == nil {
             appendUnassigned(
                 row: row,
                 kind: "container",
@@ -6251,7 +6014,7 @@ private func normalizedInventoryJSONObject(
     let engineState = available == false ? "unavailable" : "available"
     let lifecycleViolations = unassigned.filter { $0["lifecycle_violation"] as? Bool == true }
     return [
-        "schema_version": 2,
+        "schema_version": 3,
         "store": [
             "database_generation": "fixture-generation",
             "state_revision": 1,
@@ -6272,7 +6035,6 @@ private func normalizedInventoryJSONObject(
             "host_id": "host-fixture",
             "capability_state": engineState,
         ]],
-        "memberships": memberships,
         "resources": [
             "servers": serverDefinitions,
             "docker": dockerResources,
@@ -6294,7 +6056,6 @@ private func normalizedInventoryJSONObject(
         "events": [],
         "unassigned_resources": unassigned,
         "lifecycle_violations": lifecycleViolations,
-        "control_bindings": bindings,
         "v1_compatibility": legacy,
     ]
 }
@@ -6431,7 +6192,7 @@ private func inventoryWithDockerUnavailableExecution(home: String) -> CommandExe
 }
 
 private func repositoryRemovalPlanJSON() -> String {
-    #"{"schema_version":1,"kind":"repository_decommission","plan_id":"plan-remove-1","repo_id":"repo-1","repository_fingerprint":"repository-fingerprint-1","installation_generation":4,"fingerprint":"plan-fingerprint-1","created_at":"2026-07-14T12:00:00Z","actor":"tester","reason":"Removed from DevOps Board","canonical_root":"/repo","display_name":"Repo","retained_data":["repository_files","containers","volumes","databases","backups","audit_history"],"targets":[{"target_id":"server-target","kind":"server","host_resource_id":"server:immutable-1","immutable_fingerprint":"server-fingerprint-1","control_binding_id":"binding-1","display_name":"web","current_state":"running","policies":[{"policy_id":"policy-1","kind":"server_definition","immutable_fingerprint":"policy-fingerprint-1","disabled_value":"disabled"}],"allocations":[{"allocation_id":"lease-1","kind":"lease","immutable_fingerprint":"lease-fingerprint-1"}]}],"blockers":[]}"#
+    #"{"schema_version":1,"kind":"repository_decommission","plan_id":"plan-remove-1","repo_id":"repo-1","repository_fingerprint":"repository-fingerprint-1","installation_generation":4,"fingerprint":"plan-fingerprint-1","created_at":"2026-07-14T12:00:00Z","actor":"tester","reason":"Removed from DevOps Board","canonical_root":"/repo","display_name":"Repo","retained_data":["repository_files","containers","volumes","databases","backups","audit_history"],"targets":[{"target_id":"server-target","kind":"server","host_resource_id":"server:immutable-1","immutable_fingerprint":"server-fingerprint-1","display_name":"web","current_state":"running","policies":[{"policy_id":"policy-1","kind":"server_definition","immutable_fingerprint":"policy-fingerprint-1","disabled_value":"disabled"}],"allocations":[{"allocation_id":"lease-1","kind":"lease","immutable_fingerprint":"lease-fingerprint-1"}]}],"blockers":[]}"#
 }
 
 private func standaloneRetirementPlanJSON(
@@ -6439,12 +6200,11 @@ private func standaloneRetirementPlanJSON(
     planFingerprint: String = "retire-fingerprint-1",
     resourceID: String = "docker:immutable-copy-pg",
     immutableFingerprint: String = "container-fingerprint-1",
-    controlBindingID: String = "docker-binding-1",
-    ownershipFingerprint: String = "planned-ownership-generation-2",
-    controlContractFingerprint: String = "planned-controller-contract-1",
+    observationFingerprint: String = "planned-association-generation-2",
+    stableIdentityFingerprint: String = "planned-controller-contract-1",
     displayName: String = "kosttracking-prod-copy-pg"
 ) -> String {
-    #"{"schema_version":1,"kind":"standalone_resource_retirement","plan_id":"\#(planID)","resource_id":"\#(resourceID)","fingerprint":"\#(planFingerprint)","created_at":"2026-07-14T12:00:00Z","actor":"tester","reason":"Retired from DevOps Board","retained_data":["containers","volumes","databases","backups","audit_history"],"targets":[{"target_id":"\#(resourceID)","kind":"container","host_resource_id":"\#(resourceID)","immutable_fingerprint":"\#(immutableFingerprint)","control_binding_id":"\#(controlBindingID)","ownership_fingerprint":"\#(ownershipFingerprint)","control_contract_fingerprint":"\#(controlContractFingerprint)","display_name":"\#(displayName)","current_state":"running","policies":[{"policy_id":"docker-policy-1","kind":"restart_policy","immutable_fingerprint":"restart-policy-fingerprint-1","disabled_value":"no"}],"allocations":[]}]}"#
+    #"{"schema_version":1,"kind":"standalone_resource_retirement","plan_id":"\#(planID)","resource_id":"\#(resourceID)","fingerprint":"\#(planFingerprint)","created_at":"2026-07-14T12:00:00Z","actor":"tester","reason":"Retired from DevOps Board","retained_data":["containers","volumes","databases","backups","audit_history"],"targets":[{"target_id":"\#(resourceID)","kind":"container","host_resource_id":"\#(resourceID)","immutable_fingerprint":"\#(immutableFingerprint)","observation_fingerprint":"\#(observationFingerprint)","stable_identity_fingerprint":"\#(stableIdentityFingerprint)","display_name":"\#(displayName)","current_state":"running","policies":[{"policy_id":"docker-policy-1","kind":"restart_policy","immutable_fingerprint":"restart-policy-fingerprint-1","disabled_value":"no"}],"allocations":[]}]}"#
 }
 
 private func standaloneRetirementResultJSON(
@@ -6476,9 +6236,9 @@ private func emptyNormalizedInventoryExecution() -> CommandExecution {
 }
 
 /// A hand-authored normalized graph used as the primary contract fixture.
-/// Its poisoned v1 projection intentionally disagrees with every durable v2
+/// Its poisoned v1 projection intentionally disagrees with every durable v3
 /// identity so tests prove the Board cannot consult compatibility fields.
-private func directV2GraphJSONObject(
+private func directV3GraphJSONObject(
     home: String,
     sourceHome: String? = nil,
     sourceStatus: String = "imported",
@@ -6524,7 +6284,7 @@ private func directV2GraphJSONObject(
         ]
     }
     return [
-        "schema_version": 2,
+        "schema_version": 3,
         "store": [
             "database_generation": "direct-v2-generation",
             "state_revision": 9,
@@ -6555,24 +6315,6 @@ private func directV2GraphJSONObject(
             "host_id": "host-1",
             "capability_state": dockerCapability,
         ]],
-        "memberships": [
-            [
-                "membership_id": "server-membership-1",
-                "repo_id": "repo-1",
-                "resource_kind": "server",
-                "host_resource_id": "server-definition-1",
-                "immutable_fingerprint": "server-fingerprint",
-                "control_binding_id": "server-binding-1",
-            ],
-            [
-                "membership_id": "docker-membership-1",
-                "repo_id": "repo-1",
-                "resource_kind": "container",
-                "host_resource_id": "docker-resource-1",
-                "immutable_fingerprint": "docker-fingerprint",
-                "control_binding_id": "docker-binding-1",
-            ],
-        ],
         "resources": [
             "servers": [[
                 "server_definition_id": "server-definition-1",
@@ -6588,6 +6330,7 @@ private func directV2GraphJSONObject(
             ]],
             "docker": [[
                 "docker_resource_id": "docker-resource-1",
+                "repo_id": "repo-1",
                 "engine_id": "engine-1",
                 "full_container_id": "immutable-pg-container",
                 "current_name": "pg",
@@ -6748,34 +6491,6 @@ private func directV2GraphJSONObject(
         "events": [],
         "unassigned_resources": [],
         "lifecycle_violations": [],
-        "control_bindings": [
-            [
-                "binding_id": "server-binding-1",
-                "repo_id": "repo-1",
-                "source_resource_id": "legacy-server-row-77",
-                "resource_kind": "server",
-                "resource_id": "server-definition-1",
-                "source_id": "imported-source",
-                "capability": "lifecycle",
-                "provenance": "imported_legacy",
-                "authority_state": "authoritative",
-                "priority": 100,
-                "generation": 4,
-            ],
-            [
-                "binding_id": "docker-binding-1",
-                "repo_id": "repo-1",
-                "source_resource_id": "legacy-docker-row-77",
-                "resource_kind": "container",
-                "resource_id": "docker-resource-1",
-                "source_id": "imported-source",
-                "capability": "lifecycle",
-                "provenance": "imported_legacy",
-                "authority_state": "authoritative",
-                "priority": 100,
-                "generation": 4,
-            ],
-        ],
         "v1_compatibility": [
             "coordinator_home": "/poison/legacy-home",
             "servers": [
@@ -6790,7 +6505,7 @@ private func directV2GraphJSONObject(
     ]
 }
 
-private func directV2Projection(
+private func directV3Projection(
     from object: [String: Any],
     origin: CoordinatorOrigin,
     now: Date = Date()
@@ -6801,7 +6516,7 @@ private func directV2Projection(
         .boardProjection(origin: origin, now: now)
 }
 
-private func directV2RepositoryTree(
+private func directV3RepositoryTree(
     includeTemporaryScope: Bool,
     populatedTemporaryScope: Bool = false
 ) -> [String: Any] {
@@ -6869,7 +6584,7 @@ private func directV2RepositoryTree(
     ]
 }
 
-private func directV2InventoryExecution(
+private func directV3InventoryExecution(
     home: String,
     sourceHome: String? = nil,
     sourceStatus: String = "imported",
@@ -6879,7 +6594,7 @@ private func directV2InventoryExecution(
     strongArtifactPath: String = "/backups/strong.dump"
 ) throws -> CommandExecution {
     let data = try JSONSerialization.data(
-        withJSONObject: directV2GraphJSONObject(
+        withJSONObject: directV3GraphJSONObject(
             home: home,
             sourceHome: sourceHome,
             sourceStatus: sourceStatus,
@@ -7004,7 +6719,7 @@ private actor FailingObservationCoordinatorService: CoordinatorServing {
 
     func execute(origin: CoordinatorOrigin, arguments: [String]) async throws -> CommandExecution {
         calls.append(arguments.joined(separator: " "))
-        return try directV2InventoryExecution(home: origin.home)
+        return try directV3InventoryExecution(home: origin.home)
     }
 
     func capturedCalls() -> [String] { calls }

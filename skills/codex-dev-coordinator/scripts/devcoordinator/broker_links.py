@@ -17,10 +17,6 @@ from typing import Any, Callable, Mapping, Optional
 from .broker import BrokerClient, BrokerOperation, BrokerRequest
 from .broker_profile import BrokerClientProfile, BrokerRepositoryProfile
 from .repository_lifecycle import ResourceKind
-from .schema import (
-    advance_repository_owner_generation,
-    establish_repository_owner_authority,
-)
 from .sqlite_lifecycle import SQLiteLifecyclePersistence
 from .store import (
     AccountStore,
@@ -44,9 +40,6 @@ class BrokerLink:
     release_operation_id: Optional[str]
     account_id: str
     broker_socket: str
-    broker_service_uid: int
-    broker_socket_gid: int
-    broker_socket_mode: int
     broker_database_generation: str
 
 
@@ -102,22 +95,18 @@ class BrokerLinkStore:
                 """
                 INSERT INTO broker_lease_links(
                     link_id, repo_id, server_definition_id, broker_lease_id,
-                    account_id, broker_socket, broker_service_uid,
-                    broker_socket_gid, broker_socket_mode,
+                    account_id, broker_socket,
                     broker_database_generation, port, protocol, status,
                     broker_operation_id, expires_at, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'reserved', ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'reserved', ?, ?, ?, ?)
                 """,
                 (
                     link_id,
                     repository.repo_id,
                     server_definition_id,
                     broker_lease_id,
-                    profile.repository_account_id(repository),
+                    "local",
                     str(profile.service.socket_path),
-                    profile.service.service_uid,
-                    profile.service.socket_gid,
-                    profile.service.socket_mode,
                     profile.service.database_generation,
                     port,
                     protocol,
@@ -188,9 +177,6 @@ class BrokerLinkStore:
                         "server_definition_id",
                         "account_id",
                         "broker_socket",
-                        "broker_service_uid",
-                        "broker_socket_gid",
-                        "broker_socket_mode",
                         "broker_database_generation",
                         "port",
                         "protocol",
@@ -327,22 +313,18 @@ class BrokerLinkStore:
                 """
                 INSERT INTO broker_assignment_links(
                     link_id, repo_id, server_definition_id, broker_assignment_id,
-                    account_id, broker_socket, broker_service_uid,
-                    broker_socket_gid, broker_socket_mode,
+                    account_id, broker_socket,
                     broker_database_generation, port, status,
                     broker_operation_id, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'reserved', ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'reserved', ?, ?, ?)
                 """,
                 (
                     link_id,
                     repository.repo_id,
                     server_definition_id,
                     broker_assignment_id,
-                    profile.repository_account_id(repository),
+                    "local",
                     str(profile.service.socket_path),
-                    profile.service.service_uid,
-                    profile.service.socket_gid,
-                    profile.service.socket_mode,
                     profile.service.database_generation,
                     port,
                     operation_id,
@@ -377,8 +359,8 @@ class BrokerLinkStore:
         profile_repository = profile.repository(repository.canonical_root)
         if profile_repository.repo_id != repository.repo_id:
             raise RuntimeError("broker profile repository identity changed")
-        enrolled_id = repository.server_ids.get(str(server_name))
-        if enrolled_id != server_definition_id:
+        configured_id = repository.server_ids.get(str(server_name))
+        if configured_id != server_definition_id:
             raise RuntimeError(
                 "server revocation does not match the exact protected-profile identity"
             )
@@ -531,10 +513,6 @@ class BrokerLinkStore:
             connection.execute(
                 "DELETE FROM port_assignments WHERE repo_id = ? AND server_name = ? AND status = 'inactive'",
                 (repository.repo_id, server_name),
-            )
-            connection.execute(
-                "DELETE FROM repository_memberships WHERE repo_id = ? AND resource_kind = 'server' AND host_resource_id = ?",
-                (repository.repo_id, server_definition_id),
             )
             connection.execute(
                 "DELETE FROM unassigned_resources WHERE resource_kind = 'server' AND resource_id = ?",
@@ -755,10 +733,6 @@ class BrokerLinkStore:
                 "DELETE FROM port_assignments WHERE repo_id = ? AND status = 'inactive'",
                 (repository.repo_id,),
             )
-            connection.execute(
-                "DELETE FROM repository_memberships WHERE repo_id = ? AND resource_kind = 'server'",
-                (repository.repo_id,),
-            )
             deleted_servers = connection.execute(
                 "DELETE FROM server_definitions WHERE repo_id = ?",
                 (repository.repo_id,),
@@ -791,27 +765,6 @@ class BrokerLinkStore:
                 raise RuntimeError(
                     "repository revocation changed before active projection removal"
                 )
-            advance_repository_owner_generation(
-                connection,
-                repository_id=repository.repo_id,
-                owner_uid=repository.owner_uid,
-                prior_repository_generation=repository.generation,
-                repository_generation=repository.generation + 1,
-                operation_id=broker_operation_id,
-                actor="broker-profile-mirror",
-                reason="permanent broker project removal generation fence",
-                timestamp=timestamp,
-                evidence={
-                    "kind": "broker-repository-materialization-revocation",
-                    "repository_id": repository.repo_id,
-                    "canonical_root": repository.canonical_root,
-                    "prior_repository_generation": repository.generation,
-                    "repository_generation": repository.generation + 1,
-                    "owner_uid": repository.owner_uid,
-                    "broker_database_generation": profile.service.database_generation,
-                    "immutable_fingerprint": immutable_fingerprint,
-                },
-            )
         return {
             "status": "revoked",
             "repo_id": repository.repo_id,
@@ -924,7 +877,7 @@ class BrokerLinkStore:
             ).fetchone()
             if local_repo is None:
                 raise RuntimeError(
-                    "local normalized repository does not match broker enrollment"
+                    "local normalized repository does not match broker configuration"
                 )
             existing = connection.execute(
                 "SELECT * FROM broker_lifecycle_links WHERE link_id = ?",
@@ -952,10 +905,9 @@ class BrokerLinkStore:
                     INSERT INTO broker_lifecycle_links(
                         link_id, repo_id, resource_id, operation,
                         broker_operation_id, broker_plan_id, account_id,
-                        broker_socket, broker_service_uid, broker_socket_gid,
-                        broker_socket_mode, broker_database_generation,
+                        broker_socket, broker_database_generation,
                         arguments_json, result_json, status, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                               'pending', ?, ?)
                     """,
                     (
@@ -965,11 +917,8 @@ class BrokerLinkStore:
                         operation.value,
                         operation_id,
                         result.get("plan_id"),
-                        profile.repository_account_id(repository),
+                        "local",
                         str(profile.service.socket_path),
-                        profile.service.service_uid,
-                        profile.service.socket_gid,
-                        profile.service.socket_mode,
                         profile.service.database_generation,
                         arguments_json,
                         result_json,
@@ -1344,7 +1293,6 @@ class BrokerLinkStore:
         exact = persistence.resolve_standalone_resource(
             ResourceKind(str(arguments["resource_kind"])),
             str(row["resource_id"]),
-            str(arguments["control_binding_id"]),
         )
         _require_exact_arguments(exact, arguments)
         persistence.attach_resource(
@@ -1373,40 +1321,18 @@ class BrokerLinkStore:
         resource_id = str(row["resource_id"])
         timestamp = utc_timestamp()
         with self._store.immediate_transaction() as connection:
-            binding = connection.execute(
-                """
-                SELECT * FROM control_bindings
-                WHERE binding_id = ? AND resource_kind = ? AND resource_id = ?
-                """,
-                (arguments["control_binding_id"], resource_kind, resource_id),
+            association = connection.execute(
+                (
+                    "SELECT repo_id FROM docker_resources WHERE docker_resource_id = ?"
+                    if resource_kind == "container"
+                    else "SELECT repo_id FROM server_definitions WHERE server_definition_id = ?"
+                ),
+                (resource_id,),
             ).fetchone()
-            if binding is None:
-                raise RuntimeError("local standalone control binding no longer exists")
-            expected_ownership = "sha256:" + fingerprint(
-                {
-                    "binding_id": binding["binding_id"],
-                    "resource_kind": binding["resource_kind"],
-                    "resource_id": binding["resource_id"],
-                    "source_id": binding["source_id"],
-                    "capability": binding["capability"],
-                    "provenance": binding["provenance"],
-                    "authority_state": binding["authority_state"],
-                    "generation": binding["generation"],
-                }
-            )
-            if (
-                str(arguments["ownership_fingerprint"]) != expected_ownership
-                and str(binding["authority_state"]) != "retired"
-            ):
-                raise RuntimeError("local standalone controller identity changed")
-            if connection.execute(
-                """
-                SELECT 1 FROM repository_memberships
-                WHERE resource_kind = ? AND host_resource_id = ?
-                """,
-                (resource_kind, resource_id),
-            ).fetchone() is not None:
-                raise RuntimeError("local standalone resource became repository-owned")
+            if association is None:
+                raise RuntimeError("local standalone resource no longer exists")
+            if association["repo_id"] is not None:
+                raise RuntimeError("local standalone resource became associated with a repository")
             self._record_lifecycle_mirror_operation(
                 connection, row, arguments, result, timestamp=timestamp
             )
@@ -1445,14 +1371,6 @@ class BrokerLinkStore:
                 WHERE resource_kind = ? AND resource_id = ?
                 """,
                 (timestamp, resource_kind, resource_id),
-            )
-            connection.execute(
-                """
-                UPDATE control_bindings SET authority_state = 'retired',
-                    generation = generation + CASE WHEN authority_state != 'retired' THEN 1 ELSE 0 END,
-                    updated_at = ? WHERE binding_id = ?
-                """,
-                (timestamp, arguments["control_binding_id"]),
             )
             connection.execute(
                 """
@@ -1648,7 +1566,7 @@ class BrokerLinkStore:
             ).fetchone()
             if repo is None:
                 raise RuntimeError(
-                    "local normalized repository does not match the root-provisioned broker enrollment"
+                    "local normalized repository does not match the root-provisioned broker configuration"
                 )
             revoked = connection.execute(
                 """
@@ -1695,17 +1613,14 @@ class BrokerLinkStore:
 
         host_id = self._store.ensure_local_host()
         timestamp = utc_timestamp()
-        owner_operation_id = str(uuid.uuid4())
         with self._store.immediate_transaction() as connection:
             reactivated = False
             rows = list(
                 connection.execute(
                     """
                     SELECT repository.repo_id, repository.canonical_root,
-                           repository.state, repository.generation,
-                           owner.owner_uid, owner.repository_generation
+                           repository.state, repository.generation
                     FROM repositories repository
-                    LEFT JOIN repository_owners owner USING(repo_id)
                     WHERE repo_id = ? OR canonical_root = ?
                     """,
                     (repository.repo_id, repository.canonical_root),
@@ -1717,7 +1632,7 @@ class BrokerLinkStore:
                 or str(rows[0]["canonical_root"]) != repository.canonical_root
             ):
                 raise RuntimeError(
-                    "local normalized repository does not match the root-provisioned broker enrollment"
+                    "local normalized repository does not match the root-provisioned broker configuration"
                 )
             if not rows:
                 connection.execute(
@@ -1738,34 +1653,9 @@ class BrokerLinkStore:
                         timestamp,
                     ),
                 )
-                establish_repository_owner_authority(
-                    connection,
-                    repository_id=repository.repo_id,
-                    owner_uid=repository.owner_uid,
-                    repository_generation=int(repository.generation),
-                    operation_id=owner_operation_id,
-                    actor="broker-profile-bootstrap",
-                    reason="protected profile repository owner authority",
-                    timestamp=timestamp,
-                    evidence={
-                        "kind": "broker-profile-repository-owner-bootstrap",
-                        "repository_id": repository.repo_id,
-                        "canonical_root": repository.canonical_root,
-                        "repository_generation": int(repository.generation),
-                        "owner_uid": repository.owner_uid,
-                    },
-                )
             else:
                 current = rows[0]
                 current_generation = int(current["generation"])
-                if (
-                    current["owner_uid"] is None
-                    or int(current["owner_uid"]) != repository.owner_uid
-                    or int(current["repository_generation"]) != current_generation
-                ):
-                    raise RuntimeError(
-                        "local repository owner authority is missing, stale, or conflicts with the protected profile"
-                    )
                 revoked = connection.execute(
                     """
                     SELECT 1
@@ -1812,25 +1702,6 @@ class BrokerLinkStore:
                             current_generation,
                         ),
                     )
-                    advance_repository_owner_generation(
-                        connection,
-                        repository_id=repository.repo_id,
-                        owner_uid=repository.owner_uid,
-                        prior_repository_generation=current_generation,
-                        repository_generation=int(repository.generation),
-                        operation_id=owner_operation_id,
-                        actor="broker-profile-bootstrap",
-                        reason="protected profile repository generation advance",
-                        timestamp=timestamp,
-                        evidence={
-                            "kind": "broker-profile-repository-owner-generation",
-                            "repository_id": repository.repo_id,
-                            "canonical_root": repository.canonical_root,
-                            "prior_repository_generation": current_generation,
-                            "repository_generation": int(repository.generation),
-                            "owner_uid": repository.owner_uid,
-                        },
-                    )
                     reactivated = current_state == "missing"
             connection.execute(
                 """
@@ -1839,7 +1710,7 @@ class BrokerLinkStore:
                     actor, reason, updated_at
                 ) VALUES (?, 'installed', 0, 0,
                           'broker-profile-bootstrap',
-                          'root-provisioned broker enrollment', ?)
+                          'root-provisioned broker configuration', ?)
                 ON CONFLICT(repo_id) DO NOTHING
                 """,
                 (repository.repo_id, timestamp),
@@ -2003,11 +1874,8 @@ def _require_same_lease(
         or int(row["port"]) != port
         or str(row["protocol"]) != protocol
         or str(row["status"]) not in {"reserved", "active"}
-        or str(row["account_id"]) != profile.repository_account_id(repository)
+        or str(row["account_id"]) != "local"
         or str(row["broker_socket"]) != str(profile.service.socket_path)
-        or int(row["broker_service_uid"]) != profile.service.service_uid
-        or int(row["broker_socket_gid"]) != profile.service.socket_gid
-        or int(row["broker_socket_mode"]) != profile.service.socket_mode
         or str(row["broker_database_generation"])
         != profile.service.database_generation
     ):
@@ -2017,12 +1885,7 @@ def _require_same_lease(
 def _call_saved_broker(
     link: BrokerLink, request: BrokerRequest
 ) -> Mapping[str, Any]:
-    return BrokerClient(
-        Path(link.broker_socket),
-        expected_broker_uid=link.broker_service_uid,
-        expected_socket_gid=link.broker_socket_gid,
-        expected_socket_mode=link.broker_socket_mode,
-    ).call(request)
+    return BrokerClient(Path(link.broker_socket)).call(request)
 
 
 def _require_same_assignment(
@@ -2047,15 +1910,13 @@ def _require_same_assignment(
 def _require_exact_arguments(exact: Any, arguments: Mapping[str, Any]) -> None:
     observed = (
         exact.kind.value,
-        exact.control_binding_id,
         exact.immutable_fingerprint,
-        exact.ownership_fingerprint,
+        exact.observation_fingerprint,
     )
     expected = (
         str(arguments["resource_kind"]),
-        str(arguments["control_binding_id"]),
         str(arguments["immutable_fingerprint"]),
-        str(arguments["ownership_fingerprint"]),
+        str(arguments["observation_fingerprint"]),
     )
     if observed != expected:
         raise RuntimeError("local standalone resource identity changed")
@@ -2080,9 +1941,6 @@ def _lease_link(row: Any) -> BrokerLink:
         ),
         account_id=str(row["account_id"]),
         broker_socket=str(row["broker_socket"]),
-        broker_service_uid=int(row["broker_service_uid"]),
-        broker_socket_gid=int(row["broker_socket_gid"]),
-        broker_socket_mode=int(row["broker_socket_mode"]),
         broker_database_generation=str(row["broker_database_generation"]),
     )
 
@@ -2108,8 +1966,5 @@ def _assignment_link(row: Any) -> BrokerLink:
         ),
         account_id=str(row["account_id"]),
         broker_socket=str(row["broker_socket"]),
-        broker_service_uid=int(row["broker_service_uid"]),
-        broker_socket_gid=int(row["broker_socket_gid"]),
-        broker_socket_mode=int(row["broker_socket_mode"]),
         broker_database_generation=str(row["broker_database_generation"]),
     )

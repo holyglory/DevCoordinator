@@ -390,7 +390,7 @@ final class OpsStore: ObservableObject {
     }
 
     var unassignedProjectGroup: ProjectGroup? {
-        // Ownership failures are diagnostics, never a synthetic repository.
+        // Association failures are diagnostics, never a synthetic repository.
         // Missing producer-owned hierarchy renders an incompatible state.
         nil
     }
@@ -401,28 +401,28 @@ final class OpsStore: ObservableObject {
         }
     }
 
-    var authoritativeOwnershipMutationsBlocked: Bool {
-        authoritativeOwnershipProblemCount > 0
+    var authoritativeAssociationMutationsBlocked: Bool {
+        authoritativeAssociationProblemCount > 0
     }
 
-    private var authoritativeOwnershipProblemCount: Int {
+    private var authoritativeAssociationProblemCount: Int {
         guard repositoryTreesAreAuthoritative else { return 0 }
         var identities = Set<String>()
         for server in inventory.servers
-            where server.attribution != nil || server.ownershipError != nil {
+            where server.attribution != nil || server.associationError != nil {
             identities.insert("server|\(server.coordinatorID ?? server.id)")
         }
         for container in inventory.docker.containers
-            where container.attribution != nil || container.ownershipError != nil {
+            where container.attribution != nil || container.associationError != nil {
             identities.insert("container|\(container.attribution?.hostResourceID ?? container.id ?? container.stableID)")
         }
         return identities.count
     }
 
-    private var authoritativeOwnershipBlockMessage: String? {
-        let count = authoritativeOwnershipProblemCount
+    private var authoritativeAssociationBlockMessage: String? {
+        let count = authoritativeAssociationProblemCount
         guard count > 0 else { return nil }
-        return "The coordinator reports \(count) resource\(count == 1 ? "" : "s") without safe lifecycle ownership. Review the exact reason and next step in the attention banner or affected resource, resolve it with the Coordinator skill, then refresh."
+        return "The coordinator reports \(count) resource\(count == 1 ? "" : "s") without safe lifecycle association. Review the exact reason and next step in the attention banner or affected resource, resolve it with the Coordinator skill, then refresh."
     }
 
     private func isOrdinaryRuntimeMutation(_ kind: ActionKind) -> Bool {
@@ -438,7 +438,7 @@ final class OpsStore: ObservableObject {
              .repositoryDecommissionPlan, .repositoryDecommission,
              .workerRemovalPlan, .workerRemovalApply,
              .attachResource, .retireStandaloneResource:
-            // Read-only inspection and the exact corrective ownership/removal
+            // Read-only inspection and the exact corrective association/removal
             // journeys remain available; unrelated runtime mutation does not.
             return false
         }
@@ -758,8 +758,8 @@ final class OpsStore: ObservableObject {
                     )
                 )
             }
-            for conflict in repository.serverMembershipConflicts
-                where seenConflicts.insert("server-membership:\(conflict.id)").inserted
+            for conflict in repository.serverAssociationConflicts
+                where seenConflicts.insert("server-association:\(conflict.id)").inserted
                     && hasFullyLoadedEvidence(origins: conflict.activeSourceIdentities.map { $0.origin })
             {
                 let conflictedIdentities = Set(conflict.activeSourceIdentities.map(\.rawValue))
@@ -767,7 +767,7 @@ final class OpsStore: ObservableObject {
                     conflictedIdentities.contains(candidate.server.id)
                         || !Set(candidate.server.observationOrigins.map(\.id)).isDisjoint(
                             with: Set(conflict.activeSourceIdentities.map { $0.origin.id })
-                        ) && candidate.server.ownershipError == conflict.message
+                        ) && candidate.server.associationError == conflict.message
                 }
                 guard let row else { continue }
                 let target = AttentionReviewTarget(kind: .server, selectionID: row.id)
@@ -775,17 +775,17 @@ final class OpsStore: ObservableObject {
                 let resourceName = row.server.name
                 items.append(
                     ResourceAttentionItem(
-                        id: "project-conflict:server-membership:\(conflict.id)",
+                        id: "project-conflict:server-association:\(conflict.id)",
                         kind: .projectConflict,
-                        title: "\(resourceName) has conflicting project ownership",
+                        title: "\(resourceName) has conflicting project association",
                         reason: "\(conflict.message) Candidate repositories: \(repositories).",
                         recommendedNextStep: "Review the server diagnostics and correct its repository attribution before acting.",
                         reviewTarget: target
                     )
                 )
             }
-            for conflict in repository.dockerMembershipConflicts
-                where seenConflicts.insert("docker-membership:\(conflict.id)").inserted
+            for conflict in repository.dockerAssociationConflicts
+                where seenConflicts.insert("docker-association:\(conflict.id)").inserted
                     && hasFullyLoadedEvidence(origins: conflict.sourceIdentities.map { $0.origin })
             {
                 guard let physical = repositoryCatalog.unassigned.docker.first(where: {
@@ -796,9 +796,9 @@ final class OpsStore: ObservableObject {
                 let repositories = conflict.repositories.map(\.displayName).joined(separator: ", ")
                 items.append(
                     ResourceAttentionItem(
-                        id: "project-conflict:docker-membership:\(conflict.id)",
+                        id: "project-conflict:docker-association:\(conflict.id)",
                         kind: .projectConflict,
-                        title: "\(resourceName) has conflicting project ownership",
+                        title: "\(resourceName) has conflicting project association",
                         reason: "\(conflict.message) Candidate repositories: \(repositories).",
                         recommendedNextStep: "Review the container diagnostics and correct its repository attribution before acting.",
                         reviewTarget: AttentionReviewTarget(kind: .docker, selectionID: selectionID)
@@ -983,7 +983,7 @@ final class OpsStore: ObservableObject {
         return loaded.count == 1 ? loaded[0] : nil
     }
 
-    private func reportMissingOwnership(_ action: String) {
+    private func reportMissingAssociation(_ action: String) {
         setLastError(
             title: "\(action) unavailable",
             summary: "The resource's coordinator source is unknown",
@@ -1023,7 +1023,7 @@ final class OpsStore: ObservableObject {
             return .blocked(.failedSource, "Coordinator source \(origin.label) is unavailable; refresh it before acting")
         }
         if isOrdinaryRuntimeMutation(kind),
-           let message = authoritativeOwnershipBlockMessage {
+           let message = authoritativeAssociationBlockMessage {
             return .blocked(.invalidResource, message)
         }
         let capability = requiredCapability(for: kind, projectRequiresDocker: projectRequiresDocker)
@@ -1082,14 +1082,14 @@ final class OpsStore: ObservableObject {
         guard group.serverConflicts.isEmpty else {
             return .blocked(.invalidResource, "The repository has conflicting active server observations")
         }
-        guard group.serverMembershipConflicts.isEmpty else {
+        guard group.serverAssociationConflicts.isEmpty else {
             return .blocked(.invalidResource, "A server resource is claimed by several repository paths")
         }
-        guard group.dockerMembershipConflicts.isEmpty else {
+        guard group.dockerAssociationConflicts.isEmpty else {
             return .blocked(.invalidResource, "A Docker container is claimed by several repositories")
         }
         guard let origin = group.actionOrigin else {
-            return .blocked(.invalidResource, "The repository does not have one proven coordinator control binding")
+            return .blocked(.invalidResource, "The repository does not have one proven coordinator routing identity")
         }
         let identity = ResourceIdentity(
             origin: origin,
@@ -1574,7 +1574,7 @@ final class OpsStore: ObservableObject {
             return RepositoryInventorySource(origin: origin, inventory: inventory)
         }
         // Production has exactly one normalized per-account graph. Use its
-        // durable repo_id/membership/control-binding projection directly.
+        // durable repo_id and association projection directly.
         // The multi-origin branch exists only for injected migration fixtures;
         // it still derives from v2 projections, never from v1 compatibility.
         let catalog: RepositoryCatalog
@@ -1847,7 +1847,7 @@ final class OpsStore: ObservableObject {
         first.leases = inventories.flatMap(\.leases)
         first.recentEvents = inventories.flatMap(\.recentEvents)
         first.docker = mergeDockerSummaries(inventories.map(\.docker))
-        first.postgres = reconcileDockerOwnership(inventories.flatMap(\.postgres))
+        first.postgres = reconcileDockerAssociation(inventories.flatMap(\.postgres))
         first.backups = inventories.flatMap(\.backups)
         first.projectUsage = mergeProjectUsage(inventories.flatMap(\.projectUsage))
         first.testStatistics = inventories.flatMap(\.testStatistics)
@@ -1899,12 +1899,12 @@ final class OpsStore: ObservableObject {
         let available = summaries.contains { $0.available == true } ? true : summaries.first?.available
         let error = summaries.compactMap(\.error).first
         let statsError = summaries.compactMap(\.statsError).first
-        let containers = reconcileDockerOwnership(summaries.flatMap(\.containers))
-        let postgres = reconcileDockerOwnership(summaries.flatMap(\.postgres))
+        let containers = reconcileDockerAssociation(summaries.flatMap(\.containers))
+        let postgres = reconcileDockerAssociation(summaries.flatMap(\.postgres))
         return DockerSummary(available: available, error: error, statsError: statsError, containers: containers, postgres: postgres)
     }
 
-    private func reconcileDockerOwnership(_ containers: [DockerContainer]) -> [DockerContainer] {
+    private func reconcileDockerAssociation(_ containers: [DockerContainer]) -> [DockerContainer] {
         let grouped = Dictionary(grouping: containers) { container in
             container.id ?? "name:\(container.name ?? "unknown")"
         }
@@ -1912,12 +1912,12 @@ final class OpsStore: ObservableObject {
             // Normalized inventory already carries the coordinator's explicit
             // attribution decision. Do not erase its one account-scoped
             // action route merely because legacy sidecar/Compose labels are
-            // absent; those labels are importer evidence, not the v2 owner.
+            // absent; those labels are importer evidence, not the current association.
             let explicitlyAttributed = bucket.filter {
                 $0.origin != nil
                     && $0.project?.isEmpty == false
-                    && $0.ownershipError == nil
-                    && $0.ownershipCandidates.count == 1
+                    && $0.associationError == nil
+                    && $0.routeCandidates.count == 1
             }
             let explicitOrigins = Set(explicitlyAttributed.compactMap(\.origin))
             if explicitOrigins.count == 1,
@@ -1925,12 +1925,12 @@ final class OpsStore: ObservableObject {
                    dockerContainerRank($0) < dockerContainerRank($1)
                })
             {
-                selected.ownershipCandidates = Array(explicitOrigins)
-                selected.ownershipError = nil
+                selected.routeCandidates = Array(explicitOrigins)
+                selected.associationError = nil
                 return selected
             }
             // An unassigned normalized resource has no repository path by
-            // definition, but it can still carry one exact controller and
+            // definition, but it can still carry one exact observation identity and
             // immutable attach/retire evidence. Preserve that origin so the
             // corrective action remains available; do not reinterpret it as
             // a generic name-only Docker observation.
@@ -1940,8 +1940,7 @@ final class OpsStore: ObservableObject {
                 else { return false }
                 return attribution.hostResourceID?.isEmpty == false
                     && attribution.immutableFingerprint?.isEmpty == false
-                    && attribution.controlBindingID?.isEmpty == false
-                    && attribution.ownershipFingerprint?.isEmpty == false
+                    && attribution.observationFingerprint?.isEmpty == false
                     && (attribution.canAttach || attribution.canRetire)
             }
             let exactUnassignedOrigins = Set(exactUnassigned.compactMap(\.origin))
@@ -1950,7 +1949,7 @@ final class OpsStore: ObservableObject {
                    dockerContainerRank($0) < dockerContainerRank($1)
                })
             {
-                selected.ownershipCandidates = Array(exactUnassignedOrigins)
+                selected.routeCandidates = Array(exactUnassignedOrigins)
                 return selected
             }
             let sidecarOwners = Dictionary(
@@ -1964,8 +1963,8 @@ final class OpsStore: ObservableObject {
             }
             if sidecarOwners.count > 1 {
                 guard var conflict = bucket.max(by: { dockerContainerRank($0) < dockerContainerRank($1) }) else { return nil }
-                conflict.ownershipCandidates = sidecarOwners.values.compactMap { $0.first?.origin }.sorted { $0.id < $1.id }
-                conflict.ownershipError = "conflicting coordinator-sidecar ownership"
+                conflict.routeCandidates = sidecarOwners.values.compactMap { $0.first?.origin }.sorted { $0.id < $1.id }
+                conflict.associationError = "conflicting coordinator-sidecar association"
                 conflict.origin = nil
                 return conflict
             }
@@ -1974,12 +1973,12 @@ final class OpsStore: ObservableObject {
             }
             if let selected = composeOwned.sorted(by: { ($0.origin?.id ?? "") < ($1.origin?.id ?? "") }).first {
                 var selected = selected
-                selected.ownershipCandidates = composeOwned.compactMap(\.origin)
+                selected.routeCandidates = composeOwned.compactMap(\.origin)
                 return selected
             }
             guard var unknown = bucket.max(by: { dockerContainerRank($0) < dockerContainerRank($1) }) else { return nil }
-            unknown.ownershipCandidates = bucket.compactMap(\.origin)
-            unknown.ownershipError = "no coordinator or Docker Compose ownership metadata"
+            unknown.routeCandidates = bucket.compactMap(\.origin)
+            unknown.associationError = "no coordinator or Docker Compose association metadata"
             unknown.origin = nil
             return unknown
         }
@@ -2008,7 +2007,7 @@ final class OpsStore: ObservableObject {
             var dockerMemory = 0.0
             var serverCount = 0
             var containerCount = 0
-            // Membership must merge as a union: each coordinator home only
+            // Association must merge as a union: each coordinator home only
             // reports the servers/containers it manages for the shared repo.
             var seenServerIDs = Set<String>()
             var serverIDs: [String] = []
@@ -2439,7 +2438,7 @@ final class OpsStore: ObservableObject {
             setLastError(
                 title: "Repository removal unavailable",
                 summary: "No authoritative coordinator controls this repository",
-                details: "Resolve the repository's control binding before planning removal.",
+                details: "Resolve the repository's routing identity before planning removal.",
                 source: "action"
             )
             return
@@ -2644,8 +2643,8 @@ final class OpsStore: ObservableObject {
         else {
             setLastError(
                 title: "Resource attachment unavailable",
-                summary: "The destination repository has no matching authoritative controller",
-                details: "Choose an installed repository controlled by the same normalized coordinator source.",
+                summary: "The destination repository has no matching command route",
+                details: "Choose an installed repository available through the same normalized Coordinator endpoint.",
                 source: "action"
             )
             return
@@ -2777,13 +2776,11 @@ final class OpsStore: ObservableObject {
                       hasSemanticLifecycleIdentity(plan.targets[0].targetID),
                       hasSemanticLifecycleIdentity(plan.targets[0].hostResourceID),
                       hasSemanticLifecycleIdentity(plan.targets[0].immutableFingerprint),
-                      hasSemanticLifecycleIdentity(plan.targets[0].controlBindingID),
                       plan.targets[0].targetID == target.hostResourceID,
                       plan.targets[0].hostResourceID == target.hostResourceID,
                       plan.targets[0].kind == target.kind,
                       plan.targets[0].immutableFingerprint == target.immutableFingerprint,
-                      plan.targets[0].controlBindingID == target.controlBindingID,
-                      plan.targets[0].controlContractFingerprint?
+                      plan.targets[0].stableIdentityFingerprint?
                         .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false,
                       plan.targets[0].identityArguments != nil
                 else {
@@ -2838,13 +2835,11 @@ final class OpsStore: ObservableObject {
               hasSemanticLifecycleIdentity(plannedTarget.targetID),
               hasSemanticLifecycleIdentity(plannedTarget.hostResourceID),
               hasSemanticLifecycleIdentity(plannedTarget.immutableFingerprint),
-              hasSemanticLifecycleIdentity(plannedTarget.controlBindingID),
               plannedTarget.targetID == prompt.target.hostResourceID,
               plannedTarget.hostResourceID == prompt.target.hostResourceID,
               plannedTarget.kind == prompt.target.kind,
               plannedTarget.immutableFingerprint == prompt.target.immutableFingerprint,
-              plannedTarget.controlBindingID == prompt.target.controlBindingID,
-              plannedTarget.controlContractFingerprint?
+              plannedTarget.stableIdentityFingerprint?
                 .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false,
               let plannedIdentityArguments = plannedTarget.identityArguments
         else {
@@ -3323,7 +3318,7 @@ final class OpsStore: ObservableObject {
               let identity = server.resourceIdentity,
               let context = repositoryExecutionContext(for: server)
         else {
-            reportMissingOwnership(title)
+            reportMissingAssociation(title)
             return
         }
         let serverID = server.coordinatorID ?? server.id
@@ -3404,7 +3399,7 @@ final class OpsStore: ObservableObject {
               let identity = server.resourceIdentity,
               let context = repositoryExecutionContext(for: server)
         else {
-            reportMissingOwnership("Remove \(server.name)")
+            reportMissingAssociation("Remove \(server.name)")
             return
         }
         let serverID = server.coordinatorID ?? server.id
@@ -3663,7 +3658,7 @@ final class OpsStore: ObservableObject {
             return
         }
         guard let origin = server.origin, let identity = server.resourceIdentity, let project = server.project else {
-            reportMissingOwnership("Restart \(server.name)")
+            reportMissingAssociation("Restart \(server.name)")
             return
         }
         runTracked(
@@ -3682,7 +3677,7 @@ final class OpsStore: ObservableObject {
             return
         }
         guard let origin = server.origin, let identity = server.resourceIdentity, let project = server.project else {
-            reportMissingOwnership("Stop \(server.name)")
+            reportMissingAssociation("Stop \(server.name)")
             return
         }
         runTracked(
@@ -3827,7 +3822,7 @@ final class OpsStore: ObservableObject {
             setLastError(
                 title: "Lease cannot start a server",
                 summary: "Port \(lease.port) cannot be reused because this lease is \(state)",
-                details: "Only an active, unbound manual lease with exact agent and project ownership can start a server. Lease: \(lease.leaseID)",
+                details: "Only an active, unbound manual lease with exact agent and project association can start a server. Lease: \(lease.leaseID)",
                 source: "action"
             )
             return false
@@ -3859,7 +3854,7 @@ final class OpsStore: ObservableObject {
             setLastError(
                 title: "Release lease unavailable",
                 summary: "Lease \(lease.leaseID) is \(lease.managementStatus)",
-                details: "Only an active, unbound lease with exact project ownership can be released directly. Stop an attached server through its server action.",
+                details: "Only an active, unbound lease with exact project association can be released directly. Stop an attached server through its server action.",
                 source: "action"
             )
             return
@@ -3888,9 +3883,9 @@ final class OpsStore: ObservableObject {
         }
     }
 
-    private func currentAuthoritativeDatabase(matching identity: DatabaseIdentity) -> DockerContainer? {
+    private func currentDatabaseForMutation(matching identity: DatabaseIdentity) -> DockerContainer? {
         let matches = inventory.postgres.filter { database in
-            guard database.ownershipError == nil,
+            guard database.associationError == nil,
                   let currentIdentity = database.databaseIdentity
             else { return false }
             return currentIdentity.isSameImmutableDatabase(as: identity)
@@ -3901,18 +3896,18 @@ final class OpsStore: ObservableObject {
 
     func backupDatabase(container: DockerContainer?) {
         guard let container,
-              container.ownershipError == nil,
+              container.associationError == nil,
               let requestedIdentity = container.databaseIdentity
         else {
             setLastError(
                 title: "Backup database refused",
                 summary: "The selected database does not have authoritative coordinator control",
-                details: "Refresh inventory and resolve the repository ownership or control binding before backup.",
+                details: "Refresh inventory and resolve the repository association or routing identity before backup.",
                 source: "action"
             )
             return
         }
-        guard let current = currentAuthoritativeDatabase(matching: requestedIdentity),
+        guard let current = currentDatabaseForMutation(matching: requestedIdentity),
               let origin = current.origin,
               let identity = current.databaseIdentity,
               let containerID = identity.containerID,
@@ -3921,8 +3916,8 @@ final class OpsStore: ObservableObject {
         else {
             setLastError(
                 title: "Backup database refused",
-                summary: "The current inventory no longer proves one exact controlled database",
-                details: "Refresh inventory and retry only after the exact repository membership and control binding are authoritative.",
+                summary: "The current inventory no longer identifies one exact database",
+                details: "Refresh inventory and retry only after the exact repository association and routing identity are authoritative.",
                 source: "action"
             )
             return
@@ -3987,14 +3982,14 @@ final class OpsStore: ObservableObject {
             )
             return
         }
-        guard let current = currentAuthoritativeDatabase(matching: target),
+        guard let current = currentDatabaseForMutation(matching: target),
               let projectRoot = current.project,
               !projectRoot.isEmpty
         else {
             setLastError(
                 title: "Restore refused",
-                summary: "The current inventory does not prove one exact controlled database target",
-                details: "Refresh inventory and resolve the repository ownership or control binding before restoring.",
+                summary: "The current inventory does not identify one exact database target",
+                details: "Refresh inventory and resolve the repository association or routing identity before restoring.",
                 source: "action"
             )
             return
@@ -4203,7 +4198,7 @@ final class OpsStore: ObservableObject {
 
     func dockerLogs(_ container: DockerContainer) {
         guard let name = container.name, let origin = container.origin, let identity = container.resourceIdentity else {
-            reportMissingOwnership("Docker logs")
+            reportMissingAssociation("Docker logs")
             return
         }
         guard requireMutationAvailability(title: "Docker logs", kind: .dockerLogs, origin: origin, resource: identity) else { return }
@@ -4273,7 +4268,7 @@ final class OpsStore: ObservableObject {
 
     func restartDocker(_ container: DockerContainer) {
         guard let name = container.name, let origin = container.origin, let identity = container.resourceIdentity, let project = container.project else {
-            reportMissingOwnership("Restart container")
+            reportMissingAssociation("Restart container")
             return
         }
         runTracked(title: "Restart container", subtitle: name, kind: .restartDocker, origin: origin, resource: identity, arguments: ["docker", "restart", "--agent", agentID, "--project", project, "--container", name])
@@ -4289,7 +4284,7 @@ final class OpsStore: ObservableObject {
 
     func startDocker(_ container: DockerContainer) {
         guard let name = container.name, let origin = container.origin, let identity = container.resourceIdentity, let project = container.project else {
-            reportMissingOwnership("Start container")
+            reportMissingAssociation("Start container")
             return
         }
         runTracked(title: "Start container", subtitle: name, kind: .startDocker, origin: origin, resource: identity, arguments: ["docker", "start", "--agent", agentID, "--project", project, "--container", name])
@@ -4297,7 +4292,7 @@ final class OpsStore: ObservableObject {
 
     func stopDocker(_ container: DockerContainer) {
         guard let name = container.name, let origin = container.origin, let identity = container.resourceIdentity, let project = container.project else {
-            reportMissingOwnership("Stop container")
+            reportMissingAssociation("Stop container")
             return
         }
         runTracked(title: "Stop container", subtitle: name, kind: .stopDocker, origin: origin, resource: identity, arguments: ["docker", "stop", "--agent", agentID, "--project", project, "--container", name])
@@ -4305,7 +4300,7 @@ final class OpsStore: ObservableObject {
 
     func showServerLogs(_ server: ManagedServer) {
         guard let origin = server.origin, let identity = server.resourceIdentity, let project = server.project else {
-            reportMissingOwnership("Server logs")
+            reportMissingAssociation("Server logs")
             return
         }
         guard requireMutationAvailability(title: "Server logs", kind: .serverLogs, origin: origin, resource: identity) else { return }

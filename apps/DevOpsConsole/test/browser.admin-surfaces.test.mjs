@@ -355,7 +355,6 @@ function testSetupFixture(repoId) {
       { name: 'unit', depends_on: [], network: 'none', fixtures: [] },
       { name: 'integration', depends_on: ['unit'], network: 'loopback', fixtures: [] },
     ],
-    capability_policy: { requested: ['network.loopback'], missing: [] },
     evidence_policies: { handoff: 'Exact immutable source and all required targets pass.' },
     fixtures: {},
   };

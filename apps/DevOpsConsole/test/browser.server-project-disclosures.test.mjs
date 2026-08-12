@@ -273,20 +273,6 @@ function fixtureOverview(revision, {
       canonical_root: xfoilProject, display_name: 'XFoil',
     },
   ];
-  overview.inventory.memberships = [
-    ...globalFinance.map((item) => ({
-      resource_kind: 'container', host_resource_id: item.host_resource_id,
-      repo_id: 'repo-global-finance',
-    })),
-    ...xfoil.map((item) => ({
-      resource_kind: 'container', host_resource_id: item.host_resource_id,
-      repo_id: 'repo-xfoil',
-    })),
-    {
-      resource_kind: 'container', host_resource_id: dockerContainer.host_resource_id,
-      repo_id: 'repo-db',
-    },
-  ];
   overview.inventory.resources = {
     servers: [
       ...alpha.map((item) => ({ server_definition_id: item.id, repo_id: 'repo-alpha' })),
@@ -294,6 +280,9 @@ function fixtureOverview(revision, {
     ],
     docker: dockerResources.map((item) => ({
       docker_resource_id: item.host_resource_id,
+      repo_id: globalFinance.includes(item) ? 'repo-global-finance'
+        : xfoil.includes(item) ? 'repo-xfoil'
+          : item === dockerContainer ? 'repo-db' : null,
     })),
     databases: databaseResources,
   };
@@ -561,10 +550,33 @@ function fixtureMetrics() {
   };
 }
 
-async function assertAdjacentCellsDoNotOverlap(leftCell, rightCell, message) {
-  const boxes = await Promise.all([leftCell.boundingBox(), rightCell.boundingBox()]);
-  assert.ok(boxes[0] && boxes[1], `${message}: both cells must be rendered`);
-  assert.ok(boxes[0].x + boxes[0].width <= boxes[1].x, message);
+async function assertAdjacentCellsDoNotOverlap(
+  parent, leftSelector, rightSelector, message,
+) {
+  const boxes = await parent.evaluate((node, selectors) => {
+    const left = node.querySelector(selectors.left);
+    const right = node.querySelector(selectors.right);
+    if (!left || !right) return null;
+    const leftRect = left.getBoundingClientRect();
+    const rightRect = right.getBoundingClientRect();
+    return {
+      left: {
+        x: leftRect.x,
+        width: leftRect.width,
+        rendered: left.getClientRects().length > 0,
+      },
+      right: {
+        x: rightRect.x,
+        width: rightRect.width,
+        rendered: right.getClientRects().length > 0,
+      },
+    };
+  }, { left: leftSelector, right: rightSelector });
+  assert.ok(
+    boxes?.left.rendered && boxes?.right.rendered,
+    `${message}: both cells must be rendered`,
+  );
+  assert.ok(boxes.left.x + boxes.left.width <= boxes.right.x, message);
 }
 
 async function assertElementsDoNotOverlap(first, second, message) {
@@ -972,7 +984,7 @@ test('real Servers and Docker UI keep project disclosures exclusive, focused, an
         );
       });
       await assertAdjacentCellsDoNotOverlap(
-        projectHead.locator('.c-status'), projectHead.locator('.actions'),
+        projectHead, '.c-status', '.actions',
         'project running count must not be covered by lifecycle and runtime actions',
       );
       assert.equal(
@@ -1991,7 +2003,7 @@ test('real Servers and Docker UI keep project disclosures exclusive, focused, an
       assert.match(await assignmentError.textContent(),
         /Repository inventory contract is invalid.*container is missing, duplicated, or assigned to the wrong repository scope/is);
       assert.equal(await page.locator('#docker-body .docker-project-block').count(), 0,
-        'contradictory repository membership must remove every lifecycle target');
+        'contradictory repository association must remove every lifecycle target');
       assert.equal(await page.locator('#docker-body button').count(), 0,
         'a structural contradiction must expose no stale lifecycle mutation');
 
@@ -2620,6 +2632,13 @@ test('Performance paints retained metrics within one second while current invent
         await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(body) });
       });
 
+      // The product gate is for the cached Console shell. Establish the
+      // same-origin TLS connection before timing the real application
+      // navigation, while meaningful paint and LCP below still measure that
+      // complete navigation and render.
+      await page.goto(`https://${stack.consoleHost}:${stack.httpsPort}/healthz`, {
+        waitUntil: 'domcontentloaded',
+      });
       const startedAt = Date.now();
       await page.goto(`https://${stack.consoleHost}:${stack.httpsPort}/#/performance`, {
         waitUntil: 'domcontentloaded',

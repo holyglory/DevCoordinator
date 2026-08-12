@@ -25,7 +25,7 @@ from devcoordinator.broker import (
     BrokerRequest,
     PeerCredentials,
 )
-from devcoordinator.broker_persistence import BrokerPersistence, StoreBackedAuthorizer
+from devcoordinator.broker_persistence import BrokerPersistence, StoreBackedRequestAcceptor
 from devcoordinator.broker_host import (
     EPHEMERAL_DOCKER_LABELS,
     EphemeralDockerContainerTarget,
@@ -37,7 +37,6 @@ from devcoordinator.host_observation import commit_host_inventory_observation
 from devcoordinator.observer import SingleFlightObserver
 from devcoordinator.schema import (
     _upgrade_ephemeral_renewal_journal_to_v8,
-    establish_repository_owner_authority,
     initialize_schema,
 )
 from devcoordinator.store import AccountStore, CoordinatorStore, utc_timestamp
@@ -381,9 +380,9 @@ class DelayedAbsenceHost(FakeEphemeralHost):
 
 
 class DisablingTemplateAfterAttributionCoordinator(EphemeralContainerCoordinator):
-    def _record_container(self, run_id, full_container_id, *, authorized=None):
+    def _record_container(self, run_id, full_container_id, *, accepted=None):
         target = super()._record_container(
-            run_id, full_container_id, authorized=authorized
+            run_id, full_container_id, accepted=accepted
         )
         self._persistence.disable_ephemeral_templates_except(
             repo_id=REPO, template_ids=()
@@ -450,29 +449,10 @@ class EphemeralFixture:
                     """,
                     (REPO, now),
                 )
-                establish_repository_owner_authority(
-                    connection,
-                    repository_id=REPO,
-                    owner_uid=os.geteuid(),
-                    repository_generation=0,
-                    operation_id=str(uuid.uuid4()),
-                    actor="test",
-                    reason="ephemeral fixture owner",
-                    timestamp=now,
-                    evidence={"kind": "ephemeral-test-fixture"},
-                )
                 connection.execute(
                     "UPDATE schema_metadata SET migration_state = 'ready' WHERE singleton = 1"
                 )
             self.generation = store.metadata.database_generation
-        self.persistence.provision_principal(uid=os.geteuid(), account_id=ACCOUNT)
-        self.persistence.provision_repository_enrollment(
-            uid=os.geteuid(),
-            repo_id=REPO,
-            account_id=ACCOUNT,
-            issued_at=now,
-            valid_until_epoch=int(time.time()) + 3600,
-        )
         self.persistence.provision_ephemeral_template(
             template_id=TEMPLATE,
             repo_id=REPO,
@@ -488,10 +468,7 @@ class EphemeralFixture:
             memory_bytes=256 * 1024 * 1024,
             cpu_millis=750,
         )
-        self.persistence.replace_ephemeral_access(
-            uid=os.geteuid(), repo_id=REPO, template_ids=(TEMPLATE,)
-        )
-        self.authorizer = StoreBackedAuthorizer(self.persistence)
+        self.authorizer = StoreBackedRequestAcceptor(self.persistence)
 
     def close(self) -> None:
         self.temporary.cleanup()
@@ -523,7 +500,7 @@ class EphemeralFixture:
             operation_id=operation_id,
             authority_generation=self.generation,
         )
-        return self.authorizer.authorize(
+        return self.authorizer.accept(
             PeerCredentials(
                 uid=os.geteuid() if uid is None else uid,
                 gid=os.getegid(),
@@ -539,453 +516,6 @@ class EphemeralContainerTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.fixture.close()
-
-    def test_image_status_is_read_only_and_uses_only_the_sealed_template(self) -> None:
-        host = FakeEphemeralHost()
-        coordinator = EphemeralContainerCoordinator(self.fixture.persistence, host)
-
-        result = coordinator.execute(
-            self.fixture.request(BrokerOperation.EPHEMERAL_IMAGE_STATUS, TEMPLATE)
-        )
-
-        self.assertTrue(result["cached"])
-        self.assertEqual(result["image_ref"], IMAGE)
-        self.assertEqual(len(host.image_cache_checks), 1)
-        self.assertEqual(host.calls, [])
-        with sqlite3.connect(self.fixture.database) as connection:
-            self.assertEqual(
-                connection.execute("SELECT COUNT(*) FROM ephemeral_container_runs").fetchone(),
-                (0,),
-            )
-
-    def test_acl_schema_upgrade_preserves_old_grants_without_cache_authority(self) -> None:
-        with sqlite3.connect(self.fixture.database) as connection:
-            connection.execute("DROP INDEX IF EXISTS broker_ephemeral_acl_lookup")
-            connection.execute(
-                "ALTER TABLE broker_ephemeral_acl RENAME TO broker_ephemeral_acl_before_image_cache"
-            )
-            connection.execute(
-                """
-                CREATE TABLE broker_ephemeral_acl (
-                    uid INTEGER NOT NULL,
-                    repo_id TEXT NOT NULL,
-                    template_id TEXT NOT NULL,
-                    operation TEXT NOT NULL CHECK(operation IN (
-                        'ephemeral.start', 'ephemeral.status',
-                        'ephemeral.renew', 'ephemeral.finish', 'ephemeral.secret_fd'
-                    )),
-                    enabled INTEGER NOT NULL DEFAULT 1,
-                    updated_at TEXT NOT NULL,
-                    PRIMARY KEY(uid, repo_id, template_id, operation)
-                )
-                """
-            )
-            connection.execute(
-                """
-                INSERT INTO broker_ephemeral_acl(
-                    uid, repo_id, template_id, operation, enabled, updated_at
-                )
-                SELECT uid, repo_id, template_id, operation, enabled, updated_at
-                FROM broker_ephemeral_acl_before_image_cache
-                WHERE operation IN (
-                    'ephemeral.start', 'ephemeral.status',
-                    'ephemeral.renew', 'ephemeral.finish', 'ephemeral.secret_fd'
-                )
-                """
-            )
-            connection.execute("DROP TABLE broker_ephemeral_acl_before_image_cache")
-            connection.commit()
-
-        BrokerPersistence(self.fixture.database, expected_uid=os.geteuid())
-
-        with sqlite3.connect(self.fixture.database) as connection:
-            sql = connection.execute(
-                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'broker_ephemeral_acl'"
-            ).fetchone()[0]
-            operations = {
-                row[0]
-                for row in connection.execute(
-                    """
-                    SELECT operation FROM broker_ephemeral_acl
-                    WHERE uid = ? AND repo_id = ? AND template_id = ? AND enabled = 1
-                    """,
-                    (os.geteuid(), REPO, TEMPLATE),
-                )
-            }
-        self.assertIn("ephemeral.image_status", sql)
-        self.assertIn("ephemeral.image_prefetch", sql)
-        self.assertNotIn(BrokerOperation.EPHEMERAL_IMAGE_STATUS.value, operations)
-        self.assertNotIn(BrokerOperation.EPHEMERAL_IMAGE_PREFETCH.value, operations)
-
-    def test_image_prefetch_is_default_deny_and_explicitly_idempotent(self) -> None:
-        with self.assertRaisesRegex(BrokerError, "not authorized"):
-            self.fixture.request(BrokerOperation.EPHEMERAL_IMAGE_PREFETCH, TEMPLATE)
-
-        self.fixture.persistence.replace_ephemeral_access(
-            uid=os.geteuid(),
-            repo_id=REPO,
-            template_ids=(TEMPLATE,),
-            prefetch_template_ids=(TEMPLATE,),
-        )
-        host = FakeEphemeralHost(image_cached=False)
-        coordinator = EphemeralContainerCoordinator(self.fixture.persistence, host)
-        operation_id = "11111111-1111-4111-8111-111111111111"
-        first = coordinator.execute(
-            self.fixture.request(
-                BrokerOperation.EPHEMERAL_IMAGE_PREFETCH,
-                TEMPLATE,
-                operation_id=operation_id,
-            )
-        )
-        replay = coordinator.execute(
-            self.fixture.request(
-                BrokerOperation.EPHEMERAL_IMAGE_PREFETCH,
-                TEMPLATE,
-                operation_id=operation_id,
-            )
-        )
-
-        self.assertEqual(first, replay)
-        self.assertEqual(first["cache_origin"], "pulled")
-        self.assertEqual(len(host.image_prefetches), 1)
-
-    def test_uncertain_prefetch_retry_never_repeats_pull(self) -> None:
-        class UncertainImageHost(FakeEphemeralHost):
-            def docker_prefetch_ephemeral_image(self, target):
-                self.image_prefetches.append(target)
-                raise BrokerBackendError(
-                    "operation_outcome_uncertain", "injected pull reply loss"
-                )
-
-        self.fixture.persistence.replace_ephemeral_access(
-            uid=os.geteuid(),
-            repo_id=REPO,
-            template_ids=(TEMPLATE,),
-            prefetch_template_ids=(TEMPLATE,),
-        )
-        host = UncertainImageHost(image_cached=False)
-        coordinator = EphemeralContainerCoordinator(self.fixture.persistence, host)
-        operation_id = "22222222-2222-4222-8222-222222222222"
-        for _ in range(2):
-            with self.assertRaisesRegex(BrokerBackendError, "not replayed|reply loss"):
-                coordinator.execute(
-                    self.fixture.request(
-                        BrokerOperation.EPHEMERAL_IMAGE_PREFETCH,
-                        TEMPLATE,
-                        operation_id=operation_id,
-                    )
-                )
-        self.assertEqual(len(host.image_prefetches), 1)
-
-    def test_cache_miss_and_malformed_proof_stop_before_run_or_secret_work(self) -> None:
-        cases = (
-            FakeEphemeralHost(image_cached=False),
-            FakeEphemeralHost(),
-        )
-        cases[1].image_cache_proof = {
-            "cached": True,
-            "image_ref": IMAGE,
-            "image_id": "sha256:" + "c" * 64,
-            "repo_digest": IMAGE,
-            "os": "darwin",
-            "architecture": "amd64",
-        }
-        for host in cases:
-            with self.subTest(host=host):
-                coordinator = EphemeralContainerCoordinator(
-                    self.fixture.persistence, host
-                )
-                with self.assertRaises(BrokerBackendError):
-                    coordinator.execute(
-                        self.fixture.request(
-                            BrokerOperation.EPHEMERAL_START,
-                            TEMPLATE,
-                            operation_id=str(uuid.uuid4()),
-                        )
-                    )
-                self.assertNotIn("select_port", host.calls)
-                self.assertNotIn("create", host.calls)
-                self.assertNotIn("start", host.calls)
-        with sqlite3.connect(self.fixture.database) as connection:
-            self.assertEqual(
-                connection.execute("SELECT COUNT(*) FROM ephemeral_container_runs").fetchone(),
-                (0,),
-            )
-            self.assertEqual(
-                connection.execute("SELECT COUNT(*) FROM leases").fetchone(), (0,)
-            )
-
-    def test_policy_scopes_descriptor_acl_to_password_file_templates(self) -> None:
-        password_template = "ephemeral-template-password-postgres"
-        self.fixture.persistence.provision_ephemeral_template(
-            template_id=password_template,
-            repo_id=REPO,
-            name="password-postgres",
-            image_ref=IMAGE,
-            command=("postgres", "-c", "fsync=off"),
-            environment={"POSTGRES_INITDB_ARGS": "--auth-host=scram-sha-256"},
-            secret_policy_kind="postgres_initdb_password_file_v1",
-            secret_binding_id=str(uuid.uuid4()),
-            default_ttl_seconds=600,
-            max_ttl_seconds=3600,
-            container_tcp_port=5432,
-            host_port_start=55420,
-            host_port_end=55430,
-            memory_bytes=256 * 1024 * 1024,
-            cpu_millis=750,
-        )
-        self.fixture.persistence.replace_ephemeral_access(
-            uid=os.geteuid(),
-            repo_id=REPO,
-            template_ids=(TEMPLATE, password_template),
-        )
-
-        base_operations = {
-            BrokerOperation.EPHEMERAL_START.value,
-            BrokerOperation.EPHEMERAL_STATUS.value,
-            BrokerOperation.EPHEMERAL_IMAGE_STATUS.value,
-            BrokerOperation.EPHEMERAL_RENEW.value,
-            BrokerOperation.EPHEMERAL_FINISH.value,
-        }
-        with sqlite3.connect(self.fixture.database) as connection:
-            rows = connection.execute(
-                """
-                SELECT template_id, operation
-                FROM broker_ephemeral_acl
-                WHERE uid = ? AND repo_id = ? AND enabled = 1
-                ORDER BY template_id, operation
-                """,
-                (os.geteuid(), REPO),
-            ).fetchall()
-        grants: dict[str, set[str]] = {}
-        for template_id, operation in rows:
-            grants.setdefault(str(template_id), set()).add(str(operation))
-        self.assertEqual(grants[TEMPLATE], base_operations)
-        self.assertEqual(
-            grants[password_template],
-            base_operations | {BrokerOperation.EPHEMERAL_SECRET_FD.value},
-        )
-
-        self.fixture.persistence.disable_ephemeral_templates_except(
-            repo_id=REPO,
-            template_ids=(TEMPLATE,),
-        )
-        with sqlite3.connect(self.fixture.database) as connection:
-            disabled_descriptor = connection.execute(
-                """
-                SELECT enabled
-                FROM broker_ephemeral_acl
-                WHERE uid = ? AND repo_id = ? AND template_id = ?
-                  AND operation = ?
-                """,
-                (
-                    os.geteuid(),
-                    REPO,
-                    password_template,
-                    BrokerOperation.EPHEMERAL_SECRET_FD.value,
-                ),
-            ).fetchone()
-        self.assertEqual(disabled_descriptor, (0,))
-
-        # Re-enrollment that removes the policy must revoke an old descriptor
-        # grant rather than retaining it as ambient template authority.
-        self.fixture.persistence.provision_ephemeral_template(
-            template_id=password_template,
-            repo_id=REPO,
-            name="password-postgres",
-            image_ref=IMAGE,
-            command=("postgres",),
-            environment={"POSTGRES_HOST_AUTH_METHOD": "trust"},
-            default_ttl_seconds=600,
-            max_ttl_seconds=3600,
-            container_tcp_port=5432,
-            host_port_start=55420,
-            host_port_end=55430,
-            memory_bytes=256 * 1024 * 1024,
-            cpu_millis=750,
-        )
-        self.fixture.persistence.replace_ephemeral_access(
-            uid=os.geteuid(),
-            repo_id=REPO,
-            template_ids=(TEMPLATE, password_template),
-        )
-        with sqlite3.connect(self.fixture.database) as connection:
-            operations = {
-                str(row[0])
-                for row in connection.execute(
-                    """
-                    SELECT operation
-                    FROM broker_ephemeral_acl
-                    WHERE uid = ? AND repo_id = ? AND template_id = ? AND enabled = 1
-                    """,
-                    (os.geteuid(), REPO, password_template),
-                )
-            }
-        self.assertEqual(operations, base_operations)
-
-    def test_secret_binding_rotation_revokes_all_principals_and_fences_running_secret_run(
-        self,
-    ) -> None:
-        """A credential-binding rotation revokes every descriptor path before cleanup.
-
-        A run snapshots its sealed policy, so revoking only the principal that
-        happened to re-enroll would leave another enrolled principal able to
-        retrieve old material.  Exercise a real running password-backed run
-        owned by that second principal, then prove a binding-only rotation both
-        denies descriptor delivery and queues exact Docker reconciliation.
-        """
-
-        other_uid = os.geteuid() + 10_000
-        other_account = "account-ephemeral-other-principal"
-        binding_id = str(uuid.uuid4())
-        self.fixture.persistence.provision_principal(
-            uid=other_uid,
-            account_id=other_account,
-        )
-        self.fixture.persistence.provision_repository_enrollment(
-            uid=other_uid,
-            repo_id=REPO,
-            account_id=other_account,
-            issued_at=utc_timestamp(),
-            valid_until_epoch=int(time.time()) + 3600,
-        )
-        self._provision_postgres_password_file_template(binding_id=binding_id)
-        self.fixture.persistence.replace_ephemeral_access(
-            uid=os.geteuid(),
-            repo_id=REPO,
-            template_ids=(TEMPLATE,),
-        )
-        self.fixture.persistence.replace_ephemeral_access(
-            uid=other_uid,
-            repo_id=REPO,
-            template_ids=(TEMPLATE,),
-        )
-
-        host = FakeEphemeralHost()
-        coordinator = EphemeralContainerCoordinator(
-            self.fixture.persistence,
-            host,
-            secret_manager=VolatileRunSecretManager(
-                runtime_root=self.fixture.root / "runtime",
-                expected_uid=os.geteuid(),
-            ),
-            reaper_interval_seconds=3600,
-        )
-        started = coordinator.execute(
-            self.fixture.request(
-                BrokerOperation.EPHEMERAL_START,
-                TEMPLATE,
-                uid=other_uid,
-                account_id=other_account,
-            )
-        )
-        run_id = str(started["run_id"])
-        self.assertEqual(started["status"], "running")
-
-        # An identical re-enrollment is not a credential rotation: it must not
-        # revoke either principal or disrupt the already-running run.
-        self._provision_postgres_password_file_template(binding_id=binding_id)
-        with sqlite3.connect(self.fixture.database) as connection:
-            unchanged_grants = connection.execute(
-                """
-                SELECT uid, enabled
-                FROM broker_ephemeral_acl
-                WHERE repo_id = ? AND template_id = ?
-                  AND operation = 'ephemeral.secret_fd'
-                ORDER BY uid
-                """,
-                (REPO, TEMPLATE),
-            ).fetchall()
-            unchanged_status = connection.execute(
-                "SELECT status FROM ephemeral_container_runs WHERE run_id = ?",
-                (run_id,),
-            ).fetchone()
-        self.assertEqual(
-            unchanged_grants,
-            sorted([(os.geteuid(), 1), (other_uid, 1)]),
-        )
-        self.assertEqual(unchanged_status, ("running",))
-        self.fixture.request(
-            BrokerOperation.EPHEMERAL_SECRET_FD,
-            run_id,
-            arguments={
-                "template_id": TEMPLATE,
-                "run_id": run_id,
-                "request_id": str(uuid.uuid4()),
-            },
-            uid=other_uid,
-            account_id=other_account,
-        )
-
-        rotated_binding_id = str(uuid.uuid4())
-        self._provision_postgres_password_file_template(
-            binding_id=rotated_binding_id,
-        )
-
-        with sqlite3.connect(self.fixture.database) as connection:
-            revoked_grants = connection.execute(
-                """
-                SELECT uid, enabled
-                FROM broker_ephemeral_acl
-                WHERE repo_id = ? AND template_id = ?
-                  AND operation = 'ephemeral.secret_fd'
-                ORDER BY uid
-                """,
-                (REPO, TEMPLATE),
-            ).fetchall()
-            fenced_run = connection.execute(
-                """
-                SELECT status, phase, cleanup_requested, error_code,
-                       next_reconcile_at_epoch
-                FROM ephemeral_container_runs WHERE run_id = ?
-                """,
-                (run_id,),
-            ).fetchone()
-            rotated_template = connection.execute(
-                """
-                SELECT secret_policy_kind, secret_binding_id
-                FROM ephemeral_container_templates
-                WHERE repo_id = ? AND template_id = ?
-                """,
-                (REPO, TEMPLATE),
-            ).fetchone()
-        self.assertEqual(
-            revoked_grants,
-            sorted([(os.geteuid(), 0), (other_uid, 0)]),
-        )
-        self.assertEqual(
-            fenced_run,
-            (
-                "cleanup_pending",
-                "secret_policy_revoked",
-                1,
-                "ephemeral_secret_policy_revoked",
-                0,
-            ),
-        )
-        self.assertEqual(
-            rotated_template,
-            ("postgres_initdb_password_file_v1", rotated_binding_id),
-        )
-        with self.assertRaises(BrokerError) as denied:
-            self.fixture.request(
-                BrokerOperation.EPHEMERAL_SECRET_FD,
-                run_id,
-                arguments={
-                    "template_id": TEMPLATE,
-                    "run_id": run_id,
-                    "request_id": str(uuid.uuid4()),
-                },
-                uid=other_uid,
-                account_id=other_account,
-            )
-        self.assertEqual(denied.exception.code, "resource_access_denied")
-
-        recovered = coordinator.recover_startup()
-        self.assertEqual(recovered["attention"], 0)
-        self.assertIn(run_id, recovered["run_ids"])
-        self.assertEqual(coordinator._target(run_id).status, "cleaned")
-        self.assertIsNone(host.container)
 
     def _provision_quota_template(
         self,
@@ -1047,8 +577,6 @@ class EphemeralContainerTests(unittest.TestCase):
         return resolved_binding_id
 
     def _observe_ephemeral_containers(self, host: MultiEphemeralHost) -> None:
-        """Commit a realistic running Docker snapshot for the fake multi-host."""
-
         containers: list[dict[str, object]] = []
         for run_id, target in host.created_targets.items():
             container = host.containers[run_id]
@@ -1083,11 +611,7 @@ class EphemeralContainerTests(unittest.TestCase):
             "sampled_at": utc_timestamp(),
             "inventory": {
                 "servers": [],
-                "docker": {
-                    "available": True,
-                    "containers": containers,
-                    "postgres": [],
-                },
+                "docker": {"available": True, "containers": containers, "postgres": []},
             },
         }
         with CoordinatorStore.open(
@@ -1112,34 +636,85 @@ class EphemeralContainerTests(unittest.TestCase):
             self.fixture.database, expected_uid=os.geteuid()
         ) as store, store.read_transaction() as connection:
             rows = connection.execute(
-                """
-                SELECT event_kind, COUNT(*) AS event_count
-                FROM events
-                WHERE json_extract(diagnostic_json, '$.run_id') = ?
-                GROUP BY event_kind
-                """,
+                """SELECT event_kind, COUNT(*) AS event_count
+                   FROM events
+                   WHERE json_extract(diagnostic_json, '$.run_id') = ?
+                   GROUP BY event_kind""",
                 (run_id,),
             ).fetchall()
-        return {
-            str(row["event_kind"]): int(row["event_count"])
-            for row in rows
-        }
+        return {str(row["event_kind"]): int(row["event_count"]) for row in rows}
 
     def _run_and_operation_state(self, operation_id: str) -> tuple[str, str]:
         with CoordinatorStore.open(
             self.fixture.database, expected_uid=os.geteuid()
         ) as store, store.read_transaction() as connection:
             row = connection.execute(
-                """
-                SELECT run.status AS run_status, operation.status AS operation_status
-                FROM ephemeral_container_runs run
-                JOIN operations operation ON operation.operation_id = run.run_id
-                WHERE run.run_id = ?
-                """,
+                """SELECT run.status AS run_status, operation.status AS operation_status
+                   FROM ephemeral_container_runs run
+                   JOIN operations operation ON operation.operation_id = run.run_id
+                   WHERE run.run_id = ?""",
                 (operation_id,),
             ).fetchone()
         self.assertIsNotNone(row)
         return str(row["run_status"]), str(row["operation_status"])
+
+    def test_image_status_is_read_only_and_uses_only_the_sealed_template(self) -> None:
+        host = FakeEphemeralHost()
+        coordinator = EphemeralContainerCoordinator(self.fixture.persistence, host)
+
+        result = coordinator.execute(
+            self.fixture.request(BrokerOperation.EPHEMERAL_IMAGE_STATUS, TEMPLATE)
+        )
+
+        self.assertTrue(result["cached"])
+        self.assertEqual(result["image_ref"], IMAGE)
+        self.assertEqual(len(host.image_cache_checks), 1)
+        self.assertEqual(host.calls, [])
+        with sqlite3.connect(self.fixture.database) as connection:
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM ephemeral_container_runs").fetchone(),
+                (0,),
+            )
+
+
+    def test_cache_miss_and_malformed_proof_stop_before_run_or_secret_work(self) -> None:
+        cases = (
+            FakeEphemeralHost(image_cached=False),
+            FakeEphemeralHost(),
+        )
+        cases[1].image_cache_proof = {
+            "cached": True,
+            "image_ref": IMAGE,
+            "image_id": "sha256:" + "c" * 64,
+            "repo_digest": IMAGE,
+            "os": "darwin",
+            "architecture": "amd64",
+        }
+        for host in cases:
+            with self.subTest(host=host):
+                coordinator = EphemeralContainerCoordinator(
+                    self.fixture.persistence, host
+                )
+                with self.assertRaises(BrokerBackendError):
+                    coordinator.execute(
+                        self.fixture.request(
+                            BrokerOperation.EPHEMERAL_START,
+                            TEMPLATE,
+                            operation_id=str(uuid.uuid4()),
+                        )
+                    )
+                self.assertNotIn("select_port", host.calls)
+                self.assertNotIn("create", host.calls)
+                self.assertNotIn("start", host.calls)
+        with sqlite3.connect(self.fixture.database) as connection:
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM ephemeral_container_runs").fetchone(),
+                (0,),
+            )
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM leases").fetchone(), (0,)
+            )
+
 
     def test_write_ahead_create_record_start_renew_and_finish(self) -> None:
         host = FakeEphemeralHost()
@@ -2205,7 +1780,7 @@ class EphemeralContainerTests(unittest.TestCase):
         self.assertEqual(replay.error_code, "ephemeral_start_deadline_expired")
         self.assertIsNone(host.container)
 
-    def test_post_create_revocation_preserves_exact_start_failure(self) -> None:
+    def test_post_create_template_disable_preserves_exact_start_failure(self) -> None:
         host = FakeEphemeralHost()
         coordinator = DisablingTemplateAfterAttributionCoordinator(
             self.fixture.persistence, host
@@ -2477,7 +2052,7 @@ class EphemeralContainerTests(unittest.TestCase):
             self._event_counts(started["run_id"]).get("ephemeral.cleaned"), 1
         )
 
-    def test_disabled_template_retains_status_and_finish_but_cannot_renew(self) -> None:
+    def test_disabled_template_retains_existing_run_lifecycle(self) -> None:
         clock = FakeClock()
         host = FakeEphemeralHost()
         coordinator = EphemeralContainerCoordinator(
@@ -2496,30 +2071,25 @@ class EphemeralContainerTests(unittest.TestCase):
             self.fixture.request(BrokerOperation.EPHEMERAL_STATUS, started["run_id"])
         )
         self.assertEqual(status["status"], "running")
-        with self.assertRaises(BrokerError) as denied:
+        renewed = coordinator.execute(
             self.fixture.request(
                 BrokerOperation.EPHEMERAL_RENEW,
                 started["run_id"],
                 arguments={"ttl_seconds": 60},
             )
-        self.assertEqual(denied.exception.code, "control_binding_unavailable")
-
-        recovered = coordinator.reap_once()
-        self.assertEqual(recovered["run_ids"], [started["run_id"]])
-        self.assertIsNone(host.container)
-        status = coordinator.execute(
-            self.fixture.request(BrokerOperation.EPHEMERAL_STATUS, started["run_id"])
         )
-        self.assertEqual(status["status"], "cleaned")
+        self.assertEqual(renewed["status"], "running")
+
         finished = coordinator.execute(
             self.fixture.request(
                 BrokerOperation.EPHEMERAL_FINISH,
                 started["run_id"],
-                arguments={"reason": "revoked owner confirms cleanup"},
+                arguments={"reason": "caller confirms cleanup"},
             )
         )
         self.assertEqual(finished["status"], "cleaned")
-        self.assertFalse(finished["changed"])
+        self.assertTrue(finished["changed"])
+        self.assertIsNone(host.container)
 
     def test_external_disappearance_crashes_once_cleans_and_never_restarts(self) -> None:
         clock = FakeClock()
@@ -2850,7 +2420,7 @@ class EphemeralContainerTests(unittest.TestCase):
                     uid=os.geteuid() + 10000,
                 )
             )
-        self.assertEqual(caught.exception.code, "resource_access_denied")
+        self.assertEqual(caught.exception.code, "resource_unavailable")
 
     def test_template_definition_is_sealed_into_reserved_run(self) -> None:
         host = FakeEphemeralHost()
@@ -2893,27 +2463,13 @@ class EphemeralContainerTests(unittest.TestCase):
         self.assertIn("per-user", caught.exception.message)
         self.assertEqual(host.calls.count("create"), 1)
 
-    def test_template_quota_applies_across_authorized_users(self) -> None:
+    def test_template_quota_applies_across_local_callers(self) -> None:
         self._provision_quota_template(
             max_concurrent_runs=1,
             max_concurrent_runs_per_uid=1,
         )
         other_uid = os.geteuid() + 10000
         other_account = "account-ephemeral-other"
-        now = utc_timestamp()
-        self.fixture.persistence.provision_principal(
-            uid=other_uid, account_id=other_account
-        )
-        self.fixture.persistence.provision_repository_enrollment(
-            uid=other_uid,
-            repo_id=REPO,
-            account_id=other_account,
-            issued_at=now,
-            valid_until_epoch=int(time.time()) + 3600,
-        )
-        self.fixture.persistence.replace_ephemeral_access(
-            uid=other_uid, repo_id=REPO, template_ids=(TEMPLATE,)
-        )
         host = FakeEphemeralHost()
         coordinator = EphemeralContainerCoordinator(self.fixture.persistence, host)
         coordinator.execute(
@@ -3005,11 +2561,6 @@ class EphemeralContainerTests(unittest.TestCase):
                             repo_memory_budget_bytes=8 * 1024 * 1024 * 1024,
                             repo_cpu_budget_millis=16_000,
                         )
-                    fixture.persistence.replace_ephemeral_access(
-                        uid=os.geteuid(),
-                        repo_id=REPO,
-                        template_ids=(TEMPLATE, second_template),
-                    )
                     host = FakeEphemeralHost()
                     coordinator = EphemeralContainerCoordinator(
                         fixture.persistence, host

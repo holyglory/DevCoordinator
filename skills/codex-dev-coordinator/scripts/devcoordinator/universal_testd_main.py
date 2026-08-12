@@ -26,9 +26,6 @@ from .universal_test_broker import (
     BrokerConnection,
     CoordinatorBrokerTicketIssuer,
     CoordinatorRuntimeRequestSubmitter,
-    SYSTEM_AUTHORITY_SOCKET_GID,
-    SYSTEM_AUTHORITY_SOCKET_MODE,
-    SYSTEM_AUTHORITY_SOCKET_UID,
 )
 from .universal_test_snapshot_service import UnixSnapshotServiceClient
 from .universal_testd import TestdEngine, TestdEngineLoop, TestdLaunchAdapter
@@ -40,44 +37,11 @@ from .call_journal import RollingCallJournal, configured_call_journal
 SYSTEMD_LISTEN_FD_START = 3
 
 
-def _nonnegative_uid(value: str) -> int:
-    try:
-        parsed = int(value)
-    except ValueError as error:
-        raise argparse.ArgumentTypeError("UID must be an integer") from error
-    if parsed < 0:
-        raise argparse.ArgumentTypeError("UID must be non-negative")
-    return parsed
-
-
-def _socket_mode(value: str) -> int:
-    try:
-        parsed = int(value, 8)
-    except ValueError as error:
-        raise argparse.ArgumentTypeError("socket mode must be octal") from error
-    if parsed < 0 or parsed > 0o777:
-        raise argparse.ArgumentTypeError("socket mode must be between 0000 and 0777")
-    return parsed
-
-
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="devcoordinator-testd")
     parser.add_argument("--database", type=Path, required=True)
     parser.add_argument(
         "--socket", type=Path, default=Path("/run/devcoordinator-testd/testd.sock")
-    )
-    parser.add_argument(
-        "--broker-uid", type=_nonnegative_uid, default=SYSTEM_AUTHORITY_SOCKET_UID
-    )
-    parser.add_argument(
-        "--broker-socket-gid",
-        type=_nonnegative_uid,
-        default=SYSTEM_AUTHORITY_SOCKET_GID,
-    )
-    parser.add_argument(
-        "--broker-socket-mode",
-        type=_socket_mode,
-        default=SYSTEM_AUTHORITY_SOCKET_MODE,
     )
     parser.add_argument("--broker-socket", type=Path)
     parser.add_argument("--snapshot-socket", type=Path)
@@ -119,7 +83,6 @@ def inherited_systemd_listener(
 def build_testd_server(
     *,
     database: Path,
-    broker_uid: int,
     listener: socket.socket,
     previewer: RepositoryUIDPlanPreviewer | None = None,
     call_journal: RollingCallJournal | None = None,
@@ -131,7 +94,6 @@ def build_testd_server(
     return UnixTestPlaneServer(
         listener,
         service,
-        allowed_peer_uids=(broker_uid,),
         call_journal=call_journal,
     )
 
@@ -140,7 +102,6 @@ def run(
     *,
     database: Path,
     socket_path: Path,
-    broker_uid: int,
     previewer: RepositoryUIDPlanPreviewer | None = None,
     engine_loop: TestdEngineLoop | None = None,
     call_journal: RollingCallJournal | None = None,
@@ -151,7 +112,6 @@ def run(
         server = UnixTestPlaneServer.bind(
             Path(socket_path),
             StoreTestPlaneAdapter(store, previewer=previewer),
-            allowed_peer_uids=(broker_uid,),
             socket_mode=0o600,
             call_journal=call_journal,
         )
@@ -159,7 +119,6 @@ def run(
         server = UnixTestPlaneServer(
             inherited,
             StoreTestPlaneAdapter(store, previewer=previewer),
-            allowed_peer_uids=(broker_uid,),
             call_journal=call_journal,
         )
 
@@ -200,9 +159,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     broker_connection = BrokerConnection(
         arguments.broker_socket,
         authority_generation="broker-current-testd",
-        expected_broker_uid=arguments.broker_uid,
-        expected_socket_gid=arguments.broker_socket_gid,
-        expected_socket_mode=arguments.broker_socket_mode,
     )
     scheduler = WeightedFairScheduler()
     engine = TestdEngine(
@@ -225,7 +181,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     return run(
         database=arguments.database,
         socket_path=arguments.socket,
-        broker_uid=arguments.broker_uid,
         previewer=snapshot_client,
         call_journal=call_journal,
         engine_loop=TestdEngineLoop(

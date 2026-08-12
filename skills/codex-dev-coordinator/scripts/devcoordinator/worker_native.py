@@ -1,8 +1,8 @@
 """OS-owned runner isolation for durable managed-worker supervision.
 
-The broker never forks an enrolled user's arbitrary command.  It asks the
+The broker never forks an configured user's arbitrary command.  It asks the
 native service manager to execute one fixed Python entrypoint under the
-enrolled UID; that runner obtains a generation-bound launch ticket from the
+configured UID; that runner obtains a generation-bound launch ticket from the
 Coordinator authority and is the parent of the actual worker process.
 """
 

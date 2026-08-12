@@ -1,13 +1,10 @@
 #!/usr/bin/env python3
-"""Install, explicitly activate, or roll back the server-wide boundary.
+"""Install, explicitly activate, or roll back the trusted-local server boundary.
 
-Apply deliberately does not start the broker.  Enroll exact users,
-repositories, and server allowlists first, verify, then use the separate
-journal-bound ``activate`` action.  Runtime users need no sudo after
-installation: they reach the service through the trusted-local 0666 Unix
-socket and their Codex/Claude skills are direct links to this repository.  The
-complete explicit client set also owns one replacement-style systemd drop-in
-containing only those clients' canonical home write exceptions.
+Apply deliberately does not start the broker. Runtime users need no sudo after
+installation: every local account reaches the service through the 0666 Unix
+socket. Explicit user arguments select where canonical Codex/Claude skill links
+are installed; they never grant broker or repository authority.
 """
 
 from __future__ import annotations
@@ -64,13 +61,13 @@ ENROLLED_HOME_DROPIN = Path(
     "/etc/systemd/system/devcoordinator-broker.service.d/80-enrolled-home-write-paths.conf"
 )
 ENROLLED_HOME_DROPIN_SOURCE = "generated:enrolled-home-write-paths"
-BASE_READ_WRITE_PATHS = "/var/lib/devcoordinator -/run/devcoordinator"
+BASE_READ_WRITE_PATHS = "/home /var/lib/devcoordinator -/run/devcoordinator"
 BROKER_UNIT_REQUIRED_SANDBOX = {
     "UMask": "UMask=0077",
     "NoNewPrivileges": "NoNewPrivileges=true",
     "PrivateTmp": "PrivateTmp=true",
     "ProtectSystem": "ProtectSystem=strict",
-    "ProtectHome": "ProtectHome=read-only",
+    "ProtectHome": "ProtectHome=false",
     "ReadWritePaths": f"ReadWritePaths={BASE_READ_WRITE_PATHS}",
 }
 MANAGED_SKILLS = (
@@ -109,7 +106,7 @@ RUNTIME_DEPENDENCY_CONTRACT = "devcoordinator-broker-runtime-v1"
 COMPOSE_VERSION_REQUIREMENT = "stable >=2.17,<3 or >=5,<6"
 AUTHORITY_DATABASE_PATH = Path("/var/lib/devcoordinator/coordinator.sqlite3")
 CLIENT_PROFILE_PATH = Path("/etc/devcoordinator/client-profiles.json")
-PROFILE_DATABASE_ENROLLMENT_DRIFT = "profile_database_enrollment_drift"
+PROFILE_DATABASE_ROUTING_DRIFT = "profile_database_routing_drift"
 AUTHORITY_SCHEMA_CUTOVER_REQUIRED = "authority_schema_cutover_required"
 DIRECT_DOCKER_SOCKET_ACCESS = "direct_client_docker_socket_access"
 DOCKER_ADMISSION_CONTRACT = "devcoordinator-docker-admission-observe-v1"
@@ -159,10 +156,10 @@ class InstallError(RuntimeError):
     pass
 
 
-class ProfileDatabaseEnrollmentDrift(InstallError):
-    """The protected client profile promises access absent from service state."""
+class ProfileDatabaseRoutingDrift(InstallError):
+    """The published route catalog differs from current service state."""
 
-    code = PROFILE_DATABASE_ENROLLMENT_DRIFT
+    code = PROFILE_DATABASE_ROUTING_DRIFT
 
 
 class AuthoritySchemaCutoverRequired(InstallError):
@@ -171,9 +168,8 @@ class AuthoritySchemaCutoverRequired(InstallError):
     code = AUTHORITY_SCHEMA_CUTOVER_REQUIRED
     classification = "cutover_required"
     action_required = (
-        "Run the sealed offline repository-owner authority migration, republish "
-        "every protected client profile from the migrated authority, then rerun "
-        "server-wide verify and activate."
+        "Run the supported authority-schema migration, republish the host-wide "
+        "route catalog, then rerun server-wide verify and activate."
     )
 
     def __init__(self, evidence: dict[str, Any]) -> None:
@@ -996,18 +992,19 @@ def _broker_start_failure_evidence() -> dict[str, Any]:
 
 
 def _verify_broker_client_readiness(names: list[str]) -> list[dict[str, Any]]:
-    """Prove one authenticated inventory read for every exact client UID."""
+    """Prove the same host-wide inventory route is readable by every local agent."""
 
     clients = client_records(names)
     profile = _read_protected_profile(CLIENT_PROFILE_PATH)
-    generation, repositories, _ignored, issues = (
-        _current_profile_repository_enrollments(
-            profile,
-            now_epoch=int(time.time()),
-        )
-    )
+    generation, repositories, issues = _profile_repository_routes(profile)
     if issues or not generation:
         raise InstallError("broker client readiness profile is invalid")
+    if not repositories:
+        raise InstallError("broker route catalog contains no repository anchor")
+    repository = min(
+        repositories,
+        key=lambda item: (str(item["repo_id"]), str(item["canonical_root"])),
+    )
     client_script = SKILL_SOURCE / "scripts/dev_coordinator.py"
     client_failure = worker_runner_script_failure(client_script)
     if client_failure is not None:
@@ -1015,22 +1012,6 @@ def _verify_broker_client_readiness(names: list[str]) -> list[dict[str, Any]]:
     client_sha256 = digest(client_script)
     evidence: list[dict[str, Any]] = []
     for record, _home in clients:
-        candidates = sorted(
-            (
-                repository
-                for repository in repositories
-                if repository.get("uid") == record.pw_uid
-            ),
-            key=lambda repository: (
-                str(repository.get("canonical_root")),
-                str(repository.get("repo_id")),
-            ),
-        )
-        if not candidates:
-            raise InstallError(
-                f"broker client has no current repository enrollment: {record.pw_name}"
-            )
-        repository = candidates[0]
         arguments = [
             command("setpriv"),
             "--reuid",
@@ -1099,10 +1080,10 @@ def _verify_broker_client_readiness(names: list[str]) -> list[dict[str, Any]]:
         )
         if (
             not isinstance(inventory, dict)
-            or inventory.get("schema_version") != 2
+            or inventory.get("schema_version") != 3
             or not isinstance(authority, dict)
             or authority.get("scope") != "server-wide"
-            or authority.get("transport") != "authenticated-unix-socket"
+            or authority.get("transport") != "trusted-local-unix-socket"
             or authority.get("socket") != os.fspath(BROKER_SOCKET)
             or authority.get("service_uid") != SYSTEM_OWNER_UID
             or authority.get("database_generation") != generation
@@ -1878,13 +1859,14 @@ def enrolled_home_write_paths(clients: list[Any]) -> list[Path]:
 
 
 def render_enrolled_home_dropin(paths: list[Path]) -> bytes:
-    homes = validate_home_write_path_tokens(paths)
-    writable = " ".join([BASE_READ_WRITE_PATHS, *(os.fspath(path) for path in homes)])
+    # ``paths`` selects skill-link destinations only. It must never narrow the
+    # broker sandbox or become a per-account access list.
+    validate_home_write_path_tokens(paths)
     return (
         "[Service]\n"
-        "# Generated transactionally from the complete explicit --client-user set.\n"
+        "# Trusted-local global home access; user arguments install skill links only.\n"
         "ReadWritePaths=\n"
-        f"ReadWritePaths={writable}\n"
+        f"ReadWritePaths={BASE_READ_WRITE_PATHS}\n"
     ).encode("utf-8")
 
 
@@ -1961,900 +1943,186 @@ def _read_protected_profile(path: Path) -> dict[str, Any]:
     return document
 
 
-def _current_profile_repository_enrollments(
-    document: dict[str, Any], *, now_epoch: int
-) -> tuple[str | None, list[dict[str, Any]], int, list[dict[str, Any]]]:
-    """Return only profile promises that are current and enabled.
+def _profile_repository_routes(
+    document: dict[str, Any],
+) -> tuple[str | None, list[dict[str, Any]], list[dict[str, Any]]]:
+    """Parse the trusted-local routing catalog with the target client parser."""
 
-    Disabled or expired profile entries deliberately make no runtime-access
-    promise. They therefore do not require a database row and must not prevent
-    a safe restart merely because their old database evidence was removed.
-    """
-
-    issues: list[dict[str, Any]] = []
-    if document.get("version") != 1:
-        return None, [], 0, [_profile_database_issue("profile_version_invalid")]
-    clients = document.get("clients")
-    if not isinstance(clients, dict):
-        return None, [], 0, [_profile_database_issue("profile_clients_invalid")]
-    current: list[dict[str, Any]] = []
-    ignored = 0
-    seen: set[tuple[int, str]] = set()
-    _schema, _parser, _error, repository_fields = (
-        _target_broker_activation_contract()
-    )
-    for uid_raw, client in sorted(clients.items(), key=lambda item: str(item[0])):
-        try:
-            uid = int(uid_raw)
-        except (TypeError, ValueError):
-            issues.append(_profile_database_issue("profile_uid_invalid"))
-            continue
-        if uid < 0 or str(uid) != str(uid_raw) or not isinstance(client, dict):
-            issues.append(_profile_database_issue("profile_client_invalid", uid=str(uid_raw)))
-            continue
-        account_id = client.get("account_id")
-        client_issued_at = client.get("issued_at")
-        client_expiry = client.get("valid_until_epoch")
-        repositories = client.get("repositories")
-        if not isinstance(account_id, str) or not account_id:
-            issues.append(_profile_database_issue("profile_account_invalid", uid=uid))
-            continue
-        if not isinstance(client_issued_at, str) or not client_issued_at:
-            issues.append(_profile_database_issue("profile_issued_at_invalid", uid=uid))
-            continue
-        if type(client_expiry) is not int or client_expiry <= 0:
-            issues.append(_profile_database_issue("profile_expiry_invalid", uid=uid))
-            continue
-        if not isinstance(repositories, list):
-            issues.append(_profile_database_issue("profile_repositories_invalid", uid=uid))
-            continue
-        if now_epoch >= client_expiry:
-            ignored += len(repositories)
-            continue
-        for index, repository in enumerate(repositories):
-            if (
-                not isinstance(repository, dict)
-                or set(repository) != repository_fields
-            ):
-                issues.append(
-                    _profile_database_issue(
-                        "profile_repository_fields_invalid", uid=uid, index=index
-                    )
-                )
-                continue
-            enabled = repository["enabled"]
-            valid_until_epoch = repository["valid_until_epoch"]
-            if type(enabled) is not bool or type(valid_until_epoch) is not int:
-                issues.append(
-                    _profile_database_issue(
-                        "profile_repository_lifecycle_invalid", uid=uid, index=index
-                    )
-                )
-                continue
-            if not enabled or now_epoch >= valid_until_epoch:
-                ignored += 1
-                continue
-            repository_account = repository["account_id"]
-            issued_at = repository["issued_at"]
-            repo_id = repository.get("repo_id")
-            canonical_root = repository.get("canonical_root")
-            generation = repository.get("generation")
-            ephemeral_templates_raw = repository["ephemeral_templates"]
-            ephemeral_secret_policies_raw = repository[
-                "ephemeral_secret_policies"
-            ]
-            ephemeral_image_prefetch_templates_raw = repository[
-                "ephemeral_image_prefetch_templates"
-            ]
-            if repository_account != account_id:
-                issues.append(
-                    _profile_database_issue(
-                        "profile_repository_account_mismatch", uid=uid, index=index
-                    )
-                )
-                continue
-            if not isinstance(issued_at, str) or not issued_at:
-                issues.append(
-                    _profile_database_issue(
-                        "profile_repository_issued_at_invalid", uid=uid, index=index
-                    )
-                )
-                continue
-            if not isinstance(repo_id, str) or not repo_id:
-                issues.append(
-                    _profile_database_issue("profile_repo_id_invalid", uid=uid, index=index)
-                )
-                continue
-            if not isinstance(canonical_root, str) or not canonical_root:
-                issues.append(
-                    _profile_database_issue(
-                        "profile_repository_root_invalid", uid=uid, repo_id=repo_id
-                    )
-                )
-                continue
-            if type(generation) is not int or generation < 0:
-                issues.append(
-                    _profile_database_issue(
-                        "profile_repository_generation_invalid", uid=uid, repo_id=repo_id
-                    )
-                )
-                continue
-            ephemeral_templates: dict[str, str] = {}
-            if not isinstance(ephemeral_templates_raw, dict):
-                issues.append(
-                    _profile_database_issue(
-                        "profile_ephemeral_templates_invalid", uid=uid, repo_id=repo_id
-                    )
-                )
-            else:
-                seen_template_ids: set[str] = set()
-                for template_name, template_id in ephemeral_templates_raw.items():
-                    if (
-                        not isinstance(template_name, str)
-                        or not 1 <= len(template_name) <= 96
-                        or re.fullmatch(
-                            r"[a-z0-9](?:[a-z0-9_.-]*[a-z0-9])?",
-                            template_name,
-                        )
-                        is None
-                        or not isinstance(template_id, str)
-                        or not 1 <= len(template_id) <= 256
-                        or re.fullmatch(r"[A-Za-z0-9_.:@-]+", template_id) is None
-                    ):
-                        issues.append(
-                            _profile_database_issue(
-                                "profile_ephemeral_template_invalid",
-                                uid=uid,
-                                repo_id=repo_id,
-                            )
-                        )
-                        continue
-                    if template_id in seen_template_ids:
-                        issues.append(
-                            _profile_database_issue(
-                                "profile_ephemeral_template_id_duplicate",
-                                uid=uid,
-                                repo_id=repo_id,
-                                template_id=template_id,
-                            )
-                        )
-                        continue
-                    seen_template_ids.add(template_id)
-                    ephemeral_templates[template_name] = template_id
-            ephemeral_image_prefetch_templates: set[str] = set()
-            if not isinstance(ephemeral_image_prefetch_templates_raw, list):
-                issues.append(
-                    _profile_database_issue(
-                        "profile_ephemeral_image_prefetch_templates_invalid",
-                        uid=uid,
-                        repo_id=repo_id,
-                    )
-                )
-            else:
-                for template_id in ephemeral_image_prefetch_templates_raw:
-                    if (
-                        not isinstance(template_id, str)
-                        or not 1 <= len(template_id) <= 256
-                        or re.fullmatch(r"[A-Za-z0-9_.:@-]+", template_id) is None
-                        or template_id in ephemeral_image_prefetch_templates
-                        or template_id not in set(ephemeral_templates.values())
-                    ):
-                        issues.append(
-                            _profile_database_issue(
-                                "profile_ephemeral_image_prefetch_template_invalid",
-                                uid=uid,
-                                repo_id=repo_id,
-                            )
-                        )
-                        continue
-                    ephemeral_image_prefetch_templates.add(template_id)
-            ephemeral_secret_policies: dict[str, dict[str, str]] = {}
-            if not isinstance(ephemeral_secret_policies_raw, dict):
-                issues.append(
-                    _profile_database_issue(
-                        "profile_ephemeral_secret_policies_invalid",
-                        uid=uid,
-                        repo_id=repo_id,
-                    )
-                )
-            else:
-                for template_name, raw_policy in sorted(
-                    ephemeral_secret_policies_raw.items(), key=lambda item: str(item[0])
-                ):
-                    if template_name not in ephemeral_templates:
-                        issues.append(
-                            _profile_database_issue(
-                                "profile_ephemeral_secret_policy_unknown_template",
-                                uid=uid,
-                                repo_id=repo_id,
-                                template_name=str(template_name),
-                            )
-                        )
-                        continue
-                    if (
-                        not isinstance(raw_policy, dict)
-                        or set(raw_policy) != {"policy", "binding_id"}
-                    ):
-                        issues.append(
-                            _profile_database_issue(
-                                "profile_ephemeral_secret_policy_invalid",
-                                uid=uid,
-                                repo_id=repo_id,
-                                template_name=template_name,
-                            )
-                        )
-                        continue
-                    policy = raw_policy.get("policy")
-                    binding_id = raw_policy.get("binding_id")
-                    if policy != _EPHEMERAL_SECRET_FD_POLICY:
-                        issues.append(
-                            _profile_database_issue(
-                                "profile_ephemeral_secret_policy_invalid",
-                                uid=uid,
-                                repo_id=repo_id,
-                                template_name=template_name,
-                            )
-                        )
-                        continue
-                    if not _is_canonical_uuid(binding_id):
-                        issues.append(
-                            _profile_database_issue(
-                                "profile_ephemeral_secret_binding_invalid",
-                                uid=uid,
-                                repo_id=repo_id,
-                                template_name=template_name,
-                            )
-                        )
-                        continue
-                    ephemeral_secret_policies[template_name] = {
-                        "policy": policy,
-                        "binding_id": binding_id,
-                    }
-            identity = (uid, repo_id)
-            if identity in seen:
-                issues.append(
-                    _profile_database_issue(
-                        "profile_repository_duplicate", uid=uid, repo_id=repo_id
-                    )
-                )
-                continue
-            seen.add(identity)
-            current.append(
-                {
-                    "uid": uid,
-                    "account_id": account_id,
-                    "repo_id": repo_id,
-                    "canonical_root": canonical_root,
-                    "generation": generation,
-                    "issued_at": issued_at,
-                    "valid_until_epoch": valid_until_epoch,
-                    "ephemeral_templates": ephemeral_templates,
-                    "ephemeral_image_prefetch_templates": (
-                        ephemeral_image_prefetch_templates
-                    ),
-                    "ephemeral_secret_policies": ephemeral_secret_policies,
-                }
-            )
-    service = document.get("service")
-    service_generation = (
-        service.get("database_generation") if isinstance(service, dict) else None
-    )
-    if current and (not isinstance(service_generation, str) or not service_generation):
-        issues.append(_profile_database_issue("profile_database_generation_invalid"))
-        service_generation = None
-    return service_generation, current, ignored, issues
-
-
-_EPHEMERAL_PROFILE_OPERATIONS = frozenset(
-    {
-        "ephemeral.start",
-        "ephemeral.status",
-        "ephemeral.image_status",
-        "ephemeral.renew",
-        "ephemeral.finish",
-    }
-)
-_EPHEMERAL_SECRET_FD_OPERATION = "ephemeral.secret_fd"
-_EPHEMERAL_IMAGE_PREFETCH_OPERATION = "ephemeral.image_prefetch"
-_EPHEMERAL_SECRET_FD_POLICY = "postgres_initdb_password_file_v1"
-
-
-def _is_canonical_uuid(value: Any) -> bool:
-    if not isinstance(value, str):
-        return False
+    _schema, parse_profile, profile_error, _fields = _target_broker_activation_contract()
     try:
-        return str(uuid.UUID(value)) == value
-    except (AttributeError, ValueError):
-        return False
+        parsed = parse_profile(document, effective_uid=0)
+    except profile_error as error:
+        return None, [], [_profile_database_issue("profile_routing_invalid", detail=str(error)[:1024])]
+    except Exception as error:
+        return None, [], [_profile_database_issue("profile_routing_unavailable", detail=str(error)[:1024])]
+    routes = []
+    for repository in sorted(parsed.repositories.values(), key=lambda item: (item.canonical_root, item.repo_id)):
+        routes.append({
+            "repo_id": repository.repo_id,
+            "canonical_root": repository.canonical_root,
+            "generation": repository.generation,
+            "ephemeral_templates": dict(repository.ephemeral_templates),
+            "ephemeral_secret_policies": {
+                name: {"policy": policy.policy, "binding_id": policy.binding_id}
+                for name, policy in repository.ephemeral_secret_policies.items()
+            },
+        })
+    return parsed.service.database_generation, routes, []
 
 
-def _ephemeral_profile_operations_for_policy(
-    policy: str | None, *, allow_image_prefetch: bool
-) -> frozenset[str]:
-    """Derive exact profile ACLs without turning descriptor delivery generic."""
-
-    if policy is None:
-        operations = _EPHEMERAL_PROFILE_OPERATIONS
-    elif policy == _EPHEMERAL_SECRET_FD_POLICY:
-        operations = _EPHEMERAL_PROFILE_OPERATIONS | {_EPHEMERAL_SECRET_FD_OPERATION}
-    else:
-        raise ValueError("profile names an unsupported ephemeral secret policy")
-    if allow_image_prefetch:
-        return operations | {_EPHEMERAL_IMAGE_PREFETCH_OPERATION}
-    return operations
-
-
-def _ephemeral_profile_database_issues(
-    connection: sqlite3.Connection,
+def profile_database_routing_check(
     *,
-    repository: dict[str, Any],
-    template_table_exists: bool,
-    template_policy_columns_available: bool,
-    acl_table_exists: bool,
-) -> tuple[list[dict[str, Any]], int, int]:
-    """Prove one current profile's exact ephemeral template and ACL promises.
-
-    Older stores legitimately have neither table.  Their absence is drift only
-    when the protected profile, an enabled template row, or an enabled UID ACL
-    row makes an ephemeral-access promise for this current enrollment.
-    """
-
-    uid = int(repository["uid"])
-    repo_id = str(repository["repo_id"])
-    profile_templates = dict(repository["ephemeral_templates"])
-    profile_secret_policies = dict(repository["ephemeral_secret_policies"])
-    profile_image_prefetch_template_ids = set(
-        repository["ephemeral_image_prefetch_templates"]
-    )
-    profile_by_id = {
-        str(template_id): str(name)
-        for name, template_id in profile_templates.items()
-    }
-    enabled_templates: list[sqlite3.Row] = []
-    enabled_acl_rows: list[sqlite3.Row] = []
-    if template_table_exists:
-        enabled_templates = connection.execute(
-            """
-            SELECT template_id, name
-            FROM ephemeral_container_templates
-            WHERE repo_id = ? AND enabled = 1
-            ORDER BY template_id
-            """,
-            (repo_id,),
-        ).fetchall()
-    if acl_table_exists:
-        enabled_acl_rows = connection.execute(
-            """
-            SELECT template_id, operation
-            FROM broker_ephemeral_acl
-            WHERE uid = ? AND repo_id = ? AND enabled = 1
-            ORDER BY template_id, operation
-            """,
-            (uid, repo_id),
-        ).fetchall()
-    # A repository may intentionally retain an enabled template that this UID
-    # cannot use.  Only the protected UID profile or an enabled per-UID ACL is
-    # an access promise; a template row by itself must not synthesize access.
-    if not (profile_templates or enabled_acl_rows):
-        return [], 0, 0
-
-    issues: list[dict[str, Any]] = []
-    if not template_table_exists:
-        issues.append(
-            _profile_database_issue(
-                "ephemeral_template_table_missing", uid=uid, repo_id=repo_id
-            )
-        )
-    if not acl_table_exists:
-        issues.append(
-            _profile_database_issue(
-                "ephemeral_acl_table_missing", uid=uid, repo_id=repo_id
-            )
-        )
-    if not template_table_exists or not acl_table_exists:
-        return issues, len(enabled_templates), len(enabled_acl_rows)
-    if not template_policy_columns_available:
-        issues.append(
-            _profile_database_issue(
-                "ephemeral_template_policy_columns_missing",
-                uid=uid,
-                repo_id=repo_id,
-            )
-        )
-        return issues, len(enabled_templates), len(enabled_acl_rows)
-
-    enabled_database_by_id = {
-        str(row["template_id"]): str(row["name"]) for row in enabled_templates
-    }
-    for name, template_id in sorted(profile_templates.items()):
-        row = connection.execute(
-            """
-            SELECT repo_id, name, enabled, secret_policy_kind, secret_binding_id
-            FROM ephemeral_container_templates
-            WHERE template_id = ?
-            """,
-            (template_id,),
-        ).fetchone()
-        details = {
-            "uid": uid,
-            "repo_id": repo_id,
-            "template_id": template_id,
-            "template_name": name,
-        }
-        if row is None:
-            issues.append(_profile_database_issue("ephemeral_template_missing", **details))
-            continue
-        if str(row["repo_id"]) != repo_id:
-            issues.append(
-                _profile_database_issue(
-                    "ephemeral_template_repository_mismatch", **details
-                )
-            )
-        if str(row["name"]) != name:
-            issues.append(
-                _profile_database_issue("ephemeral_template_name_mismatch", **details)
-            )
-        if not bool(row["enabled"]):
-            issues.append(
-                _profile_database_issue("ephemeral_template_disabled", **details)
-            )
-        profile_policy = profile_secret_policies.get(name)
-        database_policy = row["secret_policy_kind"]
-        database_binding = row["secret_binding_id"]
-        if profile_policy is None:
-            if database_policy is not None or database_binding is not None:
-                issues.append(
-                    _profile_database_issue(
-                        "profile_ephemeral_secret_policy_missing", **details
-                    )
-                )
-        else:
-            if database_policy != profile_policy["policy"]:
-                issues.append(
-                    _profile_database_issue(
-                        "ephemeral_secret_policy_mismatch", **details
-                    )
-                )
-            if database_binding != profile_policy["binding_id"]:
-                issues.append(
-                    _profile_database_issue(
-                        "ephemeral_secret_binding_mismatch", **details
-                    )
-                )
-
-    acl_operations_by_template: dict[str, list[str]] = {}
-    for row in enabled_acl_rows:
-        acl_operations_by_template.setdefault(str(row["template_id"]), []).append(
-            str(row["operation"])
-        )
-    promised_template_ids = set(profile_by_id) | set(acl_operations_by_template)
-    for template_id in sorted(promised_template_ids):
-        operations = acl_operations_by_template.get(template_id, [])
-        profile_template_name = profile_by_id.get(template_id)
-        profile_policy = (
-            profile_secret_policies.get(profile_template_name)
-            if profile_template_name is not None
-            else None
-        )
-        expected_operations = _ephemeral_profile_operations_for_policy(
-            None if profile_policy is None else str(profile_policy["policy"]),
-            allow_image_prefetch=template_id in profile_image_prefetch_template_ids,
-        )
-        if (
-            len(operations) != len(expected_operations)
-            or set(operations) != expected_operations
-        ):
-            issues.append(
-                _profile_database_issue(
-                    "ephemeral_acl_operations_mismatch",
-                    uid=uid,
-                    repo_id=repo_id,
-                    template_id=template_id,
-                    enabled_operations=sorted(set(operations)),
-                    expected_operations=sorted(expected_operations),
-                )
-            )
-        if template_id in acl_operations_by_template and template_id not in profile_by_id:
-            issues.append(
-                _profile_database_issue(
-                    "profile_ephemeral_acl_missing",
-                    uid=uid,
-                    repo_id=repo_id,
-                    template_id=template_id,
-                )
-            )
-        database_name = enabled_database_by_id.get(template_id)
-        if (
-            template_id in acl_operations_by_template
-            and database_name is not None
-            and profile_by_id.get(template_id) != database_name
-        ):
-            issues.append(
-                _profile_database_issue(
-                    "profile_ephemeral_template_missing",
-                    uid=uid,
-                    repo_id=repo_id,
-                    template_id=template_id,
-                    template_name=database_name,
-                )
-            )
-        if (
-            template_id in acl_operations_by_template
-            and template_id not in enabled_database_by_id
-        ):
-            issues.append(
-                _profile_database_issue(
-                    "ephemeral_acl_template_inactive",
-                    uid=uid,
-                    repo_id=repo_id,
-                    template_id=template_id,
-                )
-            )
-    checked_enabled_templates = sum(
-        1 for template_id in promised_template_ids if template_id in enabled_database_by_id
-    )
-    return issues, checked_enabled_templates, len(enabled_acl_rows)
-
-
-def profile_database_enrollment_check(
-    *,
-    profile_path: Path | None = None,
-    database_path: Path | None = None,
-    now_epoch: int | None = None,
+    profile_path: Path = CLIENT_PROFILE_PATH,
+    database_path: Path = AUTHORITY_DATABASE_PATH,
 ) -> dict[str, Any]:
-    """Compare every current protected profile promise with service SQLite.
+    """Verify that the published route catalog matches current resources."""
 
-    This is deliberately a read-only installer check. It never imports the
-    broker persistence module, initializes schema, or repairs state; the
-    administrator must run the explicit offline enrollment backfill first.
-    """
-
-    profile_path = CLIENT_PROFILE_PATH if profile_path is None else profile_path
-    database_path = AUTHORITY_DATABASE_PATH if database_path is None else database_path
-    now = int(time.time()) if now_epoch is None else int(now_epoch)
     result: dict[str, Any] = {
         "ok": True,
-        "code": None,
+        "code": "profile_database_routing_ready",
         "profile": os.fspath(profile_path),
         "database": os.fspath(database_path),
-        "checked_current_enrollments": 0,
-        "checked_current_database_enrollments": 0,
-        "checked_current_ephemeral_templates": 0,
-        "checked_current_ephemeral_acl_bindings": 0,
-        "ignored_inactive_profile_enrollments": 0,
+        "checked_routes": 0,
+        "checked_ephemeral_templates": 0,
         "issues": [],
     }
-    profile_absent = not path_lexists(profile_path)
-    service_generation: str | None = None
-    repositories: list[dict[str, Any]] = []
-    ignored = 0
-    issues: list[dict[str, Any]] = []
-    if not profile_absent:
-        try:
-            document = _read_protected_profile(profile_path)
-            service_generation, repositories, ignored, issues = (
-                _current_profile_repository_enrollments(document, now_epoch=now)
-            )
-        except (InstallError, OSError, ValueError) as error:
-            issues = [
-                _profile_database_issue("profile_unavailable", detail=str(error))
-            ]
-    result["ignored_inactive_profile_enrollments"] = ignored
-    if repositories and not path_lexists(database_path):
+    issues: list[dict[str, Any]] = result["issues"]
+    if not path_lexists(profile_path):
+        issues.append(_profile_database_issue("profile_missing"))
+    if not path_lexists(database_path):
         issues.append(_profile_database_issue("database_missing"))
-    database_current_enrollments = 0
-    database_current_ephemeral_templates = 0
-    database_current_ephemeral_acl_bindings = 0
-    if path_lexists(database_path):
-        try:
-            expected_database = _protected_regular_metadata(
-                database_path,
-                label="service authority database",
-            )
-            connection = sqlite3.connect(
-                f"{database_path.resolve(strict=True).as_uri()}?mode=ro",
-                uri=True,
-                isolation_level=None,
-                timeout=5.0,
-            )
-            connection.row_factory = sqlite3.Row
-            try:
-                connection.execute("PRAGMA query_only = ON")
-                connection.execute("BEGIN")
-                enrollment_table = connection.execute(
-                    """
-                    SELECT 1
-                    FROM sqlite_master
-                    WHERE type = 'table' AND name = 'broker_repository_enrollments'
-                    """
-                ).fetchone()
-                ephemeral_template_table = connection.execute(
-                    """
-                    SELECT 1
-                    FROM sqlite_master
-                    WHERE type = 'table' AND name = 'ephemeral_container_templates'
-                    """
-                ).fetchone()
-                ephemeral_acl_table = connection.execute(
-                    """
-                    SELECT 1
-                    FROM sqlite_master
-                    WHERE type = 'table' AND name = 'broker_ephemeral_acl'
-                    """
-                ).fetchone()
-                ephemeral_template_policy_columns = False
-                if ephemeral_template_table is not None:
-                    template_columns = {
-                        str(row["name"])
-                        for row in connection.execute(
-                            "PRAGMA table_info(ephemeral_container_templates)"
-                        )
-                    }
-                    ephemeral_template_policy_columns = {
-                        "secret_policy_kind",
-                        "secret_binding_id",
-                    } <= template_columns
-                if repositories:
-                    generation_row = connection.execute(
-                        "SELECT database_generation FROM schema_metadata WHERE singleton = 1"
-                    ).fetchone()
-                    if generation_row is None:
-                        issues.append(
-                            _profile_database_issue("database_generation_missing")
-                        )
-                    elif str(generation_row["database_generation"]) != service_generation:
-                        issues.append(
-                            _profile_database_issue("database_generation_mismatch")
-                        )
-                    if enrollment_table is None:
-                        issues.append(_profile_database_issue("enrollment_table_missing"))
-                for repository in repositories:
-                    uid = int(repository["uid"])
-                    repo_id = str(repository["repo_id"])
-                    principal = connection.execute(
-                        "SELECT account_id, enabled FROM broker_acl_principals WHERE uid = ?",
-                        (uid,),
-                    ).fetchone()
-                    if principal is None:
-                        issues.append(
-                            _profile_database_issue("principal_missing", uid=uid, repo_id=repo_id)
-                        )
-                    else:
-                        if not bool(principal["enabled"]):
-                            issues.append(
-                                _profile_database_issue(
-                                    "principal_disabled", uid=uid, repo_id=repo_id
-                                )
-                            )
-                        if str(principal["account_id"]) != repository["account_id"]:
-                            issues.append(
-                                _profile_database_issue(
-                                    "principal_account_mismatch", uid=uid, repo_id=repo_id
-                                )
-                            )
-                    stored_repository = connection.execute(
-                        """
-                        SELECT r.canonical_root, r.state, r.generation,
-                               i.status AS installation_status, i.startup_fenced
-                        FROM repositories r
-                        LEFT JOIN repository_installations i USING(repo_id)
-                        WHERE r.repo_id = ?
-                        """,
-                        (repo_id,),
-                    ).fetchone()
-                    if stored_repository is None:
-                        issues.append(
-                            _profile_database_issue(
-                                "repository_missing", uid=uid, repo_id=repo_id
-                            )
-                        )
-                    else:
-                        if (
-                            str(stored_repository["canonical_root"])
-                            != repository["canonical_root"]
-                        ):
-                            issues.append(
-                                _profile_database_issue(
-                                    "repository_root_mismatch", uid=uid, repo_id=repo_id
-                                )
-                            )
-                        if str(stored_repository["state"]) != "active":
-                            issues.append(
-                                _profile_database_issue(
-                                    "repository_state_mismatch", uid=uid, repo_id=repo_id
-                                )
-                            )
-                        if int(stored_repository["generation"]) != repository["generation"]:
-                            issues.append(
-                                _profile_database_issue(
-                                    "repository_generation_mismatch", uid=uid, repo_id=repo_id
-                                )
-                            )
-                        if (
-                            stored_repository["installation_status"] != "installed"
-                            or bool(stored_repository["startup_fenced"])
-                        ):
-                            issues.append(
-                                _profile_database_issue(
-                                    "repository_installation_inactive", uid=uid, repo_id=repo_id
-                                )
-                            )
-                    if enrollment_table is not None:
-                        enrollment = connection.execute(
-                            """
-                            SELECT account_id, enabled, issued_at, valid_until_epoch
-                            FROM broker_repository_enrollments
-                            WHERE uid = ? AND repo_id = ?
-                            """,
-                            (uid, repo_id),
-                        ).fetchone()
-                        if enrollment is None:
-                            issues.append(
-                                _profile_database_issue(
-                                    "enrollment_missing", uid=uid, repo_id=repo_id
-                                )
-                            )
-                        else:
-                            if not bool(enrollment["enabled"]):
-                                issues.append(
-                                    _profile_database_issue(
-                                        "enrollment_disabled", uid=uid, repo_id=repo_id
-                                    )
-                                )
-                            if (
-                                str(enrollment["account_id"])
-                                != repository["account_id"]
-                            ):
-                                issues.append(
-                                    _profile_database_issue(
-                                        "enrollment_account_mismatch",
-                                        uid=uid,
-                                        repo_id=repo_id,
-                                    )
-                                )
-                            if str(enrollment["issued_at"]) != repository["issued_at"]:
-                                issues.append(
-                                    _profile_database_issue(
-                                        "enrollment_issued_at_mismatch",
-                                        uid=uid,
-                                        repo_id=repo_id,
-                                    )
-                                )
-                            enrollment_expiry = int(enrollment["valid_until_epoch"])
-                            if now >= enrollment_expiry:
-                                issues.append(
-                                    _profile_database_issue(
-                                        "enrollment_expired", uid=uid, repo_id=repo_id
-                                    )
-                                )
-                            if enrollment_expiry != repository["valid_until_epoch"]:
-                                issues.append(
-                                    _profile_database_issue(
-                                        "enrollment_expiry_mismatch",
-                                        uid=uid,
-                                        repo_id=repo_id,
-                                    )
-                                )
-                    (
-                        ephemeral_issues,
-                        checked_templates,
-                        checked_acl_bindings,
-                    ) = _ephemeral_profile_database_issues(
-                        connection,
-                        repository=repository,
-                        template_table_exists=ephemeral_template_table is not None,
-                        template_policy_columns_available=ephemeral_template_policy_columns,
-                        acl_table_exists=ephemeral_acl_table is not None,
-                    )
-                    issues.extend(ephemeral_issues)
-                    database_current_ephemeral_templates += checked_templates
-                    database_current_ephemeral_acl_bindings += checked_acl_bindings
-                if enrollment_table is not None:
-                    profile_by_identity = {
-                        (int(repository["uid"]), str(repository["repo_id"])): repository
-                        for repository in repositories
-                    }
-                    database_enrollments = connection.execute(
-                        """
-                        SELECT uid, repo_id, account_id, issued_at, valid_until_epoch
-                        FROM broker_repository_enrollments
-                        WHERE enabled = 1 AND valid_until_epoch > ?
-                        ORDER BY uid, repo_id
-                        """,
-                        (now,),
-                    ).fetchall()
-                    database_current_enrollments = len(database_enrollments)
-                    for enrollment in database_enrollments:
-                        uid = int(enrollment["uid"])
-                        repo_id = str(enrollment["repo_id"])
-                        repository = profile_by_identity.get((uid, repo_id))
-                        if repository is None:
-                            issues.append(
-                                _profile_database_issue(
-                                    "profile_enrollment_missing", uid=uid, repo_id=repo_id
-                                )
-                            )
-                        elif str(enrollment["account_id"]) != repository["account_id"]:
-                            # The forward comparison emits the same mismatch, but
-                            # retaining this branch makes the reverse proof
-                            # independently complete.
-                            if not any(
-                                issue.get("reason") == "enrollment_account_mismatch"
-                                and issue.get("uid") == uid
-                                and issue.get("repo_id") == repo_id
-                                for issue in issues
-                            ):
-                                issues.append(
-                                    _profile_database_issue(
-                                        "enrollment_account_mismatch",
-                                        uid=uid,
-                                        repo_id=repo_id,
-                                    )
-                                )
-                        else:
-                            reverse_mismatches = (
-                                (
-                                    "enrollment_issued_at_mismatch",
-                                    str(enrollment["issued_at"])
-                                    != repository["issued_at"],
-                                ),
-                                (
-                                    "enrollment_expiry_mismatch",
-                                    int(enrollment["valid_until_epoch"])
-                                    != repository["valid_until_epoch"],
-                                ),
-                            )
-                            for reason, mismatched in reverse_mismatches:
-                                if mismatched and not any(
-                                    issue.get("reason") == reason
-                                    and issue.get("uid") == uid
-                                    and issue.get("repo_id") == repo_id
-                                    for issue in issues
-                                ):
-                                    issues.append(
-                                        _profile_database_issue(
-                                            reason, uid=uid, repo_id=repo_id
-                                        )
-                                    )
-                connection.execute("ROLLBACK")
-            finally:
-                connection.close()
-            current_database = database_path.lstat()
-            if (current_database.st_dev, current_database.st_ino) != (
-                expected_database.st_dev,
-                expected_database.st_ino,
-            ):
-                issues.append(_profile_database_issue("database_replaced_during_check"))
-        except (InstallError, OSError, sqlite3.Error, TypeError, ValueError) as error:
-            issues.append(
-                _profile_database_issue("database_unavailable", detail=str(error))
-            )
-    result["checked_current_enrollments"] = len(repositories)
-    result["checked_current_database_enrollments"] = database_current_enrollments
-    result["checked_current_ephemeral_templates"] = (
-        database_current_ephemeral_templates
-    )
-    result["checked_current_ephemeral_acl_bindings"] = (
-        database_current_ephemeral_acl_bindings
-    )
     if issues:
-        result.update(
-            {
-                "ok": False,
-                "code": PROFILE_DATABASE_ENROLLMENT_DRIFT,
-                "status": "drift",
-                "issues": issues,
-            }
+        result["ok"] = False
+        result["code"] = "profile_database_routing_drift"
+        return result
+    try:
+        document = _read_protected_profile(profile_path)
+        service_generation, routes, parse_issues = _profile_repository_routes(
+            document
         )
-    else:
-        if profile_absent:
-            result["status"] = "profile_absent"
-        elif not repositories:
-            result["status"] = "no_current_profile_enrollments"
-        else:
-            result["status"] = "matched"
+        issues.extend(parse_issues)
+        expected_database = _protected_regular_metadata(
+            database_path, label="service authority database"
+        )
+        connection = sqlite3.connect(
+            f"{database_path.resolve(strict=True).as_uri()}?mode=ro",
+            uri=True,
+            isolation_level=None,
+            timeout=5.0,
+        )
+        connection.row_factory = sqlite3.Row
+        try:
+            connection.execute("PRAGMA query_only = ON")
+            connection.execute("BEGIN")
+            metadata = connection.execute(
+                "SELECT schema_version, database_generation, migration_state "
+                "FROM schema_metadata WHERE singleton = 1"
+            ).fetchone()
+            target_schema, _parser, _error, _fields = (
+                _target_broker_activation_contract()
+            )
+            if (
+                metadata is None
+                or int(metadata["schema_version"]) != target_schema
+                or str(metadata["migration_state"]) != "ready"
+                or str(metadata["database_generation"]) != service_generation
+            ):
+                issues.append(
+                    _profile_database_issue("database_generation_mismatch")
+                )
+            database_routes = connection.execute(
+                """
+                SELECT r.repo_id, r.canonical_root, r.generation
+                FROM repositories r
+                JOIN repository_installations i USING(repo_id)
+                WHERE r.state = 'active' AND i.status = 'installed'
+                  AND i.startup_fenced = 0
+                ORDER BY r.canonical_root, r.repo_id
+                """
+            ).fetchall()
+            route_index = {str(item["repo_id"]): item for item in routes}
+            database_index = {
+                str(item["repo_id"]): item for item in database_routes
+            }
+            if set(route_index) != set(database_index):
+                issues.append(
+                    _profile_database_issue("repository_catalog_mismatch")
+                )
+            for repo_id in sorted(set(route_index) & set(database_index)):
+                route = route_index[repo_id]
+                stored = database_index[repo_id]
+                if (
+                    route["canonical_root"] != str(stored["canonical_root"])
+                    or route["generation"] != int(stored["generation"])
+                ):
+                    issues.append(
+                        _profile_database_issue(
+                            "repository_route_mismatch", repo_id=repo_id
+                        )
+                    )
+                templates = connection.execute(
+                    """
+                    SELECT name, template_id, secret_policy_kind,
+                           secret_binding_id
+                    FROM ephemeral_container_templates
+                    WHERE repo_id = ? AND enabled = 1
+                    ORDER BY name
+                    """,
+                    (repo_id,),
+                ).fetchall()
+                expected_templates = {
+                    str(item["name"]): str(item["template_id"])
+                    for item in templates
+                }
+                expected_policies = {
+                    str(item["name"]): {
+                        "policy": str(item["secret_policy_kind"]),
+                        "binding_id": str(item["secret_binding_id"]),
+                    }
+                    for item in templates
+                    if item["secret_policy_kind"] is not None
+                }
+                if route["ephemeral_templates"] != expected_templates:
+                    issues.append(
+                        _profile_database_issue(
+                            "ephemeral_template_catalog_mismatch",
+                            repo_id=repo_id,
+                        )
+                    )
+                if route["ephemeral_secret_policies"] != expected_policies:
+                    issues.append(
+                        _profile_database_issue(
+                            "ephemeral_secret_catalog_mismatch",
+                            repo_id=repo_id,
+                        )
+                    )
+                result["checked_ephemeral_templates"] += len(templates)
+            connection.execute("COMMIT")
+        except BaseException:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+            raise
+        finally:
+            connection.close()
+        current_database = database_path.lstat()
+        if (current_database.st_dev, current_database.st_ino) != (
+            expected_database.st_dev,
+            expected_database.st_ino,
+        ):
+            issues.append(
+                _profile_database_issue("database_replaced_during_check")
+            )
+        result["checked_routes"] = len(routes)
+    except (InstallError, OSError, sqlite3.Error, ValueError) as error:
+        issues.append(
+            _profile_database_issue(
+                "routing_check_unavailable", detail=str(error)[:1024]
+            )
+        )
+    result["ok"] = not issues
+    if issues:
+        result["code"] = "profile_database_routing_drift"
     return result
-
 
 def _profile_database_repair_guidance(result: dict[str, Any]) -> str:
     reasons = {
@@ -2870,32 +2138,30 @@ def _profile_database_repair_guidance(result: dict[str, Any]) -> str:
         )
     if any("ephemeral" in reason for reason in reasons):
         steps.append(
-            "rerun exact administrator repository enrollment to republish the "
-            "sealed ephemeral template identities and their policy-derived per-UID "
-            "grants (including descriptor delivery only for credential-policy templates)"
+            "republish the host-wide route catalog with the exact ephemeral "
+            "template and credential-policy identities"
         )
     if steps:
-        steps.append("then run the explicit offline profile-enrollment backfill")
+        steps.append("then republish the host-wide route catalog")
     else:
         steps.append(
-            "run the explicit offline profile-enrollment backfill for absent rows and "
-            "resolve any reported conflicting row through administrator "
-            "enrollment or revocation"
+            "republish the host-wide route catalog after resolving the reported "
+            "resource identity conflict"
         )
     steps.append("then rerun plan and verify")
     return ", ".join(steps)
 
 
-def require_profile_database_enrollment_consistency() -> dict[str, Any]:
-    result = profile_database_enrollment_check()
+def require_profile_database_routing_consistency() -> dict[str, Any]:
+    result = profile_database_routing_check()
     if result["ok"]:
         return result
     reasons = ", ".join(
         sorted({str(issue.get("reason")) for issue in result["issues"]})
     )
-    raise ProfileDatabaseEnrollmentDrift(
-        f"{PROFILE_DATABASE_ENROLLMENT_DRIFT}: protected profile access is not "
-        f"represented by current service database enrollment state ({reasons}); "
+    raise ProfileDatabaseRoutingDrift(
+        f"{PROFILE_DATABASE_ROUTING_DRIFT}: the published host route catalog "
+        f"differs from current service state ({reasons}); "
         f"{_profile_database_repair_guidance(result)} before restart"
     )
 
@@ -2980,9 +2246,8 @@ def activation_authority_contract_check(
 ) -> dict[str, Any]:
     """Prove schema/profile compatibility before any activation lifecycle work.
 
-    It executes the target broker parser for every protected client and
-    requires an existing authority database to match the target broker schema
-    exactly. No compatibility inference is allowed.
+    It executes the target host-wide route parser once and requires an existing
+    authority database to match the target broker schema exactly.
     """
 
     target_schema, parse_profile, profile_error, _repository_fields = (
@@ -2995,7 +2260,6 @@ def activation_authority_contract_check(
         "profile": os.fspath(profile_path),
         "target_broker_schema": target_schema,
         "authority_database_schema": None,
-        "checked_profile_clients": [],
         "checked_profile_repositories": 0,
         "issues": [],
     }
@@ -3033,94 +2297,22 @@ def activation_authority_contract_check(
                 )
             )
         else:
-            clients = document.get("clients")
-            client_uids: list[int] = []
-            if isinstance(clients, dict) and clients:
-                for uid_raw in sorted(clients, key=str):
-                    try:
-                        uid = int(uid_raw)
-                    except (TypeError, ValueError):
-                        issues.append(
-                            _profile_database_issue(
-                                "profile_target_client_uid_invalid",
-                                uid=str(uid_raw)[:128],
-                            )
-                        )
-                        continue
-                    if uid < 0 or str(uid) != str(uid_raw):
-                        issues.append(
-                            _profile_database_issue(
-                                "profile_target_client_uid_invalid",
-                                uid=str(uid_raw)[:128],
-                            )
-                        )
-                        continue
-                    client_uids.append(uid)
+            try:
+                parsed = parse_profile(document, effective_uid=0)
+            except profile_error as error:
+                issues.append(
+                    _profile_database_issue(
+                        "profile_target_contract_invalid", detail=str(error)[:1024]
+                    )
+                )
+            except Exception as error:
+                issues.append(
+                    _profile_database_issue(
+                        "profile_target_contract_invalid", detail=str(error)[:1024]
+                    )
+                )
             else:
-                # Exercise the target parser even when the root/client shape is
-                # invalid; otherwise an empty protected profile could bypass
-                # the client contract simply because there was nothing to loop.
-                client_uids.append(0)
-
-            checked_uids: list[int] = evidence["checked_profile_clients"]
-            checked_repository_roots: set[str] = set()
-            for uid in client_uids:
-                raw_client = clients.get(str(uid)) if isinstance(clients, dict) else None
-                missing_owner_indexes: list[int] = []
-                if isinstance(raw_client, dict):
-                    repositories = raw_client.get("repositories")
-                    if isinstance(repositories, list):
-                        missing_owner_indexes = [
-                            index
-                            for index, repository in enumerate(repositories)
-                            if isinstance(repository, dict) and "owner_uid" not in repository
-                        ]
-                try:
-                    parsed = parse_profile(
-                        document,
-                        effective_uid=uid,
-                    )
-                except profile_error as error:
-                    reason = (
-                        "profile_repository_owner_uid_missing"
-                        if missing_owner_indexes
-                        else "profile_target_contract_invalid"
-                    )
-                    issue = _profile_database_issue(
-                        reason,
-                        uid=uid,
-                        detail=str(error)[:1024],
-                    )
-                    if missing_owner_indexes:
-                        issue["repository_indexes"] = missing_owner_indexes
-                    issues.append(issue)
-                    continue
-                except Exception as error:
-                    issues.append(
-                        _profile_database_issue(
-                            "profile_target_contract_invalid",
-                            uid=uid,
-                            detail=str(error)[:1024],
-                        )
-                    )
-                    continue
-                if missing_owner_indexes:
-                    issue = _profile_database_issue(
-                        "profile_repository_owner_uid_missing",
-                        uid=uid,
-                        detail=(
-                            "target parser accepted a merged profile containing "
-                            "repository entries without owner_uid"
-                        ),
-                    )
-                    issue["repository_indexes"] = missing_owner_indexes
-                    issues.append(issue)
-                    continue
-                checked_uids.append(uid)
-                checked_repository_roots.update(parsed.repositories)
-            evidence["checked_profile_repositories"] = len(
-                checked_repository_roots
-            )
+                evidence["checked_profile_repositories"] = len(parsed.repositories)
 
     if issues:
         evidence["ok"] = False
@@ -3172,13 +2364,13 @@ def desired_plan(names: list[str]) -> dict[str, Any]:
     source_policy = require_managed_docker_source_policy()
     docker_admission = docker_socket_admission_evidence(clients)
     home_write_paths = enrolled_home_write_paths(clients)
-    restart_precondition = profile_database_enrollment_check()
+    restart_precondition = profile_database_routing_check()
     repair_guidance = _profile_database_repair_guidance(restart_precondition)
     restart_step = (
         "rerun verify, then start or restart devcoordinator-broker.service"
         if restart_precondition["ok"]
         else (
-            f"stop before service restart; resolve {PROFILE_DATABASE_ENROLLMENT_DRIFT} "
+            f"stop before service restart; resolve {PROFILE_DATABASE_ROUTING_DRIFT} "
             f"as follows: {repair_guidance}"
         )
     )
@@ -3243,10 +2435,9 @@ def desired_plan(names: list[str]) -> dict[str, Any]:
                     "transactionally remove only its exact legacy 90-docker-config.conf"
                 ),
                 (
-                    "atomically replace the broker writable-home drop-in from the "
-                    "complete explicit client set"
+                "publish the broker's trusted-local global /home sandbox view"
                 ),
-                "enroll every exact client UID, repository, and server allowlist",
+                "publish the host-wide repository and resource route catalog",
                 restart_step,
                 "register each pre-existing listener from its owning non-root UID",
                 "verify the listener in shared inventory and DevOps Console",
@@ -3264,13 +2455,12 @@ def desired_plan(names: list[str]) -> dict[str, Any]:
     }
     if restart_precondition["ok"]:
         plan["next_step"] = (
-            "Run broker enroll once per user/repository with repeated --server allowlists, "
-            "then rerun verify immediately before the journal-bound activate action "
-            "starts devcoordinator-broker.service with the replaced enrolled-home drop-in."
+            "Rerun verify immediately before the journal-bound activate action "
+            "starts devcoordinator-broker.service."
         )
     else:
         plan["next_step"] = (
-            f"Resolve {PROFILE_DATABASE_ENROLLMENT_DRIFT}: {repair_guidance}. "
+            f"Resolve {PROFILE_DATABASE_ROUTING_DRIFT}: {repair_guidance}. "
             "Do not restart the broker."
         )
     return plan
@@ -3732,7 +2922,7 @@ def apply_install(names: list[str], transaction_raw: str, allow_noncanonical: bo
         raise InstallError("apply requires root once; clients require no sudo afterward")
     validate_broker_unit_source()
     require_managed_docker_source_policy()
-    restart_precondition = require_profile_database_enrollment_consistency()
+    restart_precondition = require_profile_database_routing_consistency()
     require_runtime_dependencies()
     transaction = Path(transaction_raw)
     if not transaction.is_absolute() or transaction.exists() or transaction.is_symlink():
@@ -3868,7 +3058,7 @@ def apply_install(names: list[str], transaction_raw: str, allow_noncanonical: bo
         # profile/database change from turning the returned restart guidance
         # into a stale authorization claim.
         journal["restart_precondition"] = (
-            require_profile_database_enrollment_consistency()
+            require_profile_database_routing_consistency()
         )
         atomic_json(transaction / JOURNAL_NAME, journal)
         run(command("systemctl"), "daemon-reload")
@@ -3987,18 +3177,18 @@ def activate_install(
     # This target-contract proof is intentionally activation-only and runs
     # before even the installed-unit verifier inspects systemd.  Staging an
     # installer transaction against schema 12 remains possible, but the target
-    # schema-13 broker cannot reach lifecycle inspection or mutation until the
-    # sealed owner migration and strict profile republication have completed.
+    # A broker cannot reach lifecycle inspection or mutation until the exact
+    # supported schema migration and host-wide route publication have completed.
     authority_contract = activation_authority_contract_check()
     verification = verify_install(requested_clients)
     if not verification.get("ok"):
         raise InstallError("current server-wide installation verification failed")
-    current_precondition = require_profile_database_enrollment_consistency()
+    current_precondition = require_profile_database_routing_consistency()
     if (
         current_precondition != document.get("restart_precondition")
         or current_precondition != verification.get("restart_precondition")
     ):
-        raise InstallError("broker activation enrollment proof changed after apply")
+        raise InstallError("broker activation route proof changed after apply")
 
     if document.get("status") == "activated":
         if not isinstance(activation, dict) or activation.get("phase") != "ready":
@@ -4195,7 +3385,7 @@ def verify_install(names: list[str]) -> dict[str, Any]:
     )
     restart_precondition = plan["restart_precondition"]
     if not restart_precondition["ok"]:
-        failure_codes.append(PROFILE_DATABASE_ENROLLMENT_DRIFT)
+        failure_codes.append(PROFILE_DATABASE_ROUTING_DRIFT)
         reasons = ", ".join(
             sorted(
                 {
@@ -4205,8 +3395,8 @@ def verify_install(names: list[str]) -> dict[str, Any]:
             )
         )
         failures.append(
-            f"{PROFILE_DATABASE_ENROLLMENT_DRIFT}: protected profile and service "
-            f"database enrollment differ ({reasons}); do not restart the broker"
+            f"{PROFILE_DATABASE_ROUTING_DRIFT}: published routes and current service "
+            f"state differ ({reasons}); do not restart the broker"
         )
     dependency_evidence = runtime_dependency_evidence()
     dependency_failure = runtime_dependency_failure(dependency_evidence)
@@ -4244,7 +3434,7 @@ def verify_install(names: list[str]) -> dict[str, Any]:
             or ENROLLED_HOME_DROPIN.read_bytes() != expected_home_dropin
         ):
             failures.append(
-                "enrolled-home writable-path drop-in does not match the complete client set"
+                "trusted-local home drop-in does not publish the global /home sandbox"
             )
     unit_guard = ROOT / "scripts/check_broker_shutdown_unit.py"
     completed_unit_guard = subprocess.run(

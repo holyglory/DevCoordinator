@@ -947,7 +947,7 @@ private struct ActivityIncidentDetail: View {
 
     private var whatHappened: String {
         if isRetirement && fingerprintChanged {
-            return "The retirement failed because the host resource controller fingerprint changed after the retirement plan was reviewed but before the retire action executed."
+            return "The retirement failed because the host resource observation fingerprint changed after the retirement plan was reviewed but before the retire action executed."
         }
         if let failure = incident.result?.failure, !failure.isEmpty { return failure }
         if let issue = incident.issue { return issue.summary }
@@ -984,7 +984,7 @@ private struct ActivityIncidentDetail: View {
             return "The confirmed operation remains fenced and may already have host effects. Inspect retained evidence before retrying the exact operation."
         }
         if isRetirement && fingerprintChanged {
-            return "The controller fingerprint changed, indicating a modification to the host resource controller or its configuration since the plan was created. No retirement mutation was performed."
+            return "The observation fingerprint changed, indicating a modification to the host resource or its configuration since the plan was created. No retirement mutation was performed."
         }
         if typedFailurePayload?.mutationPerformed == false {
             return "No host mutation was performed. The coordinator rejected the operation before changing the resource."
@@ -1024,7 +1024,7 @@ private struct ActivityIncidentDetail: View {
         } else if isRetirement && fingerprintChanged {
             steps = [
                 "Refresh the latest resource state and re-plan the retirement.",
-                "Review the controller fingerprint and confirm no unintended changes.",
+                "Review the observation fingerprint and confirm no unintended changes.",
                 "Re-run the retirement plan once validated.",
             ]
         } else if incident.phase == .succeeded {

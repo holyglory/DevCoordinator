@@ -8,6 +8,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import sqlite3
 import stat
 import sys
 import tempfile
@@ -127,7 +128,6 @@ def inventory_with_unassigned_database(*, include_database_problem: bool) -> dic
             "servers": [],
             "repositories": [],
             "repository_trees": [],
-            "memberships": [],
             "unassigned_resources": [
                 {
                     "resource_kind": "container",
@@ -229,6 +229,92 @@ def main() -> int:
         ),
         "tree server assigned to the wrong repository",
     )
+
+    # A predecessor release could retain a checksummed schema-3 generation
+    # whose repository association disagrees with its tree.  Reads must admit
+    # that one transition source so the observer can replace it, while every
+    # new publication remains strict.
+    with tempfile.TemporaryDirectory(prefix="inventory-association-upgrade-") as raw:
+        root = Path(raw)
+        database = root / "inventory.sqlite3"
+        publication = root / "inventory.publication"
+        valid_first = envelope(
+            generation=1,
+            inventory=inventory_with_server("legacy-server"),
+            published_at="2026-07-28T00:00:00.000Z",
+        )
+        initialize_inventory_store(
+            database,
+            valid_first,
+            owner_uid=os.geteuid(),
+            owner_gid=os.getegid(),
+        )
+        legacy_inventory = inventory_with_server("legacy-server")
+        legacy_inventory["schema_version"] = 3
+        legacy_inventory["resources"]["servers"][0]["repo_id"] = "repo-old"
+        legacy_payload = {
+            "schema_version": valid_first["schema_version"],
+            "generation": 1,
+            "published_at": valid_first["published_at"],
+            "inventory": legacy_inventory,
+        }
+        legacy = {
+            **legacy_payload,
+            "payload_sha256": INVENTORY_STORE._digest(legacy_payload),
+        }
+        encoded = INVENTORY_STORE._canonical(legacy)
+        with sqlite3.connect(database) as connection:
+            connection.execute(
+                "UPDATE inventory_publications "
+                "SET payload_sha256 = ?, envelope_json = ?, logical_bytes = ? "
+                "WHERE generation = 1",
+                (legacy["payload_sha256"], encoded, len(encoded)),
+            )
+            connection.commit()
+        publication.write_text(
+            json.dumps(legacy, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        publication.chmod(0o644)
+        expect(
+            verify_inventory_store(
+                database,
+                publication,
+                expected_owner_uid=os.geteuid(),
+            )["generation"]
+            == 1,
+            "legacy association generation was not admitted for transition",
+        )
+        must_fail(
+            lambda: publish_projection(
+                publication,
+                legacy,
+                owner_uid=os.geteuid(),
+                owner_gid=os.getegid(),
+            ),
+            "new publication with a legacy repository association",
+        )
+        current = envelope(
+            generation=2,
+            inventory=inventory_with_server("current-server"),
+            published_at="2026-07-28T00:00:01.000Z",
+        )
+        publish_retained_inventory(
+            database=database,
+            publication=publication,
+            value=current,
+            owner_uid=os.geteuid(),
+            owner_gid=os.getegid(),
+        )
+        expect(
+            verify_inventory_store(
+                database,
+                publication,
+                expected_owner_uid=os.geteuid(),
+            )["generation"]
+            == 2,
+            "strict current inventory did not replace the legacy association",
+        )
     duplicate_claim = inventory_with_server("duplicate-server")
     duplicate_claim["repository_trees"][0]["scopes"][0]["server_ids"].append(
         "duplicate-server"
@@ -281,13 +367,6 @@ def main() -> int:
             "host_id": "host-1",
             "canonical_root": "/repo",
             "display_name": "repo",
-        }
-    ]
-    assigned_parent["memberships"] = [
-        {
-            "resource_kind": "container",
-            "host_resource_id": "container-unassigned-1",
-            "repo_id": "repo-1",
         }
     ]
     assigned_parent["repository_trees"] = [
@@ -372,7 +451,6 @@ def main() -> int:
         initial_inventory = loaded["inventory"]
         expect(
             initial_inventory["repository_trees"] == []
-            and initial_inventory["memberships"] == []
             and initial_inventory["resources"] == {
                 "servers": [], "docker": [], "docker_ports": [], "databases": []
             }
@@ -481,10 +559,19 @@ def main() -> int:
         )
         try:
             OBSERVER.api_json = successful_api
-            second = OBSERVER.refresh_once(
-                args,
-                loaded,
-                group_id=os.getegid(),
+            with mock.patch.object(
+                OBSERVER,
+                "verify_inventory_store",
+                wraps=OBSERVER.verify_inventory_store,
+            ) as hot_path_verify:
+                second = OBSERVER.refresh_once(
+                    args,
+                    loaded,
+                    group_id=os.getegid(),
+                )
+            expect(
+                hot_path_verify.call_args.kwargs.get("integrity_check") is False,
+                "observer refresh performed a full SQLite integrity scan",
             )
             expect(second["generation"] == 2, "observer did not advance generation")
             stored_second = verify_inventory_store(

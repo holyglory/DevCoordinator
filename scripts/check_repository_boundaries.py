@@ -29,7 +29,7 @@ PRIVATE_DIRECTORY_NAMES = {
     "secrets",
 }
 CANONICAL_IMAGE = re.compile(
-    r"^apps/(?:CodexOpsConsole|DevOpsBoard|DevOpsConsole)/Artifacts/Canonical/[^/]+\.(?:png|jpg|jpeg)$",
+    r"^apps/(?:CodexOpsConsole|DevOpsBoard|DevOpsConsole)/Artifacts/(?:Canonical/[^/]+|Design/[^/]+-selected-reference)\.(?:png|jpg|jpeg)$",
     re.IGNORECASE,
 )
 SECRET_CONTENT_PATTERNS = (
@@ -166,7 +166,7 @@ class Finding:
 
 def git(repo: Path, *args: str, text: bool = True) -> str | bytes:
     completed = subprocess.run(
-        ["git", *args],
+        ["git", "-c", f"safe.directory={repo}", *args],
         cwd=repo,
         text=text,
         stdout=subprocess.PIPE,
@@ -180,6 +180,12 @@ def git(repo: Path, *args: str, text: bool = True) -> str | bytes:
 
 
 def tracked_paths(repo: Path) -> list[str]:
+    if not (repo / ".git").exists():
+        return sorted(
+            path.relative_to(repo).as_posix()
+            for path in repo.rglob("*")
+            if path.is_file() and not path.is_symlink()
+        )
     output = git(repo, "ls-files", "-z", text=False)
     assert isinstance(output, bytes)
     return sorted(item.decode("utf-8") for item in output.split(b"\0") if item)
@@ -232,6 +238,28 @@ def forbidden_history_path(path: str) -> str | None:
     if any(part.lower() in PRIVATE_DIRECTORY_NAMES for part in value.parts):
         return "runtime secret/state/backup path"
     return None
+
+
+def validate_selected_design_provenance(
+    image_path: str,
+    image: bytes,
+    provenance: object,
+) -> None:
+    if not isinstance(provenance, dict):
+        raise ValueError("selected-design provenance must be an object")
+    if provenance.get("artifact_kind") != "selected-product-design-reference":
+        raise ValueError("artifact_kind is not selected-product-design-reference")
+    if provenance.get("repository_path") != image_path:
+        raise ValueError("repository_path does not match selected design")
+    if provenance.get("sha256") != hashlib.sha256(image).hexdigest():
+        raise ValueError("image SHA-256 does not match sidecar")
+    if provenance.get("bytes") != len(image):
+        raise ValueError("image byte count does not match sidecar")
+    origin = provenance.get("origin")
+    if not isinstance(origin, dict) or origin.get("kind") != "openai-image-generation-result":
+        raise ValueError("selected design lacks generated-image origin")
+    if not isinstance(origin.get("generation_event"), str) or not origin["generation_event"]:
+        raise ValueError("selected design lacks generation identity")
 
 
 def known_historical_source_drift(
@@ -634,25 +662,23 @@ def scan_tip(repo: Path) -> list[Finding]:
             Finding("packaged-helper-set", "apps/DevOpsBoard/Tools/package_app.py", "packager must name exactly two helpers")
         )
 
-    console_artifacts = repo / "apps/DevOpsConsole/Artifacts/Canonical"
-    if console_artifacts.is_dir():
-        for sidecar in sorted(console_artifacts.glob("*.png.provenance.json")):
+    console_design_artifacts = repo / "apps/DevOpsConsole/Artifacts/Design"
+    if console_design_artifacts.is_dir():
+        for image in sorted(console_design_artifacts.glob("*-selected-reference.png")):
+            sidecar = Path(f"{image}.provenance.json")
             try:
-                provenance = json.loads(sidecar.read_text(encoding="utf-8"))
-                records = provenance["source_files"]
-                current = []
-                for record in records:
-                    source_path = repo / record["path"]
-                    digest = hashlib.sha256(source_path.read_bytes()).hexdigest()
-                    if digest != record["sha256"]:
-                        raise ValueError(f"source hash drift: {record['path']}")
-                    current.append({"path": record["path"], "sha256": digest})
-                aggregate = "".join(f"{item['path']}\0{item['sha256']}\n" for item in current)
-                if hashlib.sha256(aggregate.encode("utf-8")).hexdigest() != provenance["source_sha256"]:
-                    raise ValueError("aggregate source hash drift")
-            except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+                validate_selected_design_provenance(
+                    image.relative_to(repo).as_posix(),
+                    image.read_bytes(),
+                    json.loads(sidecar.read_text(encoding="utf-8")),
+                )
+            except (OSError, TypeError, ValueError, json.JSONDecodeError) as error:
                 findings.append(
-                    Finding("console-artifact-source-provenance", sidecar.relative_to(repo).as_posix(), str(error))
+                    Finding(
+                        "console-selected-design-provenance",
+                        image.relative_to(repo).as_posix(),
+                        str(error),
+                    )
                 )
 
     board_root = repo / "apps/DevOpsBoard"
@@ -758,6 +784,13 @@ def scan_history(repo: Path) -> list[Finding]:
                 sidecar_raw = git(repo, "show", f"{commit}:{sidecar_path}")
                 assert isinstance(image, bytes) and isinstance(sidecar_raw, str)
                 provenance = json.loads(sidecar_raw)
+                if "/Artifacts/Design/" in image_path:
+                    validate_selected_design_provenance(
+                        image_path,
+                        image,
+                        provenance,
+                    )
+                    continue
                 if provenance.get("source") != "isolated-test-fixture":
                     raise ValueError("source is not isolated-test-fixture")
                 if provenance.get("sha256") != hashlib.sha256(image).hexdigest():
@@ -841,8 +874,9 @@ def scan_history(repo: Path) -> list[Finding]:
 
 
 def scan(repo: Path) -> dict[str, object]:
+    history = scan_history(repo) if (repo / ".git").exists() else []
     findings = sorted(
-        set([*scan_tip(repo), *scan_history(repo)]),
+        set([*scan_tip(repo), *history]),
         key=lambda item: (item.rule, item.path, item.detail),
     )
     return {

@@ -23,22 +23,13 @@ from typing import Any, Callable, Iterable, Mapping
 from urllib.parse import quote
 import uuid
 
-from .repository_owner_authority import (
-    RepositoryOwnerAuthorityError,
-    load_sealed_owner_map,
-    validate_owner_map,
-)
-from .repository_execution_scope import (
-    RepositoryExecutionScopeError,
-    repository_execution_scope,
-)
-from .schema import PRE_OWNER_AUTHORITY_SCHEMA_VERSION, SCHEMA_VERSION
+from .schema import SCHEMA_VERSION
 from .worker_native import project_repository_slice
 
 
 AUDIT_KIND = "devcoordinator-project-runtime-isolation-audit"
 LEDGER_KIND = "devcoordinator-project-runtime-isolation-migration-ledger"
-CONTRACT_VERSION = 2
+CONTRACT_VERSION = 3
 REPORT_MAX_BYTES = 8 * 1024 * 1024
 MAX_RESOURCES = 100_000
 MAX_CGROUP_BYTES = 4096
@@ -155,10 +146,7 @@ def _metadata(connection: sqlite3.Connection) -> dict[str, Any]:
         FROM schema_metadata WHERE singleton = 1
         """
     ).fetchone()
-    if row is None or int(row["schema_version"]) not in {
-        PRE_OWNER_AUTHORITY_SCHEMA_VERSION,
-        SCHEMA_VERSION,
-    }:
+    if row is None or int(row["schema_version"]) != SCHEMA_VERSION:
         raise ProjectIsolationError("authority database schema is unsupported")
     hosts = connection.execute(
         "SELECT host_id FROM hosts ORDER BY host_id"
@@ -174,126 +162,48 @@ def _metadata(connection: sqlite3.Connection) -> dict[str, Any]:
     }
 
 
-def _repository_owner_uids_v13(
+def _repository_execution_uids(
     connection: sqlite3.Connection,
 ) -> dict[str, int]:
-    try:
-        execution_scope = repository_execution_scope(connection)
-    except RepositoryExecutionScopeError as error:
+    execution_uid = os.geteuid()
+    if execution_uid <= 0:
         raise ProjectIsolationError(
-            f"repository execution scope is invalid: {error}"
-        ) from error
-    executable_ids = {
-        str(item["repository_id"])
-        for item in execution_scope["executable_repositories"]
-    }
+            "runtime isolation capture requires the non-root developer service account"
+        )
     rows = connection.execute(
         """
-        SELECT repository.repo_id,
-               repository.generation AS repository_generation,
-               owner.owner_uid,
-               owner.repository_generation AS owner_repository_generation
+        SELECT repository.repo_id
         FROM repositories AS repository
-        LEFT JOIN repository_owners AS owner USING(repo_id)
+        JOIN repository_installations AS installation USING(repo_id)
+        WHERE repository.state = 'active' AND installation.status != 'disabled'
         ORDER BY repository.repo_id
         """
     ).fetchall()
-    owners: dict[str, int] = {}
-    for row in rows:
-        repository_id = str(row["repo_id"])
-        if repository_id not in executable_ids:
-            continue
-        owner_uid = row["owner_uid"]
-        owner_generation = row["owner_repository_generation"]
-        if (
-            owner_uid is None
-            or type(owner_uid) is not int
-            or owner_uid <= 0
-            or owner_generation is None
-            or int(owner_generation) != int(row["repository_generation"])
-        ):
-            raise ProjectIsolationError(
-                "repository owner authority is missing or generation-stale"
-            )
-        owners[repository_id] = int(owner_uid)
-    if set(owners) != executable_ids:
-        raise ProjectIsolationError(
-            "repository owner authority does not cover the executable scope"
-        )
-    return owners
+    return {str(row["repo_id"]): execution_uid for row in rows}
 
 
-def _repository_owner_uids_v12(
+def _repository_execution_context(
     connection: sqlite3.Connection,
-    *,
-    owner_map_path: Path | None,
-) -> tuple[dict[str, int], dict[str, Any]]:
-    if owner_map_path is None:
-        raise ProjectIsolationError(
-            "schema-12 isolation capture requires a sealed repository owner map"
-        )
-    if os.geteuid() != 0:
-        raise ProjectIsolationError(
-            "schema-12 isolation capture requires root-owned owner-map authority"
-        )
-    try:
-        document = load_sealed_owner_map(owner_map_path, expected_owner_uid=0)
-        validated = validate_owner_map(connection, document)
-    except (OSError, RepositoryOwnerAuthorityError) as error:
-        raise ProjectIsolationError(
-            f"repository owner map is invalid: {error}"
-        ) from error
-    return (
-        {
-            str(item["repository_id"]): int(item["owner_uid"])
-            for item in validated["repositories"]
-        },
-        validated,
-    )
-
-
-def _repository_owner_authority(
-    connection: sqlite3.Connection,
-    *,
-    metadata: Mapping[str, Any],
-    owner_map_path: Path | None,
-) -> tuple[dict[str, int], dict[str, Any] | None]:
-    if metadata["source_schema_version"] == PRE_OWNER_AUTHORITY_SCHEMA_VERSION:
-        return _repository_owner_uids_v12(
-            connection, owner_map_path=owner_map_path
-        )
-    if owner_map_path is not None:
-        raise ProjectIsolationError(
-            "schema-13 isolation capture must use repository owner authority, not an owner map"
-        )
-    return _repository_owner_uids_v13(connection), None
+) -> dict[str, int]:
+    return _repository_execution_uids(connection)
 
 
 def _active_resources(
-    connection: sqlite3.Connection, *, owner_uids: Mapping[str, int]
+    connection: sqlite3.Connection, *, execution_uids: Mapping[str, int]
 ) -> list[dict[str, Any]]:
     docker = connection.execute(
         """
-        SELECT membership.host_resource_id AS resource_id,
-               membership.repo_id,
+        SELECT resource.docker_resource_id AS resource_id,
+               resource.repo_id,
                resource.full_container_id,
-               observation.lifecycle,
-               binding.authority_state,
-               source.status AS source_status
-        FROM repository_memberships AS membership
+               observation.lifecycle
+        FROM docker_resources AS resource
         JOIN repositories AS repository USING(repo_id)
-        JOIN docker_resources AS resource
-          ON resource.docker_resource_id = membership.host_resource_id
         LEFT JOIN docker_observations AS observation
           ON observation.docker_resource_id = resource.docker_resource_id
-        LEFT JOIN control_bindings AS binding
-          ON binding.binding_id = membership.control_binding_id
-        LEFT JOIN coordinator_sources AS source
-          ON source.source_id = binding.source_id
-        WHERE membership.resource_kind = 'container'
-          AND repository.state = 'active'
+        WHERE repository.state = 'active'
           AND (observation.lifecycle IS NULL OR observation.lifecycle != 'stopped')
-        ORDER BY membership.repo_id, membership.host_resource_id
+        ORDER BY resource.repo_id, resource.docker_resource_id
         """
     ).fetchall()
     workers = connection.execute(
@@ -318,45 +228,41 @@ def _active_resources(
     resources: list[dict[str, Any]] = []
     for row in docker:
         repo_id = str(row["repo_id"])
-        if repo_id not in owner_uids:
+        if repo_id not in execution_uids:
             raise ProjectIsolationError(
-                "active Docker resource lacks repository owner authority"
+                "active Docker resource lacks repository execution context"
             )
         resources.append(
             {
                 "resource_kind": "docker",
                 "resource_id": str(row["resource_id"]),
                 "repo_id": repo_id,
-                "owner_uid": int(owner_uids[repo_id]),
+                "execution_uid": int(execution_uids[repo_id]),
                 "runtime_identity": {
                     "full_container_id": str(row["full_container_id"]),
                 },
-                "authority_observable": (
-                    row["authority_state"] == "authoritative"
-                    and row["source_status"] == "imported"
-                    and row["lifecycle"] is not None
-                ),
+                "identity_observable": row["lifecycle"] is not None,
             }
         )
     for row in workers:
         repo_id = str(row["repo_id"])
-        if repo_id not in owner_uids:
+        if repo_id not in execution_uids:
             raise ProjectIsolationError(
-                "active service resource lacks repository owner authority"
+                "active service resource lacks repository execution context"
             )
         resources.append(
             {
                 "resource_kind": "service",
                 "resource_id": str(row["resource_id"]),
                 "repo_id": repo_id,
-                "owner_uid": int(owner_uids[repo_id]),
+                "execution_uid": int(execution_uids[repo_id]),
                 "runtime_identity": {
                     "attempt_id": str(row["attempt_id"]),
                     "pid": int(row["pid"]),
                     "process_start_time": str(row["process_start_time"]),
                     "process_fingerprint": str(row["process_fingerprint"]),
                 },
-                "authority_observable": True,
+                "identity_observable": True,
             }
         )
     if len(resources) > MAX_RESOURCES:
@@ -580,7 +486,6 @@ def _cgroup_classification(
 def capture_isolation_audit(
     *,
     database_path: Path,
-    repository_owner_map_path: Path | None = None,
     docker_cgroup_reader: Callable[[tuple[str, ...]], Mapping[str, Mapping[str, Any]]] = inspect_docker_cgroups,
     process_cgroup_reader: Callable[[Mapping[str, Any]], str | None] = _read_process_cgroup,
     boot_id_reader: Callable[[], str] = _read_boot_id,
@@ -591,12 +496,8 @@ def capture_isolation_audit(
     connection = _database_file(database_path)
     try:
         before = _metadata(connection)
-        owner_uids, owner_map = _repository_owner_authority(
-            connection,
-            metadata=before,
-            owner_map_path=repository_owner_map_path,
-        )
-        resources = _active_resources(connection, owner_uids=owner_uids)
+        execution_uids = _repository_execution_context(connection)
+        resources = _active_resources(connection, execution_uids=execution_uids)
     finally:
         connection.close()
     docker_ids = tuple(
@@ -612,18 +513,18 @@ def capture_isolation_audit(
     rows: list[dict[str, Any]] = []
     for source in resources:
         kind = source["resource_kind"]
-        owner_uid = source["owner_uid"]
+        execution_uid = source["execution_uid"]
         expected = None
-        if type(owner_uid) is int and owner_uid > 0:
+        if type(execution_uid) is int and execution_uid > 0:
             try:
                 expected = project_repository_slice(
-                    uid=owner_uid, repository_id=source["repo_id"]
+                    uid=execution_uid, repository_id=source["repo_id"]
                 )
             except ValueError:
                 expected = None
         observed: str | None = None
         reason_override = None
-        if not source["authority_observable"] or expected is None:
+        if not source["identity_observable"] or expected is None:
             reason_override = "authority_identity_unobservable"
         elif kind == "docker":
             evidence = docker_observations.get(
@@ -648,7 +549,7 @@ def capture_isolation_audit(
                 "resource_kind": kind,
                 "resource_id": source["resource_id"],
                 "repo_id": source["repo_id"],
-                "owner_uid": owner_uid,
+                "execution_uid": execution_uid,
                 "runtime_identity": source["runtime_identity"],
                 "expected_cgroup_parent": expected,
                 "observed_cgroup": observed,
@@ -662,17 +563,12 @@ def capture_isolation_audit(
     check = _database_file(database_path)
     try:
         after = _metadata(check)
-        after_owner_uids, after_owner_map = _repository_owner_authority(
-            check,
-            metadata=after,
-            owner_map_path=repository_owner_map_path,
-        )
+        after_execution_uids = _repository_execution_context(check)
     finally:
         check.close()
     if (
         after != before
-        or after_owner_uids != owner_uids
-        or after_owner_map != owner_map
+        or after_execution_uids != execution_uids
     ):
         raise ProjectIsolationError(
             "authority changed while project runtime isolation was observed"
@@ -689,9 +585,6 @@ def capture_isolation_audit(
         "valid_until": _timestamp(captured_at + timedelta(minutes=5)),
         "host_boot_id": boot_id_reader(),
         **before,
-        "repository_owner_map_sha256": (
-            owner_map["document_sha256"] if owner_map is not None else None
-        ),
         "resources": rows,
         "counts": counts,
         "project_isolation_complete": bool(
@@ -710,7 +603,7 @@ def validate_isolation_audit(
     expected_keys = {
         "schema_version", "kind", "audit_id", "captured_at", "valid_until",
         "host_boot_id", "source_schema_version",
-        "repository_owner_map_sha256", "database_generation", "state_revision",
+        "database_generation", "state_revision",
         "observation_revision", "host_id", "resources", "counts",
         "project_isolation_complete", "evidence_sha256",
     }
@@ -720,23 +613,8 @@ def validate_isolation_audit(
         raise ProjectIsolationError("isolation audit discriminator is unsupported")
     _uuid(document["audit_id"], "audit ID")
     _uuid(document["host_boot_id"], "host boot ID")
-    if document["source_schema_version"] not in {
-        PRE_OWNER_AUTHORITY_SCHEMA_VERSION,
-        SCHEMA_VERSION,
-    }:
+    if document["source_schema_version"] != SCHEMA_VERSION:
         raise ProjectIsolationError("isolation audit source schema is unsupported")
-    owner_map_sha256 = document["repository_owner_map_sha256"]
-    if document["source_schema_version"] == PRE_OWNER_AUTHORITY_SCHEMA_VERSION:
-        if not isinstance(owner_map_sha256, str) or _SHA256_RE.fullmatch(
-            owner_map_sha256
-        ) is None:
-            raise ProjectIsolationError(
-                "schema-12 isolation audit lacks its owner-map digest"
-            )
-    elif owner_map_sha256 is not None:
-        raise ProjectIsolationError(
-            "schema-13 isolation audit contains a contradictory owner-map digest"
-        )
     captured = _parse_timestamp(document["captured_at"], "captured_at")
     valid_until = _parse_timestamp(document["valid_until"], "valid_until")
     if valid_until <= captured or valid_until - captured > timedelta(minutes=5):
@@ -755,7 +633,7 @@ def validate_isolation_audit(
     normalized_rows: list[dict[str, Any]] = []
     counts = {classification: 0 for classification in sorted(CLASSIFICATIONS)}
     row_keys = {
-        "resource_kind", "resource_id", "repo_id", "owner_uid",
+        "resource_kind", "resource_id", "repo_id", "execution_uid",
         "runtime_identity", "expected_cgroup_parent", "observed_cgroup",
         "classification", "reason_code",
     }
@@ -772,13 +650,13 @@ def validate_isolation_audit(
         if key in seen:
             raise ProjectIsolationError("isolation resource identity is duplicated")
         seen.add(key)
-        owner_uid = value["owner_uid"]
-        if type(owner_uid) is not int or owner_uid <= 0:
+        execution_uid = value["execution_uid"]
+        if type(execution_uid) is not int or execution_uid <= 0:
             if value["classification"] != "unobservable":
                 raise ProjectIsolationError("unattributed owner must be unobservable")
             expected = None
         else:
-            expected = project_repository_slice(uid=owner_uid, repository_id=repo_id)
+            expected = project_repository_slice(uid=execution_uid, repository_id=repo_id)
         if value["expected_cgroup_parent"] != expected:
             raise ProjectIsolationError("expected cgroup parent is contradictory")
         identity = value["runtime_identity"]
@@ -841,19 +719,14 @@ def verify_live_authority_binding(
     document: Mapping[str, Any],
     *,
     database_path: Path,
-    repository_owner_map_path: Path | None = None,
 ) -> dict[str, Any]:
-    """Recheck a retained audit against the exact current owner authority."""
+    """Recheck a retained audit against the exact current execution context."""
 
     checked = validate_isolation_audit(document)
     connection = _database_file(database_path)
     try:
         before = _metadata(connection)
-        owner_uids, owner_map = _repository_owner_authority(
-            connection,
-            metadata=before,
-            owner_map_path=repository_owner_map_path,
-        )
+        execution_uids = _repository_execution_context(connection)
         after = _metadata(connection)
     finally:
         connection.close()
@@ -871,17 +744,10 @@ def verify_live_authority_binding(
         raise ProjectIsolationError(
             "authority changed after project runtime isolation capture"
         )
-    owner_map_sha256 = (
-        owner_map["document_sha256"] if owner_map is not None else None
-    )
-    if owner_map_sha256 != checked["repository_owner_map_sha256"]:
-        raise ProjectIsolationError(
-            "project isolation owner-map authority changed after capture"
-        )
     for resource in checked["resources"]:
-        if owner_uids.get(str(resource["repo_id"])) != resource["owner_uid"]:
+        if execution_uids.get(str(resource["repo_id"])) != resource["execution_uid"]:
             raise ProjectIsolationError(
-                "project isolation repository owner authority changed after capture"
+                "project isolation repository execution context changed after capture"
             )
     return checked
 
@@ -906,7 +772,7 @@ def create_migration_ledger(
                 "resource_kind": row["resource_kind"],
                 "resource_id": row["resource_id"],
                 "repo_id": row["repo_id"],
-                "owner_uid": row["owner_uid"],
+                "execution_uid": row["execution_uid"],
                 "original_runtime_identity": row["runtime_identity"],
                 "action": "recreate" if row["resource_kind"] == "docker" else "restart",
                 "status": "pending",
@@ -962,7 +828,7 @@ def validate_migration_ledger(
     if not isinstance(entries, list) or len(entries) > MAX_RESOURCES:
         raise ProjectIsolationError("migration ledger entries are invalid")
     entry_keys = {
-        "resource_kind", "resource_id", "repo_id", "owner_uid",
+        "resource_kind", "resource_id", "repo_id", "execution_uid",
         "original_runtime_identity", "action", "status", "operation_id",
         "replacement_runtime_identity", "completed_at",
     }
@@ -977,7 +843,7 @@ def validate_migration_ledger(
             raise ProjectIsolationError("migration ledger resource kind is invalid")
         resource_id = _opaque(entry["resource_id"], "resource ID")
         _opaque(entry["repo_id"], "repository ID")
-        if type(entry["owner_uid"]) is not int or entry["owner_uid"] <= 0:
+        if type(entry["execution_uid"]) is not int or entry["execution_uid"] <= 0:
             raise ProjectIsolationError("migration ledger owner UID is invalid")
         key = (kind, resource_id)
         if key in seen:
@@ -1056,8 +922,10 @@ def record_migration(
             raise ProjectIsolationError("replacement runtime is not proven compliant")
         if replacement["runtime_identity"] == entry["original_runtime_identity"]:
             raise ProjectIsolationError("runtime identity did not change during migration")
-        if replacement["repo_id"] != entry["repo_id"] or replacement["owner_uid"] != entry["owner_uid"]:
-            raise ProjectIsolationError("replacement runtime changed repository ownership")
+        if replacement["repo_id"] != entry["repo_id"] or replacement["execution_uid"] != entry["execution_uid"]:
+            raise ProjectIsolationError(
+                "replacement runtime changed repository execution context"
+            )
         entry["replacement_runtime_identity"] = replacement["runtime_identity"]
     else:
         if replacement is not None:

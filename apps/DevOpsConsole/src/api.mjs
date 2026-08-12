@@ -6,7 +6,7 @@
 import { CoordError } from './coordinator.mjs';
 import { PrefsError } from './prefs.mjs';
 import { RouteError, publishedContainerPorts } from './routes.mjs';
-import { AccessError, CONSOLE_GRANT, routeGrant, testGrant } from './access.mjs';
+import { AccessError, CONSOLE_GRANT, routeGrant } from './access.mjs';
 import { TelegramServiceError } from './telegram.mjs';
 import { UpstreamAuthError } from './upstream-auth.mjs';
 import { BugStoreError } from './bugs.mjs';
@@ -166,32 +166,6 @@ export function createConsoleApi({
       throw new ApiError(401, 'authenticated Google identity is invalid');
     }
     return `google:${email}`;
-  }
-
-  function runBelongsToSession(session, run) {
-    const expected = googleTestActor(session);
-    return run?.actor === expected;
-  }
-
-  function requireRunOperationAccess(session, repoId, run) {
-    if (accessStore?.isAdmin(session?.email) || runBelongsToSession(session, run)) {
-      requireTestAccess(session, repoId, 'run');
-      return;
-    }
-    requireTestAccess(session, repoId, 'operate');
-  }
-
-  function canReadRepositoryTests(session, repoId) {
-    if (accessStore?.isAdmin(session?.email)) return true;
-    return ['read', 'run', 'operate'].some((scope) => (
-      accessStore?.canAccess(session?.email, testGrant(repoId, scope))
-    ));
-  }
-
-  function canOperateTestRun(session, repoId, run) {
-    if (accessStore?.isAdmin(session?.email)) return true;
-    const scopes = runBelongsToSession(session, run) ? ['run', 'operate'] : ['operate'];
-    return scopes.some((scope) => accessStore?.canAccess(session?.email, testGrant(repoId, scope)));
   }
 
   function testRepositoryView(repository) {
@@ -369,20 +343,6 @@ export function createConsoleApi({
     else if (setup?.fixtures && typeof setup.fixtures === 'object') {
       view.fixtures = Object.keys(setup.fixtures).sort();
     }
-    if (setup?.capability_policy && typeof setup.capability_policy === 'object'
-      && !Array.isArray(setup.capability_policy)) {
-      const policy = setup.capability_policy;
-      view.capability_policy = {
-        ok: policy.ok === true,
-        repository_grant: policy.repository_grant === true,
-        generation_match: policy.generation_match === true,
-        requested: Array.isArray(policy.requested) ? policy.requested.map(String) : [],
-        missing: Array.isArray(policy.missing) ? policy.missing.map(String) : [],
-      };
-      if (Number.isInteger(policy.repository_generation) && policy.repository_generation >= 0) {
-        view.capability_policy.repository_generation = policy.repository_generation;
-      }
-    }
     return view;
   }
 
@@ -448,10 +408,8 @@ export function createConsoleApi({
     summary.flake_rate = summary.distinct_test_count > 0
       ? summary.flaky_test_count / summary.distinct_test_count : null;
     // Percentiles, avoided-work estimates, and scheduler-capacity fields are
-    // not additive.  Recomputing them from repository rows would be false,
-    // while returning the fleet values to a partially authorized account
-    // would disclose activity outside its grants. Preserve them only when the
-    // caller is authorized for the complete enrolled fleet.
+    // not additive. Preserve the coordinator aggregate when the complete
+    // configured fleet is represented.
     summary.p95_queue_wait_seconds = preserveAggregateMetrics
       ? (fleet?.summary?.p95_queue_wait_seconds ?? null) : null;
     summary.avoided_work = preserveAggregateMetrics && fleet?.summary?.avoided_work
@@ -533,21 +491,11 @@ export function createConsoleApi({
     return targets;
   }
 
-  function requireTestAccess(session, repoId, scope) {
-    if (accessStore?.isAdmin(session?.email)) return;
-    const hierarchy = scope === 'read'
-      ? ['read', 'run', 'operate']
-      : scope === 'run' ? ['run', 'operate'] : ['operate'];
-    if (!hierarchy.some((candidate) => accessStore?.canAccess(session?.email, testGrant(repoId, candidate)))) {
-      throw new ApiError(403, `this account does not have tests:${scope} access to the repository`);
-    }
-  }
-
   async function requireKnownTestRepository(repoId) {
     const catalog = await coordinator.testRepositories();
     const repositories = Array.isArray(catalog?.repositories) ? catalog.repositories : [];
     const repository = repositories.find((item) => item?.repo_id === repoId);
-    if (!repository) throw new ApiError(404, 'repository is not enrolled for tests');
+    if (!repository) throw new ApiError(404, 'repository is not configured for tests');
     return repository;
   }
 
@@ -663,7 +611,7 @@ export function createConsoleApi({
           repository_generation: generation,
         },
         label: boundedSourceLabel(scope.display_name, `Temporary worktree ${sources.length}`),
-        detail: scope.expires_at ? `Expires ${String(scope.expires_at)}` : 'Server-authorized worktree',
+        detail: scope.expires_at ? `Expires ${String(scope.expires_at)}` : 'Configured worktree',
         temporaryRoot: scope.canonical_root,
       });
     }
@@ -693,7 +641,7 @@ export function createConsoleApi({
       && source.selector.repository_generation === selector.repository_generation
     ));
     if (!match) {
-      throw new ApiError(409, 'test source is stale or no longer authorized');
+      throw new ApiError(409, 'test source is stale or no longer configured');
     }
     return match;
   }
@@ -779,29 +727,6 @@ export function createConsoleApi({
         auth: route.auth,
         target,
       });
-    }
-    try {
-      const catalog = await coordinator.testRepositories();
-      for (const repository of catalog?.repositories || []) {
-        if (!repository || !TEST_REPO_ID_RE.test(String(repository.repo_id || ''))) continue;
-        const name = String(repository.display_name || repository.repo_id);
-        for (const [scope, target] of [
-          ['read', 'View test history, evidence and statistics'],
-          ['run', 'Plan and submit repository tests'],
-          ['operate', 'Cancel or retry any repository test run'],
-        ]) {
-          resources.push({
-            id: testGrant(repository.repo_id, scope),
-            kind: 'project-tests',
-            host: config.consoleHost,
-            title: `${name} tests · ${scope}`,
-            auth: 'google',
-            target,
-          });
-        }
-      }
-    } catch (error) {
-      clog?.warn?.('test access resources unavailable', { error: error?.message ?? String(error) });
     }
     return resources;
   }
@@ -925,7 +850,6 @@ export function createConsoleApi({
         body.reason,
         `${body.action} requested via DevOps Console by ${session.email}`,
       ),
-      agent: `devops-console:${session.email}`,
     });
     sendJson(res, 200, { plan });
   }
@@ -966,8 +890,6 @@ export function createConsoleApi({
         body.reason,
         `restore requested via DevOps Console by ${session.email}`,
       ),
-      agent: `devops-console:${session.email}`,
-      explicit: true,
     });
     sendJson(res, 200, { result });
   }
@@ -1528,25 +1450,25 @@ export function createConsoleApi({
       );
     }
 
-    const memberships = [];
+    const associations = [];
     for (const tree of inventory.repository_trees) {
       const root = tree?.root_repository;
       for (const scope of Array.isArray(tree?.scopes) ? tree.scopes : []) {
         if (!Array.isArray(scope?.server_ids) || !scope.server_ids.some(
           (id) => String(id) === serverId,
         )) continue;
-        memberships.push({ tree, root, scope });
+        associations.push({ tree, root, scope });
       }
     }
-    if (memberships.length !== 1) {
+    if (associations.length !== 1) {
       throw new ApiError(
         409,
-        memberships.length
+        associations.length
           ? 'worker belongs to more than one repository scope; action was refused'
           : 'worker has no authoritative repository scope; action was refused',
       );
     }
-    const [{ root, scope }] = memberships;
+    const [{ root, scope }] = associations;
     const rootRepo = root?.canonical_root;
     const effectiveRepo = scope?.canonical_root;
     if (
@@ -1593,25 +1515,25 @@ export function createConsoleApi({
       );
     }
 
-    const memberships = [];
+    const associations = [];
     for (const tree of inventory.repository_trees) {
       const root = tree?.root_repository;
       for (const scope of Array.isArray(tree?.scopes) ? tree.scopes : []) {
         if (!Array.isArray(scope?.container_resource_ids) || !scope.container_resource_ids.some(
           (id) => String(id) === resourceId,
         )) continue;
-        memberships.push({ root, scope });
+        associations.push({ root, scope });
       }
     }
-    if (memberships.length !== 1) {
+    if (associations.length !== 1) {
       throw new ApiError(
         409,
-        memberships.length
+        associations.length
           ? 'container belongs to more than one repository scope; log read was refused'
           : 'container has no authoritative repository scope; log read was refused',
       );
     }
-    const [{ root, scope }] = memberships;
+    const [{ root, scope }] = associations;
     const rootRepo = root?.canonical_root;
     const effectiveRepo = scope?.canonical_root;
     const container = containerMatches[0];
@@ -1620,7 +1542,9 @@ export function createConsoleApi({
       || typeof effectiveRepo !== 'string' || !effectiveRepo.startsWith('/')
       || !['root', 'temporary'].includes(scope?.kind)
       || (scope.kind === 'root' && effectiveRepo !== rootRepo)
-      || !['docker_labels', 'coordinator_sidecar'].includes(container?.metadata_source)
+      || !['docker_labels', 'coordinator_sidecar', 'catalog_association'].includes(
+        container?.metadata_source,
+      )
       || (typeof container.project === 'string' && container.project !== effectiveRepo)
     ) {
       throw new ApiError(409, 'container repository scope is incomplete or contradictory');
@@ -1848,12 +1772,14 @@ export function createConsoleApi({
       rawSlug
       && (
       !container.project
-      || !['docker_labels', 'coordinator_sidecar'].includes(container.metadata_source)
+      || !['docker_labels', 'coordinator_sidecar', 'catalog_association'].includes(
+        container.metadata_source,
+      )
       )
     ) {
       throw new ApiError(
         400,
-        'container has no verified project ownership; register it before assigning a route',
+        'container has no repository association; catalog it before assigning a route',
       );
     }
 
@@ -2166,8 +2092,10 @@ export function createConsoleApi({
         'broker-owned ephemeral containers must use ephemeral status, renew or finish',
       );
     }
-    if (!container.project || !['docker_labels', 'coordinator_sidecar'].includes(container.metadata_source)) {
-      throw new ApiError(400, 'container has no verified project ownership; register it before mutation');
+    if (!container.project || !['docker_labels', 'coordinator_sidecar', 'catalog_association'].includes(
+      container.metadata_source,
+    )) {
+      throw new ApiError(400, 'container has no repository association; catalog it before mutation');
     }
     const result = await coordinator.dockerAction(name, body.action, {
       agent: `devops-console:${session.email}`,
@@ -2380,7 +2308,6 @@ export function createConsoleApi({
         const days = boundedInteger(searchParams.get('days'), 30, 1, 3650, 'days');
         const limit = boundedInteger(searchParams.get('limit'), 25, 1, 500, 'limit');
         await requireKnownTestRepository(project);
-        requireTestAccess(session, project, 'read');
         return sendJson(res, 200, await coordinator.testStats({ project, days, limit }));
       }
       if (method === 'GET' && pathname === '/api/tests/fleet') {
@@ -2389,27 +2316,17 @@ export function createConsoleApi({
           coordinator.testRepositories(),
           coordinator.testFleet({ hours }),
         ]);
-        const enrolled = Array.isArray(catalog?.repositories) ? catalog.repositories : [];
-        const validEnrolled = enrolled
+        const configured = Array.isArray(catalog?.repositories) ? catalog.repositories : [];
+        const validConfigured = configured
           .filter((repository) => repository && TEST_REPO_ID_RE.test(String(repository.repo_id || '')));
-        const visible = validEnrolled
-          .filter((repository) => canReadRepositoryTests(session, repository.repo_id));
-        const visibleIds = new Set(visible.map((repository) => repository.repo_id));
-        const fullFleetAuthorized = validEnrolled.length === enrolled.length
-          && visibleIds.size === enrolled.length
-          && (fleet?.repositories || []).every((repository) => (
-            repository && TEST_REPO_ID_RE.test(String(repository.repo_id || ''))
-            && visibleIds.has(repository.repo_id)
-          ));
-        return sendJson(res, 200, filterTestFleet(fleet, visible, {
-          preserveAggregateMetrics: fullFleetAuthorized,
+        return sendJson(res, 200, filterTestFleet(fleet, validConfigured, {
+          preserveAggregateMetrics: true,
         }));
       }
       if (method === 'GET' && pathname === '/api/tests/repositories') {
         const catalog = await coordinator.testRepositories();
         const repositories = (catalog?.repositories || [])
           .filter((repository) => repository && TEST_REPO_ID_RE.test(String(repository.repo_id || '')))
-          .filter((repository) => canReadRepositoryTests(session, repository.repo_id))
           .map((repository) => testRepositoryView(repository));
         return sendJson(res, 200, { schema_version: 1, repositories });
       }
@@ -2417,7 +2334,6 @@ export function createConsoleApi({
       if (method === 'GET' && testSourcesMatch) {
         const repoId = requireTestRepoId(safeDecode(testSourcesMatch[1]));
         await requireKnownTestRepository(repoId);
-        requireTestAccess(session, repoId, 'run');
         const inventory = await coordinator.inventory({ maxAgeMs: 0 });
         const catalog = authoritativeTestSourceCatalog(inventory, repoId);
         return sendJson(res, 200, testSourceCatalogView(repoId, catalog));
@@ -2426,7 +2342,6 @@ export function createConsoleApi({
       if (method === 'GET' && testSetupMatch) {
         const repoId = requireTestRepoId(safeDecode(testSetupMatch[1]));
         await requireKnownTestRepository(repoId);
-        requireTestAccess(session, repoId, 'read');
         const setup = await coordinator.testRepositorySetup({ repoId });
         if ((setup?.repository_id ?? setup?.repo_id) !== repoId) {
           throw new ApiError(502, 'coordinator returned contradictory test setup identity');
@@ -2438,7 +2353,6 @@ export function createConsoleApi({
         const after = boundedInteger(searchParams.get('after'), 0, 0, Number.MAX_SAFE_INTEGER, 'after');
         const limit = boundedInteger(searchParams.get('limit'), 200, 1, 500, 'limit');
         await requireKnownTestRepository(repoId);
-        requireTestAccess(session, repoId, 'read');
         const events = await coordinator.testEvents({ repoId, after, limit });
         if ((events?.repository_id ?? events?.repo_id) !== repoId) {
           throw new ApiError(502, 'coordinator returned contradictory test event identity');
@@ -2466,10 +2380,6 @@ export function createConsoleApi({
           throw new ApiError(400, 'requested_targets are supported only for manual intent');
         }
         await requireKnownTestRepository(repoId);
-        requireTestAccess(session, repoId, 'run');
-        if (intent === 'release' && accessStore?.isAdmin(session?.email) !== true) {
-          throw new ApiError(403, 'release evidence is reserved for Console owners');
-        }
         const resolvedSource = await resolveTestSource(repoId, sourceSelector);
         const result = await coordinator.testPlan({
           repoId,
@@ -2525,7 +2435,6 @@ export function createConsoleApi({
           throw new ApiError(400, 'state is invalid');
         }
         await requireKnownTestRepository(repoId);
-        requireTestAccess(session, repoId, 'read');
         const result = await coordinator.testRuns({
           repoId, after, limit, state: runState,
         });
@@ -2540,10 +2449,9 @@ export function createConsoleApi({
         }
         const activeStates = new Set(['queued', 'running', 'cancelling', 'superseding']);
         const runs = result.runs.map((run) => {
-          const allowed = canOperateTestRun(session, repoId, run);
           return testRunView(run, {
-            can_cancel: allowed && activeStates.has(run.state),
-            can_retry: allowed && !activeStates.has(run.state) && run.state !== 'succeeded',
+            can_cancel: activeStates.has(run.state),
+            can_retry: !activeStates.has(run.state) && run.state !== 'succeeded',
           });
         });
         return sendJson(res, 200, { ...result, runs, next_cursor: nextCursor });
@@ -2559,7 +2467,6 @@ export function createConsoleApi({
         }
         if (!UUID_RE.test(operationId)) throw new ApiError(400, 'operation_id must be a UUID');
         await requireKnownTestRepository(repoId);
-        requireTestAccess(session, repoId, 'run');
         const result = await coordinator.submitTestRun({
           repoId, planId, operationId, actor: googleTestActor(session),
         });
@@ -2577,7 +2484,6 @@ export function createConsoleApi({
         const runId = requireTestEntityId(safeDecode(testRunMatch[2]));
         const action = testRunMatch[3] || 'detail';
         await requireKnownTestRepository(repoId);
-        requireTestAccess(session, repoId, 'read');
         const status = await coordinator.testRunStatus({ repoId, runId });
         if ((status?.repository_id ?? status?.repo_id) !== repoId) {
           throw new ApiError(404, 'test run does not exist in this repository');
@@ -2624,7 +2530,6 @@ export function createConsoleApi({
           const operationId = requireString(body.operation_id, 'operation_id');
           if (reason.length > 512 || /[\u0000-\u001f\u007f]/.test(reason)) throw new ApiError(400, 'reason is invalid');
           if (!UUID_RE.test(operationId)) throw new ApiError(400, 'operation_id must be a UUID');
-          requireRunOperationAccess(session, repoId, status);
           const result = await coordinator.cancelTestRun({
             repoId, runId, reason, operationId, actor: googleTestActor(session),
           });
@@ -2639,7 +2544,6 @@ export function createConsoleApi({
           if (typeof body.failed_only !== 'boolean') throw new ApiError(400, 'failed_only must be boolean');
           const operationId = requireString(body.operation_id, 'operation_id');
           if (!UUID_RE.test(operationId)) throw new ApiError(400, 'operation_id must be a UUID');
-          requireRunOperationAccess(session, repoId, status);
           const result = await coordinator.retryTestRun({
             repoId, runId, failedOnly: body.failed_only, operationId, actor: googleTestActor(session),
           });

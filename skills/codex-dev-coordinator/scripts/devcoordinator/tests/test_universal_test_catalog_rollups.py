@@ -565,16 +565,6 @@ class BrokerTestDbProjectionTests(unittest.TestCase):
                     ).fetchone()[0]
                 )
         self.persistence = BrokerPersistence(self.authority)
-        with CoordinatorStore.open(self.authority) as store:
-            with store.immediate_transaction() as connection:
-                connection.execute(
-                    "INSERT INTO broker_acl_principals(uid, account_id, enabled, updated_at) VALUES (?, 'account-tests', 1, ?)",
-                    (os.geteuid(), now),
-                )
-                connection.execute(
-                    "INSERT INTO broker_repository_enrollments(uid, repo_id, account_id, enabled, issued_at, valid_until_epoch, updated_at) VALUES (?, ?, 'account-tests', 1, ?, 4102444800, ?)",
-                    (os.geteuid(), self.repo_id, now, now),
-                )
         self.test_store = UniversalTestStore.create(
             self.root / "tests.sqlite3", clock=lambda: FIXED_NOW
         )
@@ -625,7 +615,7 @@ class BrokerTestDbProjectionTests(unittest.TestCase):
             arguments=arguments,
             authority_generation=self.generation,
         )
-        return self.backend.execute(self.persistence.authorize(self.peer, request))
+        return self.backend.execute(self.persistence.accept(self.peer, request))
 
     def test_broker_routes_catalog_stats_and_fleet_to_testdb(self) -> None:
         catalog = self.call(BrokerOperation.TEST_REPOSITORY_CATALOG, {})

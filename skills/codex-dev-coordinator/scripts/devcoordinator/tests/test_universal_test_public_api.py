@@ -8,7 +8,7 @@ import unittest
 import uuid
 
 from devcoordinator.broker import (
-    AuthorizedBrokerRequest,
+    AcceptedBrokerRequest,
     BrokerBackendError,
     BrokerError,
     BrokerOperation,
@@ -316,7 +316,7 @@ class UniversalTestPublicReadTests(unittest.TestCase):
                 )
             )
             arguments["actor"] = actor
-            return AuthorizedBrokerRequest(
+            return AcceptedBrokerRequest(
                 peer=peer,
                 request=BrokerRequest.create(
                     account_id=account_id,
@@ -373,7 +373,7 @@ class UniversalTestPublicReadTests(unittest.TestCase):
                 _test_run_actor(authorized("devcoordinator-api", actor))
             self.assertEqual(malformed.exception.code, "test_actor_invalid")
 
-        registration = AuthorizedBrokerRequest(
+        registration = AcceptedBrokerRequest(
             peer=peer,
             request=BrokerRequest.create(
                 account_id="devcoordinator-api",

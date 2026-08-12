@@ -19,7 +19,7 @@ do not act on them. Supervised workers expose explicit start, stop, restart,
 crash-loop rearm, Keep Alive, and review-first permanent removal. Turning Keep
 Alive off does not stop a running worker; a removed worker stays absent until
 the Coordinator explicitly reinstalls it. Every mutation uses an exact
-normalized control binding. A refresh performs one coalesced observation and
+current immutable resource identity. A refresh performs one coalesced observation and
 then reads its committed snapshot; cached content remains visible during later
 scheduled observations.
 

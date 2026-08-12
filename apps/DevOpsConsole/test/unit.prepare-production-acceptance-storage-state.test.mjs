@@ -38,17 +38,28 @@ test('production browser session arguments default to protected host paths', () 
   assert.deepEqual(parseArgs([]), {
     envFile: DEFAULT_ENV_FILE,
     output: DEFAULT_OUTPUT,
+    ownerUid: process.getuid(),
+    ownerGid: process.getgid(),
   });
   assert.deepEqual(parseArgs([
     '--env-file', '/tmp/console.env',
     '--output', '/tmp/browser/storage.json',
+    '--owner-uid', String(process.getuid()),
+    '--owner-gid', String(process.getgid()),
   ]), {
     envFile: '/tmp/console.env',
     output: '/tmp/browser/storage.json',
+    ownerUid: process.getuid(),
+    ownerGid: process.getgid(),
   });
   assert.throws(() => parseArgs(['--output', 'relative.json']), /absolute path/);
   assert.throws(() => parseArgs(['--unknown', '/tmp/value']), /usage/);
   assert.throws(() => parseArgs(['--output', '/tmp/a', '--output', '/tmp/b']), /more than once/);
+  assert.throws(() => parseArgs(['--owner-uid', '1000']), /provided together/);
+  assert.throws(
+    () => parseArgs(['--owner-uid', '-1', '--owner-gid', '1000']),
+    /non-negative integer/,
+  );
 });
 
 test('production browser sessions use the exact Console slot credential sources', () => {
@@ -146,7 +157,10 @@ test('storage state publication atomically replaces the file with mode 0600', ()
     const output = path.join(root, 'private', 'storage-state.json');
     atomicWriteStorageState(output, { cookies: [], origins: [] });
     atomicWriteStorageState(output, { cookies: [{ name: 'replacement' }], origins: [] });
-    assert.equal(fs.statSync(output).mode & 0o777, 0o600);
+    const metadata = fs.statSync(output);
+    assert.equal(metadata.mode & 0o777, 0o600);
+    assert.equal(metadata.uid, process.getuid());
+    assert.equal(metadata.gid, process.getgid());
     assert.deepEqual(JSON.parse(fs.readFileSync(output, 'utf8')), {
       cookies: [{ name: 'replacement' }],
       origins: [],

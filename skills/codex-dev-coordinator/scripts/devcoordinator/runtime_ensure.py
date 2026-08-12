@@ -121,6 +121,23 @@ def decide_runtime_ensure(
             "repository_family_unclassified",
         )
     observed = observed_runtime_state(observation)
+    never_started_service = (
+        observed == "unknown"
+        and desired_state == "ready"
+        and observation.get("exact") is True
+        and _lower(observation.get("resource_kind")) == "service"
+        and _lower(observation.get("lifecycle")) in {"", "unobserved"}
+        and observation.get("pid") is None
+        and observation.get("listener_observable") is not True
+    )
+    if never_started_service:
+        return RuntimeEnsureDecision(
+            desired_state,
+            "stopped",
+            "start",
+            "mutation_required",
+            None,
+        )
     if observed in {"unknown", "unhealthy"}:
         return RuntimeEnsureDecision(
             desired_state,

@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 import hashlib
+import ipaddress
 import json
 import math
 import os
@@ -289,6 +290,12 @@ def _anchored_directory_flags() -> int:
     return os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
 
 
+def _anchored_traversal_flags() -> int:
+    flags = _anchored_directory_flags()
+    path_only = getattr(os, "O_PATH", 0)
+    return (flags & ~os.O_RDONLY) | path_only if path_only else flags
+
+
 def open_anchored_compose_root(path: str) -> int:
     """Open an absolute directory without following any pathname component."""
 
@@ -301,13 +308,24 @@ def open_anchored_compose_root(path: str) -> int:
         or os.path.normpath(path) != path
     ):
         raise ValueError("Compose repository root is not canonical")
-    flags = _anchored_directory_flags()
-    descriptor = os.open("/", flags)
+    directory_flags = _anchored_directory_flags()
+    traversal_flags = _anchored_traversal_flags()
+    descriptor = os.open("/", traversal_flags)
     try:
-        for component in Path(path).parts[1:]:
+        components = Path(path).parts[1:]
+        for index, component in enumerate(components):
+            flags = (
+                directory_flags
+                if index == len(components) - 1
+                else traversal_flags
+            )
             next_descriptor = os.open(component, flags, dir_fd=descriptor)
             os.close(descriptor)
             descriptor = next_descriptor
+        if not components:
+            final_descriptor = os.open("/", directory_flags)
+            os.close(descriptor)
+            descriptor = final_descriptor
         return descriptor
     except BaseException:
         os.close(descriptor)
@@ -320,13 +338,19 @@ def open_compose_directory_beneath(
 ) -> int:
     """Open a descendant directory from a held repository descriptor."""
 
-    flags = _anchored_directory_flags()
+    directory_flags = _anchored_directory_flags()
+    traversal_flags = _anchored_traversal_flags()
     descriptor = os.dup(root_descriptor)
     os.set_inheritable(descriptor, False)
     try:
-        for component in relative_parts:
+        for index, component in enumerate(relative_parts):
             if component in {"", ".", ".."} or "/" in component:
                 raise ValueError("Compose descendant path is invalid")
+            flags = (
+                directory_flags
+                if index == len(relative_parts) - 1
+                else traversal_flags
+            )
             next_descriptor = os.open(component, flags, dir_fd=descriptor)
             os.close(descriptor)
             descriptor = next_descriptor
@@ -733,6 +757,32 @@ def _classify_volumes_from(
             )
 
 
+def _published_port_is_loopback_only(value: Any) -> bool:
+    host_ip: Any
+    if isinstance(value, Mapping):
+        host_ip = value.get("host_ip")
+    elif isinstance(value, str):
+        rendered = value.strip()
+        if rendered.startswith("["):
+            closing = rendered.find("]")
+            if closing < 2 or rendered[closing + 1 : closing + 2] != ":":
+                return False
+            host_ip = rendered[1:closing]
+        else:
+            host_ip = rendered.split(":", 1)[0] if ":" in rendered else None
+    else:
+        return False
+    if not isinstance(host_ip, str) or not host_ip.strip():
+        return False
+    normalized = host_ip.strip()
+    if normalized.startswith("[") and normalized.endswith("]"):
+        normalized = normalized[1:-1]
+    try:
+        return ipaddress.ip_address(normalized).is_loopback
+    except ValueError:
+        return False
+
+
 def _classify_deploy(
     value: Any,
     *,
@@ -898,6 +948,7 @@ def require_effective_compose_model(
     service_replicas: dict[str, int] = {}
     service_images: dict[str, str] = {}
     replica_budget = 0
+    published_ports_require_approval = False
     for service_name, raw_service in services_value.items():
         if not isinstance(raw_service, Mapping):
             raise ValueError(
@@ -999,6 +1050,9 @@ def require_effective_compose_model(
             raise ValueError("effective Compose service ports are invalid")
         if ports:
             risks.add("published_host_ports")
+            for port in ports:
+                if not _published_port_is_loopback_only(port):
+                    published_ports_require_approval = True
         service_networks = raw_service.get("networks") or ()
         if isinstance(service_networks, str):
             service_network_names = (service_networks,)
@@ -1058,9 +1112,13 @@ def require_effective_compose_model(
         )
 
     ordered_risks = tuple(sorted(risks))
-    if ordered_risks and not host_access_approved:
+    approval_required_risks = set(ordered_risks)
+    if not published_ports_require_approval:
+        approval_required_risks.discard("published_host_ports")
+    if approval_required_risks and not host_access_approved:
         raise PermissionError(
-            "effective Compose model requests host-equivalent access; rerun enrollment with explicit administrator approval"
+            "effective Compose model requests administrator-approved host access: "
+            + ", ".join(sorted(approval_required_risks))
         )
     canonical = json.dumps(
         model,

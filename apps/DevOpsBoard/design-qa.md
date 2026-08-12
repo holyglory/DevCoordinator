@@ -54,10 +54,6 @@ final result: passed
 
 The small canonical set lives in `Artifacts/Canonical/`:
 
-- `dev-servers.png` — desktop board, Dev Servers tab, 1440 × 1024.
-- `docker-board.png` — desktop board, Docker tab, 1440 × 1024.
-- `databases.png` — desktop board, Databases tab, 1440 × 1024.
-- `menu-action-error.png` — menu-bar error state, 430 × 600.
 
 Every PNG has an adjacent `.provenance.json` file. For acceptance as current,
 the sidecar must identify the fixture and generator; record the PNG dimensions

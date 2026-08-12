@@ -118,8 +118,8 @@ def main() -> int:
         shutil.copytree(clean, missing_repository_write)
         replace(
             missing_repository_write / "devcoordinator-authority.service",
-            "ReadWritePaths=/home ",
-            "ReadWritePaths=",
+            "ReadWritePaths=/home /var/lib/devcoordinator ",
+            "ReadWritePaths=/var/lib/devcoordinator ",
         )
         expect(
             "authority_repository_compatibility_path_missing"
@@ -179,17 +179,43 @@ def main() -> int:
             "authority without artifact write access was not rejected",
         )
 
+        missing_browser_lifecycle_write = Path(raw) / "missing-browser-lifecycle-write"
+        shutil.copytree(clean, missing_browser_lifecycle_write)
+        replace(
+            missing_browser_lifecycle_write / "devcoordinator-authority.service",
+            " /var/lib/devcoordinator-browser-lifecycle",
+            "",
+        )
+        expect(
+            "authority_browser_lifecycle_storage_missing"
+            in codes(missing_browser_lifecycle_write),
+            "authority without dedicated browser telemetry write access was not rejected",
+        )
+
         authority_runtime_conflict = Path(raw) / "authority-runtime-conflict"
         shutil.copytree(clean, authority_runtime_conflict)
         replace(
             authority_runtime_conflict / "devcoordinator-authority.service",
-            "StateDirectoryMode=0700\n",
-            "StateDirectoryMode=0700\nRuntimeDirectory=devcoordinator\n",
+            "StateDirectoryMode=0711\n",
+            "StateDirectoryMode=0711\nRuntimeDirectory=devcoordinator\n",
         )
         expect(
             "authority_runtime_directory_socket_conflict"
             in codes(authority_runtime_conflict),
             "authority ownership of the socket parent runtime directory was not rejected",
+        )
+
+        private_authority_parent = Path(raw) / "private-authority-parent"
+        shutil.copytree(clean, private_authority_parent)
+        replace(
+            private_authority_parent / "devcoordinator-authority.service",
+            "StateDirectoryMode=0711",
+            "StateDirectoryMode=0700",
+        )
+        expect(
+            "authority_state_parent_traversal_invalid"
+            in codes(private_authority_parent),
+            "authority state parent that blocks non-secret actual-caller telemetry was not rejected",
         )
 
         authority_group = Path(raw) / "authority-group"
@@ -314,6 +340,18 @@ def main() -> int:
             "missing test scheduler attempt spool directory was not rejected",
         )
 
+        private_attempt_root = Path(raw) / "private-attempt-root"
+        shutil.copytree(clean, private_attempt_root)
+        replace(
+            private_attempt_root / "devcoordinator-availability.tmpfiles.conf",
+            "d /var/lib/devcoordinator-test-runs 0711 root root -",
+            "d /var/lib/devcoordinator-test-runs 0700 root root -",
+        )
+        expect(
+            "tmpfiles_contract_invalid" in codes(private_attempt_root),
+            "attempt root that strands attributed repository-UID runners was not rejected",
+        )
+
         missing_bug_tmpfiles = Path(raw) / "missing-bug-tmpfiles"
         shutil.copytree(clean, missing_bug_tmpfiles)
         replace(
@@ -361,6 +399,30 @@ def main() -> int:
         expect(
             "tmpfiles_contract_invalid" in codes(private_profile),
             "locally unreadable non-secret client profile was not rejected",
+        )
+
+        private_browser_telemetry = Path(raw) / "private-browser-telemetry"
+        shutil.copytree(clean, private_browser_telemetry)
+        replace(
+            private_browser_telemetry / "devcoordinator-availability.tmpfiles.conf",
+            "d /var/lib/devcoordinator-browser-lifecycle 0755 root root -",
+            "d /var/lib/devcoordinator-browser-lifecycle 0700 root root -",
+        )
+        expect(
+            "tmpfiles_contract_invalid" in codes(private_browser_telemetry),
+            "browser lifecycle telemetry hidden behind a private parent was not rejected",
+        )
+
+        missing_browser_projection = Path(raw) / "missing-browser-projection"
+        shutil.copytree(clean, missing_browser_projection)
+        replace(
+            missing_browser_projection / "devcoordinator-availability.tmpfiles.conf",
+            "z /etc/devcoordinator/browser-runtime-lock.json 0644 root root -\n",
+            "",
+        )
+        expect(
+            "tmpfiles_contract_invalid" in codes(missing_browser_projection),
+            "missing actual-caller browser runtime projection was not rejected",
         )
 
         writable_check = Path(raw) / "writable-check"
@@ -488,6 +550,19 @@ def main() -> int:
                 ),
             )
 
+        snapshotd_attempt_root = Path(raw) / "snapshotd-attempt-root"
+        shutil.copytree(clean, snapshotd_attempt_root)
+        replace(
+            snapshotd_attempt_root / "devcoordinator-test-snapshotd.service",
+            "StateDirectory=devcoordinator-test-snapshots devcoordinator-test-snapshot-catalog",
+            "StateDirectory=devcoordinator-test-snapshots devcoordinator-test-snapshot-catalog devcoordinator-test-runs",
+        )
+        expect(
+            "snapshotd_attempt_root_lifecycle_conflict"
+            in codes(snapshotd_attempt_root),
+            "snapshotd lifecycle ownership of the shared attempt root was not rejected",
+        )
+
         shared_identity = Path(raw) / "shared-identity"
         shutil.copytree(clean, shared_identity)
         replace(
@@ -614,6 +689,18 @@ def main() -> int:
             "handoff API reuse of the live protected profile was not rejected",
         )
 
+        stale_api_profile_schema = Path(raw) / "stale-api-profile-schema"
+        shutil.copytree(clean, stale_api_profile_schema)
+        replace(
+            stale_api_profile_schema / "devcoordinator-api.service",
+            "--expected-schema 2",
+            "--expected-schema 1",
+        )
+        expect(
+            "api_profile_contract_invalid" in codes(stale_api_profile_schema),
+            "API startup with a stale routing-profile schema was not rejected",
+        )
+
         hidden_repositories = Path(raw) / "hidden-repositories"
         shutil.copytree(clean, hidden_repositories)
         replace(
@@ -623,7 +710,7 @@ def main() -> int:
         )
         expect(
             "api_repository_visibility_invalid" in codes(hidden_repositories),
-            "API startup with enrolled repositories hidden below /home was not rejected",
+            "API startup with cataloged repositories hidden below /home was not rejected",
         )
 
         unbounded_projects = Path(raw) / "unbounded-projects"

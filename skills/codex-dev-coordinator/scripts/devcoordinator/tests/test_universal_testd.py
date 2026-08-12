@@ -25,6 +25,7 @@ from devcoordinator.universal_test_store import (
     AttemptConclusion,
     TargetResources,
     UniversalTestStore,
+    TestStoreConflict,
 )
 from devcoordinator.universal_test_transport import (
     TEST_HEALTH,
@@ -32,6 +33,7 @@ from devcoordinator.universal_test_transport import (
     TestPlaneDispatcher,
 )
 from devcoordinator.universal_testd import (
+    _attempt_scoped_result_chunk,
     BrokerLaunchTicket,
     LiveSourceChanged,
     RunnerHandle,
@@ -195,6 +197,32 @@ class EngineFixture(unittest.TestCase):
 
 
 class TestdEngineTests(EngineFixture):
+    def test_reporter_failure_identity_is_scoped_to_one_attempt(self) -> None:
+        raw = {
+            "chunk_id": "chunk-repeated-failure",
+            "chunk_index": 0,
+            "cases": [],
+            "failures": [
+                {
+                    "failure_id": "failure-reporter-local",
+                    "classification": "test_failure",
+                    "message": "same failing case",
+                    "case_id": None,
+                    "location": None,
+                    "artifact_id": None,
+                }
+            ],
+            "artifacts": [],
+            "reporter_complete": True,
+        }
+
+        first = _attempt_scoped_result_chunk("attempt-first", raw)
+        replay = _attempt_scoped_result_chunk("attempt-first", raw)
+        second = _attempt_scoped_result_chunk("attempt-second", raw)
+
+        self.assertEqual(first.failures[0].failure_id, replay.failures[0].failure_id)
+        self.assertNotEqual(first.failures[0].failure_id, second.failures[0].failure_id)
+
     def test_store_discards_declared_capacity_values(self) -> None:
         selected = plan(mode=SourceMode.LIVE, fingerprint=uuid.uuid4().hex * 2)
         submitted = self.store.submit_plan(
@@ -646,6 +674,144 @@ class TestdEngineTests(EngineFixture):
         self.assertEqual(cancelled["unresolved_attempt_ids"], [])
         self.assertEqual(self.store.get_run(submitted.run_id)["state"], "cancelled")
 
+    def test_cancel_terminal_envelope_is_stable_while_store_replay_fails(self) -> None:
+        submitted = self.submit_live()
+        self.engine.schedule(launch_batch=1)
+        request = self.launcher.requests[0]
+        self.store.request_cancel(
+            submitted.run_id,
+            actor="user@example.com",
+            reason="manual cancellation",
+            operation_id=operation_id(),
+        )
+        real_terminalize = self.store.terminalize_attempt
+
+        with mock.patch.object(
+            self.store,
+            "terminalize_attempt",
+            side_effect=RuntimeError("injected terminal-store outage"),
+        ):
+            first = self.engine.heartbeat()
+            retained = self.spool.active_envelopes()[0]
+            first_terminal = dict(retained.terminal_envelope or {})
+            self.clock.advance(10)
+            second = self.engine.heartbeat()
+            second_terminal = dict(
+                self.spool.active_envelopes()[0].terminal_envelope or {}
+            )
+
+        self.assertEqual(first["completed_attempt_ids"], [])
+        self.assertEqual(second["completed_attempt_ids"], [])
+        self.assertEqual(first["failures"][0]["stage"], "terminal_replay")
+        self.assertEqual(second["failures"][0]["stage"], "terminal_replay")
+        self.assertEqual(first_terminal, second_terminal)
+        self.assertEqual(len(self.spool.pending_envelopes()), 1)
+
+        with mock.patch.object(
+            self.store, "terminalize_attempt", wraps=real_terminalize
+        ):
+            recovered = self.engine.heartbeat()
+
+        self.assertEqual(
+            recovered["completed_attempt_ids"], [request.ticket.attempt_id]
+        )
+        self.assertEqual(self.store.get_run(submitted.run_id)["state"], "cancelled")
+        self.assertEqual(self.spool.pending_envelopes(), ())
+        self.assertEqual(self.spool.active_envelopes(), ())
+
+    def test_obsolete_terminal_transport_is_consumed_after_attempt_finishes(self) -> None:
+        submitted = self.submit_live()
+        self.engine.schedule(launch_batch=1)
+        request = self.launcher.requests[0]
+        self.store.terminalize_attempt(
+            request.ticket.attempt_id,
+            generation=request.ticket.generation,
+            conclusion=AttemptConclusion.INFRASTRUCTURE_FAILED,
+            duration_seconds=1.0,
+            operation_id=operation_id(),
+        )
+        self.spool.append(
+            AttemptExitEnvelope(
+                envelope_id="exit-obsolete-terminal-transport",
+                attempt_id=request.ticket.attempt_id,
+                generation=request.ticket.generation,
+                operation_id=operation_id(),
+                conclusion=AttemptConclusion.CANCELLED,
+                duration_seconds=99.0,
+            )
+        )
+
+        replay = self.engine.replay_spool()
+
+        self.assertEqual(
+            replay["imported_envelope_ids"],
+            ["exit-obsolete-terminal-transport"],
+        )
+        self.assertEqual(self.spool.pending_envelopes(), ())
+        self.assertEqual(self.store.get_run(submitted.run_id)["state"], "failed")
+
+    def test_obsolete_result_transport_is_consumed_after_attempt_finishes(self) -> None:
+        submitted = self.submit_live()
+        self.engine.schedule(launch_batch=1)
+        request = self.launcher.requests[0]
+        self.store.terminalize_attempt(
+            request.ticket.attempt_id,
+            generation=request.ticket.generation,
+            conclusion=AttemptConclusion.INFRASTRUCTURE_FAILED,
+            duration_seconds=1.0,
+            operation_id=operation_id(),
+        )
+        self.spool.append_result_chunk(
+            AttemptResultChunkEnvelope(
+                envelope_id="result-obsolete-terminal-transport",
+                attempt_id=request.ticket.attempt_id,
+                generation=request.ticket.generation,
+                chunk={
+                    "chunk_id": "chunk-obsolete-terminal-transport",
+                    "chunk_index": 0,
+                    "cases": [],
+                    "failures": [],
+                    "artifacts": [],
+                    "reporter_complete": True,
+                },
+            )
+        )
+
+        replay = self.engine.replay_result_spool()
+
+        self.assertEqual(
+            replay["imported_envelope_ids"],
+            ["result-obsolete-terminal-transport"],
+        )
+        self.assertEqual(self.spool.pending_result_chunks(), ())
+
+    def test_cancel_imports_terminal_native_evidence_before_requesting_stop(self) -> None:
+        submitted = self.submit_live()
+        self.engine.schedule(launch_batch=1)
+        request = self.launcher.requests[0]
+        self.spool.append(
+            AttemptExitEnvelope(
+                envelope_id="exit-immediately-before-cancel",
+                attempt_id=request.ticket.attempt_id,
+                generation=request.ticket.generation,
+                operation_id=operation_id(),
+                conclusion=AttemptConclusion.INFRASTRUCTURE_FAILED,
+                duration_seconds=1.0,
+            )
+        )
+        self.engine._active.clear()
+
+        cancelled = self.engine.cancel_run(
+            run_id=submitted.run_id,
+            actor="user@example.com",
+            reason="late cancellation",
+            operation_id=operation_id(),
+        )
+
+        self.assertEqual(cancelled["active_attempt_ids"], [])
+        self.assertEqual(cancelled["unresolved_attempt_ids"], [])
+        self.assertEqual(self.store.get_run(submitted.run_id)["state"], "failed")
+
     def test_durable_exit_replays_after_testd_crash(self) -> None:
         submitted = self.submit_live()
         self.engine.schedule(launch_batch=1)
@@ -852,6 +1018,63 @@ class TestdEngineTests(EngineFixture):
         self.assertEqual(replacement.spool.active_envelopes(), ())
         self.assertEqual(replacement.spool.pending_result_chunks(), ())
         self.assertEqual(replacement.spool.pending_envelopes(), ())
+
+    def test_running_runtime_survives_replacement_after_ordinary_lease_expiry(
+        self,
+    ) -> None:
+        submitted = self.submit_live()
+        self.engine.schedule(launch_batch=1)
+        request = self.launcher.requests[0]
+        self.clock.advance(31)
+
+        replacement_launcher = FakeLauncher(
+            observations=self.launcher.observations
+        )
+        replacement = TestdEngine(
+            store=self.store,
+            scheduler=self.scheduler,
+            ticket_issuer=self.issuer,
+            launcher=replacement_launcher,
+            spool=DurableAttemptSpool.open(self.spool.root),
+            clock=self.clock,
+        )
+
+        reaped = replacement.reap()
+        heartbeat = replacement.heartbeat()
+
+        self.assertEqual(reaped["abandoned_attempt_ids"], [])
+        self.assertEqual(
+            heartbeat["running_attempt_ids"], [request.ticket.attempt_id]
+        )
+        self.assertEqual(heartbeat["failures"], [])
+        self.assertEqual(self.store.get_run(submitted.run_id)["state"], "running")
+        self.assertEqual(len(replacement_launcher.recoveries), 1)
+        self.assertEqual(replacement_launcher.requests, [])
+
+    def test_recovery_lease_rejects_wrong_owner_and_reaped_attempt(self) -> None:
+        self.submit_live()
+        self.engine.schedule(launch_batch=1)
+        request = self.launcher.requests[0]
+        self.clock.advance(31)
+
+        with self.assertRaisesRegex(TestStoreConflict, "lease owner changed"):
+            self.store.recover_attempt_lease(
+                request.ticket.attempt_id,
+                generation=request.ticket.generation,
+                lease_owner="another-testd",
+                operation_id=operation_id(),
+            )
+        self.assertEqual(
+            self.store.reap_expired_attempts()["abandoned_attempt_ids"],
+            [request.ticket.attempt_id],
+        )
+        with self.assertRaisesRegex(TestStoreConflict, "no longer active"):
+            self.store.recover_attempt_lease(
+                request.ticket.attempt_id,
+                generation=request.ticket.generation,
+                lease_owner="devcoordinator-testd",
+                operation_id=operation_id(),
+            )
 
     def test_launched_attempt_is_abandoned_not_duplicated_after_lost_heartbeat(self) -> None:
         submitted = self.submit_live()
@@ -1201,14 +1424,9 @@ class UnixTransportTests(unittest.TestCase):
         connection = BrokerConnection(
             arguments.broker_socket,
             authority_generation="broker-current-testd",
-            expected_broker_uid=arguments.broker_uid,
-            expected_socket_gid=arguments.broker_socket_gid,
-            expected_socket_mode=arguments.broker_socket_mode,
         )
 
-        self.assertEqual(connection.expected_broker_uid, 0)
-        self.assertEqual(connection.expected_socket_gid, 0)
-        self.assertEqual(connection.expected_socket_mode, 0o666)
+        self.assertEqual(connection.socket_path, Path(arguments.broker_socket))
 
 
 if __name__ == "__main__":

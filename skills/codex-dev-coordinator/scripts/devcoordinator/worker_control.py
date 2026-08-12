@@ -29,6 +29,7 @@ from .worker_native import (
     WorkerNativeError,
     native_worker_manager,
 )
+from .worker_runner import observe_worker_process_identity
 from .worker_supervision import (
     DEFAULT_CRASH_LIMIT,
     DEFAULT_CRASH_WINDOW_SECONDS,
@@ -51,6 +52,7 @@ class WorkerReplaceError(WorkerControlError):
 
 
 ManagerFactory = Callable[..., Any]
+ProcessObserver = Callable[[int, str], str]
 
 
 class WorkerController:
@@ -64,6 +66,7 @@ class WorkerController:
         manager_factory: ManagerFactory = native_worker_manager,
         state_root: Path | None = None,
         execution_uid: int | None = None,
+        process_observer: ProcessObserver = observe_worker_process_identity,
         clock: Callable[[], float] = time.monotonic,
         sleeper: Callable[[float], None] = time.sleep,
     ) -> None:
@@ -89,6 +92,7 @@ class WorkerController:
                 "only system authority may control a worker for another UID"
             )
         self.execution_uid = requested_uid
+        self.process_observer = process_observer
         self.clock = clock
         self.sleeper = sleeper
         self._manager: Any | None = None
@@ -243,6 +247,11 @@ class WorkerController:
             name=name,
         )
         policy = self._require_policy(worker_id)
+        active_attempt = (
+            None
+            if policy.get("current_attempt_id") is None
+            else self.supervision.attempt(str(policy["current_attempt_id"]))
+        )
         operation_id = self._begin_operation(
             context=context, actor=actor, action="stop", request={}
         )
@@ -265,17 +274,44 @@ class WorkerController:
                 accepted={"stopped"},
                 timeout_seconds=timeout_seconds,
             )
+            terminal_process_proof = self._terminal_process_proof(active_attempt)
             payload = self._payload(
                 context=context,
                 policy=policy,
                 native=native.to_dict(),
                 native_error=None,
             )
+            payload["terminal_process_proof"] = terminal_process_proof
             self._finish_operation(operation_id, result=payload)
             return payload
         except BaseException as error:
             self._finish_operation(operation_id, error=error)
             raise
+
+    def _terminal_process_proof(
+        self, attempt: Mapping[str, Any] | None
+    ) -> dict[str, Any]:
+        """Prove the exact pre-stop process absent, including PID reuse."""
+
+        if attempt is None or attempt.get("pid") is None:
+            return {"certain": True, "state": "not_launched"}
+        pid = int(attempt["pid"])
+        started = attempt.get("process_start_time")
+        if not isinstance(started, str) or not started:
+            raise WorkerControlError(
+                "stopped service has no immutable pre-stop process identity"
+            )
+        state = self.process_observer(pid, started)
+        if state not in {"absent", "mismatch"}:
+            raise WorkerControlError(
+                "stopped service process absence is unproven; exact PID identity is "
+                + str(state)
+            )
+        return {
+            "certain": True,
+            "state": "pid_reused" if state == "mismatch" else "absent",
+            "pid": pid,
+        }
 
     def restart(
         self,
@@ -894,13 +930,6 @@ class WorkerController:
             )
             connection.execute(
                 """
-                UPDATE repository_memberships SET immutable_fingerprint = ?
-                WHERE resource_kind = 'server' AND host_resource_id = ?
-                """,
-                (replacement["definition_fingerprint"], worker_id),
-            )
-            connection.execute(
-                """
                 UPDATE startup_policies
                 SET immutable_fingerprint = ?, generation = generation + 1,
                     updated_at = ?
@@ -1167,13 +1196,6 @@ class WorkerController:
                     (worker_id, key, value)
                     for key, value in snapshot["environment"].items()
                 ],
-            )
-            connection.execute(
-                """
-                UPDATE repository_memberships SET immutable_fingerprint = ?
-                WHERE resource_kind = 'server' AND host_resource_id = ?
-                """,
-                (snapshot["definition_fingerprint"], worker_id),
             )
             connection.execute(
                 """
@@ -1478,16 +1500,13 @@ class WorkerController:
                        scope.family_id, scope.project_kind,
                        family.root_repo_id,
                        observation.lifecycle AS observed_lifecycle,
-                       observation.pid AS observed_pid,
-                       worker_policy.execution_uid AS policy_execution_uid
+                       observation.pid AS observed_pid
                 FROM server_definitions definition
                 JOIN repositories repository USING(repo_id)
                 JOIN repository_installations installation USING(repo_id)
                 JOIN repository_scopes scope USING(repo_id)
                 JOIN repository_families family USING(family_id)
                 LEFT JOIN server_observations observation
-                  USING(server_definition_id)
-                LEFT JOIN worker_policies worker_policy
                   USING(server_definition_id)
                 WHERE definition.server_definition_id = ?
                   AND repository.host_id = ?
@@ -1503,25 +1522,18 @@ class WorkerController:
             raise WorkerControlError("worker belongs to another repository scope")
         if str(context["name"]) != name:
             raise WorkerControlError("worker name does not match its immutable ID")
-        if str(context.get("role") or "").lower() != "worker":
-            raise WorkerControlError(
-                "keep-alive supervision is available only for installed worker-role services"
-            )
         if not allow_inactive and (
             str(context["repository_state"]) != "active"
             or str(context["installation_status"]) != "installed"
             or bool(context["startup_fenced"])
         ):
-            raise WorkerControlError("worker repository is not installed and startable")
+            raise WorkerControlError(
+                "supervised service repository is not installed and startable"
+            )
         execution_uid = self.execution_uid
         if execution_uid is None:
             raise WorkerControlError(
                 "system worker control requires the authenticated peer execution UID"
-            )
-        policy_uid = context.get("policy_execution_uid")
-        if policy_uid is not None and int(policy_uid) != execution_uid:
-            raise WorkerControlError(
-                "worker policy belongs to another execution account"
             )
         account = pwd.getpwuid(execution_uid)
         context["execution_uid"] = execution_uid

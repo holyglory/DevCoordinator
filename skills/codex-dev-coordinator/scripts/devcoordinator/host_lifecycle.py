@@ -138,7 +138,7 @@ class CoordinatorHostLifecycleAdapter:
                 state.observable,
                 target.immutable_fingerprint if identity_matches else _observed_identity(state.full_container_id),
                 state.observable and identity_matches,
-                target.ownership_fingerprint if identity_matches else None,
+                target.observation_fingerprint if identity_matches else None,
                 (
                     RunningState.RUNNING
                     if state.running is True
@@ -166,7 +166,7 @@ class CoordinatorHostLifecycleAdapter:
                 state.observable,
                 target.immutable_fingerprint if state.identity_matches else "observed:server-mismatch",
                 state.observable and state.identity_matches,
-                target.ownership_fingerprint if state.identity_matches else None,
+                target.observation_fingerprint if state.identity_matches else None,
                 state.running_state,
                 listener_active=(
                     state.listener_active if state.listener_observable else None
@@ -191,7 +191,7 @@ class CoordinatorHostLifecycleAdapter:
             state.observable,
             target.immutable_fingerprint if state.identity_matches else "observed:supervisor-mismatch",
             state.observable and state.identity_matches,
-            target.ownership_fingerprint if state.identity_matches else None,
+            target.observation_fingerprint if state.identity_matches else None,
             running,
             supervisor_active=state.active,
             replacement_fingerprint=(

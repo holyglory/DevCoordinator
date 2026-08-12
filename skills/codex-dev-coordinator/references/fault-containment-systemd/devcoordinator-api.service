@@ -15,7 +15,7 @@ Environment=DEVCOORDINATOR_TEST_READ_AUTHORITY=testd
 Environment=DEVCOORDINATOR_CALL_LOG=/var/log/devcoordinator/calls.jsonl
 Environment=DEVCOORDINATOR_CALL_LOG_MAX_BYTES=4194304
 Environment=DEVCOORDINATOR_CALL_LOG_BACKUPS=4
-ExecStartPre=/opt/devcoordinator/releases/RELEASE_DIGEST/bin/devcoordinator-profile-check --read-only --profile /etc/devcoordinator/client-profiles.json --expected-schema 1
+ExecStartPre=/opt/devcoordinator/releases/RELEASE_DIGEST/bin/devcoordinator-profile-check --read-only --profile /etc/devcoordinator/client-profiles.json --expected-schema 2
 ExecStart=/opt/devcoordinator/releases/RELEASE_DIGEST/bin/devcoordinator-api --systemd-socket --profile /etc/devcoordinator/client-profiles.json
 Restart=always
 RestartSec=2
@@ -34,7 +34,7 @@ PrivateTmp=yes
 PrivateDevices=yes
 ProtectSystem=strict
 # Repository roots live below /home.  The API only needs read access to
-# canonicalize enrolled identities before delegating mutations to the broker.
+# canonicalize cataloged identities before delegating mutations to the broker.
 ProtectHome=read-only
 ProtectKernelTunables=yes
 ProtectKernelModules=yes

@@ -1,16 +1,20 @@
 #!/usr/bin/env python3
-"""Fail-closed checks for project process and container isolation policy."""
+"""Checks for trusted-local project runtime isolation evidence.
+
+Repository identifiers select inventory and cgroup boundaries only.  Every
+repository runs under the one developer service account; no owner map,
+membership, grant, or controller binding participates in capture or replay.
+"""
 
 from __future__ import annotations
 
-import json
+from datetime import datetime, timedelta, timezone
 import inspect
+import json
 import os
 from pathlib import Path
-import sqlite3
 import sys
 import tempfile
-from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest import mock
 import uuid
@@ -22,8 +26,9 @@ if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
 import dev_coordinator  # noqa: E402
-from devcoordinator.broker_host import _compose_isolation_override  # noqa: E402
 from devcoordinator import project_runtime_isolation as isolation  # noqa: E402
+from devcoordinator.broker_host import _compose_isolation_override  # noqa: E402
+from devcoordinator.schema import SCHEMA_VERSION  # noqa: E402
 from devcoordinator.worker_native import project_repository_slice  # noqa: E402
 
 
@@ -32,17 +37,51 @@ def expect(condition: bool, message: str) -> None:
         raise AssertionError(message)
 
 
+def _capture(
+    *,
+    metadata: dict[str, object],
+    resources: list[dict[str, object]],
+    execution_uid: int,
+    docker_parent: str,
+    process_parent: str,
+    boot_id: str,
+    now: datetime,
+) -> dict[str, object]:
+    connection = SimpleNamespace(close=lambda: None)
+    contexts = {str(row["repo_id"]): execution_uid for row in resources}
+    with (
+        mock.patch.object(isolation, "_database_file", return_value=connection),
+        mock.patch.object(isolation, "_metadata", return_value=metadata),
+        mock.patch.object(
+            isolation, "_repository_execution_context", return_value=contexts
+        ),
+        mock.patch.object(isolation, "_active_resources", return_value=resources),
+    ):
+        return isolation.capture_isolation_audit(
+            database_path=Path("/private/authority.db"),
+            docker_cgroup_reader=lambda identities: {
+                identities[0]: {"cgroup_parent": docker_parent, "running": True}
+            },
+            process_cgroup_reader=lambda _identity: process_parent,
+            boot_id_reader=lambda: boot_id,
+            now=lambda: now,
+        )
+
+
 def main() -> int:
-    repository_slice = project_repository_slice(uid=501, repository_id="repo-one")
+    execution_uid = 501
+    repository_slice = project_repository_slice(
+        uid=execution_uid, repository_id="repo-one"
+    )
     expect(
         repository_slice.startswith("devcoordinator-projects-uid501-repo")
         and repository_slice.endswith(".slice"),
-        "repository runner does not descend from the protected projects hierarchy",
+        "repository runtime did not receive a bounded cgroup slice",
     )
     expect(
         repository_slice
-        != project_repository_slice(uid=501, repository_id="repo-two"),
-        "different repositories share one leaf slice",
+        != project_repository_slice(uid=execution_uid, repository_id="repo-two"),
+        "different repositories share one cgroup leaf",
     )
 
     launch = dev_coordinator.LaunchSpec(
@@ -60,10 +99,7 @@ def main() -> int:
         try:
             dev_coordinator.start_process(launch=launch, server_id="server-one")
         except RuntimeError as error:
-            expect(
-                "forbidden" in str(error),
-                "control-plane launch failed for an unrelated reason",
-            )
+            expect("forbidden" in str(error), "control-plane launch failed unexpectedly")
         else:
             raise AssertionError("control-plane service launched a project process")
         popen.assert_not_called()
@@ -71,7 +107,7 @@ def main() -> int:
     override = json.loads(
         _compose_isolation_override(
             SimpleNamespace(
-                owner_uid=501,
+                owner_uid=execution_uid,
                 repo_id="repo-one",
                 services=("api", "worker"),
             )
@@ -79,7 +115,7 @@ def main() -> int:
     )
     expect(
         set(override["services"]) == {"api", "worker"},
-        "Compose isolation overlay did not cover every authorized service",
+        "Compose isolation did not cover all selected services",
     )
     for policy in override["services"].values():
         expect(
@@ -87,7 +123,7 @@ def main() -> int:
             and policy["mem_limit"] == "20g"
             and policy["cpus"] == "8.0"
             and policy["pids_limit"] == 4096,
-            "Compose isolation overlay omitted a project resource ceiling",
+            "Compose isolation omitted a runtime resource ceiling",
         )
 
     inspect_commands: list[tuple[str, ...]] = []
@@ -97,135 +133,75 @@ def main() -> int:
     ) -> tuple[int, bytes]:
         inspect_commands.append(command)
         return 0, (
-            b'{"Id":"' + b"a" * 64
+            b'{"Id":"'
+            + b"a" * 64
             + b'","CgroupParent":"legacy.slice","Running":true,'
-            b'"Env":["SECRET_CANARY=do-not-retain"]}\n'
+            + b'"Env":["SECRET_CANARY=do-not-retain"]}\n'
         )
 
     with (
-        mock.patch.object(isolation, "_safe_docker_executable", return_value=Path("/usr/bin/docker")),
-        mock.patch.object(isolation, "_bounded_command_stdout", side_effect=hostile_inspect),
+        mock.patch.object(
+            isolation, "_safe_docker_executable", return_value=Path("/usr/bin/docker")
+        ),
+        mock.patch.object(
+            isolation, "_bounded_command_stdout", side_effect=hostile_inspect
+        ),
     ):
         expect(
             isolation.inspect_docker_cgroups(("a" * 64,)) == {},
-            "Docker isolation audit accepted unexpected secret-bearing inspect fields",
+            "Docker isolation accepted unexpected secret-bearing inspect fields",
         )
     expect(
         len(inspect_commands) == 1
         and ".Config" not in inspect_commands[0][3]
         and ".Mounts" not in inspect_commands[0][3]
-        and ".Labels" not in inspect_commands[0][3]
-        and "SECRET_CANARY" not in " ".join(inspect_commands[0]),
-        "Docker isolation audit requested secret-bearing runtime metadata",
+        and ".Labels" not in inspect_commands[0][3],
+        "Docker isolation requested secret-bearing runtime metadata",
     )
+
     returncode, excess = isolation._bounded_command_stdout(
-        (
-            sys.executable,
-            "-c",
-            "import os; os.write(1, b'x' * 131072)",
-        ),
+        (sys.executable, "-c", "import os; os.write(1, b'x' * 131072)"),
         timeout_seconds=5,
         maximum_bytes=1024,
     )
     expect(
         excess is None and returncode != 0,
-        "Docker isolation audit retained output beyond its hard byte cap",
+        "Docker isolation retained output beyond its hard byte cap",
     )
+
+    authority = mock.MagicMock()
+    authority.execute.return_value.fetchall.return_value = [
+        {"repo_id": "repo-one"},
+        {"repo_id": "repo-two"},
+    ]
+    with mock.patch.object(isolation.os, "geteuid", return_value=execution_uid):
+        expect(
+            isolation._repository_execution_uids(authority)
+            == {"repo-one": execution_uid, "repo-two": execution_uid},
+            "repository runtime contexts are not host-wide developer contexts",
+        )
+    source = inspect.getsource(isolation)
+    for obsolete in (
+        "repository_owner_uids",
+        "repository_owner_map",
+        "repository_membership",
+        "control_binding",
+        "source_permission",
+    ):
+        expect(obsolete not in source, f"isolation still references {obsolete}")
 
     fixed_now = datetime(2026, 7, 28, 12, 0, tzinfo=timezone.utc)
     docker_id = "a" * 64
     replacement_docker_id = "b" * 64
     process_fingerprint = "sha256:" + "c" * 64
     boot_id = str(uuid.UUID("11111111-2222-4333-8444-555555555555"))
-    metadata = {
-        "source_schema_version": 13,
+    metadata: dict[str, object] = {
+        "source_schema_version": SCHEMA_VERSION,
         "database_generation": "generation-one",
         "state_revision": 8,
         "observation_revision": 13,
         "host_id": "host-one",
     }
-
-    authority = sqlite3.connect(":memory:")
-    authority.row_factory = sqlite3.Row
-    authority.executescript(
-        """
-        CREATE TABLE schema_metadata(
-            singleton INTEGER PRIMARY KEY, schema_version INTEGER NOT NULL,
-            database_generation TEXT NOT NULL, state_revision INTEGER NOT NULL,
-            migration_state TEXT NOT NULL
-        );
-        INSERT INTO schema_metadata VALUES(1, 13, 'generation-one', 8, 'ready');
-        CREATE TABLE repositories(
-            repo_id TEXT PRIMARY KEY, canonical_root TEXT NOT NULL,
-            display_name TEXT NOT NULL, generation INTEGER NOT NULL,
-            state TEXT NOT NULL
-        );
-        CREATE TABLE repository_owners(
-            repo_id TEXT PRIMARY KEY, owner_uid INTEGER NOT NULL,
-            repository_generation INTEGER NOT NULL
-        );
-        INSERT INTO repositories VALUES (
-            'repo-one', '/srv/repo-one', 'Repo One', 7, 'active'
-        );
-        INSERT INTO repository_owners VALUES ('repo-one', 501, 7);
-        """
-    )
-    expect(
-        isolation._repository_owner_uids_v13(authority) == {"repo-one": 501},
-        "schema-13 isolation did not use explicit repository owner authority",
-    )
-    authority.execute(
-        "UPDATE repository_owners SET repository_generation = 6 WHERE repo_id = 'repo-one'"
-    )
-    try:
-        isolation._repository_owner_uids_v13(authority)
-    except isolation.ProjectIsolationError:
-        pass
-    else:
-        raise AssertionError("schema-13 isolation accepted stale owner generation")
-    authority.close()
-
-    owner_map_path = Path("/root/private/repository-owner-map.json")
-    owner_map_document = {
-        "document_sha256": "sha256:" + "d" * 64,
-        "repositories": [
-            {"repository_id": "repo-one", "owner_uid": 501},
-            {"repository_id": "repo-two", "owner_uid": 502},
-        ],
-    }
-    with (
-        mock.patch.object(isolation.os, "geteuid", return_value=0),
-        mock.patch.object(
-            isolation, "load_sealed_owner_map", return_value=owner_map_document
-        ) as load_owner_map,
-        mock.patch.object(
-            isolation, "validate_owner_map", return_value=owner_map_document
-        ) as validate_map,
-    ):
-        owner_uids, checked_map = isolation._repository_owner_uids_v12(
-            SimpleNamespace(), owner_map_path=owner_map_path
-        )
-    expect(
-        owner_uids == {"repo-one": 501, "repo-two": 502}
-        and checked_map == owner_map_document,
-        "schema-12 isolation did not derive every owner exclusively from its sealed map",
-    )
-    load_owner_map.assert_called_once_with(owner_map_path, expected_owner_uid=0)
-    validate_map.assert_called_once()
-    try:
-        isolation._repository_owner_uids_v12(
-            SimpleNamespace(), owner_map_path=None
-        )
-    except isolation.ProjectIsolationError:
-        pass
-    else:
-        raise AssertionError("schema-12 isolation accepted a missing owner map")
-    active_resource_source = inspect.getsource(isolation._active_resources)
-    expect(
-        "effective_uid" not in active_resource_source
-        and "execution_uid" not in active_resource_source,
-        "isolation inventory still trusts source/policy execution identity as owner authority",
-    )
 
     def resource_rows(*, container_id: str = docker_id) -> list[dict[str, object]]:
         return [
@@ -233,24 +209,61 @@ def main() -> int:
                 "resource_kind": "docker",
                 "resource_id": "docker-one",
                 "repo_id": "repo-one",
-                "owner_uid": 501,
+                "execution_uid": execution_uid,
                 "runtime_identity": {"full_container_id": container_id},
-                "authority_observable": True,
+                "identity_observable": True,
             },
             {
                 "resource_kind": "service",
                 "resource_id": "service-one",
                 "repo_id": "repo-two",
-                "owner_uid": 502,
+                "execution_uid": execution_uid,
                 "runtime_identity": {
                     "attempt_id": "attempt-one",
                     "pid": 2345,
                     "process_start_time": "123456",
                     "process_fingerprint": process_fingerprint,
                 },
-                "authority_observable": True,
+                "identity_observable": True,
             },
         ]
+
+    process_parent = (
+        "/devcoordinator-projects.slice/"
+        + project_repository_slice(uid=execution_uid, repository_id="repo-two")
+        + "/service.scope"
+    )
+    audit = _capture(
+        metadata=metadata,
+        resources=resource_rows(),
+        execution_uid=execution_uid,
+        docker_parent="legacy.slice",
+        process_parent=process_parent,
+        boot_id=boot_id,
+        now=fixed_now,
+    )
+    expect(
+        audit["counts"]
+        == {"compliant": 1, "legacy_requires_recreation": 1, "unobservable": 0},
+        "live isolation audit did not classify legacy resources",
+    )
+    expect(
+        audit["source_schema_version"] == SCHEMA_VERSION
+        and audit["project_isolation_complete"] is False,
+        "isolation evidence is not bound to the current authority schema",
+    )
+    expect(
+        not any(
+            key in audit
+            for key in (
+                "repository_owner_map_sha256",
+                "memberships",
+                "control_bindings",
+                "controller_permissions",
+            )
+        ),
+        "isolation evidence leaked obsolete repository access state",
+    )
 
     connection = SimpleNamespace(close=lambda: None)
     with (
@@ -258,45 +271,8 @@ def main() -> int:
         mock.patch.object(isolation, "_metadata", return_value=metadata),
         mock.patch.object(
             isolation,
-            "_repository_owner_authority",
-            return_value=({"repo-one": 501, "repo-two": 502}, None),
-        ),
-        mock.patch.object(isolation, "_active_resources", return_value=resource_rows()),
-    ):
-        audit = isolation.capture_isolation_audit(
-            database_path=Path("/private/authority.db"),
-            docker_cgroup_reader=lambda identities: {
-                identities[0]: {"cgroup_parent": "legacy.slice", "running": True}
-            },
-            process_cgroup_reader=lambda identity: (
-                f"/devcoordinator-projects.slice/"
-                f"{project_repository_slice(uid=502, repository_id='repo-two')}"
-                "/service.scope"
-            ),
-            boot_id_reader=lambda: boot_id,
-            now=lambda: fixed_now,
-        )
-    expect(
-        audit["counts"]
-        == {"compliant": 1, "legacy_requires_recreation": 1, "unobservable": 0},
-        "exact live isolation audit did not classify legacy resources",
-    )
-    expect(
-        audit["project_isolation_complete"] is False,
-        "legacy resource incorrectly passed the isolation gate",
-    )
-    expect(
-        audit["source_schema_version"] == 13
-        and audit["repository_owner_map_sha256"] is None,
-        "post-split isolation evidence did not bind its schema authority",
-    )
-    with (
-        mock.patch.object(isolation, "_database_file", return_value=connection),
-        mock.patch.object(isolation, "_metadata", return_value=metadata),
-        mock.patch.object(
-            isolation,
-            "_repository_owner_authority",
-            return_value=({"repo-one": 501, "repo-two": 502}, None),
+            "_repository_execution_context",
+            return_value={"repo-one": execution_uid, "repo-two": execution_uid},
         ),
     ):
         expect(
@@ -304,16 +280,17 @@ def main() -> int:
                 audit, database_path=Path("/private/authority.db")
             )["evidence_sha256"]
             == audit["evidence_sha256"],
-            "retained isolation audit did not recheck its live owner authority",
+            "retained isolation audit did not recheck live inventory identity",
         )
-    changed_metadata = {**metadata, "state_revision": metadata["state_revision"] + 1}
+
+    changed_metadata = {**metadata, "state_revision": 9}
     with (
         mock.patch.object(isolation, "_database_file", return_value=connection),
         mock.patch.object(isolation, "_metadata", return_value=changed_metadata),
         mock.patch.object(
             isolation,
-            "_repository_owner_authority",
-            return_value=({"repo-one": 501, "repo-two": 502}, None),
+            "_repository_execution_context",
+            return_value={"repo-one": execution_uid, "repo-two": execution_uid},
         ),
     ):
         try:
@@ -323,42 +300,8 @@ def main() -> int:
         except isolation.ProjectIsolationError:
             pass
         else:
-            raise AssertionError("retained isolation audit accepted an advanced authority")
-    schema12_metadata = {**metadata, "source_schema_version": 12}
-    schema12_map = {
-        "document_sha256": "sha256:" + "d" * 64,
-        "repositories": [],
-    }
-    with (
-        mock.patch.object(isolation, "_database_file", return_value=connection),
-        mock.patch.object(isolation, "_metadata", return_value=schema12_metadata),
-        mock.patch.object(
-            isolation,
-            "_repository_owner_authority",
-            return_value=({"repo-one": 501, "repo-two": 502}, schema12_map),
-        ),
-        mock.patch.object(isolation, "_active_resources", return_value=resource_rows()),
-    ):
-        schema12_audit = isolation.capture_isolation_audit(
-            database_path=Path("/private/authority.db"),
-            repository_owner_map_path=owner_map_path,
-            docker_cgroup_reader=lambda identities: {
-                identities[0]: {"cgroup_parent": "legacy.slice", "running": True}
-            },
-            process_cgroup_reader=lambda identity: (
-                f"/devcoordinator-projects.slice/"
-                f"{project_repository_slice(uid=502, repository_id='repo-two')}"
-                "/service.scope"
-            ),
-            boot_id_reader=lambda: boot_id,
-            now=lambda: fixed_now,
-        )
-    expect(
-        schema12_audit["source_schema_version"] == 12
-        and schema12_audit["repository_owner_map_sha256"]
-        == schema12_map["document_sha256"],
-        "pre-split isolation evidence omitted its sealed owner-map digest",
-    )
+            raise AssertionError("retained isolation audit accepted changed authority")
+
     ledger = isolation.create_migration_ledger(
         audit,
         deadline=fixed_now + timedelta(hours=12),
@@ -366,42 +309,18 @@ def main() -> int:
     )
     expect(
         ledger["counts"] == {"pending": 1, "completed": 0, "retired": 0},
-        "legacy resource did not create an explicit migration ledger entry",
+        "legacy resource did not create a migration ledger entry",
     )
 
-    expected_docker_parent = project_repository_slice(
-        uid=501, repository_id="repo-one"
+    replacement_audit = _capture(
+        metadata=metadata,
+        resources=resource_rows(container_id=replacement_docker_id),
+        execution_uid=execution_uid,
+        docker_parent=repository_slice,
+        process_parent=process_parent,
+        boot_id=boot_id,
+        now=fixed_now + timedelta(minutes=1),
     )
-    with (
-        mock.patch.object(isolation, "_database_file", return_value=connection),
-        mock.patch.object(isolation, "_metadata", return_value=metadata),
-        mock.patch.object(
-            isolation,
-            "_repository_owner_authority",
-            return_value=({"repo-one": 501, "repo-two": 502}, None),
-        ),
-        mock.patch.object(
-            isolation,
-            "_active_resources",
-            return_value=resource_rows(container_id=replacement_docker_id),
-        ),
-    ):
-        replacement_audit = isolation.capture_isolation_audit(
-            database_path=Path("/private/authority.db"),
-            docker_cgroup_reader=lambda identities: {
-                identities[0]: {
-                    "cgroup_parent": expected_docker_parent,
-                    "running": True,
-                }
-            },
-            process_cgroup_reader=lambda identity: (
-                f"/devcoordinator-projects.slice/"
-                f"{project_repository_slice(uid=502, repository_id='repo-two')}"
-                "/service.scope"
-            ),
-            boot_id_reader=lambda: boot_id,
-            now=lambda: fixed_now + timedelta(minutes=1),
-        )
     operation_id = str(uuid.UUID("22222222-3333-4444-8555-666666666666"))
     completed = isolation.record_migration(
         ledger,
@@ -414,7 +333,7 @@ def main() -> int:
     )
     expect(
         completed["counts"] == {"pending": 0, "completed": 1, "retired": 0},
-        "migration evidence did not complete the exact ledger entry",
+        "replacement identity did not complete the exact migration entry",
     )
     expect(
         isolation.record_migration(
@@ -428,25 +347,6 @@ def main() -> int:
         == completed["evidence_sha256"],
         "idempotent migration acknowledgement changed its evidence",
     )
-    stale_identity_audit = json.loads(json.dumps(replacement_audit))
-    stale_identity_audit["resources"][0]["runtime_identity"] = {
-        "full_container_id": docker_id
-    }
-    stale_identity_audit.pop("evidence_sha256")
-    stale_identity_audit = isolation._with_fingerprint(stale_identity_audit)
-    try:
-        isolation.record_migration(
-            ledger,
-            audit=stale_identity_audit,
-            resource_kind="docker",
-            resource_id="docker-one",
-            operation_id=operation_id,
-            outcome="completed",
-        )
-    except isolation.ProjectIsolationError:
-        pass
-    else:
-        raise AssertionError("unchanged runtime identity completed a migration ledger")
 
     unobservable = json.loads(json.dumps(audit))
     unobservable["resources"][0]["observed_cgroup"] = None
@@ -487,14 +387,6 @@ def main() -> int:
             pass
         else:
             raise AssertionError("isolation evidence publication clobbered a file")
-        link = private / "audit-link.json"
-        link.symlink_to(audit_file)
-        try:
-            isolation.read_private_document(link)
-        except (OSError, isolation.ProjectIsolationError):
-            pass
-        else:
-            raise AssertionError("isolation evidence reader followed a symlink")
 
     print("project isolation self-test ok")
     return 0

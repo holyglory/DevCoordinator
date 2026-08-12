@@ -167,9 +167,6 @@ def oidc(_url: str, _timeout: float) -> bytes:
 def candidate_state(release: Path) -> dict[str, object]:
     state, _authority, _testd = fixtures.through_seal(release=release)
     state = cutover.transition(
-        state, evidence_kind="api-delegation", evidence=fixtures.delegation()
-    )
-    state = cutover.transition(
         state,
         evidence_kind="profile-inventory-readiness",
         evidence=fixtures.profile_inventory_readiness(release=release),
@@ -351,7 +348,7 @@ class PrepareRunner:
         self.enable_count = 0
         self.commands: list[tuple[str, ...]] = []
         self.background_transactions: dict[str, dict[str, object]] = {}
-        self.isolation_source_schema_version = 13
+        self.isolation_source_schema_version = 15
 
     def run_json(self, argv):
         self.commands.append(tuple(argv))
@@ -385,9 +382,7 @@ class PrepareRunner:
             return dict(self.background_transactions[directory])
         if executable == "devcoordinator-project-isolation-audit":
             if argv[1] == "capture":
-                self.isolation_source_schema_version = (
-                    12 if "--repository-owner-map" in argv else 13
-                )
+                self.isolation_source_schema_version = 15
                 output = Path(argv[argv.index("--output") + 1])
                 private_file(output, b'{"fixture":"isolation"}\n', 0o400)
                 return {
@@ -409,11 +404,6 @@ class PrepareRunner:
                     "kind": activation.PROJECT_ISOLATION_VERIFICATION_KIND,
                     "audit_sha256": "sha256:" + "8" * 64,
                     "source_schema_version": self.isolation_source_schema_version,
-                    "repository_owner_map_sha256": (
-                        "sha256:" + "9" * 64
-                        if self.isolation_source_schema_version == 12
-                        else None
-                    ),
                     "audit_counts": {
                         "compliant": 1,
                         "legacy_requires_recreation": 0,
@@ -673,9 +663,6 @@ class AdoptionRunner:
 def sealed_preparation_state(release: Path, rendered: Path) -> dict[str, object]:
     state, _authority, _testd = fixtures.through_seal(release=release)
     state = cutover.transition(
-        state, evidence_kind="api-delegation", evidence=fixtures.delegation()
-    )
-    state = cutover.transition(
         state,
         evidence_kind="profile-inventory-readiness",
         evidence=fixtures.profile_inventory_readiness(release=release),
@@ -813,65 +800,6 @@ class ActivationTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.raw.cleanup()
 
-    def test_repository_owner_api_binds_execution_scope_to_same_release(self) -> None:
-        owner_api = activation._repository_owner_authority_api(ROOT)
-        self.assertEqual(len(owner_api), 5)
-        self.assertEqual(
-            owner_api[2].__module__,
-            "devcoordinator.repository_execution_scope",
-        )
-        for module_name, relative in (
-            (
-                "devcoordinator.repository_owner_authority",
-                "repository_owner_authority.py",
-            ),
-            (
-                "devcoordinator.repository_execution_scope",
-                "repository_execution_scope.py",
-            ),
-        ):
-            module = sys.modules[module_name]
-            self.assertEqual(
-                Path(str(module.__file__)).resolve(),
-                (
-                    ROOT
-                    / "skills/codex-dev-coordinator/scripts/devcoordinator"
-                    / relative
-                ).resolve(),
-            )
-
-    def test_first_adoption_repair_reason_binds_descendant_revision(self) -> None:
-        plan_id = str(uuid.uuid4())
-        deployment_id = str(uuid.uuid4())
-        plan = {"plan_id": plan_id, "authority_state_revision": 7}
-        result = {
-            "maintenance_deployment_id": deployment_id,
-            "state_revision_before": 11,
-            "state_revision_after": 12,
-            "reason": cutover._authority_repair_mutation_reason(
-                plan_id=plan_id,
-                deployment_id=deployment_id,
-                state_revision_before=11,
-            ),
-        }
-        self.assertTrue(
-            activation._first_adoption_repair_reason_is_exact(
-                plan=plan, result=result
-            )
-        )
-        for field, value in (
-            ("reason", cutover.AUTHORITY_REPOSITORY_REPAIR_REASON),
-            ("state_revision_before", 10),
-            ("state_revision_after", 13),
-        ):
-            with self.subTest(field=field):
-                drifted = {**result, field: value}
-                self.assertFalse(
-                    activation._first_adoption_repair_reason_is_exact(
-                        plan=plan, result=drifted
-                    )
-                )
-
     def test_first_adoption_repair_rejects_wal_backed_target_drift(self) -> None:
         database = self.root / "wal-repair-authority.sqlite3"
         repository_id = "eb1dc238-f385-505b-bb7a-cce5107df4e9"
@@ -938,7 +866,7 @@ class ActivationTests(unittest.TestCase):
                     policy_immutable_fingerprint TEXT NOT NULL,
                     target_immutable_fingerprint TEXT NOT NULL,
                     control_binding_id TEXT NOT NULL,
-                    ownership_fingerprint TEXT NOT NULL,
+                    observation_fingerprint TEXT NOT NULL,
                     native_identity_fingerprint TEXT NOT NULL,
                     captured_value TEXT NOT NULL,
                     restore_required INTEGER NOT NULL,
@@ -1510,7 +1438,6 @@ class ActivationTests(unittest.TestCase):
                 activation.prepare_candidate(
                     state=state,
                     candidate_slot_source=slot_source,
-                    test_capability_policy=fixtures.capability_policy(),
                     legacy_console_env=self.legacy_console_env,
                     background_project_root=self.background_project_root,
                     background_config_transaction=self.root / "background-failed",
@@ -1624,7 +1551,6 @@ class ActivationTests(unittest.TestCase):
             candidate, credential = activation.prepare_candidate(
                 state=state,
                 candidate_slot_source=slot_source,
-                test_capability_policy=fixtures.capability_policy(),
                 legacy_console_env=self.legacy_console_env,
                 background_project_root=self.background_project_root,
                 background_config_transaction=self.root / "background-success",
@@ -1723,7 +1649,6 @@ class ActivationTests(unittest.TestCase):
             graph, _credential = activation.prepare_candidate(
                 state=sealed_preparation_state(self.release, rendered),
                 candidate_slot_source=slot_source,
-                test_capability_policy=None,
                 legacy_console_env=self.legacy_console_env,
                 background_project_root=self.background_project_root,
                 background_config_transaction=self.root / "background-clean-adoption",
@@ -1753,7 +1678,6 @@ class ActivationTests(unittest.TestCase):
                 first_adoption_legacy_authority_database=(
                     self.root / "fresh-authority-clean-adoption.sqlite3"
                 ),
-                repository_owner_map=None,
                 first_adoption_journal=graph_journal,
             )
 
@@ -1825,7 +1749,6 @@ class ActivationTests(unittest.TestCase):
                 activation.prepare_candidate(
                     state=sealed_preparation_state(self.release, rendered),
                     candidate_slot_source=slot_source,
-                    test_capability_policy=None,
                     legacy_console_env=self.legacy_console_env,
                     background_project_root=self.background_project_root,
                     background_config_transaction=self.root / "background-first-adoption",
@@ -1850,16 +1773,12 @@ class ActivationTests(unittest.TestCase):
                     first_adoption_legacy_authority_database=(
                         self.root / "legacy-authority-first-adoption.sqlite3"
                     ),
-                    repository_owner_map=(
-                        self.root / "repository-owner-map-first-adoption.json"
-                    ),
                     first_adoption_journal=graph_journal,
                     failpoint=crash_after_first_install,
                 )
             graph, credential = activation.prepare_candidate(
                 state=sealed_preparation_state(self.release, rendered),
                 candidate_slot_source=slot_source,
-                test_capability_policy=None,
                 legacy_console_env=self.legacy_console_env,
                 background_project_root=self.background_project_root,
                 background_config_transaction=self.root / "background-first-adoption",
@@ -1883,9 +1802,6 @@ class ActivationTests(unittest.TestCase):
                 first_adoption_defer_start=True,
                 first_adoption_legacy_authority_database=(
                     self.root / "legacy-authority-first-adoption.sqlite3"
-                ),
-                repository_owner_map=(
-                    self.root / "repository-owner-map-first-adoption.json"
                 ),
                 first_adoption_journal=graph_journal,
             )
@@ -1950,10 +1866,6 @@ class ActivationTests(unittest.TestCase):
                     "legacy_database": graph["project_isolation"][
                         "authority_database"
                     ],
-                    "owner_map": str(
-                        self.root / "repository-owner-map-first-adoption.json"
-                    ),
-                    "owner_map_sha256": "9" * 64,
                 },
                 "api": {},
                 "public": {},
@@ -1966,19 +1878,6 @@ class ActivationTests(unittest.TestCase):
                     cutover,
                     "load_state",
                     return_value={"release": str(self.release)},
-                ),
-                mock.patch.object(
-                    activation,
-                    "_repository_owner_authority_api",
-                    return_value=(
-                        lambda _path, **_kwargs: {
-                            "document_sha256": "sha256:" + "9" * 64
-                        },
-                        mock.Mock(),
-                        mock.Mock(),
-                        "fixture-fence",
-                        1,
-                    ),
                 ),
                 self.assertRaisesRegex(
                     activation.ActivationError,
@@ -2082,332 +1981,6 @@ class ActivationTests(unittest.TestCase):
         )
         self.assertEqual(operation["phase"], "complete")
         self.assertEqual(operation["result"], result)
-
-    def test_authority_adoption_uses_logical_split_and_exact_rollback(self) -> None:
-        legacy_dir = private_dir(self.root / "legacy-authority")
-        source = legacy_dir / "normalized.sqlite3"
-        with closing(sqlite3.connect(source)) as connection:
-            connection.executescript(
-                """
-                CREATE TABLE schema_metadata(
-                    singleton INTEGER PRIMARY KEY,
-                    schema_version INTEGER NOT NULL,
-                    database_generation TEXT NOT NULL,
-                    state_revision INTEGER NOT NULL,
-                    observation_revision INTEGER NOT NULL
-                );
-                INSERT INTO schema_metadata VALUES (1, 1, 'generation-a', 7, 9);
-                CREATE TABLE bulky_history(payload BLOB NOT NULL);
-                """
-            )
-            connection.execute(
-                "INSERT INTO bulky_history(payload) VALUES (?)", (b"x" * (2 * 1024 * 1024),)
-            )
-            connection.commit()
-        source.chmod(0o600)
-        source_sha = hashlib.sha256(source.read_bytes()).hexdigest()
-        authority_dir = private_dir(self.root / "authority")
-        inventory_dir = private_dir(self.root / "inventory")
-        evidence_dir = private_dir(self.root / "adoption-evidence")
-        authority = authority_dir / "authority.sqlite3"
-        inventory = inventory_dir / "inventory.sqlite3"
-        inventory_publication = inventory_dir / "inventory.publication"
-        attestation = evidence_dir / "storage-split.json"
-        pointer = evidence_dir / "authority-adoption.json"
-        owner_operation_id = str(uuid.uuid4())
-        owner_map_document = {"operation_id": owner_operation_id}
-        owner_map = private_file(
-            evidence_dir / "repository-owners.json", b"{}\n"
-        )
-        owner_map_sha256 = hashlib.sha256(owner_map.read_bytes()).hexdigest()
-        envelope = {
-            "schema_version": 1,
-            "generation": 1,
-            "published_at": "2026-07-28T00:00:00.000Z",
-            "payload_sha256": "1" * 64,
-            "inventory": {
-                "schema_version": 1,
-                "repositories": [{"repository_id": "repo-1"}],
-                "servers": [],
-                "docker": {"available": True, "containers": []},
-                "project_usage": [],
-                "projection_status": "retained",
-            },
-        }
-
-        def fake_split(**kwargs):
-            if kwargs["attestation_path"].exists():
-                return json.loads(
-                    kwargs["attestation_path"].read_text(encoding="utf-8")
-                )
-            with closing(sqlite3.connect(kwargs["authority_database"])) as connection:
-                connection.execute(
-                    "CREATE TABLE schema_metadata("
-                    "singleton INTEGER PRIMARY KEY, schema_version INTEGER NOT NULL, "
-                    "database_generation TEXT NOT NULL, state_revision INTEGER NOT NULL, "
-                    "observation_revision INTEGER NOT NULL)"
-                )
-                connection.execute(
-                    "INSERT INTO schema_metadata VALUES (1, 1, 'generation-a', 7, 9)"
-                )
-                connection.commit()
-            kwargs["authority_database"].chmod(0o600)
-            private_file(kwargs["inventory_database"], b"bounded-inventory\n")
-            info = source.stat()
-            document = {
-                "kind": "devcoordinator-logical-storage-split",
-                "schema_version": 1,
-                "document_sha256": "2" * 64,
-                "source": {
-                    "path": str(source),
-                    "device": info.st_dev,
-                    "inode": info.st_ino,
-                    "size": info.st_size,
-                    "mtime_ns": info.st_mtime_ns,
-                    "mode": "0600",
-                    "owner_uid": self.uid,
-                    "sha256": source_sha,
-                },
-                "authority": {
-                    "file": {
-                        "sha256": hashlib.sha256(
-                            kwargs["authority_database"].read_bytes()
-                        ).hexdigest()
-                    }
-                },
-                "inventory": {
-                    "database": {
-                        "size": kwargs["inventory_database"].stat().st_size,
-                        "sha256": hashlib.sha256(
-                            kwargs["inventory_database"].read_bytes()
-                        ).hexdigest(),
-                        "owner_uid": self.uid,
-                        "owner_gid": os.getegid(),
-                        "mode": "0600",
-                    }
-                },
-            }
-            private_file(
-                kwargs["attestation_path"],
-                json.dumps(document, sort_keys=True).encode() + b"\n",
-            )
-            return document
-
-        def fake_verify(document, **_kwargs):
-            return dict(document)
-
-        def fake_read_inventory(_path, **_kwargs):
-            return {
-                "generation": 1,
-                "payload_sha256": envelope["payload_sha256"],
-                "envelope": envelope,
-            }
-
-        def fake_publish(path, value, **_kwargs):
-            path.write_text(json.dumps(dict(value), sort_keys=True), encoding="utf-8")
-            path.chmod(0o640)
-
-        def fake_verify_inventory(_database, _publication, **_kwargs):
-            return {
-                "generation": 1,
-                "payload_sha256": envelope["payload_sha256"],
-            }
-
-        def fake_read_publication(path, **_kwargs):
-            return json.loads(path.read_text(encoding="utf-8"))
-
-        maintenance_events: list[str] = []
-
-        def activate_maintenance(**_kwargs):
-            maintenance_events.append("activate")
-
-        def clear_maintenance(**_kwargs):
-            maintenance_events.append("clear")
-
-        maintenance_deployment: list[str] = []
-
-        def activate_owner_maintenance(**kwargs):
-            maintenance_events.append("activate")
-            maintenance_deployment[:] = [kwargs["deployment_id"]]
-            marker = Path(kwargs["maintenance_root"]) / "maintenance.json"
-            private_file(marker, b"maintenance\n", mode=0o640)
-
-        def load_maintenance(**_kwargs):
-            return type(
-                "MaintenanceState",
-                (),
-                {"deployment_id": maintenance_deployment[-1]},
-            )()
-
-        def fake_load_owner_map(_path, **_kwargs):
-            return dict(owner_map_document)
-
-        def fake_apply_owner_map(connection, _document, **_kwargs):
-            connection.execute(
-                "UPDATE schema_metadata SET schema_version = 13"
-            )
-            return {"status": "applied"}
-
-        def fake_owner_verification(database, _document, **_kwargs):
-            return {
-                "status": "applied",
-                "schema_version": 13,
-                "database_generation": "generation-a",
-                "state_revision": 8,
-                "repository_count": 1,
-                "owner_map_sha256": "sha256:" + "a" * 64,
-                "operation_id": owner_operation_id,
-                "database_identity": activation._sqlite_identity(database),
-            }
-
-        split_api = (
-            fake_split,
-            fake_verify,
-            fake_read_inventory,
-            fake_publish,
-            fake_verify_inventory,
-            fake_read_publication,
-        )
-        runner = AdoptionRunner()
-        operation_journal = evidence_dir / "operation.json"
-        crashed = False
-
-        def crash_after_owner_commit(stage: str) -> None:
-            nonlocal crashed
-            if stage == "authority-owner-map-commit-before-journal" and not crashed:
-                crashed = True
-                raise activation.PowerLossSimulation(stage)
-
-        with (
-            mock.patch.object(activation, "IMMUTABLE_RELEASE_ROOT", self.release_root),
-            mock.patch.object(activation, "_storage_split_api", return_value=split_api),
-            mock.patch.object(
-                activation,
-                "_repository_owner_authority_api",
-                return_value=(
-                    fake_load_owner_map,
-                    fake_apply_owner_map,
-                    mock.Mock(),
-                    "devcoordinator-repository-owner-cutover-fence",
-                    1,
-                ),
-            ),
-            mock.patch.object(
-                activation,
-                "_verify_repository_owner_authority",
-                side_effect=fake_owner_verification,
-            ),
-            mock.patch.object(
-                activation,
-                "_verify_base_split_after_owner_migration",
-                side_effect=lambda document, **_kwargs: dict(document),
-            ),
-            mock.patch.object(
-                activation,
-                "_maintenance_api",
-                return_value=(
-                    "control-plane",
-                    "maintenance",
-                    activate_owner_maintenance,
-                    clear_maintenance,
-                    load_maintenance,
-                ),
-            ),
-        ):
-            with self.assertRaises(activation.PowerLossSimulation):
-                activation.adopt_authority_database(
-                    release=self.release,
-                    source_database=source,
-                    authority_database=authority,
-                    inventory_database=inventory,
-                    inventory_publication=inventory_publication,
-                    split_attestation=attestation,
-                    pointer_file=pointer,
-                    maintenance_root=private_dir(self.root / "maintenance"),
-                    maintenance_gid=os.getegid(),
-                    authority_owner_uid=self.uid,
-                    authority_owner_gid=os.getegid(),
-                    inventory_owner_uid=self.uid,
-                    inventory_owner_gid=os.getegid(),
-                    operation_journal=operation_journal,
-                    owner_map_path=owner_map,
-                    owner_map_sha256=owner_map_sha256,
-                    expected_uid=self.uid,
-                    runner=runner,
-                    failpoint=crash_after_owner_commit,
-                )
-            adoption = activation.adopt_authority_database(
-                release=self.release,
-                source_database=source,
-                authority_database=authority,
-                inventory_database=inventory,
-                inventory_publication=inventory_publication,
-                split_attestation=attestation,
-                pointer_file=pointer,
-                maintenance_root=private_dir(self.root / "maintenance"),
-                maintenance_gid=os.getegid(),
-                authority_owner_uid=self.uid,
-                authority_owner_gid=os.getegid(),
-                inventory_owner_uid=self.uid,
-                inventory_owner_gid=os.getegid(),
-                operation_journal=operation_journal,
-                owner_map_path=owner_map,
-                owner_map_sha256=owner_map_sha256,
-                expected_uid=self.uid,
-                runner=runner,
-            )
-            self.assertEqual(adoption["kind"], activation.AUTHORITY_ADOPTION_KIND)
-            self.assertEqual(
-                adoption["storage_split"]["document_sha256"], "2" * 64
-            )
-            self.assertNotIn("backup", json.dumps(adoption).lower())
-            self.assertEqual(hashlib.sha256(source.read_bytes()).hexdigest(), source_sha)
-            self.assertLess(authority.stat().st_size, source.stat().st_size)
-            self.assertEqual(maintenance_events, ["activate", "activate"])
-            self.assertFalse(runner.active)
-
-            activation.rollback_authority_adoption(
-                adoption,
-                release=self.release,
-                maintenance_gid=os.getegid(),
-                expected_uid=self.uid,
-                runner=runner,
-                operation_journal=operation_journal,
-                legacy_writer_unfencer=lambda: (
-                    maintenance_events.append("unfence-writer")
-                    or {
-                        "inactive_before_restart": not runner.active,
-                        "document_sha256": "e" * 64,
-                    }
-                ),
-                legacy_writer_verifier=lambda: (
-                    maintenance_events.append("verify-writer")
-                    or {
-                        "ready": runner.active,
-                        "document_sha256": "f" * 64,
-                    }
-                ),
-            )
-        self.assertTrue(runner.active)
-        self.assertEqual(
-            maintenance_events,
-            [
-                "activate",
-                "activate",
-                "unfence-writer",
-                "verify-writer",
-                "clear",
-            ],
-        )
-        self.assertTrue(source.exists())
-        for path in (
-            authority,
-            inventory,
-            inventory_publication,
-            attestation,
-            pointer,
-        ):
-            self.assertFalse(path.exists())
 
     def test_candidate_acceptance_rejects_pending_project_isolation(self) -> None:
         base = {
@@ -2617,14 +2190,12 @@ class ActivationTests(unittest.TestCase):
             "storage_split",
             "legacy_writer_retired",
             "snapshotd_ready",
-            "capability_policy_ready",
             "authority_test_plane_ready",
             "api_bootstrap_profile_ready",
             "api_handoff_ready",
             "api_final_profile_ready",
             "api_ready",
             "maintenance_released",
-            "api_delegation_verified",
             "profile_inventory_ready",
             "project_isolation_ready",
             "fleet_ready",
@@ -2837,118 +2408,6 @@ class ActivationTests(unittest.TestCase):
         self.assertIn("--expected-journal-sha256", argv)
         self.assertIn("--outer-transaction-id", argv)
 
-    def test_api_delegation_replays_after_state_publication_before_outer_journal(
-        self,
-    ) -> None:
-        root = private_dir(self.root / "delegation-replay")
-        evidence_path = root / "delegation.json"
-        delegation = fixtures.delegation()
-        cutover._publish_evidence(
-            evidence_path, delegation, uid=self.uid
-        )
-        state = {
-            "release": str(self.release),
-            "evidence": {"api-delegation": delegation},
-        }
-        request = {
-            "state": str(root / "state.json"),
-            "ports": first_adoption_port_request(root),
-            "candidate": {},
-            "console": {},
-            "authority": {},
-            "api": {
-                "delegation_evidence": str(evidence_path),
-            },
-            "public": {},
-            "fleet": {},
-            "background": {},
-        }
-        journal = {
-            "steps": {
-                "storage_split": {
-                    "owner_authority": {
-                        "target_database_generation": (
-                            fixtures.TARGET_AUTHORITY_GENERATION
-                        )
-                    }
-                },
-                "api_final_profile_ready": {
-                    "attestation": {
-                        "authority_generation": (
-                            fixtures.TARGET_AUTHORITY_GENERATION
-                        )
-                    }
-                },
-            }
-        }
-        with (
-            mock.patch.object(
-                cutover, "load_state", return_value=state
-            ),
-            mock.patch.object(
-                activation,
-                "_verify_trusted_api_profile_delegation",
-                return_value=delegation,
-            ) as verify,
-            mock.patch.object(
-                cutover, "record_evidence", return_value=state
-            ) as record,
-            mock.patch.object(
-                cutover,
-                "_publish_evidence",
-                side_effect=AssertionError(
-                    "replay must not republish delegation evidence"
-                ),
-            ),
-        ):
-            replay = activation._first_adoption_live_step(
-                "api_delegation_verified",
-                request=request,
-                journal=journal,
-                expected_uid=self.uid,
-                runner=mock.Mock(),
-            )
-        self.assertEqual(replay, delegation)
-        self.assertEqual(
-            verify.call_args.kwargs["created_at"],
-            delegation["created_at"],
-        )
-        record.assert_called_once()
-
-    def test_api_delegation_uses_trusted_loopback_without_internal_bearer(
-        self,
-    ) -> None:
-        response = mock.Mock()
-        response.status = 200
-        response.read.return_value = json.dumps(
-            {"repositories": [{"repo_id": "repo-alpha"}]}
-        ).encode("utf-8")
-        connection = mock.Mock()
-        connection.getresponse.return_value = response
-        with mock.patch.object(
-            activation.http.client,
-            "HTTPConnection",
-            return_value=connection,
-        ):
-            catalog = activation._trusted_loopback_api_catalog()
-        self.assertEqual(catalog["repositories"][0]["repo_id"], "repo-alpha")
-        request = connection.request.call_args
-        self.assertEqual(request.args[:2], ("GET", "/v1/test-repositories"))
-        headers = request.kwargs["headers"]
-        self.assertNotIn("authorization", {name.lower() for name in headers})
-        connection.close.assert_called_once()
-
-        for untrusted in (
-            "https://127.0.0.1:29876/v1/test-repositories",
-            "http://192.0.2.1:29876/v1/test-repositories",
-            "http://user@127.0.0.1:29876/v1/test-repositories",
-            "http://127.0.0.1:29876/v1/test-repositories?token=legacy",
-        ):
-            with self.subTest(url=untrusted), self.assertRaisesRegex(
-                activation.ActivationError, "trusted loopback HTTP"
-            ):
-                activation._trusted_loopback_api_catalog(untrusted)
-
     def test_profile_inventory_readiness_replays_after_state_publication(
         self,
     ) -> None:
@@ -2983,7 +2442,7 @@ class ActivationTests(unittest.TestCase):
             mock.patch.object(cutover, "load_state", return_value=state),
             mock.patch.object(
                 cutover,
-                "verify_post_v13_profile_inventory_readiness",
+                "verify_profile_inventory_readiness",
                 return_value=readiness,
             ) as verify,
             mock.patch.object(cutover, "record_evidence", return_value=state) as record,
@@ -3008,7 +2467,7 @@ class ActivationTests(unittest.TestCase):
         )
         record.assert_called_once()
 
-    def test_profile_rollback_resume_binds_both_authority_generations(
+    def test_profile_rollback_resume_binds_current_catalog_generation(
         self,
     ) -> None:
         root = private_dir(self.root / "profile-rollback-resume")
@@ -3036,9 +2495,8 @@ class ActivationTests(unittest.TestCase):
                 publication=None,
                 journal_path=journal,
                 adoption={
-                    "owner_authority": {
-                        "source_database_generation": "legacy-generation",
-                        "target_database_generation": "final-generation",
+                    "authority": {
+                        "database_generation": "final-generation",
                     }
                 },
                 authority={
@@ -3047,7 +2505,6 @@ class ActivationTests(unittest.TestCase):
                 api={
                     "profile_path": str(root / "client-profiles.json"),
                     "api_uid": 2302,
-                    "profile_access_gid": 2310,
                 },
                 candidate={
                     "rollback_directory": str(root / "rollback")
@@ -3056,43 +2513,30 @@ class ActivationTests(unittest.TestCase):
                 expected_uid=self.uid,
             )
         self.assertEqual(result, expected)
-        self.assertEqual(
-            publish.call_args.kwargs["source_authority_generation"],
-            "legacy-generation",
-        )
-        self.assertEqual(
-            publish.call_args.kwargs["target_authority_generation"],
-            "final-generation",
-        )
+        self.assertEqual(publish.call_args.kwargs["validation_uid"], 2302)
 
     def test_profile_restore_is_replay_safe_after_outer_journal_loss(
         self,
     ) -> None:
         root = private_dir(self.root / "profile-restore-replay")
         destination = private_file(
-            root / "profile.json", b'{"version":1}\n', 0o640
+            root / "profile.json", b'{"version":2}\n', 0o644
         )
         attestation = cutover.seal(
             cutover.PROFILE_REPAIR_KIND,
             {
                 "profile_path": str(destination),
                 "profile_owner_uid": self.uid,
-                "profile_group_gid": os.getegid(),
-                "profile_mode": "0640",
+                "profile_mode": "0644",
                 "profile_sha256": hashlib.sha256(
                     destination.read_bytes()
                 ).hexdigest(),
-                "source_authority_generation": "legacy-generation",
                 "authority_generation": "final-generation",
                 "authority_source_sha256": "a" * 64,
-                "api_uid": 2302,
-                "broker_account_id": "devcoordinator-api",
+                "validation_uid": 2302,
                 "repository_ids": ["repo-alpha"],
-                "client_uids": [2302],
                 "repository_bindings": [],
                 "parser_verified": True,
-                "all_clients_parser_verified": True,
-                "existing_profile_contents_reused": False,
                 "atomic_publication_verified": True,
                 "created_at": activation._now(),
             },
@@ -3146,7 +2590,6 @@ class ActivationTests(unittest.TestCase):
                 "authority": {},
                 "inventory": {},
                 "storage_split": {},
-                "owner_authority": {},
                 "pointer_path": str(root / "pointer.json"),
                 "legacy_source_original_path": str(
                     root / "legacy.sqlite3"
@@ -3189,7 +2632,7 @@ class ActivationTests(unittest.TestCase):
         def catalog():
             return client.call(
                 BrokerRequest.create(
-                    account_id="devcoordinator-api",
+                    account_id="local",
                     project_id="host",
                     resource_id="catalog",
                     operation=BrokerOperation.TEST_REPOSITORY_CATALOG,
@@ -3311,8 +2754,6 @@ class ActivationTests(unittest.TestCase):
                 "operation_journal": str(
                     self.root / "authority-operation.json"
                 ),
-                "owner_map": str(self.root / "owners.json"),
-                "owner_map_sha256": "a" * 64,
             },
             "api": {},
             "public": {},
@@ -3389,95 +2830,6 @@ class ActivationTests(unittest.TestCase):
                 )
             )
         )
-
-    def test_capability_policy_publication_replays_after_power_loss(
-        self,
-    ) -> None:
-        root = private_dir(self.root / "policy-publication")
-        rollback = private_dir(root / "rollback")
-        destination = root / "policy.json"
-        journal = root / "journal.json"
-        payload = b'{"schema_version":1,"repositories":[]}\n'
-        calls = 0
-
-        def publish(**_kwargs):
-            nonlocal calls
-            calls += 1
-            destination.write_bytes(payload)
-            destination.chmod(0o600)
-            return {
-                "ok": True,
-                "created": calls == 1,
-                "attestation": cutover.seal(
-                    cutover.CAPABILITY_POLICY_KIND,
-                    {
-                        "policy_path": str(destination),
-                        "policy_owner_uid": self.uid,
-                        "policy_mode": "0600",
-                        "policy_file_sha256": hashlib.sha256(
-                            payload
-                        ).hexdigest(),
-                        "policy_fingerprint": "b" * 64,
-                        "authority_generation": "target-generation",
-                        "authority_export_sha256": "c" * 64,
-                        "dogfood_repository_id": "repo-alpha",
-                        "repository_grants": [],
-                        "coverage_complete": True,
-                        "broker_contract_verified": True,
-                        "created_at": activation._now(),
-                    },
-                ),
-            }
-
-        crashed = False
-
-        def failpoint(stage: str) -> None:
-            nonlocal crashed
-            if not crashed:
-                crashed = True
-                raise activation.PowerLossSimulation(stage)
-
-        arguments = {
-            "authority_database": root / "authority.sqlite3",
-            "snapshot_socket": root / "snapshot.sock",
-            "destination": destination,
-            "dogfood_repository_id": "repo-alpha",
-            "rollback_directory": rollback,
-            "journal_file": journal,
-            "expected_uid": self.uid,
-        }
-        with mock.patch.object(
-            cutover, "publish_test_capability_policy", side_effect=publish
-        ):
-            with self.assertRaises(activation.PowerLossSimulation):
-                activation.publish_first_adoption_capability_policy(
-                    **arguments, failpoint=failpoint
-                )
-            completed = (
-                activation.publish_first_adoption_capability_policy(
-                    **arguments
-                )
-            )
-        self.assertEqual(calls, 2)
-        operation = activation._load_private_journal(
-            journal,
-            kind=activation.CAPABILITY_POLICY_PUBLICATION_JOURNAL_KIND,
-            expected_uid=self.uid,
-        )
-        self.assertEqual(operation["phase"], "complete")
-        restored = activation._restore_first_adoption_capability_policy(
-            completed,
-            journal_file=journal,
-            expected_uid=self.uid,
-        )
-        self.assertFalse(destination.exists())
-        self.assertIs(restored["prior_existed"], False)
-        replay = activation._restore_first_adoption_capability_policy(
-            completed,
-            journal_file=journal,
-            expected_uid=self.uid,
-        )
-        self.assertIs(replay["replayed"], True)
 
     def test_first_availability_catalogs_setup_without_fleet_mutation(
         self,
@@ -3617,7 +2969,7 @@ class ActivationTests(unittest.TestCase):
         request = {
             "state": str(root / "state.json"),
             "ports": first_adoption_port_request(root),
-            "candidate": {"dogfood_repository_id": repository_id},
+            "candidate": {},
             "console": {},
             "authority": {"database": str(root / "authority.sqlite3")},
             "api": {},
@@ -3699,42 +3051,6 @@ class ActivationTests(unittest.TestCase):
         )
         self.assertEqual(runner.actions, ["catalog"])
 
-    def test_first_availability_requires_ready_clean_dogfood(self) -> None:
-        authority_rows = [
-            {
-                "repository_id": "repo-alpha",
-                "owner_uid": 1200,
-                "repository_generation": 7,
-            }
-        ]
-        catalog = {
-            "ok": True,
-            "counts": {"ready": 0, "missing": 1, "invalid": 0},
-            "repositories": [
-                {
-                    "repository_id": "repo-alpha",
-                    "repository_generation": 7,
-                    "owner_uid": 1200,
-                    "status": "missing",
-                    "adoption_ready": False,
-                    "safety_status": "clean",
-                    "safety_action_count": 0,
-                    "safety_blocker_codes": [],
-                    "deletion_scan_complete": True,
-                    "deleted_tracked_count": 0,
-                }
-            ],
-        }
-        with self.assertRaisesRegex(
-            activation.ActivationError,
-            "dogfood repository must already have a valid, clean test manifest",
-        ):
-            activation._first_adoption_fleet_setup_result(
-                catalog,
-                authority_rows=authority_rows,
-                dogfood_repository_id="repo-alpha",
-            )
-
     def test_fleet_request_output_replays_only_for_exact_content(
         self,
     ) -> None:
@@ -3775,224 +3091,6 @@ class ActivationTests(unittest.TestCase):
                 output, request, expected_uid=self.uid
             )
 
-    def test_first_adoption_repairs_manifest_metadata_in_separate_resumable_transaction(
-        self,
-    ) -> None:
-        root = private_dir(self.root / "fleet-safety-repair")
-        evidence_root = private_dir(root / "evidence")
-        repair_repository_id = "repo-repair"
-        clean_repository_id = "repo-clean"
-        export = cutover.seal(
-            cutover.AUTHORITY_REPOSITORY_EXPORT_KIND,
-            {
-                "authority_generation": "final-generation",
-                "repositories": [
-                    {
-                        "repository_id": clean_repository_id,
-                        "owner_uid": 1200,
-                        "repository_generation": 2,
-                    },
-                    {
-                        "repository_id": repair_repository_id,
-                        "owner_uid": 1201,
-                        "repository_generation": 4,
-                    },
-                ],
-                "exported_at": "2026-07-29T00:00:00.000Z",
-            },
-        )
-        export_path = root / "authority-export.json"
-        cutover._publish_evidence(export_path, export, uid=self.uid)
-        authority = {"database": str(root / "authority.sqlite3")}
-        fleet = {
-            "authority_export": str(export_path),
-            "evidence_root": str(evidence_root),
-            "manifest_template_sha256": "a" * 64,
-            "manifest_set": str(root / "manifest-set.json"),
-            "adoption_request": str(root / "adoption-request.json"),
-            "helper": str(root / "uid-helper"),
-        }
-
-        def catalog(*, repaired: bool):
-            return {
-                "ok": True,
-                "counts": {"ready": 1, "missing": 1, "invalid": 0},
-                "repositories": [
-                    {
-                        "repository_id": clean_repository_id,
-                        "repository_generation": 2,
-                        "owner_uid": 1200,
-                        "status": "ready",
-                        "adoption_ready": True,
-                        "safety_status": "clean",
-                        "safety_action_count": 0,
-                        "safety_blocker_codes": [],
-                        "deletion_scan_complete": True,
-                        "deleted_tracked_count": 0,
-                    },
-                    {
-                        "repository_id": repair_repository_id,
-                        "repository_generation": 4,
-                        "owner_uid": 1201,
-                        "status": "missing",
-                        "adoption_ready": False,
-                        "safety_status": "clean" if repaired else "repairable",
-                        "safety_action_count": 0 if repaired else 2,
-                        "safety_blocker_codes": [],
-                        "deletion_scan_complete": True,
-                        "deleted_tracked_count": 0,
-                    },
-                ],
-            }
-
-        class SafetyRunner:
-            def __init__(self) -> None:
-                self.actions: list[str] = []
-                self.catalog_calls = 0
-                self.fail_apply_once = True
-
-            def run_json(self, argv):
-                values = list(argv)
-                if "plan-safety-repair" in values:
-                    self.actions.append("plan-safety-repair")
-                    return {
-                        "ok": True,
-                        "plan_id": "manifest-safety-repair-" + "1" * 32,
-                        "plan_sha256": "b" * 64,
-                        "repositories": [
-                            {
-                                "repository_id": clean_repository_id,
-                                "repository_generation": 2,
-                                "owner_uid": 1200,
-                                "status": "clean",
-                                "action_count": 0,
-                                "blocker_codes": [],
-                            },
-                            {
-                                "repository_id": repair_repository_id,
-                                "repository_generation": 4,
-                                "owner_uid": 1201,
-                                "status": "repairable",
-                                "action_count": 2,
-                                "blocker_codes": [],
-                            },
-                        ],
-                    }
-                if "apply-safety-repair" in values:
-                    self.actions.append("apply-safety-repair")
-                    if self.fail_apply_once:
-                        self.fail_apply_once = False
-                        raise RuntimeError(
-                            "injected uncertain safety apply reply"
-                        )
-                    return {
-                        "ok": True,
-                        "state": "applied",
-                        "plan_id": "manifest-safety-repair-" + "1" * 32,
-                        "plan_sha256": "b" * 64,
-                        "result_sha256": "c" * 64,
-                        "remaining_blocked_repository_ids": [],
-                    }
-                if "rollback-safety-repair" in values:
-                    self.actions.append("rollback-safety-repair")
-                    return {
-                        "ok": True,
-                        "state": "rolled_back",
-                        "plan_id": "manifest-safety-repair-" + "1" * 32,
-                        "apply_result_sha256": "c" * 64,
-                        "rollback_sha256": "d" * 64,
-                    }
-                if "catalog" in values:
-                    self.actions.append("catalog")
-                    self.catalog_calls += 1
-                    return catalog(repaired=self.catalog_calls > 1)
-                self.fail("unexpected fleet safety command")
-
-        runner = SafetyRunner()
-        prefix = [
-            str(self.release / "bin/devcoordinator-test-manifest-adoption"),
-            "--authority-database",
-            str(authority["database"]),
-            "--helper",
-            str(fleet["helper"]),
-            "--evidence-root",
-            str(evidence_root),
-        ]
-        with self.assertRaisesRegex(RuntimeError, "uncertain safety apply"):
-            activation._prepare_first_adoption_fleet_safety(
-                release=self.release,
-                authority=authority,
-                fleet=fleet,
-                authority_export=export,
-                export_path=export_path,
-                prefix=prefix,
-                expected_uid=self.uid,
-                runner=runner,
-            )
-        interrupted = activation._load_private_journal(
-            activation._fleet_safety_transaction_path(fleet),
-            kind=activation.FIRST_ADOPTION_FLEET_SAFETY_JOURNAL_KIND,
-            expected_uid=self.uid,
-        )
-        self.assertEqual(interrupted["phase"], "apply_intent")
-        first, indexed = activation._prepare_first_adoption_fleet_safety(
-            release=self.release,
-            authority=authority,
-            fleet=fleet,
-            authority_export=export,
-            export_path=export_path,
-            prefix=prefix,
-            expected_uid=self.uid,
-            runner=runner,
-        )
-        replay, replay_indexed = activation._prepare_first_adoption_fleet_safety(
-            release=self.release,
-            authority=authority,
-            fleet=fleet,
-            authority_export=export,
-            export_path=export_path,
-            prefix=prefix,
-            expected_uid=self.uid,
-            runner=runner,
-        )
-        self.assertEqual(
-            runner.actions,
-            [
-                "catalog",
-                "plan-safety-repair",
-                "apply-safety-repair",
-                "catalog",
-                "apply-safety-repair",
-                "catalog",
-                "catalog",
-            ],
-        )
-        self.assertEqual(
-            indexed[repair_repository_id]["safety_status"], "clean"
-        )
-        self.assertEqual(first, replay)
-        self.assertEqual(indexed, replay_indexed)
-        journal_path = activation._fleet_safety_transaction_path(fleet)
-        self.assertEqual(stat.S_IMODE(journal_path.stat().st_mode), 0o600)
-        journal = activation._load_private_journal(
-            journal_path,
-            kind=activation.FIRST_ADOPTION_FLEET_SAFETY_JOURNAL_KIND,
-            expected_uid=self.uid,
-        )
-        self.assertEqual(journal["phase"], "complete")
-        rolled_back = (
-            activation._rollback_first_adoption_fleet_transaction(
-                release=self.release,
-                authority=authority,
-                fleet_request=fleet,
-                fleet_evidence=None,
-                expected_uid=self.uid,
-                runner=runner,
-            )
-        )
-        self.assertTrue(rolled_back["skipped"])
-        self.assertEqual(rolled_back["safety"]["state"], "rolled_back")
-        self.assertEqual(runner.actions[-1], "rollback-safety-repair")
 
     def test_manifest_template_builder_is_sealed_and_replay_safe(
         self,
@@ -4029,130 +3127,6 @@ class ActivationTests(unittest.TestCase):
             activation.FIRST_ADOPTION_MANIFEST_TEMPLATE_KIND,
         )
         self.assertEqual(output.stat().st_mode & 0o777, 0o600)
-
-    def test_first_adoption_state_rollback_removes_only_transaction_evidence(
-        self,
-    ) -> None:
-        root = private_dir(self.root / "state-evidence-rollback")
-        state_path = root / "state.json"
-        delegation_path = root / "delegation.json"
-        candidate_path = root / "candidate.json"
-        activation_path = root / "activation.json"
-        state, _authority, _testd = fixtures.through_seal()
-        delegation = fixtures.delegation()
-        state = cutover.transition(
-            state,
-            evidence_kind="api-delegation",
-            evidence=delegation,
-        )
-        cutover._write_private_json(
-            state_path,
-            state,
-            uid=self.uid,
-            create=True,
-        )
-        cutover._publish_evidence(
-            delegation_path, delegation, uid=self.uid
-        )
-        arguments = {
-            "state_path": state_path,
-            "candidate_request": {
-                "candidate_evidence": str(candidate_path),
-                "activation_evidence": str(activation_path),
-            },
-            "api_request": {
-                "delegation_evidence": str(delegation_path),
-                "inventory_readiness_evidence": str(
-                    root / "profile-inventory-readiness.json"
-                ),
-            },
-            "live_steps": {
-                "api_delegation_verified": delegation
-            },
-            "expected_uid": self.uid,
-        }
-        result = activation._rollback_first_adoption_cutover_state(
-            **arguments
-        )
-        rewound = cutover.load_state(
-            state_path, authority_uid=self.uid
-        )
-        self.assertEqual(result["state_evidence_removed"], ["api-delegation"])
-        self.assertEqual(rewound["phase"], "sealed")
-        self.assertNotIn("api-delegation", rewound["evidence"])
-        self.assertFalse(delegation_path.exists())
-        replay = activation._rollback_first_adoption_cutover_state(
-            **arguments
-        )
-        self.assertEqual(replay["state_evidence_removed"], [])
-        self.assertEqual(replay["files_removed"], [])
-
-    def test_authority_adoption_early_failure_clears_maintenance(self) -> None:
-        source = private_file(self.root / "early/source.sqlite3", b"not-opened\n")
-        authority_dir = private_dir(self.root / "early-authority")
-        inventory_dir = private_dir(self.root / "early-inventory")
-        evidence_dir = private_dir(self.root / "early-evidence")
-        events: list[str] = []
-        runner = AdoptionRunner()
-        runner.active = False
-        split_api = (mock.Mock(), mock.Mock(), mock.Mock(), mock.Mock(), mock.Mock(), mock.Mock())
-        owner_map = private_file(evidence_dir / "owners.json", b"{}\n")
-        owner_operation_id = str(uuid.uuid4())
-
-        def activate_maintenance(**_kwargs):
-            events.append("activate")
-
-        def clear_maintenance(**_kwargs):
-            events.append("clear")
-
-        with (
-            mock.patch.object(activation, "IMMUTABLE_RELEASE_ROOT", self.release_root),
-            mock.patch.object(activation, "_storage_split_api", return_value=split_api),
-            mock.patch.object(
-                activation,
-                "_repository_owner_authority_api",
-                return_value=(
-                    lambda _path, **_kwargs: {"operation_id": owner_operation_id},
-                    mock.Mock(),
-                    mock.Mock(),
-                    "devcoordinator-repository-owner-cutover-fence",
-                    1,
-                ),
-            ),
-            mock.patch.object(
-                activation,
-                "_maintenance_api",
-                return_value=(
-                    "control-plane",
-                    "maintenance",
-                    activate_maintenance,
-                    clear_maintenance,
-                    mock.Mock(),
-                ),
-            ),
-            self.assertRaisesRegex(activation.ActivationError, "active legacy writer"),
-        ):
-            activation.adopt_authority_database(
-                release=self.release,
-                source_database=source,
-                authority_database=authority_dir / "authority.sqlite3",
-                inventory_database=inventory_dir / "inventory.sqlite3",
-                inventory_publication=inventory_dir / "inventory.publication",
-                split_attestation=evidence_dir / "split.json",
-                pointer_file=evidence_dir / "pointer.json",
-                maintenance_root=private_dir(self.root / "early-maintenance"),
-                maintenance_gid=os.getegid(),
-                authority_owner_uid=self.uid,
-                authority_owner_gid=os.getegid(),
-                inventory_owner_uid=self.uid,
-                inventory_owner_gid=os.getegid(),
-                operation_journal=evidence_dir / "operation.json",
-                owner_map_path=owner_map,
-                owner_map_sha256=hashlib.sha256(owner_map.read_bytes()).hexdigest(),
-                expected_uid=self.uid,
-                runner=runner,
-            )
-        self.assertEqual(events, [])
 
     def test_retained_inventory_gate_rejects_empty_repository_projection(self) -> None:
         with self.assertRaisesRegex(
@@ -4214,14 +3188,6 @@ class ActivationTests(unittest.TestCase):
                 },
                 "candidate": {
                     "slot_source": str(root / "slot.env"),
-                    "capability_policy": cutover.TEST_CAPABILITY_POLICY_PATH,
-                    "capability_policy_evidence": str(
-                        root / "policy-evidence.json"
-                    ),
-                    "capability_policy_journal": str(
-                        root / "policy-journal.json"
-                    ),
-                    "dogfood_repository_id": "repo-alpha",
                     "rollback_directory": str(root / "graph-rollback"),
                     "legacy_console_env": str(root / "legacy.env"),
                     "background_project_root": str(root / "project"),
@@ -4272,8 +3238,6 @@ class ActivationTests(unittest.TestCase):
                     "split_attestation": str(root / "split.json"),
                     "adoption_pointer": str(root / "adoption.json"),
                     "operation_journal": str(root / "authority-operation.json"),
-                    "owner_map": str(root / "repository-owners.json"),
-                    "owner_map_sha256": "c" * 64,
                     "maintenance_root": str(
                         activation.CANONICAL_MAINTENANCE_ROOT
                     ),
@@ -4296,9 +3260,7 @@ class ActivationTests(unittest.TestCase):
                     "final_profile_journal": str(
                         root / "final-profile-journal.json"
                     ),
-                    "profile_access_gid": 2310,
                     "api_uid": 2302,
-                    "delegation_evidence": str(root / "delegation.json"),
                     "inventory_readiness_evidence": str(
                         root / "profile-inventory-readiness.json"
                     ),

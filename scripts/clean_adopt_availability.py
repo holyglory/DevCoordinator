@@ -3,8 +3,8 @@
 
 This is the intentionally destructive alternative to the schema-12 history
 bridge.  It retains only the four small Console control files, creates empty
-current authority/inventory/test stores, re-enrolls canonical repositories
-from their checked-in runtime manifests, and then uses the existing immutable
+current authority/inventory/test stores, catalogs canonical repositories from
+their checked-in runtime manifests, and then uses the existing immutable
 release and first-listener handoff primitives to install the availability
 graph.  Repository worktrees and project databases/volumes are never inputs
 to cleanup and are never removed by this program.
@@ -23,7 +23,6 @@ import http.client
 import json
 import os
 from pathlib import Path
-import pwd
 import re
 import shutil
 import stat
@@ -55,8 +54,8 @@ from devcoordinator.inventory_projection import (  # noqa: E402
 from devcoordinator.normalized_server_lifecycle import (  # noqa: E402
     NormalizedPortLifecycle,
 )
-from devcoordinator.store import AccountStore  # noqa: E402
-from devcoordinator.broker_profile import load_broker_profile  # noqa: E402
+from devcoordinator.store import AccountStore, deterministic_id, utc_timestamp  # noqa: E402
+from devcoordinator.schema import SCHEMA_VERSION  # noqa: E402
 from devcoordinator.universal_test_store import UniversalTestStore  # noqa: E402
 from devcoordinator.universal_test_transport import (  # noqa: E402
     TestPlaneTransportError,
@@ -65,10 +64,9 @@ from devcoordinator.universal_test_transport import (  # noqa: E402
 from server_wide_installer_fence import acquire_installer_mutex  # noqa: E402
 
 
-MANIFEST_VERSION = 1
+MANIFEST_VERSION = 2
 MANIFEST_KIND = "devcoordinator-clean-adoption"
 JOURNAL_KIND = "devcoordinator-clean-adoption-transaction"
-ENROLLMENT_FAILURE_KIND = "devcoordinator-clean-adoption-enrollment-failures"
 CONSOLE_STATE_FILES = (
     "routes.json",
     "upstream-auth.json",
@@ -80,7 +78,6 @@ CONSOLE_UNIT_RE = re.compile(
     r"^devcoordinator-console@[0-9a-f]{64}\.service$"
 )
 PORT_RANGE_RE = re.compile(r"^(\d{1,5})-(\d{1,5})$")
-ACCOUNT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:@/-]{0,255}$")
 SERVER_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 TEST_SETUP_CANARY_ATTEMPTS = 16
 TEST_SETUP_CANARY_RETRY_DELAYS = (1, 2, 3, *(5 for _ in range(12)))
@@ -100,7 +97,6 @@ DEFAULT_DESTINATIONS = {
     "route_resolution": "/var/lib/devcoordinator/clean-adoption/route-resolution.json",
     "publication_input": "/var/lib/devcoordinator/clean-adoption/publication-input.json",
     "publication": "/var/lib/devcoordinator-edge/routes.publication",
-    "test_capability_policy": "/etc/devcoordinator/test-execution-capabilities.json",
     "telegram_destination": "/var/lib/devcoordinator-notifications/telegram-control.json",
 }
 DESTINATION_FIELDS = frozenset(DEFAULT_DESTINATIONS)
@@ -135,28 +131,14 @@ MANIFEST_FIELDS = frozenset(
 REPOSITORY_FIELDS = frozenset(
     {
         "canonical_root",
-        "owner_uid",
         "runtime_file",
         "port_range",
         "fixed_ports",
-        "clients",
         "approve_compose_host_access",
-        "grant_cleanup",
-        "grant_ephemeral_image_prefetch",
         "compose_run_once_services",
     }
 )
 FIXED_PORT_FIELDS = frozenset({"name", "port"})
-CLIENT_FIELDS = frozenset(
-    {
-        "uid",
-        "account_id",
-        "agent",
-        "all_servers",
-        "servers",
-        "profile_valid_days",
-    }
-)
 
 
 class CleanAdoptionError(RuntimeError):
@@ -378,43 +360,6 @@ def _read_legacy_regular(
         "mode": f"{stat.S_IMODE(before.st_mode):04o}",
     }
 
-
-def _normalize_client(value: object, *, label: str) -> dict[str, object]:
-    if not isinstance(value, Mapping) or set(value) != CLIENT_FIELDS:
-        raise CleanAdoptionError(f"{label} fields are invalid")
-    uid = _positive_uid(value["uid"], f"{label}.uid")
-    account_id = value["account_id"]
-    agent = value["agent"]
-    if not isinstance(account_id, str) or ACCOUNT_RE.fullmatch(account_id) is None:
-        raise CleanAdoptionError(f"{label}.account_id is invalid")
-    if not isinstance(agent, str) or not agent or len(agent.encode("utf-8")) > 256:
-        raise CleanAdoptionError(f"{label}.agent is invalid")
-    all_servers = value["all_servers"]
-    servers = value["servers"]
-    if type(all_servers) is not bool or not isinstance(servers, list):
-        raise CleanAdoptionError(f"{label} server grants are invalid")
-    if all_servers and servers:
-        raise CleanAdoptionError(f"{label} cannot mix all_servers and servers")
-    if any(
-        not isinstance(item, str)
-        or not item
-        or len(item.encode("utf-8")) > 256
-        for item in servers
-    ) or len(servers) != len(set(servers)):
-        raise CleanAdoptionError(f"{label}.servers are invalid")
-    days = value["profile_valid_days"]
-    if type(days) is not int or not 1 <= int(days) <= 365:
-        raise CleanAdoptionError(f"{label}.profile_valid_days is invalid")
-    return {
-        "uid": uid,
-        "account_id": account_id,
-        "agent": agent,
-        "all_servers": all_servers,
-        "servers": list(servers),
-        "profile_valid_days": int(days),
-    }
-
-
 def _normalize_repository(value: object, *, index: int) -> dict[str, object]:
     label = f"repositories[{index}]"
     if not isinstance(value, Mapping) or set(value) != REPOSITORY_FIELDS:
@@ -426,27 +371,12 @@ def _normalize_repository(value: object, *, index: int) -> dict[str, object]:
         raise CleanAdoptionError(
             f"{label}.runtime_file must be the canonical repo-local .codex/dev-runtime.json"
         )
-    owner_uid = _positive_uid(value["owner_uid"], f"{label}.owner_uid")
     port_match = PORT_RANGE_RE.fullmatch(str(value["port_range"]))
     if port_match is None:
         raise CleanAdoptionError(f"{label}.port_range is invalid")
     port_start, port_end = (int(port_match.group(1)), int(port_match.group(2)))
     if not 1 <= port_start <= port_end <= 65535:
         raise CleanAdoptionError(f"{label}.port_range is invalid")
-    clients_value = value["clients"]
-    if not isinstance(clients_value, list) or not clients_value or len(clients_value) > 64:
-        raise CleanAdoptionError(f"{label}.clients are invalid")
-    clients = [
-        _normalize_client(item, label=f"{label}.clients[{client_index}]")
-        for client_index, item in enumerate(clients_value)
-    ]
-    if len({int(item["uid"]) for item in clients}) != len(clients):
-        raise CleanAdoptionError(f"{label}.clients repeat a UID")
-    owner_clients = [item for item in clients if int(item["uid"]) == owner_uid]
-    if len(owner_clients) != 1:
-        raise CleanAdoptionError(
-            f"{label}.owner_uid must identify exactly one enrolled client"
-        )
     fixed_value = value["fixed_ports"]
     if not isinstance(fixed_value, list) or len(fixed_value) > 1024:
         raise CleanAdoptionError(f"{label}.fixed_ports are invalid")
@@ -472,20 +402,8 @@ def _normalize_repository(value: object, *, index: int) -> dict[str, object]:
         raise CleanAdoptionError(
             f"{label}.fixed_ports must be name-sorted with unique names and ports"
         )
-    owner_client = owner_clients[0]
-    if not owner_client["all_servers"] and not set(fixed_names) <= set(
-        owner_client["servers"]
-    ):
-        raise CleanAdoptionError(
-            f"{label}.fixed_ports are not authorized for the repository owner"
-        )
-    booleans = (
-        "approve_compose_host_access",
-        "grant_cleanup",
-        "grant_ephemeral_image_prefetch",
-    )
-    if any(type(value[name]) is not bool for name in booleans):
-        raise CleanAdoptionError(f"{label} enrollment flags are invalid")
+    if type(value["approve_compose_host_access"]) is not bool:
+        raise CleanAdoptionError(f"{label}.approve_compose_host_access is invalid")
     compose_services = value["compose_run_once_services"]
     if not isinstance(compose_services, list) or any(
         not isinstance(item, str) or not item or len(item.encode("utf-8")) > 256
@@ -494,12 +412,10 @@ def _normalize_repository(value: object, *, index: int) -> dict[str, object]:
         raise CleanAdoptionError(f"{label}.compose_run_once_services are invalid")
     return {
         "canonical_root": str(root),
-        "owner_uid": owner_uid,
         "runtime_file": str(runtime),
         "port_range": f"{port_start}-{port_end}",
         "fixed_ports": fixed_ports,
-        "clients": clients,
-        **{name: bool(value[name]) for name in booleans},
+        "approve_compose_host_access": bool(value["approve_compose_host_access"]),
         "compose_run_once_services": list(compose_services),
     }
 
@@ -575,7 +491,7 @@ def validate_manifest(
         )
     background = paths["background_project_root"]
     if background not in roots:
-        raise CleanAdoptionError("background project must be one enrolled canonical repository")
+        raise CleanAdoptionError("background project must be one cataloged canonical repository")
     normalized = {
         "schema_version": MANIFEST_VERSION,
         "kind": MANIFEST_KIND,
@@ -612,209 +528,53 @@ def fresh_store_plan(validated: Mapping[str, object]) -> dict[str, object]:
         "project_storage_mutated": False,
     }
 
-
-def enrollment_commands(
+def catalog_repositories_offline(
     validated: Mapping[str, object],
     *,
-    executable: str | Path | None = None,
-) -> list[list[str]]:
-    manifest = validate_manifest(validated)
-    release = Path(str(manifest["release"]))
-    helper = (
-        release / "skills/codex-dev-coordinator/scripts/dev_coordinator.py"
-        if executable is None
-        else Path(executable)
-    )
-    destinations = manifest["destinations"]
-    commands: list[list[str]] = []
-    for repository in manifest["repositories"]:
-        if not isinstance(repository, Mapping):
-            raise CleanAdoptionError("normalized repository is invalid")
-        for client in repository["clients"]:
-            command = [
-                "/usr/bin/python3",
-                "-I",
-                "-B",
-                str(helper),
-                "broker",
-                "enroll",
-                "--database",
-                str(destinations["authority_database"]),
-                "--socket",
-                "/run/devcoordinator-authority.sock",
-                "--access-gid",
-                "0",
-                "--socket-mode",
-                "0666",
-                "--client-uid",
-                str(client["uid"]),
-                "--repository-owner-uid",
-                str(repository["owner_uid"]),
-                "--account-id",
-                str(client["account_id"]),
-                "--project",
-                str(repository["canonical_root"]),
-                "--agent",
-                str(client["agent"]),
-                "--runtime-file",
-                str(repository["runtime_file"]),
-                "--port-range",
-                str(repository["port_range"]),
-                "--profile-output",
-                str(destinations["profile"]),
-                "--profile-valid-days",
-                str(client["profile_valid_days"]),
-            ]
-            if client["all_servers"]:
-                command.append("--all-servers")
-            else:
-                for server in client["servers"]:
-                    command.extend(("--server", str(server)))
-            if repository["approve_compose_host_access"]:
-                command.append("--approve-compose-host-access")
-            if repository["grant_cleanup"]:
-                command.append("--grant-cleanup")
-            if repository["grant_ephemeral_image_prefetch"]:
-                command.append("--grant-ephemeral-image-prefetch")
-            for service in repository["compose_run_once_services"]:
-                command.extend(("--compose-run-once-service", str(service)))
-            commands.append(command)
-    return commands
-
-
-def fixed_port_commands(
-    validated: Mapping[str, object],
-    *,
-    executable: str | Path | None = None,
-    account_lookup: Callable[[int], object] | None = None,
-) -> list[list[str]]:
-    """Build exact owner-attributed broker commands for retained fixed ports."""
+    expected_uid: int = 0,
+) -> dict[str, object]:
+    """Seed only host-wide repository routing records into a fresh authority."""
 
     manifest = validate_manifest(validated)
-    release = Path(str(manifest["release"]))
-    helper = (
-        release / "skills/codex-dev-coordinator/scripts/dev_coordinator.py"
-        if executable is None
-        else Path(executable)
-    )
-    profile = str(manifest["destinations"]["profile"])
-    lookup = pwd.getpwuid if account_lookup is None else account_lookup
-    commands: list[list[str]] = []
-    for repository in manifest["repositories"]:
-        owner_uid = int(repository["owner_uid"])
-        try:
-            account = lookup(owner_uid)
-        except (KeyError, OSError) as error:
-            raise CleanAdoptionError(
-                f"repository owner account {owner_uid} is unavailable"
-            ) from error
-        owner_gid = getattr(account, "pw_gid", None)
-        if type(owner_gid) is not int or int(owner_gid) < 0:
-            raise CleanAdoptionError(
-                f"repository owner account {owner_uid} has an invalid group"
-            )
-        for fixed in repository["fixed_ports"]:
-            commands.append(
-                [
-                    "/usr/bin/setpriv",
-                    "--reuid",
-                    str(owner_uid),
-                    "--regid",
-                    str(owner_gid),
-                    "--init-groups",
-                    "--reset-env",
-                    "/usr/bin/env",
-                    "DEVCOORDINATOR_AUTHORITY=system",
-                    f"DEVCOORDINATOR_BROKER_PROFILE={profile}",
-                    "PYTHONDONTWRITEBYTECODE=1",
-                    "/usr/bin/python3",
-                    "-I",
-                    "-B",
-                    str(helper),
-                    "port",
-                    "assign",
-                    "--agent",
-                    "clean-adoption",
-                    "--project",
-                    str(repository["canonical_root"]),
-                    "--name",
-                    str(fixed["name"]),
-                    "--port",
-                    str(fixed["port"]),
-                ]
-            )
-    return commands
-
-
-def api_enrollment_commands(
-    validated: Mapping[str, object],
-    *,
-    api_uid: int,
-    executable: str | Path | None = None,
-) -> list[list[str]]:
-    """Enroll the protected API identity across every canonical repository."""
-
-    manifest = validate_manifest(validated)
-    if type(api_uid) is not int or api_uid <= 0:
-        raise CleanAdoptionError("API service UID is invalid")
-    if any(
-        int(client["uid"]) == api_uid
-        for repository in manifest["repositories"]
-        for client in repository["clients"]
-    ):
-        raise CleanAdoptionError("API service UID collides with a manifest client")
-    helper = (
-        Path(str(manifest["release"]))
-        / "skills/codex-dev-coordinator/scripts/dev_coordinator.py"
-        if executable is None
-        else Path(executable)
-    )
-    destinations = manifest["destinations"]
-    commands: list[list[str]] = []
-    for repository in manifest["repositories"]:
-        command = [
-            "/usr/bin/python3",
-            "-I",
-            "-B",
-            str(helper),
-            "broker",
-            "enroll",
-            "--database",
-            str(destinations["authority_database"]),
-            "--socket",
-            "/run/devcoordinator-authority.sock",
-            "--access-gid",
-            "0",
-            "--socket-mode",
-            "0666",
-            "--client-uid",
-            str(api_uid),
-            "--repository-owner-uid",
-            str(repository["owner_uid"]),
-            "--account-id",
-            cutover.API_BROKER_ACCOUNT,
-            "--project",
-            str(repository["canonical_root"]),
-            "--agent",
-            "devcoordinator-api",
-            "--runtime-file",
-            str(repository["runtime_file"]),
-            "--port-range",
-            str(repository["port_range"]),
-            "--profile-output",
-            str(destinations["profile"]),
-            "--profile-valid-days",
-            "365",
-            "--all-servers",
-            "--grant-cleanup",
-            "--grant-ephemeral-image-prefetch",
-        ]
-        if repository["approve_compose_host_access"]:
-            command.append("--approve-compose-host-access")
-        for service in repository["compose_run_once_services"]:
-            command.extend(("--compose-run-once-service", str(service)))
-        commands.append(command)
-    return commands
+    if os.geteuid() != expected_uid or expected_uid != 0:
+        raise CleanAdoptionError("offline repository cataloging must run as root")
+    database = Path(str(manifest["destinations"]["authority_database"]))
+    store = AccountStore.open(database, expected_uid=expected_uid)
+    try:
+        host_id = store.ensure_local_host()
+        timestamp = utc_timestamp()
+        repository_ids: dict[str, str] = {}
+        with store.immediate_transaction() as connection:
+            for repository in manifest["repositories"]:
+                root = str(repository["canonical_root"])
+                repo_id = deterministic_id("repository", host_id, root)
+                connection.execute(
+                    """
+                    INSERT INTO repositories(
+                        repo_id, host_id, canonical_root, display_name,
+                        state, generation, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, 'active', 0, ?, ?)
+                    """,
+                    (repo_id, host_id, root, Path(root).name or root, timestamp, timestamp),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO repository_installations(
+                        repo_id, status, startup_fenced, generation,
+                        reason, actor, updated_at
+                    ) VALUES (?, 'installed', 0, 0, ?, 'clean-adoption', ?)
+                    """,
+                    (repo_id, "trusted-local repository catalog", timestamp),
+                )
+                repository_ids[root] = repo_id
+    finally:
+        store.close()
+    return {
+        "host_id": host_id,
+        "repository_ids": repository_ids,
+        "repository_count": len(repository_ids),
+        "access_model": "trusted-local",
+    }
 
 
 def replay_fixed_ports_offline(
@@ -879,14 +639,14 @@ def replay_fixed_ports_offline(
 def activate_fresh_authority(
     database: Path | str, *, expected_uid: int
 ) -> dict[str, object]:
-    """Activate a newly created schema-13 authority without importing history."""
+    """Activate a newly created authority without importing history."""
 
     store = AccountStore.open(database, expected_uid=expected_uid)
     try:
         metadata = store.connection.execute(
             "SELECT schema_version,database_generation,migration_state FROM schema_metadata WHERE singleton=1"
         ).fetchone()
-        if metadata is not None and tuple(metadata)[::2] == (13, "empty"):
+        if metadata is not None and tuple(metadata)[::2] == (SCHEMA_VERSION, "empty"):
             activated_at = _now()
             with store.immediate_transaction(revision_kind=None) as connection:
                 connection.execute(
@@ -895,20 +655,22 @@ def activate_fresh_authority(
                     SET authority_mode='sqlite', migration_state='ready',
                         first_sqlite_mutation_at=COALESCE(first_sqlite_mutation_at, ?),
                         updated_at=?
-                    WHERE singleton=1 AND schema_version=13
+                    WHERE singleton=1 AND schema_version=?
                       AND migration_state='empty'
                     """,
-                    (activated_at, activated_at),
+                    (activated_at, activated_at, SCHEMA_VERSION),
                 )
             metadata = store.connection.execute(
                 "SELECT schema_version,database_generation,migration_state FROM schema_metadata WHERE singleton=1"
             ).fetchone()
     finally:
         store.close()
-    if metadata is None or int(metadata[0]) != 13 or str(metadata[2]) != "ready":
-        raise CleanAdoptionError("fresh authority did not initialize at ready schema 13")
+    if metadata is None or int(metadata[0]) != SCHEMA_VERSION or str(metadata[2]) != "ready":
+        raise CleanAdoptionError(
+            f"fresh authority did not initialize at ready schema {SCHEMA_VERSION}"
+        )
     return {
-        "schema_version": 13,
+        "schema_version": SCHEMA_VERSION,
         "database_generation": str(metadata[1]),
         "migration_state": "ready",
     }
@@ -979,7 +741,7 @@ def initialize_fresh_stores(
     )
     return {
         "ok": True,
-        "authority_schema_version": 13,
+        "authority_schema_version": SCHEMA_VERSION,
         "authority_generation": authority["database_generation"],
         "test_schema_version": test_summary["schema_version"],
         "test_store_generation": test_summary["store_generation"],
@@ -1120,7 +882,7 @@ def plan_adoption(manifest: Mapping[str, object]) -> dict[str, object]:
         "console_state": source,
         "fresh_stores": fresh_store_plan(checked),
         "repository_count": len(checked["repositories"]),
-        "enrollment_count": len(enrollment_commands(checked)),
+        "repository_catalog_count": len(checked["repositories"]),
         "project_worktrees_mutated": False,
         "project_databases_or_volumes_mutated": False,
         "schema12_bridge_used": False,
@@ -1154,124 +916,6 @@ def _write_journal(path: Path, value: Mapping[str, object], *, uid: int) -> dict
     activation._atomic_private(path, _canonical(document) + b"\n", expected_uid=uid)
     return document
 
-
-def _bounded_failure_message(error: BaseException, *, maximum_bytes: int = 1024) -> str:
-    payload = str(error).encode("utf-8", errors="replace")
-    if len(payload) <= maximum_bytes:
-        return payload.decode("utf-8")
-    suffix = b"... [truncated]"
-    return (payload[: maximum_bytes - len(suffix)] + suffix).decode(
-        "utf-8", errors="replace"
-    )
-
-
-def _enrollment_command_context(argv: Sequence[str]) -> dict[str, object]:
-    values: dict[str, object] = {}
-    for flag, field in (
-        ("--project", "project"),
-        ("--client-uid", "client_uid"),
-        ("--account-id", "account_id"),
-        ("--agent", "agent"),
-    ):
-        try:
-            value = argv[argv.index(flag) + 1]
-        except (ValueError, IndexError):
-            continue
-        values[field] = str(value)
-    return values
-
-
-def _run_enrollment_batch(
-    runner: activation.CommandRunner,
-    commands: Sequence[Sequence[str]],
-    *,
-    phase: str,
-    operation_id: str,
-    manifest_sha256: str,
-    transaction_root: Path,
-    expected_uid: int,
-) -> list[dict[str, object]]:
-    """Run every bounded enrollment and publish one protected failure report.
-
-    A failed command is never promoted into the success journal step.  Replaying
-    the outer transaction therefore retries the same idempotent enrollment
-    batch, while a successful batch retains the pre-existing journal shape.
-    """
-
-    filenames = {
-        "repositories_enrolled": "repository-enrollment-failures.json",
-        "api_enrolled": "api-enrollment-failures.json",
-    }
-    failure_labels = {
-        "repositories_enrolled": "repository enrollment",
-        "api_enrolled": "API repository enrollment",
-    }
-    if phase not in filenames:
-        raise CleanAdoptionError("enrollment batch phase is invalid")
-    if not commands:
-        raise CleanAdoptionError(f"{failure_labels[phase]} command batch is empty")
-
-    results: list[dict[str, object]] = []
-    failures: list[dict[str, object]] = []
-    for index, argv in enumerate(commands):
-        try:
-            result = runner.run_json(argv)
-            if not isinstance(result, Mapping) or result.get("ok") is not True:
-                raise activation.ActivationError(
-                    "activation command returned an unsuccessful result"
-                )
-            results.append(dict(result))
-        except (
-            activation.ActivationError,
-            subprocess.TimeoutExpired,
-            OSError,
-        ) as error:
-            cause = (
-                error
-                if isinstance(error, subprocess.TimeoutExpired)
-                else error.__cause__
-            )
-            failures.append(
-                {
-                    "command_index": index,
-                    "classification": (
-                        "timeout"
-                        if isinstance(cause, subprocess.TimeoutExpired)
-                        else "command_failure"
-                    ),
-                    "error_type": type(error).__name__,
-                    "error": _bounded_failure_message(error),
-                    **_enrollment_command_context(argv),
-                }
-            )
-
-    if failures:
-        artifact = cutover.seal(
-            ENROLLMENT_FAILURE_KIND,
-            {
-                "operation_id": operation_id,
-                "manifest_sha256": manifest_sha256,
-                "phase": phase,
-                "command_count": len(commands),
-                "success_count": len(commands) - len(failures),
-                "failure_count": len(failures),
-                "failures": failures,
-                "recorded_at": _now(),
-            },
-        )
-        artifact_path = transaction_root / filenames[phase]
-        activation._atomic_private(
-            artifact_path,
-            _canonical(artifact) + b"\n",
-            expected_uid=expected_uid,
-        )
-        raise CleanAdoptionError(
-            f"{failure_labels[phase]} failed for {len(failures)} of "
-            f"{len(commands)} commands; protected details: {artifact_path}"
-        )
-    return results
-
-
 def _rotate_disposable_state(
     manifest: Mapping[str, object], *, transaction_root: Path
 ) -> dict[str, object]:
@@ -1286,7 +930,6 @@ def _rotate_disposable_state(
         "route_resolution",
         "publication_input",
         "publication",
-        "test_capability_policy",
         "telegram_destination",
     )
     candidates: list[Path] = []
@@ -1399,10 +1042,10 @@ def _wait_for_authority_application(
     poll_interval_seconds: float = 0.25,
     sleeper: Callable[[float], None] = time.sleep,
 ) -> dict[str, object]:
-    """Wait for one authenticated broker response, not merely systemd active.
+    """Wait for one trusted-local broker response, not merely systemd active.
 
     ``Type=exec`` becomes active before the authority has adopted and validated
-    its inherited listener.  A bounded owner-attributed inventory request proves
+    its inherited listener.  A bounded host-wide inventory request proves
     that the application has crossed that boundary.  The per-attempt coreutils
     timeout keeps an accepted-but-unserved socket from consuming the whole
     adoption transaction.
@@ -1428,26 +1071,12 @@ def _wait_for_authority_application(
     repository = repositories[0]
     if not isinstance(repository, Mapping):
         raise CleanAdoptionError("authority readiness repository is invalid")
-    clients = repository.get("clients")
     canonical_root = repository.get("canonical_root")
     if (
-        not isinstance(clients, Sequence)
-        or isinstance(clients, (str, bytes))
-        or not clients
-        or not isinstance(canonical_root, str)
+        not isinstance(canonical_root, str)
         or not canonical_root
     ):
         raise CleanAdoptionError("authority readiness canary is incomplete")
-    client = clients[0]
-    if not isinstance(client, Mapping) or type(client.get("uid")) is not int:
-        raise CleanAdoptionError("authority readiness client is invalid")
-    client_uid = int(client["uid"])
-    try:
-        account = pwd.getpwuid(client_uid)
-    except (KeyError, OSError) as error:
-        raise CleanAdoptionError(
-            f"authority readiness account {client_uid} is unavailable"
-        ) from error
     expected_repository_id = expected_repository_ids.get(canonical_root)
     profile_path = destinations.get("profile")
     release = manifest.get("release")
@@ -1469,13 +1098,6 @@ def _wait_for_authority_application(
         "/usr/bin/timeout",
         "--signal=KILL",
         "5",
-        "/usr/bin/setpriv",
-        "--reuid",
-        str(client_uid),
-        "--regid",
-        str(account.pw_gid),
-        "--init-groups",
-        "--reset-env",
         "/usr/bin/env",
         "DEVCOORDINATOR_AUTHORITY=system",
         f"DEVCOORDINATOR_BROKER_PROFILE={profile_path}",
@@ -1537,13 +1159,13 @@ def _wait_for_authority_application(
                     "attempts": attempt,
                     "canonical_root": canonical_root,
                     "repo_id": expected_repository_id,
-                    "client_uid": client_uid,
+                    "caller": "trusted-local-installer",
                     "schema_version": 2,
                 }
         if attempt != max_attempts:
             sleeper(float(poll_interval_seconds))
     raise CleanAdoptionError(
-        "authority did not reach authenticated application readiness"
+        "authority did not reach trusted-local application readiness"
     )
 
 
@@ -1732,7 +1354,7 @@ def _test_plane_application_canary(
     expected_repository_ids: Mapping[str, str],
     *,
     setup_repository_id: str,
-    setup_owner_uid: int,
+    setup_execution_uid: int,
     socket_path: Path = Path("/run/devcoordinator-testd/testd.sock"),
 ) -> dict[str, object]:
     """Prove testd, snapshotd, and Test Store writes before maintenance clears."""
@@ -1742,8 +1364,8 @@ def _test_plane_application_canary(
         not repository_ids
         or len(set(repository_ids)) != len(repository_ids)
         or setup_repository_id not in repository_ids
-        or type(setup_owner_uid) is not int
-        or setup_owner_uid <= 0
+        or type(setup_execution_uid) is not int
+        or setup_execution_uid <= 0
     ):
         raise CleanAdoptionError("clean-adoption test-plane canary scope is invalid")
     plane = UnixTestPlaneClient(
@@ -1756,7 +1378,7 @@ def _test_plane_application_canary(
         setup = dict(
             plane.setup(
                 repository_id=setup_repository_id,
-                owner_uid=setup_owner_uid,
+                owner_uid=setup_execution_uid,
             )
         )
         catalog = dict(plane.repository_catalog(repository_ids=repository_ids))
@@ -1818,6 +1440,8 @@ def _final_health_gate(
     expected_repository_ids: Mapping[str, str],
     observer_uid: int,
     testd_uid: int,
+    canary_uid: int,
+    canary_gid: int,
     runner: activation.CommandRunner,
 ) -> dict[str, object]:
     units = (
@@ -1847,28 +1471,17 @@ def _final_health_gate(
         Path(str(manifest["release"]))
         / "skills/codex-dev-coordinator/scripts/dev_coordinator.py"
     )
-    seen_canaries: set[tuple[str, int]] = set()
+    if canary_uid <= 0 or canary_gid <= 0:
+        raise CleanAdoptionError("trusted-local canary identity is invalid")
     for repository in manifest["repositories"]:
-        for client in repository["clients"]:
-            client_uid = int(client["uid"])
-            canary_key = (str(repository["canonical_root"]), client_uid)
-            if canary_key in seen_canaries:
-                continue
-            seen_canaries.add(canary_key)
-            try:
-                account = pwd.getpwuid(client_uid)
-            except (KeyError, OSError) as error:
-                raise CleanAdoptionError(
-                    f"inventory canary account {client_uid} is unavailable"
-                ) from error
-            output = runner.text(
-                [
+        output = runner.text(
+            [
                 "/usr/bin/setpriv",
                 "--reuid",
-                str(client_uid),
+                str(canary_uid),
                 "--regid",
-                str(account.pw_gid),
-                "--init-groups",
+                str(canary_gid),
+                "--clear-groups",
                 "--reset-env",
                 "/usr/bin/env",
                 "DEVCOORDINATOR_AUTHORITY=system",
@@ -1885,31 +1498,31 @@ def _final_health_gate(
                 str(repository["canonical_root"]),
                 "--no-docker",
                 "--compact-json",
-                ]
-            )
-            try:
-                inventory_document = json.loads(output)
-            except json.JSONDecodeError as error:
-                raise CleanAdoptionError("inventory canary returned invalid JSON") from error
-            scoped = inventory_document.get("repositories")
-            if (
-                inventory_document.get("schema_version") != 2
-                or not isinstance(scoped, list)
-                or len(scoped) != 1
-                or scoped[0].get("canonical_root")
-                != str(repository["canonical_root"])
-                or scoped[0].get("repo_id")
-                != expected_repository_ids.get(str(repository["canonical_root"]))
-            ):
-                raise CleanAdoptionError("inventory canary returned contradictory scope")
-            inventory_canaries.append(
-                {
-                    "canonical_root": str(repository["canonical_root"]),
-                    "repo_id": str(scoped[0]["repo_id"]),
-                    "client_uid": client_uid,
-                    "schema_version": 2,
-                }
-            )
+            ]
+        )
+        try:
+            inventory_document = json.loads(output)
+        except json.JSONDecodeError as error:
+            raise CleanAdoptionError("inventory canary returned invalid JSON") from error
+        scoped = inventory_document.get("repositories")
+        if (
+            inventory_document.get("schema_version") != 3
+            or not isinstance(scoped, list)
+            or len(scoped) != 1
+            or scoped[0].get("canonical_root")
+            != str(repository["canonical_root"])
+            or scoped[0].get("repo_id")
+            != expected_repository_ids.get(str(repository["canonical_root"]))
+        ):
+            raise CleanAdoptionError("inventory canary returned contradictory scope")
+        inventory_canaries.append(
+            {
+                "canonical_root": str(repository["canonical_root"]),
+                "repo_id": str(scoped[0]["repo_id"]),
+                "caller_uid": canary_uid,
+                "schema_version": 2,
+            }
+        )
     destinations = manifest["destinations"]
     authority = AccountStore.open(destinations["authority_database"], expected_uid=0)
     try:
@@ -1918,7 +1531,7 @@ def _final_health_gate(
         ).fetchone()
     finally:
         authority.close()
-    if authority_metadata is None or tuple(authority_metadata) != (13, "ready"):
+    if authority_metadata is None or tuple(authority_metadata) != (SCHEMA_VERSION, "ready"):
         raise CleanAdoptionError("clean-adoption final authority is not ready")
     inventory = verify_inventory_store(
         Path(str(destinations["inventory_database"])),
@@ -1936,21 +1549,12 @@ def _final_health_gate(
         raise CleanAdoptionError("clean-adoption final Test Store identity is invalid")
     setup_root = str(manifest["background_project_root"])
     setup_repository_id = expected_repository_ids.get(setup_root)
-    setup_rows = [
-        item
-        for item in manifest["repositories"]
-        if isinstance(item, Mapping) and item.get("canonical_root") == setup_root
-    ]
-    if (
-        not isinstance(setup_repository_id, str)
-        or len(setup_rows) != 1
-        or type(setup_rows[0].get("owner_uid")) is not int
-    ):
+    if not isinstance(setup_repository_id, str):
         raise CleanAdoptionError("clean-adoption test setup canary identity is invalid")
     test_plane = _test_plane_application_canary(
         expected_repository_ids,
         setup_repository_id=setup_repository_id,
-        setup_owner_uid=int(setup_rows[0]["owner_uid"]),
+        setup_execution_uid=canary_uid,
     )
     domain = _console_domain(
         staged_legacy_env,
@@ -1970,7 +1574,7 @@ def _final_health_gate(
             "repository_count": len(expected_repository_ids),
         },
         "test_plane": test_plane,
-        "authority_schema_version": 13,
+        "authority_schema_version": SCHEMA_VERSION,
         "inventory_generation": inventory["generation"],
         "test_schema_version": 5,
         "public_status": public_status,
@@ -2010,7 +1614,7 @@ def _tests_catalog_api_canary(
 
     expected_ids = set(expected_repository_ids.values())
     if setup_repository_id not in expected_ids:
-        raise CleanAdoptionError("Tests setup canary repository is not enrolled")
+        raise CleanAdoptionError("Tests setup canary repository is not cataloged")
 
     def read_catalog(*, label: str) -> list[Mapping[str, object]]:
         status, payload = read_api("/v1/test-repositories", label=label)
@@ -2041,7 +1645,7 @@ def _tests_catalog_api_canary(
             raise CleanAdoptionError("Tests catalog API contract is contradictory")
         return rows
 
-    # The internal pre-clear canary has already retained the dogfood setup in a
+    # The internal pre-clear canary has already retained the selected setup in a
     # healthy cutover. Repeat that exact setup through the public API to prove
     # the broker path after maintenance clears. Keeping ``missing`` valid here
     # also makes this check deterministic when an operator invokes it alone on
@@ -2440,66 +2044,17 @@ def apply_adoption(
                 owner_gid=int(observer["gid"]),
             )
             advance("fresh_inventory", inventory)
-        if not done("repositories_enrolled"):
-            results = _run_enrollment_batch(
-                command,
-                enrollment_commands(checked),
-                phase="repositories_enrolled",
-                operation_id=str(current["operation_id"]),
-                manifest_sha256=manifest_sha,
-                transaction_root=transaction_root,
-                expected_uid=expected_uid,
+        if not done("repositories_cataloged"):
+            catalog = catalog_repositories_offline(checked, expected_uid=0)
+            profile = cutover.reconstruct_api_profile_from_authority(
+                authority_database=Path(str(destinations["authority_database"])),
+                destination=Path(str(destinations["profile"])),
+                validation_uid=int(api["uid"]),
+                authority_uid=0,
             )
-            repo_ids: dict[str, str] = {}
-            for repository, result_group_start in zip(
-                checked["repositories"],
-                _group_enrollment_results(checked, results),
-            ):
-                ids = {
-                    str(result.get("repo_id") or result.get("repository_id"))
-                    for result in result_group_start
-                }
-                if len(ids) != 1 or "None" in ids:
-                    raise CleanAdoptionError("repository enrollment returned contradictory IDs")
-                repo_ids[str(repository["canonical_root"])] = ids.pop()
-            advance("repositories_enrolled", {"repository_ids": repo_ids, "results": results})
-        if not done("api_enrolled"):
-            api_commands = api_enrollment_commands(
-                checked, api_uid=int(api["uid"])
-            )
-            api_results = _run_enrollment_batch(
-                command,
-                api_commands,
-                phase="api_enrolled",
-                operation_id=str(current["operation_id"]),
-                manifest_sha256=manifest_sha,
-                transaction_root=transaction_root,
-                expected_uid=expected_uid,
-            )
-            if len(api_results) != len(checked["repositories"]):
-                raise CleanAdoptionError("API repository enrollment failed")
-            api_profile = load_broker_profile(
-                path=Path(str(destinations["profile"])),
-                effective_uid=int(api["uid"]),
-                required=True,
-            )
-            expected_roots = {
-                str(repository["canonical_root"])
-                for repository in checked["repositories"]
-            }
-            if (
-                api_profile.account_id != cutover.API_BROKER_ACCOUNT
-                or set(api_profile.repositories) != expected_roots
-            ):
-                raise CleanAdoptionError("API protected profile is incomplete")
             advance(
-                "api_enrolled",
-                {
-                    "api_uid": int(api["uid"]),
-                    "account_id": api_profile.account_id,
-                    "repositories": sorted(api_profile.repositories),
-                    "results": api_results,
-                },
+                "repositories_cataloged",
+                {**catalog, "profile": profile},
             )
         if not done("graph_installed"):
             synthetic = _synthetic_sealed_state(
@@ -2508,7 +2063,6 @@ def apply_adoption(
             graph, credential = activation.prepare_candidate(
                 state=synthetic,
                 candidate_slot_source=Path(str(checked["candidate_slot_source"])),
-                test_capability_policy=None,
                 legacy_console_env=staged_env,
                 background_project_root=Path(str(checked["background_project_root"])),
                 background_config_transaction=transaction_root / "background-config",
@@ -2527,7 +2081,6 @@ def apply_adoption(
                 first_adoption_legacy_authority_database=Path(
                     str(destinations["authority_database"])
                 ),
-                repository_owner_map=None,
                 first_adoption_journal=transaction_root / "graph-journal.json",
             )
             cutover._publish_evidence(transaction_root / "graph.json", graph, uid=0)
@@ -2560,19 +2113,6 @@ def apply_adoption(
                     ),
                 ),
             )
-        if not done("test_policy"):
-            repository_ids = current["steps"]["repositories_enrolled"]["repository_ids"]
-            dogfood_id = repository_ids[str(checked["background_project_root"])]
-            policy = activation.publish_first_adoption_capability_policy(
-                authority_database=Path(str(destinations["authority_database"])),
-                snapshot_socket=Path("/run/devcoordinator-test-snapshotd/snapshot.sock"),
-                destination=Path(str(destinations["test_capability_policy"])),
-                dogfood_repository_id=str(dogfood_id),
-                rollback_directory=transaction_root / "policy-rollback",
-                journal_file=transaction_root / "policy-journal.json",
-                expected_uid=0,
-            )
-            advance("test_policy", policy)
         if not done("fixed_ports"):
             advance(
                 "fixed_ports",
@@ -2592,7 +2132,7 @@ def apply_adoption(
                     maintenance_record["deployment_id"]
                 ),
                 expected_repository_ids=current["steps"][
-                    "repositories_enrolled"
+                    "repositories_cataloged"
                 ]["repository_ids"],
                 runner=command,
             )
@@ -2741,10 +2281,12 @@ def apply_adoption(
                         maintenance_record["deployment_id"]
                     ),
                     expected_repository_ids=current["steps"][
-                        "repositories_enrolled"
+                        "repositories_cataloged"
                     ]["repository_ids"],
                     observer_uid=int(observer["uid"]),
                     testd_uid=int(testd["uid"]),
+                    canary_uid=int(api["uid"]),
+                    canary_gid=int(api["gid"]),
                     runner=command,
                 ),
             )
@@ -2771,7 +2313,7 @@ def apply_adoption(
                 },
             )
         if not done("post_maintenance_api_ready"):
-            repository_ids = current["steps"]["repositories_enrolled"][
+            repository_ids = current["steps"]["repositories_cataloged"][
                 "repository_ids"
             ]
             advance(
@@ -2796,21 +2338,6 @@ def apply_adoption(
                 },
             )
         return current
-
-
-def _group_enrollment_results(
-    manifest: Mapping[str, object], results: Sequence[Mapping[str, object]]
-) -> list[list[Mapping[str, object]]]:
-    grouped: list[list[Mapping[str, object]]] = []
-    offset = 0
-    for repository in manifest["repositories"]:
-        count = len(repository["clients"])
-        grouped.append(list(results[offset : offset + count]))
-        offset += count
-    if offset != len(results):
-        raise CleanAdoptionError("enrollment result count is invalid")
-    return grouped
-
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)

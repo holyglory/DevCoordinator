@@ -428,7 +428,7 @@ def public_snapshot_source_diagnostic(value: object) -> str:
     if message in exact_failures:
         return exact_failures[message]
     if message.startswith("Git snapshot inspection failed:"):
-        return "Git metadata inspection failed for the enrolled repository."
+        return "Git metadata inspection failed for the configured repository."
     if message.startswith("gitlink worktree") or message.startswith(
         "Git index contains an unmerged entry:"
     ):
@@ -942,7 +942,7 @@ class SnapshotRepositoryBinding:
 
 @runtime_checkable
 class SnapshotRepositoryResolver(Protocol):
-    """Resolve only authority-enrolled identity inside the UID helper."""
+    """Resolve only authority-configured identity inside the UID helper."""
 
     def resolve_as_owner(
         self, *, repository_id: str, owner_uid: int

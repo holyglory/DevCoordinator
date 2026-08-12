@@ -173,18 +173,14 @@ export const CANONICAL_OVERVIEW = Object.freeze({
           display_name: 'Sample API preview',
         },
       ],
-      memberships: [
-        { resource_kind: 'container', host_resource_id: databaseResourceId, repo_id: rootRepoId },
-        { resource_kind: 'container', host_resource_id: previewResourceId, repo_id: temporaryRepoId },
-      ],
       resources: {
         servers: [
           { server_definition_id: workerId, repo_id: rootRepoId },
           { server_definition_id: previewServerId, repo_id: temporaryRepoId },
         ],
         docker: [
-          { docker_resource_id: databaseResourceId },
-          { docker_resource_id: previewResourceId },
+          { docker_resource_id: databaseResourceId, repo_id: rootRepoId },
+          { docker_resource_id: previewResourceId, repo_id: temporaryRepoId },
         ],
         databases: [{
           database_binding_id: databaseBindingId,

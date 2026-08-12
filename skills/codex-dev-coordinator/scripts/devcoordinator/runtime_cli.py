@@ -30,7 +30,7 @@ from .worker_supervision import (
 
 
 RUNTIME_SIMPLE_ACTIONS = frozenset(
-    {"status", "start", "stop", "restart", "remove"}
+    {"status", "start", "stop", "restart", "replace", "remove"}
 )
 
 
@@ -135,6 +135,29 @@ def add_runtime_cli_arguments(parser: argparse.ArgumentParser) -> None:
         ),
     )
     parser.add_argument("--target-name", help="required service display/runtime name")
+    parser.add_argument(
+        "--argv",
+        action="append",
+        metavar="ARG",
+        help=(
+            "one literal no-shell service argument; repeat for every argument "
+            "when defining or replacing a service"
+        ),
+    )
+    parser.add_argument(
+        "--cwd",
+        help="absolute working directory for a service definition or replacement",
+    )
+    parser.add_argument(
+        "--env",
+        action="append",
+        metavar="KEY=VALUE",
+        help="one literal environment value; repeat as needed",
+    )
+    parser.add_argument(
+        "--expected-definition-generation",
+        help="non-negative current service definition generation for replace",
+    )
     parser.add_argument(
         "--purpose",
         metavar="PURPOSE",
@@ -256,6 +279,10 @@ def _flag_values_present(namespace: argparse.Namespace) -> list[str]:
         "target_kind",
         "target_id",
         "target_name",
+        "argv",
+        "cwd",
+        "env",
+        "expected_definition_generation",
         "purpose",
         "ttl_seconds",
         "no_ttl",
@@ -340,6 +367,37 @@ def runtime_request_from_flags(namespace: argparse.Namespace) -> dict[str, Any]:
     reason = getattr(namespace, "reason", None)
     if reason is not None:
         options["reason"] = reason
+    argv = getattr(namespace, "argv", None)
+    if argv is not None:
+        options["argv"] = list(argv)
+    cwd = getattr(namespace, "cwd", None)
+    if cwd is not None:
+        options["cwd"] = cwd
+    environment: dict[str, str] = {}
+    for entry in getattr(namespace, "env", None) or []:
+        key, separator, value = str(entry).partition("=")
+        if not separator or not key or key in environment:
+            raise RuntimeRequestError(
+                "--env entries must be unique literal KEY=VALUE values"
+            )
+        environment[key] = value
+    if action == "replace" or getattr(namespace, "env", None) is not None:
+        options["env"] = environment
+    expected_generation = getattr(
+        namespace, "expected_definition_generation", None
+    )
+    if expected_generation is not None:
+        if (
+            not isinstance(expected_generation, str)
+            or not expected_generation.isascii()
+            or not expected_generation.isdigit()
+        ):
+            raise RuntimeRequestError(
+                "expected_definition_generation must be a non-negative integer"
+            )
+        options["expected_definition_generation"] = int(
+            expected_generation, 10
+        )
     for field in (
         "remove_plan_id",
         "remove_plan_fingerprint",

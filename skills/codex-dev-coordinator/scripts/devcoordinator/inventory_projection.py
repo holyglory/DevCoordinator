@@ -24,7 +24,6 @@ _REQUIRED_NORMALIZED_LISTS = (
     "servers",
     "repositories",
     "repository_trees",
-    "memberships",
     "unassigned_resources",
     "lifecycle_violations",
 )
@@ -127,7 +126,7 @@ def _resource_index(
 def _validate_repository_tree_contract(value: Mapping[str, Any]) -> None:
     """Reject a normalized graph the Console would have to fail closed on.
 
-    Repository scopes and explicit ownership problems form one exhaustive,
+    Repository scopes and explicit catalog problems form one exhaustive,
     non-overlapping partition of current normalized resources.  Validating at
     publication keeps malformed observer output from replacing the retained
     last-known-good generation and makes the Python producer—not each UI—the
@@ -138,7 +137,6 @@ def _validate_repository_tree_contract(value: Mapping[str, Any]) -> None:
     repository_trees = _record_list(
         value.get("repository_trees"), name="repository_trees"
     )
-    memberships = _record_list(value.get("memberships"), name="memberships")
     unassigned = _record_list(
         value.get("unassigned_resources"), name="unassigned_resources"
     )
@@ -190,21 +188,6 @@ def _validate_repository_tree_contract(value: Mapping[str, Any]) -> None:
     databases_by_id = _resource_index(
         databases, id_key="database_binding_id", name="database"
     )
-    container_memberships: dict[str, dict[str, Any]] = {}
-    for membership in memberships:
-        if membership.get("resource_kind") != "container":
-            continue
-        resource_id = membership.get("host_resource_id")
-        if not isinstance(resource_id, str) or not resource_id:
-            _repository_contract_error(
-                "a container membership has no immutable ID"
-            )
-        if resource_id in container_memberships:
-            _repository_contract_error(
-                "a container membership immutable ID is duplicated"
-            )
-        container_memberships[resource_id] = membership
-
     problem_ids = {"server": set(), "container": set(), "database": set()}
     seen_problem_ids: set[tuple[str, str]] = set()
     for problem in [*unassigned, *lifecycle]:
@@ -217,16 +200,16 @@ def _validate_repository_tree_contract(value: Mapping[str, Any]) -> None:
             or not resource_id
         ):
             _repository_contract_error(
-                "an ownership problem has no immutable resource identity"
+                "a catalog problem has no immutable resource identity"
             )
         problem_key = (kind, resource_id)
         if problem_key in seen_problem_ids:
             _repository_contract_error(
-                "an ownership problem immutable resource identity is duplicated"
+                "a catalog problem immutable resource identity is duplicated"
             )
         if kind not in problem_ids:
             _repository_contract_error(
-                "an ownership problem has an unknown normalized resource kind"
+                "a catalog problem has an unknown normalized resource kind"
             )
         seen_problem_ids.add(problem_key)
         problem_ids[kind].add(resource_id)
@@ -246,8 +229,8 @@ def _validate_repository_tree_contract(value: Mapping[str, Any]) -> None:
             or parent_id not in problem_ids["container"]
         ):
             _repository_contract_error(
-                "a database ownership problem is not backed by its exact "
-                "container ownership problem"
+                "a database catalog problem is not backed by its exact "
+                "container catalog problem"
             )
 
     family_ids: set[str] = set()
@@ -324,11 +307,10 @@ def _validate_repository_tree_contract(value: Mapping[str, Any]) -> None:
                     )
                 classified["server"].add(resource_id)
             for resource_id in container_ids:
-                membership = container_memberships.get(resource_id)
+                row = docker_by_id.get(resource_id)
                 if (
-                    resource_id not in docker_by_id
-                    or membership is None
-                    or membership.get("repo_id") != repo_id
+                    row is None
+                    or row.get("repo_id") != repo_id
                     or resource_id in classified["container"]
                 ):
                     _repository_contract_error(
@@ -363,11 +345,11 @@ def _validate_repository_tree_contract(value: Mapping[str, Any]) -> None:
     for kind in ("server", "container", "database"):
         if classified[kind] & problem_ids[kind]:
             _repository_contract_error(
-                f"a {kind} is both repository-classified and an ownership problem"
+                f"a {kind} is both repository-classified and a catalog problem"
             )
         if classified[kind] | problem_ids[kind] != normalized_ids[kind]:
             _repository_contract_error(
-                "the repository tree and explicit ownership problems do not "
+                "the repository tree and explicit catalog problems do not "
                 "cover every normalized resource exactly once"
             )
 
@@ -382,13 +364,17 @@ def _validate_repository_tree_contract(value: Mapping[str, Any]) -> None:
             )
 
 
-def _validate_inventory(value: Any) -> dict[str, Any]:
+def _validate_inventory(
+    value: Any,
+    *,
+    allow_legacy_repository_associations: bool = False,
+) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise InventoryProjectionError("inventory projection must contain one object")
     encoded = _canonical(value)
     if len(encoded) > MAX_PROJECTION_BYTES - 4096:
         raise InventoryProjectionError("inventory projection exceeds its byte budget")
-    if value.get("schema_version") not in {1, 2}:
+    if value.get("schema_version") not in {1, 2, 3}:
         raise InventoryProjectionError("inventory schema is unsupported")
     for name in ("servers", "repositories"):
         if not isinstance(value.get(name), list):
@@ -402,7 +388,7 @@ def _validate_inventory(value: Any) -> dict[str, Any]:
     # first-deployment seed can be refreshed in place. New seeds are complete
     # (see ``empty_inventory`` below), while every normalized schema-2 source
     # is rejected before publication unless it carries the Console contract.
-    normalized = value["schema_version"] == 2
+    normalized = value["schema_version"] in {2, 3}
     if normalized:
         for name in _REQUIRED_NORMALIZED_LISTS:
             if not isinstance(value.get(name), list):
@@ -419,7 +405,7 @@ def _validate_inventory(value: Any) -> dict[str, Any]:
         for name in _REQUIRED_OBSERVATION_LISTS:
             if not isinstance(observations.get(name), list):
                 raise InventoryProjectionError(f"inventory.observations.{name} must be a list")
-    if value["schema_version"] == 2:
+    if value["schema_version"] in {2, 3}:
         compatibility = value.get("v1_compatibility")
         if not isinstance(compatibility, dict):
             raise InventoryProjectionError(
@@ -431,7 +417,8 @@ def _validate_inventory(value: Any) -> dict[str, Any]:
                 "inventory.v1_compatibility is missing required fields: "
                 + ", ".join(missing)
             )
-        _validate_repository_tree_contract(value)
+        if not allow_legacy_repository_associations:
+            _validate_repository_tree_contract(value)
     # Round-trip detaches mutable/custom mappings and rejects non-JSON values.
     return json.loads(encoded.decode("utf-8"))
 
@@ -448,7 +435,11 @@ def envelope(*, generation: int, inventory: Mapping[str, Any], published_at: str
     return {**payload, "payload_sha256": _digest(payload)}
 
 
-def validate_envelope(value: Any) -> dict[str, Any]:
+def validate_envelope(
+    value: Any,
+    *,
+    allow_legacy_repository_associations: bool = False,
+) -> dict[str, Any]:
     if not isinstance(value, dict) or set(value) != {
         "generation", "inventory", "payload_sha256", "published_at", "schema_version"
     }:
@@ -460,7 +451,10 @@ def validate_envelope(value: Any) -> dict[str, Any]:
     published_at = value.get("published_at")
     if not isinstance(published_at, str) or len(published_at) < 20 or len(published_at) > 40:
         raise InventoryProjectionError("inventory publication timestamp is invalid")
-    inventory = _validate_inventory(value.get("inventory"))
+    inventory = _validate_inventory(
+        value.get("inventory"),
+        allow_legacy_repository_associations=allow_legacy_repository_associations,
+    )
     payload = {
         "schema_version": PROJECTION_SCHEMA,
         "generation": value["generation"],
@@ -540,7 +534,14 @@ def read_projection(path: Path, *, expected_owner_uid: int | None = None) -> dic
         raise InventoryProjectionError(
             f"inventory publication cannot be decoded: {error}"
         ) from error
-    return validate_envelope(value)
+    # The predecessor release could publish repository associations that no
+    # longer satisfy the trusted-local grouping contract.  Its root-owned,
+    # checksummed active generation remains readable only as a transition
+    # source; every new envelope and publication is still validated strictly.
+    return validate_envelope(
+        value,
+        allow_legacy_repository_associations=True,
+    )
 
 
 def publish_projection(
@@ -782,7 +783,10 @@ def _decoded_store_envelope(row: sqlite3.Row) -> dict[str, Any]:
         value = json.loads(raw.decode("utf-8"))
     except (TypeError, ValueError, UnicodeError, json.JSONDecodeError) as error:
         raise InventoryProjectionError("inventory store payload is invalid") from error
-    validated = validate_envelope(value)
+    validated = validate_envelope(
+        value,
+        allow_legacy_repository_associations=True,
+    )
     if (
         int(row["generation"]) != validated["generation"]
         or str(row["payload_sha256"]) != validated["payload_sha256"]
@@ -793,15 +797,19 @@ def _decoded_store_envelope(row: sqlite3.Row) -> dict[str, Any]:
 
 
 def read_inventory_store(
-    path: Path, *, expected_owner_uid: int
+    path: Path,
+    *,
+    expected_owner_uid: int,
+    integrity_check: bool = True,
 ) -> dict[str, Any]:
     connection = _open_inventory_store(
         path, expected_owner_uid=expected_owner_uid, create=False
     )
     try:
-        check = connection.execute("PRAGMA quick_check").fetchone()
-        if check is None or str(check[0]) != "ok":
-            raise InventoryProjectionError("inventory store integrity check failed")
+        if integrity_check:
+            check = connection.execute("PRAGMA quick_check").fetchone()
+            if check is None or str(check[0]) != "ok":
+                raise InventoryProjectionError("inventory store integrity check failed")
         metadata = connection.execute(
             "SELECT * FROM inventory_store_metadata WHERE singleton = 1"
         ).fetchone()
@@ -1029,6 +1037,7 @@ def verify_inventory_store(
     publication: Path,
     *,
     expected_owner_uid: int,
+    integrity_check: bool = True,
 ) -> dict[str, Any]:
     """Verify and repair only the two bounded crash windows between files."""
 
@@ -1074,7 +1083,11 @@ def verify_inventory_store(
         raise
     finally:
         connection.close()
-    return read_inventory_store(database, expected_owner_uid=expected_owner_uid)
+    return read_inventory_store(
+        database,
+        expected_owner_uid=expected_owner_uid,
+        integrity_check=integrity_check,
+    )
 
 
 def empty_inventory() -> dict[str, Any]:
@@ -1091,7 +1104,6 @@ def empty_inventory() -> dict[str, Any]:
         "servers": [],
         "repositories": [],
         "repository_trees": [],
-        "memberships": [],
         "resources": {
             "servers": [],
             "docker": [],

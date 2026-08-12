@@ -118,6 +118,9 @@ class RecordingSchedulerProfile:
     def __init__(self) -> None:
         self.calls: list[tuple[str, dict[str, object]]] = []
 
+    def repository(self, _root: str) -> SimpleNamespace:
+        return SimpleNamespace(repo_id=REPOSITORY_ID)
+
     def __getattr__(self, name: str):
         if name not in self.METHODS:
             raise AttributeError(name)
@@ -279,47 +282,25 @@ class OversizedCatalogProfile:
         }
 
 
-class OversizedDoctorProfile:
-    repository_id = "repo-00000000-0000-4000-8000-000000000010"
+class DynamicSetupCatalogProfile(SetupCatalogProfile):
+    def __init__(self, root: Path) -> None:
+        super().__init__()
+        self.repository_profile = SimpleNamespace(
+            repo_id="repo-00000000-0000-4000-8000-000000000008",
+            canonical_root=str(root.resolve()),
+            enabled=True,
+        )
+        self.repositories = {}
+        self.resolve_calls: list[str] = []
 
     def repository(self, _root: str) -> SimpleNamespace:
-        return SimpleNamespace(repo_id=self.repository_id)
+        raise KeyError("static installed profile is intentionally stale")
 
-    def test_repository_setup(self, *, repository: str) -> dict[str, object]:
-        if repository != self.repository_id:
-            raise AssertionError("unexpected repository")
-        return {
-            "capability_policy": {
-                "ok": False,
-                "missing": [
-                    f"grant-{index:03d}-" + ("x" * 1_000) for index in range(200)
-                ],
-            }
-        }
-
-
-class OversizedRegistrationProfile(FakeSchedulerProfile):
-    def register_test_plan(
-        self,
-        *,
-        plan: object,
-        manifest: object,
-        actor: str,
-        operation_id: str,
-    ) -> dict[str, object]:
-        result = super().register_test_plan(
-            plan=plan,
-            manifest=manifest,
-            actor=actor,
-            operation_id=operation_id,
-        )
-        result["capability_policy"] = {
-            "ok": False,
-            "missing": [
-                f"grant-{index:03d}-" + ("x" * 1_000) for index in range(200)
-            ],
-        }
-        return result
+    def resolve_repository(self, root: str) -> SimpleNamespace | None:
+        self.resolve_calls.append(root)
+        if root != self.repository_profile.canonical_root:
+            return None
+        return self.repository_profile
 
 
 class ImmutablePreviewProfile:
@@ -365,6 +346,21 @@ class ImmutablePreviewProfile:
             "registered": True,
             "operation_id": operation_id,
         }
+
+
+class DynamicImmutablePreviewProfile(ImmutablePreviewProfile):
+    def __init__(self, root: Path) -> None:
+        super().__init__(root)
+        self.resolve_calls: list[str] = []
+
+    def repository(self, _root: str) -> SimpleNamespace:
+        raise KeyError("static installed profile is intentionally stale")
+
+    def resolve_repository(self, root: str) -> SimpleNamespace | None:
+        self.resolve_calls.append(root)
+        if root != str(self.root.resolve()):
+            return None
+        return SimpleNamespace(repo_id=self.repository_id)
 
 
 class LivePreviewProfile:
@@ -430,26 +426,6 @@ class UnavailablePreviewProfile(FakeSchedulerProfile):
     def preview_test_plan(self, **_arguments: object) -> dict[str, object]:
         self.preview_calls += 1
         raise NotImplementedError
-
-
-class CapabilityDoctorProfile:
-    repository_id = "repo-00000000-0000-4000-8000-000000000010"
-
-    def __init__(self, *, approved: bool) -> None:
-        self.approved = approved
-
-    def repository(self, _root: str) -> SimpleNamespace:
-        return SimpleNamespace(repo_id=self.repository_id)
-
-    def test_repository_setup(self, *, repository: str) -> dict[str, object]:
-        if repository != self.repository_id:
-            raise AssertionError("unexpected repository")
-        return {
-            "capability_policy": {
-                "ok": self.approved,
-                "missing": [] if self.approved else ["repository-generation-grant"],
-            }
-        }
 
 
 class FailedWaitProfile:
@@ -646,7 +622,7 @@ class UniversalTestCliTests(unittest.TestCase):
                 ]
             )
 
-    def test_every_opaque_test_continuation_requires_repository_id(self) -> None:
+    def test_every_test_continuation_accepts_exact_id_or_canonical_root(self) -> None:
         test_commands = parser()._subparsers._group_actions[0].choices[  # type: ignore[union-attr]
             "test"
         ]._subparsers._group_actions[0].choices
@@ -661,16 +637,56 @@ class UniversalTestCliTests(unittest.TestCase):
             "wait",
         ):
             with self.subTest(command=name):
-                repository_actions = [
-                    action
+                option_strings = {
+                    option
                     for action in test_commands[name]._actions
-                    if action.dest == "repository"
+                    if action.dest in {"repository", "root_repo"}
+                    for option in action.option_strings
+                }
+                self.assertEqual(option_strings, {"--repository-id", "--root-repo"})
+
+        submit = test_commands["submit"]
+        with self.assertRaises(SystemExit):
+            parser().parse_args(
+                [
+                    "test",
+                    "submit",
+                    "--plan-id",
+                    "plan-one",
+                    "--operation-id",
+                    PLAN_OPERATION_ID,
                 ]
-                self.assertEqual(len(repository_actions), 1)
-                self.assertEqual(
-                    repository_actions[0].option_strings, ["--repository-id"]
-                )
-                self.assertTrue(repository_actions[0].required)
+            )
+        parsed = parser().parse_args(
+            [
+                "test",
+                "submit",
+                "--root-repo",
+                str(self.root),
+                "--plan-id",
+                "plan-one",
+                "--operation-id",
+                PLAN_OPERATION_ID,
+            ]
+        )
+        self.assertEqual(parsed.root_repo, str(self.root))
+        self.assertIsNone(parsed.repository)
+        with self.assertRaises(SystemExit):
+            parser().parse_args(
+                [
+                    "test",
+                    "submit",
+                    "--repository-id",
+                    REPOSITORY_ID,
+                    "--root-repo",
+                    str(self.root),
+                    "--plan-id",
+                    "plan-one",
+                    "--operation-id",
+                    PLAN_OPERATION_ID,
+                ]
+            )
+        self.assertIsNotNone(submit)
 
     def test_manifest_init_is_atomic_valid_and_non_destructive(self) -> None:
         initialized = initialize_manifest(self.root, force=False)
@@ -789,91 +805,6 @@ class UniversalTestCliTests(unittest.TestCase):
             "target_executable_unavailable",
             {issue["code"] for issue in result["issues"]},
         )
-
-    def test_manifest_doctor_exposes_missing_sealed_repository_grant(self) -> None:
-        self._committed_repository()
-        parsed = parser().parse_args(
-            [
-                "test",
-                "manifest",
-                "doctor",
-                "--root-repo",
-                str(self.root),
-            ]
-        )
-        result = handle_universal_test_cli(
-            parsed,
-            canonical_project=lambda value: value,
-            broker_profile_loader=lambda: CapabilityDoctorProfile(approved=False),
-            statistics_reader=lambda **_kwargs: self.fail("statistics called"),
-        )
-        self.assertFalse(result["ok"])
-        self.assertEqual(result["status"], "invalid")
-        self.assertIn(
-            "capability_policy_missing",
-            {issue["code"] for issue in result["issues"]},
-        )
-
-    def test_manifest_doctor_fails_closed_without_protected_broker_profile(self) -> None:
-        self._committed_repository()
-        parsed = parser().parse_args(
-            [
-                "test",
-                "manifest",
-                "doctor",
-                "--root-repo",
-                str(self.root),
-            ]
-        )
-        result = handle_universal_test_cli(
-            parsed,
-            canonical_project=lambda value: value,
-            broker_profile_loader=lambda: None,
-            statistics_reader=lambda **_kwargs: self.fail("statistics called"),
-        )
-
-        self.assertFalse(result["ok"])
-        self.assertEqual(result["status"], "invalid")
-        issue = next(
-            item
-            for item in result["issues"]
-            if item["code"] == "capability_policy_unavailable"
-        )
-        self.assertEqual(issue["severity"], "error")
-
-    def test_manifest_doctor_bounds_broker_policy_and_agent_envelope(self) -> None:
-        self._committed_repository()
-        parsed = parser().parse_args(
-            [
-                "test",
-                "manifest",
-                "doctor",
-                "--root-repo",
-                str(self.root),
-            ]
-        )
-        self.assertTrue(parsed.compact_json)
-        result = handle_universal_test_cli(
-            parsed,
-            canonical_project=lambda value: value,
-            broker_profile_loader=OversizedDoctorProfile,
-            statistics_reader=lambda **_kwargs: self.fail("statistics called"),
-        )
-
-        encoded = json.dumps(
-            result, separators=(",", ":"), sort_keys=True
-        ).encode("utf-8")
-        self.assertLessEqual(len(encoded), 8192)
-        self.assertFalse(result["ok"])
-        self.assertEqual(result["capability_policy"]["missing_count"], 200)
-        self.assertEqual(len(result["capability_policy"]["missing"]), 8)
-        self.assertTrue(result["capability_policy"]["truncated"])
-        issue = next(
-            item
-            for item in result["issues"]
-            if item["code"] == "capability_policy_missing"
-        )
-        self.assertNotIn("x" * 100, issue["message"])
 
     def test_broker_profile_exception_text_is_not_exposed(self) -> None:
         self._committed_repository()
@@ -1061,6 +992,71 @@ class UniversalTestCliTests(unittest.TestCase):
         )
         self.assertEqual(result["operation_id"], operation_id)
 
+    def test_submit_resolves_an_adopted_root_in_a_fresh_process(self) -> None:
+        operation_id = "00000000-0000-4000-8000-000000000006"
+        parsed = parser().parse_args(
+            [
+                "test",
+                "submit",
+                "--root-repo",
+                str(self.root),
+                "--plan-id",
+                "plan-abc",
+                "--operation-id",
+                operation_id,
+            ]
+        )
+
+        result = handle_universal_test_cli(
+            parsed,
+            canonical_project=lambda value: value,
+            broker_profile_loader=FakeSchedulerProfile,
+            statistics_reader=lambda **_kwargs: self.fail("statistics called"),
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(
+            result["run_id"], "run-00000000-0000-4000-8000-000000000001"
+        )
+        self.assertEqual(result["operation_id"], operation_id)
+
+    def test_wait_resolves_an_adopted_root_in_a_fresh_process(self) -> None:
+        parsed = parser().parse_args(
+            [
+                "test",
+                "wait",
+                "--root-repo",
+                str(self.root),
+                "--run-id",
+                "run-abc",
+                "--timeout-seconds",
+                "15",
+            ]
+        )
+        profile = RecordingSchedulerProfile()
+
+        result = handle_universal_test_cli(
+            parsed,
+            canonical_project=lambda value: value,
+            broker_profile_loader=lambda: profile,
+            statistics_reader=lambda **_kwargs: self.fail("statistics called"),
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(
+            profile.calls,
+            [
+                (
+                    "wait_test_run",
+                    {
+                        "repository": REPOSITORY_ID,
+                        "run_id": "run-abc",
+                        "timeout_seconds": 15,
+                    },
+                )
+            ],
+        )
+
     def test_read_and_control_commands_dispatch_exact_bounded_arguments(self) -> None:
         operation_id = "00000000-0000-4000-8000-000000000003"
         cases = (
@@ -1219,30 +1215,6 @@ class UniversalTestCliTests(unittest.TestCase):
         self.assertLessEqual(len(encoded), 8192)
         self.assertTrue(planned["plan"]["truncated"]["changes"])
 
-    def test_default_plan_bounds_broker_registration_details(self) -> None:
-        self._committed_repository()
-        planned = build_local_plan(
-            root=self.root,
-            temporary=None,
-            agent="codex",
-            intent="change",
-            raw_changes=tuple(
-                f"modified:generated/path-{index:04d}.py" for index in range(200)
-            ),
-            requested_targets=(),
-            broker_profile=OversizedRegistrationProfile(),
-            operation_id=PLAN_OPERATION_ID,
-        )
-
-        encoded = json.dumps(
-            planned, separators=(",", ":"), sort_keys=True
-        ).encode("utf-8")
-        self.assertLessEqual(len(encoded), 8192)
-        policy = planned["submission"]["registration"]["capability_policy"]
-        self.assertEqual(policy["missing_count"], 200)
-        self.assertEqual(len(policy["missing"]), 8)
-        self.assertTrue(policy["truncated"])
-
     def test_immutable_plan_fails_closed_until_snapshot_broker_exists(self) -> None:
         self._committed_repository()
         pending = build_local_plan(
@@ -1277,6 +1249,23 @@ class UniversalTestCliTests(unittest.TestCase):
         self.assertTrue(planned["submission"]["available"])
         self.assertEqual(planned["plan"]["source"]["mode"], "immutable")
         self.assertTrue(planned["plan"]["source"]["snapshot_id"].startswith("snapshot-"))
+
+    def test_plan_dynamically_resolves_authority_adopted_repository(self) -> None:
+        self._committed_repository()
+        profile = DynamicImmutablePreviewProfile(self.root)
+        planned = build_local_plan(
+            root=self.root,
+            temporary=None,
+            agent="codex",
+            intent="release",
+            raw_changes=(),
+            requested_targets=(),
+            broker_profile=profile,
+            operation_id=PLAN_OPERATION_ID,
+            compact=False,
+        )
+        self.assertTrue(planned["ok"])
+        self.assertEqual(profile.resolve_calls, [str(self.root.resolve())])
 
     def test_immutable_temporary_worktree_and_manual_target_reach_broker_preview(self) -> None:
         self._committed_repository()
@@ -1439,6 +1428,13 @@ class UniversalTestCliTests(unittest.TestCase):
 
         ready = read_test_catalog(None, ReadySetupCatalogProfile())
         self.assertEqual(ready["repositories"][0]["targets"], ["unit"])
+
+    def test_catalog_dynamically_resolves_authority_adopted_repository(self) -> None:
+        profile = DynamicSetupCatalogProfile(self.root)
+        catalog = read_test_catalog(self.root, profile)
+        self.assertEqual(profile.resolve_calls, [str(self.root.resolve())])
+        self.assertEqual(catalog["repository_count"], 1)
+        self.assertEqual(catalog["repositories"][0]["status"], "missing")
 
     def test_catalog_checks_all_rows_but_returns_one_bounded_envelope(self) -> None:
         parsed = parser().parse_args(["test", "catalog"])

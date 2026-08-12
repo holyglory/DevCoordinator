@@ -22,7 +22,7 @@ from unittest import mock
 import clean_adopt_availability as subject
 
 
-_AUTHORITY_SCHEMA_VERSION = 13
+_AUTHORITY_SCHEMA_VERSION = 15
 _TEST_STORE_SCHEMA_VERSION = 5
 _INVENTORY_STORE_SCHEMA_VERSION = 1
 
@@ -89,31 +89,10 @@ class CleanAdoptionTests(unittest.TestCase):
             "repositories": [
                 {
                     "canonical_root": str(repository),
-                    "owner_uid": max(self.uid, 1),
                     "runtime_file": str(runtime_file),
                     "port_range": "3100-3199",
                     "fixed_ports": [{"name": "web", "port": 3150}],
-                    "clients": [
-                        {
-                            "uid": max(self.uid, 1),
-                            "account_id": "owner@example.test",
-                            "agent": "codex-owner",
-                            "all_servers": True,
-                            "servers": [],
-                            "profile_valid_days": 30,
-                        },
-                        {
-                            "uid": max(self.uid, 1) + 1,
-                            "account_id": "agent@example.test",
-                            "agent": "codex-agent",
-                            "all_servers": False,
-                            "servers": ["web"],
-                            "profile_valid_days": 7,
-                        },
-                    ],
                     "approve_compose_host_access": True,
-                    "grant_cleanup": True,
-                    "grant_ephemeral_image_prefetch": True,
                     "compose_run_once_services": ["seed"],
                 }
             ],
@@ -135,7 +114,7 @@ class CleanAdoptionTests(unittest.TestCase):
             ),
         )
 
-    def test_valid_manifest_normalizes_explicit_repositories_owners_and_clients(
+    def test_valid_manifest_normalizes_host_wide_repository_routes(
         self,
     ) -> None:
         document = self.manifest()
@@ -147,7 +126,6 @@ class CleanAdoptionTests(unittest.TestCase):
             repository["runtime_file"],
             str(Path(repository["canonical_root"]) / ".codex/dev-runtime.json"),
         )
-        self.assertEqual(repository["owner_uid"], max(self.uid, 1))
         self.assertEqual(
             validated["ports"],
             {
@@ -159,10 +137,8 @@ class CleanAdoptionTests(unittest.TestCase):
             },
         )
         self.assertEqual(repository["fixed_ports"], [{"name": "web", "port": 3150}])
-        self.assertEqual(
-            [client["account_id"] for client in repository["clients"]],
-            ["owner@example.test", "agent@example.test"],
-        )
+        self.assertNotIn("clients", repository)
+        self.assertNotIn("owner_uid", repository)
 
     def test_manifest_requires_exact_console_file_list_and_destination_set(self) -> None:
         mutations = (
@@ -192,15 +168,11 @@ class CleanAdoptionTests(unittest.TestCase):
                 document, expected_uid=self.uid, current_uid=self.uid
             )
 
-    def test_manifest_rejects_duplicate_repository_and_client_uid(self) -> None:
+    def test_manifest_rejects_duplicate_repository(self) -> None:
         def duplicate_repository(document: dict[str, object]) -> None:
             document["repositories"].append(copy.deepcopy(document["repositories"][0]))
 
-        def duplicate_client(document: dict[str, object]) -> None:
-            repository = document["repositories"][0]
-            repository["clients"].append(copy.deepcopy(repository["clients"][0]))
-
-        for mutation in (duplicate_repository, duplicate_client):
+        for mutation in (duplicate_repository,):
             with self.subTest(mutation=mutation.__name__):
                 document = self.manifest()
                 mutation(document)
@@ -226,7 +198,7 @@ class CleanAdoptionTests(unittest.TestCase):
                 self.assertEqual(evidence["owner_uid"], self.uid)
                 self.assertEqual(evidence["owner_gid"], self.gid)
 
-    def test_fixed_ports_require_sorted_unique_authorized_assignments(self) -> None:
+    def test_fixed_ports_require_sorted_unique_assignments(self) -> None:
         mutations = (
             lambda repo: repo["fixed_ports"].append({"name": "api", "port": 3151}),
             lambda repo: repo["fixed_ports"].append({"name": "web2", "port": 3150}),
@@ -240,218 +212,6 @@ class CleanAdoptionTests(unittest.TestCase):
                     subject.validate_manifest(
                         document, expected_uid=self.uid, current_uid=self.uid
                     )
-
-    def test_enrollment_commands_are_exact_shell_free_and_deterministic(self) -> None:
-        validated = self.validated()
-        executable = "/opt/devcoordinator/releases/" + "b" * 64 + "/enroll.py"
-        first = subject.enrollment_commands(validated, executable=executable)
-        second = subject.enrollment_commands(validated, executable=executable)
-        self.assertEqual(first, second)
-        self.assertEqual(len(first), 2)
-        for command in first:
-            self.assertIsInstance(command, list)
-            self.assertTrue(command)
-            self.assertTrue(all(isinstance(argument, str) for argument in command))
-            self.assertEqual(command[:4], ["/usr/bin/python3", "-I", "-B", executable])
-            self.assertNotIn("sh", command[:5])
-            self.assertNotIn("bash", command[:5])
-
-        repository = validated["repositories"][0]
-        destinations = validated["destinations"]
-        owner_client, agent_client = repository["clients"]
-
-        def prefix(client: dict[str, object]) -> list[str]:
-            return [
-                "/usr/bin/python3",
-                "-I",
-                "-B",
-                executable,
-                "broker",
-                "enroll",
-                "--database",
-                destinations["authority_database"],
-                "--socket",
-                "/run/devcoordinator-authority.sock",
-                "--access-gid",
-                "0",
-                "--socket-mode",
-                "0666",
-                "--client-uid",
-                str(client["uid"]),
-                "--repository-owner-uid",
-                str(repository["owner_uid"]),
-                "--account-id",
-                client["account_id"],
-                "--project",
-                repository["canonical_root"],
-                "--agent",
-                client["agent"],
-                "--runtime-file",
-                repository["runtime_file"],
-                "--port-range",
-                repository["port_range"],
-                "--profile-output",
-                destinations["profile"],
-                "--profile-valid-days",
-                str(client["profile_valid_days"]),
-            ]
-
-        shared_grants = [
-            "--approve-compose-host-access",
-            "--grant-cleanup",
-            "--grant-ephemeral-image-prefetch",
-            "--compose-run-once-service",
-            "seed",
-        ]
-        expected_owner = prefix(owner_client) + ["--all-servers", *shared_grants]
-        expected_agent = prefix(agent_client) + ["--server", "web", *shared_grants]
-        self.assertEqual(first, [expected_owner, expected_agent])
-
-    def test_api_enrollment_only_approves_compose_when_repository_declares_it(self) -> None:
-        document = self.manifest()
-        executable = "/opt/devcoordinator/releases/" + "b" * 64 + "/enroll.py"
-        api_uid = max(self.uid, 1) + 100
-
-        approved = subject.api_enrollment_commands(
-            subject.validate_manifest(
-                document, expected_uid=self.uid, current_uid=self.uid
-            ),
-            api_uid=api_uid,
-            executable=executable,
-        )
-        self.assertIn("--approve-compose-host-access", approved[0])
-
-        document["repositories"][0]["approve_compose_host_access"] = False
-        unapproved = subject.api_enrollment_commands(
-            subject.validate_manifest(
-                document, expected_uid=self.uid, current_uid=self.uid
-            ),
-            api_uid=api_uid,
-            executable=executable,
-        )
-        self.assertNotIn("--approve-compose-host-access", unapproved[0])
-        self.assertIn("--grant-cleanup", unapproved[0])
-        self.assertIn("--grant-ephemeral-image-prefetch", unapproved[0])
-
-    def test_enrollment_batch_collects_all_failures_and_keeps_replay_clean(self) -> None:
-        transaction_root = self.root / "enrollment-transaction"
-        transaction_root.mkdir(mode=0o700)
-        commands = [
-            [
-                "/usr/bin/enroll",
-                "--project",
-                f"/repo-{index}",
-                "--client-uid",
-                str(1000 + index),
-                "--account-id",
-                f"agent-{index}@example.test",
-                "--agent",
-                f"agent-{index}",
-            ]
-            for index in range(3)
-        ]
-
-        class FailingRunner:
-            def __init__(self) -> None:
-                self.calls: list[list[str]] = []
-
-            def run_json(self, argv):
-                self.calls.append(list(argv))
-                index = len(self.calls) - 1
-                if index == 0:
-                    raise subject.activation.ActivationError("first failure")
-                if index == 2:
-                    raise subprocess.TimeoutExpired(list(argv), 120)
-                return {"ok": True, "repo_id": "repo-one"}
-
-        runner = FailingRunner()
-        operation_id = "8060e625-ae47-432e-be09-5b01f449cdd8"
-        with self.assertRaisesRegex(
-            subject.CleanAdoptionError,
-            "repository enrollment failed for 2 of 3 commands",
-        ):
-            subject._run_enrollment_batch(
-                runner,
-                commands,
-                phase="repositories_enrolled",
-                operation_id=operation_id,
-                manifest_sha256="a" * 64,
-                transaction_root=transaction_root,
-                expected_uid=self.uid,
-            )
-        self.assertEqual(runner.calls, commands)
-
-        artifact_path = transaction_root / "repository-enrollment-failures.json"
-        artifact_bytes = artifact_path.read_bytes()
-        artifact = subject.cutover.verify_seal(
-            json.loads(artifact_bytes),
-            kind=subject.ENROLLMENT_FAILURE_KIND,
-            fields={
-                "operation_id",
-                "manifest_sha256",
-                "phase",
-                "command_count",
-                "success_count",
-                "failure_count",
-                "failures",
-                "recorded_at",
-            },
-        )
-        self.assertEqual(stat.S_IMODE(artifact_path.stat().st_mode), 0o600)
-        self.assertEqual(artifact["operation_id"], operation_id)
-        self.assertEqual(artifact["command_count"], 3)
-        self.assertEqual(artifact["success_count"], 1)
-        self.assertEqual(artifact["failure_count"], 2)
-        self.assertEqual(
-            [failure["command_index"] for failure in artifact["failures"]],
-            [0, 2],
-        )
-        self.assertEqual(
-            [failure["classification"] for failure in artifact["failures"]],
-            ["command_failure", "timeout"],
-        )
-        self.assertEqual(
-            [failure["project"] for failure in artifact["failures"]],
-            ["/repo-0", "/repo-2"],
-        )
-
-        class SuccessfulRunner:
-            def __init__(self) -> None:
-                self.calls: list[list[str]] = []
-
-            def run_json(self, argv):
-                self.calls.append(list(argv))
-                return {"ok": True, "repo_id": f"repo-{len(self.calls) - 1}"}
-
-        replay = SuccessfulRunner()
-        results = subject._run_enrollment_batch(
-            replay,
-            commands,
-            phase="repositories_enrolled",
-            operation_id=operation_id,
-            manifest_sha256="a" * 64,
-            transaction_root=transaction_root,
-            expected_uid=self.uid,
-        )
-        self.assertEqual(len(results), 3)
-        self.assertEqual(replay.calls, commands)
-        self.assertEqual(artifact_path.read_bytes(), artifact_bytes)
-
-    def test_apply_batches_both_repository_and_api_enrollment_failures(self) -> None:
-        source = Path(subject.__file__).read_text(encoding="utf-8")
-        start = source.index("def apply_adoption(")
-        end = source.index("\ndef _group_enrollment_results(", start)
-        apply_source = source[start:end]
-        repositories = apply_source.index('if not done("repositories_enrolled"):')
-        api = apply_source.index('if not done("api_enrolled"):', repositories)
-        graph = apply_source.index('if not done("graph_installed"):', api)
-        self.assertIn(
-            'phase="repositories_enrolled"', apply_source[repositories:api]
-        )
-        self.assertIn('phase="api_enrolled"', apply_source[api:graph])
-        self.assertNotIn(
-            "[command.run_json(argv)", apply_source[repositories:graph]
-        )
 
     def test_static_console_instance_is_stopped_without_enabled_state_gate(self) -> None:
         class Runner:
@@ -747,7 +507,7 @@ class CleanAdoptionTests(unittest.TestCase):
                 )
 
         authority_connection = mock.Mock()
-        authority_connection.execute.return_value.fetchone.return_value = (13, "ready")
+        authority_connection.execute.return_value.fetchone.return_value = (15, "ready")
         authority_store = mock.Mock(connection=authority_connection)
         runner = Runner()
         test_plane_result = {
@@ -760,7 +520,6 @@ class CleanAdoptionTests(unittest.TestCase):
             "setup_retained": True,
         }
         with (
-            mock.patch.object(subject.pwd, "getpwuid", return_value=SimpleNamespace(pw_gid=self.gid)),
             mock.patch.object(subject.AccountStore, "open", return_value=authority_store),
             mock.patch.object(
                 subject,
@@ -783,12 +542,14 @@ class CleanAdoptionTests(unittest.TestCase):
                 expected_repository_ids={repository["canonical_root"]: repo_id},
                 observer_uid=self.uid,
                 testd_uid=self.uid,
+                canary_uid=max(self.uid, 1),
+                canary_gid=max(self.gid, 1),
                 runner=runner,
             )
         self.assertEqual(result["inventory_canaries"][0]["repo_id"], repo_id)
         self.assertEqual(
-            {item["client_uid"] for item in result["inventory_canaries"]},
-            {client["uid"] for client in repository["clients"]},
+            {item["caller_uid"] for item in result["inventory_canaries"]},
+            {max(self.uid, 1)},
         )
         self.assertEqual(result["test_catalog"]["repository_count"], 1)
         self.assertEqual(result["test_catalog"]["status"], "pending-maintenance-clear")
@@ -796,7 +557,7 @@ class CleanAdoptionTests(unittest.TestCase):
         test_plane_canary.assert_called_once_with(
             {repository["canonical_root"]: repo_id},
             setup_repository_id=repo_id,
-            setup_owner_uid=repository["owner_uid"],
+            setup_execution_uid=max(self.uid, 1),
         )
         canary = runner.commands[0]
         self.assertIn(
@@ -805,7 +566,7 @@ class CleanAdoptionTests(unittest.TestCase):
             canary,
         )
         self.assertEqual(canary[-5:], ["inventory", "--project", repository["canonical_root"], "--no-docker", "--compact-json"])
-        self.assertEqual(len(runner.commands), len(repository["clients"]))
+        self.assertEqual(len(runner.commands), 1)
 
     def test_test_plane_application_canary_proves_setup_write_and_retention(self) -> None:
         repository_ids = {
@@ -863,7 +624,7 @@ class CleanAdoptionTests(unittest.TestCase):
             result = subject._test_plane_application_canary(
                 repository_ids,
                 setup_repository_id="repo-one",
-                setup_owner_uid=max(self.uid, 1),
+                setup_execution_uid=max(self.uid, 1),
                 socket_path=socket_path,
             )
         client.assert_called_once_with(
@@ -911,7 +672,7 @@ class CleanAdoptionTests(unittest.TestCase):
             subject._test_plane_application_canary(
                 {"/home/example": "repo-one"},
                 setup_repository_id="repo-one",
-                setup_owner_uid=max(self.uid, 1),
+                setup_execution_uid=max(self.uid, 1),
                 socket_path=self.root / "testd.sock",
             )
 
@@ -1476,7 +1237,7 @@ class CleanAdoptionTests(unittest.TestCase):
     def test_apply_uses_root_maintenance_identity_without_shared_group(self) -> None:
         source = Path(subject.__file__).read_text(encoding="utf-8")
         start = source.index("def apply_adoption(")
-        end = source.index("\ndef _group_enrollment_results(", start)
+        end = source.index("\ndef _parser(", start)
         apply_source = source[start:end]
         self.assertIn("maintenance_gid = 0", apply_source)
         self.assertIn("expected_gid=maintenance_gid", apply_source)
@@ -1536,7 +1297,7 @@ class CleanAdoptionTests(unittest.TestCase):
             self.assertTrue(parent.is_dir())
             self.assertEqual(stat.S_IMODE(parent.stat().st_mode), 0o700)
 
-    def test_authority_readiness_requires_authenticated_application_response(self) -> None:
+    def test_authority_readiness_requires_trusted_local_application_response(self) -> None:
         manifest = self.validated()
         repository = manifest["repositories"][0]
         repository_id = "repo-application-ready"
@@ -1573,30 +1334,28 @@ class CleanAdoptionTests(unittest.TestCase):
 
         runner = Runner()
         sleeps: list[float] = []
-        with mock.patch.object(
-            subject.pwd,
-            "getpwuid",
-            return_value=SimpleNamespace(pw_gid=self.gid),
-        ):
-            result = subject._wait_for_authority_application(
-                manifest,
-                maintenance_deployment_id=(
-                    "8060e625-ae47-432e-be09-5b01f449cdd8"
-                ),
-                expected_repository_ids={
-                    repository["canonical_root"]: repository_id
-                },
-                runner=runner,
-                max_attempts=4,
-                poll_interval_seconds=0.125,
-                sleeper=sleeps.append,
-            )
+        result = subject._wait_for_authority_application(
+            manifest,
+            maintenance_deployment_id=(
+                "8060e625-ae47-432e-be09-5b01f449cdd8"
+            ),
+            expected_repository_ids={
+                repository["canonical_root"]: repository_id
+            },
+            runner=runner,
+            max_attempts=4,
+            poll_interval_seconds=0.125,
+            sleeper=sleeps.append,
+        )
         self.assertEqual(result["attempts"], 3)
         self.assertEqual(result["repo_id"], repository_id)
         self.assertEqual(runner.text_calls, 3)
         self.assertEqual(runner.status_calls, 4)
         self.assertEqual(sleeps, [0.125, 0.125])
-        self.assertEqual(runner.command[:4], ["/usr/bin/timeout", "--signal=KILL", "5", "/usr/bin/setpriv"])
+        self.assertEqual(
+            runner.command[:4],
+            ["/usr/bin/timeout", "--signal=KILL", "5", "/usr/bin/env"],
+        )
         self.assertIn(
             "DEVCOORDINATOR_MAINTENANCE_DEPLOYMENT_ID="
             "8060e625-ae47-432e-be09-5b01f449cdd8",
@@ -1632,16 +1391,9 @@ class CleanAdoptionTests(unittest.TestCase):
 
         runner = Runner()
         sleeps: list[float] = []
-        with (
-            mock.patch.object(
-                subject.pwd,
-                "getpwuid",
-                return_value=SimpleNamespace(pw_gid=self.gid),
-            ),
-            self.assertRaisesRegex(
-                subject.CleanAdoptionError,
-                "authenticated application readiness",
-            ),
+        with self.assertRaisesRegex(
+            subject.CleanAdoptionError,
+            "trusted-local application readiness",
         ):
             subject._wait_for_authority_application(
                 manifest,

@@ -28,9 +28,9 @@ BROKER_HOME_DROPIN = (
     "/etc/systemd/system/devcoordinator-broker.service.d/"
     "80-enrolled-home-write-paths.conf"
 )
-BASE_READ_WRITE_PATHS = "/var/lib/devcoordinator -/run/devcoordinator"
+BASE_READ_WRITE_PATHS = "/home /var/lib/devcoordinator -/run/devcoordinator"
 HOME_DROPIN_COMMENT = (
-    "# Generated transactionally from the complete explicit --client-user set."
+    "# Trusted-local global home access; user arguments install skill links only."
 )
 SYSTEMD_STOP_TIMEOUT_SECONDS = 65 * 60
 SYSTEMD_STOP_TIMEOUT_SOURCE = "65min"
@@ -192,33 +192,16 @@ def source_directives(source: str, key: str) -> list[tuple[str, str]]:
 
 def validate_home_dropin_source(source: str) -> tuple[str, ...]:
     lines = source.splitlines()
-    if len(lines) != 4 or lines[:3] != [
+    if lines != [
         "[Service]",
         HOME_DROPIN_COMMENT,
         "ReadWritePaths=",
+        f"ReadWritePaths={BASE_READ_WRITE_PATHS}",
     ]:
         raise BrokerShutdownUnitError(
-            "enrolled-home drop-in must contain only its generated Service reset"
+            "trusted-local home drop-in must contain only its global Service reset"
         )
-    prefix = f"ReadWritePaths={BASE_READ_WRITE_PATHS} "
-    if not lines[3].startswith(prefix):
-        raise BrokerShutdownUnitError(
-            "enrolled-home drop-in must retain the authority/run writable paths"
-        )
-    homes = tuple(lines[3][len(prefix) :].split())
-    if not homes or tuple(sorted(set(homes))) != homes:
-        raise BrokerShutdownUnitError(
-            "enrolled-home writable paths must be nonempty, unique, and sorted"
-        )
-    for raw in homes:
-        path = Path(raw)
-        if path.parent != Path("/home") or not re.fullmatch(
-            r"[A-Za-z0-9._+-]+", path.name
-        ):
-            raise BrokerShutdownUnitError(
-                f"enrolled-home writable path is not one safe direct /home child: {raw}"
-            )
-    return homes
+    return ()
 
 
 def read_home_dropin(path: Path) -> str:
@@ -318,7 +301,7 @@ def validate_source_unit(source: str) -> None:
         "NoNewPrivileges": "NoNewPrivileges=true",
         "PrivateTmp": "PrivateTmp=true",
         "ProtectSystem": "ProtectSystem=strict",
-        "ProtectHome": "ProtectHome=read-only",
+        "ProtectHome": "ProtectHome=false",
         "ReadWritePaths": f"ReadWritePaths={BASE_READ_WRITE_PATHS}",
     }
     for key, directive in service_security.items():
@@ -357,10 +340,7 @@ def validate_effective_unit(
                 "[Service]",
                 HOME_DROPIN_COMMENT,
                 "ReadWritePaths=",
-                (
-                    f"ReadWritePaths={BASE_READ_WRITE_PATHS} "
-                    + " ".join(expected_home_paths)
-                ),
+                f"ReadWritePaths={BASE_READ_WRITE_PATHS}",
             ]
         )
         + "\n"
@@ -387,10 +367,8 @@ def validate_effective_unit(
         "NoNewPrivileges": "yes",
         "PrivateTmp": "yes",
         "ProtectSystem": "strict",
-        "ProtectHome": "read-only",
-        "ReadWritePaths": (
-            BASE_READ_WRITE_PATHS + " " + " ".join(expected_home_paths)
-        ),
+        "ProtectHome": "no",
+        "ReadWritePaths": BASE_READ_WRITE_PATHS,
         "ReadOnlyPaths": "",
         "BindPaths": "",
         "AmbientCapabilities": "",

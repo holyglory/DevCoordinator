@@ -1054,6 +1054,12 @@ def _observe_process_identity(pid: int, expected_start: str) -> str:
     return "unknown"
 
 
+def observe_worker_process_identity(pid: int, expected_start: str) -> str:
+    """Classify whether one immutable worker process identity still exists."""
+
+    return _observe_process_identity(pid, expected_start)
+
+
 def _deterministic_environment(
     stored: Mapping[str, str], *, execution_uid: int
 ) -> dict[str, str]:
@@ -1102,7 +1108,7 @@ def _artifact_with_link(artifact: Mapping[str, str]) -> dict[str, str]:
 
 
 class BrokerWorkerAuthority:
-    """Use only the protected per-UID broker enrollment for worker state.
+    """Use the host routing profile for worker state.
 
     The runner sends opaque identities and fencing evidence.  Commands, paths,
     environment, ownership, and restart decisions are returned by the broker;
@@ -1120,10 +1126,6 @@ class BrokerWorkerAuthority:
         if type(uid) is not int or uid < 0:
             raise WorkerAuthorityBlocked("worker execution UID is invalid")
         self.worker_id = _canonical_uuid("worker_id", worker_id)
-        if type(profile.client_uid) is not int or profile.client_uid != uid:
-            raise WorkerAuthorityBlocked(
-                "broker profile belongs to another operating-system account"
-            )
         try:
             repository = profile.repository_for_server_id(self.worker_id)
         except BrokerProfileError as error:
@@ -1140,7 +1142,7 @@ class BrokerWorkerAuthority:
         effective_uid: int | None = None,
         profile_path: Path | None = None,
     ) -> "BrokerWorkerAuthority":
-        """Load the required root-provisioned enrollment for one fixed worker."""
+        """Load the required root-provisioned configuration for one fixed worker."""
 
         uid = os.geteuid() if effective_uid is None else int(effective_uid)
         try:
@@ -2231,6 +2233,7 @@ __all__ = [
     "WorkerRunner",
     "WorkerRunnerError",
     "add_worker_cli_parser",
+    "observe_worker_process_identity",
     "validate_launch_candidate",
     "worker_runner_cli_result",
 ]

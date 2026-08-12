@@ -73,7 +73,7 @@ class RuntimeCliTests(unittest.TestCase):
         inventory_words = " ".join(inventory_help.split())
         top_level_words = " ".join(top_level_help.split())
         for expected in (
-            "status/start/stop/restart/remove",
+            "status/start/stop/restart/replace/remove",
             "inventory --project ROOT_REPO --compact-json",
             "Only run may set KillAfterRun=true",
             "first start supplies Keep Alive explicitly",
@@ -206,11 +206,36 @@ class RuntimeCliTests(unittest.TestCase):
             runtime_cli.RUNTIME_SIMPLE_ACTIONS & runtime_api_module.RUNTIME_ACTIONS
         ):
             with self.subTest(action=action):
-                extra = ["--reason", "obsolete worker"] if action == "remove" else []
+                if action == "remove":
+                    extra = ["--reason", "obsolete worker"]
+                elif action == "replace":
+                    extra = [
+                        "--argv",
+                        "/usr/bin/python3",
+                        "--argv",
+                        "worker.py",
+                        "--cwd",
+                        "/repo with spaces/$literal;not-shell",
+                        "--env",
+                        "MODE=dev",
+                        "--expected-definition-generation",
+                        "4",
+                    ]
+                else:
+                    extra = []
                 request = runtime_cli.load_runtime_cli_request(
                     self.parse(*self.existing_service_flags(action), *extra)
                 )
                 self.assertEqual(request["action"], action)
+                if action == "replace":
+                    self.assertEqual(
+                        request["options"]["argv"],
+                        ["/usr/bin/python3", "worker.py"],
+                    )
+                    self.assertEqual(request["options"]["env"], {"MODE": "dev"})
+                    self.assertEqual(
+                        request["options"]["expected_definition_generation"], 4
+                    )
 
         for kind in ("docker", "database_stack"):
             with self.subTest(kind=kind):
@@ -218,6 +243,8 @@ class RuntimeCliTests(unittest.TestCase):
                 name_index = arguments.index("--target-name")
                 del arguments[name_index : name_index + 2]
                 arguments[arguments.index("service")] = kind
+                if arguments[0] == "replace":
+                    arguments.extend(["--argv", "/usr/bin/python3"])
                 with mock.patch.object(
                     runtime_cli,
                     "validate_runtime_request",

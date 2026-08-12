@@ -130,12 +130,7 @@ MENU_SPEC = ArtifactSpec(
     ),
 )
 
-CANONICAL_SPECS = {
-    "dev-servers.png": DEV_SERVERS_SPEC,
-    "docker-board.png": BOARD_SPEC,
-    "databases.png": BOARD_SPEC,
-    "menu-action-error.png": MENU_SPEC,
-}
+CANONICAL_SPECS: dict[str, RegionSpec] = {}
 
 BOARD_SOURCE_FILES = (
     "Package.swift",
@@ -160,12 +155,7 @@ MENU_SOURCE_FILES = (
     "Tools/MenuBarSnapshotMain.swift",
     "Tools/SnapshotProvenance.swift",
 )
-CANONICAL_SOURCE_FILES = {
-    "dev-servers.png": BOARD_SOURCE_FILES,
-    "docker-board.png": BOARD_SOURCE_FILES,
-    "databases.png": BOARD_SOURCE_FILES,
-    "menu-action-error.png": MENU_SOURCE_FILES,
-}
+CANONICAL_SOURCE_FILES: dict[str, tuple[str, ...]] = {}
 
 
 def _paeth(left: int, up: int, upper_left: int) -> int:

@@ -9,15 +9,8 @@ import re
 import sqlite3
 from typing import Iterable, Mapping
 
-from .repository_execution_scope import (
-    RepositoryExecutionScopeError,
-    repository_execution_scope,
-    validate_repository_execution_scope,
-)
-
-
-SCHEMA_VERSION = 13
-PRE_OWNER_AUTHORITY_SCHEMA_VERSION = 12
+SCHEMA_VERSION = 15
+LEGACY_SCHEMA_VERSIONS = frozenset({12, 13, 14})
 MINIMUM_MIGRATABLE_SCHEMA_VERSION = 1
 
 
@@ -77,54 +70,6 @@ CREATE TABLE IF NOT EXISTS repositories (
     updated_at TEXT NOT NULL,
     UNIQUE(host_id, canonical_root)
 );
-
--- Repository execution ownership is explicit authority.  It intentionally
--- lives outside ``repositories`` so legacy repository records cannot acquire
--- an execution UID from a column default, caller identity, or a filesystem
--- guess.  A ready authority store must contain exactly one row for every
--- repository; consumers fail closed when it is absent or generation-stale.
-CREATE TABLE IF NOT EXISTS repository_owners (
-    repo_id TEXT PRIMARY KEY REFERENCES repositories(repo_id) ON DELETE CASCADE,
-    owner_uid INTEGER NOT NULL CHECK(owner_uid > 0),
-    repository_generation INTEGER NOT NULL CHECK(repository_generation >= 0),
-    authority_generation INTEGER NOT NULL CHECK(authority_generation >= 1),
-    evidence_sha256 TEXT NOT NULL,
-    operation_id TEXT NOT NULL,
-    established_by TEXT NOT NULL,
-    established_at TEXT NOT NULL
-);
-
--- Every initial owner assignment and later transfer is retained.  Transfer
--- rows are immutable: correction is a new generation-fenced transfer, never
--- an UPDATE or DELETE that could rewrite execution authority history.
-CREATE TABLE IF NOT EXISTS repository_owner_transfers (
-    transfer_id TEXT PRIMARY KEY,
-    repo_id TEXT NOT NULL REFERENCES repositories(repo_id) ON DELETE RESTRICT,
-    prior_owner_uid INTEGER CHECK(prior_owner_uid IS NULL OR prior_owner_uid > 0),
-    owner_uid INTEGER NOT NULL CHECK(owner_uid > 0),
-    repository_generation INTEGER NOT NULL CHECK(repository_generation >= 0),
-    authority_generation INTEGER NOT NULL CHECK(authority_generation >= 1),
-    evidence_sha256 TEXT NOT NULL,
-    evidence_json TEXT NOT NULL,
-    operation_id TEXT NOT NULL,
-    actor TEXT NOT NULL,
-    reason TEXT NOT NULL,
-    transferred_at TEXT NOT NULL,
-    UNIQUE(repo_id, authority_generation),
-    UNIQUE(operation_id, repo_id)
-);
-
-CREATE TRIGGER IF NOT EXISTS repository_owner_transfers_no_update
-BEFORE UPDATE ON repository_owner_transfers
-BEGIN
-    SELECT RAISE(ABORT, 'repository owner transfer history is immutable');
-END;
-
-CREATE TRIGGER IF NOT EXISTS repository_owner_transfers_no_delete
-BEFORE DELETE ON repository_owner_transfers
-BEGIN
-    SELECT RAISE(ABORT, 'repository owner transfer history is immutable');
-END;
 
 CREATE TABLE IF NOT EXISTS repository_aliases (
     alias_id TEXT PRIMARY KEY,
@@ -295,27 +240,6 @@ CREATE TABLE IF NOT EXISTS source_resources (
     created_at TEXT NOT NULL,
     UNIQUE(source_id, resource_kind, native_id)
 );
-
-CREATE TABLE IF NOT EXISTS control_bindings (
-    binding_id TEXT PRIMARY KEY,
-    repo_id TEXT REFERENCES repositories(repo_id) ON DELETE RESTRICT,
-    source_resource_id TEXT REFERENCES source_resources(source_resource_id) ON DELETE RESTRICT,
-    resource_kind TEXT NOT NULL,
-    resource_id TEXT NOT NULL,
-    source_id TEXT NOT NULL REFERENCES coordinator_sources(source_id) ON DELETE RESTRICT,
-    capability TEXT NOT NULL,
-    provenance TEXT NOT NULL,
-    authority_state TEXT NOT NULL
-        CHECK (authority_state IN ('candidate', 'authoritative', 'conflicting', 'retired')),
-    priority INTEGER NOT NULL DEFAULT 0,
-    generation INTEGER NOT NULL DEFAULT 0 CHECK (generation >= 0),
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
-);
-
-CREATE UNIQUE INDEX IF NOT EXISTS one_authoritative_control_binding
-ON control_bindings(resource_kind, resource_id)
-WHERE authority_state = 'authoritative';
 
 CREATE TABLE IF NOT EXISTS server_definitions (
     server_definition_id TEXT PRIMARY KEY,
@@ -609,6 +533,7 @@ CREATE TABLE IF NOT EXISTS leases (
     server_definition_id TEXT REFERENCES server_definitions(server_definition_id) ON DELETE SET NULL,
     source_id TEXT REFERENCES coordinator_sources(source_id) ON DELETE SET NULL,
     port INTEGER NOT NULL CHECK (port BETWEEN 1 AND 65535),
+    protocol TEXT NOT NULL DEFAULT 'tcp' CHECK(protocol IN ('tcp', 'udp')),
     owner TEXT,
     agent TEXT,
     purpose TEXT,
@@ -633,9 +558,6 @@ CREATE TABLE IF NOT EXISTS broker_lease_links (
     local_lease_id TEXT UNIQUE,
     account_id TEXT NOT NULL,
     broker_socket TEXT NOT NULL,
-    broker_service_uid INTEGER NOT NULL CHECK (broker_service_uid >= 0),
-    broker_socket_gid INTEGER NOT NULL CHECK (broker_socket_gid >= 0),
-    broker_socket_mode INTEGER NOT NULL CHECK (broker_socket_mode = 432),
     broker_database_generation TEXT NOT NULL,
     port INTEGER NOT NULL CHECK (port BETWEEN 1 AND 65535),
     protocol TEXT NOT NULL CHECK (protocol IN ('tcp', 'udp')),
@@ -664,9 +586,6 @@ CREATE TABLE IF NOT EXISTS broker_assignment_links (
     local_assignment_id TEXT UNIQUE,
     account_id TEXT NOT NULL,
     broker_socket TEXT NOT NULL,
-    broker_service_uid INTEGER NOT NULL CHECK (broker_service_uid >= 0),
-    broker_socket_gid INTEGER NOT NULL CHECK (broker_socket_gid >= 0),
-    broker_socket_mode INTEGER NOT NULL CHECK (broker_socket_mode = 432),
     broker_database_generation TEXT NOT NULL,
     port INTEGER NOT NULL CHECK (port BETWEEN 1 AND 65535),
     status TEXT NOT NULL CHECK (status IN (
@@ -715,9 +634,6 @@ CREATE TABLE IF NOT EXISTS broker_lifecycle_links (
     broker_plan_id TEXT,
     account_id TEXT NOT NULL,
     broker_socket TEXT NOT NULL,
-    broker_service_uid INTEGER NOT NULL CHECK (broker_service_uid >= 0),
-    broker_socket_gid INTEGER NOT NULL CHECK (broker_socket_gid >= 0),
-    broker_socket_mode INTEGER NOT NULL CHECK (broker_socket_mode = 432),
     broker_database_generation TEXT NOT NULL,
     arguments_json TEXT NOT NULL,
     result_json TEXT NOT NULL,
@@ -833,8 +749,6 @@ CREATE TABLE IF NOT EXISTS startup_policy_restore_states (
         CHECK (policy_kind IN ('docker_restart', 'compose', 'supervisor', 'coordinator')),
     policy_immutable_fingerprint TEXT NOT NULL,
     target_immutable_fingerprint TEXT NOT NULL,
-    control_binding_id TEXT NOT NULL REFERENCES control_bindings(binding_id) ON DELETE RESTRICT,
-    ownership_fingerprint TEXT NOT NULL,
     native_identity_fingerprint TEXT NOT NULL,
     captured_value TEXT NOT NULL,
     restore_required INTEGER NOT NULL CHECK (restore_required IN (0, 1)),
@@ -868,18 +782,6 @@ CREATE TABLE IF NOT EXISTS startup_policy_restore_states (
         (restore_required = 1 AND status IN ('captured', 'restored'))
         OR (restore_required = 0 AND status = 'not_required')
     )
-);
-
-CREATE TABLE IF NOT EXISTS repository_memberships (
-    membership_id TEXT PRIMARY KEY,
-    repo_id TEXT NOT NULL REFERENCES repositories(repo_id) ON DELETE RESTRICT,
-    resource_kind TEXT NOT NULL CHECK (resource_kind IN ('server', 'container', 'supervisor')),
-    host_resource_id TEXT NOT NULL,
-    immutable_fingerprint TEXT NOT NULL,
-    control_binding_id TEXT REFERENCES control_bindings(binding_id) ON DELETE RESTRICT,
-    created_at TEXT NOT NULL,
-    UNIQUE(repo_id, resource_kind, host_resource_id),
-    UNIQUE(resource_kind, host_resource_id)
 );
 
 CREATE TABLE IF NOT EXISTS resource_retirements (
@@ -919,7 +821,7 @@ ON resource_lifecycle_history(resource_kind, resource_id, occurred_at);
 CREATE TABLE IF NOT EXISTS cleanup_plans (
     plan_id TEXT PRIMARY KEY REFERENCES operations(operation_id) ON DELETE CASCADE,
     repo_id TEXT REFERENCES repositories(repo_id) ON DELETE RESTRICT,
-    target_kind TEXT NOT NULL CHECK(target_kind IN ('project', 'server', 'container', 'worktree')),
+    target_kind TEXT NOT NULL CHECK(target_kind IN ('project', 'server', 'container', 'volume', 'worktree')),
     target_id TEXT NOT NULL,
     action TEXT NOT NULL CHECK(action IN ('purge', 'forget')),
     target_fingerprint TEXT NOT NULL,
@@ -947,7 +849,7 @@ CREATE TABLE IF NOT EXISTS cleanup_phase_evidence (
 );
 
 CREATE TABLE IF NOT EXISTS cleanup_tombstones (
-    target_kind TEXT NOT NULL CHECK(target_kind IN ('project', 'server', 'container', 'worktree')),
+    target_kind TEXT NOT NULL CHECK(target_kind IN ('project', 'server', 'container', 'volume', 'worktree')),
     target_id TEXT NOT NULL,
     target_generation INTEGER NOT NULL DEFAULT 0 CHECK(target_generation >= 0),
     repo_id TEXT REFERENCES repositories(repo_id) ON DELETE RESTRICT,
@@ -992,6 +894,7 @@ CREATE TABLE IF NOT EXISTS docker_engines (
 CREATE TABLE IF NOT EXISTS docker_resources (
     docker_resource_id TEXT PRIMARY KEY,
     engine_id TEXT NOT NULL REFERENCES docker_engines(engine_id) ON DELETE RESTRICT,
+    repo_id TEXT REFERENCES repositories(repo_id) ON DELETE SET NULL,
     full_container_id TEXT NOT NULL,
     current_name TEXT NOT NULL,
     image TEXT,
@@ -1028,7 +931,7 @@ CREATE TABLE IF NOT EXISTS docker_labels (
     PRIMARY KEY(docker_resource_id, name)
 );
 
-CREATE TABLE IF NOT EXISTS docker_ownership_claims (
+CREATE TABLE IF NOT EXISTS docker_repository_hints (
     claim_id TEXT PRIMARY KEY,
     docker_resource_id TEXT REFERENCES docker_resources(docker_resource_id) ON DELETE RESTRICT,
     source_resource_id TEXT REFERENCES source_resources(source_resource_id) ON DELETE RESTRICT,
@@ -1482,7 +1385,6 @@ END;
 CREATE INDEX IF NOT EXISTS repositories_by_state ON repositories(state, display_name);
 CREATE INDEX IF NOT EXISTS sources_by_status ON coordinator_sources(status, canonical_home);
 CREATE INDEX IF NOT EXISTS source_resources_by_repo ON source_resources(repo_id, resource_kind);
-CREATE INDEX IF NOT EXISTS memberships_by_repo ON repository_memberships(repo_id, resource_kind);
 CREATE INDEX IF NOT EXISTS operations_by_repo ON operations(repo_id, created_at);
 CREATE INDEX IF NOT EXISTS telemetry_by_resource_time
     ON telemetry_samples(host_resource_kind, host_resource_id, sampled_at);
@@ -1491,53 +1393,6 @@ CREATE INDEX IF NOT EXISTS database_observations_by_container
 CREATE INDEX IF NOT EXISTS database_backups_by_target
     ON database_backups(source_container_id, source_database_name, created_at);
 CREATE INDEX IF NOT EXISTS unassigned_by_status ON unassigned_resources(status, reason_code);
-"""
-
-
-# The offline v12 -> v13 authority migration executes only this additive DDL
-# after validating an operator-sealed, exact owner map.  Keep it independent
-# from ``initialize_schema``: service startup must never invent repository
-# execution ownership or partially advance this authority boundary.
-REPOSITORY_OWNER_AUTHORITY_DDL = r"""
-CREATE TABLE repository_owners (
-    repo_id TEXT PRIMARY KEY REFERENCES repositories(repo_id) ON DELETE CASCADE,
-    owner_uid INTEGER NOT NULL CHECK(owner_uid > 0),
-    repository_generation INTEGER NOT NULL CHECK(repository_generation >= 0),
-    authority_generation INTEGER NOT NULL CHECK(authority_generation >= 1),
-    evidence_sha256 TEXT NOT NULL,
-    operation_id TEXT NOT NULL,
-    established_by TEXT NOT NULL,
-    established_at TEXT NOT NULL
-);
-
-CREATE TABLE repository_owner_transfers (
-    transfer_id TEXT PRIMARY KEY,
-    repo_id TEXT NOT NULL REFERENCES repositories(repo_id) ON DELETE RESTRICT,
-    prior_owner_uid INTEGER CHECK(prior_owner_uid IS NULL OR prior_owner_uid > 0),
-    owner_uid INTEGER NOT NULL CHECK(owner_uid > 0),
-    repository_generation INTEGER NOT NULL CHECK(repository_generation >= 0),
-    authority_generation INTEGER NOT NULL CHECK(authority_generation >= 1),
-    evidence_sha256 TEXT NOT NULL,
-    evidence_json TEXT NOT NULL,
-    operation_id TEXT NOT NULL,
-    actor TEXT NOT NULL,
-    reason TEXT NOT NULL,
-    transferred_at TEXT NOT NULL,
-    UNIQUE(repo_id, authority_generation),
-    UNIQUE(operation_id, repo_id)
-);
-
-CREATE TRIGGER repository_owner_transfers_no_update
-BEFORE UPDATE ON repository_owner_transfers
-BEGIN
-    SELECT RAISE(ABORT, 'repository owner transfer history is immutable');
-END;
-
-CREATE TRIGGER repository_owner_transfers_no_delete
-BEFORE DELETE ON repository_owner_transfers
-BEGIN
-    SELECT RAISE(ABORT, 'repository owner transfer history is immutable');
-END;
 """
 
 
@@ -1560,469 +1415,196 @@ def _execute_ddl(connection: sqlite3.Connection, ddl: str) -> None:
         raise RuntimeError("coordinator schema contains an incomplete SQL statement")
 
 
-def migrate_repository_owner_authority_v13(
+def _upgrade_cleanup_volume_contract_to_v13(
     connection: sqlite3.Connection,
-    *,
-    assignments: Iterable[dict[str, object]],
-    execution_scope: Mapping[str, object],
-    target_database_generation: str,
-    operation_id: str,
-    actor: str,
-    evidence_sha256: str,
-    timestamp: str,
 ) -> None:
-    """Apply one exact, operator-sealed v12 -> v13 owner authority map.
+    """Widen exact cleanup evidence to named volumes inside the sealed cutover.
 
-    This primitive intentionally accepts no path or caller UID from which an
-    owner could be inferred.  The caller must hold an offline transaction and
-    supply exactly one generation-bound assignment for every executable
-    repository.  A retained repository may be omitted only when the sealed
-    execution-scope partition proves an exact terminal project cleanup.
-    SQLite makes the schema change, initial owner rows, immutable ledger,
-    database-generation rotation, and schema-version advance atomic; a crash
-    therefore leaves either complete v12 or complete v13 authority.  Rotating
-    the generation fences every request or profile loaded before this parser
-    and authority change.
+    SQLite cannot alter a CHECK constraint in place. Rebuild the parent and
+    its sole child together, then rebuild tombstones, while the caller's
+    offline transaction and deferred foreign-key check keep the v12 or v13
+    shape atomic across a crash.
     """
 
-    if not connection.in_transaction:
-        raise RuntimeError("repository owner authority migration requires a transaction")
-    if not isinstance(operation_id, str) or not operation_id.strip():
-        raise ValueError("repository owner migration operation_id is required")
-    if not isinstance(actor, str) or not actor.strip():
-        raise ValueError("repository owner migration actor is required")
-    if not isinstance(timestamp, str) or not timestamp.strip():
-        raise ValueError("repository owner migration timestamp is required")
-    if (
-        not isinstance(target_database_generation, str)
-        or target_database_generation != target_database_generation.strip()
-        or not target_database_generation
-        or len(target_database_generation) > 256
-        or any(ord(character) < 0x20 for character in target_database_generation)
-    ):
-        raise ValueError("repository owner migration target database generation is invalid")
-    if not isinstance(evidence_sha256, str) or not _SHA256_FINGERPRINT.fullmatch(
-        evidence_sha256
-    ):
-        raise ValueError("repository owner map evidence_sha256 is invalid")
-
-    metadata = connection.execute(
-        """
-        SELECT schema_version, migration_state, database_generation
-        FROM schema_metadata WHERE singleton = 1
-        """
+    plan_sql_row = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'cleanup_plans'"
     ).fetchone()
-    if metadata is None or int(metadata[0]) != PRE_OWNER_AUTHORITY_SCHEMA_VERSION:
-        actual = None if metadata is None else metadata[0]
-        raise RuntimeError(
-            "repository owner authority migration requires exact schema "
-            f"{PRE_OWNER_AUTHORITY_SCHEMA_VERSION}; found {actual}"
-        )
-    if str(metadata[1]) != "ready":
-        raise RuntimeError(
-            "repository owner authority migration requires migration_state=ready"
-        )
-    source_database_generation = str(metadata[2])
-    if target_database_generation == source_database_generation:
-        raise RuntimeError(
-            "repository owner authority migration must rotate database generation"
-        )
-    for table in ("repository_owners", "repository_owner_transfers"):
-        if connection.execute(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (table,)
-        ).fetchone() is not None:
-            raise RuntimeError(
-                "repository owner authority migration found partial v13 state; "
-                "restore the sealed v12 database before retrying"
-            )
-
-    try:
-        validated_scope = validate_repository_execution_scope(
-            connection, execution_scope
-        )
-    except RepositoryExecutionScopeError as error:
-        raise RuntimeError(
-            f"repository owner execution scope is invalid: {error}"
-        ) from error
-    if (
-        validated_scope["authority_schema_version"]
-        != PRE_OWNER_AUTHORITY_SCHEMA_VERSION
-        or validated_scope["database_generation"] != source_database_generation
-        or validated_scope["migration_state"] != "ready"
-    ):
-        raise RuntimeError(
-            "repository owner execution scope is bound to another authority"
-        )
-
-    normalized: list[dict[str, object]] = []
-    seen: set[str] = set()
-    for raw in assignments:
-        if not isinstance(raw, dict) or set(raw) != {
-            "repository_id",
-            "canonical_root",
-            "repository_generation",
-            "owner_uid",
-        }:
-            raise ValueError("repository owner assignment fields are invalid")
-        repository_id = raw["repository_id"]
-        canonical_root = raw["canonical_root"]
-        generation = raw["repository_generation"]
-        owner_uid = raw["owner_uid"]
-        if not isinstance(repository_id, str) or not repository_id or repository_id in seen:
-            raise ValueError("repository owner assignment repository_id is invalid")
-        if not isinstance(canonical_root, str) or not canonical_root.startswith("/"):
-            raise ValueError("repository owner assignment canonical_root is invalid")
-        if isinstance(generation, bool) or not isinstance(generation, int) or generation < 0:
-            raise ValueError("repository owner assignment generation is invalid")
-        if isinstance(owner_uid, bool) or not isinstance(owner_uid, int) or owner_uid <= 0:
-            raise ValueError("repository owner assignment owner_uid is invalid")
-        seen.add(repository_id)
-        normalized.append(
-            {
-                "repository_id": repository_id,
-                "canonical_root": canonical_root,
-                "repository_generation": generation,
-                "owner_uid": owner_uid,
-            }
-        )
-    normalized.sort(key=lambda item: str(item["repository_id"]))
-
-    actual = [
-        {
-            "repository_id": str(item["repository_id"]),
-            "canonical_root": str(item["canonical_root"]),
-            "repository_generation": int(item["repository_generation"]),
-        }
-        for item in validated_scope["executable_repositories"]
-    ]
-    proposed = [
-        {
-            "repository_id": str(item["repository_id"]),
-            "canonical_root": str(item["canonical_root"]),
-            "repository_generation": int(item["repository_generation"]),
-        }
-        for item in normalized
-    ]
-    if proposed != actual:
-        raise RuntimeError(
-            "repository owner map does not cover every executable repository exactly once"
-        )
-
-    _execute_ddl(connection, REPOSITORY_OWNER_AUTHORITY_DDL)
-    for item in normalized:
-        repository_id = str(item["repository_id"])
-        owner_uid = int(item["owner_uid"])
-        generation = int(item["repository_generation"])
-        entry_evidence = json.dumps(
-            {
-                "kind": "devcoordinator-repository-owner-initial-assignment",
-                "owner_map_sha256": evidence_sha256,
-                **item,
-            },
-            sort_keys=True,
-            separators=(",", ":"),
-            ensure_ascii=False,
-            allow_nan=False,
-        )
-        transfer_id = "repository-owner-initial-" + hashlib.sha256(
-            f"{operation_id}\0{repository_id}".encode("utf-8")
-        ).hexdigest()
-        connection.execute(
-            """
-            INSERT INTO repository_owners(
-                repo_id, owner_uid, repository_generation,
-                authority_generation, evidence_sha256, operation_id,
-                established_by, established_at
-            ) VALUES (?, ?, ?, 1, ?, ?, ?, ?)
-            """,
-            (
-                repository_id,
-                owner_uid,
-                generation,
-                evidence_sha256,
-                operation_id,
-                actor,
-                timestamp,
-            ),
-        )
-        connection.execute(
-            """
-            INSERT INTO repository_owner_transfers(
-                transfer_id, repo_id, prior_owner_uid, owner_uid,
-                repository_generation, authority_generation,
-                evidence_sha256, evidence_json, operation_id, actor,
-                reason, transferred_at
-            ) VALUES (?, ?, NULL, ?, ?, 1, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                transfer_id,
-                repository_id,
-                owner_uid,
-                generation,
-                evidence_sha256,
-                entry_evidence,
-                operation_id,
-                actor,
-                "sealed v12 to v13 repository owner authority migration",
-                timestamp,
-            ),
-        )
-    changed = connection.execute(
-        """
-        UPDATE schema_metadata
-        SET schema_version = ?, database_generation = ?,
-            state_revision = state_revision + 1, updated_at = ?
-        WHERE singleton = 1 AND schema_version = ? AND migration_state = 'ready'
-          AND database_generation = ?
-        """,
-        (
-            SCHEMA_VERSION,
-            target_database_generation,
-            timestamp,
-            PRE_OWNER_AUTHORITY_SCHEMA_VERSION,
-            source_database_generation,
-        ),
-    ).rowcount
-    if changed != 1:
-        raise RuntimeError("repository owner authority schema fence changed")
-    try:
-        committed_scope = repository_execution_scope(connection)
-    except RepositoryExecutionScopeError as error:
-        raise RuntimeError(
-            f"repository owner committed execution scope is invalid: {error}"
-        ) from error
-    partition_fields = (
-        "repository_count",
-        "executable_repository_count",
-        "excluded_terminal_repository_count",
-        "repository_universe_sha256",
-        "executable_repositories_sha256",
-        "excluded_terminal_repositories_sha256",
-        "executable_repositories",
-        "excluded_terminal_repositories",
-    )
-    if (
-        committed_scope["authority_schema_version"] != SCHEMA_VERSION
-        or committed_scope["database_generation"] != target_database_generation
-        or committed_scope["state_revision"]
-        != int(validated_scope["state_revision"]) + 1
-        or committed_scope["migration_state"] != "ready"
-        or any(
-            committed_scope[field] != validated_scope[field]
-            for field in partition_fields
-        )
-    ):
-        raise RuntimeError(
-            "repository owner execution scope changed during schema migration"
-        )
-
-
-def establish_repository_owner_authority(
-    connection: sqlite3.Connection,
-    *,
-    repository_id: str,
-    owner_uid: int,
-    repository_generation: int,
-    operation_id: str,
-    actor: str,
-    reason: str,
-    timestamp: str,
-    evidence: dict[str, object],
-) -> None:
-    """Establish the first explicit owner for a newly inserted repository."""
-
-    if not connection.in_transaction:
-        raise RuntimeError("repository owner establishment requires a transaction")
-    if isinstance(owner_uid, bool) or not isinstance(owner_uid, int) or owner_uid <= 0:
-        raise ValueError("repository owner UID must be a positive integer")
-    if (
-        isinstance(repository_generation, bool)
-        or not isinstance(repository_generation, int)
-        or repository_generation < 0
-    ):
-        raise ValueError("repository generation must be a non-negative integer")
-    for label, value in (
-        ("repository id", repository_id),
-        ("operation id", operation_id),
-        ("actor", actor),
-        ("reason", reason),
-        ("timestamp", timestamp),
-    ):
-        if not isinstance(value, str) or not value.strip():
-            raise ValueError(f"{label} is required")
-    row = connection.execute(
-        "SELECT generation FROM repositories WHERE repo_id = ?", (repository_id,)
+    tombstone_sql_row = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'cleanup_tombstones'"
     ).fetchone()
-    if row is None or int(row[0]) != repository_generation:
-        raise RuntimeError("repository owner establishment generation fence changed")
-    if connection.execute(
-        "SELECT 1 FROM repository_owners WHERE repo_id = ?", (repository_id,)
-    ).fetchone() is not None:
-        raise RuntimeError("repository already has explicit owner authority")
-    try:
-        evidence_json = json.dumps(
-            evidence,
-            sort_keys=True,
-            separators=(",", ":"),
-            ensure_ascii=False,
-            allow_nan=False,
+    phase_row = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'cleanup_phase_evidence'"
+    ).fetchone()
+    if plan_sql_row is None or tombstone_sql_row is None or phase_row is None:
+        raise RuntimeError(
+            "coordinator schema v13 migration requires complete v12 cleanup tables"
         )
-    except (TypeError, ValueError, UnicodeError, RecursionError) as error:
-        raise ValueError("repository owner evidence must be canonical JSON") from error
-    evidence_sha256 = "sha256:" + hashlib.sha256(
-        evidence_json.encode("utf-8")
-    ).hexdigest()
-    transfer_id = "repository-owner-initial-" + hashlib.sha256(
-        f"{operation_id}\0{repository_id}".encode("utf-8")
-    ).hexdigest()
+    plan_sql = str(plan_sql_row[0] or "")
+    tombstone_sql = str(tombstone_sql_row[0] or "")
+    if "'volume'" in plan_sql and "'volume'" in tombstone_sql:
+        return
+    if "'volume'" in plan_sql or "'volume'" in tombstone_sql:
+        raise RuntimeError(
+            "coordinator schema v13 migration rejected a partial volume cleanup schema"
+        )
+    plan_columns = {
+        str(row[1]) for row in connection.execute("PRAGMA table_info(cleanup_plans)")
+    }
+    phase_columns = {
+        str(row[1])
+        for row in connection.execute("PRAGMA table_info(cleanup_phase_evidence)")
+    }
+    required_plan_columns = {
+        "plan_id",
+        "repo_id",
+        "target_kind",
+        "target_id",
+        "action",
+        "target_fingerprint",
+        "plan_fingerprint",
+        "confirmation_phrase",
+        "snapshot_json",
+        "status",
+        "phase",
+        "actor",
+        "reason",
+    }
+    required_phase_columns = {"plan_id", "phase", "status", "evidence_json"}
+    if not required_plan_columns.issubset(plan_columns) or not required_phase_columns.issubset(
+        phase_columns
+    ):
+        raise RuntimeError(
+            "coordinator schema v13 migration rejected incomplete v12 cleanup evidence"
+        )
+
+    connection.execute("PRAGMA defer_foreign_keys = ON")
     connection.execute(
-        """
-        INSERT INTO repository_owners(
-            repo_id, owner_uid, repository_generation, authority_generation,
-            evidence_sha256, operation_id, established_by, established_at
-        ) VALUES (?, ?, ?, 1, ?, ?, ?, ?)
+        "ALTER TABLE cleanup_phase_evidence RENAME TO cleanup_phase_evidence_v12"
+    )
+    connection.execute("ALTER TABLE cleanup_plans RENAME TO cleanup_plans_v12")
+    connection.execute(
+        "ALTER TABLE cleanup_tombstones RENAME TO cleanup_tombstones_v12"
+    )
+    _execute_ddl(
+        connection,
+        r"""
+        CREATE TABLE cleanup_plans (
+            plan_id TEXT PRIMARY KEY REFERENCES operations(operation_id) ON DELETE CASCADE,
+            repo_id TEXT REFERENCES repositories(repo_id) ON DELETE RESTRICT,
+            target_kind TEXT NOT NULL CHECK(target_kind IN (
+                'project', 'server', 'container', 'volume', 'worktree'
+            )),
+            target_id TEXT NOT NULL,
+            action TEXT NOT NULL CHECK(action IN ('purge', 'forget')),
+            target_fingerprint TEXT NOT NULL,
+            plan_fingerprint TEXT NOT NULL,
+            confirmation_phrase TEXT NOT NULL,
+            snapshot_json TEXT NOT NULL,
+            status TEXT NOT NULL CHECK(status IN (
+                'planned', 'running', 'needs_attention', 'succeeded'
+            )),
+            phase TEXT NOT NULL,
+            actor TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(target_kind, target_id, plan_fingerprint)
+        );
+
+        CREATE TABLE cleanup_phase_evidence (
+            plan_id TEXT NOT NULL REFERENCES cleanup_plans(plan_id) ON DELETE CASCADE,
+            phase TEXT NOT NULL,
+            status TEXT NOT NULL CHECK(status IN ('running', 'succeeded', 'failed')),
+            evidence_json TEXT,
+            error_json TEXT,
+            started_at TEXT NOT NULL,
+            finished_at TEXT,
+            PRIMARY KEY(plan_id, phase)
+        );
+
+        CREATE TABLE cleanup_tombstones (
+            target_kind TEXT NOT NULL CHECK(target_kind IN (
+                'project', 'server', 'container', 'volume', 'worktree'
+            )),
+            target_id TEXT NOT NULL,
+            target_generation INTEGER NOT NULL DEFAULT 0
+                CHECK(target_generation >= 0),
+            repo_id TEXT REFERENCES repositories(repo_id) ON DELETE RESTRICT,
+            immutable_fingerprint TEXT NOT NULL,
+            operation_id TEXT NOT NULL
+                REFERENCES operations(operation_id) ON DELETE RESTRICT,
+            actor TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            evidence_json TEXT NOT NULL,
+            removed_at TEXT NOT NULL,
+            PRIMARY KEY(target_kind, target_id, target_generation)
+        );
         """,
-        (
-            repository_id,
-            owner_uid,
-            repository_generation,
-            evidence_sha256,
-            operation_id,
-            actor,
-            timestamp,
-        ),
+    )
+    plan_created_at = (
+        "created_at" if "created_at" in plan_columns else "'v12-volume-contract-migration'"
+    )
+    plan_updated_at = (
+        "updated_at" if "updated_at" in plan_columns else "'v12-volume-contract-migration'"
+    )
+    phase_error_json = "error_json" if "error_json" in phase_columns else "NULL"
+    phase_started_at = (
+        "started_at"
+        if "started_at" in phase_columns
+        else "'v12-volume-contract-migration'"
+    )
+    phase_finished_at = (
+        "finished_at"
+        if "finished_at" in phase_columns
+        else "CASE WHEN status IN ('succeeded', 'failed') "
+        "THEN 'v12-volume-contract-migration' ELSE NULL END"
+    )
+    connection.execute(
+        f"""
+        INSERT INTO cleanup_plans(
+            plan_id, repo_id, target_kind, target_id, action,
+            target_fingerprint, plan_fingerprint, confirmation_phrase,
+            snapshot_json, status, phase, actor, reason, created_at, updated_at
+        )
+        SELECT plan_id, repo_id, target_kind, target_id, action,
+               target_fingerprint, plan_fingerprint, confirmation_phrase,
+               snapshot_json, status, phase, actor, reason,
+               {plan_created_at}, {plan_updated_at}
+        FROM cleanup_plans_v12
+        """
+    )
+    connection.execute(
+        f"""
+        INSERT INTO cleanup_phase_evidence(
+            plan_id, phase, status, evidence_json, error_json,
+            started_at, finished_at
+        )
+        SELECT plan_id, phase, status, evidence_json,
+               {phase_error_json}, {phase_started_at}, {phase_finished_at}
+        FROM cleanup_phase_evidence_v12
+        """
     )
     connection.execute(
         """
-        INSERT INTO repository_owner_transfers(
-            transfer_id, repo_id, prior_owner_uid, owner_uid,
-            repository_generation, authority_generation, evidence_sha256,
-            evidence_json, operation_id, actor, reason, transferred_at
-        ) VALUES (?, ?, NULL, ?, ?, 1, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            transfer_id,
-            repository_id,
-            owner_uid,
-            repository_generation,
-            evidence_sha256,
-            evidence_json,
-            operation_id,
-            actor,
-            reason,
-            timestamp,
-        ),
-    )
-
-
-def advance_repository_owner_generation(
-    connection: sqlite3.Connection,
-    *,
-    repository_id: str,
-    owner_uid: int,
-    prior_repository_generation: int,
-    repository_generation: int,
-    operation_id: str,
-    actor: str,
-    reason: str,
-    timestamp: str,
-    evidence: dict[str, object],
-) -> None:
-    """Fence unchanged owner authority to an explicitly advanced repo generation."""
-
-    if not connection.in_transaction:
-        raise RuntimeError("repository owner generation advance requires a transaction")
-    if repository_generation != prior_repository_generation + 1:
-        raise ValueError("repository owner generation must advance by exactly one")
-    current = connection.execute(
+        INSERT INTO cleanup_tombstones
+        SELECT * FROM cleanup_tombstones_v12
         """
-        SELECT owner_uid, repository_generation, authority_generation
-        FROM repository_owners WHERE repo_id = ?
-        """,
-        (repository_id,),
-    ).fetchone()
-    repository = connection.execute(
-        "SELECT generation FROM repositories WHERE repo_id = ?", (repository_id,)
-    ).fetchone()
-    if (
-        current is None
-        or repository is None
-        or int(current[0]) != owner_uid
-        or int(current[1]) != prior_repository_generation
-        or int(repository[0]) != repository_generation
-    ):
-        raise RuntimeError("repository owner generation fence changed")
-    authority_generation = int(current[2]) + 1
-    try:
-        evidence_json = json.dumps(
-            evidence,
-            sort_keys=True,
-            separators=(",", ":"),
-            ensure_ascii=False,
-            allow_nan=False,
+    )
+    connection.execute("DROP TABLE cleanup_phase_evidence_v12")
+    connection.execute("DROP TABLE cleanup_plans_v12")
+    connection.execute("DROP TABLE cleanup_tombstones_v12")
+    violations = list(connection.execute("PRAGMA foreign_key_check"))
+    if violations:
+        raise RuntimeError(
+            "coordinator schema v13 cleanup-table migration violated foreign keys"
         )
-    except (TypeError, ValueError, UnicodeError, RecursionError) as error:
-        raise ValueError("repository owner generation evidence must be canonical JSON") from error
-    evidence_sha256 = "sha256:" + hashlib.sha256(
-        evidence_json.encode("utf-8")
-    ).hexdigest()
-    transfer_id = "repository-owner-generation-" + hashlib.sha256(
-        f"{operation_id}\0{repository_id}\0{authority_generation}".encode("utf-8")
-    ).hexdigest()
-    changed = connection.execute(
-        """
-        UPDATE repository_owners
-        SET repository_generation = ?, authority_generation = ?,
-            evidence_sha256 = ?, operation_id = ?, established_by = ?,
-            established_at = ?
-        WHERE repo_id = ? AND owner_uid = ?
-          AND repository_generation = ? AND authority_generation = ?
-        """,
-        (
-            repository_generation,
-            authority_generation,
-            evidence_sha256,
-            operation_id,
-            actor,
-            timestamp,
-            repository_id,
-            owner_uid,
-            prior_repository_generation,
-            authority_generation - 1,
-        ),
-    ).rowcount
-    if changed != 1:
-        raise RuntimeError("repository owner generation authority changed")
-    connection.execute(
-        """
-        INSERT INTO repository_owner_transfers(
-            transfer_id, repo_id, prior_owner_uid, owner_uid,
-            repository_generation, authority_generation, evidence_sha256,
-            evidence_json, operation_id, actor, reason, transferred_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            transfer_id,
-            repository_id,
-            owner_uid,
-            owner_uid,
-            repository_generation,
-            authority_generation,
-            evidence_sha256,
-            evidence_json,
-            operation_id,
-            actor,
-            reason,
-            timestamp,
-        ),
-    )
 
 
 def _upgrade_sha256_fingerprints_to_v4(connection: sqlite3.Connection) -> None:
-    """Normalize the exact current resource identities used by lifecycle ACLs.
+    """Normalize exact resource identities in legacy pre-v15 tables.
 
     Schema v3 observations accidentally persisted the canonical digest without
-    its algorithm tag in repository memberships and startup policies.  Only an
+    its algorithm tag in legacy association rows and startup policies. Only an
     exact lowercase 64-hex legacy value is safe to reinterpret.  Anything else
     is ambiguous evidence and must abort the surrounding store-open
     transaction instead of being guessed into a lifecycle identity.
@@ -2144,7 +1726,7 @@ def _upgrade_ephemeral_secret_policy_to_v7(connection: sqlite3.Connection) -> No
 
     The runtime password never enters SQLite.  These nullable fields retain
     only the reviewed policy name and an opaque binding ID so a running
-    container can be recovered without allowing reenrollment to substitute a
+    container can be recovered without allowing reconfiguration to substitute a
     new credential contract for an already admitted run.
     """
 
@@ -2485,19 +2067,382 @@ def _upgrade_cleanup_tombstones_to_v11(
     )
 
 
+_LEGACY_LOCAL_AUTHORIZATION_TABLES = (
+    "broker_cleanup_resource_acl",
+    "broker_lifecycle_resource_acl",
+    "broker_database_acl",
+    "broker_compose_run_once_acl",
+    "broker_compose_acl",
+    "broker_assignment_acl",
+    "broker_worker_acl",
+    "broker_runtime_acl",
+    "broker_ephemeral_acl",
+    "broker_resource_acl",
+    "broker_repository_read_acl",
+    "broker_host_observation_acl",
+    "broker_cleanup_acl",
+    "broker_lifecycle_acl",
+    "broker_repository_configurations",
+    "broker_assignment_owners",
+    "broker_lease_owners",
+    "broker_acl_principals",
+)
+
+
+def _schema_table_exists(connection: sqlite3.Connection, table: str) -> bool:
+    return connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (table,)
+    ).fetchone() is not None
+
+
+def _table_columns(connection: sqlite3.Connection, table: str) -> set[str]:
+    if not _schema_table_exists(connection, table):
+        return set()
+    return {str(row[1]) for row in connection.execute(f'PRAGMA table_info("{table}")')}
+
+
+def _drop_obsolete_link_transport_policy_columns(
+    connection: sqlite3.Connection,
+) -> None:
+    """Remove former Unix ownership/mode policy from durable broker links."""
+
+    migrations = (
+        (
+            "broker_lease_links",
+            """
+            CREATE TABLE broker_lease_links_v15 (
+                link_id TEXT PRIMARY KEY,
+                repo_id TEXT NOT NULL REFERENCES repositories(repo_id) ON DELETE RESTRICT,
+                server_definition_id TEXT NOT NULL REFERENCES server_definitions(server_definition_id) ON DELETE RESTRICT,
+                broker_lease_id TEXT NOT NULL UNIQUE,
+                local_lease_id TEXT UNIQUE,
+                account_id TEXT NOT NULL,
+                broker_socket TEXT NOT NULL,
+                broker_database_generation TEXT NOT NULL,
+                port INTEGER NOT NULL CHECK (port BETWEEN 1 AND 65535),
+                protocol TEXT NOT NULL CHECK (protocol IN ('tcp', 'udp')),
+                status TEXT NOT NULL CHECK (status IN (
+                    'reserved', 'active', 'release_pending', 'released',
+                    'rollback_failed', 'reconciliation_required'
+                )),
+                broker_operation_id TEXT NOT NULL,
+                release_operation_id TEXT,
+                expires_at TEXT,
+                last_error_code TEXT,
+                last_error_message TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """,
+            (
+                "link_id", "repo_id", "server_definition_id", "broker_lease_id",
+                "local_lease_id", "account_id", "broker_socket",
+                "broker_database_generation", "port", "protocol",
+                "status", "broker_operation_id", "release_operation_id", "expires_at",
+                "last_error_code", "last_error_message", "created_at", "updated_at",
+            ),
+        ),
+        (
+            "broker_assignment_links",
+            """
+            CREATE TABLE broker_assignment_links_v15 (
+                link_id TEXT PRIMARY KEY,
+                repo_id TEXT NOT NULL REFERENCES repositories(repo_id) ON DELETE RESTRICT,
+                server_definition_id TEXT NOT NULL REFERENCES server_definitions(server_definition_id) ON DELETE RESTRICT,
+                broker_assignment_id TEXT NOT NULL UNIQUE,
+                local_assignment_id TEXT UNIQUE,
+                account_id TEXT NOT NULL,
+                broker_socket TEXT NOT NULL,
+                broker_database_generation TEXT NOT NULL,
+                port INTEGER NOT NULL CHECK (port BETWEEN 1 AND 65535),
+                status TEXT NOT NULL CHECK (status IN (
+                    'reserved', 'active', 'release_pending', 'released',
+                    'rollback_failed', 'reconciliation_required'
+                )),
+                broker_operation_id TEXT NOT NULL,
+                release_operation_id TEXT,
+                last_error_code TEXT,
+                last_error_message TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(repo_id, server_definition_id)
+            )
+            """,
+            (
+                "link_id", "repo_id", "server_definition_id", "broker_assignment_id",
+                "local_assignment_id", "account_id", "broker_socket",
+                "broker_database_generation", "port", "status",
+                "broker_operation_id", "release_operation_id", "last_error_code",
+                "last_error_message", "created_at", "updated_at",
+            ),
+        ),
+        (
+            "broker_lifecycle_links",
+            """
+            CREATE TABLE broker_lifecycle_links_v15 (
+                link_id TEXT PRIMARY KEY,
+                repo_id TEXT NOT NULL REFERENCES repositories(repo_id) ON DELETE RESTRICT,
+                resource_id TEXT NOT NULL,
+                operation TEXT NOT NULL CHECK(operation IN (
+                    'repository.remove', 'repository.reinstall',
+                    'resource.attach', 'resource.retire'
+                )),
+                broker_operation_id TEXT NOT NULL UNIQUE,
+                broker_plan_id TEXT,
+                account_id TEXT NOT NULL,
+                broker_socket TEXT NOT NULL,
+                broker_database_generation TEXT NOT NULL,
+                arguments_json TEXT NOT NULL,
+                result_json TEXT NOT NULL,
+                status TEXT NOT NULL CHECK(status IN (
+                    'pending', 'applied', 'reconciliation_required', 'operator_required'
+                )),
+                last_error_code TEXT,
+                last_error_message TEXT,
+                attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0),
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                applied_at TEXT
+            )
+            """,
+            (
+                "link_id", "repo_id", "resource_id", "operation",
+                "broker_operation_id", "broker_plan_id", "account_id", "broker_socket",
+                "broker_database_generation",
+                "arguments_json", "result_json", "status", "last_error_code",
+                "last_error_message", "attempts", "created_at", "updated_at", "applied_at",
+            ),
+        ),
+    )
+    for table, create_sql, retained in migrations:
+        if not {
+            "broker_service_uid", "broker_socket_gid", "broker_socket_mode"
+        } & _table_columns(connection, table):
+            continue
+        replacement = f"{table}_v15"
+        connection.execute(create_sql)
+        columns = ", ".join(retained)
+        connection.execute(
+            f'INSERT INTO "{replacement}"({columns}) SELECT {columns} FROM "{table}"'
+        )
+        connection.execute(f'DROP TABLE "{table}"')
+        connection.execute(f'ALTER TABLE "{replacement}" RENAME TO "{table}"')
+
+
+def _migrate_trusted_local_schema_v15(
+    connection: sqlite3.Connection,
+    *,
+    database_generation: str,
+    timestamp: str,
+) -> None:
+    """Collapse legacy ownership, ACL, and group state into target metadata."""
+
+    _upgrade_cleanup_volume_contract_to_v13(connection)
+
+    if _schema_table_exists(connection, "docker_ownership_claims") and not _schema_table_exists(
+        connection, "docker_repository_hints"
+    ):
+        connection.execute(
+            "ALTER TABLE docker_ownership_claims RENAME TO docker_repository_hints"
+        )
+
+    docker_columns = _table_columns(connection, "docker_resources")
+    if docker_columns and "repo_id" not in docker_columns:
+        connection.execute(
+            "ALTER TABLE docker_resources ADD COLUMN repo_id TEXT REFERENCES repositories(repo_id) ON DELETE SET NULL"
+        )
+        if _schema_table_exists(connection, "repository_memberships"):
+            connection.execute(
+                """
+                UPDATE docker_resources
+                SET repo_id = (
+                    SELECT membership.repo_id
+                    FROM repository_memberships AS membership
+                    WHERE membership.resource_kind = 'container'
+                      AND membership.host_resource_id = docker_resources.docker_resource_id
+                    LIMIT 1
+                )
+                WHERE repo_id IS NULL
+                """
+            )
+        if _schema_table_exists(connection, "docker_repository_hints"):
+            connection.execute(
+                """
+                UPDATE docker_resources
+                SET repo_id = (
+                    SELECT claim.repo_id
+                    FROM docker_repository_hints AS claim
+                    WHERE claim.docker_resource_id = docker_resources.docker_resource_id
+                      AND claim.repo_id IS NOT NULL
+                      AND claim.conflict_state = 'clear'
+                    ORDER BY claim.priority DESC, claim.claim_id
+                    LIMIT 1
+                )
+                WHERE repo_id IS NULL
+                """
+            )
+
+    lease_columns = _table_columns(connection, "leases")
+    if lease_columns and "protocol" not in lease_columns:
+        connection.execute(
+            "ALTER TABLE leases ADD COLUMN protocol TEXT NOT NULL DEFAULT 'tcp' CHECK(protocol IN ('tcp', 'udp'))"
+        )
+        if _schema_table_exists(connection, "broker_lease_owners"):
+            connection.execute(
+                """
+                UPDATE leases
+                SET protocol = COALESCE((
+                    SELECT context.protocol
+                    FROM broker_lease_owners AS context
+                    WHERE context.lease_id = leases.lease_id
+                ), protocol)
+                """
+            )
+
+    restore_columns = _table_columns(connection, "startup_policy_restore_states")
+    if "control_binding_id" in restore_columns or "ownership_fingerprint" in restore_columns:
+        connection.execute(
+            """
+            CREATE TABLE startup_policy_restore_states_v14 (
+                policy_id TEXT PRIMARY KEY REFERENCES startup_policies(policy_id) ON DELETE CASCADE,
+                repo_id TEXT REFERENCES repositories(repo_id) ON DELETE RESTRICT,
+                resource_kind TEXT NOT NULL,
+                resource_id TEXT NOT NULL,
+                policy_kind TEXT NOT NULL CHECK(policy_kind IN ('docker_restart', 'compose', 'supervisor', 'coordinator')),
+                policy_immutable_fingerprint TEXT NOT NULL,
+                target_immutable_fingerprint TEXT NOT NULL,
+                native_identity_fingerprint TEXT NOT NULL,
+                captured_value TEXT NOT NULL,
+                restore_required INTEGER NOT NULL CHECK(restore_required IN (0, 1)),
+                status TEXT NOT NULL CHECK(status IN ('captured', 'restored', 'not_required')),
+                docker_restart_policy TEXT,
+                supervisor_manager TEXT CHECK(supervisor_manager IS NULL OR supervisor_manager IN ('systemd', 'launchd')),
+                supervisor_unit_file_state TEXT,
+                supervisor_loaded INTEGER CHECK(supervisor_loaded IN (0, 1) OR supervisor_loaded IS NULL),
+                supervisor_enabled INTEGER CHECK(supervisor_enabled IN (0, 1) OR supervisor_enabled IS NULL),
+                captured_operation_id TEXT NOT NULL REFERENCES operations(operation_id) ON DELETE RESTRICT,
+                last_restore_permit_id TEXT REFERENCES operations(operation_id) ON DELETE SET NULL,
+                capture_generation INTEGER NOT NULL DEFAULT 0 CHECK(capture_generation >= 0),
+                captured_at TEXT NOT NULL,
+                restored_at TEXT,
+                updated_at TEXT NOT NULL,
+                UNIQUE(repo_id, resource_kind, resource_id, policy_kind),
+                CHECK(
+                    (policy_kind = 'docker_restart' AND docker_restart_policy IS NOT NULL AND supervisor_manager IS NULL)
+                    OR (policy_kind = 'supervisor' AND docker_restart_policy IS NULL AND supervisor_manager IS NOT NULL AND supervisor_unit_file_state IS NOT NULL AND supervisor_loaded IS NOT NULL AND supervisor_enabled IS NOT NULL)
+                    OR (policy_kind IN ('compose', 'coordinator') AND docker_restart_policy IS NULL AND supervisor_manager IS NULL)
+                ),
+                CHECK((restore_required = 1 AND status IN ('captured', 'restored')) OR (restore_required = 0 AND status = 'not_required'))
+            )
+            """
+        )
+        retained = (
+            "policy_id, repo_id, resource_kind, resource_id, policy_kind, "
+            "policy_immutable_fingerprint, target_immutable_fingerprint, "
+            "native_identity_fingerprint, captured_value, restore_required, status, "
+            "docker_restart_policy, supervisor_manager, supervisor_unit_file_state, "
+            "supervisor_loaded, supervisor_enabled, captured_operation_id, "
+            "last_restore_permit_id, capture_generation, captured_at, restored_at, updated_at"
+        )
+        connection.execute(
+            f"INSERT INTO startup_policy_restore_states_v14({retained}) "
+            f"SELECT {retained} FROM startup_policy_restore_states"
+        )
+        connection.execute("DROP TABLE startup_policy_restore_states")
+        connection.execute(
+            "ALTER TABLE startup_policy_restore_states_v14 RENAME TO startup_policy_restore_states"
+        )
+
+    if _schema_table_exists(connection, "broker_port_policies"):
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS broker_port_ranges (
+                repo_id TEXT NOT NULL REFERENCES repositories(repo_id) ON DELETE CASCADE,
+                server_definition_id TEXT NOT NULL REFERENCES server_definitions(server_definition_id) ON DELETE CASCADE,
+                protocol TEXT NOT NULL CHECK(protocol IN ('tcp', 'udp')),
+                start_port INTEGER NOT NULL CHECK(start_port BETWEEN 1 AND 65535),
+                end_port INTEGER NOT NULL CHECK(end_port BETWEEN start_port AND 65535),
+                max_ttl_seconds INTEGER NOT NULL CHECK(max_ttl_seconds BETWEEN 1 AND 604800),
+                enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0, 1)),
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY(repo_id, server_definition_id, protocol, start_port, end_port)
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO broker_port_ranges(
+                repo_id, server_definition_id, protocol, start_port, end_port,
+                max_ttl_seconds, enabled, updated_at
+            )
+            SELECT repo_id, server_definition_id, protocol, start_port, end_port,
+                   max(max_ttl_seconds), max(enabled), max(updated_at)
+            FROM broker_port_policies
+            GROUP BY repo_id, server_definition_id, protocol, start_port, end_port
+            """
+        )
+        connection.execute("DROP TABLE broker_port_policies")
+
+    operation_sql = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'broker_operation_requests'"
+    ).fetchone()
+    if operation_sql is not None and "broker_acl_principals" in str(operation_sql[0]):
+        connection.execute(
+            "ALTER TABLE broker_operation_requests RENAME TO broker_operation_requests_legacy_auth"
+        )
+        connection.execute(
+            """
+            CREATE TABLE broker_operation_requests (
+                operation_id TEXT PRIMARY KEY REFERENCES operations(operation_id) ON DELETE CASCADE,
+                uid INTEGER NOT NULL CHECK(uid >= 0),
+                account_id TEXT NOT NULL,
+                repo_id TEXT NOT NULL REFERENCES repositories(repo_id) ON DELETE RESTRICT,
+                resource_id TEXT NOT NULL,
+                operation TEXT NOT NULL,
+                request_fingerprint TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO broker_operation_requests
+            SELECT * FROM broker_operation_requests_legacy_auth
+            """
+        )
+        connection.execute("DROP TABLE broker_operation_requests_legacy_auth")
+
+    _drop_obsolete_link_transport_policy_columns(connection)
+
+    for table in _LEGACY_LOCAL_AUTHORIZATION_TABLES:
+        connection.execute(f'DROP TABLE IF EXISTS "{table}"')
+    connection.execute("DROP TABLE IF EXISTS repository_memberships")
+    connection.execute("DROP TABLE IF EXISTS control_bindings")
+    connection.execute("DROP TABLE IF EXISTS repository_owner_transfers")
+    connection.execute("DROP TABLE IF EXISTS repository_owners")
+    connection.execute("DROP TRIGGER IF EXISTS repository_owner_transfers_no_update")
+    connection.execute("DROP TRIGGER IF EXISTS repository_owner_transfers_no_delete")
+
+    changed = connection.execute(
+        """
+        UPDATE schema_metadata
+        SET schema_version = ?, database_generation = ?,
+            state_revision = state_revision + 1, updated_at = ?
+        WHERE singleton = 1 AND schema_version IN (12, 13, 14)
+        """,
+        (SCHEMA_VERSION, database_generation, timestamp),
+    ).rowcount
+    if changed != 1:
+        raise RuntimeError("trusted-local schema migration lost its version fence")
+
+
 def initialize_schema(
     connection: sqlite3.Connection,
     *,
     database_generation: str,
     timestamp: str,
 ) -> None:
-    """Create a fresh v13 store or validate one already at exact v13.
-
-    Existing stores are deliberately never upgraded here.  In particular,
-    v12 has no repository execution-owner authority and must pass through the
-    separately sealed offline owner-map transaction.  This check runs before
-    any v13 DDL, so an ordinary service open of v12 is byte/logically no-write.
-    """
+    """Create or migrate the schema to the trusted-local v15 model."""
 
     tables = {
         str(row[0])
@@ -2531,29 +2476,50 @@ def initialize_schema(
     if row is None:
         raise RuntimeError("coordinator schema metadata singleton is missing")
     version = int(row[0])
-    if version == PRE_OWNER_AUTHORITY_SCHEMA_VERSION:
-        raise RuntimeError(
-            "coordinator schema 12 requires the sealed offline repository-owner "
-            "authority migration; service startup will not infer owners"
+    if version in LEGACY_SCHEMA_VERSIONS:
+        _migrate_trusted_local_schema_v15(
+            connection,
+            database_generation=database_generation,
+            timestamp=timestamp,
         )
-    if version != SCHEMA_VERSION:
+    elif version != SCHEMA_VERSION:
         raise RuntimeError(
             f"unsupported coordinator database schema {version}; expected {SCHEMA_VERSION}"
         )
-    required = {"repository_owners", "repository_owner_transfers"}
-    missing = sorted(required - tables)
-    if missing:
+
+    _execute_ddl(connection, DDL)
+    forbidden = {
+        "repository_memberships",
+        "control_bindings",
+        "repository_owners",
+        "repository_owner_transfers",
+        *_LEGACY_LOCAL_AUTHORIZATION_TABLES,
+    }
+    present = sorted(
+        table for table in forbidden if _schema_table_exists(connection, table)
+    )
+    if present:
         raise RuntimeError(
-            "coordinator schema 13 repository-owner authority is incomplete: "
-            + ", ".join(missing)
+            "trusted-local schema still contains obsolete authorization tables: "
+            + ", ".join(present)
         )
+    required_columns = {
+        "docker_resources": {"repo_id"},
+        "leases": {"protocol"},
+    }
+    for table, expected in required_columns.items():
+        missing = expected - _table_columns(connection, table)
+        if missing:
+            raise RuntimeError(
+                f"trusted-local schema table {table} is missing: "
+                + ", ".join(sorted(missing))
+            )
 
 
 def invariant_violations(
     connection: sqlite3.Connection,
     *,
     include_foreign_keys: bool = True,
-    include_owner_authority: bool = True,
 ) -> list[InvariantViolation]:
     """Return human-readable violations not expressible as local constraints.
 
@@ -2561,9 +2527,6 @@ def invariant_violations(
     ``foreign_key_check`` is therefore a maintenance verifier for pre-existing
     corruption, not a per-mutation safety primitive; callers on short write
     paths can omit it while still evaluating the semantic consistency checks.
-    The explicit owner-authority switch exists only for the sealed schema-12
-    recovery verifier, whose database predates those schema-13 tables but must
-    still run every invariant defined by its own authority generation.
     """
 
     violations: list[InvariantViolation] = []
@@ -2576,75 +2539,7 @@ def invariant_violations(
                 )
             )
 
-    if include_owner_authority:
-        metadata = connection.execute(
-            """
-            SELECT schema_version, migration_state
-            FROM schema_metadata WHERE singleton = 1
-            """
-        ).fetchone()
-        if (
-            metadata is not None
-            and int(metadata[0]) == SCHEMA_VERSION
-            and str(metadata[1]) == "ready"
-        ):
-            try:
-                execution_scope = repository_execution_scope(connection)
-            except (RepositoryExecutionScopeError, sqlite3.DatabaseError) as error:
-                violations.append(
-                    InvariantViolation(
-                        "ready_repository_execution_scope_invalid",
-                        "ready authority repository execution scope is invalid: "
-                        f"{error}",
-                    )
-                )
-            else:
-                executable_ids = {
-                    str(item["repository_id"])
-                    for item in execution_scope["executable_repositories"]
-                }
-                owner_ids = {
-                    str(row[0])
-                    for row in connection.execute(
-                        "SELECT repo_id FROM repository_owners"
-                    )
-                }
-                for repository_id in sorted(executable_ids - owner_ids):
-                    violations.append(
-                        InvariantViolation(
-                            "ready_repository_missing_owner_authority",
-                            "ready executable repository has no explicit "
-                            f"execution owner: {repository_id}",
-                        )
-                    )
-
     checks: Iterable[tuple[str, str, str]] = (
-        (
-            "repository_owner_generation_stale",
-            """
-            SELECT r.repo_id
-            FROM repositories r
-            JOIN repository_owners owner USING(repo_id)
-            WHERE owner.repository_generation != r.generation
-            """,
-            "repository owner authority is fenced to another repository generation",
-        ),
-        (
-            "repository_owner_ledger_mismatch",
-            """
-            SELECT owner.repo_id
-            FROM repository_owners owner
-            LEFT JOIN repository_owner_transfers transfer
-              ON transfer.repo_id = owner.repo_id
-             AND transfer.authority_generation = owner.authority_generation
-            WHERE transfer.transfer_id IS NULL
-               OR transfer.owner_uid != owner.owner_uid
-               OR transfer.repository_generation != owner.repository_generation
-               OR transfer.evidence_sha256 != owner.evidence_sha256
-               OR transfer.operation_id != owner.operation_id
-            """,
-            "repository owner authority does not match its immutable ledger head",
-        ),
         (
             "installed_missing_repository",
             """
@@ -2714,16 +2609,6 @@ def invariant_violations(
             "disabled repository retains an enabled startup policy",
         ),
         (
-            "membership_binding_repository_mismatch",
-            """
-            SELECT m.membership_id
-            FROM repository_memberships m
-            JOIN control_bindings b ON b.binding_id = m.control_binding_id
-            WHERE b.repo_id IS NOT NULL AND b.repo_id != m.repo_id
-            """,
-            "membership points to a control binding for another repository",
-        ),
-        (
             "successful_operation_incomplete_target",
             """
             SELECT DISTINCT o.operation_id
@@ -2790,7 +2675,7 @@ def invariant_violations(
             JOIN repository_families f USING(family_id)
             WHERE r.host_id != f.host_id
             """,
-            "repository scope crosses host authority",
+            "repository scope crosses hosts",
         ),
         (
             "repository_scope_partial_filesystem_identity",
@@ -2853,6 +2738,8 @@ def invariant_violations(
             SELECT resource.session_id || ':' || resource.resource_id
             FROM runtime_session_resources resource
             JOIN runtime_sessions session USING(session_id)
+            LEFT JOIN docker_resources docker
+              ON docker.docker_resource_id = resource.resource_id
             WHERE resource.resource_kind = 'docker'
               AND resource.cleanup_state IN ('active', 'retained')
               AND COALESCE(
@@ -2861,12 +2748,8 @@ def invariant_violations(
                   ''
               )
                   != 'reserved'
-              AND NOT EXISTS (
-                  SELECT 1 FROM repository_memberships membership
-                  WHERE membership.resource_kind = 'container'
-                    AND membership.host_resource_id = resource.resource_id
-                    AND membership.repo_id = session.repo_id
-              )
+              AND (docker.docker_resource_id IS NULL
+                   OR docker.repo_id != session.repo_id)
             """,
             "runtime Docker resource does not belong to its session repository",
         ),
@@ -2878,6 +2761,8 @@ def invariant_violations(
             JOIN runtime_sessions session USING(session_id)
             LEFT JOIN database_bindings binding
               ON binding.database_binding_id = resource.resource_id
+            LEFT JOIN docker_resources docker
+              ON docker.docker_resource_id = binding.docker_resource_id
             WHERE resource.resource_kind = 'database_stack'
               AND resource.cleanup_state IN ('active', 'retained')
               AND COALESCE(
@@ -2889,12 +2774,7 @@ def invariant_violations(
               AND (
                   binding.database_binding_id IS NULL
                   OR binding.repo_id != session.repo_id
-                  OR NOT EXISTS (
-                      SELECT 1 FROM repository_memberships membership
-                      WHERE membership.resource_kind = 'container'
-                        AND membership.host_resource_id = binding.docker_resource_id
-                        AND membership.repo_id = session.repo_id
-                  )
+                  OR docker.repo_id != session.repo_id
               )
             """,
             "runtime database resource does not belong to its session repository",
@@ -2960,15 +2840,7 @@ def invariant_violations(
             "worker crash event belongs to a different repository",
         ),
     )
-    owner_authority_codes = frozenset(
-        {
-            "repository_owner_generation_stale",
-            "repository_owner_ledger_mismatch",
-        }
-    )
     for code, sql, prefix in checks:
-        if not include_owner_authority and code in owner_authority_codes:
-            continue
         for row in connection.execute(sql):
             violations.append(InvariantViolation(code, f"{prefix}: {row[0]}"))
     return violations

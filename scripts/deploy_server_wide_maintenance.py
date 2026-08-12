@@ -832,20 +832,19 @@ class Driver:
             "-I",
             str(cli),
             "broker",
-            "migrate-profile-enrollments",
+            "migrate-store",
             "--database",
             str(DATABASE),
-            "--profile",
-            str(PROFILE),
         ]
-        self.run(arguments, timeout=120)
+        first = self.run(arguments, timeout=120)
         second = self.run(arguments, timeout=120)
         try:
-            document = json.loads(second.stdout)
+            first_document = json.loads(first.stdout)
+            second_document = json.loads(second.stdout)
         except json.JSONDecodeError as error:
-            raise DeploymentError("profile migration did not return JSON") from error
-        if int(document.get("inserted", -1)) != 0:
-            raise DeploymentError("profile migration is not idempotent")
+            raise DeploymentError("store migration did not return JSON") from error
+        if first_document != second_document:
+            raise DeploymentError("store migration is not idempotent")
 
     def installer(self, action: str) -> None:
         arguments = [

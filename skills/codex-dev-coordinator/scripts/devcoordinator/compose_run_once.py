@@ -140,7 +140,7 @@ class ComposeRunOnceReceiptContract:
 
 @dataclass(frozen=True)
 class ComposeRunOncePolicy:
-    """One exact service capability sealed during root enrollment."""
+    """One exact service capability sealed during root configuration."""
 
     name: str
     max_timeout_seconds: int

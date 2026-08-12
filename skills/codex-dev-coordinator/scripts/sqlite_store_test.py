@@ -310,7 +310,6 @@ class StoreTests(unittest.TestCase):
             required = {
                 "repositories",
                 "repository_installations",
-                "repository_memberships",
                 "startup_policies",
                 "startup_policy_restore_states",
                 "operations",
@@ -324,6 +323,14 @@ class StoreTests(unittest.TestCase):
                 "unassigned_resources",
             }
             self.assertTrue(required <= tables, required - tables)
+            self.assertTrue(
+                {
+                    "repository_memberships",
+                    "control_bindings",
+                    "repository_owners",
+                    "repository_owner_transfers",
+                }.isdisjoint(tables)
+            )
             indexes = {
                 row[0]
                 for row in store.connection.execute(
@@ -2137,7 +2144,7 @@ class StoreTests(unittest.TestCase):
                 {
                     row[0]
                     for row in store.connection.execute(
-                        "SELECT conflict_state FROM docker_ownership_claims WHERE docker_resource_id = ?",
+                        "SELECT conflict_state FROM docker_repository_hints WHERE docker_resource_id = ?",
                         (shared_resource,),
                     )
                 },

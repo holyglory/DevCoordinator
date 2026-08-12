@@ -11,7 +11,7 @@ import unittest
 import uuid
 from unittest import mock
 
-from devcoordinator import broker_enrollment
+from devcoordinator import broker_configuration
 from devcoordinator.broker_persistence import BrokerPersistence
 from devcoordinator.broker_profile import BrokerProfileError, profile_from_document
 from devcoordinator.ephemeral_secrets import (
@@ -231,7 +231,7 @@ class VolatileSecretManagerTests(unittest.TestCase):
                 self.assertTrue(mount.source_directory.is_dir())
 
 
-class SecretPolicyEnrollmentTests(unittest.TestCase):
+class SecretPolicyConfigurationTests(unittest.TestCase):
     def test_manifest_accepts_only_typed_nonsecret_policy(self) -> None:
         template = {
             "name": "artifact-db",
@@ -244,14 +244,14 @@ class SecretPolicyEnrollmentTests(unittest.TestCase):
             "secret_policy": _POLICY,
             **_QUOTAS,
         }
-        normalized = broker_enrollment._normalize_ephemeral_templates([template])
+        normalized = broker_configuration._normalize_ephemeral_templates([template])
         self.assertEqual(normalized[0]["secret_policy"], _POLICY)
         with self.assertRaises(ValueError):
-            broker_enrollment._normalize_ephemeral_templates(
+            broker_configuration._normalize_ephemeral_templates(
                 [{**template, "secret_policy": "plaintext_password_v1"}]
             )
         with self.assertRaises(ValueError):
-            broker_enrollment._normalize_ephemeral_templates(
+            broker_configuration._normalize_ephemeral_templates(
                 [{**template, "password": "must-never-be-accepted"}]
             )
         for environment, label in (
@@ -267,11 +267,11 @@ class SecretPolicyEnrollmentTests(unittest.TestCase):
         ):
             with self.subTest(label=label):
                 with self.assertRaisesRegex(ValueError, "SCRAM|auth method"):
-                    broker_enrollment._normalize_ephemeral_templates(
+                    broker_configuration._normalize_ephemeral_templates(
                         [{**template, "env": environment}]
                     )
 
-    def test_enrollment_persists_policy_and_opaque_binding_only(self) -> None:
+    def test_configuration_persists_policy_and_opaque_binding_only(self) -> None:
         template = {
             "name": "artifact-db",
             "image_ref": _IMAGE,
@@ -283,17 +283,16 @@ class SecretPolicyEnrollmentTests(unittest.TestCase):
             "secret_policy": _POLICY,
             **_QUOTAS,
         }
-        normalized = broker_enrollment._normalize_ephemeral_templates([template])
+        normalized = broker_configuration._normalize_ephemeral_templates([template])
         persistence = mock.Mock()
         template_id = deterministic_id("ephemeral-template", "repo-test", "artifact-db")
         persistence.provision_ephemeral_template.return_value = {"template_id": template_id}
-        result = broker_enrollment._provision_ephemeral_templates(
+        result = broker_configuration._provision_ephemeral_templates(
             persistence,
             repo_id="repo-test",
-            client_uid=os.geteuid(),
             templates=normalized,
         )
-        profile = broker_enrollment._ephemeral_secret_policy_profiles(
+        profile = broker_configuration._ephemeral_secret_policy_profiles(
             repo_id="repo-test", template_ids=result, templates=normalized
         )
         provisioned = persistence.provision_ephemeral_template.call_args.kwargs
@@ -319,55 +318,39 @@ class SecretPolicyEnrollmentTests(unittest.TestCase):
         root = "/tmp/profile-secret-policy-repository"
         binding_id = str(uuid.uuid4())
         document = {
-            "version": 1,
+            "version": 2,
             "service": {
                 "socket": "/run/devcoordinator-authority.sock",
-                "uid": 0,
-                "gid": 100,
-                "mode": "0660",
                 "database_generation": "generation-test",
             },
-            "clients": {
-                str(os.geteuid()): {
-                    "account_id": "account-test",
-                    "issued_at": "2026-07-24T00:00:00Z",
-                    "valid_until_epoch": 9_999_999_999,
-                    "repositories": [
-                        {
-                            "canonical_root": root,
-                            "repo_id": "repo-test",
-                            "generation": 0,
-                            "owner_uid": os.geteuid(),
-                            "servers": {},
-                            "containers": {},
-                            "compose_definition_id": None,
-                            "compose_container_ids": [],
-                            "compose_run_once_services": {},
-                            "ephemeral_templates": {"artifact-db": "template-test"},
-                            "ephemeral_image_prefetch_templates": [],
-                            "ephemeral_secret_policies": {
-                                "artifact-db": {
-                                    "policy": _POLICY,
-                                    "binding_id": binding_id,
-                                }
-                            },
-                            "account_id": "account-test",
-                            "enabled": True,
-                            "issued_at": "2026-07-24T00:00:00Z",
-                            "valid_until_epoch": 9_999_999_999,
+            "repositories": [
+                {
+                    "canonical_root": root,
+                    "repo_id": "repo-test",
+                    "generation": 0,
+                    "servers": {},
+                    "containers": {},
+                    "compose_definition_id": None,
+                    "compose_container_ids": [],
+                    "compose_run_once_services": {},
+                    "ephemeral_templates": {"artifact-db": "template-test"},
+                    "ephemeral_secret_policies": {
+                        "artifact-db": {
+                            "policy": _POLICY,
+                            "binding_id": binding_id,
                         }
-                    ],
+                    },
                 }
-            },
+            ],
         }
         profile = profile_from_document(document, effective_uid=os.geteuid())
         policy = profile.repository(root).ephemeral_secret_policy("artifact-db")
         self.assertIsNotNone(policy)
         self.assertEqual(policy.policy if policy else None, _POLICY)
         malformed = json.loads(json.dumps(document))
-        malformed["clients"][str(os.geteuid())]["repositories"][0][
-            "ephemeral_secret_policies"
-        ]["artifact-db"]["value"] = "must-never-appear"
+        malformed["repositories"][0]["ephemeral_secret_policies"]["artifact-db"][
+            "value"
+        ] = "must-never-appear"
         with self.assertRaises(BrokerProfileError):
             profile_from_document(malformed, effective_uid=os.geteuid())
 
@@ -394,62 +377,6 @@ class SecretPolicyEnrollmentTests(unittest.TestCase):
                 self.assertNotIn("password", columns)
         finally:
             connection.close()
-
-    def test_legacy_ephemeral_acl_is_upgraded_for_descriptor_authorization(
-        self,
-    ) -> None:
-        """Existing service stores gain the typed operation without a reset."""
-
-        with tempfile.TemporaryDirectory(
-            prefix="devcoordinator-secret-acl-migration-",
-            dir=str(Path("/tmp").resolve()),
-        ) as temporary:
-            database = Path(temporary) / "coordinator.sqlite3"
-            persistence = BrokerPersistence(database, expected_uid=os.geteuid())
-            with persistence._store() as store:
-                with store.immediate_transaction() as connection:
-                    connection.execute(
-                        "ALTER TABLE broker_ephemeral_acl RENAME TO broker_ephemeral_acl_current"
-                    )
-                    connection.execute(
-                        """
-                        CREATE TABLE broker_ephemeral_acl (
-                            uid INTEGER NOT NULL REFERENCES broker_acl_principals(uid) ON DELETE CASCADE,
-                            repo_id TEXT NOT NULL REFERENCES repositories(repo_id) ON DELETE CASCADE,
-                            template_id TEXT NOT NULL
-                                REFERENCES ephemeral_container_templates(template_id) ON DELETE CASCADE,
-                            operation TEXT NOT NULL CHECK(operation IN (
-                                'ephemeral.start', 'ephemeral.status',
-                                'ephemeral.renew', 'ephemeral.finish'
-                            )),
-                            enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0, 1)),
-                            updated_at TEXT NOT NULL,
-                            PRIMARY KEY(uid, repo_id, template_id, operation)
-                        )
-                        """
-                    )
-                    connection.execute("DROP TABLE broker_ephemeral_acl_current")
-
-            persistence.initialize()
-            with persistence._store() as store:
-                with store.read_transaction() as connection:
-                    table_sql = str(
-                        connection.execute(
-                            """
-                            SELECT sql FROM sqlite_master
-                            WHERE type = 'table' AND name = 'broker_ephemeral_acl'
-                            """
-                        ).fetchone()[0]
-                    )
-                    lookup_index = connection.execute(
-                        """
-                        SELECT 1 FROM sqlite_master
-                        WHERE type = 'index' AND name = 'broker_ephemeral_acl_lookup'
-                        """
-                    ).fetchone()
-            self.assertIn("ephemeral.secret_fd", table_sql)
-            self.assertIsNotNone(lookup_index)
-
 
 if __name__ == "__main__":
     unittest.main()

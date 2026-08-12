@@ -95,18 +95,12 @@ class MaintenanceTests(unittest.TestCase):
     def _client(self) -> BrokerClient:
         return BrokerClient(
             self.socket,
-            expected_broker_uid=self.uid,
-            expected_socket_gid=self.gid,
             maintenance_root=self.maintenance_runtime,
         )
 
     def test_absent_marker_does_not_change_broker_admission(self) -> None:
         self.assertIsNone(
-            load_maintenance_state(
-                expected_uid=self.uid,
-                expected_gid=self.gid,
-                maintenance_root=self.maintenance_runtime,
-            )
+            load_maintenance_state(maintenance_root=self.maintenance_runtime)
         )
 
     def test_marker_identity_mapping_does_not_affect_clients(self) -> None:
@@ -127,7 +121,6 @@ class MaintenanceTests(unittest.TestCase):
             maintenance_module, "MAINTENANCE_ROOT", self.maintenance_runtime
         ), mock.patch.object(Path, "lstat", new=unmapped_root):
             state = load_maintenance_state(
-                expected_uid=0,
                 maintenance_root=self.maintenance_runtime,
             )
 
@@ -136,7 +129,6 @@ class MaintenanceTests(unittest.TestCase):
 
         with mock.patch.object(Path, "lstat", new=unmapped_root):
             custom = load_maintenance_state(
-                expected_uid=0,
                 maintenance_root=self.maintenance_runtime,
             )
         self.assertIsNotNone(custom)
@@ -162,8 +154,6 @@ class MaintenanceTests(unittest.TestCase):
         unrelated_socket_gid = marker.stat().st_gid + 1
         client = BrokerClient(
             self.socket,
-            expected_broker_uid=self.uid,
-            expected_socket_gid=unrelated_socket_gid,
             maintenance_root=self.maintenance_runtime,
         )
 
@@ -341,11 +331,7 @@ class MaintenanceTests(unittest.TestCase):
                 started_at=str(first["started_at"]),
                 maintenance_root=self.maintenance_runtime,
             )
-        current = load_maintenance_state(
-            expected_uid=self.uid,
-            expected_gid=self.gid,
-            maintenance_root=self.maintenance_runtime,
-        )
+        current = load_maintenance_state(maintenance_root=self.maintenance_runtime)
         self.assertIsNotNone(current)
         self.assertEqual(current.deployment_id, first["deployment_id"])
 

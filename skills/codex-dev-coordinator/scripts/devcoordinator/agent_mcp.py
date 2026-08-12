@@ -106,7 +106,7 @@ def _annotations(
         "readOnlyHint": read_only,
         "destructiveHint": destructive,
         "idempotentHint": idempotent,
-        # The authority is the closed set of locally enrolled repositories,
+        # The authority is the closed set of locally configured repositories,
         # targets, durable operations, and test runs; none of these tools search
         # or mutate an unbounded external entity space.
         "openWorldHint": False,
@@ -141,11 +141,11 @@ def _tool(
 
 
 _SELECTOR = _string_schema(
-    "Exact immutable target ID or unique enrolled display name."
+    "Exact immutable target ID or unique configured display name."
 )
 _KIND = {
     "type": "string",
-    "description": "Optional enrolled target kind filter.",
+    "description": "Optional configured target kind filter.",
     "enum": list(_RESOURCE_KINDS),
 }
 _HANDLE = _string_schema(
@@ -181,7 +181,7 @@ TOOLS: tuple[dict[str, Any], ...] = (
     _tool(
         "runtime_status",
         "Runtime status",
-        "Read fresh bounded status for one exact enrolled runtime target.",
+        "Read fresh bounded status for one exact configured runtime target.",
         _object_schema(
             {"selector": _SELECTOR, "kind": _KIND}, required=("selector",)
         ),
@@ -293,7 +293,7 @@ TOOLS: tuple[dict[str, Any], ...] = (
         "Report Coordinator bug",
         (
             "Atomically report one bounded reproducible Coordinator defect through "
-            "the out-of-band registry; no broker, profile, repository enrollment, "
+            "the out-of-band registry; no broker, profile, repository configuration, "
             "API, or testd connection is required."
         ),
         _object_schema(

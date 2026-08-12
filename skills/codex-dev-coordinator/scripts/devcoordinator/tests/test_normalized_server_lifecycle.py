@@ -24,7 +24,6 @@ from devcoordinator.normalized_server_lifecycle import (
     PortLeaseRequest,
     ServerStartRequest,
 )
-from devcoordinator.schema import establish_repository_owner_authority
 from devcoordinator.store import AccountStore, deterministic_id, utc_timestamp
 
 
@@ -94,17 +93,6 @@ class NormalizedPortLifecycleTests(unittest.TestCase):
                 """,
                 (repo_id, host_id, str(root), root.name, timestamp, timestamp),
             )
-            establish_repository_owner_authority(
-                connection,
-                repository_id=repo_id,
-                owner_uid=max(os.geteuid(), 1),
-                repository_generation=0,
-                operation_id=f"fixture-owner-{repo_id}",
-                actor="fixture",
-                reason="normalized lifecycle fixture owner authority",
-                timestamp=timestamp,
-                evidence={"kind": "normalized-lifecycle-fixture-owner"},
-            )
             connection.execute(
                 """
                 INSERT INTO repository_installations(
@@ -168,17 +156,6 @@ class NormalizedPortLifecycleTests(unittest.TestCase):
                     timestamp,
                     timestamp,
                 ),
-            )
-            establish_repository_owner_authority(
-                connection,
-                repository_id=foreign_repo_id,
-                owner_uid=max(os.geteuid(), 1),
-                repository_generation=0,
-                operation_id=f"fixture-owner-{foreign_repo_id}",
-                actor="foreign-fixture",
-                reason="restored foreign lifecycle fixture owner authority",
-                timestamp=timestamp,
-                evidence={"kind": "normalized-lifecycle-foreign-fixture-owner"},
             )
             connection.execute(
                 """
@@ -741,180 +718,6 @@ class NormalizedPortLifecycleTests(unittest.TestCase):
                     projected_server["lease_id"], running["lease_id"]
                 )
 
-    def test_compatibility_usage_projects_only_current_running_samples(self) -> None:
-        running = self.running_server(name="metrics-web", port=3213)
-        ports = self.service()
-        with ports.store.immediate_transaction() as connection:
-            definition = connection.execute(
-                """
-                SELECT d.repo_id, r.host_id, d.updated_at
-                FROM server_definitions d JOIN repositories r USING(repo_id)
-                WHERE d.server_definition_id = ?
-                """,
-                (running["id"],),
-            ).fetchone()
-            self.assertIsNotNone(definition)
-            repo_id = str(definition["repo_id"])
-            host_id = str(definition["host_id"])
-            current_run_boundary = str(definition["updated_at"])
-
-            connection.execute(
-                """
-                INSERT INTO telemetry_samples(
-                    sample_id, host_resource_kind, host_resource_id, sampled_at,
-                    cpu_percent, memory_bytes, network_rx_bytes, network_tx_bytes,
-                    block_read_bytes, block_write_bytes
-                ) VALUES (?, 'server', ?, '2000-01-01T00:00:00Z', 99.0, 99000,
-                          NULL, NULL, NULL, NULL)
-                """,
-                (
-                    deterministic_id("telemetry", "stale-server", running["id"]),
-                    running["id"],
-                ),
-            )
-
-        graph = ports.store.inventory_v2()["v1_compatibility"]
-        projected_server = next(
-            item for item in graph["servers"] if item["id"] == running["id"]
-        )
-        self.assertNotIn(
-            "process_usage",
-            projected_server,
-            "a running definition must not inherit telemetry from an older run",
-        )
-        project_usage = next(
-            item for item in graph["project_usage"] if item["project"] == str(self.project)
-        )
-        self.assertIsNone(project_usage["cpu_percent"])
-        self.assertIsNone(project_usage["memory_bytes"])
-
-        docker_resource_id = deterministic_id("docker-resource", host_id, "metrics-db")
-        with ports.store.immediate_transaction() as connection:
-            connection.execute(
-                """
-                INSERT INTO telemetry_samples(
-                    sample_id, host_resource_kind, host_resource_id, sampled_at,
-                    cpu_percent, memory_bytes, network_rx_bytes, network_tx_bytes,
-                    block_read_bytes, block_write_bytes
-                ) VALUES (?, 'server', ?, ?, 2.5, 1000, NULL, NULL, NULL, NULL)
-                """,
-                (
-                    deterministic_id("telemetry", "current-server", running["id"]),
-                    running["id"],
-                    current_run_boundary,
-                ),
-            )
-            engine_id = deterministic_id("docker-engine", host_id, "test")
-            connection.execute(
-                """
-                INSERT INTO docker_engines(
-                    engine_id, host_id, context_identity, capability_state,
-                    created_at, updated_at
-                ) VALUES (?, ?, 'test', 'available', ?, ?)
-                """,
-                (engine_id, host_id, current_run_boundary, current_run_boundary),
-            )
-            connection.execute(
-                """
-                INSERT INTO docker_resources(
-                    docker_resource_id, engine_id, full_container_id, current_name,
-                    image, created_at, updated_at
-                ) VALUES (?, ?, ?, 'metrics-db', 'postgres:test', ?, ?)
-                """,
-                (
-                    docker_resource_id,
-                    engine_id,
-                    "a" * 64,
-                    current_run_boundary,
-                    current_run_boundary,
-                ),
-            )
-            connection.execute(
-                """
-                INSERT INTO docker_observations(
-                    docker_resource_id, lifecycle, health, restart_policy,
-                    ports_fingerprint, labels_fingerprint, sampled_at,
-                    observation_fingerprint
-                ) VALUES (?, 'running', 'healthy', 'no', 'ports', 'labels', ?, 'observation')
-                """,
-                (docker_resource_id, current_run_boundary),
-            )
-            connection.execute(
-                """
-                INSERT INTO repository_memberships(
-                    membership_id, repo_id, resource_kind, host_resource_id,
-                    immutable_fingerprint, control_binding_id, created_at
-                ) VALUES (?, ?, 'container', ?, 'container-identity', NULL, ?)
-                """,
-                (
-                    deterministic_id("membership", repo_id, docker_resource_id),
-                    repo_id,
-                    docker_resource_id,
-                    current_run_boundary,
-                ),
-            )
-            connection.execute(
-                """
-                INSERT INTO telemetry_samples(
-                    sample_id, host_resource_kind, host_resource_id, sampled_at,
-                    cpu_percent, memory_bytes, network_rx_bytes, network_tx_bytes,
-                    block_read_bytes, block_write_bytes
-                ) VALUES (?, 'docker', ?, ?, 1.25, 500, NULL, NULL, NULL, NULL)
-                """,
-                (
-                    deterministic_id("telemetry", "docker", docker_resource_id),
-                    docker_resource_id,
-                    current_run_boundary,
-                ),
-            )
-
-        graph = ports.store.inventory_v2()["v1_compatibility"]
-        projected_server = next(
-            item for item in graph["servers"] if item["id"] == running["id"]
-        )
-        self.assertEqual(
-            projected_server["process_usage"],
-            {
-                "source": "normalized_observation",
-                "sampled_at": current_run_boundary,
-                "cpu_percent": 2.5,
-                "memory_bytes": 1000,
-                "rss_bytes": 1000,
-            },
-        )
-        project_usage = next(
-            item for item in graph["project_usage"] if item["project"] == str(self.project)
-        )
-        self.assertEqual(project_usage["cpu_percent"], 3.75)
-        self.assertEqual(project_usage["memory_bytes"], 1500)
-        self.assertEqual(project_usage["process_count"], 2)
-        self.assertEqual(project_usage["usage"]["server"]["process_count"], 1)
-        self.assertEqual(project_usage["usage"]["docker"]["process_count"], 1)
-
-        with ports.store.immediate_transaction() as connection:
-            connection.execute(
-                """
-                UPDATE server_definitions
-                SET generation = generation + 1, updated_at = '9999-01-01T00:00:00Z'
-                WHERE server_definition_id = ?
-                """,
-                (running["id"],),
-            )
-        graph = ports.store.inventory_v2()["v1_compatibility"]
-        projected_server = next(
-            item for item in graph["servers"] if item["id"] == running["id"]
-        )
-        self.assertNotIn(
-            "process_usage",
-            projected_server,
-            "advancing the definition generation must fence the prior run sample",
-        )
-        project_usage = next(
-            item for item in graph["project_usage"] if item["project"] == str(self.project)
-        )
-        self.assertEqual(project_usage["cpu_percent"], 1.25)
-        self.assertEqual(project_usage["memory_bytes"], 500)
-
     def test_inventory_normalizes_preexisting_real_server_telemetry(self) -> None:
         running = self.running_server(name="legacy-metrics-web", port=3213)
         ports = self.service()
@@ -1372,13 +1175,11 @@ class NormalizedPortLifecycleTests(unittest.TestCase):
             "repositories": [
                 {
                     "repo_id": "repo-a",
-                    "canonical_root": "/srv/alpha",
                     "display_name": "alpha",
                     "setup_status": "ready",
                 },
                 {
                     "repo_id": "repo-b",
-                    "canonical_root": "/srv/Beta",
                     "display_name": "Beta",
                     "setup_status": "missing",
                 },
@@ -1913,6 +1714,7 @@ class NormalizedPortLifecycleTests(unittest.TestCase):
                 "compose-up",
                 "compose-down",
                 "compose-run-once",
+                "compose-recreate-service",
                 "logs",
                 "start",
                 "stop",

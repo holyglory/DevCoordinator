@@ -124,14 +124,14 @@ struct RepositoryServerConflict: Equatable, Sendable, Identifiable {
     }
 }
 
-struct RepositoryServerMembershipConflict: Equatable, Sendable, Identifiable {
+struct RepositoryServerAssociationConflict: Equatable, Sendable, Identifiable {
     let id: String
     let repositories: [RepositoryIdentity]
     let activeSourceIdentities: [ResourceIdentity]
     let claimedPaths: [String]
 
     var message: String {
-        "One server resource is claimed by several repository paths. Resolve its ownership before acting."
+        "One server resource is claimed by several repository paths. Resolve its association before acting."
     }
 }
 
@@ -142,14 +142,14 @@ struct RepositoryManagedServer: Equatable, Sendable, Identifiable {
     let representative: ManagedServer
     let observations: [RepositoryServerObservation]
     let conflict: RepositoryServerConflict?
-    let membershipConflicts: [RepositoryServerMembershipConflict]
-    let controlCandidates: [CoordinatorOrigin]
+    let associationConflicts: [RepositoryServerAssociationConflict]
+    let routeCandidates: [CoordinatorOrigin]
     let actionOrigin: CoordinatorOrigin?
 
     var id: String { identity.id }
     var sourceIdentities: [ResourceIdentity] { observations.map(\.sourceIdentity) }
     var sourceOrigins: Set<CoordinatorOrigin> { Set(observations.map { $0.sourceIdentity.origin }) }
-    var isActionBlocked: Bool { conflict != nil || !membershipConflicts.isEmpty || actionOrigin == nil }
+    var isActionBlocked: Bool { conflict != nil || !associationConflicts.isEmpty || actionOrigin == nil }
 }
 
 struct RepositoryDockerIdentity: Codable, Hashable, Sendable, Identifiable, Comparable {
@@ -163,7 +163,7 @@ struct RepositoryDockerIdentity: Codable, Hashable, Sendable, Identifiable, Comp
     }
 }
 
-struct RepositoryDockerMembershipConflict: Equatable, Sendable, Identifiable {
+struct RepositoryDockerAssociationConflict: Equatable, Sendable, Identifiable {
     let resource: RepositoryDockerIdentity
     let repositories: [RepositoryIdentity]
     let sourceIdentities: [ResourceIdentity]
@@ -171,7 +171,7 @@ struct RepositoryDockerMembershipConflict: Equatable, Sendable, Identifiable {
 
     var id: String { resource.id }
     var message: String {
-        "One physical Docker container is claimed by several repository paths. Resolve its ownership before acting."
+        "One physical Docker container is claimed by several repository paths. Resolve its association before acting."
     }
 }
 
@@ -182,8 +182,8 @@ struct RepositoryDockerResource: Equatable, Sendable, Identifiable {
     let representative: DockerContainer
     let observations: [RepositoryDockerObservation]
     let repositoryCandidates: [RepositoryIdentity]
-    let membershipError: String?
-    let controlCandidates: [CoordinatorOrigin]
+    let associationError: String?
+    let routeCandidates: [CoordinatorOrigin]
 
     var id: String { identity.id }
     var sourceIdentities: [ResourceIdentity] { observations.map(\.sourceIdentity) }
@@ -217,18 +217,18 @@ struct RepositoryAggregate: Equatable, Sendable, Identifiable {
     let servers: [RepositoryManagedServer]
     let docker: [RepositoryDockerResource]
     let usage: RepositoryUsage
-    let controlOrigin: CoordinatorOrigin?
-    let serverMembershipConflicts: [RepositoryServerMembershipConflict]
-    let dockerMembershipConflicts: [RepositoryDockerMembershipConflict]
+    let routeOrigin: CoordinatorOrigin?
+    let serverAssociationConflicts: [RepositoryServerAssociationConflict]
+    let dockerAssociationConflicts: [RepositoryDockerAssociationConflict]
 
     var id: String { identity.id }
     var displayName: String { identity.displayName }
     var serverConflicts: [RepositoryServerConflict] { servers.compactMap(\.conflict) }
     var projectActionsBlocked: Bool {
-        controlOrigin == nil
+        routeOrigin == nil
             || !serverConflicts.isEmpty
-            || !serverMembershipConflicts.isEmpty
-            || !dockerMembershipConflicts.isEmpty
+            || !serverAssociationConflicts.isEmpty
+            || !dockerAssociationConflicts.isEmpty
     }
 }
 
@@ -280,18 +280,18 @@ struct ProjectGroup: Equatable {
     var databases: [DockerContainer]
     var usage: ProjectUsage?
     var kind: ProjectGroupKind = .repository
-    var controlOrigin: CoordinatorOrigin? = nil
+    var routeOrigin: CoordinatorOrigin? = nil
     var observedOrigins: [CoordinatorOrigin] = []
     var serverConflicts: [RepositoryServerConflict] = []
-    var serverMembershipConflicts: [RepositoryServerMembershipConflict] = []
-    var dockerMembershipConflicts: [RepositoryDockerMembershipConflict] = []
+    var serverAssociationConflicts: [RepositoryServerAssociationConflict] = []
+    var dockerAssociationConflicts: [RepositoryDockerAssociationConflict] = []
     var unassignedEvidenceCount = 0
-    var usesCatalogControlBinding = false
+    var usesCatalogRouting = false
 
     var hasObservedDockerRuntime: Bool {
         !containers.isEmpty
             || !databases.isEmpty
-            || !dockerMembershipConflicts.isEmpty
+            || !dockerAssociationConflicts.isEmpty
             || (usage?.containerCount ?? 0) > 0
     }
 
@@ -299,8 +299,8 @@ struct ProjectGroup: Equatable {
     var projectActionsBlocked: Bool {
         actionOrigin == nil
             || !serverConflicts.isEmpty
-            || !serverMembershipConflicts.isEmpty
-            || !dockerMembershipConflicts.isEmpty
+            || !serverAssociationConflicts.isEmpty
+            || !dockerAssociationConflicts.isEmpty
     }
 
     /// Existing focused tests and hand-built fixtures predate the catalog and
@@ -308,7 +308,7 @@ struct ProjectGroup: Equatable {
     /// catalog groups use the explicit binding, including an intentional nil
     /// when several legacy sources cannot be routed safely.
     var actionOrigin: CoordinatorOrigin? {
-        if usesCatalogControlBinding { return controlOrigin }
+        if usesCatalogRouting { return routeOrigin }
         let origins = Set(
             servers.compactMap(\.origin)
                 + containers.compactMap(\.origin)
@@ -338,13 +338,13 @@ func makeProjectGroups(from catalog: RepositoryCatalog, inventory: Inventory) ->
         }
         let servers = aggregate.servers.map { service -> ManagedServer in
             var server = service.representative
-            server.ownershipCandidates = Array(service.sourceOrigins).sorted { $0.id < $1.id }
+            server.routeCandidates = Array(service.sourceOrigins).sorted { $0.id < $1.id }
             server.observationOrigins = service.sourceOrigins.sorted { $0.id < $1.id }
             if let actionOrigin = service.actionOrigin {
                 server.origin = actionOrigin
             }
-            server.ownershipError = service.conflict?.message
-                ?? service.membershipConflicts.first?.message
+            server.associationError = service.conflict?.message
+                ?? service.associationConflicts.first?.message
                 ?? (service.actionOrigin == nil
                     ? "Several coordinator sources retain this server definition; choose an authoritative source before acting."
                     : nil)
@@ -363,10 +363,10 @@ func makeProjectGroups(from catalog: RepositoryCatalog, inventory: Inventory) ->
                 else { return database }
                 var database = database
                 if database.origin == nil { database.origin = physical.origin }
-                if database.ownershipCandidates.isEmpty {
-                    database.ownershipCandidates = physical.ownershipCandidates
+                if database.routeCandidates.isEmpty {
+                    database.routeCandidates = physical.routeCandidates
                 }
-                if database.ownershipError == nil { database.ownershipError = physical.ownershipError }
+                if database.associationError == nil { database.associationError = physical.associationError }
                 database.observationOrigins = physical.observationOrigins
                 return database
             }
@@ -390,7 +390,7 @@ func makeProjectGroups(from catalog: RepositoryCatalog, inventory: Inventory) ->
             processes: nil,
             hotProcesses: aggregate.usage.hotProcesses
         )
-        usage.origin = aggregate.controlOrigin
+        usage.origin = aggregate.routeOrigin
         return ProjectGroup(
             id: aggregate.identity.repoID.map { "repo:\($0)" }
                 ?? "path:\(aggregate.identity.canonicalRoot)",
@@ -402,12 +402,12 @@ func makeProjectGroups(from catalog: RepositoryCatalog, inventory: Inventory) ->
             databases: databases,
             usage: usage,
             kind: .repository,
-            controlOrigin: aggregate.controlOrigin,
+            routeOrigin: aggregate.routeOrigin,
             observedOrigins: aggregate.sourceObservations.map(\.origin),
             serverConflicts: aggregate.serverConflicts,
-            serverMembershipConflicts: aggregate.serverMembershipConflicts,
-            dockerMembershipConflicts: aggregate.dockerMembershipConflicts,
-            usesCatalogControlBinding: true
+            serverAssociationConflicts: aggregate.serverAssociationConflicts,
+            dockerAssociationConflicts: aggregate.dockerAssociationConflicts,
+            usesCatalogRouting: true
         )
     }
 
@@ -443,11 +443,11 @@ func makeProjectGroups(from catalog: RepositoryCatalog, inventory: Inventory) ->
                 databases: unassignedDatabases,
                 usage: nil,
                 kind: .unassigned,
-                controlOrigin: nil,
+                routeOrigin: nil,
                 observedOrigins: origins.sorted { $0.id < $1.id },
                 serverConflicts: [],
                 unassignedEvidenceCount: catalog.unassigned.usageObservations.count,
-                usesCatalogControlBinding: true
+                usesCatalogRouting: true
             )
         )
     }
@@ -467,8 +467,8 @@ private func unassignedServerPresentations(
         .map { observation -> ManagedServer in
             var server = observation.server
             server.observationOrigins = [observation.sourceIdentity.origin]
-            if server.ownershipCandidates.isEmpty {
-                server.ownershipCandidates = [observation.sourceIdentity.origin]
+            if server.routeCandidates.isEmpty {
+                server.routeCandidates = [observation.sourceIdentity.origin]
             }
             return server
         }
@@ -477,15 +477,15 @@ private func unassignedServerPresentations(
         var server = ranked.server
         let origins = Set(group.map { $0.sourceIdentity.origin }).sorted { $0.id < $1.id }
         server.observationOrigins = origins
-        server.ownershipCandidates = origins
-        server.ownershipError = group.compactMap { $0.server.ownershipError }.first
+        server.routeCandidates = origins
+        server.associationError = group.compactMap { $0.server.associationError }.first
         return server
     }
     return deduplicatedManagedServers(activePhysical + stoppedOrUnknown)
         .sorted { ($0.name.lowercased(), $0.id) < ($1.name.lowercased(), $1.id) }
 }
 
-func projectMembershipKey(originID: String?, nativeID: String) -> String {
+func projectAssociationKey(originID: String?, nativeID: String) -> String {
     "\(originID ?? "unknown")|\(nativeID)"
 }
 
@@ -526,16 +526,16 @@ func repositoryCatalogConflictHealthSignals(_ catalog: RepositoryCatalog) -> [Re
                 reason: conflict.message
             )
         }
-        for conflict in repository.serverMembershipConflicts {
+        for conflict in repository.serverAssociationConflicts {
             append(
-                id: "server-membership:\(conflict.id)",
+                id: "server-association:\(conflict.id)",
                 origins: conflict.activeSourceIdentities.map { $0.origin },
                 reason: conflict.message
             )
         }
-        for conflict in repository.dockerMembershipConflicts {
+        for conflict in repository.dockerAssociationConflicts {
             append(
-                id: "docker-membership:\(conflict.id)",
+                id: "docker-association:\(conflict.id)",
                 origins: conflict.sourceIdentities.map { $0.origin },
                 reason: conflict.message
             )
@@ -600,7 +600,7 @@ private func repositoryDockerNativeID(_ container: DockerContainer) -> String? {
 /// Metrics freshness and mutation authority are separate. The catalog keeps
 /// every raw observation and may choose a freshest sample for aggregation,
 /// while `OpsStore.mergeInventories` has already resolved coordinator-sidecar
-/// or Compose ownership for actions. Reuse that exact merged row for visible
+/// or Compose association for actions. Reuse that exact merged row for visible
 /// identity so selection and mutation cannot drift to a different observer.
 private func repositoryDockerPresentation(
     _ resource: RepositoryDockerResource,
@@ -613,15 +613,15 @@ private func repositoryDockerPresentation(
     }
     var container = merged ?? resource.representative
     container.observationOrigins = resource.sourceOrigins.sorted { $0.id < $1.id }
-    if let membershipError = resource.membershipError {
+    if let associationError = resource.associationError {
         container.origin = nil
-        container.ownershipError = membershipError
+        container.associationError = associationError
     }
-    if container.ownershipCandidates.isEmpty {
+    if container.routeCandidates.isEmpty {
         if let origin = container.origin {
-            container.ownershipCandidates = [origin]
+            container.routeCandidates = [origin]
         } else {
-            container.ownershipCandidates = resource.sourceOrigins.sorted { $0.id < $1.id }
+            container.routeCandidates = resource.sourceOrigins.sorted { $0.id < $1.id }
         }
     }
     return container
@@ -649,12 +649,12 @@ private struct MutableRepositorySourceObservation {
 
 private struct PendingRepositoryDockerObservation {
     let observation: RepositoryDockerObservation
-    let membership: RepositoryMembershipResolution
+    let association: RepositoryAssociationResolution
 }
 
 private struct PendingRepositoryServerObservation {
     let observation: RepositoryServerObservation
-    let membership: RepositoryMembershipResolution
+    let association: RepositoryAssociationResolution
 }
 
 /// A raw path claim remains evidence even when the path is missing or is not a
@@ -675,7 +675,7 @@ private struct RepositoryPathClaim: Hashable {
     }
 }
 
-private struct RepositoryMembershipResolution {
+private struct RepositoryAssociationResolution {
     let claims: [RepositoryPathClaim]
 
     init(_ claims: Set<RepositoryPathClaim>) {
@@ -712,8 +712,8 @@ private struct RepositoryCatalogBuilder {
             let containers = primaryDockerContainers(in: source.inventory).map {
                 normalizedContainer($0, origin: origin)
             }
-            var serverMemberships: [String: Set<RepositoryPathClaim>] = [:]
-            var dockerMemberships: [String: Set<RepositoryPathClaim>] = [:]
+            var serverAssociations: [String: Set<RepositoryPathClaim>] = [:]
+            var dockerAssociations: [String: Set<RepositoryPathClaim>] = [:]
 
             for rawUsage in source.inventory.projectUsage {
                 var usage = rawUsage
@@ -723,10 +723,10 @@ private struct RepositoryCatalogBuilder {
                     unassignedUsage.append(usage)
                     if let claim {
                         for nativeID in usage.serverIDs ?? [] {
-                            serverMemberships[nativeID, default: []].insert(claim)
+                            serverAssociations[nativeID, default: []].insert(claim)
                         }
                         for name in usage.containerNames ?? [] {
-                            dockerMemberships[name, default: []].insert(claim)
+                            dockerAssociations[name, default: []].insert(claim)
                         }
                     }
                     continue
@@ -740,17 +740,17 @@ private struct RepositoryCatalogBuilder {
                     usage: usage
                 )
                 for nativeID in usage.serverIDs ?? [] {
-                    if let claim { serverMemberships[nativeID, default: []].insert(claim) }
+                    if let claim { serverAssociations[nativeID, default: []].insert(claim) }
                 }
                 for name in usage.containerNames ?? [] {
-                    if let claim { dockerMemberships[name, default: []].insert(claim) }
+                    if let claim { dockerAssociations[name, default: []].insert(claim) }
                 }
             }
 
             for server in servers {
                 let sourceIdentity = server.resourceIdentity
                     ?? ResourceIdentity(origin: origin, kind: .server, nativeID: server.coordinatorID ?? server.id)
-                var claims = serverMemberships[server.coordinatorID ?? server.id] ?? []
+                var claims = serverAssociations[server.coordinatorID ?? server.id] ?? []
                 if let explicit = RepositoryPathClaim(projectPath: server.project) {
                     claims.insert(explicit)
                 }
@@ -758,14 +758,14 @@ private struct RepositoryCatalogBuilder {
                 pendingServers.append(
                     PendingRepositoryServerObservation(
                         observation: observation,
-                        membership: RepositoryMembershipResolution(claims)
+                        association: RepositoryAssociationResolution(claims)
                     )
                 )
             }
 
             for container in containers {
                 guard let sourceIdentity = sourceDockerIdentity(container, origin: origin) else { continue }
-                var claims = container.name.flatMap { dockerMemberships[$0] } ?? []
+                var claims = container.name.flatMap { dockerAssociations[$0] } ?? []
                 if let explicit = RepositoryPathClaim(projectPath: container.project) {
                     claims.insert(explicit)
                 }
@@ -773,7 +773,7 @@ private struct RepositoryCatalogBuilder {
                 pendingDocker.append(
                     PendingRepositoryDockerObservation(
                         observation: observation,
-                        membership: RepositoryMembershipResolution(claims)
+                        association: RepositoryAssociationResolution(claims)
                     )
                 )
             }
@@ -781,7 +781,7 @@ private struct RepositoryCatalogBuilder {
 
         var serverBuckets: [RepositoryIdentity: [RepositoryServerObservation]] = [:]
         var unassignedServers: [RepositoryServerObservation] = []
-        var serverMembershipConflicts: [RepositoryIdentity: [RepositoryServerMembershipConflict]] = [:]
+        var serverAssociationConflicts: [RepositoryIdentity: [RepositoryServerAssociationConflict]] = [:]
         // A damaged or partially migrated state file can repeat one native
         // server row. Reconcile its claims without letting duplicate keys trap
         // the Board process; presentation still collapses the observations to
@@ -789,28 +789,28 @@ private struct RepositoryCatalogBuilder {
         var pendingServerClaimsByIdentity: [ResourceIdentity: Set<RepositoryPathClaim>] = [:]
         for pending in pendingServers {
             pendingServerClaimsByIdentity[pending.observation.sourceIdentity, default: []]
-                .formUnion(pending.membership.claims)
+                .formUnion(pending.association.claims)
         }
         var resolvedServerRepositories: [ResourceIdentity: RepositoryIdentity] = [:]
-        var serverConflictByIdentity: [ResourceIdentity: RepositoryServerMembershipConflict] = [:]
+        var serverConflictByIdentity: [ResourceIdentity: RepositoryServerAssociationConflict] = [:]
 
         func retainServerConflict(
             observations: [RepositoryServerObservation],
-            membership: RepositoryMembershipResolution
+            association: RepositoryAssociationResolution
         ) {
             let sourceIdentities = observations.map(\.sourceIdentity).sorted()
-            let conflict = RepositoryServerMembershipConflict(
-                id: (sourceIdentities.map(\.rawValue) + membership.resolutionKeys.sorted())
+            let conflict = RepositoryServerAssociationConflict(
+                id: (sourceIdentities.map(\.rawValue) + association.resolutionKeys.sorted())
                     .joined(separator: "||"),
-                repositories: membership.repositories,
+                repositories: association.repositories,
                 activeSourceIdentities: sourceIdentities,
-                claimedPaths: membership.claimedPaths
+                claimedPaths: association.claimedPaths
             )
             for identity in sourceIdentities { serverConflictByIdentity[identity] = conflict }
-            for repository in membership.repositories {
+            for repository in association.repositories {
                 repositories.insert(repository)
-                if serverMembershipConflicts[repository, default: []].contains(where: { $0.id == conflict.id }) == false {
-                    serverMembershipConflicts[repository, default: []].append(conflict)
+                if serverAssociationConflicts[repository, default: []].contains(where: { $0.id == conflict.id }) == false {
+                    serverAssociationConflicts[repository, default: []].append(conflict)
                 }
             }
         }
@@ -823,12 +823,12 @@ private struct RepositoryCatalogBuilder {
             .map(\.observation)
             .filter { isActiveServerObservation($0.server) }
         for physicalGroup in physicalServerGroups(activeServerObservations) {
-            let membership = RepositoryMembershipResolution(
+            let association = RepositoryAssociationResolution(
                 Set(physicalGroup.flatMap { pendingServerClaimsByIdentity[$0.sourceIdentity] ?? [] })
             )
-            if membership.isConflicting {
-                retainServerConflict(observations: physicalGroup, membership: membership)
-            } else if let repository = membership.repository {
+            if association.isConflicting {
+                retainServerConflict(observations: physicalGroup, association: association)
+            } else if let repository = association.repository {
                 for observation in physicalGroup {
                     resolvedServerRepositories[observation.sourceIdentity] = repository
                 }
@@ -839,9 +839,9 @@ private struct RepositoryCatalogBuilder {
         // corroboration. Their own complete claim set must still fail closed.
         for pending in pendingServers where resolvedServerRepositories[pending.observation.sourceIdentity] == nil
             && serverConflictByIdentity[pending.observation.sourceIdentity] == nil {
-            if pending.membership.isConflicting {
-                retainServerConflict(observations: [pending.observation], membership: pending.membership)
-            } else if let repository = pending.membership.repository {
+            if pending.association.isConflicting {
+                retainServerConflict(observations: [pending.observation], association: pending.association)
+            } else if let repository = pending.association.repository {
                 resolvedServerRepositories[pending.observation.sourceIdentity] = repository
             }
         }
@@ -851,8 +851,8 @@ private struct RepositoryCatalogBuilder {
             if let conflict = serverConflictByIdentity[identity] {
                 var server = pending.observation.server
                 server.origin = nil
-                server.ownershipError = conflict.message
-                server.ownershipCandidates = Set(conflict.activeSourceIdentities.map { $0.origin })
+                server.associationError = conflict.message
+                server.routeCandidates = Set(conflict.activeSourceIdentities.map { $0.origin })
                     .sorted { $0.id < $1.id }
                 unassignedServers.append(
                     RepositoryServerObservation(sourceIdentity: identity, server: server)
@@ -875,16 +875,16 @@ private struct RepositoryCatalogBuilder {
 
         var dockerBuckets: [RepositoryIdentity: [RepositoryDockerObservation]] = [:]
         var unassignedDocker: [RepositoryDockerResource] = []
-        var dockerMembershipConflicts: [RepositoryIdentity: [RepositoryDockerMembershipConflict]] = [:]
+        var dockerAssociationConflicts: [RepositoryIdentity: [RepositoryDockerAssociationConflict]] = [:]
         var resolvedDockerUsageKeys = Set<String>()
         let physicalDocker = Dictionary(grouping: pendingDocker) {
             dockerCatalogIdentity($0.observation)
         }
         for (identity, pending) in physicalDocker {
             let observations = pending.map(\.observation)
-            let membership = RepositoryMembershipResolution(Set(pending.flatMap { $0.membership.claims }))
-            let candidates = membership.repositories
-            if !membership.isConflicting, let repository = membership.repository {
+            let association = RepositoryAssociationResolution(Set(pending.flatMap { $0.association.claims }))
+            let candidates = association.repositories
+            if !association.isConflicting, let repository = association.repository {
                 repositories.insert(repository)
                 dockerBuckets[repository, default: []].append(contentsOf: observations)
                 for observation in observations {
@@ -904,18 +904,18 @@ private struct RepositoryCatalogBuilder {
                     )
                 }
             } else {
-                let membershipConflict = membership.isConflicting
-                    ? RepositoryDockerMembershipConflict(
+                let associationConflict = association.isConflicting
+                    ? RepositoryDockerAssociationConflict(
                         resource: identity,
                         repositories: candidates,
                         sourceIdentities: observations.map(\.sourceIdentity).sorted(),
-                        claimedPaths: membership.claimedPaths
+                        claimedPaths: association.claimedPaths
                     )
                     : nil
-                if let membershipConflict {
+                if let associationConflict {
                     for repository in candidates {
                         repositories.insert(repository)
-                        dockerMembershipConflicts[repository, default: []].append(membershipConflict)
+                        dockerAssociationConflicts[repository, default: []].append(associationConflict)
                     }
                 }
                 unassignedDocker.append(
@@ -923,7 +923,7 @@ private struct RepositoryCatalogBuilder {
                         identity: identity,
                         observations: observations,
                         repositoryCandidates: candidates,
-                        membershipError: membershipConflict?.message
+                        associationError: associationConflict?.message
                     )
                 )
             }
@@ -938,7 +938,7 @@ private struct RepositoryCatalogBuilder {
             let servers = buildManagedServers(
                 repository: repository,
                 observations: serverBuckets[repository] ?? [],
-                membershipConflicts: serverMembershipConflicts[repository] ?? []
+                associationConflicts: serverAssociationConflicts[repository] ?? []
             )
             let docker = buildDockerResources(
                 observations: dockerBuckets[repository] ?? [],
@@ -955,9 +955,9 @@ private struct RepositoryCatalogBuilder {
                 servers: servers,
                 docker: docker,
                 usage: aggregateUsage(servers: servers, docker: docker),
-                controlOrigin: conservativeControlOrigin(servers: servers, docker: docker),
-                serverMembershipConflicts: serverMembershipConflicts[repository] ?? [],
-                dockerMembershipConflicts: dockerMembershipConflicts[repository] ?? []
+                routeOrigin: conservativeRouteOrigin(servers: servers, docker: docker),
+                serverAssociationConflicts: serverAssociationConflicts[repository] ?? [],
+                dockerAssociationConflicts: dockerAssociationConflicts[repository] ?? []
             )
         }
 
@@ -1054,7 +1054,7 @@ private func updateSourceObservation(
 private func buildManagedServers(
     repository: RepositoryIdentity,
     observations: [RepositoryServerObservation],
-    membershipConflicts: [RepositoryServerMembershipConflict]
+    associationConflicts: [RepositoryServerAssociationConflict]
 ) -> [RepositoryManagedServer] {
     let buckets = Dictionary(grouping: observations) {
         RepositoryLogicalServerIdentity(repository: repository, serviceName: $0.server.name)
@@ -1069,39 +1069,39 @@ private func buildManagedServers(
                 activeSourceIdentities: active.map(\.sourceIdentity).sorted()
             )
             : nil
-        let membershipConflicts = membershipConflicts.filter { membershipConflict in
-            !Set(membershipConflict.activeSourceIdentities).isDisjoint(with: sorted.map(\.sourceIdentity))
+        let associationConflicts = associationConflicts.filter { associationConflict in
+            !Set(associationConflict.activeSourceIdentities).isDisjoint(with: sorted.map(\.sourceIdentity))
         }
         let representative = sorted.max(by: { serverObservationRank($0) < serverObservationRank($1) })!.server
-        let controlCandidates = possibleServerControlOrigins(
+        let routeCandidates = possibleServerRouteOrigins(
             observations: sorted,
             active: active,
             conflict: conflict,
-            membershipConflicts: membershipConflicts
+            associationConflicts: associationConflicts
         )
-        let actionOrigin = controlCandidates.count == 1 ? controlCandidates[0] : nil
+        let actionOrigin = routeCandidates.count == 1 ? routeCandidates[0] : nil
         return RepositoryManagedServer(
             identity: identity,
             representative: representative,
             observations: sorted,
             conflict: conflict,
-            membershipConflicts: membershipConflicts,
-            controlCandidates: controlCandidates,
+            associationConflicts: associationConflicts,
+            routeCandidates: routeCandidates,
             actionOrigin: actionOrigin
         )
     }
     .sorted { $0.identity < $1.identity }
 }
 
-private func possibleServerControlOrigins(
+private func possibleServerRouteOrigins(
     observations: [RepositoryServerObservation],
     active: [RepositoryServerObservation],
     conflict: RepositoryServerConflict?,
-    membershipConflicts: [RepositoryServerMembershipConflict]
+    associationConflicts: [RepositoryServerAssociationConflict]
 ) -> [CoordinatorOrigin] {
-    guard conflict == nil, membershipConflicts.isEmpty else { return [] }
+    guard conflict == nil, associationConflicts.isEmpty else { return [] }
 
-    // One active source is the only current controller even when other homes
+    // One active source is the only current route even when other homes
     // retain stale stopped definitions. Multiple active source records remain
     // ambiguous even when they happen to observe the same PID/listener: each
     // coordinator would update a different lease and lifecycle journal.
@@ -1221,7 +1221,7 @@ private func buildDockerResources(
             identity: identity,
             observations: bucket,
             repositoryCandidates: repositoryCandidates,
-            membershipError: nil
+            associationError: nil
         )
     }
     .sorted { $0.identity < $1.identity }
@@ -1231,7 +1231,7 @@ private func buildDockerResource(
     identity: RepositoryDockerIdentity,
     observations: [RepositoryDockerObservation],
     repositoryCandidates: [RepositoryIdentity],
-    membershipError: String?
+    associationError: String?
 ) -> RepositoryDockerResource {
     let sorted = observations.sorted { $0.sourceIdentity < $1.sourceIdentity }
     let representative = sorted.max(by: { dockerObservationRank($0) < dockerObservationRank($1) })!.container
@@ -1240,21 +1240,21 @@ private func buildDockerResource(
         representative: representative,
         observations: sorted,
         repositoryCandidates: repositoryCandidates,
-        membershipError: membershipError,
-        controlCandidates: dockerControlCandidates(
+        associationError: associationError,
+        routeCandidates: dockerRouteCandidates(
             observations: sorted,
             repositoryCandidates: repositoryCandidates,
-            membershipError: membershipError
+            associationError: associationError
         )
     )
 }
 
-private func dockerControlCandidates(
+private func dockerRouteCandidates(
     observations: [RepositoryDockerObservation],
     repositoryCandidates: [RepositoryIdentity],
-    membershipError: String?
+    associationError: String?
 ) -> [CoordinatorOrigin] {
-    guard repositoryCandidates.count == 1, membershipError == nil else { return [] }
+    guard repositoryCandidates.count == 1, associationError == nil else { return [] }
     let sidecarOrigins = Set(observations.compactMap { observation -> CoordinatorOrigin? in
         observation.container.metadataSource == "coordinator_sidecar"
             ? observation.sourceIdentity.origin
@@ -1277,14 +1277,14 @@ private func dockerObservationRank(_ observation: RepositoryDockerObservation) -
     )
 }
 
-private func conservativeControlOrigin(
+private func conservativeRouteOrigin(
     servers: [RepositoryManagedServer],
     docker: [RepositoryDockerResource]
 ) -> CoordinatorOrigin? {
     // A whole-project command is routed only through a source that can prove
     // coverage for every logical server and every Docker sidecar/Compose
     // resource. Display aggregation stays independent from this binding.
-    let constraints = servers.map(\.controlCandidates) + docker.map(\.controlCandidates)
+    let constraints = servers.map(\.routeCandidates) + docker.map(\.routeCandidates)
     guard !constraints.isEmpty, constraints.allSatisfy({ !$0.isEmpty }) else { return nil }
     var candidates = Set(constraints[0])
     for constraint in constraints.dropFirst() {

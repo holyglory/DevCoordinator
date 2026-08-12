@@ -5,8 +5,8 @@ The acceptance deliberately uses a fresh client process for every step.  It
 proves that a normal non-root developer caller can start a bounded service, recover the
 durable operation from a second process, receive an exact-port collision error,
 and rely on broker-owned TTL cleanup.  When the production fixture is not yet
-enrolled the same run also proves first-use adoption.  Later deployments report
-an enrolled-repository smoke honestly instead of claiming to repeat adoption.
+configured the same run also proves first-use adoption.  Later deployments report
+an configured-repository smoke honestly instead of claiming to repeat adoption.
 Source tests exercise both states without adding disposable broker records.
 
 The acceptance never calls systemd or inspects broker storage directly.
@@ -210,7 +210,7 @@ class Client:
         self,
         arguments: Sequence[str],
         *,
-        expect_ok: bool,
+        expect_ok: bool | None,
         timeout: float = 90.0,
     ) -> dict[str, Any]:
         completed = subprocess.run(
@@ -225,7 +225,7 @@ class Client:
         )
         document = _json_document(completed)
         actual_ok = completed.returncode == 0 and document.get("ok") is True
-        if actual_ok != expect_ok:
+        if expect_ok is not None and actual_ok != expect_ok:
             if document.get("ok") is False:
                 # The client already validated and bounded this public error
                 # envelope.  Preserve it verbatim so an acceptance failure does
@@ -258,6 +258,25 @@ def _fetch(
             "temporary development server returned an unexpected page"
         )
     return payload
+
+
+def _fetch_when_ready(port: int, *, deadline: float) -> bytes:
+    """Allow a newly listening development server to finish its cold page build."""
+
+    last_error: OSError | None = None
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        try:
+            return _fetch(port)
+        except OSError as error:
+            last_error = error
+            time.sleep(min(0.2, max(0.0, remaining)))
+    raise FirstUseAcceptanceError(
+        "temporary development server opened its port but did not return the page "
+        "before the cold-start deadline: " + _bounded(last_error or "timed out")
+    )
 
 
 def _tcp_listener_present(port: int, *, timeout: float = 0.25) -> bool:
@@ -407,6 +426,65 @@ def _require_ttl_terminal_visibility(
         )
 
 
+def _wait_for_ttl_terminal_visibility(
+    *,
+    client: Client,
+    common: Sequence[str],
+    service_id: str,
+    deadline: float,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Wait for the active catalog and retained status projections to agree.
+
+    The broker-owned TTL unit can stop before the observer publishes the next
+    inventory snapshot.  A removed listener is therefore necessary but not
+    sufficient evidence that both read surfaces have converged.
+    """
+
+    last_targets: dict[str, Any] | None = None
+    last_status: dict[str, Any] | None = None
+    while time.monotonic() < deadline:
+        last_targets = client.call(
+            ("targets", service_id, "--kind", "service", *common),
+            expect_ok=None,
+        )
+        last_status = client.call(
+            ("runtime", "status", service_id, "--kind", "service", *common),
+            expect_ok=True,
+        )
+        try:
+            _require_ttl_terminal_visibility(
+                targets=last_targets,
+                status=last_status,
+                service_id=service_id,
+            )
+        except FirstUseAcceptanceError:
+            selected = last_targets.get("selected")
+            target = last_status.get("target")
+            target_is_exact = (
+                last_targets.get("ok") is False
+                and last_targets.get("code") == "target_not_found"
+            ) or (
+                last_targets.get("ok") is True
+                and isinstance(selected, Mapping)
+                and selected.get("id") == service_id
+            )
+            status_is_exact = (
+                isinstance(target, Mapping)
+                and target.get("id") == service_id
+                and last_status.get("classification") in {"ready", "expired"}
+            )
+            if not target_is_exact or not status_is_exact:
+                raise
+            time.sleep(0.2)
+            continue
+        return last_targets, last_status
+    raise FirstUseAcceptanceError(
+        "TTL cleanup listener stopped, but active and terminal projections did "
+        "not converge before the deadline: "
+        + _bounded({"targets": last_targets, "status": last_status})
+    )
+
+
 def run(argv: Sequence[str] | None = None) -> dict[str, Any]:
     args = _parser().parse_args(argv)
     application_cwd = Path(args.cwd)
@@ -428,15 +506,15 @@ def run(argv: Sequence[str] | None = None) -> dict[str, Any]:
     initial = client.call(("capabilities", *common), expect_ok=True)
     repository = initial.get("repository")
     if not isinstance(repository, Mapping) or repository.get("state") not in {
-        "enrolled",
-        "unenrolled",
+        "configured",
+        "unconfigured",
     }:
-        raise FirstUseAcceptanceError("pure discovery did not return repository enrollment state")
+        raise FirstUseAcceptanceError("pure discovery did not return repository configuration state")
     initial_state = str(repository["state"])
-    adoption_exercised = initial_state == "unenrolled"
+    adoption_exercised = initial_state == "unconfigured"
     targets = client.call(("targets", *common), expect_ok=True)
     if adoption_exercised and targets.get("target_count") != 0:
-        raise FirstUseAcceptanceError("unenrolled pure discovery invented runtime targets")
+        raise FirstUseAcceptanceError("unconfigured pure discovery invented runtime targets")
 
     port = _select_ephemeral_port() if args.auto_port else requested_port
     attempted_ports: set[int] = set()
@@ -503,14 +581,14 @@ def run(argv: Sequence[str] | None = None) -> dict[str, Any]:
             ttl_seconds=args.ttl_seconds,
             caller_uid=client.caller_uid,
         )
-        _fetch(port)
+        _fetch_when_ready(port, deadline=time.monotonic() + 10.0)
         continuation = serve.get("continuation")
         if not isinstance(continuation, str):
             raise FirstUseAcceptanceError("temporary service omitted its operation continuation")
 
         fresh = client.call(("capabilities", *common), expect_ok=True)
         fresh_repository = fresh.get("repository")
-        if not isinstance(fresh_repository, Mapping) or fresh_repository.get("state") != "enrolled":
+        if not isinstance(fresh_repository, Mapping) or fresh_repository.get("state") != "configured":
             raise FirstUseAcceptanceError("fresh client did not observe first-use repository adoption")
         visible_targets = client.call(
             ("targets", service_id, "--kind", "service", *common),
@@ -618,18 +696,11 @@ def run(argv: Sequence[str] | None = None) -> dict[str, Any]:
         raise FirstUseAcceptanceError(
             "broker-owned TTL cleanup did not remove the exact TCP listener"
         )
-    expired_target = client.call(
-        ("targets", service_id, "--kind", "service", *common),
-        expect_ok=False,
-    )
-    expired_status = client.call(
-        ("runtime", "status", service_id, "--kind", "service", *common),
-        expect_ok=True,
-    )
-    _require_ttl_terminal_visibility(
-        targets=expired_target,
-        status=expired_status,
+    expired_target, expired_status = _wait_for_ttl_terminal_visibility(
+        client=client,
+        common=common,
         service_id=service_id,
+        deadline=time.monotonic() + 20,
     )
     return {
         "ok": True,
@@ -637,13 +708,13 @@ def run(argv: Sequence[str] | None = None) -> dict[str, Any]:
         "acceptance_mode": (
             "first-use-adoption"
             if adoption_exercised
-            else "enrolled-repository-smoke"
+            else "configured-repository-smoke"
         ),
         "project": client.project.name,
         "caller_user": client.caller_user,
         "caller_uid": client.caller_uid,
         "initial_repository_state": initial_state,
-        "fresh_repository_state": "enrolled",
+        "fresh_repository_state": "configured",
         "repository_adoption_exercised": adoption_exercised,
         "first_use_runtime_proved": adoption_exercised,
         "service_id": service_id,

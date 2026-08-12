@@ -50,3 +50,6 @@ ProtectKernelModules=yes
 ProtectControlGroups=yes
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 ReadWritePaths=/var/lib/devcoordinator-console /var/lib/devcoordinator-bugs /run/devcoordinator-console
+
+[Install]
+WantedBy=multi-user.target

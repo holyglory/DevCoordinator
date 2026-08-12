@@ -12,6 +12,8 @@ import argparse
 import json
 import os
 from pathlib import Path
+import shlex
+import stat
 import sys
 import time
 from typing import Any, Mapping, Sequence
@@ -37,7 +39,7 @@ _REPOSITORY_ADOPTION_FAILURE_CODES = frozenset(
         "repository_adoption_invariant_failed",
         "repository_adoption_store_failed",
         "repository_context_invalid",
-        "repository_owner_authority_failed",
+        "repository_catalog_registration_failed",
     }
 )
 
@@ -75,6 +77,29 @@ def _add_scoped_project(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _operation_follow_command(handle: str, *, project: str | None) -> str:
+    command = "devcoordinator operation"
+    if isinstance(project, str) and project:
+        command += f" --project {shlex.quote(project)}"
+    return f"{command} follow {shlex.quote(handle)}"
+
+
+def _scope_test_result(
+    result: Mapping[str, Any], *, project: str
+) -> dict[str, Any]:
+    """Keep generated test continuations independent of the caller's cwd."""
+
+    document = dict(result)
+    next_command = document.get("next_command")
+    if isinstance(next_command, str) and next_command.startswith(
+        "devcoordinator test "
+    ):
+        document["next_command"] = (
+            f"{next_command} --project {shlex.quote(project)}"
+        )
+    return document
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = _Parser(
         prog="devcoordinator",
@@ -101,8 +126,41 @@ def _parser() -> argparse.ArgumentParser:
     targets.add_argument("--limit", type=int, default=4)
     _add_scoped_project(targets)
 
+    storage = commands.add_parser(
+        "storage",
+        help="read Docker storage, remove one selected container, or plan/apply volume deletion",
+    )
+    storage.add_argument(
+        "action", choices=("inventory", "remove", "plan", "apply")
+    )
+    storage.add_argument(
+        "target_kind",
+        nargs="?",
+        choices=("container", "image", "volume", "build_cache"),
+    )
+    storage.add_argument("target_id", nargs="?")
+    storage.add_argument(
+        "--reason",
+        default=None,
+        help="bounded reason for direct container removal or a volume cleanup plan",
+    )
+    storage.add_argument("--plan", help="durable cleanup plan UUID returned by storage plan")
+    storage.add_argument(
+        "--fingerprint",
+        help="exact durable plan fingerprint returned by storage plan",
+    )
+    storage.add_argument(
+        "--confirm",
+        help="exact target-bound confirmation phrase returned by storage plan",
+    )
+    storage.add_argument(
+        "--operation-id",
+        help="canonical operation UUID for idempotent plan/apply replay",
+    )
+    _add_scoped_project(storage)
+
     runtime = commands.add_parser(
-        "runtime", help="execute one exact enrolled runtime lifecycle action"
+        "runtime", help="execute one exact configured runtime lifecycle action"
     )
     runtime.add_argument(
         "action",
@@ -114,6 +172,7 @@ def _parser() -> argparse.ArgumentParser:
             "start",
             "stop",
             "restart",
+            "replace",
         ),
     )
     runtime.add_argument(
@@ -134,7 +193,7 @@ def _parser() -> argparse.ArgumentParser:
     runtime.add_argument("--ttl-seconds", type=int)
     runtime.add_argument(
         "--cwd",
-        help="repository-relative working directory for runtime serve",
+        help="repository-relative working directory for runtime serve or replace",
     )
     runtime.add_argument(
         "--port", type=int, help="exact fixed TCP port for runtime serve"
@@ -163,6 +222,18 @@ def _parser() -> argparse.ArgumentParser:
     runtime.add_argument(
         "--operation-id",
         help="canonical UUID to replay a prior mutation exactly",
+    )
+    runtime.add_argument(
+        "--expected-generation",
+        type=int,
+        help="current service definition generation required by runtime replace",
+    )
+    runtime.add_argument(
+        "--env",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="one literal environment value for runtime replace; repeat as needed",
     )
     _add_scoped_project(runtime)
 
@@ -217,6 +288,52 @@ def _parser() -> argparse.ArgumentParser:
     )
     _add_scoped_project(follow)
 
+    for action, help_text in (
+        ("status", "read compact current state for one run"),
+        ("summary", "read the bounded terminal summary for one run"),
+    ):
+        command = test_actions.add_parser(action, help=help_text)
+        command.add_argument("run", help="dc1:run handle or exact run ID")
+        _add_scoped_project(command)
+
+    failures = test_actions.add_parser(
+        "failures", help="read one cursor-bounded page of actionable failures"
+    )
+    failures.add_argument("run", help="dc1:run handle or exact run ID")
+    failures.add_argument("--after")
+    failures.add_argument("--limit", type=int, default=10)
+    _add_scoped_project(failures)
+
+    artifact = test_actions.add_parser(
+        "artifact", help="resolve one exact verified test artifact"
+    )
+    artifact.add_argument("run", help="dc1:run handle or exact run ID")
+    artifact.add_argument("artifact", help="exact artifact ID")
+    _add_scoped_project(artifact)
+
+    wait = test_actions.add_parser(
+        "wait", help="wait for one run up to an explicit bounded deadline"
+    )
+    wait.add_argument("run", help="dc1:run handle or exact run ID")
+    wait.add_argument("--timeout-seconds", type=int, required=True)
+    _add_scoped_project(wait)
+
+    cancel = test_actions.add_parser(
+        "cancel", help="request cancellation of one exact run"
+    )
+    cancel.add_argument("run", help="dc1:run handle or exact run ID")
+    cancel.add_argument("--reason", required=True)
+    cancel.add_argument("--operation-id")
+    _add_scoped_project(cancel)
+
+    retry = test_actions.add_parser(
+        "retry", help="retry only failed work from one exact run"
+    )
+    retry.add_argument("run", help="dc1:run handle or exact run ID")
+    retry.add_argument("--failed-only", action="store_true", required=True)
+    retry.add_argument("--operation-id")
+    _add_scoped_project(retry)
+
     # Bug intake is intentionally registered on the stable agent client but
     # executes before repository/profile/authority discovery.  The dedicated
     # devcoordinator-bug wrapper exposes the same actions during a wider
@@ -230,9 +347,14 @@ def _parser() -> argparse.ArgumentParser:
 def _repository_context(namespace: argparse.Namespace) -> Any:
     from .repository_context import resolve_effective_repository_context
 
-    return resolve_effective_repository_context(
+    context = resolve_effective_repository_context(
         project=getattr(namespace, "project", None) or os.getcwd()
     )
+    # Preserve the resolved canonical scope for any failure/continuation
+    # emitted after discovery.  The resulting command can be followed from a
+    # different working directory without silently selecting another repo.
+    namespace._resolved_project = context.effective.canonical_root
+    return context
 
 
 def _profile_and_capabilities(
@@ -251,9 +373,9 @@ def _profile_and_capabilities(
             "the protected broker profile is unavailable",
             classification="shared_authority_required",
         )
-    # Capabilities describe the host authority, not repository enrollment.
+    # Capabilities describe the host authority, not repository configuration.
     # Route this read through any current transport anchor so a valid new Git
-    # root can discover its truthful unenrolled/bootstrap state without a
+    # root can discover its truthful unconfigured/bootstrap state without a
     # mutation hidden inside a read command.
     if execution_state is not None:
         execution_state["broker_contacted"] = None
@@ -301,7 +423,7 @@ def _target_projection(
     if repository is None:
         if selector is not None:
             raise AgentCliError(
-                "repository_unenrolled",
+                "repository_unconfigured",
                 "runtime targets are unavailable until the first start-like mutation adopts this repository",
                 classification="repository_bootstrap_required",
             )
@@ -310,7 +432,7 @@ def _target_projection(
                 "schema_version": 1,
                 "ok": True,
                 "repository": {
-                    "state": "unenrolled",
+                    "state": "unconfigured",
                     "kind": context.project_kind,
                     "bootstrap_supported": True,
                 },
@@ -339,7 +461,7 @@ def _runtime_target(
     selector: str,
     kind: str | None,
 ) -> dict[str, Any]:
-    """Resolve an exact enrolled ID locally, otherwise use fresh inventory.
+    """Resolve an exact configured ID locally, otherwise use fresh inventory.
 
     Protected profile values are immutable authority identities, not ownership
     guesses.  Display names, database bindings, and ambiguous cross-kind values
@@ -398,7 +520,7 @@ def _require_resolved_repository(profile: Any, canonical_root: str) -> Any:
     repository = profile.resolve_repository(canonical_root)
     if repository is None:
         raise AgentCliError(
-            "repository_unenrolled",
+            "repository_unconfigured",
             "this repository has not been adopted; run one start-like runtime command first",
             classification="repository_bootstrap_required",
         )
@@ -485,6 +607,136 @@ def _validate_runtime_serve_namespace(
     return argv, launch_timeout_seconds, kill_after_run
 
 
+def _replacement_environment(values: Sequence[str]) -> dict[str, str]:
+    environment: dict[str, str] = {}
+    for item in values:
+        key, separator, value = str(item).partition("=")
+        if (
+            not separator
+            or not key
+            or key in environment
+            or "\x00" in key
+            or "\x00" in value
+        ):
+            raise AgentCliError(
+                "replacement_environment_invalid",
+                "runtime replace requires unique literal --env KEY=VALUE entries",
+            )
+        environment[key] = value
+    return environment
+
+
+def _declared_compose_selector(root: str, selector: str) -> bool:
+    """Return whether the exact selector is declared by the bounded manifest.
+
+    This check only decides whether a missing target may trigger the already
+    sealed Compose definition.  The authority remains the source of the files,
+    environment, ownership and operation grant used for the mutation.
+    """
+
+    manifest = Path(root) / ".codex" / "dev-runtime.json"
+    try:
+        metadata = manifest.lstat()
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or manifest.is_symlink()
+            or metadata.st_size > 2 * 1024 * 1024
+        ):
+            return False
+        document = json.loads(manifest.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return False
+    if not isinstance(document, Mapping):
+        return False
+    declared: set[str] = set()
+    docker = document.get("docker")
+    if isinstance(docker, Mapping):
+        services = docker.get("services")
+        if isinstance(services, list):
+            declared.update(
+                value for value in services if isinstance(value, str) and value
+            )
+    dependencies = document.get("dependencies")
+    if isinstance(dependencies, list):
+        for dependency in dependencies:
+            if not isinstance(dependency, Mapping):
+                continue
+            for field in ("name", "service", "container"):
+                value = dependency.get(field)
+                if isinstance(value, str) and value:
+                    declared.add(value)
+    return selector in declared
+
+
+def _bootstrap_declared_compose_target(
+    *, profile: Any, context: Any, selector: str, operation_id: str
+) -> None:
+    from .broker import BrokerOperation
+
+    effective = _require_resolved_repository(
+        profile, context.effective.canonical_root
+    )
+    if not _declared_compose_selector(
+        context.effective.canonical_root, selector
+    ):
+        raise AgentCliError(
+            "target_not_found",
+            "target selector matched no authoritative resource and is not declared by this repository manifest",
+        )
+    try:
+        compose_id = effective.compose_id()
+    except BaseException:
+        configuration_operation_id = str(
+            uuid.uuid5(
+                uuid.UUID(operation_id),
+                "repository.compose.ensure:"
+                + context.effective.canonical_root,
+            )
+        )
+        profile.ensure_repository_with_outcome(
+            canonical_root=context.effective.canonical_root,
+            project_kind=(
+                "temporary" if context.temporary is not None else "primary"
+            ),
+            agent=_attribution(),
+            operation_id=configuration_operation_id,
+        )
+        effective = profile.refresh_repository(
+            context.effective.canonical_root
+        )
+        if effective is None:
+            raise AgentCliError(
+                "compose_bootstrap_unavailable",
+                "the repository was adopted but its declared Compose definition was not published",
+                classification="repository_bootstrap_failed",
+            )
+        try:
+            compose_id = effective.compose_id()
+        except BaseException as error:
+            raise AgentCliError(
+                "compose_bootstrap_unavailable",
+                "the repository was adopted but its declared Compose definition could not be sealed; correct the returned manifest or Compose error and retry",
+                classification="repository_bootstrap_failed",
+            ) from error
+    child_operation_id = str(
+        uuid.uuid5(uuid.UUID(operation_id), "compose.bootstrap:" + selector)
+    )
+    returned_id, report = profile.call(
+        repository=effective,
+        resource_id=compose_id,
+        operation=BrokerOperation.COMPOSE_UP,
+        arguments={},
+        operation_id=child_operation_id,
+    )
+    if returned_id != child_operation_id or not isinstance(report, Mapping):
+        raise AgentCliError(
+            "compose_bootstrap_reply_invalid",
+            "Compose bootstrap returned contradictory operation evidence",
+            classification="invalid_reply",
+            phase="transport",
+        )
+
+
 def _runtime(
     namespace: argparse.Namespace,
     *,
@@ -520,13 +772,13 @@ def _runtime(
 
         # One agent command owns both first-use adoption and launch.  Separate
         # deterministic mutation IDs let each durable broker operation replay
-        # exactly without asking the caller to orchestrate an enrollment step.
+        # exactly without asking the caller to orchestrate an configuration step.
         scopes = [(context.root, "primary")]
         if context.temporary is not None:
             scopes.append((context.effective, "temporary"))
         for scope, project_kind in scopes:
-            was_enrolled = (
-                profile.repository_if_enrolled(scope.canonical_root) is not None
+            was_configured = (
+                profile.repository_if_configured(scope.canonical_root) is not None
             )
             ensure_operation_id = str(
                 uuid.uuid5(
@@ -534,20 +786,22 @@ def _runtime(
                     "repository.ensure:" + scope.canonical_root,
                 )
             )
-            if not was_enrolled and execution_state is not None:
+            if not was_configured and execution_state is not None:
                 execution_state["broker_contacted"] = None
             try:
-                _repository, enrollment_changed = (
+                _repository, configuration_changed = (
                     profile.ensure_repository_with_outcome(
                         canonical_root=scope.canonical_root,
-                        owner_uid=scope.root_owner_uid,
                         project_kind=project_kind,
                         agent=agent,
                         operation_id=ensure_operation_id,
+                        transport_timeout_seconds=float(
+                            launch_timeout_seconds + 30
+                        ),
                     )
                 )
             except BaseException as error:
-                if not was_enrolled and execution_state is not None:
+                if not was_configured and execution_state is not None:
                     execution_state["broker_contacted"] = _broker_contact_from_error(
                         error
                     )
@@ -567,9 +821,9 @@ def _runtime(
                     except (AttributeError, TypeError):
                         pass
                 raise
-            if not was_enrolled and execution_state is not None:
+            if not was_configured and execution_state is not None:
                 execution_state["broker_contacted"] = True
-            if enrollment_changed and execution_state is not None:
+            if configuration_changed and execution_state is not None:
                 execution_state["mutation_performed"] = True
 
         root = _require_resolved_repository(
@@ -661,25 +915,69 @@ def _runtime(
             or namespace.ttl_seconds is not None
             or namespace.keep_alive is not None
             or namespace.rearm_crash_loop
+            or namespace.cwd is not None
+            or namespace.port is not None
+            or namespace.launch_timeout_seconds is not None
+            or namespace.kill_after_run is not None
+            or namespace.expected_generation is not None
+            or namespace.env
+            or getattr(namespace, "argv", [])
         ):
             raise AgentCliError(
                 "ensure_option_forbidden",
                 "runtime ensure accepts only selector, --desired, --kind, and --operation-id",
             )
-        target = _runtime_target(
-            profile=profile,
-            context=context,
-            selector=namespace.selector,
-            kind=namespace.kind,
-        )
+        operation_id = _canonical_operation_id(namespace.operation_id, mutate=True)
+        namespace.operation_id = operation_id
+        assert operation_id is not None
+        if namespace.desired == "ready":
+            scopes = [(context.root, "primary")]
+            if context.temporary is not None:
+                scopes.append((context.effective, "temporary"))
+            for scope, project_kind in scopes:
+                catalog_operation_id = str(
+                    uuid.uuid5(
+                        uuid.UUID(operation_id),
+                        "repository.catalog:" + scope.canonical_root,
+                    )
+                )
+                profile.ensure_repository_with_outcome(
+                    canonical_root=scope.canonical_root,
+                    project_kind=project_kind,
+                    agent=_attribution(),
+                    operation_id=catalog_operation_id,
+                )
+        try:
+            target = _runtime_target(
+                profile=profile,
+                context=context,
+                selector=namespace.selector,
+                kind=namespace.kind,
+            )
+        except BaseException as error:
+            if (
+                namespace.desired != "ready"
+                or getattr(error, "code", None) != "target_not_found"
+            ):
+                raise
+            _bootstrap_declared_compose_target(
+                profile=profile,
+                context=context,
+                selector=namespace.selector,
+                operation_id=operation_id,
+            )
+            target = _runtime_target(
+                profile=profile,
+                context=context,
+                selector=namespace.selector,
+                kind=namespace.kind,
+            )
         root = _require_resolved_repository(
             profile, context.root.canonical_root
         )
         effective = _require_resolved_repository(
             profile, context.effective.canonical_root
         )
-        operation_id = _canonical_operation_id(namespace.operation_id, mutate=True)
-        namespace.operation_id = operation_id
         report = profile.runtime_ensure(
             repository=effective,
             resource_id=str(target["id"]),
@@ -703,8 +1001,9 @@ def _runtime(
         operation_handle = continuation_handle("operation", operation_id)
         result["continuation"] = operation_handle
         if result.get("ok") is not True:
-            result["next_command"] = (
-                f"devcoordinator operation follow {operation_handle}"
+            result["next_command"] = _operation_follow_command(
+                operation_handle,
+                project=context.effective.canonical_root,
             )
         return require_agent_result(
             result, surface="runtime ensure", maximum_bytes=2 * 1024
@@ -714,16 +1013,18 @@ def _runtime(
         raise AgentCliError(
             "desired_state_forbidden", "--desired applies only to runtime ensure"
         )
-    if (
+    if namespace.action != "replace" and (
         namespace.cwd is not None
         or namespace.port is not None
         or namespace.launch_timeout_seconds is not None
         or namespace.kill_after_run is not None
         or getattr(namespace, "argv", [])
+        or namespace.expected_generation is not None
+        or namespace.env
     ):
         raise AgentCliError(
             "serve_option_forbidden",
-            "--cwd, --port, --launch-timeout-seconds, --kill-after-run, and argv apply only to runtime serve",
+            "--cwd, --port, --launch-timeout-seconds, --kill-after-run, --expected-generation, --env, and argv apply only to runtime serve or replace",
         )
     actions = runtime_caps.get("actions") if isinstance(runtime_caps, Mapping) else None
     if not isinstance(actions, list) or namespace.action not in actions:
@@ -766,6 +1067,37 @@ def _runtime(
         profile, context.effective.canonical_root
     )
     action = str(namespace.action)
+    replacement_environment: dict[str, str] | None = None
+    if action == "replace":
+        if str(target["kind"]) != "service":
+            raise AgentCliError(
+                "replacement_target_invalid",
+                "runtime replace accepts one exact configured service target",
+            )
+        if (
+            namespace.cwd is None
+            or namespace.expected_generation is None
+            or namespace.expected_generation < 0
+            or not getattr(namespace, "argv", [])
+        ):
+            raise AgentCliError(
+                "replacement_definition_incomplete",
+                "runtime replace requires --cwd, --expected-generation, and structured argv after --",
+            )
+        if (
+            namespace.port is not None
+            or namespace.launch_timeout_seconds is not None
+            or namespace.kill_after_run is not None
+            or namespace.purpose is not None
+            or namespace.ttl_seconds is not None
+            or namespace.keep_alive is not None
+            or namespace.rearm_crash_loop
+        ):
+            raise AgentCliError(
+                "replacement_option_forbidden",
+                "runtime replace accepts only selector, --kind service, --cwd, --expected-generation, --env, --operation-id, and structured argv",
+            )
+        replacement_environment = _replacement_environment(namespace.env)
     mutate = action not in {"status", "capture_logs"}
     operation_id = _canonical_operation_id(namespace.operation_id, mutate=mutate)
     namespace.operation_id = operation_id
@@ -790,6 +1122,15 @@ def _runtime(
         "restart_limit": None,
         "restart_window_seconds": None,
     }
+    if action == "replace":
+        arguments.update(
+            {
+                "expected_definition_generation": namespace.expected_generation,
+                "argv": list(namespace.argv),
+                "cwd": namespace.cwd,
+                "environment": replacement_environment,
+            }
+        )
     returned_operation_id, report = profile.call(
         repository=effective,
         resource_id=str(target["id"]),
@@ -930,13 +1271,297 @@ def _operation(
     if isinstance(plan_id, str):
         document["plan_handle"] = continuation_handle("plan", plan_id)
     if certainty == "pending":
-        document["next_command"] = f"devcoordinator operation follow {handle}"
+        document["next_command"] = _operation_follow_command(
+            handle,
+            project=context.effective.canonical_root,
+        )
     elif isinstance(run_id, str):
-        document["next_command"] = f"devcoordinator test follow {run_handle}"
+        document["next_command"] = (
+            f"devcoordinator test follow {shlex.quote(run_handle)}"
+            f" --project {shlex.quote(context.root.canonical_root)}"
+        )
     return require_agent_result(
         document,
         surface="operation follow",
         maximum_bytes=MAX_OPERATION_FOLLOW_RESULT_BYTES,
+    )
+
+
+def _storage(
+    namespace: argparse.Namespace,
+    *,
+    profile: Any,
+    context: Any,
+    execution_state: dict[str, bool | None] | None = None,
+) -> dict[str, Any]:
+    from .broker import BrokerOperation
+
+    repository = _require_resolved_repository(
+        profile, context.effective.canonical_root
+    )
+    if namespace.action == "remove":
+        if namespace.target_kind != "container" or namespace.target_id is None:
+            raise AgentCliError(
+                "storage_target_required",
+                "storage remove requires container and one exact Coordinator target ID",
+            )
+        if namespace.plan or namespace.fingerprint or namespace.confirm:
+            raise AgentCliError(
+                "storage_remove_option_forbidden",
+                "storage remove does not use a plan, fingerprint, or confirmation phrase",
+            )
+        operation_id = _canonical_operation_id(namespace.operation_id, mutate=True)
+        if execution_state is not None:
+            execution_state["broker_contacted"] = None
+        try:
+            returned_operation_id, result = profile.call(
+                repository=repository,
+                resource_id=namespace.target_id,
+                operation=BrokerOperation.CONTAINER_REMOVE,
+                arguments={
+                    "target_id": namespace.target_id,
+                    "reason": namespace.reason
+                    or "developer-directed Docker container removal",
+                },
+                operation_id=operation_id,
+            )
+        except BaseException as error:
+            if execution_state is not None:
+                execution_state["broker_contacted"] = _broker_contact_from_error(
+                    error
+                )
+            raise
+        if execution_state is not None:
+            execution_state["broker_contacted"] = True
+            execution_state["mutation_performed"] = True
+        if returned_operation_id != operation_id or not isinstance(result, Mapping):
+            raise AgentCliError(
+                "storage_remove_reply_invalid",
+                "the authority did not return the exact correlated container-removal result",
+                classification="invalid_reply",
+                phase="transport",
+            )
+        payload = dict(result)
+        payload.update(
+            {
+                "schema_version": 1,
+                "ok": result.get("ok") is True,
+                "operation_id": returned_operation_id,
+                "continuation": continuation_handle(
+                    "operation", returned_operation_id
+                ),
+            }
+        )
+        return require_agent_result(
+            payload,
+            surface="direct Docker container removal",
+            maximum_bytes=4 * 1024,
+        )
+    if namespace.action == "apply":
+        if namespace.target_kind is not None or namespace.target_id is not None:
+            raise AgentCliError(
+                "storage_target_forbidden",
+                "storage apply uses only the exact durable --plan, --fingerprint, and --confirm values",
+            )
+        if namespace.reason is not None:
+            raise AgentCliError(
+                "storage_reason_forbidden", "--reason applies only to storage plan"
+            )
+        if not namespace.plan or not namespace.fingerprint or not namespace.confirm:
+            raise AgentCliError(
+                "storage_plan_required",
+                "storage apply requires --plan, --fingerprint, and --confirm exactly as returned by storage plan",
+            )
+        operation_id = _canonical_operation_id(namespace.operation_id, mutate=True)
+        if execution_state is not None:
+            execution_state["broker_contacted"] = None
+        try:
+            returned_operation_id, result = profile.call(
+                repository=repository,
+                resource_id=repository.repo_id,
+                operation=BrokerOperation.CLEANUP_APPLY,
+                arguments={
+                    "plan_id": namespace.plan,
+                    "plan_fingerprint": namespace.fingerprint,
+                    "confirmation_phrase": namespace.confirm,
+                },
+                operation_id=operation_id,
+            )
+        except BaseException as error:
+            if execution_state is not None:
+                execution_state["broker_contacted"] = _broker_contact_from_error(
+                    error
+                )
+            raise
+        if execution_state is not None:
+            execution_state["broker_contacted"] = True
+            execution_state["mutation_performed"] = True
+        if returned_operation_id != operation_id or not isinstance(result, Mapping):
+            raise AgentCliError(
+                "storage_apply_reply_invalid",
+                "the authority did not return the exact correlated storage-cleanup result",
+                classification="invalid_reply",
+                phase="transport",
+            )
+        payload = dict(result)
+        payload.update(
+            {
+                "schema_version": 1,
+                "ok": bool(
+                    result.get(
+                        "ok",
+                        result.get("status") in {"succeeded", "already_complete"},
+                    )
+                ),
+                "operation_id": returned_operation_id,
+                "continuation": continuation_handle("operation", returned_operation_id),
+            }
+        )
+        return require_agent_result(
+            payload,
+            surface="Docker storage reclaim apply",
+            maximum_bytes=4 * 1024,
+        )
+    if namespace.plan or namespace.fingerprint or namespace.confirm:
+        raise AgentCliError(
+            "storage_apply_option_forbidden",
+            "--plan, --fingerprint, and --confirm apply only to storage apply",
+        )
+    inventory = profile.inventory(canonical_root=context.effective.canonical_root)
+    storage = inventory.get("docker_storage")
+    if not isinstance(storage, Mapping):
+        raise AgentCliError(
+            "storage_inventory_unavailable",
+            "the authority did not return Docker storage accounting",
+            classification="unavailable",
+        )
+    if namespace.action == "inventory":
+        if (
+            namespace.target_kind is not None
+            or namespace.target_id is not None
+            or namespace.reason is not None
+            or namespace.operation_id is not None
+        ):
+            raise AgentCliError(
+                "storage_target_forbidden",
+                "storage inventory does not accept cleanup targets, reasons, or operation IDs",
+            )
+        project = next(
+            (
+                dict(row)
+                for row in storage.get("projects") or []
+                if isinstance(row, Mapping)
+                and str(row.get("repo_id") or "") == repository.repo_id
+            ),
+            None,
+        )
+        project_plans = [
+            dict(row)
+            for row in storage.get("cleanup_plans") or []
+            if isinstance(row, Mapping)
+            and repository.repo_id in (row.get("project_ids") or [])
+        ]
+        return require_agent_result(
+            {
+                "schema_version": 1,
+                "ok": storage.get("available") is True,
+                "status": storage.get("status") or (
+                    "ready" if storage.get("available") is True else "unavailable"
+                ),
+                "error": bounded_text(storage.get("error"), maximum_bytes=512)
+                if storage.get("error")
+                else None,
+                "sampled_at": storage.get("sampled_at"),
+                "repository": project
+                or {
+                    "repo_id": repository.repo_id,
+                    "exclusive_attributed_bytes": 0,
+                    "referenced_shared_bytes": 0,
+                    "components": {},
+                },
+                "accounting": storage.get("accounting"),
+                "cleanup_plans": project_plans[:16],
+                "cleanup_plan_count": len(project_plans),
+                "truncated": len(project_plans) > 16,
+                "evidence_fingerprint": storage.get("evidence_fingerprint"),
+            },
+            surface="project Docker storage",
+            maximum_bytes=4 * 1024,
+        )
+    if namespace.target_kind is None or namespace.target_id is None:
+        raise AgentCliError(
+            "storage_target_required",
+            "storage plan requires one exact target kind and target ID",
+        )
+    if namespace.target_kind == "container":
+        raise AgentCliError(
+            "storage_remove_required",
+            "container deletion is direct; use `devcoordinator storage remove container TARGET --reason REASON`",
+        )
+    if namespace.target_kind not in {"container", "volume"}:
+        raise AgentCliError(
+            "storage_cleanup_kind_unsupported",
+            "plan/apply is available only for an exclusively project-owned detached Compose volume; container deletion uses storage remove, while image and build-cache rows remain read-only accounting candidates",
+            classification="unsupported_capability",
+        )
+    matches = [
+        dict(row)
+        for row in storage.get("cleanup_plans") or []
+        if isinstance(row, Mapping)
+        and row.get("target_kind") == namespace.target_kind
+        and row.get("target_id") == namespace.target_id
+        and row.get("apply_supported") is True
+        and list(row.get("project_ids") or []) == [repository.repo_id]
+    ]
+    if len(matches) != 1:
+        raise AgentCliError(
+            "storage_cleanup_not_proven",
+            "the current authority sample does not prove that exact storage object reclaimable",
+        )
+    operation_id = _canonical_operation_id(namespace.operation_id, mutate=True)
+    if execution_state is not None:
+        execution_state["broker_contacted"] = None
+    try:
+        returned_operation_id, durable = profile.call(
+            repository=repository,
+            resource_id=namespace.target_id,
+            operation=BrokerOperation.CLEANUP_PLAN,
+            arguments={
+                "action": "purge",
+                "target_kind": namespace.target_kind,
+                "target_id": namespace.target_id,
+                "reason": namespace.reason or "exact Docker storage reclaim",
+            },
+            operation_id=operation_id,
+        )
+    except BaseException as error:
+        if execution_state is not None:
+            execution_state["broker_contacted"] = _broker_contact_from_error(error)
+        raise
+    if execution_state is not None:
+        execution_state["broker_contacted"] = True
+        execution_state["mutation_performed"] = True
+    if returned_operation_id != operation_id or not isinstance(durable, Mapping):
+        raise AgentCliError(
+            "storage_plan_reply_invalid",
+            "the authority did not return the exact correlated durable cleanup plan",
+            classification="invalid_reply",
+            phase="transport",
+        )
+    return require_agent_result(
+        {
+            "schema_version": 1,
+            "ok": True,
+            "status": "planned",
+            "sampled_at": storage.get("sampled_at"),
+            "candidate": matches[0],
+            "plan": dict(durable),
+            "operation_id": returned_operation_id,
+            "continuation": continuation_handle("operation", returned_operation_id),
+            "evidence_fingerprint": storage.get("evidence_fingerprint"),
+        },
+        surface="Docker storage reclaim plan",
+        maximum_bytes=4 * 1024,
     )
 
 
@@ -948,10 +1573,9 @@ def _test(
     context: Any,
 ) -> dict[str, Any]:
     from .agent_test import (
-        REVIEW_INTENTS,
         enqueue_test,
         project_test_follow,
-        submit_reviewed_plan,
+        submit_test_plan,
     )
 
     test_caps = capabilities.get("tests")
@@ -968,9 +1592,7 @@ def _test(
     )
     action = namespace.test_action
     if action == "enqueue":
-        automatic = test_caps.get("enqueue_intents")
-        reviewed = test_caps.get("explicit_review_intents")
-        allowed = reviewed if namespace.intent in REVIEW_INTENTS else automatic
+        allowed = test_caps.get("enqueue_intents")
         if not isinstance(allowed, list) or namespace.intent not in allowed:
             raise AgentCliError(
                 "capability_unavailable",
@@ -978,7 +1600,7 @@ def _test(
                 classification="unsupported_capability",
                 phase="handshake",
             )
-        return enqueue_test(
+        return _scope_test_result(enqueue_test(
             profile=profile,
             repository=root,
             temporary_repository=(effective if context.temporary is not None else None),
@@ -988,28 +1610,35 @@ def _test(
             launch_timeout_seconds=namespace.launch_timeout_seconds,
             actor=_attribution(),
             operation_id=namespace.operation_id,
-        )
+        ), project=context.root.canonical_root)
     if action == "submit":
-        return submit_reviewed_plan(
+        return _scope_test_result(submit_test_plan(
             profile=profile,
             repository=root,
             plan_id=_handle_identity(namespace.plan, expected_kind="plan"),
             actor=_attribution(),
             operation_id=namespace.operation_id,
+        ), project=context.root.canonical_root)
+    if action in {"follow", "status", "summary", "wait"}:
+        wait_seconds = (
+            namespace.timeout_seconds
+            if action == "wait"
+            else namespace.wait_seconds
+            if action == "follow"
+            else 0
         )
-    if action == "follow":
-        if not 0 <= namespace.wait_seconds <= 86_400:
+        if not 0 <= wait_seconds <= 86_400:
             raise AgentCliError(
-                "wait_deadline_invalid", "--wait-seconds must be from 0 through 86400"
+                "wait_deadline_invalid", "test wait deadline must be from 0 through 86400"
             )
         run_id = _handle_identity(namespace.run, expected_kind="run")
         status = (
             profile.test_run_status(run_id=run_id, repository=root.repo_id)
-            if namespace.wait_seconds == 0
+            if wait_seconds == 0
             else profile.wait_test_run(
                 run_id=run_id,
                 repository=root.repo_id,
-                timeout_seconds=namespace.wait_seconds,
+                timeout_seconds=wait_seconds,
             )
         )
         if not isinstance(status, Mapping):
@@ -1024,10 +1653,68 @@ def _test(
 
         summary = (
             profile.test_run_summary(run_id=run_id, repository=root.repo_id)
-            if state in TERMINAL_STATES
+            if action == "summary" or state in TERMINAL_STATES
             else None
         )
-        return project_test_follow(status, run_id=run_id, summary=summary)
+        return _scope_test_result(
+            project_test_follow(status, run_id=run_id, summary=summary),
+            project=context.root.canonical_root,
+        )
+    if action == "failures":
+        if not 1 <= namespace.limit <= 50:
+            raise AgentCliError(
+                "failure_limit_invalid", "--limit must be from 1 through 50"
+            )
+        run_id = _handle_identity(namespace.run, expected_kind="run")
+        result = profile.test_run_failures(
+            repository=root.repo_id,
+            run_id=run_id,
+            after=namespace.after,
+            limit=namespace.limit,
+        )
+        return require_agent_result(result, surface="test failures")
+    if action == "artifact":
+        run_id = _handle_identity(namespace.run, expected_kind="run")
+        artifact_id = _handle_identity(namespace.artifact, expected_kind="artifact")
+        return require_agent_result(
+            profile.test_artifact(
+                repository=root.repo_id,
+                run_id=run_id,
+                artifact_id=artifact_id,
+            ),
+            surface="test artifact",
+        )
+    if action in {"cancel", "retry"}:
+        run_id = _handle_identity(namespace.run, expected_kind="run")
+        operation_id = namespace.operation_id
+        assert operation_id is not None
+        if action == "cancel":
+            if not namespace.reason.strip() or len(namespace.reason) > 500:
+                raise AgentCliError(
+                    "cancel_reason_invalid",
+                    "--reason must be from 1 through 500 characters",
+                )
+            result = profile.cancel_test_run(
+                repository=root.repo_id,
+                run_id=run_id,
+                reason=namespace.reason,
+                operation_id=operation_id,
+                actor=_attribution(),
+            )
+        else:
+            result = profile.retry_test_run(
+                repository=root.repo_id,
+                run_id=run_id,
+                failed_only=True,
+                operation_id=operation_id,
+                actor=_attribution(),
+            )
+        document = dict(result)
+        document["operation_id"] = operation_id
+        document["continuation"] = continuation_handle(
+            "operation", operation_id
+        )
+        return require_agent_result(document, surface=f"test {action}")
     raise AgentCliError("command_unsupported", "test action is unsupported")
 
 
@@ -1051,13 +1738,13 @@ def _execute(
         repository_result: dict[str, Any]
         if repository is None:
             repository_result = {
-                "state": "unenrolled",
+                "state": "unconfigured",
                 "kind": context.project_kind,
                 "bootstrap_supported": True,
             }
         else:
             repository_result = {
-                "state": "enrolled",
+                "state": "configured",
                 "id": repository.repo_id,
                 "generation": repository.generation,
                 "kind": context.project_kind,
@@ -1080,6 +1767,13 @@ def _execute(
             selector=namespace.selector,
             kind=namespace.kind,
             limit=namespace.limit,
+        )
+    if namespace.command == "storage":
+        return _storage(
+            namespace,
+            profile=profile,
+            context=context,
+            execution_state=execution_state,
         )
     if namespace.command == "runtime":
         return _runtime(
@@ -1116,8 +1810,12 @@ def _command_mutates(namespace: argparse.Namespace | None) -> bool:
         return False
     if namespace.command == "runtime":
         return namespace.action not in {"status", "capture_logs"}
+    if namespace.command == "storage":
+        return namespace.action in {"remove", "plan", "apply"}
     return namespace.command == "test" and namespace.test_action in {
+        "cancel",
         "enqueue",
+        "retry",
         "submit",
     }
 
@@ -1159,7 +1857,6 @@ def _error_classification(error: BaseException, code: str) -> str:
         "execution_identity_unavailable",
         "temporary_service_execution_identity_unavailable",
         "temporary_service_execution_identity_mismatch",
-        "repository_access_normalization_failed",
         "temporary_service_launch_failed",
         "temporary_service_exited",
         "temporary_service_readiness_timeout",
@@ -1229,7 +1926,7 @@ def _next_action_for_failure(
     outcome: str,
     phase: str,
 ) -> str:
-    if code == "repository_unenrolled":
+    if code == "repository_unconfigured":
         return (
             "Submit one structured runtime serve command for this repository; "
             "that single command adopts the repository and starts the bounded service."
@@ -1237,11 +1934,11 @@ def _next_action_for_failure(
     if code in {
         "repository_adoption_constraint_failed",
         "repository_adoption_invariant_failed",
-        "repository_owner_authority_failed",
+        "repository_catalog_registration_failed",
     }:
         return (
             "The broker rejected repository adoption before launch and returned the "
-            "specific authority conflict in the message. Correct that conflict, then "
+            "specific catalog conflict in the message. Correct that conflict, then "
             "rerun the original structured runtime serve command with a fresh operation "
             "ID; do not enable local fallback, bind the port directly, or choose another port."
         )
@@ -1257,26 +1954,11 @@ def _next_action_for_failure(
             "Do not retry blindly or bypass Coordinator; report the returned operation ID "
             "and error code to the Coordinator task."
         )
-    if code == "test_execution_owner_unavailable":
-        return (
-            "Repository authorization succeeded, but the Coordinator's durable execution-owner "
-            "record is missing, stale, fenced, or internally inconsistent. This is Coordinator "
-            "state, not a project source, dependency, port, or sandbox error. Do not change the "
-            "application or launch it directly; report the returned operation ID to the "
-            "Coordinator task and retry only after that state is repaired."
-        )
-    if code == "repository_execution_owner_disabled":
-        return (
-            "Repository adoption reached the Coordinator, but the repository owner's "
-            "account or repository enrollment is explicitly disabled. This is "
-            "Coordinator account state, not project code or a port failure. Re-enable "
-            "that exact owner enrollment, then submit a fresh structured runtime serve operation."
-        )
     if code == "invalid_arguments":
         return (
             "The command shape was rejected locally before any broker call or mutation. "
             "Run the returned help command, correct the options, and resubmit; do not "
-            "change repository enrollment or enable local fallback."
+            "change repository configuration or enable local fallback."
         )
     if code == "serve_definition_incomplete":
         return (
@@ -1336,12 +2018,6 @@ def _next_action_for_failure(
             "process-observation path, then submit a fresh operation ID; this is not a project "
             "source defect."
         )
-    if code == "repository_access_normalization_failed":
-        return (
-            "Coordinator could not prepare the validated working tree for the actual "
-            "local caller. Repair the Coordinator authority's /home write boundary, "
-            "then submit a fresh operation ID; do not chmod the repository manually."
-        )
     if code == "temporary_service_launch_failed":
         return (
             "The bounded systemd unit could not start. Use the returned launch "
@@ -1372,7 +2048,7 @@ def _next_action_for_failure(
         return (
             "Repository adoption did not complete. Follow this exact operation for "
             "the retained broker evidence, correct the reported condition, then issue "
-            "a fresh runtime serve operation; do not bypass Coordinator or edit enrollment files."
+            "a fresh runtime serve operation; do not bypass Coordinator or edit configuration files."
         )
     if broker_contacted is None:
         return (
@@ -1391,6 +2067,7 @@ def _failure(
     operation_id_hint: str | None = None,
     broker_contacted: bool | None = False,
     observed_mutation: bool | None = False,
+    project_hint: str | None = None,
 ) -> dict[str, Any]:
     code = getattr(error, "code", None)
     if not isinstance(code, str) or not code:
@@ -1403,7 +2080,6 @@ def _failure(
             "execution_identity_unavailable",
             "temporary_service_execution_identity_unavailable",
             "temporary_service_execution_identity_mismatch",
-            "repository_access_normalization_failed",
             "temporary_service_launch_failed",
             "temporary_service_exited",
             "temporary_service_readiness_timeout",
@@ -1484,7 +2160,7 @@ def _failure(
         "kill_after_run_required",
         "launch_timeout_invalid",
         "port_invalid",
-        "repository_unenrolled",
+        "repository_unconfigured",
         "serve_definition_incomplete",
         "serve_option_forbidden",
         "serve_purpose_invalid",
@@ -1497,7 +2173,7 @@ def _failure(
     next_command = (
         explicit_next_command
         if explicit_next_command is not None
-        else f"devcoordinator operation follow {continuation}"
+        else _operation_follow_command(continuation, project=project_hint)
         if continuation is not None
         else "devcoordinator runtime serve --help"
         if code in serve_contract_codes or code in repository_adoption_codes
@@ -1517,7 +2193,7 @@ def _failure(
         phase=phase,
     )
     decision_evidence = dict(evidence) if isinstance(evidence, Mapping) else {}
-    if code == "repository_unenrolled":
+    if code == "repository_unconfigured":
         decision_evidence.update(
             {
                 "discovery_is_pure": True,
@@ -1550,7 +2226,7 @@ def _failure(
     document["stage"] = phase
     document["action"] = (
         "run_start_like_repository_adoption"
-        if code == "repository_unenrolled"
+        if code == "repository_unconfigured"
         else "follow_operation"
         if continuation is not None
         else "run_next_command"
@@ -1654,7 +2330,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     try:
         structured_argv: list[str] = []
-        if raw_arguments[:2] == ["runtime", "serve"]:
+        if raw_arguments[:2] in (["runtime", "serve"], ["runtime", "replace"]):
             try:
                 separator = raw_arguments.index("--", 3)
             except ValueError:
@@ -1665,8 +2341,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         try:
             namespace = _parser().parse_args(raw_arguments)
         except AgentCliError as error:
-            if raw_arguments[:2] == ["runtime", "serve"]:
-                error.next_command = "devcoordinator runtime serve --help"
+            if raw_arguments[:2] in (["runtime", "serve"], ["runtime", "replace"]):
+                error.next_command = f"devcoordinator runtime {raw_arguments[1]} --help"
                 namespace = argparse.Namespace(
                     command="runtime",
                     action="serve",
@@ -1681,8 +2357,18 @@ def main(argv: Sequence[str] | None = None) -> int:
                 namespace.operation_id,
                 mutate=namespace.action not in {"status", "capture_logs"},
             )
+        elif namespace.command == "storage" and namespace.action in {
+            "remove",
+            "plan",
+            "apply",
+        }:
+            namespace.operation_id = _canonical_operation_id(
+                namespace.operation_id, mutate=True
+            )
         elif namespace.command == "test" and namespace.test_action in {
+            "cancel",
             "enqueue",
+            "retry",
             "submit",
         }:
             namespace.operation_id = _canonical_operation_id(
@@ -1717,6 +2403,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                     ),
                     broker_contacted=execution_state["broker_contacted"],
                     observed_mutation=execution_state["mutation_performed"],
+                    project_hint=(
+                        getattr(namespace, "_resolved_project", None)
+                        or getattr(namespace, "project", None)
+                        if namespace is not None
+                        else None
+                    ),
                 ),
                 stream=sys.stdout,
             )

@@ -28,11 +28,11 @@ from devcoordinator.broker import (
     SerializedMutationWriter,
 )
 from devcoordinator.broker_backend import StoreBackedMutationBackend
-from devcoordinator import broker_enrollment
+from devcoordinator import broker_configuration
 from devcoordinator import broker_host
 from devcoordinator import broker_persistence
 from devcoordinator.broker_host import LocalBrokerHostMutations
-from devcoordinator.broker_persistence import BrokerPersistence, StoreBackedAuthorizer
+from devcoordinator.broker_persistence import BrokerPersistence, StoreBackedRequestAcceptor
 from devcoordinator.compose_contract import (
     require_effective_compose_model,
     require_sealable_compose_payload,
@@ -125,7 +125,10 @@ class ExtendedBrokerFixture:
                     side_effect=in_process_descriptor_path,
                 )
             )
-        home = Path(pwd.getpwuid(os.geteuid()).pw_dir).resolve()
+        home = Path(
+            os.environ.get("DEVCOORDINATOR_TEST_TMP_ROOT")
+            or pwd.getpwuid(os.geteuid()).pw_dir
+        ).resolve()
         self._temporary = tempfile.TemporaryDirectory(
             prefix=".broker-extended-", dir=str(home)
         )
@@ -234,42 +237,17 @@ class ExtendedBrokerFixture:
                             now,
                         ),
                     )
+                    connection.execute(
+                        """
+                        INSERT INTO broker_port_ranges(
+                            repo_id, server_definition_id, protocol,
+                            start_port, end_port, max_ttl_seconds, enabled, updated_at
+                        ) VALUES (?, ?, 'tcp', 43100, 43199, 604800, 1, ?)
+                        """,
+                        (repo_id, server_id, now),
+                    )
             self.generation = store.metadata.database_generation
 
-        self.persistence.provision_principal(uid=os.geteuid(), account_id=ACCOUNT)
-        self.persistence.provision_principal(
-            uid=self.foreign_uid, account_id=FOREIGN_ACCOUNT
-        )
-        for uid, repo_id, server_id in (
-            (os.geteuid(), REPO_ALPHA, SERVER_ALPHA),
-            (os.geteuid(), REPO_BETA, SERVER_BETA),
-            (self.foreign_uid, REPO_ALPHA, SERVER_ALPHA),
-        ):
-            self.persistence.provision_repository_enrollment(
-                uid=uid,
-                repo_id=repo_id,
-                account_id=(FOREIGN_ACCOUNT if uid == self.foreign_uid else ACCOUNT),
-                issued_at=utc_timestamp(),
-                valid_until_epoch=int(time.time()) + 3_600,
-            )
-            for operation in (
-                BrokerOperation.PORT_ASSIGN,
-                BrokerOperation.PORT_UNASSIGN,
-            ):
-                self.persistence.grant_resource(
-                    uid=uid,
-                    repo_id=repo_id,
-                    resource_kind="server",
-                    resource_id=server_id,
-                    operation=operation,
-                )
-            self.persistence.grant_port_range(
-                uid=uid,
-                repo_id=repo_id,
-                server_definition_id=server_id,
-                start_port=43_100,
-                end_port=43_199,
-            )
         self.persistence.provision_compose_definition(
             repo_id=REPO_ALPHA,
             compose_definition_id=COMPOSE_ALPHA,
@@ -278,14 +256,6 @@ class ExtendedBrokerFixture:
             services=("db", "web"),
             project_name="alpha-stack",
         )
-        for operation in (BrokerOperation.COMPOSE_UP, BrokerOperation.COMPOSE_DOWN):
-            self.persistence.grant_resource(
-                uid=os.geteuid(),
-                repo_id=REPO_ALPHA,
-                resource_kind="compose",
-                resource_id=COMPOSE_ALPHA,
-                operation=operation,
-            )
 
     def close(self) -> None:
         try:
@@ -439,15 +409,15 @@ class ExtendedBrokerFixture:
                         "project_name": active_project_name,
                         "service_name": service,
                         "lifecycle": "running",
-                        "ownership_state": "exclusive",
-                        "authoritative_owner_repo_id": active_repo_id,
+                        "association_state": "exclusive",
+                        "associated_repo_id": active_repo_id,
                     }
                     connection.execute(
                         """
                         INSERT INTO broker_observed_compose_containers(
                             snapshot_id, docker_resource_id, full_container_id,
                             project_name, service_name, lifecycle,
-                            ownership_state, authoritative_owner_repo_id,
+                            association_state, associated_repo_id,
                             observation_fingerprint
                         ) VALUES (?, ?, ?, ?, ?, 'running', 'exclusive', ?, ?)
                         """,
@@ -505,13 +475,14 @@ class ExtendedBrokerFixture:
                 connection.execute(
                     """
                     INSERT INTO docker_resources(
-                        docker_resource_id, engine_id, full_container_id,
+                        docker_resource_id, engine_id, repo_id, full_container_id,
                         current_name, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         resource_id,
                         engine_id,
+                        owner_repo_id,
                         hashlib.sha256(token.encode("ascii")).hexdigest(),
                         "observed-" + token,
                         now,
@@ -525,36 +496,6 @@ class ExtendedBrokerFixture:
                     """,
                     (resource_id, project_name),
                 )
-                if owner_repo_id is not None:
-                    binding_id = "binding-" + token
-                    connection.execute(
-                        """
-                        INSERT INTO control_bindings(
-                            binding_id, repo_id, resource_kind, resource_id,
-                            source_id, capability, provenance, authority_state,
-                            priority, generation, created_at, updated_at
-                        ) VALUES (?, ?, 'container', ?, ?, 'lifecycle',
-                                  'fixture', 'authoritative', 100, 0, ?, ?)
-                        """,
-                        (binding_id, owner_repo_id, resource_id, SOURCE, now, now),
-                    )
-                    connection.execute(
-                        """
-                        INSERT INTO repository_memberships(
-                            membership_id, repo_id, resource_kind,
-                            host_resource_id, immutable_fingerprint,
-                            control_binding_id, created_at
-                        ) VALUES (?, ?, 'container', ?, ?, ?, ?)
-                        """,
-                        (
-                            "membership-" + token,
-                            owner_repo_id,
-                            resource_id,
-                            "immutable-" + token,
-                            binding_id,
-                            now,
-                        ),
-                    )
                 connection.execute(
                     """
                     INSERT INTO observation_snapshots(
@@ -597,7 +538,7 @@ class ExtendedBrokerFixture:
                     INSERT INTO broker_observed_compose_containers(
                         snapshot_id, docker_resource_id, full_container_id,
                         project_name, service_name, lifecycle,
-                        ownership_state, authoritative_owner_repo_id,
+                        association_state, associated_repo_id,
                         observation_fingerprint
                     ) VALUES (?, ?, ?, ?, 'web', 'running', ?, ?, ?)
                     """,
@@ -744,7 +685,7 @@ def service_for(
         observe_before_lifecycle_plan=observer or fixture.observe_full_docker,
     )
     service = BrokerService(
-        StoreBackedAuthorizer(fixture.persistence),
+        StoreBackedRequestAcceptor(fixture.persistence),
         SerializedMutationWriter(backend),
     )
     return service, host
@@ -757,7 +698,7 @@ class BrokerAssignmentTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.fixture.close()
 
-    def test_never_started_enrolled_definition_is_usable_but_not_a_server_instance(self) -> None:
+    def test_never_started_configured_definition_is_usable_but_not_a_server_instance(self) -> None:
         orphan_id = "server-bare-orphan"
         timestamp = utc_timestamp()
         with CoordinatorStore.open(
@@ -781,14 +722,6 @@ class BrokerAssignmentTests(unittest.TestCase):
                         timestamp,
                     ),
                 )
-        self.fixture.persistence.replace_server_access(
-            uid=os.geteuid(),
-            repo_id=REPO_ALPHA,
-            server_definition_ids=(SERVER_ALPHA,),
-            start_port=43_100,
-            end_port=43_199,
-        )
-
         with AccountStore.open(
             self.fixture.persistence.database_path, expected_uid=os.geteuid()
         ) as store:
@@ -801,7 +734,7 @@ class BrokerAssignmentTests(unittest.TestCase):
         self.assertIn(
             SERVER_ALPHA,
             server_ids,
-            "false-positive guard: exact broker enrollment keeps a lease target usable",
+            "false-positive guard: exact broker configuration keeps a lease target usable",
         )
         self.assertNotIn(
             orphan_id,
@@ -824,7 +757,7 @@ class BrokerAssignmentTests(unittest.TestCase):
         self.assertNotIn(SERVER_ALPHA, usage["server_ids"])
         self.assertNotIn(orphan_id, usage["server_ids"])
 
-    def test_enrollment_compose_failure_precedes_all_authority_and_profile_mutation(
+    def test_configuration_compose_failure_precedes_all_authority_and_profile_mutation(
         self,
     ) -> None:
         (self.fixture.alpha_root / ".git").mkdir()
@@ -840,23 +773,18 @@ class BrokerAssignmentTests(unittest.TestCase):
             raise RuntimeError("fixture renderer rejected the model")
 
         with (
-            mock.patch.object(broker_enrollment.os, "geteuid", return_value=0),
+            mock.patch.object(broker_configuration.os, "geteuid", return_value=0),
             mock.patch.object(
-                broker_enrollment,
+                broker_configuration,
                 "BrokerPersistence",
                 side_effect=AssertionError("authority opened before preflight"),
             ),
             self.assertRaisesRegex(RuntimeError, "renderer rejected"),
         ):
-            broker_enrollment.enroll_repository(
+            broker_configuration.configure_repository(
                 database_path=database,
                 socket_path=self.fixture.root / "broker.sock",
-                socket_gid=0,
-                client_uid=os.geteuid(),
-                # The root preflight mock patches the shared ``os`` module;
-                # keep repository execution authority explicitly non-root.
-                repository_owner_uid=1,
-                account_id="account-preflight",
+                execution_uid=1,
                 canonical_root=str(self.fixture.alpha_root),
                 servers=(),
                 port_start=41_000,
@@ -875,7 +803,7 @@ class BrokerAssignmentTests(unittest.TestCase):
         self.assertEqual(database.read_bytes(), b"prior-authority")
         self.assertEqual(profile.read_bytes(), b"prior-profile")
 
-    def test_host_global_conflict_and_exact_owner_release(self) -> None:
+    def test_host_global_conflict_and_exact_release(self) -> None:
         probes: list[tuple[int, str]] = []
 
         def probe(port: int, protocol: str) -> bool:
@@ -910,15 +838,6 @@ class BrokerAssignmentTests(unittest.TestCase):
         )
         self.assertFalse(conflict_reply["ok"], conflict_reply)
         self.assertEqual(conflict_reply["error"]["code"], "port_assignment_conflict")
-
-        foreign_release = self.fixture.request(
-            BrokerOperation.PORT_UNASSIGN, foreign=True
-        )
-        foreign_reply = service.reply_for_document(
-            self.fixture.peer(foreign=True), foreign_release.to_wire()
-        )
-        self.assertFalse(foreign_reply["ok"], foreign_reply)
-        self.assertEqual(foreign_reply["error"]["code"], "resource_access_denied")
 
         operation_id = str(uuid.uuid4())
         release_request = self.fixture.request(
@@ -1050,45 +969,17 @@ class BrokerComposeTests(unittest.TestCase):
                 connection.execute(
                     """
                     INSERT INTO docker_resources(
-                        docker_resource_id, engine_id, full_container_id,
+                        docker_resource_id, engine_id, repo_id, full_container_id,
                         current_name, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         resource_id,
                         existing["engine_id"],
+                        REPO_ALPHA,
                         full_id,
                         f"alpha-stack-{service_name}-1",
                         now,
-                        now,
-                    ),
-                )
-                binding_id = "binding-extra-" + token
-                connection.execute(
-                    """
-                    INSERT INTO control_bindings(
-                        binding_id, repo_id, resource_kind, resource_id,
-                        source_id, capability, provenance, authority_state,
-                        priority, generation, created_at, updated_at
-                    ) VALUES (?, ?, 'container', ?, ?, 'lifecycle',
-                              'fixture', 'authoritative', 100, 0, ?, ?)
-                    """,
-                    (binding_id, REPO_ALPHA, resource_id, SOURCE, now, now),
-                )
-                connection.execute(
-                    """
-                    INSERT INTO repository_memberships(
-                        membership_id, repo_id, resource_kind,
-                        host_resource_id, immutable_fingerprint,
-                        control_binding_id, created_at
-                    ) VALUES (?, ?, 'container', ?, ?, ?, ?)
-                    """,
-                    (
-                        "membership-extra-" + token,
-                        REPO_ALPHA,
-                        resource_id,
-                        "immutable-extra-" + token,
-                        binding_id,
                         now,
                     ),
                 )
@@ -1106,7 +997,7 @@ class BrokerComposeTests(unittest.TestCase):
                     INSERT INTO broker_observed_compose_containers(
                         snapshot_id, docker_resource_id, full_container_id,
                         project_name, service_name, lifecycle,
-                        ownership_state, authoritative_owner_repo_id,
+                        association_state, associated_repo_id,
                         observation_fingerprint
                     ) VALUES (?, ?, ?, 'alpha-stack', ?, ?,
                               'exclusive', ?, ?)
@@ -1123,77 +1014,13 @@ class BrokerComposeTests(unittest.TestCase):
                 )
         return resource_id
 
-    def test_enrollment_container_grants_require_exact_snapshot_and_current_membership(
-        self,
-    ) -> None:
+    def test_configuration_compose_scope_accepts_exact_declared_services(self) -> None:
         snapshot_id = self.fixture.observed_compose_snapshot(
             owner_repo_id=REPO_ALPHA,
             project_name="alpha-stack",
         )
 
-        granted = broker_enrollment._grant_observed_containers(
-            self.fixture.persistence,
-            repo_id=REPO_ALPHA,
-            client_uid=os.geteuid(),
-            snapshot_id=snapshot_id,
-        )
-
-        self.assertEqual(len(set(granted.values())), 1)
-        resource_id = next(iter(granted.values()))
-        self.fixture.persistence.revoke_observation_derived_access(
-            uid=os.geteuid(),
-            repo_id=REPO_ALPHA,
-            containers=True,
-        )
-        with CoordinatorStore.open(
-            self.fixture.persistence.database_path,
-            expected_uid=os.geteuid(),
-        ) as store:
-            with store.immediate_transaction() as connection:
-                connection.execute(
-                    """
-                    DELETE FROM repository_memberships
-                    WHERE repo_id = ? AND host_resource_id = ?
-                    """,
-                    (REPO_ALPHA, resource_id),
-                )
-
-        with self.assertRaisesRegex(RuntimeError, "membership"):
-            broker_enrollment._grant_observed_containers(
-                self.fixture.persistence,
-                repo_id=REPO_ALPHA,
-                client_uid=os.geteuid(),
-                snapshot_id=snapshot_id,
-            )
-        with self.assertRaisesRegex(RuntimeError, "exact completed"):
-            broker_enrollment._grant_observed_containers(
-                self.fixture.persistence,
-                repo_id=REPO_ALPHA,
-                client_uid=os.geteuid(),
-                snapshot_id="snapshot-not-returned-by-enrollment",
-            )
-        with CoordinatorStore.open(
-            self.fixture.persistence.database_path,
-            expected_uid=os.geteuid(),
-        ) as store:
-            with store.read_transaction() as connection:
-                enabled = connection.execute(
-                    """
-                    SELECT count(*) FROM broker_resource_acl
-                    WHERE uid = ? AND repo_id = ?
-                      AND resource_kind = 'container' AND enabled = 1
-                    """,
-                    (os.geteuid(), REPO_ALPHA),
-                ).fetchone()[0]
-        self.assertEqual(enabled, 0)
-
-    def test_enrollment_compose_scope_accepts_exact_declared_services(self) -> None:
-        snapshot_id = self.fixture.observed_compose_snapshot(
-            owner_repo_id=REPO_ALPHA,
-            project_name="alpha-stack",
-        )
-
-        scope = self.fixture.persistence.compose_enrollment_container_scope(
+        scope = self.fixture.persistence.compose_configuration_container_scope(
             repo_id=REPO_ALPHA,
             snapshot_id=snapshot_id,
             project_name="alpha-stack",
@@ -1203,7 +1030,7 @@ class BrokerComposeTests(unittest.TestCase):
         self.assertEqual(len(scope.lifecycle_container_ids), 1)
         self.assertEqual(scope.non_lifecycle_container_ids, ())
 
-    def test_enrollment_compose_scope_rejects_active_undeclared_service(self) -> None:
+    def test_configuration_compose_scope_rejects_active_undeclared_service(self) -> None:
         snapshot_id = self.fixture.observed_compose_snapshot(
             owner_repo_id=REPO_ALPHA,
             project_name="alpha-stack",
@@ -1214,7 +1041,7 @@ class BrokerComposeTests(unittest.TestCase):
         )
 
         with self.assertRaises(BrokerError) as caught:
-            self.fixture.persistence.compose_enrollment_container_scope(
+            self.fixture.persistence.compose_configuration_container_scope(
                 repo_id=REPO_ALPHA,
                 snapshot_id=snapshot_id,
                 project_name="alpha-stack",
@@ -1224,7 +1051,7 @@ class BrokerComposeTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, "compose_scope_incomplete")
         self.assertIn("undeclared-worker", caught.exception.message)
 
-    def test_enrollment_run_once_container_is_never_a_standalone_grant(self) -> None:
+    def test_configuration_run_once_container_is_never_a_standalone_resource(self) -> None:
         snapshot_id = self.fixture.observed_compose_snapshot(
             owner_repo_id=REPO_ALPHA,
             project_name="alpha-stack",
@@ -1234,28 +1061,14 @@ class BrokerComposeTests(unittest.TestCase):
             service_name="migrate",
         )
 
-        scope = self.fixture.persistence.compose_enrollment_container_scope(
+        scope = self.fixture.persistence.compose_configuration_container_scope(
             repo_id=REPO_ALPHA,
             snapshot_id=snapshot_id,
             project_name="alpha-stack",
             service_names=("web",),
             run_once_service_names=("migrate",),
         )
-        aliases, identities, runtime_grants, resource_grants = (
-            broker_enrollment._collect_observed_containers(
-                self.fixture.persistence,
-                repo_id=REPO_ALPHA,
-                client_uid=os.geteuid(),
-                snapshot_id=snapshot_id,
-                excluded_container_ids=scope.non_lifecycle_container_ids,
-            )
-        )
-
         self.assertEqual(scope.non_lifecycle_container_ids, (run_once_id,))
-        self.assertNotIn(run_once_id, set(aliases.values()))
-        self.assertNotIn(run_once_id, {item[1] for item in identities})
-        self.assertNotIn(run_once_id, {item[1] for item in runtime_grants})
-        self.assertNotIn(run_once_id, {item[1] for item in resource_grants})
 
     def test_inactive_undeclared_compose_container_is_not_downgraded(self) -> None:
         snapshot_id = self.fixture.observed_compose_snapshot(
@@ -1268,7 +1081,7 @@ class BrokerComposeTests(unittest.TestCase):
             lifecycle="stopped",
         )
 
-        scope = self.fixture.persistence.compose_enrollment_container_scope(
+        scope = self.fixture.persistence.compose_configuration_container_scope(
             repo_id=REPO_ALPHA,
             snapshot_id=snapshot_id,
             project_name="alpha-stack",
@@ -1277,13 +1090,12 @@ class BrokerComposeTests(unittest.TestCase):
 
         self.assertEqual(scope.non_lifecycle_container_ids, (stopped_id,))
 
-    def test_reenrollment_reuses_identity_when_compose_file_set_changes(self) -> None:
-        override = self.fixture.alpha_root / "compose.reenrolled.yml"
+    def test_reconfiguration_reuses_identity_when_compose_file_set_changes(self) -> None:
+        override = self.fixture.alpha_root / "compose.reconfigured.yml"
         override.write_text("services: {}\n", encoding="utf-8")
-        compose_id = broker_enrollment._provision_compose(
+        compose_id = broker_configuration._provision_compose(
             self.fixture.persistence,
             repo_id=REPO_ALPHA,
-            client_uid=os.geteuid(),
             root=self.fixture.alpha_root,
             compose={
                 "declared": True,
@@ -1301,31 +1113,7 @@ class BrokerComposeTests(unittest.TestCase):
             [str(self.fixture.compose_one), str(override)],
         )
         self.assertEqual(definition["services"], ["db", "api"])
-        with CoordinatorStore.open(
-            self.fixture.persistence.database_path,
-            expected_uid=os.geteuid(),
-        ) as store:
-            with store.read_transaction() as connection:
-                grants = list(
-                    connection.execute(
-                        """
-                        SELECT operation, enabled FROM broker_compose_acl
-                        WHERE uid = ? AND repo_id = ?
-                          AND compose_definition_id = ?
-                        ORDER BY operation
-                        """,
-                        (os.geteuid(), REPO_ALPHA, COMPOSE_ALPHA),
-                    )
-                )
-        self.assertEqual(
-            {str(row["operation"]) for row in grants if bool(row["enabled"])},
-            {
-                "compose.up",
-                "compose.stop",
-                "compose.restart",
-                "compose.down",
-            },
-        )
+        self.assertTrue(definition["enabled"])
 
     def test_running_operation_blocks_definition_reprovision_race(self) -> None:
         reprovision_errors: list[str] = []
@@ -1371,11 +1159,10 @@ class BrokerComposeTests(unittest.TestCase):
         self.assertEqual(definition["services"], ["db", "web"])
         self.assertTrue(definition["enabled"])
 
-    def test_reenrollment_without_compose_revokes_old_opaque_authority(self) -> None:
-        removed = broker_enrollment._provision_compose(
+    def test_reconfiguration_without_compose_disables_old_definition(self) -> None:
+        removed = broker_configuration._provision_compose(
             self.fixture.persistence,
             repo_id=REPO_ALPHA,
-            client_uid=os.geteuid(),
             root=self.fixture.alpha_root,
             compose=None,
         )
@@ -1384,25 +1171,12 @@ class BrokerComposeTests(unittest.TestCase):
             repo_id=REPO_ALPHA
         )[0]
         self.assertFalse(definition["enabled"])
-        with CoordinatorStore.open(
-            self.fixture.persistence.database_path,
-            expected_uid=os.geteuid(),
-        ) as store:
-            with store.read_transaction() as connection:
-                enabled_grants = connection.execute(
-                    """
-                    SELECT count(*) FROM broker_compose_acl
-                    WHERE repo_id = ? AND enabled = 1
-                    """,
-                    (REPO_ALPHA,),
-                ).fetchone()[0]
-        self.assertEqual(enabled_grants, 0)
         request = self.fixture.request(
             BrokerOperation.COMPOSE_DOWN,
             resource_id=COMPOSE_ALPHA,
         )
-        with self.assertRaises(BrokerError):
-            self.fixture.persistence.authorize(self.fixture.peer(), request)
+        accepted = self.fixture.persistence.accept(self.fixture.peer(), request)
+        self.assertEqual(accepted.request.operation, BrokerOperation.COMPOSE_DOWN)
 
     def test_project_name_change_requires_old_observed_resources_retired(
         self,
@@ -1412,10 +1186,9 @@ class BrokerComposeTests(unittest.TestCase):
             project_name="alpha-stack",
         )
         with self.assertRaisesRegex(BrokerError, "old Compose project name"):
-            broker_enrollment._provision_compose(
+            broker_configuration._provision_compose(
                 self.fixture.persistence,
                 repo_id=REPO_ALPHA,
-                client_uid=os.geteuid(),
                 root=self.fixture.alpha_root,
                 compose={
                     "declared": True,
@@ -1467,84 +1240,6 @@ class BrokerComposeTests(unittest.TestCase):
             observation_snapshot_id=snapshot_id,
         )
         self.assertEqual(result["compose_definition_id"], COMPOSE_ALPHA)
-
-    def test_retired_empty_project_name_can_transfer_to_another_repository(
-        self,
-    ) -> None:
-        self.fixture.persistence.disable_repository_compose(repo_id=REPO_ALPHA)
-        beta_compose = self.fixture.beta_root / "compose.yml"
-        beta_compose.write_text("services: {}\n", encoding="utf-8")
-        with CoordinatorStore.open(
-            self.fixture.persistence.database_path,
-            expected_uid=os.geteuid(),
-        ) as store:
-            with store.immediate_transaction() as connection:
-                connection.execute(
-                    """
-                    UPDATE broker_compose_acl
-                    SET enabled = 1
-                    WHERE compose_definition_id = ?
-                      AND operation IN ('compose.stop', 'compose.down')
-                    """,
-                    (COMPOSE_ALPHA,),
-                )
-            evidence = self.fixture.observe_full_docker(store)
-        with mock.patch.object(
-            broker_persistence, "_service_administrator_uid", return_value=0
-        ):
-            released = self.fixture.persistence.release_compose_project_name(
-                compose_definition_id=COMPOSE_ALPHA,
-                observation_evidence=evidence,
-                actor_uid=0,
-            )
-        self.assertFalse(released["claimed"])
-        with CoordinatorStore.open(
-            self.fixture.persistence.database_path,
-            expected_uid=os.geteuid(),
-        ) as store:
-            with store.read_transaction() as connection:
-                active_acl_count = int(
-                    connection.execute(
-                        "SELECT count(*) FROM broker_compose_acl "
-                        "WHERE compose_definition_id = ? AND enabled = 1",
-                        (COMPOSE_ALPHA,),
-                    ).fetchone()[0]
-                )
-        self.assertEqual(active_acl_count, 0)
-        self.fixture.persistence.provision_compose_definition(
-            repo_id=REPO_BETA,
-            compose_definition_id="compose-beta",
-            cwd=self.fixture.beta_root,
-            files=(beta_compose,),
-            services=("api",),
-            project_name="alpha-stack",
-            observation_snapshot_id=str(evidence["snapshot_id"]),
-        )
-        self.fixture.persistence.grant_resource(
-            uid=os.geteuid(),
-            repo_id=REPO_BETA,
-            resource_kind="compose",
-            resource_id="compose-beta",
-            operation=BrokerOperation.COMPOSE_UP,
-        )
-
-        def runner(
-            command: tuple[str, ...],
-            cwd: str,
-            timeout: float,
-            environment: Mapping[str, str],
-        ) -> subprocess.CompletedProcess[str]:
-            del cwd, timeout, environment
-            return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
-
-        service, _ = service_for(self.fixture, compose_runner=runner)
-        request = self.fixture.request(
-            BrokerOperation.COMPOSE_UP,
-            repo_id=REPO_BETA,
-            resource_id="compose-beta",
-        )
-        reply = service.reply_for_document(self.fixture.peer(), request.to_wire())
-        self.assertTrue(reply["ok"], reply)
 
     def test_project_name_release_requires_root_and_exact_complete_empty_evidence(
         self,
@@ -1725,10 +1420,9 @@ class BrokerComposeTests(unittest.TestCase):
             encoding="utf-8",
         )
         with self.assertRaisesRegex(ValueError, "unsupported transitive key"):
-            broker_enrollment._provision_compose(
+            broker_configuration._provision_compose(
                 self.fixture.persistence,
                 repo_id=REPO_ALPHA,
-                client_uid=os.geteuid(),
                 root=self.fixture.alpha_root,
                 compose={
                     "declared": True,
@@ -1964,14 +1658,6 @@ volumes:
                 },
                 "host_devices",
             ),
-            "published port": (
-                {
-                    "ports": [
-                        {"target": 8080, "published": "25001", "host_ip": "127.0.0.1"}
-                    ]
-                },
-                "published_host_ports",
-            ),
         }
         for label, (service_fields, expected_risk) in cases.items():
             with self.subTest(label=label):
@@ -1985,7 +1671,9 @@ volumes:
                         }
                     }
                 ).encode()
-                with self.assertRaisesRegex(PermissionError, "explicit administrator"):
+                with self.assertRaisesRegex(
+                    PermissionError, "administrator-approved host access"
+                ):
                     require_effective_compose_model(
                         payload,
                         declared_services=("web",),
@@ -2001,6 +1689,112 @@ volumes:
                     host_access_approved=True,
                 )
                 self.assertIn(expected_risk, evidence.host_access_risks)
+
+        for label, host_ip in (
+            ("IPv4 loopback", "127.0.0.1"),
+            ("IPv4 loopback range", "127.42.0.9"),
+            ("IPv6 loopback", "::1"),
+            ("bracketed IPv6 loopback", "[::1]"),
+        ):
+            with self.subTest(label=label):
+                payload = json.dumps(
+                    {
+                        "services": {
+                            "web": {
+                                "image": "example.invalid/web:test",
+                                "ports": [
+                                    {
+                                        "target": 8080,
+                                        "published": "25001",
+                                        "host_ip": host_ip,
+                                    }
+                                ],
+                            }
+                        }
+                    }
+                ).encode()
+                evidence = require_effective_compose_model(
+                    payload,
+                    declared_services=("web",),
+                    declared_profiles=(),
+                    project_name="alpha-stack",
+                    host_access_approved=False,
+                )
+                self.assertIn("published_host_ports", evidence.host_access_risks)
+
+        for label, port in (
+            ("IPv4 loopback short syntax", "127.0.0.1:${PORT:-25001}:8080"),
+            ("IPv6 loopback short syntax", "[::1]:${PORT:-25001}:8080"),
+        ):
+            with self.subTest(label=label):
+                payload = json.dumps(
+                    {
+                        "services": {
+                            "web": {
+                                "image": "example.invalid/web:test",
+                                "ports": [port],
+                            }
+                        }
+                    }
+                ).encode()
+                evidence = require_effective_compose_model(
+                    payload,
+                    declared_services=("web",),
+                    declared_profiles=(),
+                    project_name="alpha-stack",
+                    host_access_approved=False,
+                )
+                self.assertIn("published_host_ports", evidence.host_access_risks)
+
+        for label, port in (
+            ("missing host", {"target": 8080, "published": "25001"}),
+            (
+                "IPv4 wildcard",
+                {"target": 8080, "published": "25001", "host_ip": "0.0.0.0"},
+            ),
+            (
+                "IPv6 wildcard",
+                {"target": 8080, "published": "25001", "host_ip": "::"},
+            ),
+            (
+                "public address",
+                {"target": 8080, "published": "25001", "host_ip": "192.0.2.1"},
+            ),
+            (
+                "malformed address",
+                {"target": 8080, "published": "25001", "host_ip": "localhost"},
+            ),
+            ("short syntax", "25001:8080"),
+        ):
+            with self.subTest(label=label):
+                payload = json.dumps(
+                    {
+                        "services": {
+                            "web": {
+                                "image": "example.invalid/web:test",
+                                "ports": [port],
+                            }
+                        }
+                    }
+                ).encode()
+                with self.assertRaisesRegex(
+                    PermissionError, "administrator-approved host access"
+                ):
+                    require_effective_compose_model(
+                        payload,
+                        declared_services=("web",),
+                        declared_profiles=(),
+                        project_name="alpha-stack",
+                        host_access_approved=False,
+                    )
+                evidence = require_effective_compose_model(
+                    payload,
+                    declared_services=("web",),
+                    declared_profiles=(),
+                    project_name="alpha-stack",
+                    host_access_approved=True,
+                )
+                self.assertIn("published_host_ports", evidence.host_access_risks)
 
         external = json.dumps(
             {
@@ -2104,7 +1898,9 @@ volumes:
                 }
             }
         ).encode()
-        with self.assertRaisesRegex(PermissionError, "explicit administrator"):
+        with self.assertRaisesRegex(
+            PermissionError, "administrator-approved host access"
+        ):
             require_effective_compose_model(
                 risky,
                 declared_services=("web",),
@@ -2130,7 +1926,9 @@ volumes:
         )
 
         self.fixture.persistence.compose_model_renderer = lambda **_arguments: risky
-        with self.assertRaisesRegex(PermissionError, "explicit administrator"):
+        with self.assertRaisesRegex(
+            PermissionError, "administrator-approved host access"
+        ):
             self.fixture.persistence.provision_compose_definition(
                 repo_id=REPO_ALPHA,
                 compose_definition_id=COMPOSE_ALPHA,
@@ -2279,19 +2077,6 @@ volumes:
         )
         definition = migrated.list_compose_definitions(repo_id=REPO_ALPHA)[0]
         self.assertFalse(definition["enabled"])
-        with CoordinatorStore.open(
-            migrated.database_path,
-            expected_uid=os.geteuid(),
-        ) as store:
-            with store.read_transaction() as connection:
-                enabled_grants = connection.execute(
-                    """
-                    SELECT count(*) FROM broker_compose_acl
-                    WHERE compose_definition_id = ? AND enabled = 1
-                    """,
-                    (COMPOSE_ALPHA,),
-                ).fetchone()[0]
-        self.assertEqual(enabled_grants, 0)
 
     def test_wire_cannot_supply_paths_names_argv_or_options(self) -> None:
         for argument in (
@@ -2455,422 +2240,104 @@ volumes:
         self.assertEqual(replay, first)
         self.assertEqual(len(calls), 1)
 
-    def test_compose_reply_uses_exact_fresh_snapshot_not_retained_container_history(self) -> None:
-        historical_id = "docker-historical"
-        current_id = "docker-current"
-        timestamp = utc_timestamp()
-        with CoordinatorStore.open(
-            self.fixture.persistence.database_path, expected_uid=os.geteuid()
-        ) as store:
-            with store.immediate_transaction() as connection:
+    def test_exact_service_recreate_is_single_service_waited_and_identity_proved(self) -> None:
+        calls: list[tuple[str, ...]] = []
+        previous_full_id = "1" * 64
+
+        def retain_pre_action_service(store, snapshot_id):
+            with store.immediate_transaction(revision_kind="observation") as connection:
+                present = connection.execute(
+                    """
+                    SELECT 1 FROM broker_observed_compose_containers
+                    WHERE snapshot_id = ? AND service_name = 'web'
+                    """,
+                    (snapshot_id,),
+                ).fetchone()
+                if present is not None:
+                    return
+                engine_id = "engine-current-" + snapshot_id
+                resource_id = "container-current-" + snapshot_id[-12:]
+                now = utc_timestamp()
                 connection.execute(
                     """
                     INSERT INTO docker_engines(
                         engine_id, host_id, context_identity, capability_state,
                         created_at, updated_at
-                    ) VALUES (
-                        'engine-fixture', ?, 'fixture', 'available', ?, ?
-                    )
+                    ) VALUES (?, ?, ?, 'available', ?, ?)
                     """,
-                    (HOST, timestamp, timestamp),
-                )
-                for resource_id, full_id, name in (
-                    (historical_id, "a" * 64, "historical-stopped"),
-                    (current_id, "b" * 64, "current-running"),
-                ):
-                    binding_id = "binding-" + resource_id
-                    connection.execute(
-                        """
-                        INSERT INTO docker_resources(
-                            docker_resource_id, engine_id, full_container_id,
-                            current_name, image, created_at, updated_at
-                        ) VALUES (?, 'engine-fixture', ?, ?, 'fixture:latest', ?, ?)
-                        """,
-                        (resource_id, full_id, name, timestamp, timestamp),
-                    )
-                    connection.execute(
-                        """
-                        INSERT INTO docker_observations(
-                            docker_resource_id, lifecycle, health,
-                            restart_policy, sampled_at, observation_fingerprint
-                        ) VALUES (?, ?, 'healthy', 'unless-stopped', ?, ?)
-                        """,
-                        (
-                            resource_id,
-                            "stopped" if resource_id == historical_id else "running",
-                            timestamp,
-                            "observation-" + resource_id,
-                        ),
-                    )
-                    connection.execute(
-                        """
-                        INSERT INTO control_bindings(
-                            binding_id, repo_id, resource_kind, resource_id,
-                            source_id, capability, provenance, authority_state,
-                            priority, generation, created_at, updated_at
-                        ) VALUES (
-                            ?, ?, 'container', ?, ?, 'lifecycle',
-                            'docker_labels', 'authoritative', 100, 0, ?, ?
-                        )
-                        """,
-                        (
-                            binding_id,
-                            REPO_ALPHA,
-                            resource_id,
-                            SOURCE,
-                            timestamp,
-                            timestamp,
-                        ),
-                    )
-                    connection.execute(
-                        """
-                        INSERT INTO repository_memberships(
-                            membership_id, repo_id, resource_kind,
-                            host_resource_id, immutable_fingerprint,
-                            control_binding_id, created_at
-                        ) VALUES (?, ?, 'container', ?, ?, ?, ?)
-                        """,
-                        (
-                            "membership-" + resource_id,
-                            REPO_ALPHA,
-                            resource_id,
-                            "sha256:" + ("c" * 64),
-                            binding_id,
-                            timestamp,
-                        ),
-                    )
-
-        def runner(
-            command: tuple[str, ...],
-            cwd: str,
-            timeout: float,
-            environment: Mapping[str, str],
-        ) -> subprocess.CompletedProcess[str]:
-            del cwd, timeout, environment
-            return subprocess.CompletedProcess(command, 0, stdout="ok\n", stderr="")
-
-        service, _ = service_for(self.fixture, compose_runner=runner)
-        self.fixture.observed_container_ids = (current_id,)
-
-        def mutate_latest_after_snapshot(
-            store: CoordinatorStore, snapshot_id: str
-        ) -> None:
-            del snapshot_id
-            self.fixture.after_snapshot_commit = None
-            with store.immediate_transaction() as connection:
-                connection.execute(
-                    """
-                    UPDATE docker_observations
-                    SET lifecycle = 'stopped', health = 'mutated-after-snapshot',
-                        restart_policy = 'no', sampled_at = ?,
-                        observation_fingerprint = 'mutable-after-snapshot'
-                    WHERE docker_resource_id = ?
-                    """,
-                    (utc_timestamp(), current_id),
-                )
-
-        self.fixture.after_snapshot_commit = mutate_latest_after_snapshot
-        up = service.reply_for_document(
-            self.fixture.peer(),
-            self.fixture.request(
-                BrokerOperation.COMPOSE_UP,
-                resource_id=COMPOSE_ALPHA,
-            ).to_wire(),
-        )
-        self.assertTrue(up["ok"], up)
-        self.assertEqual(
-            [item["docker_resource_id"] for item in up["result"]["observed_resources"]],
-            [current_id],
-            "must-catch: Compose up evidence is bound to the exact fresh snapshot",
-        )
-        exact = up["result"]["observed_resources"][0]
-        self.assertEqual(
-            exact["snapshot_id"],
-            up["result"]["broker_observation"]["snapshot_id"],
-        )
-        self.assertEqual(
-            exact["observation_fingerprint"],
-            "snapshot-" + current_id,
-            "must-catch: exact outcome identity comes from immutable snapshot membership",
-        )
-        self.assertEqual(exact["current_lifecycle"], "stopped")
-        self.assertEqual(exact["current_health"], "mutated-after-snapshot")
-        self.assertEqual(exact["current_restart_policy"], "no")
-        self.assertEqual(
-            exact["current_observation_fingerprint"], "mutable-after-snapshot"
-        )
-        self.assertNotIn(
-            "lifecycle",
-            exact,
-            "mutable latest-row detail must be labeled current, not represented as snapshot fact",
-        )
-
-        self.fixture.observed_container_ids = ()
-        down = service.reply_for_document(
-            self.fixture.peer(),
-            self.fixture.request(
-                BrokerOperation.COMPOSE_DOWN,
-                resource_id=COMPOSE_ALPHA,
-            ).to_wire(),
-        )
-        self.assertTrue(down["ok"], down)
-        self.assertEqual(
-            down["result"]["observed_resources"],
-            [],
-            "must-catch: retained stopped rows cannot reappear after Compose down",
-        )
-
-    def test_compose_reobserves_when_first_ticket_sampled_before_mutation(self) -> None:
-        current_id = "docker-post-mutation"
-        timestamp = utc_timestamp()
-        with CoordinatorStore.open(
-            self.fixture.persistence.database_path, expected_uid=os.geteuid()
-        ) as store:
-            with store.immediate_transaction() as connection:
-                connection.execute(
-                    """
-                    INSERT INTO docker_engines(
-                        engine_id, host_id, context_identity, capability_state,
-                        created_at, updated_at
-                    ) VALUES ('engine-race', ?, 'race', 'available', ?, ?)
-                    """,
-                    (HOST, timestamp, timestamp),
+                    (engine_id, HOST, "current-" + snapshot_id, now, now),
                 )
                 connection.execute(
                     """
                     INSERT INTO docker_resources(
                         docker_resource_id, engine_id, full_container_id,
-                        current_name, image, created_at, updated_at
-                    ) VALUES (?, 'engine-race', ?, 'post-mutation',
-                              'fixture:latest', ?, ?)
+                        current_name, created_at, updated_at
+                    ) VALUES (?, ?, ?, 'alpha-stack-web-1', ?, ?)
                     """,
-                    (current_id, "d" * 64, timestamp, timestamp),
+                    (resource_id, engine_id, previous_full_id, now, now),
                 )
                 connection.execute(
                     """
-                    INSERT INTO docker_observations(
-                        docker_resource_id, lifecycle, health,
-                        restart_policy, sampled_at, observation_fingerprint
-                    ) VALUES (?, 'running', 'healthy', 'unless-stopped', ?, ?)
-                    """,
-                    (current_id, timestamp, "current-" + current_id),
-                )
-                connection.execute(
-                    """
-                    INSERT INTO control_bindings(
-                        binding_id, repo_id, resource_kind, resource_id,
-                        source_id, capability, provenance, authority_state,
-                        priority, generation, created_at, updated_at
-                    ) VALUES ('binding-race', ?, 'container', ?, ?, 'lifecycle',
-                              'docker_labels', 'authoritative', 100, 0, ?, ?)
-                    """,
-                    (REPO_ALPHA, current_id, SOURCE, timestamp, timestamp),
-                )
-                connection.execute(
-                    """
-                    INSERT INTO repository_memberships(
-                        membership_id, repo_id, resource_kind,
-                        host_resource_id, immutable_fingerprint,
-                        control_binding_id, created_at
-                    ) VALUES ('membership-race', ?, 'container', ?, ?,
-                              'binding-race', ?)
-                    """,
-                    (REPO_ALPHA, current_id, "sha256:" + "e" * 64, timestamp),
-                )
-
-        pre_sample_captured = threading.Event()
-        release_pre_sample = threading.Event()
-        mutation_executed = threading.Event()
-        join_detected = threading.Event()
-        external_outcome: dict[str, Any] = {}
-        external_errors: list[BaseException] = []
-        post_sample_count = 0
-        owner: threading.Thread | None = None
-        capability_fingerprint = "sha256:" + "9" * 64
-
-        def commit_snapshot(
-            connection: Any, snapshot_id: str, sample: Mapping[str, Any]
-        ) -> None:
-            committed_at = utc_timestamp()
-            connection.execute(
-                """
-                INSERT INTO observation_capabilities(
-                    snapshot_id, observer_domain, docker_available,
-                    capability_fingerprint, committed_at
-                ) VALUES (?, 'host-runtime-v2:full-docker', 1, ?, ?)
-                """,
-                (snapshot_id, capability_fingerprint, committed_at),
-            )
-            connection.execute(
-                """
-                INSERT INTO broker_observation_compose_scope(
-                    snapshot_id, assets_complete, observed_asset_count,
-                    evidence_fingerprint, recorded_at
-                ) VALUES (?, 1, 0, ?, ?)
-                """,
-                (snapshot_id, "scope-" + str(sample["phase"]), committed_at),
-            )
-            phase = str(sample["phase"])
-            for resource_id in sample["resource_ids"]:
-                connection.execute(
-                    """
-                    INSERT INTO observation_snapshot_resources(
-                        snapshot_id, resource_kind, resource_id,
+                    INSERT INTO broker_observed_compose_containers(
+                        snapshot_id, docker_resource_id, full_container_id,
+                        project_name, service_name, lifecycle,
+                        association_state, associated_repo_id,
                         observation_fingerprint
-                    ) VALUES (?, 'container', ?, ?)
+                    ) VALUES (?, ?, ?, 'alpha-stack', 'web', 'running',
+                              'exclusive', ?, ?)
                     """,
-                    (snapshot_id, resource_id, f"snapshot-{phase}-{resource_id}"),
+                    (
+                        snapshot_id,
+                        resource_id,
+                        previous_full_id,
+                        REPO_ALPHA,
+                        "current-web-" + snapshot_id,
+                    ),
                 )
-            if phase == "post":
-                for service_name in ("db", "web"):
-                    full_id = hashlib.sha256(
-                        f"{snapshot_id}:{service_name}".encode("utf-8")
-                    ).hexdigest()
-                    resource_id = f"compose-post-{service_name}-{full_id[:12]}"
-                    connection.execute(
-                        """
-                        INSERT INTO docker_resources(
-                            docker_resource_id, engine_id, full_container_id,
-                            current_name, image, created_at, updated_at
-                        ) VALUES (?, 'engine-race', ?, ?, 'fixture:latest', ?, ?)
-                        """,
-                        (
-                            resource_id,
-                            full_id,
-                            f"alpha-stack-{service_name}-1",
-                            committed_at,
-                            committed_at,
-                        ),
-                    )
-                    connection.execute(
-                        """
-                        INSERT INTO broker_observed_compose_containers(
-                            snapshot_id, docker_resource_id, full_container_id,
-                            project_name, service_name, lifecycle,
-                            ownership_state, authoritative_owner_repo_id,
-                            observation_fingerprint
-                        ) VALUES (?, ?, ?, 'alpha-stack', ?, 'running',
-                                  'exclusive', ?, ?)
-                        """,
-                        (
-                            snapshot_id,
-                            resource_id,
-                            full_id,
-                            service_name,
-                            REPO_ALPHA,
-                            f"compose-post-{service_name}",
-                        ),
-                    )
 
-        def pre_sampler() -> Mapping[str, Any]:
-            pre_sample_captured.set()
-            if not release_pre_sample.wait(5):
-                raise RuntimeError("fixture timed out waiting for Compose mutation")
-            return {"phase": "pre", "resource_ids": []}
+        self.fixture.after_snapshot_commit = retain_pre_action_service
 
-        def own_pre_mutation_ticket() -> None:
-            try:
-                with AccountStore.open(
-                    self.fixture.persistence.database_path,
-                    expected_uid=os.geteuid(),
-                ) as store:
-                    outcome = SingleFlightObserver(store, join_timeout=5).observe(
-                        host_id=HOST,
-                        observer_domain="host-runtime-v2:full-docker",
-                        sampler=pre_sampler,
-                        commit=commit_snapshot,
-                    )
-                    external_outcome["snapshot_id"] = outcome.snapshot_id
-            except BaseException as error:
-                external_errors.append(error)
-
-        def post_sampler() -> Mapping[str, Any]:
-            nonlocal post_sample_count
-            post_sample_count += 1
-            if not mutation_executed.is_set():
-                raise RuntimeError("post-mutation observer sampled too early")
-            return {"phase": "post", "resource_ids": [current_id]}
-
-        def preflight_sampler() -> Mapping[str, Any]:
-            return {"phase": "preflight", "resource_ids": []}
-
-        def join_sleeper(delay: float) -> None:
-            join_detected.set()
-            release_pre_sample.set()
-            threading.Event().wait(delay)
-
-        def observe_after_mutation(store: CoordinatorStore) -> Mapping[str, Any]:
-            sampler = (
-                post_sampler if mutation_executed.is_set() else preflight_sampler
-            )
-            outcome = SingleFlightObserver(
-                store,
-                join_timeout=5,
-                sleeper=join_sleeper,
-            ).observe(
-                host_id=HOST,
-                observer_domain="host-runtime-v2:full-docker",
-                sampler=sampler,
-                commit=commit_snapshot,
-            )
-            return {
-                "snapshot_id": outcome.snapshot_id,
-                "host_id": outcome.host_id,
-                "observer_domain": outcome.observer_domain,
-                "joined": outcome.joined,
-                "docker_available": True,
-                "capability_fingerprint": capability_fingerprint,
-                "material_fingerprint": outcome.material_fingerprint,
-                "completed_at": outcome.completed_at,
-            }
-
-        def runner(
-            command: tuple[str, ...],
-            cwd: str,
-            timeout: float,
-            environment: Mapping[str, str],
-        ) -> subprocess.CompletedProcess[str]:
-            nonlocal owner
+        def runner(command, cwd, timeout, environment):
             del cwd, timeout, environment
-            owner = threading.Thread(target=own_pre_mutation_ticket, daemon=True)
-            owner.start()
-            if not pre_sample_captured.wait(3):
-                raise RuntimeError(
-                    "fixture did not capture its sample before Compose mutation"
-                )
-            mutation_executed.set()
-            return subprocess.CompletedProcess(command, 0, stdout="ok\n", stderr="")
+            normalized, _env, _files, _paths = capture_sealed_compose_command(command)
+            calls.append(normalized)
+            return subprocess.CompletedProcess(command, 0, stdout="recreated\n", stderr="")
 
-        service, _ = service_for(
-            self.fixture,
-            compose_runner=runner,
-            observer=observe_after_mutation,
-        )
+        service, _ = service_for(self.fixture, compose_runner=runner)
         request = self.fixture.request(
             BrokerOperation.COMPOSE_UP,
             resource_id=COMPOSE_ALPHA,
+            arguments={
+                "service": "web",
+                "force_recreate": True,
+                "wait_timeout_seconds": 45,
+            },
         )
-        reply = service.reply_for_document(
-            self.fixture.peer(),
-            request.to_wire(),
-        )
-        self.assertIsNotNone(owner)
-        assert owner is not None
-        owner.join(3)
 
-        self.assertFalse(owner.is_alive(), "pre-mutation observation owner must finish")
-        self.assertEqual(external_errors, [])
+        reply = service.reply_for_document(self.fixture.peer(), request.to_wire())
+
         self.assertTrue(reply["ok"], reply)
-        self.assertTrue(join_detected.is_set(), "first observer call must join the old ticket")
-        self.assertEqual(post_sample_count, 1)
+        recreation = reply["result"]["service_recreation"]
+        self.assertEqual(recreation["service"], "web")
         self.assertNotEqual(
-            reply["result"]["broker_observation"]["snapshot_id"],
-            external_outcome["snapshot_id"],
-            "must-catch: Compose result cannot reuse a snapshot sampled before mutation",
+            recreation["previous"]["full_container_id"],
+            recreation["current"]["full_container_id"],
         )
+        self.assertTrue(recreation["volumes_preserved_from_sealed_model"])
+        self.assertTrue(recreation["dependencies_recreated"] is False)
         self.assertEqual(
-            reply["result"]["observed_resources"][0]["observation_fingerprint"],
-            "snapshot-post-" + current_id,
+            calls[0][-9:],
+            (
+                "up",
+                "--no-build",
+                "--detach",
+                "--no-deps",
+                "--force-recreate",
+                "--wait",
+                "--wait-timeout",
+                "45",
+                "web",
+            ),
         )
 
     def test_invoked_failure_with_proven_final_state_completes_without_retry(self) -> None:
@@ -2964,6 +2431,118 @@ volumes:
         )
         self.assertTrue(blocked["ok"], blocked)
         self.assertEqual(calls, 2)
+
+    def test_committed_compose_state_mismatch_is_terminal_not_uncertain(self) -> None:
+        observation_count = 0
+
+        def observe_stopped_after_action(
+            store: CoordinatorStore,
+        ) -> Mapping[str, Any]:
+            nonlocal observation_count
+            observation_count += 1
+            evidence = self.fixture.observe_full_docker(store)
+            if observation_count == 2:
+                with store.immediate_transaction(
+                    revision_kind="observation"
+                ) as connection:
+                    connection.execute(
+                        "DELETE FROM broker_observed_compose_containers "
+                        "WHERE snapshot_id = ?",
+                        (evidence["snapshot_id"],),
+                    )
+            return evidence
+
+        def runner(
+            command: tuple[str, ...],
+            cwd: str,
+            timeout: float,
+            environment: Mapping[str, str],
+        ) -> subprocess.CompletedProcess[str]:
+            del cwd, timeout, environment
+            return subprocess.CompletedProcess(
+                command, 0, stdout="ok\n", stderr=""
+            )
+
+        service, _ = service_for(
+            self.fixture,
+            compose_runner=runner,
+            observer=observe_stopped_after_action,
+        )
+        request = self.fixture.request(
+            BrokerOperation.COMPOSE_UP,
+            resource_id=COMPOSE_ALPHA,
+            operation_id=str(uuid.uuid4()),
+        )
+
+        reply = service.reply_for_document(self.fixture.peer(), request.to_wire())
+
+        self.assertFalse(reply["ok"], reply)
+        self.assertEqual(reply["error"]["code"], "compose_observation_mismatch")
+        with CoordinatorStore.open(
+            self.fixture.persistence.database_path, expected_uid=os.geteuid()
+        ) as store:
+            with store.read_transaction() as connection:
+                operation = connection.execute(
+                    "SELECT status, phase, error_code FROM operations "
+                    "WHERE operation_id = ?",
+                    (request.operation_id,),
+                ).fetchone()
+        self.assertEqual(
+            dict(operation),
+            {
+                "status": "failed",
+                "phase": "failed",
+                "error_code": "compose_observation_mismatch",
+            },
+        )
+
+    def test_compose_observer_failure_retains_bounded_inner_code(self) -> None:
+        observation_count = 0
+
+        def failing_post_observer(
+            store: CoordinatorStore,
+        ) -> Mapping[str, Any]:
+            nonlocal observation_count
+            observation_count += 1
+            if observation_count == 1:
+                return self.fixture.observe_full_docker(store)
+            raise BrokerError(
+                "observer_backend_failed", "observer fixture failed"
+            )
+
+        def runner(
+            command: tuple[str, ...],
+            cwd: str,
+            timeout: float,
+            environment: Mapping[str, str],
+        ) -> subprocess.CompletedProcess[str]:
+            del cwd, timeout, environment
+            return subprocess.CompletedProcess(
+                command, 0, stdout="ok\n", stderr=""
+            )
+
+        service, _ = service_for(
+            self.fixture,
+            compose_runner=runner,
+            observer=failing_post_observer,
+        )
+        request = self.fixture.request(
+            BrokerOperation.COMPOSE_UP,
+            resource_id=COMPOSE_ALPHA,
+            operation_id=str(uuid.uuid4()),
+        )
+
+        reply = service.reply_for_document(self.fixture.peer(), request.to_wire())
+
+        self.assertFalse(reply["ok"], reply)
+        self.assertEqual(reply["error"]["code"], "operation_outcome_uncertain")
+        candidate = self.fixture.persistence.compose_reconciliation_candidate(
+            request.operation_id
+        )
+        self.assertEqual(
+            candidate["uncertain_outcome"]["observation_failure_code"],
+            "observer_backend_failed",
+        )
 
     def test_missing_effective_model_evidence_requires_fingerprint_abandonment(
         self,
@@ -3147,7 +2726,7 @@ volumes:
             resource_id=COMPOSE_ALPHA,
             operation_id=str(uuid.uuid4()),
         )
-        authorized = self.fixture.persistence.authorize(
+        authorized = self.fixture.persistence.accept(
             self.fixture.peer(), request
         )
         self.assertEqual(
@@ -3360,7 +2939,7 @@ volumes:
             ).to_wire(),
         )
         self.assertFalse(reply["ok"], reply)
-        self.assertEqual(reply["error"]["code"], "operation_outcome_uncertain")
+        self.assertEqual(reply["error"]["code"], "compose_observation_mismatch")
         self.assertEqual(calls, 1)
         with CoordinatorStore.open(
             self.fixture.persistence.database_path,
@@ -3417,7 +2996,7 @@ volumes:
                     INSERT INTO broker_observed_compose_containers(
                         snapshot_id, docker_resource_id, full_container_id,
                         project_name, service_name, lifecycle,
-                        ownership_state, authoritative_owner_repo_id,
+                        association_state, associated_repo_id,
                         observation_fingerprint
                     ) VALUES (?, ?, ?, 'alpha-stack', 'web', 'running',
                               'exclusive', ?, 'extra-observation')
@@ -3438,55 +3017,6 @@ volumes:
         self.assertFalse(proof["desired_state_observed"])
         self.assertEqual(proof["excess_services"], ["web"])
         self.assertEqual(proof["expected_service_replicas"], {"web": 1})
-
-    def test_restart_partial_phase_is_fenced_with_exact_completed_phases(self) -> None:
-        calls: list[str] = []
-
-        def runner(
-            command: tuple[str, ...],
-            cwd: str,
-            timeout: float,
-            environment: Mapping[str, str],
-        ) -> subprocess.CompletedProcess[str]:
-            del cwd, timeout, environment
-            phase = "stop" if "stop" in command else "up"
-            calls.append(phase)
-            return subprocess.CompletedProcess(
-                command,
-                0 if phase == "stop" else 1,
-                stdout="",
-                stderr="suppressed",
-            )
-
-        self.fixture.persistence.grant_resource(
-            uid=os.geteuid(),
-            repo_id=REPO_ALPHA,
-            resource_kind="compose",
-            resource_id=COMPOSE_ALPHA,
-            operation=BrokerOperation.COMPOSE_RESTART,
-        )
-        service, _ = service_for(self.fixture, compose_runner=runner)
-        request = self.fixture.request(
-            BrokerOperation.COMPOSE_RESTART,
-            resource_id=COMPOSE_ALPHA,
-        )
-        reply = service.reply_for_document(self.fixture.peer(), request.to_wire())
-        self.assertFalse(reply["ok"], reply)
-        self.assertEqual(reply["error"]["code"], "operation_outcome_uncertain")
-        with CoordinatorStore.open(
-            self.fixture.persistence.database_path,
-            expected_uid=os.geteuid(),
-        ) as store:
-            with store.read_transaction() as connection:
-                row = connection.execute(
-                    "SELECT status, result_json FROM operations WHERE operation_id = ?",
-                    (request.operation_id,),
-                ).fetchone()
-        self.assertEqual(row["status"], "needs_attention")
-        evidence = json.loads(str(row["result_json"]))
-        self.assertEqual(evidence["failed_phase"], "up")
-        self.assertEqual(evidence["completed_phases"], ["stop"])
-        self.assertEqual(calls, ["stop", "up"])
 
     def test_body_and_sealed_cleanup_failure_preserve_both_redacted_facts(
         self,
@@ -3708,7 +3238,7 @@ volumes:
             project_name="alpha-stack",
         )
         self.fixture.env_one.write_text(
-            "RUNTIME_OPAQUE_VALUE=changed-after-enrollment\n", encoding="utf-8"
+            "RUNTIME_OPAQUE_VALUE=changed-after-configuration\n", encoding="utf-8"
         )
         service, _ = service_for(self.fixture, compose_runner=runner)
         reply = service.reply_for_document(
@@ -3884,239 +3414,6 @@ volumes:
             if moved.is_dir():
                 moved.rename(self.fixture.alpha_root)
 
-    def test_restart_path_drift_between_phases_is_uncertain(self) -> None:
-        self.fixture.persistence.grant_resource(
-            uid=os.geteuid(),
-            repo_id=REPO_ALPHA,
-            resource_kind="compose",
-            resource_id=COMPOSE_ALPHA,
-            operation=BrokerOperation.COMPOSE_RESTART,
-        )
-        calls: list[str] = []
-
-        def runner(
-            command: tuple[str, ...],
-            cwd: str,
-            timeout: float,
-            environment: Mapping[str, str],
-        ) -> subprocess.CompletedProcess[str]:
-            del cwd, timeout, environment
-            calls.append("stop" if "stop" in command else "up")
-            return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
-
-        service, _ = service_for(self.fixture, compose_runner=runner)
-        request = self.fixture.request(
-            BrokerOperation.COMPOSE_RESTART,
-            resource_id=COMPOSE_ALPHA,
-        )
-        with mock.patch.object(
-            broker_host,
-            "_compose_target_paths_are_current",
-            side_effect=(True, True, False),
-        ):
-            reply = service.reply_for_document(self.fixture.peer(), request.to_wire())
-        self.assertFalse(reply["ok"], reply)
-        self.assertEqual(reply["error"]["code"], "operation_outcome_uncertain")
-        self.assertEqual(calls, ["stop"])
-        with CoordinatorStore.open(
-            self.fixture.persistence.database_path,
-            expected_uid=os.geteuid(),
-        ) as store:
-            with store.read_transaction() as connection:
-                result = connection.execute(
-                    "SELECT result_json FROM operations WHERE operation_id = ?",
-                    (request.operation_id,),
-                ).fetchone()
-        evidence = json.loads(str(result["result_json"]))
-        self.assertEqual(evidence["failed_phase"], "up_path_precheck")
-        self.assertEqual(evidence["completed_phases"], ["stop"])
-
-    def test_stop_restart_and_down_use_only_the_persisted_compose_scope(self) -> None:
-        calls: list[tuple[str, ...]] = []
-        captured_inputs: list[tuple[tuple[bytes, ...], tuple[bytes, ...]]] = []
-
-        def runner(
-            command: tuple[str, ...],
-            cwd: str,
-            timeout: float,
-            environment: Mapping[str, str],
-        ) -> subprocess.CompletedProcess[str]:
-            del cwd, timeout, environment
-            normalized, env_payloads, compose_payloads, _paths = (
-                capture_sealed_compose_command(command)
-            )
-            calls.append(normalized)
-            captured_inputs.append((env_payloads, compose_payloads))
-            return subprocess.CompletedProcess(command, 0, stdout="ok\n", stderr="")
-
-        self.fixture.persistence.provision_compose_definition(
-            repo_id=REPO_ALPHA,
-            compose_definition_id=COMPOSE_ALPHA,
-            cwd=self.fixture.alpha_root,
-            files=(self.fixture.compose_one, self.fixture.compose_two),
-            env_files=(self.fixture.env_one, self.fixture.env_two),
-            profiles=("capture", "display"),
-            services=("db", "web"),
-            project_name="alpha-stack",
-        )
-        for operation in (
-            BrokerOperation.COMPOSE_STOP,
-            BrokerOperation.COMPOSE_RESTART,
-        ):
-            self.fixture.persistence.grant_resource(
-                uid=os.geteuid(),
-                repo_id=REPO_ALPHA,
-                resource_kind="compose",
-                resource_id=COMPOSE_ALPHA,
-                operation=operation,
-            )
-
-        service, _ = service_for(self.fixture, compose_runner=runner)
-        for operation in (
-            BrokerOperation.COMPOSE_STOP,
-            BrokerOperation.COMPOSE_RESTART,
-            BrokerOperation.COMPOSE_DOWN,
-        ):
-            reply = service.reply_for_document(
-                self.fixture.peer(),
-                self.fixture.request(operation, resource_id=COMPOSE_ALPHA).to_wire(),
-            )
-            self.assertTrue(reply["ok"], reply)
-
-        prefix = (
-            "/trusted/docker",
-            "compose",
-            "--project-directory",
-            ".",
-            "--project-name",
-            "alpha-stack",
-            "--env-file",
-            "<sealed-env-0>",
-            "--env-file",
-            "<sealed-env-1>",
-            "--env-file",
-            "<sealed-env-2>",
-            "--profile",
-            "capture",
-            "--profile",
-            "display",
-            "--file",
-            "<sealed-compose-0>",
-            "--file",
-            "<sealed-compose-1>",
-            "--file",
-            "<sealed-compose-2>",
-        )
-        self.assertEqual(
-            calls,
-            [
-                (*prefix, "stop", "db", "web"),
-                (*prefix, "stop", "db", "web"),
-                (
-                    *prefix,
-                    "up",
-                    "--no-build",
-                    "--detach",
-                    "--no-deps",
-                    "db",
-                    "web",
-                ),
-                (*prefix, "down"),
-            ],
-        )
-        self.assertTrue(
-            all(
-                env_payloads
-                == (
-                    b"",
-                    self.fixture.env_one.read_bytes(),
-                    self.fixture.env_two.read_bytes(),
-                )
-                and compose_payloads[:2]
-                == (
-                    self.fixture.compose_one.read_bytes(),
-                    self.fixture.compose_two.read_bytes(),
-                )
-                and json.loads(compose_payloads[2])
-                == {
-                    "services": {
-                        service: {
-                            "cgroup_parent": project_repository_slice(
-                                uid=os.geteuid(), repository_id=REPO_ALPHA
-                            ),
-                            "cpus": "8.0",
-                            "mem_limit": "20g",
-                            "pids_limit": 4096,
-                        }
-                        for service in ("db", "web")
-                    }
-                }
-                for env_payloads, compose_payloads in captured_inputs
-            )
-        )
-
-    def test_fresh_observed_name_conflict_blocks_every_action_before_runner(
-        self,
-    ) -> None:
-        for operation in (
-            BrokerOperation.COMPOSE_UP,
-            BrokerOperation.COMPOSE_STOP,
-            BrokerOperation.COMPOSE_RESTART,
-            BrokerOperation.COMPOSE_DOWN,
-        ):
-            self.fixture.persistence.grant_resource(
-                uid=os.geteuid(),
-                repo_id=REPO_ALPHA,
-                resource_kind="compose",
-                resource_id=COMPOSE_ALPHA,
-                operation=operation,
-            )
-        calls = 0
-
-        def runner(
-            command: tuple[str, ...],
-            cwd: str,
-            timeout: float,
-            environment: Mapping[str, str],
-        ) -> subprocess.CompletedProcess[str]:
-            del command, cwd, timeout, environment
-            nonlocal calls
-            calls += 1
-            raise AssertionError("conflicted Compose mutation reached Docker")
-
-        def observe_unassigned(_store: CoordinatorStore) -> Mapping[str, Any]:
-            snapshot_id = self.fixture.observed_compose_snapshot(
-                owner_repo_id=None,
-                project_name="alpha-stack",
-            )
-            return self.fixture.snapshot_evidence(snapshot_id)
-
-        service, _host = service_for(
-            self.fixture,
-            compose_runner=runner,
-            observer=observe_unassigned,
-        )
-        for operation in (
-            BrokerOperation.COMPOSE_UP,
-            BrokerOperation.COMPOSE_STOP,
-            BrokerOperation.COMPOSE_RESTART,
-            BrokerOperation.COMPOSE_DOWN,
-        ):
-            with self.subTest(operation=operation.value):
-                reply = service.reply_for_document(
-                    self.fixture.peer(),
-                    self.fixture.request(
-                        operation,
-                        resource_id=COMPOSE_ALPHA,
-                    ).to_wire(),
-                )
-                self.assertFalse(reply["ok"], reply)
-                self.assertEqual(
-                    reply["error"]["code"],
-                    "compose_project_name_conflict",
-                )
-        self.assertEqual(calls, 0)
-
     def test_exact_owned_observation_allows_action_and_binds_preflight(self) -> None:
         calls = 0
 
@@ -4215,7 +3512,7 @@ volumes:
             BrokerOperation.COMPOSE_UP,
             resource_id=COMPOSE_ALPHA,
         )
-        first_authorized = self.fixture.persistence.authorize(
+        first_authorized = self.fixture.persistence.accept(
             self.fixture.peer(), first_request
         )
         self.assertEqual(
@@ -4265,7 +3562,7 @@ volumes:
         self.assertEqual(observations, 0)
         self.assertEqual(runner_calls, 0)
 
-        second_authorized = self.fixture.persistence.authorize(
+        second_authorized = self.fixture.persistence.accept(
             self.fixture.peer(), second_request
         )
         with self.assertRaises(BrokerError) as raised:
@@ -4422,182 +3719,6 @@ volumes:
                 )
             self.assertEqual(raised.exception.code, "compose_project_name_conflict")
 
-    def test_legacy_compose_acl_schema_migrates_all_four_exact_operations(self) -> None:
-        third_uid = os.geteuid() + 20_000
-        self.fixture.persistence.provision_principal(
-            uid=third_uid, account_id="account-third"
-        )
-        now = utc_timestamp()
-        with CoordinatorStore.open(
-            self.fixture.persistence.database_path, expected_uid=os.geteuid()
-        ) as store:
-            with store.immediate_transaction() as connection:
-                connection.execute("DROP TABLE broker_compose_acl")
-                connection.execute(
-                    """
-                    CREATE TABLE broker_compose_acl (
-                        uid INTEGER NOT NULL
-                            REFERENCES broker_acl_principals(uid) ON DELETE CASCADE,
-                        repo_id TEXT NOT NULL
-                            REFERENCES repositories(repo_id) ON DELETE CASCADE,
-                        compose_definition_id TEXT NOT NULL
-                            REFERENCES broker_compose_definitions(compose_definition_id)
-                            ON DELETE CASCADE,
-                        operation TEXT NOT NULL
-                            CHECK(operation IN ('compose.up', 'compose.down')),
-                        enabled INTEGER NOT NULL DEFAULT 1
-                            CHECK(enabled IN (0, 1)),
-                        updated_at TEXT NOT NULL,
-                        PRIMARY KEY(
-                            uid, repo_id, compose_definition_id, operation
-                        )
-                    )
-                    """
-                )
-                connection.executemany(
-                    """
-                    INSERT INTO broker_compose_acl(
-                        uid, repo_id, compose_definition_id,
-                        operation, enabled, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        (
-                            os.geteuid(),
-                            REPO_ALPHA,
-                            COMPOSE_ALPHA,
-                            "compose.up",
-                            1,
-                            now,
-                        ),
-                        (
-                            os.geteuid(),
-                            REPO_ALPHA,
-                            COMPOSE_ALPHA,
-                            "compose.down",
-                            1,
-                            now,
-                        ),
-                        (
-                            self.fixture.foreign_uid,
-                            REPO_ALPHA,
-                            COMPOSE_ALPHA,
-                            "compose.up",
-                            1,
-                            now,
-                        ),
-                        (
-                            self.fixture.foreign_uid,
-                            REPO_ALPHA,
-                            COMPOSE_ALPHA,
-                            "compose.down",
-                            0,
-                            now,
-                        ),
-                        (
-                            third_uid,
-                            REPO_ALPHA,
-                            COMPOSE_ALPHA,
-                            "compose.up",
-                            0,
-                            now,
-                        ),
-                        (
-                            third_uid,
-                            REPO_ALPHA,
-                            COMPOSE_ALPHA,
-                            "compose.down",
-                            1,
-                            now,
-                        ),
-                    ),
-                )
-
-        migrated = BrokerPersistence(
-            self.fixture.persistence.database_path,
-            expected_uid=os.geteuid(),
-        )
-        with CoordinatorStore.open(
-            migrated.database_path, expected_uid=os.geteuid()
-        ) as store:
-            with store.read_transaction() as connection:
-                rows = list(
-                    connection.execute(
-                        """
-                        SELECT uid, operation, enabled
-                        FROM broker_compose_acl
-                        WHERE repo_id = ? AND compose_definition_id = ?
-                        ORDER BY uid, operation
-                        """,
-                        (REPO_ALPHA, COMPOSE_ALPHA),
-                    )
-                )
-        grants = {
-            (int(row["uid"]), str(row["operation"])): int(row["enabled"])
-            for row in rows
-        }
-        self.assertEqual(
-            {
-                operation: grants[(os.geteuid(), operation)]
-                for operation in (
-                    "compose.up",
-                    "compose.stop",
-                    "compose.restart",
-                    "compose.down",
-                )
-            },
-            {
-                "compose.up": 1,
-                "compose.stop": 1,
-                "compose.restart": 1,
-                "compose.down": 1,
-            },
-        )
-        self.assertEqual(grants[(self.fixture.foreign_uid, "compose.stop")], 0)
-        self.assertEqual(grants[(self.fixture.foreign_uid, "compose.restart")], 0)
-        self.assertEqual(grants[(third_uid, "compose.stop")], 1)
-        self.assertEqual(grants[(third_uid, "compose.restart")], 0)
-
-        fourth_uid = os.geteuid() + 30_000
-        migrated.provision_principal(uid=fourth_uid, account_id="account-fourth")
-        for operation in (
-            BrokerOperation.COMPOSE_UP,
-            BrokerOperation.COMPOSE_STOP,
-            BrokerOperation.COMPOSE_RESTART,
-            BrokerOperation.COMPOSE_DOWN,
-        ):
-            migrated.grant_resource(
-                uid=fourth_uid,
-                repo_id=REPO_ALPHA,
-                resource_kind="compose",
-                resource_id=COMPOSE_ALPHA,
-                operation=operation,
-            )
-        with CoordinatorStore.open(
-            migrated.database_path, expected_uid=os.geteuid()
-        ) as store:
-            with store.read_transaction() as connection:
-                accepted_operations = {
-                    str(row["operation"])
-                    for row in connection.execute(
-                        """
-                        SELECT operation FROM broker_compose_acl
-                        WHERE uid = ? AND repo_id = ?
-                          AND compose_definition_id = ? AND enabled = 1
-                        """,
-                        (fourth_uid, REPO_ALPHA, COMPOSE_ALPHA),
-                    )
-                }
-        self.assertEqual(
-            accepted_operations,
-            {
-                "compose.up",
-                "compose.stop",
-                "compose.restart",
-                "compose.down",
-            },
-        )
-
     def test_legacy_compose_fingerprint_migrates_once_and_fences_pending_work(
         self,
     ) -> None:
@@ -4637,7 +3758,7 @@ volumes:
             BrokerOperation.COMPOSE_UP,
             resource_id=COMPOSE_ALPHA,
         )
-        authorized = self.fixture.persistence.authorize(self.fixture.peer(), request)
+        authorized = self.fixture.persistence.accept(self.fixture.peer(), request)
         disposition = self.fixture.persistence.reserve_operation(
             authorized,
             compose_preflight=evidence,
@@ -4873,7 +3994,9 @@ volumes:
         self.assertEqual(down["result"]["action"], "down")
         self.assertEqual(calls, ["down"])
 
-    def test_ungranted_compose_identity_is_rejected_before_host_effect(self) -> None:
+    def test_trusted_local_compose_command_is_shared_across_callers(
+        self,
+    ) -> None:
         calls = 0
 
         def runner(
@@ -4896,9 +4019,8 @@ volumes:
         reply = service.reply_for_document(
             self.fixture.peer(foreign=True), request.to_wire()
         )
-        self.assertFalse(reply["ok"], reply)
-        self.assertEqual(reply["error"]["code"], "operation_access_denied")
-        self.assertEqual(calls, 0)
+        self.assertTrue(reply["ok"], reply)
+        self.assertEqual(calls, 1)
 
 
 if __name__ == "__main__":

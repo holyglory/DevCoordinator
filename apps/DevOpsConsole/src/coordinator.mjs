@@ -284,18 +284,19 @@ function failureCode(err) {
   return null;
 }
 
-// Schema v2 keeps normalized identities at the top level and isolates the
+// Normalized schemas keep identities at the top level and isolate the
 // legacy Console read model under v1_compatibility. Existing Console journeys
 // deliberately consume that declared projection: overlay only its known keys
 // into a new view, retaining the normalized graph as non-conflicting evidence
 // and never mutating the cached wire response.
 function consoleInventoryView(value, trustedObservations = new Map()) {
-  if (!value || typeof value !== 'object' || Array.isArray(value) || value.schema_version !== 2) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)
+      || ![2, 3].includes(value.schema_version)) {
     return value;
   }
   const compatibility = value.v1_compatibility;
   if (!compatibility || typeof compatibility !== 'object' || Array.isArray(compatibility)) {
-    throw new CoordError('coordinator schema-v2 inventory compatibility projection is incomplete', {
+    throw new CoordError('coordinator inventory compatibility projection is incomplete', {
       status: 502,
     });
   }
@@ -303,7 +304,7 @@ function consoleInventoryView(value, trustedObservations = new Map()) {
     (key) => !Object.prototype.hasOwnProperty.call(compatibility, key),
   );
   if (missing.length > 0) {
-    throw new CoordError('coordinator schema-v2 inventory compatibility projection is incomplete', {
+    throw new CoordError('coordinator inventory compatibility projection is incomplete', {
       status: 502,
     });
   }
@@ -313,8 +314,8 @@ function consoleInventoryView(value, trustedObservations = new Map()) {
       ? consoleDockerProjection(value, compatibility.docker, trustedObservations)
       : compatibility[key];
   }
-  // A rolling older broker may still project enrollment-only definitions as
-  // `unobserved` servers merely because they have a port-policy ACL. Keep the
+  // A rolling older broker may still project configuration-only definitions as
+  // `unobserved` servers merely because they have a port policy. Keep the
   // untouched normalized graph and compatibility payload for exact lease
   // consumers, but the Console read model must require lifecycle evidence.
   const servers = Array.isArray(projected.servers)
@@ -340,14 +341,13 @@ function consoleInventoryView(value, trustedObservations = new Map()) {
 // telemetry is projected above before the historical-only fields are removed.
 function consoleOverviewInventoryView(value, trustedObservations = new Map()) {
   const projected = consoleInventoryView(value, trustedObservations);
-  if (!projected || projected.schema_version !== 2) return projected;
+  if (!projected || ![2, 3].includes(projected.schema_version)) return projected;
   const observations = projected.observations;
   return {
     schema_version: projected.schema_version,
     store: projected.store,
     repositories: projected.repositories,
     repository_trees: projected.repository_trees,
-    memberships: projected.memberships,
     resources: projected.resources,
     unassigned_resources: projected.unassigned_resources,
     lifecycle_violations: projected.lifecycle_violations,

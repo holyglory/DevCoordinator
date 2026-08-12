@@ -59,14 +59,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     capture = commands.add_parser("capture", help="capture one exact live audit")
     capture.add_argument("--database", type=_absolute, required=True)
-    capture.add_argument(
-        "--repository-owner-map",
-        type=_absolute,
-        help=(
-            "required root-private sealed owner map when --database is schema 12; "
-            "forbidden for schema 13"
-        ),
-    )
     capture.add_argument("--output", type=_absolute, required=True)
     capture.add_argument(
         "--docker-executable", type=_absolute, default=Path("/usr/bin/docker")
@@ -93,7 +85,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     verify = commands.add_parser("verify", help="verify audit and optional ledger")
     verify.add_argument("--audit", type=_absolute, required=True)
     verify.add_argument("--database", type=_absolute)
-    verify.add_argument("--repository-owner-map", type=_absolute)
     verify.add_argument("--ledger", type=_absolute)
     verify.add_argument("--require-fresh", action="store_true")
     return parser.parse_args(argv)
@@ -102,7 +93,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def _capture(args: argparse.Namespace) -> dict[str, object]:
     audit = capture_isolation_audit(
         database_path=args.database,
-        repository_owner_map_path=args.repository_owner_map,
         docker_cgroup_reader=lambda identities: inspect_docker_cgroups(
             identities, docker_executable=args.docker_executable
         ),
@@ -114,7 +104,6 @@ def _capture(args: argparse.Namespace) -> dict[str, object]:
         "output": str(args.output),
         "evidence_sha256": audit["evidence_sha256"],
         "source_schema_version": audit["source_schema_version"],
-        "repository_owner_map_sha256": audit["repository_owner_map_sha256"],
         "counts": audit["counts"],
         "project_isolation_complete": audit["project_isolation_complete"],
         "valid_until": audit["valid_until"],
@@ -180,18 +169,12 @@ def _verify(args: argparse.Namespace) -> dict[str, object]:
         audit = verify_live_authority_binding(
             audit,
             database_path=args.database,
-            repository_owner_map_path=args.repository_owner_map,
-        )
-    elif args.repository_owner_map is not None:
-        raise ProjectIsolationError(
-            "repository owner map verification requires --database"
         )
     result: dict[str, object] = {
         "ok": True,
         "kind": "project-runtime-isolation-verification",
         "audit_sha256": audit["evidence_sha256"],
         "source_schema_version": audit["source_schema_version"],
-        "repository_owner_map_sha256": audit["repository_owner_map_sha256"],
         "audit_counts": audit["counts"],
         "project_isolation_complete": audit["project_isolation_complete"],
     }

@@ -6,9 +6,10 @@ domains; they are not security tenants.
 
 ## Local trust boundary
 
-Local communication is authorized by the typed protocol and exact known
-repository/resource identity. The system records a peer UID when available so
-events remain attributable, but it never rejects a local client because of:
+Local communication has no caller authorization gate. The typed protocol and
+exact known repository/resource identity validate the command target. The
+system records a peer UID when available so events remain attributable, but it
+never rejects a local client because of:
 
 - UID or GID;
 - file or directory owner;
@@ -17,24 +18,19 @@ events remain attributable, but it never rejects a local client because of:
 - link count or a writable ancestor.
 
 Local sockets are reachable by every account. The published broker catalog and
-retained inventory are readable by every account. Client entries are routing
-and attribution data, not an ACL. No agent-created token, signature, or local
+retained inventory are readable by every account. Routing records are
+operational metadata, not an ACL. No agent-created token, signature,
+enrollment, membership, source permission, controller permission, or local
 cryptographic handshake is required.
 
 The actual non-root local caller is the execution identity for repository code.
 Coordinator records that UID durably for accounting, cleanup, and evidence; it
 does not substitute the repository filesystem owner, root, or a control-plane
 service account, and the repository command receives no elevated capability.
-For a fresh launch, Coordinator first proves the exact port is free. It may then
-descriptor-walk only the exact resolved, repository-contained working directory
-and restore group-class `rwX` access there. The walk prunes `.git`, does not
-follow symlinks, and silently skips multiply linked regular files. Directories
-gain only group-class `rwX`; a regular file gains group-class `rw`, plus execute
-only when it was already executable. Bytes, UID, GID, named ACL entries, world
-bits, and regular-file executable intent do not change. With an extended POSIX
-ACL, changing group-class bits changes its mask and may make an existing named
-local-account entry effective. This fixed preparation never executes a
-repository command. A port collision performs no metadata mutation.
+For a fresh launch, Coordinator first proves the exact port is free and then
+validates the exact resolved, repository-contained working directory. It does
+not rewrite repository ownership, groups, modes, or ACLs. A port collision
+performs no repository mutation.
 
 The protocol still rejects malformed or oversized messages, unknown
 repositories/resources, stale generations, disabled actions or lifecycle
@@ -43,16 +39,20 @@ escapes, symlinks at exact file boundaries, and replayed mutations with a
 different operation identity. Those checks prevent accidental cross-project
 interference rather than distrust another local user.
 
+Developer-directed Docker container deletion is the explicit exception. An
+agent or user-selected current Coordinator target is enough to issue one fixed
+`docker rm -f <full-container-id>` call. It has no repository association,
+cleanup grant, archive, lifecycle-state, mount, Compose-role, database-binding,
+fingerprint, plan, confirmation, or second-observation gate. This can interrupt
+a running service and discards its container writable layer. The command never
+passes `-v`; named-volume deletion remains a separate data-retention workflow.
+
 The service keeps the caller's ordinary umask. There is no `UMask=0000`, no
 world-writable source-tree policy, and no broad normalization of a repository
 root when only a contained working directory will execute.
 
-The root lifecycle authority sets `ProtectHome=false` while keeping
-`ProtectSystem=strict` and the explicit `ReadWritePaths=/home` exception. Its
-own systemd sandbox can therefore perform that exact-cwd repair for any trusted
-local account. This replaces brittle per-home installer exceptions. Repository
-code does not inherit that view or root authority: it starts only after
-`setpriv` drops to the recorded actual caller.
+Repository code does not inherit root authority: it starts only after `setpriv`
+drops to the recorded actual caller.
 
 Public Google login, Console grants, domain authorization, Telegram ownership,
 upstream identities, and secret-bearing credential transports remain product

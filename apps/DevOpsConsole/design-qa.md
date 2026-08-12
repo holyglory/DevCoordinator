@@ -12,7 +12,7 @@
   sidecar records both source-input hashes.
 - Browser-rendered implementation:
   `apps/DevOpsConsole/Artifacts/Canonical/tests-detail-desktop.png`, SHA-256
-  `63b566f703a95d54f806b037060d77cf39e047d041c8d06d325448002911f6ed`.
+  `92cf3f000680cc1417afb635144bb4d8a5cf89f7c654de052c460f74098995e4`.
   Its provenance sidecar binds the pixels to the current UI, fixture, browser
   test, helper, and locked Playwright files.
 - Route and state: `/#/tests`, dark theme, populated 18-repository 24-hour

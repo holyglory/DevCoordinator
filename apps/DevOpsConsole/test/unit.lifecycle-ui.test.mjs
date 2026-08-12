@@ -110,6 +110,23 @@ test('archive UI and polling require explicit backend lifecycle readiness', asyn
     'boot must not repeatedly call a deliberately unavailable archive endpoint');
 });
 
+test('TTL-owned temporary services never expose generic Archive controls', async () => {
+  const app = await fsp.readFile(new URL('../src/ui/app.js', import.meta.url), 'utf8');
+  const eligibility = extractFunction(app, 'function serverSupportsGenericLifecycle(server)');
+  const serverRow = extractFunction(app, 'function serverItem(o, s, hiddenRow = false)');
+  const treeRow = extractFunction(app, 'function treeServerRow(o, s, hiddenRow)');
+
+  assert.match(eligibility, /role[\s\S]*temporary/,
+    'generic lifecycle eligibility must be derived from the authoritative temporary role');
+  for (const source of [serverRow, treeRow]) {
+    assert.match(source, /serverSupportsGenericLifecycle\(s\)/);
+    assert.match(source, /genericLifecycle[\s\S]*archiveButton\(archiveTarget/,
+      'every server surface must suppress Archive for TTL-owned temporary services');
+    assert.match(source, /'data-lifecycle-target': genericLifecycle/,
+      'temporary services must not masquerade as post-lifecycle focus targets');
+  }
+});
+
 test('worktrees are disclosed only when the backend advertises removable archived children', async () => {
   const app = await fsp.readFile(new URL('../src/ui/app.js', import.meta.url), 'utf8');
   const groups = extractFunction(app, 'function archivedGroups(page)');

@@ -55,11 +55,8 @@ PARTITIONS = (
         "broker-authority",
         lambda module: _has_prefix("test_broker")(module)
         or _is_named(
-            "test_enrollment_snapshot_fingerprints",
-            "test_filesystem_acl",
             "test_maintenance",
             "test_project_profile_revocation",
-            "test_repository_owner_authority",
         )(module),
     ),
     Partition(

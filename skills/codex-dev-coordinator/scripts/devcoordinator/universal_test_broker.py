@@ -29,14 +29,6 @@ from .universal_testd import (
 )
 
 
-# The stable authority socket is intentionally available to every trusted local
-# account on this single-developer host.  Keep the test daemon's client
-# expectation aligned with the root-owned systemd socket unit instead of
-# inheriting BrokerClient's narrower per-group development-socket default.
-SYSTEM_AUTHORITY_SOCKET_UID = 0
-SYSTEM_AUTHORITY_SOCKET_GID = 0
-SYSTEM_AUTHORITY_SOCKET_MODE = 0o666
-
 # One broker call is only a polling slice inside the caller-owned launch
 # deadline.  Snapshot materialization and systemd activation can legitimately
 # outlive this slice; the deterministic operation identity is replayed until
@@ -111,9 +103,6 @@ class RepositoryLaunchDescriptorResolver(Protocol):
 class BrokerConnection:
     socket_path: Path
     authority_generation: str
-    expected_broker_uid: int = SYSTEM_AUTHORITY_SOCKET_UID
-    expected_socket_gid: int | None = SYSTEM_AUTHORITY_SOCKET_GID
-    expected_socket_mode: int = SYSTEM_AUTHORITY_SOCKET_MODE
 
     def __post_init__(self) -> None:
         path = Path(self.socket_path)
@@ -168,11 +157,7 @@ class _InternalBrokerCalls:
             operation_id=operation_id,
             authority_generation=self.connection.authority_generation,
         )
-        client_arguments: dict[str, object] = {
-            "expected_broker_uid": self.connection.expected_broker_uid,
-            "expected_socket_gid": self.connection.expected_socket_gid,
-            "expected_socket_mode": self.connection.expected_socket_mode,
-        }
+        client_arguments: dict[str, object] = {}
         # Omit the keyword when the caller accepts the BrokerClient default so
         # older injected factories remain source-compatible.
         if timeout_seconds is not None:

@@ -16,13 +16,13 @@ import os
 from pathlib import Path
 import re
 import stat
-from typing import Callable, Mapping
+from typing import Callable, Mapping, Sequence
 
 from .universal_test_store import AttemptConclusion, TestStoreContractError
 
 
 SPOOL_SCHEMA_VERSION = 3
-ACTIVE_ATTEMPT_SCHEMA_VERSION = 4
+ACTIVE_ATTEMPT_SCHEMA_VERSION = 5
 MAX_SPOOL_ENVELOPE_BYTES = 512 * 1024
 MAX_SPOOL_ENTRIES_PER_REPLAY = 1_000
 _SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:@/-]{0,255}$")
@@ -192,6 +192,7 @@ class ActiveAttemptEnvelope:
     launch_operation_id: str | None = None
     launch_timeout_seconds: int = 300
     launch_confirmed: bool = True
+    terminal_envelope: Mapping[str, object] | None = None
 
     def to_document(self) -> dict[str, object]:
         return {
@@ -210,6 +211,11 @@ class ActiveAttemptEnvelope:
             "launch_operation_id": self.launch_operation_id,
             "launch_timeout_seconds": self.launch_timeout_seconds,
             "launch_confirmed": self.launch_confirmed,
+            "terminal_envelope": (
+                None
+                if self.terminal_envelope is None
+                else dict(self.terminal_envelope)
+            ),
         }
 
     @classmethod
@@ -229,18 +235,22 @@ class ActiveAttemptEnvelope:
             "next_source_check_at",
             "result_chunk_ids",
         }
-        current_expected = legacy_expected | {
+        version_4_expected = legacy_expected | {
             "launch_ticket_id",
             "launch_operation_id",
             "launch_timeout_seconds",
             "launch_confirmed",
         }
+        current_expected = version_4_expected | {"terminal_envelope"}
         legacy = set(value) == legacy_expected and value.get("schema_version") == 3
+        version_4 = (
+            set(value) == version_4_expected and value.get("schema_version") == 4
+        )
         current = (
             set(value) == current_expected
             and value.get("schema_version") == ACTIVE_ATTEMPT_SCHEMA_VERSION
         )
-        if not legacy and not current:
+        if not legacy and not version_4 and not current:
             raise TestStoreContractError("active attempt spool fields are invalid")
         generation = value["generation"]
         repository_generation = value["repository_generation"]
@@ -275,7 +285,7 @@ class ActiveAttemptEnvelope:
         launch_operation_id = None
         launch_timeout_seconds = 300
         launch_confirmed = True
-        if current:
+        if version_4 or current:
             raw_ticket_id = value["launch_ticket_id"]
             raw_operation_id = value["launch_operation_id"]
             if raw_ticket_id is not None:
@@ -301,6 +311,22 @@ class ActiveAttemptEnvelope:
                 raise TestStoreContractError(
                     "pending active attempt launch identity is incomplete"
                 )
+        terminal_envelope = None
+        if current and value["terminal_envelope"] is not None:
+            raw_terminal = value["terminal_envelope"]
+            if not isinstance(raw_terminal, Mapping):
+                raise TestStoreContractError(
+                    "active attempt terminal envelope is invalid"
+                )
+            terminal = AttemptExitEnvelope.from_document(raw_terminal)
+            if (
+                terminal.attempt_id != value["attempt_id"]
+                or terminal.generation != generation
+            ):
+                raise TestStoreContractError(
+                    "active attempt terminal envelope identity is invalid"
+                )
+            terminal_envelope = terminal.to_document()
         return cls(
             attempt_id=_safe_id("attempt_id", value["attempt_id"]),
             generation=generation,
@@ -316,6 +342,7 @@ class ActiveAttemptEnvelope:
             launch_operation_id=launch_operation_id,
             launch_timeout_seconds=launch_timeout_seconds,
             launch_confirmed=launch_confirmed,
+            terminal_envelope=terminal_envelope,
         )
 
 
@@ -350,6 +377,7 @@ class DurableAttemptSpool:
         self.root = Path(root)
         self.pending = self.root / "pending"
         self.processed = self.root / "processed"
+        self.terminal_conflicts = self.root / "terminal-conflicts"
         self.result_pending = self.root / "result-pending"
         self.result_processed = self.root / "result-processed"
         self.active = self.root / "active"
@@ -360,6 +388,7 @@ class DurableAttemptSpool:
         root.mkdir(mode=0o700, parents=False, exist_ok=False)
         (root / "pending").mkdir(mode=0o700)
         (root / "processed").mkdir(mode=0o700)
+        (root / "terminal-conflicts").mkdir(mode=0o700)
         (root / "result-pending").mkdir(mode=0o700)
         (root / "result-processed").mkdir(mode=0o700)
         (root / "active").mkdir(mode=0o700)
@@ -378,6 +407,7 @@ class DurableAttemptSpool:
         for path in (
             spool.pending,
             spool.processed,
+            spool.terminal_conflicts,
             spool.result_pending,
             spool.result_processed,
             spool.active,
@@ -394,6 +424,7 @@ class DurableAttemptSpool:
             self.root,
             self.pending,
             self.processed,
+            self.terminal_conflicts,
             self.result_pending,
             self.result_processed,
             self.active,
@@ -627,27 +658,80 @@ class DurableAttemptSpool:
         importer: Callable[[AttemptExitEnvelope], object],
         *,
         limit: int = 1_000,
+        priority_names: tuple[str, ...] = (),
     ) -> dict[str, object]:
         if not callable(importer):
             raise TestStoreContractError("spool importer must be callable")
         if type(limit) is not int or not 1 <= limit <= MAX_SPOOL_ENTRIES_PER_REPLAY:
             raise TestStoreContractError("spool limit is invalid")
+        if (
+            not isinstance(priority_names, tuple)
+            or len(priority_names) > 16
+            or len(set(priority_names)) != len(priority_names)
+            or any(
+                not isinstance(name, str)
+                or Path(name).name != name
+                or not name.endswith(".json")
+                for name in priority_names
+            )
+        ):
+            raise TestStoreContractError("spool replay priorities are invalid")
         imported: list[str] = []
         failed: list[dict[str, str]] = []
-        names = sorted(
+        quarantined: list[str] = []
+        available = sorted(
             entry.name
             for entry in os.scandir(self.pending)
             if entry.name.endswith(".json") and not entry.is_symlink()
+        )
+        available_names = set(available)
+        prioritized = [name for name in priority_names if name in available_names]
+        prioritized_names = set(prioritized)
+        names = (
+            prioritized
+            + [name for name in available if name not in prioritized_names]
         )[:limit]
+        replayable: list[tuple[str, AttemptExitEnvelope]] = []
+        seen_identities: set[tuple[str, str, int, str]] = set()
+        conflicting_names: list[str] = []
         for name in names:
             try:
                 envelope = self._read(name)
+                identity = (
+                    envelope.envelope_id,
+                    envelope.attempt_id,
+                    envelope.generation,
+                    envelope.operation_id,
+                )
+                if identity in seen_identities:
+                    conflicting_names.append(name)
+                    quarantined.append(envelope.envelope_id)
+                    continue
+                seen_identities.add(identity)
+                replayable.append((name, envelope))
+            except Exception as error:
+                failed.append({"entry": name, "error_type": type(error).__name__})
+        if conflicting_names:
+            try:
+                self._quarantine_terminal_conflicts(conflicting_names)
+            except Exception as error:
+                failed.extend(
+                    {"entry": name, "error_type": type(error).__name__}
+                    for name in conflicting_names
+                )
+                quarantined = []
+        for name, envelope in replayable:
+            try:
                 importer(envelope)
                 self._complete(name)
                 imported.append(envelope.envelope_id)
             except Exception as error:  # retained for the next bounded replay
                 failed.append({"entry": name, "error_type": type(error).__name__})
-        return {"imported_envelope_ids": imported, "failed": failed}
+        return {
+            "imported_envelope_ids": imported,
+            "quarantined_conflicting_envelope_ids": quarantined,
+            "failed": failed,
+        }
 
     def replay_result_chunks(
         self,
@@ -776,6 +860,37 @@ class DurableAttemptSpool:
 
     def _complete(self, name: str) -> None:
         self._complete_in(name, pending=self.pending, processed=self.processed)
+
+    def _quarantine_terminal_conflicts(self, names: Sequence[str]) -> None:
+        """Preserve contradictory duplicate transport outside hot replay."""
+
+        pending_fd = self._open_directory(self.pending)
+        conflicts_fd = self._open_directory(self.terminal_conflicts)
+        try:
+            for name in names:
+                if Path(name).name != name or not name.endswith(".json"):
+                    raise TestStoreContractError(
+                        "terminal conflict entry name is invalid"
+                    )
+                try:
+                    os.stat(name, dir_fd=conflicts_fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    pass
+                else:
+                    raise TestStoreContractError(
+                        "terminal conflict evidence already exists"
+                    )
+                os.rename(
+                    name,
+                    name,
+                    src_dir_fd=pending_fd,
+                    dst_dir_fd=conflicts_fd,
+                )
+            os.fsync(pending_fd)
+            os.fsync(conflicts_fd)
+        finally:
+            os.close(conflicts_fd)
+            os.close(pending_fd)
 
     def _complete_in(self, name: str, *, pending: Path, processed: Path) -> None:
         pending_fd = self._open_directory(pending)

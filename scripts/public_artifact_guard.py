@@ -53,20 +53,7 @@ PINNED_DEPLOYMENT_HOME_SUFFIXES = (
     "/.local/state/devops-console",
 )
 
-# This self-test is an approved immutable cutover artifact. Its hostile strings
-# and real deployment fixture paths are necessary regression inputs, and the
-# file cannot carry inline suppressions without invalidating its reviewed seal.
-# Permit only the exact reviewed bytes at the exact finding locations; any edit,
-# relocation, or newly introduced finding falls back to the ordinary scanner.
-SEALED_TEXT_FIXTURE_ALLOWANCES = {
-    "scripts/self_test_schema12_legacy_broker_bridge.py": {
-        "sha256": "ee387f177e10e070ef2ea88fedfed8ce7c94baf998646ce6d0bec5000ffb59e5",
-        "rules": {
-            "text-secret": frozenset({180}),
-            "text-private-home": frozenset({8444, 11190}),
-        },
-    }
-}
+SEALED_TEXT_FIXTURE_ALLOWANCES: dict[str, dict[str, object]] = {}
 
 HOME_PATTERNS = (
     re.compile(r"(?<![A-Za-z0-9])/(?:Users|home)/([A-Za-z0-9._-]+)(?=/)"),

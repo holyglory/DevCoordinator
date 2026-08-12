@@ -69,7 +69,7 @@ from devcoordinator.universal_test_snapshot import (  # type: ignore[import-not-
 MAX_HELPER_REQUEST_BYTES = 512 * 1024
 MAX_HELPER_RESPONSE_BYTES = 64 * 1024 * 1024
 MAX_SETUP_RESULT_BYTES = 192 * 1024
-MAX_SAFETY_REPAIR_ENTRIES = 256
+MAX_UNREADABLE_ENTRIES = 256
 MAX_SETUP_INPUT_COVERAGE_PATH_GAPS = 128
 _CONTROL_PLANE_READ_OPERATIONS = frozenset(
     {
@@ -402,22 +402,16 @@ def _adoption_safety_identity(
         if not readable:
             path_hash = hashlib.sha256(relative.encode("utf-8")).hexdigest()[:16]
             unreadable.append(path_hash)
-            if len(unreadable_entries) < MAX_SAFETY_REPAIR_ENTRIES:
+            if len(unreadable_entries) < MAX_UNREADABLE_ENTRIES:
                 try:
                     identity = _metadata_identity(candidate)
                 except OSError:
                     identity = None
-                required_permissions = None
-                if identity is not None and identity["kind"] == "regular":
-                    required_permissions = (
-                        "r-x" if int(identity["mode"]) & 0o111 else "r--"
-                    )
                 unreadable_entries.append(
                     {
                         "relative_path": relative,
                         "path_hash": path_hash,
                         "identity": identity,
-                        "required_permissions": required_permissions,
                     }
                 )
 

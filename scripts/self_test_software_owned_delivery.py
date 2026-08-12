@@ -8,6 +8,7 @@ from pathlib import Path
 import sys
 import tempfile
 import threading
+from typing import Sequence
 import unittest
 
 
@@ -16,6 +17,7 @@ if str(ROOT / "scripts") not in sys.path:
     sys.path.insert(0, str(ROOT / "scripts"))
 
 import software_owned_delivery as delivery  # noqa: E402
+import run_production_console_acceptance as console_acceptance  # noqa: E402
 
 
 DIGEST = "a" * 64
@@ -28,7 +30,7 @@ def command(name: str, *, blocking: bool = True) -> dict[str, object]:
 def plan() -> dict[str, object]:
     return delivery.validate_plan(
         {
-            "schema_version": 1,
+            "schema_version": delivery.SCHEMA_VERSION,
             "kind": delivery.PLAN_KIND,
             "source_checks": [
                 command("advisory-failure", blocking=False),
@@ -40,6 +42,7 @@ def plan() -> dict[str, object]:
                 "rollback": [command("rollback-one"), command("rollback-two")],
                 "health": [command("health-one"), command("health-two")],
             },
+            "acceptance_setup": [command("acceptance-session")],
             "acceptance": [
                 command("acceptance-one", blocking=False),
                 command("acceptance-two", blocking=False),
@@ -152,6 +155,7 @@ class DeliveryTests(unittest.TestCase):
         acceptance_execution_timeout_seconds: int | None = None,
         acceptance_launch_timeout_seconds: int | None = None,
         acceptance_wait_timeout_seconds: int | None = None,
+        root_prefix: Sequence[str] | None = None,
     ) -> delivery.Delivery:
         return delivery.Delivery(
             repo=ROOT,
@@ -160,7 +164,7 @@ class DeliveryTests(unittest.TestCase):
             transaction_root=self.root / "transaction",
             plan=selected_plan or plan(),
             executor=executor or FakeExecutor(),
-            root_prefix=[],
+            root_prefix=[] if root_prefix is None else root_prefix,
             max_parallel=4,
             acceptance_execution_timeout_seconds=acceptance_execution_timeout_seconds,
             acceptance_launch_timeout_seconds=acceptance_launch_timeout_seconds,
@@ -196,24 +200,82 @@ class DeliveryTests(unittest.TestCase):
         self.assertTrue(subject.events_path.read_text(encoding="utf-8").endswith("\n"))
         self.assertTrue(subject.text_log_path.read_text(encoding="utf-8").endswith("\n"))
 
-    def test_production_plan_blocks_on_first_use_development_server_journey(self) -> None:
+    def test_production_plan_has_no_repository_specific_acceptance(self) -> None:
         production = delivery.load_plan(ROOT / "deploy/software-owned-delivery.json")
-        steps = {
-            str(item["name"]): item
-            for item in production["acceptance"]
+        self.assertEqual(
+            [item["name"] for item in production["acceptance_setup"]],
+            ["production-browser-session"],
+        )
+        setup_argv = production["acceptance_setup"][0]["argv"]
+        self.assertIn("{caller_uid}", setup_argv)
+        self.assertIn("{caller_gid}", setup_argv)
+        encoded = json.dumps(production["acceptance"], sort_keys=True)
+        self.assertNotIn("/home/holyglory/", encoded)
+        self.assertNotIn("first-use-development-server", encoded)
+
+    def test_same_schema_commands_use_one_release_scoped_transaction(self) -> None:
+        executor = FakeExecutor()
+        subject = self.subject(executor=executor, selected_plan=reset_plan())
+
+        subject.state["release"] = {
+            "digest": DIGEST,
+            "path": f"/opt/devcoordinator/releases/{DIGEST}",
         }
-        first_use = steps["first-use-development-server"]
-        self.assertTrue(first_use["blocking"])
-        argv = first_use["argv"]
-        self.assertIn("{release}/bin/devcoordinator-first-use-acceptance", argv)
-        self.assertIn("/home/holyglory/DesignDocEngine", argv)
-        self.assertNotIn("/home/holyglory/DesignDocEngine/prototype", argv)
-        self.assertIn("--caller-user", argv)
-        self.assertEqual(argv[argv.index("--caller-user") + 1], "holygloryTT")
-        self.assertIn("--cwd", argv)
-        self.assertEqual(argv[argv.index("--cwd") + 1], "prototype")
-        self.assertIn("--auto-port", argv)
-        self.assertNotIn("4173", argv)
+        results = subject.deploy_same_schema()
+        subject._rollback(reset_plan()["same_schema"]["rollback"])
+
+        self.assertTrue(all(item.ok for item in results))
+        switch_calls = [
+            call
+            for call in executor.calls
+            if any(Path(value).name == "devcoordinator-same-schema-switch" for value in call)
+        ]
+        self.assertEqual(len(switch_calls), 4)
+        expected = str(self.root / "transaction" / DIGEST)
+        for call in switch_calls:
+            self.assertEqual(call[call.index("--transaction-root") + 1], expected)
+
+    def test_browser_storage_handoff_requires_exact_caller_owned_private_json(self) -> None:
+        storage = self.root / "storage-state.json"
+        storage.write_text('{"cookies":[],"origins":[]}\n', encoding="utf-8")
+        storage.chmod(0o600)
+        self.assertEqual(
+            console_acceptance.validated_storage_state(storage), storage.absolute()
+        )
+        storage.chmod(0o644)
+        with self.assertRaisesRegex(
+            console_acceptance.AcceptanceError, "mode 0600"
+        ):
+            console_acceptance.validated_storage_state(storage)
+        storage.chmod(0o600)
+        link = self.root / "storage-link.json"
+        link.symlink_to(storage)
+        with self.assertRaisesRegex(
+            console_acceptance.AcceptanceError, "non-symlink"
+        ):
+            console_acceptance.validated_storage_state(link)
+
+    def test_browser_storage_handoff_is_consumed_after_preflight_failure(self) -> None:
+        release = self.root / DIGEST
+        release.mkdir()
+        storage = self.root / "consumed-storage-state.json"
+        storage.write_text('{"cookies":[],"origins":[]}\n', encoding="utf-8")
+        storage.chmod(0o600)
+        with self.assertRaises(console_acceptance.AcceptanceError):
+            console_acceptance.run(
+                [
+                    "--release",
+                    str(release),
+                    "--runtime-lock",
+                    str(self.root / "missing-runtime-lock.json"),
+                    "--storage-state",
+                    str(storage),
+                    "--consume-storage-state",
+                    "--output-dir",
+                    str(self.root / "acceptance-output"),
+                ]
+            )
+        self.assertFalse(storage.exists())
 
     def test_package_has_no_source_ownership_approval_arguments(self) -> None:
         executor = FakeExecutor()
@@ -341,6 +403,7 @@ class DeliveryTests(unittest.TestCase):
 
     def test_acceptance_threads_caller_defined_runner_timeouts(self) -> None:
         selected_plan = plan()
+        selected_plan["acceptance_setup"] = []
         selected_plan["acceptance"] = [
             {
                 "name": "runner-probe",
@@ -381,6 +444,20 @@ class DeliveryTests(unittest.TestCase):
             ],
         )
 
+    def test_acceptance_runs_as_actual_caller_not_privileged_prefix(self) -> None:
+        executor = FakeExecutor()
+        subject = self.subject(
+            executor=executor,
+            root_prefix=["sudo-fixture", "--"],
+        )
+        results = subject.acceptance()
+        self.assertTrue(all(result.ok for result in results))
+        self.assertEqual(executor.calls[0][:2], ["sudo-fixture", "--"])
+        self.assertTrue(
+            all(call[:2] != ["sudo-fixture", "--"] for call in executor.calls[1:]),
+            "agent-facing acceptance was executed as the privileged installer",
+        )
+
     def test_acceptance_requires_all_three_timeouts_from_the_caller(self) -> None:
         with self.assertRaises(SystemExit):
             delivery.parser().parse_args(
@@ -393,7 +470,12 @@ class DeliveryTests(unittest.TestCase):
         results = subject.acceptance()
         self.assertEqual(
             [FakeExecutor.name(call) for call in executor.calls],
-            ["acceptance-one", "acceptance-two", "acceptance-three"],
+            [
+                "acceptance-session",
+                "acceptance-one",
+                "acceptance-two",
+                "acceptance-three",
+            ],
         )
         self.assertEqual(sum(not result.ok for result in results), 2)
         report = subject.report()
@@ -457,6 +539,18 @@ class DeliveryTests(unittest.TestCase):
         )
         rebuilt = delivery.read_json(subject.report_path)
         self.assertEqual(rebuilt["counts"]["steps"], 1)
+
+    def test_run_root_lock_rejects_overlapping_delivery_controller(self) -> None:
+        run_root = self.root / "single-flight-run"
+        with delivery.exclusive_run_root(run_root):
+            with self.assertRaisesRegex(
+                delivery.DeliveryError,
+                "another software-owned delivery is active",
+            ):
+                with delivery.exclusive_run_root(run_root):
+                    self.fail("overlapping delivery acquired the same run root")
+        with delivery.exclusive_run_root(run_root):
+            self.assertEqual((run_root / "delivery.lock").stat().st_mode & 0o777, 0o600)
 
 
 if __name__ == "__main__":

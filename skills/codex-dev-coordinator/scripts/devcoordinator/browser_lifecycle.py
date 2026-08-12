@@ -33,7 +33,9 @@ from typing import Any, Callable, Iterable, Iterator, Mapping, Protocol
 
 
 SCHEMA_VERSION = 1
-DEFAULT_STATE_PATH = Path("/var/lib/devcoordinator/browser-lifecycle.json")
+DEFAULT_STATE_PATH = Path(
+    "/var/lib/devcoordinator-browser-lifecycle/browser-lifecycle.json"
+)
 DEFAULT_IDLE_SECONDS = 15 * 60
 DEFAULT_TERM_TIMEOUT_SECONDS = 5.0
 DEFAULT_KILL_TIMEOUT_SECONDS = 2.0
@@ -803,9 +805,24 @@ def _state_lock_path(state_path: Path) -> Path:
 
 @contextmanager
 def _state_lock(state_path: Path, *, exclusive: bool) -> Iterator[None]:
-    state_path.parent.mkdir(parents=True, exist_ok=True)
     lock_path = _state_lock_path(state_path)
-    descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o664)
+    if exclusive:
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
+        # The authority service runs with UMask=0077. Status readers need no
+        # write access, but every trusted developer account must be able to
+        # acquire a shared flock on this coordination inode.
+        os.fchmod(descriptor, 0o644)
+    else:
+        try:
+            descriptor = os.open(lock_path, os.O_RDONLY)
+        except FileNotFoundError:
+            if state_path.exists() or state_path.is_symlink():
+                raise BrowserLifecycleError(
+                    "browser lifecycle lock is unavailable for existing state"
+                )
+            yield
+            return
     try:
         fcntl.flock(descriptor, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
         yield
@@ -855,7 +872,7 @@ def _write_state_unlocked(state_path: Path, document: Mapping[str, Any]) -> None
     )
     temporary = Path(temporary_name)
     try:
-        os.fchmod(descriptor, 0o664)
+        os.fchmod(descriptor, 0o644)
         with os.fdopen(descriptor, "wb", closefd=True) as stream:
             stream.write(encoded)
             stream.flush()

@@ -173,7 +173,7 @@ def _require_broker_stopped_baseline(
         reject("normalized authority envelope is missing")
     if (
         authority.get("scope") != "server-wide"
-        or authority.get("transport") != "authenticated-unix-socket"
+        or authority.get("transport") != "trusted-local-unix-socket"
         or not isinstance(authority.get("socket"), str)
         or not Path(authority["socket"]).is_absolute()
         or _integer(authority.get("service_uid")) is None
@@ -1190,7 +1190,7 @@ def inventory_probe(
         raise ConsoleRegistrationError("inventory endpoint did not prove the no-Docker contract")
     # Keep the authoritative schema-v2 envelope intact. The classifier needs
     # both its normalized rows and its explicit v1 compatibility projection;
-    # returning only the projected aliases while retaining schema_version=2
+    # returning only the projected aliases while retaining schema_version=3
     # makes compatibility assignments masquerade as normalized assignments.
     return value
 

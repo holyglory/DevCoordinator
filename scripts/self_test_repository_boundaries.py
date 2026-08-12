@@ -92,6 +92,22 @@ def relative_provenance(image: bytes, source_path: str, source: bytes) -> str:
     return json.dumps(value, indent=2, sort_keys=True) + "\n"
 
 
+def selected_design_provenance(image: bytes, repository_path: str) -> str:
+    value = {
+        "schema_version": 1,
+        "artifact_type": "test-fixture-snapshot",
+        "artifact_kind": "selected-product-design-reference",
+        "repository_path": repository_path,
+        "sha256": hashlib.sha256(image).hexdigest(),
+        "bytes": len(image),
+        "origin": {
+            "kind": "openai-image-generation-result",
+            "generation_event": "fixture-generation-event",
+        },
+    }
+    return json.dumps(value, indent=2, sort_keys=True) + "\n"
+
+
 def main() -> int:
     temp = Path(tempfile.mkdtemp(prefix="devcoordinator-boundary-self-test-")).resolve(strict=True)
     try:
@@ -122,6 +138,19 @@ def main() -> int:
         write(
             Path(f"{safe_board_image_path}.provenance.json"),
             relative_provenance(safe_image, safe_board_source_path, safe_board_source),
+        )
+        selected_design_path = (
+            repo
+            / "apps/DevOpsConsole/Artifacts/Design/fleet-selected-reference.png"
+        )
+        selected_design_repository_path = selected_design_path.relative_to(repo).as_posix()
+        write(selected_design_path, safe_image)
+        write(
+            Path(f"{selected_design_path}.provenance.json"),
+            selected_design_provenance(
+                safe_image,
+                selected_design_repository_path,
+            ),
         )
         write(
             repo / "docs/history/holyskills-to-devcoordinator.commit-map",
@@ -207,6 +236,18 @@ Environment=ROOT_STATE=%h/.local/state/root-app
         check(
             module.forbidden_history_path("apps/DevOpsConsole/Artifacts/Canonical/projects.png") is None,
             "canonical fixture was flagged",
+        )
+        check(
+            module.forbidden_history_path(
+                "apps/DevOpsConsole/Artifacts/Design/fleet-selected-reference.png"
+            ) is None,
+            "selected Product Design reference was flagged",
+        )
+        check(
+            module.forbidden_history_path(
+                "apps/DevOpsConsole/Artifacts/Design/arbitrary-screenshot.png"
+            ) == "non-canonical historical image",
+            "arbitrary Design screenshot escaped the history boundary",
         )
 
         # Codex persists private editor checkpoints as direct-tree refs.  Keep
@@ -465,6 +506,10 @@ Environment=ROOT_STATE=%h/.local/state/root-app
         for expected in ("design-qa-live-production.png", ".env", "private.key", "runtime-backups/state.json"):
             check(expected in details, f"must-catch historical class missing: {expected}")
         check("missing-sidecar.png" in details, "missing canonical sidecar path was not reported")
+        check(
+            "fleet-selected-reference.png" not in details,
+            "valid selected Product Design reference was rejected",
+        )
         check("missing-relative-source.png" in details, "missing app-relative provenance source was not reported")
         check(
             any(

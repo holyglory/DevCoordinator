@@ -87,7 +87,7 @@ SNAPSHOT_PAYLOAD_TABLES = frozenset(
         "broker_observation_compose_scope",
         "broker_observed_compose_assets",
         "broker_observed_compose_containers",
-        "broker_host_observation_owners",
+        "broker_host_observation_sessions",
     }
 )
 
@@ -113,8 +113,6 @@ AUTHORITY_TABLES = frozenset(
         "hosts",
         "coordinator_sources",
         "repositories",
-        "repository_owners",
-        "repository_owner_transfers",
         "repository_aliases",
         "repository_families",
         "repository_scopes",
@@ -123,7 +121,6 @@ AUTHORITY_TABLES = frozenset(
         "runtime_session_resources",
         "repository_installations",
         "source_resources",
-        "control_bindings",
         "server_definitions",
         "server_command_arguments",
         "server_environment",
@@ -143,7 +140,6 @@ AUTHORITY_TABLES = frozenset(
         "operation_target_dependencies",
         "startup_policies",
         "startup_policy_restore_states",
-        "repository_memberships",
         "resource_retirements",
         "resource_lifecycle_history",
         "cleanup_plans",
@@ -152,7 +148,7 @@ AUTHORITY_TABLES = frozenset(
         "worktree_cleanup_identities",
         "docker_engines",
         "docker_resources",
-        "docker_ownership_claims",
+        "docker_repository_hints",
         "ephemeral_container_templates",
         "ephemeral_template_arguments",
         "ephemeral_template_environment",
@@ -166,17 +162,9 @@ AUTHORITY_TABLES = frozenset(
         "backup_evidence",
         "legacy_imports",
         "migration_conflicts",
-        "broker_acl_principals",
-        "broker_repository_enrollments",
-        "broker_resource_acl",
-        "broker_ephemeral_acl",
-        "broker_runtime_acl",
-        "broker_worker_acl",
         "broker_server_revocations",
         "broker_repository_revocations",
         "broker_worker_operation_requests",
-        "broker_assignment_acl",
-        "broker_assignment_owners",
         "broker_compose_definitions",
         "broker_compose_directory_identity",
         "broker_compose_effective_model_evidence",
@@ -189,20 +177,11 @@ AUTHORITY_TABLES = frozenset(
         "broker_compose_profiles",
         "broker_compose_services",
         "broker_compose_run_once_services",
-        "broker_compose_acl",
-        "broker_compose_run_once_acl",
         "broker_compose_run_once_attempts",
-        "broker_lifecycle_acl",
-        "broker_lifecycle_resource_acl",
-        "broker_repository_read_acl",
-        "broker_host_observation_acl",
-        "broker_cleanup_acl",
-        "broker_cleanup_resource_acl",
-        "broker_database_acl",
         "broker_database_host_results",
-        "broker_port_policies",
+        "broker_runtime_replacements",
+        "broker_port_ranges",
         "broker_operation_requests",
-        "broker_lease_owners",
         "broker_test_admission_fences",
         *CURRENT_OBSERVATION_TABLES,
         *SPECIAL_AUTHORITY_TABLES,
@@ -528,12 +507,12 @@ def _selected_snapshots(
             (MAX_SNAPSHOTS_PER_STATUS,),
         )
     }
-    if _has_table(connection, "broker_repository_enrollments"):
-        for column in ("enrollment_snapshot_id", "grant_snapshot_id"):
+    if _has_table(connection, "broker_repository_configurations"):
+        for column in ("configuration_snapshot_id", "grant_snapshot_id"):
             retained.update(
                 str(row[0])
                 for row in connection.execute(
-                    f"SELECT {column} FROM legacy.broker_repository_enrollments "
+                    f"SELECT {column} FROM legacy.broker_repository_configurations "
                     f"WHERE {column} IS NOT NULL"
                 )
             )

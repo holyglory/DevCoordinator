@@ -104,15 +104,14 @@ class FakePreviewer:
 class FakeAuthority:
     def __init__(self, root: Path) -> None:
         self.root = root
-        self.calls: list[tuple[str, int]] = []
+        self.calls: list[str] = []
 
-    def repository(self, *, repository_id: str, owner_uid: int):
-        self.calls.append((repository_id, owner_uid))
+    def repository(self, *, repository_id: str):
+        self.calls.append(repository_id)
         return {
             "repository_id": repository_id,
             "canonical_root": str(self.root),
             "generation": 7,
-            "owner_uid": owner_uid,
         }
 
 
@@ -419,7 +418,7 @@ class RepositorySetupSurfaceTests(unittest.TestCase):
                 repository_id="repo-setup", owner_uid=self.owner_uid
             )
 
-    def test_root_snapshot_setup_authorizes_then_calls_uid_helper(self) -> None:
+    def test_root_snapshot_setup_resolves_catalog_then_calls_uid_helper(self) -> None:
         helper_result = self.helper_setup()
         authority = FakeAuthority(self.root)
         helper = FakeHelper(helper_result)
@@ -430,7 +429,7 @@ class RepositorySetupSurfaceTests(unittest.TestCase):
             {"repository_id": "repo-setup", "owner_uid": self.owner_uid}
         )
         self.assertEqual(result["repository_id"], "repo-setup")
-        self.assertEqual(authority.calls, [("repo-setup", self.owner_uid)])
+        self.assertEqual(authority.calls, ["repo-setup"])
         self.assertEqual(helper.calls, [
             (
                 "setup",

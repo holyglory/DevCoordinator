@@ -281,21 +281,6 @@ class RuntimeApiTests(unittest.TestCase):
                     timestamp,
                 ),
             )
-            connection.execute(
-                """
-                INSERT INTO repository_memberships(
-                    membership_id, repo_id, resource_kind, host_resource_id,
-                    immutable_fingerprint, created_at
-                ) VALUES (?, ?, 'server', ?, ?, ?)
-                """,
-                (
-                    deterministic_id("membership", repo_id, server_id),
-                    repo_id,
-                    server_id,
-                    "sha256:" + "1" * 64,
-                    timestamp,
-                ),
-            )
         return server_id
 
     def _running_service_result(
@@ -438,7 +423,6 @@ class RuntimeApiTests(unittest.TestCase):
         server_id = deterministic_id("server-definition", repo_id, "web")
         timestamp = "2026-01-01T00:00:00Z"
         source_id = deterministic_id("runtime-test-source", host_id, repo_id)
-        binding_id = deterministic_id("control-binding", "server", server_id)
         with store.immediate_transaction() as connection:
             connection.execute(
                 """
@@ -485,34 +469,6 @@ class RuntimeApiTests(unittest.TestCase):
                           'runtime test cleanup', ?, 'stopped-observation')
                 """,
                 (server_id, timestamp, timestamp),
-            )
-            connection.execute(
-                """
-                INSERT INTO control_bindings(
-                    binding_id, repo_id, resource_kind, resource_id, source_id,
-                    capability, provenance, authority_state, priority,
-                    generation, created_at, updated_at
-                ) VALUES (?, ?, 'server', ?, ?, 'lifecycle',
-                          'normalized_direct_control', 'authoritative', 100,
-                          0, ?, ?)
-                """,
-                (binding_id, repo_id, server_id, source_id, timestamp, timestamp),
-            )
-            connection.execute(
-                """
-                INSERT INTO repository_memberships(
-                    membership_id, repo_id, resource_kind, host_resource_id,
-                    immutable_fingerprint, control_binding_id, created_at
-                ) VALUES (?, ?, 'server', ?, ?, ?, ?)
-                """,
-                (
-                    deterministic_id("membership", repo_id, "server", server_id),
-                    repo_id,
-                    server_id,
-                    "sha256:" + "1" * 64,
-                    binding_id,
-                    timestamp,
-                ),
             )
             connection.execute(
                 """
@@ -599,11 +555,11 @@ class RuntimeApiTests(unittest.TestCase):
             connection.execute(
                 """
                 INSERT INTO docker_resources(
-                    docker_resource_id, engine_id, full_container_id,
+                    docker_resource_id, engine_id, repo_id, full_container_id,
                     current_name, created_at, updated_at
-                ) VALUES (?, ?, ?, 'runtime-db', ?, ?)
+                ) VALUES (?, ?, ?, ?, 'runtime-db', ?, ?)
                 """,
-                (docker_id, engine_id, full_container_id, timestamp, timestamp),
+                (docker_id, engine_id, repo_id, full_container_id, timestamp, timestamp),
             )
             connection.execute(
                 """
@@ -613,21 +569,6 @@ class RuntimeApiTests(unittest.TestCase):
                 ) VALUES (?, ?, ?, 'runtime-docker-observation')
                 """,
                 (docker_id, lifecycle, timestamp),
-            )
-            connection.execute(
-                """
-                INSERT INTO repository_memberships(
-                    membership_id, repo_id, resource_kind, host_resource_id,
-                    immutable_fingerprint, created_at
-                ) VALUES (?, ?, 'container', ?, ?, ?)
-                """,
-                (
-                    deterministic_id("membership", repo_id, docker_id),
-                    repo_id,
-                    docker_id,
-                    "sha256:" + "d" * 64,
-                    timestamp,
-                ),
             )
             connection.execute(
                 """
@@ -759,8 +700,19 @@ class RuntimeApiTests(unittest.TestCase):
             validate_runtime_request(self.request(purpose="test"))
         with self.assertRaisesRegex(RuntimeRequestError, "JSON boolean"):
             validate_runtime_request(self.request(kill_after_run=1))
-        with self.assertRaisesRegex(RuntimeRequestError, "only for action run"):
+        with self.assertRaisesRegex(
+            RuntimeRequestError, "only for action run or Docker/database replace"
+        ):
             validate_runtime_request(self.request(kill_after_run=True))
+        replacement = validate_runtime_request(
+            self.request(
+                action="replace",
+                target={"kind": "docker", "id": "container-runtime-test"},
+                kill_after_run=True,
+                options={},
+            )
+        )
+        self.assertTrue(replacement["kill_after_run"])
 
     def test_strict_options_reject_coercions_nul_and_unbounded_values(self) -> None:
         invalid_options = (
@@ -1139,32 +1091,19 @@ class RuntimeApiTests(unittest.TestCase):
             canonical_root=str(self.repository),
             repo_id="repo-id",
             generation=3,
-            owner_uid=1000,
             server_ids={"worker": "old-worker-id"},
             container_ids={},
             compose_definition_id=None,
             compose_container_ids=frozenset(),
             compose_run_once_services={},
             ephemeral_templates={},
-            ephemeral_image_prefetch_template_ids=frozenset(),
             ephemeral_secret_policies={},
-            account_id="account-id",
-            enabled=True,
-            issued_at="2026-01-01T00:00:00Z",
-            valid_until_epoch=int(time.time()) + 3600,
         )
         profile = dev_coordinator.BrokerClientProfile(
             service=dev_coordinator.BrokerServiceProfile(
                 socket_path=self.root / "broker.sock",
-                service_uid=0,
-                socket_gid=os.getgid(),
-                socket_mode=0o660,
                 database_generation="generation",
             ),
-            client_uid=os.geteuid(),
-            account_id="account-id",
-            issued_at="2026-01-01T00:00:00Z",
-            valid_until_epoch=int(time.time()) + 3600,
             repositories={str(self.repository): repository},
         )
         fingerprint = "sha256:" + "a" * 64
@@ -1225,7 +1164,7 @@ class RuntimeApiTests(unittest.TestCase):
             "revoked",
         )
 
-    def test_existing_service_start_may_reuse_enrolled_definition(self) -> None:
+    def test_existing_service_start_may_reuse_configured_definition(self) -> None:
         existing_id = "service-id"
         validated = validate_runtime_request(
             self.request(
@@ -1479,234 +1418,6 @@ class RuntimeApiTests(unittest.TestCase):
         self.assertNotIn(
             server_id, after["repository_trees"][0]["scopes"][0]["server_ids"]
         )
-
-    def test_expired_created_service_deletes_catalog_hides_empty_temporary_scope_and_reinstalls(self) -> None:
-        linked = self.root / "temporary-worktree"
-        subprocess.run(
-            [
-                "git",
-                "-C",
-                str(self.repository),
-                "worktree",
-                "add",
-                "-qb",
-                "runtime-catalog-cleanup",
-                str(linked),
-            ],
-            check=True,
-        )
-        context = resolve_repository_context(
-            root_repo=str(self.repository), temporary_repo=str(linked)
-        )
-        with AccountStore.open_default(self.home, effective_uid=os.geteuid()) as store:
-            host_id, root_repo_id = self._insert_repository(store)
-            temporary_repo_id = deterministic_id(
-                "repository", host_id, str(linked.resolve())
-            )
-            timestamp = "2026-01-01T00:00:00Z"
-            with store.immediate_transaction() as connection:
-                connection.execute(
-                    """
-                    INSERT INTO repositories(
-                        repo_id, host_id, canonical_root, display_name, state,
-                        generation, created_at, updated_at
-                    ) VALUES (?, ?, ?, 'temporary-worktree', 'active', 0, ?, ?)
-                    """,
-                    (
-                        temporary_repo_id,
-                        host_id,
-                        str(linked.resolve()),
-                        timestamp,
-                        timestamp,
-                    ),
-                )
-                connection.execute(
-                    """
-                    INSERT INTO repository_installations(
-                        repo_id, status, startup_fenced, generation, actor, updated_at
-                    ) VALUES (?, 'installed', 0, 0, 'test', ?)
-                    """,
-                    (temporary_repo_id, timestamp),
-                )
-            persist_repository_context(
-                store,
-                context,
-                root_repo_id=root_repo_id,
-                effective_repo_id=temporary_repo_id,
-                timestamp=timestamp,
-            )
-            server_id = self._insert_created_service_catalog(
-                store,
-                repo_id=temporary_repo_id,
-                host_id=host_id,
-                repository=linked.resolve(),
-            )
-            request = validate_runtime_request(
-                self.request(
-                    purpose="temporary",
-                    ttl_seconds=1,
-                    root_repo=str(self.repository),
-                    temporary_repo=str(linked.resolve()),
-                    target={"kind": "service", "id": server_id, "name": "web"},
-                )
-            )
-            session_id = create_runtime_session(
-                store,
-                family_id=root_repo_id,
-                root_repo_id=root_repo_id,
-                repo_id=temporary_repo_id,
-                request=request,
-                timestamp=timestamp,
-            )
-            mark_runtime_session_started(store, session_id, timestamp=timestamp)
-            link_runtime_resource(
-                store,
-                session_id=session_id,
-                resource_kind="service",
-                resource_id=server_id,
-                cleanup_disposition="removed",
-                identity={"generation": 0},
-                timestamp=timestamp,
-            )
-            finish_runtime_session(
-                store,
-                session_id,
-                succeeded=True,
-                result={"ok": True},
-                keep_running_until_ttl=True,
-                timestamp=timestamp,
-            )
-            reaped = reap_expired_runtime_sessions(
-                store,
-                timestamp="2026-01-01T00:00:02Z",
-                cleanup=lambda _request, _resources: {
-                    "ok": True,
-                    "state": "removed",
-                    "server": {
-                        "id": server_id,
-                        "status": "stopped",
-                        "identity_observable": True,
-                    },
-                },
-            )
-            inventory = store.inventory_v2()
-            with store.read_transaction() as connection:
-                active_counts = {
-                    table: connection.execute(
-                        f"SELECT COUNT(*) FROM {table} WHERE " + predicate,
-                        parameters,
-                    ).fetchone()[0]
-                    for table, predicate, parameters in (
-                        ("server_definitions", "server_definition_id = ?", (server_id,)),
-                        ("repository_memberships", "host_resource_id = ?", (server_id,)),
-                        ("control_bindings", "resource_id = ?", (server_id,)),
-                        ("startup_policies", "resource_id = ?", (server_id,)),
-                        ("port_assignments", "repo_id = ?", (temporary_repo_id,)),
-                        ("leases", "repo_id = ?", (temporary_repo_id,)),
-                    )
-                }
-                session_evidence = connection.execute(
-                    """
-                    SELECT s.status, s.result_json, r.cleanup_state
-                    FROM runtime_sessions s
-                    JOIN runtime_session_resources r USING(session_id)
-                    WHERE s.session_id = ?
-                    """,
-                    (session_id,),
-                ).fetchone()
-                installation = connection.execute(
-                    """
-                    SELECT status, startup_fenced FROM repository_installations
-                    WHERE repo_id = ?
-                    """,
-                    (temporary_repo_id,),
-                ).fetchone()
-                scope_count = connection.execute(
-                    "SELECT COUNT(*) FROM repository_scopes WHERE repo_id = ?",
-                    (temporary_repo_id,),
-                ).fetchone()[0]
-            self.assertEqual(reaped[0]["status"], "expired")
-            self.assertEqual(set(active_counts.values()), {0})
-            self.assertEqual(session_evidence["status"], "expired")
-            self.assertEqual(session_evidence["cleanup_state"], "removed")
-            self.assertTrue(
-                json.loads(session_evidence["result_json"])["catalog_cleanup"][
-                    "temporary_scope"
-                ]["removed"]
-            )
-            self.assertEqual(dict(installation), {"status": "disabled", "startup_fenced": 1})
-            # The active presentation is gone, while the exact Git-family
-            # relationship remains as the minimal identity needed by the
-            # explicit Coordinator reinstall journey.
-            self.assertEqual(scope_count, 1)
-
-            repository_ids = {item["repo_id"] for item in inventory["repositories"]}
-            tree_scope_ids = {
-                scope["repo_id"]
-                for tree in inventory["repository_trees"]
-                for scope in tree["scopes"]
-            }
-            self.assertEqual(repository_ids, tree_scope_ids)
-            self.assertEqual(repository_ids, {root_repo_id})
-
-            SQLiteLifecyclePersistence(store).reinstall_repository(
-                temporary_repo_id,
-                actor="test-agent",
-                reason="new Coordinator runtime installation",
-            )
-            persist_repository_context(
-                store,
-                context,
-                root_repo_id=root_repo_id,
-                effective_repo_id=temporary_repo_id,
-                timestamp="2026-01-01T00:00:03Z",
-            )
-            recreated_id = self._insert_created_service_catalog(
-                store,
-                repo_id=temporary_repo_id,
-                host_id=host_id,
-                repository=linked.resolve(),
-            )
-            self.assertEqual(recreated_id, server_id)
-            replacement_timestamp = utc_timestamp()
-            replacement_request = copy.deepcopy(request)
-            replacement_request["ttl_seconds"] = 3600
-            replacement_session = create_runtime_session(
-                store,
-                family_id=root_repo_id,
-                root_repo_id=root_repo_id,
-                repo_id=temporary_repo_id,
-                request=replacement_request,
-                timestamp=replacement_timestamp,
-            )
-            mark_runtime_session_started(
-                store, replacement_session, timestamp=replacement_timestamp
-            )
-            link_runtime_resource(
-                store,
-                session_id=replacement_session,
-                resource_kind="service",
-                resource_id=server_id,
-                cleanup_disposition="removed",
-                identity={"generation": 0},
-                timestamp=replacement_timestamp,
-            )
-            finish_runtime_session(
-                store,
-                replacement_session,
-                succeeded=True,
-                result={"ok": True},
-                keep_running_until_ttl=True,
-                timestamp=replacement_timestamp,
-            )
-            reinstalled = store.inventory_v2()
-        temporary_scope = next(
-            scope
-            for tree in reinstalled["repository_trees"]
-            for scope in tree["scopes"]
-            if scope["repo_id"] == temporary_repo_id
-        )
-        self.assertIn(server_id, temporary_scope["server_ids"])
 
     def test_borrowed_service_docker_and_database_catalog_rows_are_retained(self) -> None:
         with AccountStore.open_default(self.home, effective_uid=os.geteuid()) as store:
@@ -2322,99 +2033,6 @@ class RuntimeApiTests(unittest.TestCase):
                 "ps-start:Fri Jul 25 10:00:00 2026",
             )
 
-    def test_tree_never_makes_retained_docker_alias_or_unassigned_resource_actionable(self) -> None:
-        with AccountStore.open_default(self.home, effective_uid=os.geteuid()) as store:
-            host_id, repo_id = self._insert_repository(store)
-            timestamp = "2026-01-01T00:00:00Z"
-            engine_id = deterministic_id("docker-engine", host_id, "default")
-            full_native_id = "a" * 64
-            alias_native_id = "a" * 12
-            unassigned_native_id = "b" * 64
-            full_resource_id = deterministic_id("docker-resource", engine_id, full_native_id)
-            alias_resource_id = deterministic_id("docker-resource", engine_id, alias_native_id)
-            unassigned_resource_id = deterministic_id(
-                "docker-resource", engine_id, unassigned_native_id
-            )
-            with store.immediate_transaction() as connection:
-                connection.execute(
-                    """
-                    INSERT INTO docker_engines(
-                        engine_id, host_id, context_identity, capability_state,
-                        created_at, updated_at
-                    ) VALUES (?, ?, 'default', 'available', ?, ?)
-                    """,
-                    (engine_id, host_id, timestamp, timestamp),
-                )
-                for resource_id, native_id, name in (
-                    (full_resource_id, full_native_id, "canonical"),
-                    (alias_resource_id, alias_native_id, "alias"),
-                    (unassigned_resource_id, unassigned_native_id, "unassigned"),
-                ):
-                    connection.execute(
-                        """
-                        INSERT INTO docker_resources(
-                            docker_resource_id, engine_id, full_container_id,
-                            current_name, created_at, updated_at
-                        ) VALUES (?, ?, ?, ?, ?, ?)
-                        """,
-                        (resource_id, engine_id, native_id, name, timestamp, timestamp),
-                    )
-                    connection.execute(
-                        """
-                        INSERT INTO docker_observations(
-                            docker_resource_id, lifecycle, ports_fingerprint,
-                            labels_fingerprint, sampled_at, observation_fingerprint
-                        ) VALUES (?, 'running', 'ports', 'labels', ?, ?)
-                        """,
-                        (resource_id, timestamp, f"observation-{resource_id}"),
-                    )
-                for resource_id in (full_resource_id, alias_resource_id):
-                    connection.execute(
-                        """
-                        INSERT INTO repository_memberships(
-                            membership_id, repo_id, resource_kind,
-                            host_resource_id, immutable_fingerprint, created_at
-                        ) VALUES (?, ?, 'container', ?, ?, ?)
-                        """,
-                        (
-                            deterministic_id("membership", repo_id, resource_id),
-                            repo_id,
-                            resource_id,
-                            "sha256:" + ("2" if resource_id == full_resource_id else "3") * 64,
-                            timestamp,
-                        ),
-                    )
-                connection.execute(
-                    """
-                    INSERT INTO unassigned_resources(
-                        unassigned_id, host_id, resource_kind, resource_id,
-                        display_name, reason_code, status, created_at, updated_at
-                    ) VALUES (?, ?, 'container', ?, 'unassigned', 'name_only',
-                              'active', ?, ?)
-                    """,
-                    (
-                        deterministic_id("unassigned", host_id, unassigned_resource_id),
-                        host_id,
-                        unassigned_resource_id,
-                        timestamp,
-                        timestamp,
-                    ),
-                )
-            inventory = store.inventory_v2()
-        scope_ids = set(
-            inventory["repository_trees"][0]["scopes"][0][
-                "container_resource_ids"
-            ]
-        )
-        normalized_ids = {
-            item["docker_resource_id"]
-            for item in inventory["resources"]["docker"]
-        }
-        self.assertIn(full_resource_id, scope_ids)
-        self.assertNotIn(alias_resource_id, scope_ids)
-        self.assertNotIn(unassigned_resource_id, scope_ids)
-        self.assertTrue(scope_ids <= normalized_ids)
-
     def test_repeated_status_is_one_observation_and_creates_no_sessions_or_events(self) -> None:
         with AccountStore.open_default(self.home, effective_uid=os.geteuid()) as store:
             host_id, repo_id = self._insert_repository(store)
@@ -2773,7 +2391,7 @@ class RuntimeApiTests(unittest.TestCase):
                     resource_kind="diagnostic", resource_id=session_id
                 )
 
-    def test_service_start_reuses_enrolled_runtime_configuration(self) -> None:
+    def test_service_start_reuses_configured_runtime_configuration(self) -> None:
         server_id = "existing-service-id"
         request = validate_runtime_request(
             self.request(
@@ -3736,59 +3354,6 @@ class RuntimeApiTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(result["result"]["terminal_state"]["observed_state"], "running")
 
-    def test_docker_stop_accepts_freshly_proved_absence(self) -> None:
-        with AccountStore.open_default(self.home, effective_uid=os.geteuid()) as store:
-            host_id, repo_id = self._insert_repository(store)
-            docker_id, database_id = self._insert_docker_database(
-                store, repo_id=repo_id, host_id=host_id, lifecycle="running"
-            )
-
-            def dispatch(*_args):
-                with store.immediate_transaction() as connection:
-                    connection.execute(
-                        "DELETE FROM database_observations WHERE database_binding_id = ?",
-                        (database_id,),
-                    )
-                    connection.execute(
-                        "DELETE FROM database_bindings WHERE database_binding_id = ?",
-                        (database_id,),
-                    )
-                    connection.execute(
-                        "DELETE FROM repository_memberships "
-                        "WHERE resource_kind = 'container' AND host_resource_id = ?",
-                        (docker_id,),
-                    )
-                    connection.execute(
-                        "DELETE FROM docker_observations WHERE docker_resource_id = ?",
-                        (docker_id,),
-                    )
-                    connection.execute(
-                        "DELETE FROM docker_resources WHERE docker_resource_id = ?",
-                        (docker_id,),
-                    )
-                return {
-                    "ok": False,
-                    "terminal_state_pending": True,
-                    "classification": "terminal_state_pending",
-                    "returncode": 0,
-                }
-
-            result = execute_runtime_request(
-                self.request(
-                    action="stop",
-                    target={"kind": "docker", "id": docker_id},
-                    options={},
-                ),
-                store=store,
-                callbacks=self._callbacks(
-                    store,
-                    dispatch=dispatch,
-                    observe=lambda _project: self._full_docker_observation(store),
-                ),
-            )
-        self.assertTrue(result["ok"])
-        self.assertEqual(result["result"]["terminal_state"]["observed_state"], "absent")
-
     def test_database_restart_requires_database_readiness(self) -> None:
         with AccountStore.open_default(self.home, effective_uid=os.geteuid()) as store:
             host_id, repo_id = self._insert_repository(store)
@@ -3982,7 +3547,7 @@ class RuntimeApiTests(unittest.TestCase):
                     "unsupported_safe_replace",
                 )
 
-    def test_docker_replace_is_rejected_before_account_store_or_host_access(self) -> None:
+    def test_docker_replace_client_compose_paths_are_rejected_before_host_access(self) -> None:
         for kind in ("docker", "database_stack"):
             with (
                 self.subTest(kind=kind),
@@ -4022,10 +3587,10 @@ class RuntimeApiTests(unittest.TestCase):
                     )
                 )
             self.assertFalse(result["ok"])
-            self.assertEqual(result["classification"], "unsupported_safe_replace")
-            self.assertEqual(result["evidence"]["resource_kind"], kind)
+            self.assertEqual(result["classification"], "invalid_request")
             self.assertEqual(
-                result["evidence"]["resource_id"], "immutable-resource-id"
+                result["evidence"]["code"],
+                "broker_runtime_options_forbidden",
             )
             open_store.assert_not_called()
             resolve_repository.assert_not_called()

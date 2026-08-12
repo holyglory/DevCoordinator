@@ -290,7 +290,7 @@ class WorkerControllerTests(unittest.TestCase):
         self.assertFalse(crash["restart_allowed"])
         self.assertEqual(self.supervision.policy(self.worker_id)["supervisor_state"], "idle")
 
-    def test_first_supervised_start_requires_explicit_policy_and_worker_role(self) -> None:
+    def test_first_supervised_start_requires_explicit_policy_for_any_service_role(self) -> None:
         with self.assertRaisesRegex(WorkerControlError, "explicit keep_alive"):
             self._start(keep_alive=None)
         with self.store.immediate_transaction() as connection:
@@ -298,8 +298,9 @@ class WorkerControllerTests(unittest.TestCase):
                 "UPDATE server_definitions SET role='web' WHERE server_definition_id=?",
                 (self.worker_id,),
             )
-        with self.assertRaisesRegex(WorkerControlError, "worker-role"):
-            self._start(keep_alive=True)
+        started = self._start(keep_alive=True)
+        self.assertEqual(started["status"], "running")
+        self.assertEqual(started["supervision"]["keep_alive"], True)
 
     def test_stopped_observation_with_stale_pid_allows_supervised_restart(self) -> None:
         timestamp = utc_timestamp()
@@ -330,6 +331,52 @@ class WorkerControllerTests(unittest.TestCase):
 
         self.assertTrue(restarted["ok"])
         self.assertEqual(restarted["status"], "running")
+
+    def test_stop_proves_exact_process_absent_when_pid_was_reused(self) -> None:
+        self._start()
+        controller = WorkerController(
+            self.store,
+            coordinator_script=Path(__file__).parents[2] / "dev_coordinator.py",
+            manager_factory=lambda **_kwargs: self.manager,
+            process_observer=lambda _pid, _started: "mismatch",
+            sleeper=lambda _seconds: None,
+        )
+
+        stopped = controller.stop(
+            worker_id=self.worker_id,
+            canonical_repository=str(self.project),
+            name="queue-worker",
+            actor="test-agent",
+            timeout_seconds=0.1,
+        )
+
+        self.assertEqual(
+            stopped["terminal_process_proof"],
+            {"certain": True, "state": "pid_reused", "pid": 31_001},
+        )
+
+    def test_stop_fails_closed_when_exact_process_identity_remains_alive(self) -> None:
+        self._start()
+        controller = WorkerController(
+            self.store,
+            coordinator_script=Path(__file__).parents[2] / "dev_coordinator.py",
+            manager_factory=lambda **_kwargs: self.manager,
+            process_observer=lambda _pid, _started: "alive",
+            sleeper=lambda _seconds: None,
+        )
+
+        with self.assertRaisesRegex(WorkerControlError, "absence is unproven"):
+            controller.stop(
+                worker_id=self.worker_id,
+                canonical_repository=str(self.project),
+                name="queue-worker",
+                actor="test-agent",
+                timeout_seconds=0.1,
+            )
+        self.assertEqual(
+            self.supervision.policy(self.worker_id)["supervisor_state"],
+            "stopped",
+        )
         self.assertEqual(self.manager.start_calls, 1)
 
     def test_active_unmanaged_observation_requires_exact_server_stop(self) -> None:

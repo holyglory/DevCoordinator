@@ -1,6 +1,6 @@
 // The browser must consume the coordinator's complete repository_trees model.
 // Flat names, paths, and resource rows are lookup data only and must never
-// synthesize repository membership when that authoritative model is absent.
+// synthesize repository association when that authoritative model is absent.
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -81,7 +81,6 @@ function minimalAuthoritativeInventory() {
     repositories: [{
       repo_id: 'repo', host_id: 'host', canonical_root: '/repo', display_name: 'Repo',
     }],
-    memberships: [],
     resources: {
       servers: [{ server_definition_id: 'server', repo_id: 'repo' }],
       docker: [],
@@ -110,7 +109,6 @@ function initializedRetainedInventory() {
     projection_status: 'initialized',
     repositories: [],
     repository_trees: [],
-    memberships: [],
     resources: { servers: [], docker: [], docker_ports: [], databases: [] },
     observations: { servers: [], docker: [], databases: [], snapshots: [], telemetry: [] },
     unassigned_resources: [],
@@ -155,10 +153,6 @@ test('repository trees group one root repo with exact nested temporary scopes', 
       { repo_id: 'repo-root', host_id: 'host', canonical_root: '/repos/Nevod', display_name: 'Nevod' },
       { repo_id: 'repo-temp', host_id: 'host', canonical_root: '/tmp/Nevod-run', display_name: 'Nevod browser test' },
     ],
-    memberships: [
-      { resource_kind: 'container', host_resource_id: 'docker-db', repo_id: 'repo-root' },
-      { resource_kind: 'container', host_resource_id: 'docker-temp', repo_id: 'repo-temp' },
-    ],
     servers: [rootServer, temporaryServer, pathLookalike],
     docker: {
       available: true,
@@ -171,8 +165,8 @@ test('repository trees group one root repo with exact nested temporary scopes', 
         { server_definition_id: 'server-temp', repo_id: 'repo-temp' },
       ],
       docker: [
-        { docker_resource_id: 'docker-db' },
-        { docker_resource_id: 'docker-temp' },
+        { docker_resource_id: 'docker-db', repo_id: 'repo-root' },
+        { docker_resource_id: 'docker-temp', repo_id: 'repo-temp' },
       ],
       databases: [{
         database_binding_id: 'binding-db', docker_resource_id: 'docker-db',
@@ -244,7 +238,7 @@ test('repository trees group one root repo with exact nested temporary scopes', 
 test('an authoritative empty repository tree does not fall back to flat project rows', async () => {
   const { projectGroupsOf } = await loadProjectGroupsOf();
   const groups = projectGroupsOf({ inventory: {
-    repositories: [], memberships: [],
+    repositories: [],
     resources: { servers: [], docker: [], databases: [] },
     observations: { docker: [], databases: [] },
     unassigned_resources: [], lifecycle_violations: [],
@@ -264,9 +258,6 @@ test('unassigned resources stay contained while exact affected mutations remain 
   const inventory = {
     repositories: [{
       repo_id: 'repo', host_id: 'host', canonical_root: '/repo', display_name: 'Repo',
-    }],
-    memberships: [{
-      resource_kind: 'container', host_resource_id: 'claimed-container', repo_id: 'repo',
     }],
     servers: [
       { id: 'claimed-server', name: 'claimed', status: 'running' },
@@ -288,8 +279,8 @@ test('unassigned resources stay contained while exact affected mutations remain 
         { server_definition_id: 'unclaimed-server', repo_id: null },
       ],
       docker: [
-        { docker_resource_id: 'claimed-container' },
-        { docker_resource_id: 'unclaimed-container' },
+        { docker_resource_id: 'claimed-container', repo_id: 'repo' },
+        { docker_resource_id: 'unclaimed-container', repo_id: null },
       ],
       databases: [{
         database_binding_id: 'claimed-db', docker_resource_id: 'claimed-container',
@@ -495,7 +486,7 @@ test('flat project usage and names never synthesize a repository hierarchy', asy
   );
 });
 
-test('project membership excludes control-only port lease definitions from operational collections', async () => {
+test('project association excludes control-only port lease definitions from operational collections', async () => {
   const { projectGroupsOf } = await loadProjectGroupsOf();
   const live = { id: 'live', name: 'web', status: 'running' };
   const stopped = { id: 'stopped', name: 'worker', status: 'stopped' };

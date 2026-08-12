@@ -45,9 +45,21 @@ class CapabilityContractTests(unittest.TestCase):
         self.assertEqual(document["runtime"]["ensure_states"], ["ready", "stopped"])
         self.assertEqual(
             document["tests"]["enqueue_intents"],
-            ["change", "checkpoint", "manual"],
+            ["change", "checkpoint", "handoff", "release", "manual"],
         )
         self.assertTrue(document["runtime"]["operation_replay"])
+        self.assertEqual(
+            document["storage"]["actions"],
+            ["apply", "inventory", "plan", "remove"],
+        )
+        self.assertEqual(
+            document["storage"]["direct_remove_target_kinds"], ["container"]
+        )
+        self.assertEqual(
+            document["storage"]["plan_apply_target_kinds"], ["volume"]
+        )
+        self.assertNotIn("approval_classes", document)
+        self.assertNotIn("remove", document["runtime"]["actions"])
         encoded = json.dumps(
             document, separators=(",", ":"), sort_keys=True
         ).encode("utf-8")

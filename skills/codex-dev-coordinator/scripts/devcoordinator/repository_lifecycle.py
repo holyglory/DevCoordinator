@@ -178,22 +178,20 @@ class ExactResourceRef:
     resource_id: str
     kind: ResourceKind
     immutable_fingerprint: str
-    control_binding_id: str
-    ownership_fingerprint: str
+    observation_fingerprint: str
     policies: tuple[StartupPolicyRef, ...] = ()
     allocations: tuple[AllocationRef, ...] = ()
     native_identity: tuple[tuple[str, str], ...] = ()
-    # Stable controller identity excluding observation-generation churn.  The
-    # generation-bearing ownership_fingerprint remains the exact snapshot
+    # Stable resource identity excluding observation-generation churn.  The
+    # generation-bearing observation_fingerprint remains the exact snapshot
     # identity used by a single host action; this contract is what permits a
-    # later observation to prove that the same controller still owns it.
-    control_contract_fingerprint: str = ""
+    # later observation to prove that the same resource is still present.
+    stable_identity_fingerprint: str = ""
 
     def __post_init__(self) -> None:
         _require_identity("resource_id", self.resource_id)
         _require_identity("immutable_fingerprint", self.immutable_fingerprint)
-        _require_identity("control_binding_id", self.control_binding_id)
-        _require_identity("ownership_fingerprint", self.ownership_fingerprint)
+        _require_identity("observation_fingerprint", self.observation_fingerprint)
         if len({item.policy_id for item in self.policies}) != len(self.policies):
             raise ValueError("duplicate startup policy identity")
         if len({(item.kind, item.allocation_id) for item in self.allocations}) != len(
@@ -214,9 +212,8 @@ class ExactResourceRef:
             "kind": self.kind.value,
             "host_resource_id": self.resource_id,
             "immutable_fingerprint": self.immutable_fingerprint,
-            "control_binding_id": self.control_binding_id,
-            "ownership_fingerprint": self.ownership_fingerprint,
-            "control_contract_fingerprint": self.control_contract_fingerprint,
+            "observation_fingerprint": self.observation_fingerprint,
+            "stable_identity_fingerprint": self.stable_identity_fingerprint,
             "native_identity": {
                 str(key): str(value) for key, value in self.native_identity
             },
@@ -243,7 +240,7 @@ class StandaloneSnapshot:
     resource: ExactResourceRef
     retirement_status: str | None
     attached_repo_id: str | None
-    authority_state: str
+    catalogued: bool
 
 
 @dataclass(frozen=True)
@@ -341,8 +338,6 @@ class CapturedStartupPolicyState:
     policy_kind: PolicyKind
     policy_immutable_fingerprint: str
     target_immutable_fingerprint: str
-    control_binding_id: str
-    ownership_fingerprint: str
     native_identity_fingerprint: str
     captured_value: str
     restore_required: bool
@@ -382,7 +377,7 @@ class ResourceObservation:
     identity_observable: bool
     immutable_fingerprint: str | None
     ownership_observable: bool
-    ownership_fingerprint: str | None
+    observation_fingerprint: str | None
     running_state: RunningState
     listener_active: bool | None = None
     container_running: bool | None = None
@@ -835,8 +830,8 @@ class RepositoryLifecycle:
                 f"resource is attached to repository {snapshot.attached_repo_id}; "
                 "remove it through that repository"
             )
-        if snapshot.authority_state != "authoritative":
-            raise OwnershipError("standalone resource has no unique authoritative controller")
+        if not snapshot.catalogued:
+            raise OwnershipError("standalone resource is not current in the catalog")
         if snapshot.retirement_status in {"disabling", "retired"}:
             raise ActionFencedError("standalone resource is already fenced or retired")
         fingerprint = _fingerprint(
@@ -870,8 +865,8 @@ class RepositoryLifecycle:
         snapshot = self._persistence.standalone_snapshot(resource)
         if snapshot.attached_repo_id != repo_id:
             raise OwnershipError("resource repository attachment changed before archive planning")
-        if snapshot.authority_state != "authoritative":
-            raise OwnershipError("resource has no unique authoritative controller")
+        if not snapshot.catalogued:
+            raise OwnershipError("resource is not current in the catalog")
         if snapshot.retirement_status in {"disabling", "retired"}:
             raise ActionFencedError("resource is already archived or archive is in progress")
         fingerprint = _fingerprint(
@@ -1039,8 +1034,8 @@ class RepositoryLifecycle:
         observation = self._adapter.observe_exact(resource)
         self._verify_exact_identity(resource, observation)
         snapshot = self._persistence.standalone_snapshot(resource)
-        if snapshot.authority_state != "authoritative":
-            raise OwnershipError("resource controller is not uniquely authoritative")
+        if not snapshot.catalogued:
+            raise OwnershipError("resource is not current in the catalog")
         if snapshot.attached_repo_id is not None and snapshot.attached_repo_id != repo_id:
             raise OwnershipError(f"resource already belongs to {snapshot.attached_repo_id}")
         if snapshot.retirement_status in {"disabling", "retired"}:
@@ -1306,7 +1301,7 @@ class RepositoryLifecycle:
             raise PlanDriftError("resource was replaced by a different immutable identity")
         if not observation.ownership_observable:
             raise OwnershipError("resource ownership is unobservable")
-        if observation.ownership_fingerprint != target.ownership_fingerprint:
+        if observation.observation_fingerprint != target.observation_fingerprint:
             raise OwnershipError("resource ownership binding changed")
 
     @staticmethod
@@ -1461,8 +1456,7 @@ def _require_identity(label: str, value: str) -> None:
 def _require_exact_target(target: ExactResourceRef) -> None:
     _require_identity("resource_id", target.resource_id)
     _require_identity("immutable_fingerprint", target.immutable_fingerprint)
-    _require_identity("control_binding_id", target.control_binding_id)
-    _require_identity("ownership_fingerprint", target.ownership_fingerprint)
+    _require_identity("observation_fingerprint", target.observation_fingerprint)
 
 
 def _require_explicit(explicit: bool) -> None:

@@ -13,7 +13,8 @@ export function createGuard({ sessions, access, config, log }) {
   /**
    * Parse + verify the session cookie AND re-check current policy membership
    * on every request, so removing an invited user revokes an already-issued
-   * cookie immediately. Exact resource grants are checked separately.
+   * cookie immediately. Console and published-route access are checked
+   * separately; neither check scopes Coordinator resources by repository.
    */
   function sessionFrom(req) {
     const session = identityFrom(req);

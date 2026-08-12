@@ -201,7 +201,10 @@ test('stable edge retains Console shell and HTTP/HTTPS project routes without a 
 
   const publicRoute = await request({ port, host: 'public.vr.ae', path: '/ready' });
   assert.equal(publicRoute.status, 200);
-  assert.equal(JSON.parse(publicRoute.body).cookie, null);
+  const publicPayload = JSON.parse(publicRoute.body);
+  assert.equal(publicPayload.cookie, null);
+  assert.equal(publicPayload.email, null);
+  assert.equal(publicPayload.routeId, null);
 
   const offlineRoute = await request({ port, host: 'offline.vr.ae', path: '/ready' });
   assert.equal(offlineRoute.status, 502);

@@ -15,15 +15,10 @@ from devcoordinator.cleanup_lifecycle import (
     CleanupLifecycle,
     PlanDriftError,
 )
-from devcoordinator.schema import (
-    advance_repository_owner_generation,
-    establish_repository_owner_authority,
-)
 from devcoordinator.store import AccountStore, utc_timestamp
 
 
 UID = os.geteuid()
-OWNER_UID = UID if UID > 0 else 1
 
 
 class ProjectCleanupGenerationTests(unittest.TestCase):
@@ -50,17 +45,6 @@ class ProjectCleanupGenerationTests(unittest.TestCase):
                 ) VALUES (?, ?, ?, 'Generation Test', 'active', 0, ?, ?)
                 """,
                 (repo_id, host_id, str(self.root / "repository"), now, now),
-            )
-            establish_repository_owner_authority(
-                connection,
-                repository_id=repo_id,
-                owner_uid=OWNER_UID,
-                repository_generation=0,
-                operation_id="fixture-generation-owner",
-                actor="fixture",
-                reason="project cleanup fixture owner authority",
-                timestamp=now,
-                evidence={"kind": "project-cleanup-generation-fixture"},
             )
             connection.execute(
                 """
@@ -197,18 +181,6 @@ class ProjectCleanupGenerationTests(unittest.TestCase):
                     """,
                     (now, repo_id),
                 )
-                advance_repository_owner_generation(
-                    connection,
-                    repository_id=repo_id,
-                    owner_uid=OWNER_UID,
-                    prior_repository_generation=1,
-                    repository_generation=2,
-                    operation_id="fixture-explicit-reinstall-generation-2",
-                    actor="fixture",
-                    reason="explicit fixture reinstall",
-                    timestamp=now,
-                    evidence={"kind": "project-cleanup-generation-reinstall"},
-                )
                 connection.execute(
                     """
                     UPDATE repository_installations
@@ -300,18 +272,6 @@ class ProjectCleanupGenerationTests(unittest.TestCase):
                         """,
                         (timestamp, repo_id),
                     )
-                    advance_repository_owner_generation(
-                        connection,
-                        repository_id=repo_id,
-                        owner_uid=OWNER_UID,
-                        prior_repository_generation=0,
-                        repository_generation=1,
-                        operation_id="fixture-finalization-race-generation-1",
-                        actor="fixture",
-                        reason="simulate an exact concurrent generation advance",
-                        timestamp=timestamp,
-                        evidence={"kind": "project-cleanup-generation-race"},
-                    )
                 return {"generation_advanced": True}
 
             lifecycle = CleanupLifecycle(store, prepare_apply=advance_generation)
@@ -321,7 +281,9 @@ class ProjectCleanupGenerationTests(unittest.TestCase):
                 actor="test",
                 reason="generation race",
             )
-            with self.assertRaisesRegex(PlanDriftError, "owner authority.*stale"):
+            with self.assertRaisesRegex(
+                PlanDriftError, "catalog identity changed before removal"
+            ):
                 lifecycle.apply(
                     plan_id=plan.plan_id,
                     plan_fingerprint=plan.plan_fingerprint,

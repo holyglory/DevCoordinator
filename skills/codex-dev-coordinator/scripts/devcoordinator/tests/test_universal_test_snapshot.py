@@ -610,7 +610,7 @@ class UniversalTestSnapshotTests(unittest.TestCase):
             public_snapshot_source_diagnostic(
                 "Git snapshot inspection failed: fatal: secret /outside/path"
             ),
-            "Git metadata inspection failed for the enrolled repository.",
+            "Git metadata inspection failed for the configured repository.",
         )
         self.assertEqual(
             public_snapshot_source_diagnostic(

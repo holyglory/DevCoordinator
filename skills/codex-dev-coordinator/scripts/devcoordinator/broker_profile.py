@@ -3,9 +3,8 @@
 The standard CLI never discovers a broker by probing.  On a managed host,
 Unix accounts are attribution identities for one trusted developer rather
 than separate security tenants, so file ownership and mode bits are not
-profile authorization evidence. Profiles published for local accounts are
-merged; each repository still carries its exact configured account and
-normalized resource IDs.
+profile request validation evidence. Profiles published for local accounts are
+merged into one server-wide repository and resource catalog.
 """
 
 from __future__ import annotations
@@ -34,30 +33,22 @@ from .universal_test_contract import TestManifest, manifest_to_document
 from .universal_test_planner import TestPlan
 
 
-PROFILE_VERSION = 1
+PROFILE_VERSION = 2
 REPOSITORY_PROFILE_FIELDS = frozenset(
     {
         "canonical_root",
         "repo_id",
         "generation",
-        "owner_uid",
         "servers",
         "containers",
         "compose_definition_id",
         "compose_container_ids",
         "compose_run_once_services",
         "ephemeral_templates",
-        "ephemeral_image_prefetch_templates",
         "ephemeral_secret_policies",
-        "account_id",
-        "enabled",
-        "issued_at",
-        "valid_until_epoch",
     }
 )
-REPOSITORY_ENSURE_EVIDENCE_FIELDS = frozenset(
-    {"execution_uid", "filesystem_owner_uid"}
-)
+REPOSITORY_ENSURE_EVIDENCE_FIELDS = frozenset({"execution_uid"})
 HOST_OBSERVE_CLIENT_TIMEOUT_SECONDS = 11 * 60.0
 INVENTORY_READ_CLIENT_TIMEOUT_SECONDS = 60.0
 SYSTEM_PROFILE_PATH = Path(
@@ -110,9 +101,6 @@ class BrokerProfileError(RuntimeError):
 @dataclass(frozen=True)
 class BrokerServiceProfile:
     socket_path: Path
-    service_uid: int
-    socket_gid: int
-    socket_mode: int
     database_generation: str
 
 
@@ -137,54 +125,32 @@ class BrokerRepositoryProfile:
     canonical_root: str
     repo_id: str
     generation: int
-    owner_uid: int
     server_ids: Mapping[str, str]
     container_ids: Mapping[str, str]
     compose_definition_id: Optional[str]
     compose_container_ids: frozenset[str]
     compose_run_once_services: Mapping[str, int]
     ephemeral_templates: Mapping[str, str]
-    ephemeral_image_prefetch_template_ids: frozenset[str]
     ephemeral_secret_policies: Mapping[str, EphemeralSecretPolicyProfile]
-    account_id: str
-    enabled: bool
-    issued_at: str
-    valid_until_epoch: int
     execution_uid: Optional[int] = None
-    filesystem_owner_uid: Optional[int] = None
-
-    def require_account(self, *, account_id: str) -> None:
-        """Bind even retained cleanup calls to the profile's exact account."""
-
-        if self.account_id != account_id:
-            raise BrokerProfileError(
-                "repository broker enrollment belongs to another account"
-            )
-
-    def require_current(self, *, account_id: str) -> None:
-        self.require_account(account_id=account_id)
-        if not self.enabled:
-            raise BrokerProfileError(
-                "repository broker enrollment is disabled; rerun Coordinator skill installation"
-            )
 
     def server_id(self, name: str) -> str:
         value = self.server_ids.get(str(name))
         if value is None:
             raise BrokerProfileError(
-                f"server {name!r} is not enrolled with the host coordinator broker; "
-                "rerun Coordinator skill installation as the host administrator"
+                f"server {name!r} is not configured with the host coordinator broker; "
+                "run a start-like command so the live broker catalogs the repository manifest"
             )
         return value
 
     def require_server_id(self, resource_id: str) -> str:
-        """Require an exact opaque server ID already present in this enrollment."""
+        """Require an exact opaque server ID already present in this configuration."""
 
         candidate = str(resource_id)
         if candidate not in self.server_ids.values():
             raise BrokerProfileError(
-                f"server identity {candidate!r} is not enrolled with the host coordinator broker; "
-                "rerun Coordinator skill installation as the host administrator"
+                f"server identity {candidate!r} is not configured with the host coordinator broker; "
+                "run a start-like command so the live broker catalogs the repository manifest"
             )
         return candidate
 
@@ -192,7 +158,7 @@ class BrokerRepositoryProfile:
         value = self.container_ids.get(str(identity))
         if value is None:
             raise BrokerProfileError(
-                f"Docker resource {identity!r} is not enrolled with the host coordinator broker; "
+                f"Docker resource {identity!r} is not configured with the host coordinator broker; "
                 "refresh service observation and rerun Coordinator skill installation"
             )
         return value
@@ -215,8 +181,8 @@ class BrokerRepositoryProfile:
         maximum = self.compose_run_once_services.get(name)
         if maximum is None:
             raise BrokerProfileError(
-                f"Compose run-once service {name!r} is not explicitly enrolled; "
-                "rerun Coordinator skill installation with the reviewed service grant"
+                f"Compose run-once service {name!r} is not explicitly configured; "
+                "rerun Coordinator configuration with the declared service policy"
             )
         if (
             type(timeout_seconds) is not int
@@ -231,23 +197,16 @@ class BrokerRepositoryProfile:
         value = self.ephemeral_templates.get(str(name))
         if value is None:
             raise BrokerProfileError(
-                f"ephemeral template {name!r} is not enrolled with the host "
+                f"ephemeral template {name!r} is not configured with the host "
                 "coordinator broker; rerun Coordinator skill installation as "
                 "the host administrator"
             )
         return value
 
     def ephemeral_image_prefetch_template_id(self, name: str) -> str:
-        """Return one template only when the root profile explicitly permits pull."""
+        """Return the configured template identity for a typed prefetch call."""
 
-        value = self.ephemeral_template_id(name)
-        if value not in self.ephemeral_image_prefetch_template_ids:
-            raise BrokerProfileError(
-                f"ephemeral image prefetch for template {name!r} is not explicitly "
-                "enrolled; rerun Coordinator skill installation with the reviewed "
-                "image-prefetch grant"
-            )
-        return value
+        return self.ephemeral_template_id(name)
 
     def ephemeral_secret_policy(
         self, name: str
@@ -260,52 +219,25 @@ class BrokerRepositoryProfile:
 @dataclass(frozen=True)
 class BrokerClientProfile:
     service: BrokerServiceProfile
-    client_uid: int
-    account_id: str
-    issued_at: str
-    valid_until_epoch: int
     repositories: Mapping[str, BrokerRepositoryProfile]
 
-    def repository_account_id(self, repository: BrokerRepositoryProfile) -> str:
-        """Return the repository's declared account in the merged host view."""
-
-        return repository.account_id
-
-    def _require_repository_current(
-        self, repository: BrokerRepositoryProfile
-    ) -> None:
-        repository.require_current(
-            account_id=self.repository_account_id(repository)
-        )
-
-    def _require_repository_account(
-        self, repository: BrokerRepositoryProfile
-    ) -> None:
-        repository.require_account(
-            account_id=self.repository_account_id(repository)
-        )
-
     def _current_transport_anchor(self) -> BrokerRepositoryProfile:
-        current: list[BrokerRepositoryProfile] = []
-        for candidate in self.repositories.values():
-            try:
-                self._require_repository_current(candidate)
-            except BrokerProfileError:
-                continue
-            current.append(candidate)
-        if not current:
+        if not self.repositories:
             raise BrokerProfileError(
-                "authenticated account has no current repository enrollment for broker access"
+                "broker routing profile contains no repository anchor"
             )
-        return min(current, key=lambda item: (item.repo_id, item.canonical_root))
+        return min(
+            self.repositories.values(),
+            key=lambda item: (item.repo_id, item.canonical_root),
+        )
 
-    def repository_if_enrolled(
+    def repository_if_configured(
         self, canonical_root: str
     ) -> BrokerRepositoryProfile | None:
-        """Return one exact current enrollment without treating absence as failure.
+        """Return one exact current configuration without treating absence as failure.
 
         Repository discovery is a pure client-side lookup.  Callers use this
-        distinction to report a valid Git root as ``unenrolled`` while keeping
+        distinction to report a valid Git root as ``unconfigured`` while keeping
         first-use adoption on a start-like broker mutation.
         """
 
@@ -313,22 +245,18 @@ class BrokerClientProfile:
         # make a protected client's ability to traverse another trusted local
         # account's home a prerequisite for this read-only lookup.
         canonical = _canonical_repository_lookup_root(canonical_root)
-        value = self.repositories.get(canonical)
-        if value is None:
-            return None
-        self._require_repository_current(value)
-        return value
+        return self.repositories.get(canonical)
 
     def repository(self, canonical_root: str) -> BrokerRepositoryProfile:
-        value = self.repository_if_enrolled(canonical_root)
+        value = self.repository_if_configured(canonical_root)
         if value is None:
             canonical = _canonical_repository_lookup_root(canonical_root)
             raise BrokerProfileError(
-                f"repository {canonical} is not enrolled; this eligible first-use "
+                f"repository {canonical} is not configured; this eligible first-use "
                 "Git root has not yet been adopted. Local fallback is intentionally "
                 "disabled, so use "
                 "`devcoordinator runtime serve --help` and submit one structured serve call",
-                code="repository_unenrolled",
+                code="repository_unconfigured",
                 classification="repository_bootstrap_required",
             )
         return value
@@ -339,7 +267,7 @@ class BrokerClientProfile:
         """Read an adopted repository that is newer than the installed profile."""
 
         canonical = _canonical_repository_lookup_root(canonical_root)
-        existing = self.repository_if_enrolled(canonical)
+        existing = self.repository_if_configured(canonical)
         if existing is not None:
             return existing
         return self.refresh_repository(canonical)
@@ -364,94 +292,53 @@ class BrokerClientProfile:
             arguments={"canonical_root": canonical},
         )
         state = result.get("state")
-        if state == "unenrolled":
+        if state == "unregistered":
             return None
-        if state != "enrolled":
+        if state != "available":
             raise BrokerProfileError(
-                "repository exists but is not eligible for first-use runtime access"
+                "repository exists but is not currently available"
             )
         repository_document = result.get("repository")
-        repository_account_id = (
-            str(repository_document.get("account_id") or "")
-            if isinstance(repository_document, dict)
-            else ""
-        )
-        # The protected client can dynamically merge one broker-issued route
-        # owned by another trusted local account.  The physical caller remains
-        # the kernel peer; this account value only selects the already-enabled
-        # typed policy for the exact repository and resource identities.
-        repository = _repository_from_document(
-            repository_document, account_id=repository_account_id
-        )
+        repository = _repository_from_document(repository_document)
         if repository.canonical_root != canonical:
             raise BrokerProfileError(
                 "repository resolution returned another canonical root"
             )
         if not isinstance(self.repositories, dict):
             raise BrokerProfileError(
-                "broker profile repository view cannot accept dynamic enrollment"
+                "broker profile repository view cannot accept dynamic configuration"
             )
         self.repositories[canonical] = repository
         return repository
 
-    def retained_ephemeral_repository(
-        self, canonical_root: str
-    ) -> BrokerRepositoryProfile:
-        """Resolve one recorded repo for retained status/cleanup calls.
-
-        This deliberately does not discover repositories or revive a disabled
-        enrollment. The protected profile supplies only the exact opaque repo
-        identity; the broker still proves the run belongs to the exact
-        configured account/repository and permits only ``ephemeral.status`` or
-        ``ephemeral.finish`` after revocation.
-        """
-
-        canonical = str(Path(canonical_root).expanduser().resolve())
-        value = self.repositories.get(canonical)
-        if value is None:
-            raise BrokerProfileError(
-                f"repository {canonical} is not recorded in the configured host "
-                "broker profile; retained ephemeral cleanup cannot discover it"
-            )
-        self._require_repository_account(value)
-        return value
-
     def repository_for_server_id(self, server_id: str) -> BrokerRepositoryProfile:
-        """Resolve one fixed runner ID only through current protected enrollments."""
+        """Resolve one fixed runner ID through the current routing catalog."""
 
         candidate = str(server_id)
         matches: list[BrokerRepositoryProfile] = []
         for repository in self.repositories.values():
-            try:
-                self._require_repository_current(repository)
-            except BrokerProfileError:
-                continue
             if candidate in repository.server_ids.values():
                 matches.append(repository)
         if not matches:
             raise BrokerProfileError(
-                f"server identity {candidate!r} is not present in a current host broker enrollment"
+                f"server identity {candidate!r} is not present in the current routing catalog"
             )
         if len(matches) != 1:
             raise BrokerProfileError(
-                f"server identity {candidate!r} is ambiguous across protected repository enrollments"
+                f"server identity {candidate!r} is ambiguous across repository routes"
             )
         return matches[0]
 
     def repository_by_id(self, repo_id: str) -> BrokerRepositoryProfile:
-        """Resolve one immutable repository id through current enrollments."""
+        """Resolve one immutable repository id through current configurations."""
 
         matches: list[BrokerRepositoryProfile] = []
         for repository in self.repositories.values():
-            try:
-                self._require_repository_current(repository)
-            except BrokerProfileError:
-                continue
             if repository.repo_id == str(repo_id):
                 matches.append(repository)
         if len(matches) != 1:
             raise BrokerProfileError(
-                "repository identity is not uniquely present in the protected enrollment"
+                "repository identity is not uniquely present in the routing catalog"
             )
         return matches[0]
 
@@ -465,17 +352,9 @@ class BrokerClientProfile:
         operation_id: Optional[str] = None,
         transport_timeout_seconds: float | None = None,
     ) -> tuple[str, dict[str, Any]]:
-        retained_ephemeral = operation in {
-            BrokerOperation.EPHEMERAL_STATUS,
-            BrokerOperation.EPHEMERAL_FINISH,
-        }
-        if retained_ephemeral:
-            self._require_repository_account(repository)
-        else:
-            self._require_repository_current(repository)
         call_arguments: dict[str, Any] = {
             "service": self.service,
-            "account_id": self.repository_account_id(repository),
+            "account_id": "local",
             "repo_id": repository.repo_id,
             "repository_generation": repository.generation,
             "resource_id": resource_id,
@@ -496,7 +375,7 @@ class BrokerClientProfile:
         arguments: Optional[Mapping[str, Any]] = None,
         operation_id: Optional[str] = None,
     ) -> tuple[str, dict[str, Any]]:
-        """Call only the fixed worker protocol for one exactly enrolled server."""
+        """Call only the fixed worker protocol for one exactly configured server."""
 
         if operation not in {
             BrokerOperation.WORKER_LAUNCH_TICKET,
@@ -516,33 +395,24 @@ class BrokerClientProfile:
         )
 
     def inventory(self, *, canonical_root: str | None = None) -> dict[str, Any]:
-        """Read host authority through the requested or a current enrollment.
+        """Read host authority through the requested or a current configuration.
 
         A project-scoped caller must identify its exact repository so the
-        broker authorization request cannot be routed through an unrelated
-        enrollment. Host-wide callers retain the deterministic current-
-        enrollment selection because they have no project scope to prefer.
+        broker request validation request cannot be routed through an unrelated
+        configuration. Host-wide callers retain the deterministic current-
+        configuration selection because they have no project scope to prefer.
         """
 
         if canonical_root is not None:
             repository = self.repository(canonical_root)
         elif not self.repositories:
             raise BrokerProfileError(
-                "authenticated account has no enrolled repository for host inventory access"
+                "broker routing profile has no repository anchor for host inventory"
             )
         else:
-            current: list[BrokerRepositoryProfile] = []
-            for candidate in self.repositories.values():
-                try:
-                    self._require_repository_current(candidate)
-                except BrokerProfileError:
-                    continue
-                current.append(candidate)
-            if not current:
-                raise BrokerProfileError(
-                    "authenticated account has no current repository enrollment for host inventory access"
-                )
-            repository = min(current, key=lambda item: item.canonical_root)
+            repository = min(
+                self.repositories.values(), key=lambda item: item.canonical_root
+            )
         _operation_id, result = self.call(
             repository=repository,
             resource_id=repository.repo_id,
@@ -571,17 +441,17 @@ class BrokerClientProfile:
         self,
         *,
         canonical_root: str,
-        owner_uid: int,
         project_kind: str,
         agent: str,
         operation_id: str,
+        transport_timeout_seconds: float | None = None,
     ) -> BrokerRepositoryProfile:
         repository, _changed = self.ensure_repository_with_outcome(
             canonical_root=canonical_root,
-            owner_uid=owner_uid,
             project_kind=project_kind,
             agent=agent,
             operation_id=operation_id,
+            transport_timeout_seconds=transport_timeout_seconds,
         )
         return repository
 
@@ -589,17 +459,17 @@ class BrokerClientProfile:
         self,
         *,
         canonical_root: str,
-        owner_uid: int,
         project_kind: str,
         agent: str,
         operation_id: str,
+        transport_timeout_seconds: float | None = None,
     ) -> tuple[BrokerRepositoryProfile, bool]:
         """Adopt a proven Git root through one existing transport anchor.
 
         This method is intentionally called only from a start-like command.
         It contacts the broker even when the repository is already visible so
-        an older partial adoption can idempotently reconcile its execution-owner
-        enrollment before launch. The returned profile is added to this
+        an older partial adoption can idempotently reconcile its execution
+        configuration before launch. The returned profile is added to this
         process's merged host view so the immediately following runtime mutation
         uses the broker-issued immutable repository identity without writing an
         installed profile.
@@ -614,10 +484,10 @@ class BrokerClientProfile:
             arguments={
                 "agent": agent,
                 "canonical_root": canonical_root,
-                "owner_uid": owner_uid,
                 "project_kind": project_kind,
             },
             operation_id=operation_id,
+            transport_timeout_seconds=transport_timeout_seconds,
         )
         if result.get("operation_id") != submitted_operation_id:
             raise BrokerProfileError(
@@ -629,10 +499,7 @@ class BrokerClientProfile:
                 "repository ensure omitted its exact mutation outcome"
             )
         repository_document = result.get("repository")
-        repository = _repository_from_document(
-            repository_document,
-            account_id=anchor.account_id,
-        )
+        repository = _repository_from_document(repository_document)
         expected_root = _canonical_repository_lookup_root(canonical_root)
         if repository.canonical_root != expected_root:
             raise BrokerProfileError(
@@ -640,7 +507,7 @@ class BrokerClientProfile:
             )
         if not isinstance(self.repositories, dict):
             raise BrokerProfileError(
-                "broker profile repository view cannot accept first-use enrollment"
+                "broker profile repository view cannot accept first-use configuration"
             )
         self.repositories[repository.canonical_root] = repository
         return repository, changed
@@ -657,7 +524,7 @@ class BrokerClientProfile:
         temporary_repo_id: str | None = None,
         operation_id: str | None = None,
     ) -> dict[str, Any]:
-        """Ensure one exact enrolled runtime target through broker policy."""
+        """Ensure one exact configured runtime target through broker policy."""
 
         submitted_operation_id, result = self.call(
             repository=repository,
@@ -681,7 +548,7 @@ class BrokerClientProfile:
         return result
 
     def capabilities(self, *, canonical_root: str | None = None) -> dict[str, Any]:
-        """Read the active authority contract through one exact enrollment."""
+        """Read the active authority contract through one exact configuration."""
 
         if canonical_root is not None:
             repository = self.repository(canonical_root)
@@ -698,11 +565,11 @@ class BrokerClientProfile:
     def events(
         self, *, after: str | None = None, limit: int = 100
     ) -> dict[str, Any]:
-        """Read the host-wide durable event journal through one enrollment."""
+        """Read the host-wide durable event journal through one configuration."""
 
         if not self.repositories:
             raise BrokerProfileError(
-                "authenticated account has no enrolled repository for host event access"
+                "routing catalog has no repository anchor for host event access"
             )
         repository = min(
             self.repositories.values(), key=lambda item: item.canonical_root
@@ -719,20 +586,15 @@ class BrokerClientProfile:
         return result
 
     def fleet_test_statistics(self, *, hours: int = 24) -> dict[str, Any]:
-        """Read one host-wide bounded test projection through one enrollment."""
+        """Read one host-wide bounded test projection through one route."""
 
-        current: list[BrokerRepositoryProfile] = []
-        for candidate in self.repositories.values():
-            try:
-                self._require_repository_current(candidate)
-            except BrokerProfileError:
-                continue
-            current.append(candidate)
-        if not current:
+        if not self.repositories:
             raise BrokerProfileError(
-                "authenticated account has no current repository enrollment for fleet test access"
+                "broker routing profile has no repository anchor for fleet test access"
             )
-        repository = min(current, key=lambda item: item.canonical_root)
+        repository = min(
+            self.repositories.values(), key=lambda item: item.canonical_root
+        )
         _operation_id, result = self.call(
             repository=repository,
             resource_id=repository.repo_id,
@@ -742,7 +604,7 @@ class BrokerClientProfile:
         return result
 
     def test_health(self) -> dict[str, Any]:
-        """Read protected testd/store identity through authenticated broker ACLs."""
+        """Read the current testd/store identity through the broker."""
 
         return self._test_call(
             operation=BrokerOperation.TEST_HEALTH,
@@ -750,7 +612,7 @@ class BrokerClientProfile:
         )
 
     def test_repository_catalog(self) -> dict[str, Any]:
-        """Read the exact enrolled catalog joined to retained testd setup state."""
+        """Read the exact configured catalog joined to retained testd setup state."""
 
         repository = self._test_namespace_anchor()
         _operation_id, result = self.call(
@@ -769,23 +631,19 @@ class BrokerClientProfile:
 
         Plan and run identifiers intentionally do not encode a repository.  The
         broker resolves their immutable repository in testd and then performs a
-        second, exact authorization against the current protected enrollment
+        second, exact request validation against the current routing catalog
         before returning data or mutating state.  This deterministic anchor is
-        therefore not treated as ownership evidence.
+        therefore not treated as attachment evidence.
         """
 
-        current: list[BrokerRepositoryProfile] = []
-        for candidate in self.repositories.values():
-            try:
-                self._require_repository_current(candidate)
-            except BrokerProfileError:
-                continue
-            current.append(candidate)
-        if not current:
+        if not self.repositories:
             raise BrokerProfileError(
-                "authenticated account has no current repository enrollment for test access"
+                "broker routing profile has no repository anchor for test access"
             )
-        return min(current, key=lambda item: (item.repo_id, item.canonical_root))
+        return min(
+            self.repositories.values(),
+            key=lambda item: (item.repo_id, item.canonical_root),
+        )
 
     def _test_call(
         self,
@@ -831,16 +689,29 @@ class BrokerClientProfile:
     ) -> dict[str, Any]:
         """Bind one opaque run operation to its caller-supplied repository."""
 
-        enrolled = self.repository_by_id(repository)
+        matches: list[BrokerRepositoryProfile] = []
+        for candidate in self.repositories.values():
+            if candidate.repo_id == str(repository):
+                matches.append(candidate)
+        # Prefer the first current catalog route so ordinary submissions retain
+        # their generation-bound identity. A completed run may outlive that
+        # configuration; in that case any current route is transport only.
+        anchor = (
+            matches[0]
+            if matches
+            else self._current_transport_anchor()
+        )
+        call_arguments = dict(arguments)
+        call_arguments.setdefault("expected_repository_id", str(repository))
         result = self._test_call(
-            repository=enrolled,
+            repository=anchor,
             operation=operation,
-            arguments=arguments,
+            arguments=call_arguments,
             operation_id=operation_id,
             expose_operation_id=expose_operation_id,
             transport_timeout_seconds=transport_timeout_seconds,
         )
-        if result.get("repository_id") != enrolled.repo_id:
+        if result.get("repository_id") != str(repository):
             raise BrokerProfileError(
                 "broker test run operation belongs to another repository"
             )
@@ -861,7 +732,7 @@ class BrokerClientProfile:
         repository = self.repository(plan.source.original_root)
         if plan.repository_id != repository.repo_id:
             raise BrokerProfileError(
-                "test plan repository identity does not match the protected enrollment"
+                "test plan repository identity does not match the routing catalog"
             )
         return self._test_call(
             repository=repository,
@@ -886,9 +757,9 @@ class BrokerClientProfile:
         launch_timeout_seconds: int = 300,
         operation_id: str,
     ) -> dict[str, Any]:
-        enrolled = self.repository_by_id(repository)
+        configured = self.repository_by_id(repository)
         return self._test_call(
-            repository=enrolled,
+            repository=configured,
             operation=BrokerOperation.TEST_PLAN_PREVIEW,
             arguments={
                 "intent": str(intent),
@@ -913,14 +784,13 @@ class BrokerClientProfile:
     ) -> dict[str, Any]:
         """Submit only if testd resolves the plan to this exact repository."""
 
-        enrolled = self.repository_by_id(repository)
         arguments = {
             "plan_id": str(plan_id),
-            "expected_repository_id": enrolled.repo_id,
+            "expected_repository_id": str(repository),
             "actor": str(actor),
         }
         return self._test_run_call(
-            repository=enrolled.repo_id,
+            repository=str(repository),
             operation=BrokerOperation.TEST_RUN_SUBMIT,
             arguments=arguments,
             operation_id=str(operation_id),
@@ -949,14 +819,14 @@ class BrokerClientProfile:
         limit: int = 50,
         state: str | None = None,
     ) -> dict[str, Any]:
-        enrolled = self.repository_by_id(repository)
+        configured = self.repository_by_id(repository)
         arguments: dict[str, Any] = {"limit": limit}
         if after is not None:
             arguments["after"] = str(after)
         if state is not None:
             arguments["state"] = str(state)
         return self._test_call(
-            repository=enrolled,
+            repository=configured,
             operation=BrokerOperation.TEST_RUN_LIST,
             arguments=arguments,
         )
@@ -1031,17 +901,17 @@ class BrokerClientProfile:
         after_event_id: int = 0,
         limit: int = 200,
     ) -> dict[str, Any]:
-        enrolled = self.repository_by_id(repository)
+        configured = self.repository_by_id(repository)
         return self._test_call(
-            repository=enrolled,
+            repository=configured,
             operation=BrokerOperation.TEST_EVENTS_READ,
             arguments={"after_event_id": after_event_id, "limit": limit},
         )
 
     def test_repository_setup(self, *, repository: str) -> dict[str, Any]:
-        enrolled = self.repository_by_id(repository)
+        configured = self.repository_by_id(repository)
         return self._test_call(
-            repository=enrolled,
+            repository=configured,
             operation=BrokerOperation.TEST_REPOSITORY_SETUP,
             arguments={},
         )
@@ -1162,9 +1032,9 @@ class BrokerClientProfile:
     def check_test_evidence(
         self, *, repository: str, policy: str, snapshot: str
     ) -> dict[str, Any]:
-        enrolled = self.repository(repository)
+        configured = self.repository(repository)
         return self._test_call(
-            repository=enrolled,
+            repository=configured,
             operation=BrokerOperation.TEST_EVIDENCE_CHECK,
             arguments={
                 "snapshot_id": str(snapshot),
@@ -1180,9 +1050,9 @@ class BrokerClientProfile:
         snapshot: str,
         operation_id: str,
     ) -> dict[str, Any]:
-        enrolled = self.repository(repository)
+        configured = self.repository(repository)
         return self._test_call(
-            repository=enrolled,
+            repository=configured,
             operation=BrokerOperation.TEST_EVIDENCE_CONSUME,
             arguments={
                 "snapshot_id": str(snapshot),
@@ -1223,9 +1093,6 @@ def call_broker(
         raise BrokerProfileError("broker client timeout must be positive and finite")
     client = BrokerClient(
         service.socket_path,
-        expected_broker_uid=service.service_uid,
-        expected_socket_gid=service.socket_gid,
-        expected_socket_mode=service.socket_mode,
         timeout_seconds=(
             _broker_client_timeout_seconds(operation, arguments=arguments)
             if transport_timeout_seconds is None
@@ -1303,6 +1170,7 @@ def _broker_client_timeout_seconds(
         return 5 * 60.0
     if operation in {
         BrokerOperation.REPOSITORY_REMOVE,
+        BrokerOperation.REPOSITORY_ENSURE,
         BrokerOperation.RESOURCE_ATTACH,
         BrokerOperation.RESOURCE_RETIRE,
         BrokerOperation.RUNTIME_ENSURE,
@@ -1322,7 +1190,6 @@ def _load_broker_profile(
     path: Path | None = None,
     effective_uid: int | None = None,
     required: bool = False,
-    trusted_owner_uid: int = 0,
     host_view: bool,
 ) -> BrokerClientProfile | None:
     configured_by_environment = bool(str(os.environ.get(PROFILE_PATH_ENV) or "").strip())
@@ -1330,13 +1197,7 @@ def _load_broker_profile(
     candidate = (path or configured_profile_path()).expanduser()
     uid = os.geteuid() if effective_uid is None else int(effective_uid)
     try:
-        metadata = _validate_profile_file(
-            candidate,
-            trusted_owner_uid=trusted_owner_uid,
-            allow_unmapped_owner=(
-                candidate == SYSTEM_PROFILE_PATH and not explicitly_configured
-            ),
-        )
+        metadata = _validate_profile_file(candidate)
     except FileNotFoundError:
         if required or explicitly_configured:
             raise BrokerProfileError(
@@ -1363,7 +1224,6 @@ def load_broker_profile(
     path: Path | None = None,
     effective_uid: int | None = None,
     required: bool = False,
-    trusted_owner_uid: int = 0,
 ) -> BrokerClientProfile | None:
     """Load the same-developer host routing view used by local clients."""
 
@@ -1371,7 +1231,6 @@ def load_broker_profile(
         path=path,
         effective_uid=effective_uid,
         required=required,
-        trusted_owner_uid=trusted_owner_uid,
         host_view=True,
     )
 
@@ -1381,15 +1240,13 @@ def load_exact_broker_profile(
     path: Path | None = None,
     effective_uid: int | None = None,
     required: bool = False,
-    trusted_owner_uid: int = 0,
 ) -> BrokerClientProfile | None:
-    """Load one UID enrollment for a proof that explicitly requires it."""
+    """Load one UID configuration for a proof that explicitly requires it."""
 
     return _load_broker_profile(
         path=path,
         effective_uid=effective_uid,
         required=required,
-        trusted_owner_uid=trusted_owner_uid,
         host_view=False,
     )
 
@@ -1399,24 +1256,9 @@ def profile_from_document(
     *,
     effective_uid: int | None = None,
 ) -> BrokerClientProfile:
-    """Parse exactly one UID enrollment for services and administrative proofs."""
+    """Parse the host routing profile; UID is attribution, not admission."""
 
-    uid = os.geteuid() if effective_uid is None else int(effective_uid)
-    if not isinstance(document, dict):
-        raise BrokerProfileError("broker profile fields are invalid")
-    clients = document.get("clients")
-    raw_client = clients.get(str(uid)) if isinstance(clients, dict) else None
-    if raw_client is None:
-        raise BrokerProfileError(
-            "broker profile has no enrollment for the effective local client"
-        )
-    _profile_from_document(document, effective_uid=uid)
-    scoped = dict(document)
-    scoped["clients"] = {str(uid): raw_client}
-    return _profile_from_document(
-        scoped,
-        effective_uid=uid,
-    )
+    return _profile_from_document(document, effective_uid=effective_uid)
 
 
 def host_profile_from_document(
@@ -1424,7 +1266,7 @@ def host_profile_from_document(
     *,
     effective_uid: int | None = None,
 ) -> BrokerClientProfile:
-    """Parse all valid local enrollments as one repository-routing view."""
+    """Parse all valid local configurations as one repository-routing view."""
 
     return _profile_from_document(
         document,
@@ -1437,170 +1279,75 @@ def _profile_from_document(
     *,
     effective_uid: int | None = None,
 ) -> BrokerClientProfile:
-    effective_uid = os.geteuid() if effective_uid is None else int(effective_uid)
-    if not isinstance(document, dict) or set(document) != {
-        "version",
-        "service",
-        "clients",
-    }:
+    del effective_uid
+    if not isinstance(document, dict):
         raise BrokerProfileError("broker profile fields are invalid")
-    if document.get("version") != PROFILE_VERSION:
+    version = document.get("version")
+    if version != PROFILE_VERSION:
         raise BrokerProfileError("broker profile version is unsupported")
+    expected_document_fields = {"version", "service", "repositories"}
+    if set(document) != expected_document_fields:
+        raise BrokerProfileError("broker profile fields are invalid")
     service_raw = document.get("service")
-    if not isinstance(service_raw, dict) or set(service_raw) != {
-        "socket",
-        "uid",
-        "gid",
-        "mode",
-        "database_generation",
-    }:
+    service_fields = set(service_raw) if isinstance(service_raw, dict) else set()
+    if (
+        not isinstance(service_raw, dict)
+        or service_fields != {"socket", "database_generation"}
+    ):
         raise BrokerProfileError("broker service profile fields are invalid")
     socket_path = Path(str(service_raw.get("socket") or ""))
     if not socket_path.is_absolute() or ".." in socket_path.parts:
         raise BrokerProfileError("broker socket must be an absolute path without traversal")
-    service_uid = _nonnegative_int(service_raw.get("uid"), "service uid")
-    socket_gid = _nonnegative_int(service_raw.get("gid"), "socket gid")
-    try:
-        socket_mode = int(str(service_raw.get("mode")), 8)
-    except ValueError as error:
-        raise BrokerProfileError("broker socket mode must be octal") from error
-    if not 0 <= socket_mode <= 0o7777:
-        raise BrokerProfileError("broker socket mode must be a valid permission mode")
     generation = _identifier(service_raw.get("database_generation"), "database generation")
 
-    clients = document.get("clients")
-    if not isinstance(clients, dict) or not clients:
-        raise BrokerProfileError("broker clients must be an object")
+    repository_documents = document.get("repositories")
+    if not isinstance(repository_documents, list) or not repository_documents:
+        raise BrokerProfileError(
+            "broker routing profile repositories must be a non-empty list"
+        )
 
-    # All Unix accounts on this host are one developer trust domain. Parse the
-    # atomically published client set and expose its repository grants as one
-    # view; the effective UID remains attribution only.
-    parsed_clients: list[tuple[int, str, str, int, list[Any]]] = []
-    required_client_fields = {
-        "account_id",
-        "issued_at",
-        "valid_until_epoch",
-        "repositories",
-    }
-    for raw_uid, raw in clients.items():
-        try:
-            client_uid = int(str(raw_uid), 10)
-        except (TypeError, ValueError) as error:
-            raise BrokerProfileError("broker profile client UID is invalid") from error
-        if client_uid < 0 or str(client_uid) != str(raw_uid):
-            raise BrokerProfileError("broker profile client UID is invalid")
-        if not isinstance(raw, dict) or set(raw) != required_client_fields:
-            raise BrokerProfileError("broker client profile fields are invalid")
-        client_account_id = _identifier(raw.get("account_id"), "account id")
-        client_valid_until = _positive_int(
-            raw.get("valid_until_epoch"), "profile expiry"
-        )
-        client_issued_at = raw.get("issued_at")
-        if not isinstance(client_issued_at, str) or not client_issued_at:
-            raise BrokerProfileError("broker client profile issued-at is invalid")
-        repositories_raw = raw.get("repositories")
-        if not isinstance(repositories_raw, list) or not repositories_raw:
-            raise BrokerProfileError(
-                "broker client profile repositories must be a non-empty list"
-            )
-        parsed_clients.append(
-            (
-                client_uid,
-                client_account_id,
-                client_issued_at,
-                client_valid_until,
-                repositories_raw,
-            )
-        )
-    if not parsed_clients:
-        raise BrokerProfileError("broker profile has no valid local client enrollment")
-
-    selected = next(
-        (item for item in parsed_clients if item[0] == effective_uid),
-        None,
-    )
-    if selected is None:
-        selected = max(
-            parsed_clients,
-            key=lambda item: (
-                item[3],
-                item[2],
-                -item[0],
-            ),
-        )
-    _selected_uid, account_id, issued_at, valid_until, _selected_repositories = (
-        selected
-    )
     repositories: dict[str, BrokerRepositoryProfile] = {}
-    repository_ranks: dict[str, tuple[bool, int, bool, bool, int, int]] = {}
-    for (
-        client_uid,
-        client_account,
-        _client_issued_at,
-        _client_expiry,
-        items,
-    ) in parsed_clients:
-        for item in items:
-            repository = _repository_from_document(
-                item,
-                account_id=client_account,
+    for item in repository_documents:
+        repository = _repository_from_document(item)
+        current = repositories.get(repository.canonical_root)
+        if current is None or repository.generation > current.generation:
+            repositories[repository.canonical_root] = repository
+        elif (
+            repository.generation == current.generation
+            and repository.repo_id != current.repo_id
+        ):
+            raise BrokerProfileError(
+                "broker routing profile has conflicting repository identities"
             )
-            rank = (
-                repository.enabled,
-                repository.generation,
-                client_uid == effective_uid,
-                client_uid == repository.owner_uid,
-                repository.valid_until_epoch,
-                -client_uid,
-            )
-            if rank > repository_ranks.get(
-                repository.canonical_root, (False, -1, False, False, -1, 0)
-            ):
-                repositories[repository.canonical_root] = repository
-                repository_ranks[repository.canonical_root] = rank
     if not repositories:
-        raise BrokerProfileError("broker profile has no enrolled repositories")
+        raise BrokerProfileError("broker profile has no configured repositories")
     return BrokerClientProfile(
         service=BrokerServiceProfile(
             socket_path=socket_path,
-            service_uid=service_uid,
-            socket_gid=socket_gid,
-            socket_mode=socket_mode,
             database_generation=generation,
         ),
-        client_uid=effective_uid,
-        account_id=account_id,
-        issued_at=issued_at,
-        valid_until_epoch=valid_until,
         repositories=repositories,
     )
 
 
 def _repository_from_document(
     value: Any,
-    *,
-    account_id: str,
 ) -> BrokerRepositoryProfile:
     if not isinstance(value, dict):
         raise BrokerProfileError("broker repository profile fields are invalid")
     fields = set(value)
-    if fields not in {
-        REPOSITORY_PROFILE_FIELDS,
-        REPOSITORY_PROFILE_FIELDS | REPOSITORY_ENSURE_EVIDENCE_FIELDS,
-    }:
+    if not REPOSITORY_PROFILE_FIELDS <= fields or not fields <= (
+        REPOSITORY_PROFILE_FIELDS | REPOSITORY_ENSURE_EVIDENCE_FIELDS
+    ):
         raise BrokerProfileError("broker repository profile fields are invalid")
     execution_uid: int | None = None
-    filesystem_owner_uid: int | None = None
-    if REPOSITORY_ENSURE_EVIDENCE_FIELDS <= fields:
+    if "execution_uid" in fields:
         execution_uid = _nonnegative_int(value["execution_uid"], "execution UID")
-        filesystem_owner_uid = _nonnegative_int(
-            value["filesystem_owner_uid"], "filesystem owner UID"
-        )
     canonical_root = _canonical_repository_lookup_root(
         str(value.get("canonical_root") or "")
     )
     if not Path(canonical_root).is_absolute():
-        raise BrokerProfileError("enrolled repository root must be absolute")
+        raise BrokerProfileError("configured repository root must be absolute")
     servers = _identifier_mapping(value["servers"], "server")
     containers = _identifier_mapping(value["containers"], "container")
     ephemeral_templates = _identifier_mapping(
@@ -1608,10 +1355,6 @@ def _repository_from_document(
     )
     ephemeral_secret_policies = _ephemeral_secret_policy_mapping(
         value["ephemeral_secret_policies"]
-    )
-    ephemeral_image_prefetch_template_ids = _ephemeral_image_prefetch_template_ids(
-        value["ephemeral_image_prefetch_templates"],
-        template_ids=frozenset(ephemeral_templates.values()),
     )
     if not set(ephemeral_secret_policies) <= set(ephemeral_templates):
         raise BrokerProfileError(
@@ -1624,56 +1367,28 @@ def _repository_from_document(
     )
     compose_container_ids = _compose_container_id_set(
         value["compose_container_ids"],
-        enrolled_container_ids=frozenset(containers.values()),
+        configured_container_ids=frozenset(containers.values()),
     )
     if compose_run_once_services and compose is None:
         raise BrokerProfileError(
-            "Compose run-once services require one enrolled Compose definition"
+            "Compose run-once services require one configured Compose definition"
         )
     if compose_container_ids and compose is None:
         raise BrokerProfileError(
-            "Compose-owned containers require one enrolled Compose definition"
-        )
-    repository_account_id = _identifier(
-        value["account_id"], "repository account id"
-    )
-    if repository_account_id != account_id:
-        raise BrokerProfileError(
-            "broker repository profile belongs to another account"
-        )
-    enabled = value["enabled"]
-    if type(enabled) is not bool:
-        raise BrokerProfileError("repository enrollment enabled must be boolean")
-    issued_at = str(value["issued_at"] or "")
-    if not issued_at:
-        raise BrokerProfileError("repository profile issued-at is invalid")
-    valid_until_epoch = _positive_int(
-        value["valid_until_epoch"], "repository profile expiry"
-    )
-    owner_uid = _positive_int(value["owner_uid"], "repository owner UID")
-    if execution_uid is not None and execution_uid != owner_uid:
-        raise BrokerProfileError(
-            "repository execution evidence contradicts its execution owner"
+            "Compose-owned containers require one configured Compose definition"
         )
     return BrokerRepositoryProfile(
         canonical_root=canonical_root,
         repo_id=_identifier(value["repo_id"], "repository id"),
         generation=_nonnegative_int(value["generation"], "repository generation"),
-        owner_uid=owner_uid,
         server_ids=servers,
         container_ids=containers,
         compose_definition_id=compose,
         compose_container_ids=compose_container_ids,
         compose_run_once_services=compose_run_once_services,
         ephemeral_templates=ephemeral_templates,
-        ephemeral_image_prefetch_template_ids=ephemeral_image_prefetch_template_ids,
         ephemeral_secret_policies=ephemeral_secret_policies,
-        account_id=repository_account_id,
-        enabled=enabled,
-        issued_at=issued_at,
-        valid_until_epoch=valid_until_epoch,
         execution_uid=execution_uid,
-        filesystem_owner_uid=filesystem_owner_uid,
     )
 
 
@@ -1710,9 +1425,9 @@ def _compose_run_once_service_mapping(value: Any) -> Mapping[str, int]:
 
 
 def _compose_container_id_set(
-    value: Any, *, enrolled_container_ids: frozenset[str]
+    value: Any, *, configured_container_ids: frozenset[str]
 ) -> frozenset[str]:
-    """Parse the exact subset owned by the enrolled Compose definition."""
+    """Parse the exact subset owned by the configured Compose definition."""
 
     if not isinstance(value, list) or len(value) > 4_096:
         raise BrokerProfileError(
@@ -1725,9 +1440,9 @@ def _compose_container_id_set(
         raise BrokerProfileError(
             "broker Compose-owned container resource ID list has duplicates"
         )
-    if not set(result) <= enrolled_container_ids:
+    if not set(result) <= configured_container_ids:
         raise BrokerProfileError(
-            "broker Compose-owned container resource is not enrolled"
+            "broker Compose-owned container resource is not configured"
         )
     return frozenset(result)
 
@@ -1759,7 +1474,7 @@ def _ephemeral_secret_policy_mapping(
 def _ephemeral_image_prefetch_template_ids(
     value: Any, *, template_ids: frozenset[str]
 ) -> frozenset[str]:
-    """Parse only a root-declared subset of enrolled opaque template IDs."""
+    """Parse only a root-declared subset of configured opaque template IDs."""
 
     if not isinstance(value, list):
         raise BrokerProfileError(
@@ -1774,7 +1489,7 @@ def _ephemeral_image_prefetch_template_ids(
         )
     if not set(result) <= template_ids:
         raise BrokerProfileError(
-            "broker ephemeral image prefetch template is not enrolled"
+            "broker ephemeral image prefetch template is not configured"
         )
     return frozenset(result)
 
@@ -1801,11 +1516,7 @@ def _positive_int(value: Any, label: str) -> int:
 
 def _validate_profile_file(
     path: Path,
-    *,
-    trusted_owner_uid: int,
-    allow_unmapped_owner: bool = False,
 ) -> os.stat_result:
-    del trusted_owner_uid, allow_unmapped_owner
     if not path.is_absolute() or ".." in path.parts:
         raise BrokerProfileError("broker profile path must be absolute without traversal")
     current = Path(path.anchor)

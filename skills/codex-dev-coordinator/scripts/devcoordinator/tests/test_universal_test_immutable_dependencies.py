@@ -829,6 +829,47 @@ class ImmutableDependencyBindingTests(unittest.TestCase):
             )
         )
 
+    def test_dotnet_target_selects_account_with_requested_sdk(self) -> None:
+        owner_uid = 12001
+        alternate_uid = 12002
+        owner_home = self.base / "owner-dotnet-home"
+        alternate_home = self.base / "alternate-dotnet-home"
+        for home in (owner_home, alternate_home):
+            executable = home / ".dotnet" / "dotnet"
+            executable.parent.mkdir(parents=True)
+            executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            executable.chmod(0o755)
+        (alternate_home / ".dotnet" / "sdk" / "10.0.302").mkdir(parents=True)
+        global_json = self.original / "global.json"
+        global_json.write_text(
+            '{"sdk":{"version":"10.0.302","rollForward":"disable"}}\n',
+            encoding="utf-8",
+        )
+        (self.materialized / "global.json").write_bytes(global_json.read_bytes())
+        self.provenance["dependency_locks"]["global.json"] = digest(global_json)
+        accounts = {
+            owner_uid: SimpleNamespace(pw_dir=str(owner_home)),
+            alternate_uid: SimpleNamespace(pw_dir=str(alternate_home)),
+        }
+
+        with mock.patch(
+            "devcoordinator.universal_test_snapshot_service.pwd.getpwuid",
+            side_effect=lambda uid: accounts[uid],
+        ):
+            _bindings, _python, executable, toolchains = self.derive(
+                {
+                    "driver": "dotnet",
+                    "cwd": ".",
+                    "argv": ["{dotnet}", "test", "src/App.sln"],
+                },
+                account_uids=(alternate_uid,),
+                full=True,
+            )
+
+        expected = alternate_home / ".dotnet" / "dotnet"
+        self.assertEqual(executable, str(expected))
+        self.assertEqual(toolchains[0]["source_root"], str(expected.parent))
+
 
 if __name__ == "__main__":
     unittest.main()

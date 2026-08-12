@@ -140,7 +140,7 @@ def runtime_request_error_context(payload: Any) -> dict[str, Any]:
 
 
 class UnclassifiedRuntimeResource(RuntimeError):
-    """A scoped resource does not have one exact repository membership."""
+    """A scoped resource has no exact repository association."""
 
 
 class RuntimeObservationUnavailable(RuntimeError):
@@ -311,8 +311,6 @@ def validate_runtime_request(payload: Any) -> dict[str, Any]:
         temporary_repo = _nonempty_string(temporary_repo, field="temporary_repo")
     if type(payload["kill_after_run"]) is not bool:
         raise RuntimeRequestError("kill_after_run must be a JSON boolean")
-    if payload["kill_after_run"] and action != "run":
-        raise RuntimeRequestError("kill_after_run=true is valid only for action run")
     ttl_seconds = payload["ttl_seconds"]
     if ttl_seconds is not None and (
         type(ttl_seconds) is not int
@@ -346,6 +344,13 @@ def validate_runtime_request(payload: Any) -> dict[str, Any]:
     kind = _nonempty_string(target.get("kind"), field="target.kind", maximum=40)
     if kind not in RUNTIME_TARGET_KINDS:
         raise RuntimeRequestError("target.kind must be service, docker, or database_stack")
+    if payload["kill_after_run"] and not (
+        action == "run"
+        or (action == "replace" and kind in {"docker", "database_stack"})
+    ):
+        raise RuntimeRequestError(
+            "kill_after_run=true is valid only for action run or Docker/database replace"
+        )
     target_id = target.get("id")
     target_name = target.get("name")
     if target_id is not None:
@@ -1578,7 +1583,7 @@ def _classification_evidence(
                         "resource_kind": "service",
                         "resource_id": target.get("id"),
                         "display_name": target["name"],
-                        "reason_code": "missing_membership",
+                        "reason_code": "missing_catalog_entry",
                     }
                 )
             elif (
@@ -1598,11 +1603,8 @@ def _classification_evidence(
         elif kind == "docker":
             row = connection.execute(
                 """
-                SELECT d.docker_resource_id, m.repo_id
+                SELECT d.docker_resource_id, d.repo_id
                 FROM docker_resources d
-                LEFT JOIN repository_memberships m
-                  ON m.resource_kind = 'container'
-                 AND m.host_resource_id = d.docker_resource_id
                 WHERE d.docker_resource_id = ?
                 """,
                 (target["id"],),
@@ -1613,17 +1615,16 @@ def _classification_evidence(
                         "classification": "unclassified_resource",
                         "resource_kind": "docker",
                         "resource_id": target["id"],
-                        "reason_code": "missing_membership",
+                        "reason_code": "missing_association",
                     }
                 )
         else:
             row = connection.execute(
                 """
-                SELECT b.database_binding_id, b.repo_id, m.repo_id AS container_repo_id
+                SELECT b.database_binding_id, b.repo_id,
+                       d.repo_id AS container_repo_id
                 FROM database_bindings b
-                LEFT JOIN repository_memberships m
-                  ON m.resource_kind = 'container'
-                 AND m.host_resource_id = b.docker_resource_id
+                LEFT JOIN docker_resources d USING(docker_resource_id)
                 WHERE b.database_binding_id = ?
                 """,
                 (target["id"],),
@@ -1638,7 +1639,7 @@ def _classification_evidence(
                         "classification": "unclassified_resource",
                         "resource_kind": "database_stack",
                         "resource_id": target["id"],
-                        "reason_code": "missing_membership",
+                        "reason_code": "missing_association",
                     }
                 )
     evidence.extend(

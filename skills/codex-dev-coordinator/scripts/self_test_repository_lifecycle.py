@@ -67,7 +67,7 @@ class HostState:
     identity_observable: bool = True
     ownership_observable: bool = True
     fingerprint: str | None = None
-    ownership_fingerprint: str | None = None
+    observation_fingerprint: str | None = None
     replacement_fingerprint: str | None = None
 
 
@@ -103,8 +103,8 @@ class FakeAdapter:
             identity_observable=state.identity_observable,
             immutable_fingerprint=state.fingerprint or target.immutable_fingerprint,
             ownership_observable=state.ownership_observable,
-            ownership_fingerprint=(
-                state.ownership_fingerprint or target.ownership_fingerprint
+            observation_fingerprint=(
+                state.observation_fingerprint or target.observation_fingerprint
             ),
             running_state=state.running_state,
             listener_active=state.listener_active,
@@ -367,7 +367,7 @@ class FakePersistence:
                 policy.immutable_fingerprint,
                 target.immutable_fingerprint,
                 target.control_binding_id,
-                target.ownership_fingerprint,
+                target.observation_fingerprint,
                 "native-fingerprint",
                 str(observation.value),
                 observation.value != policy.disabled_value,

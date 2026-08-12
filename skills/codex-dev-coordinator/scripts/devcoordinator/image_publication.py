@@ -42,6 +42,7 @@ from .compose_contract import (
     require_effective_compose_model,
     require_sealable_compose_payload,
 )
+from .compose_run_once import normalize_compose_run_once_policies
 
 
 ARTIFACT_VERSION = 1
@@ -102,15 +103,18 @@ class PublicationSpec:
     context_paths: tuple[str, ...]
     source_root: str
     source_exclude_directories: tuple[str, ...]
+    build_only: bool
     rollout_services: tuple[str, ...]
     migration_service: str | None
     workload_service: str
-    workload_container: str
-    health_url: str
-    ready_url: str
+    workload_container: str | None
+    health_url: str | None
+    ready_url: str | None
     health_timeout_seconds: int
     compose_files: tuple[str, ...]
     compose_env_files: tuple[str, ...]
+    compose_lifecycle_services: tuple[str, ...]
+    compose_run_once_services: tuple[str, ...]
     compose_services: tuple[str, ...]
     compose_profiles: tuple[str, ...]
     compose_project_name: str
@@ -123,6 +127,7 @@ class PublicationSpec:
             "context_paths": list(self.context_paths),
             "source_root": self.source_root,
             "source_exclude_directories": list(self.source_exclude_directories),
+            "build_only": self.build_only,
             "rollout_services": list(self.rollout_services),
             "migration_service": self.migration_service,
             "workload_service": self.workload_service,
@@ -204,9 +209,32 @@ def normalize_publication_spec(
         minimum=0,
         maximum=16,
     )
-    compose_services = _require_service_list(
-        docker.get("services"), field="docker.services", minimum=1, maximum=128
+    compose_lifecycle_services = _require_service_list(
+        docker.get("services") or [],
+        field="docker.services",
+        minimum=0,
+        maximum=128,
     )
+    try:
+        compose_run_once_services = tuple(
+            policy.name
+            for policy in normalize_compose_run_once_policies(
+                docker.get("run_once_services") or ()
+            )
+        )
+    except (TypeError, ValueError) as exc:
+        raise ImagePublicationError("docker.run_once_services is invalid") from exc
+    if set(compose_lifecycle_services) & set(compose_run_once_services):
+        raise ImagePublicationError(
+            "docker services and run_once_services must be disjoint"
+        )
+    compose_services = tuple(
+        (*compose_lifecycle_services, *compose_run_once_services)
+    )
+    if not compose_services:
+        raise ImagePublicationError(
+            "image publication requires a declared Compose service"
+        )
     compose_profiles = _require_service_list(
         docker.get("profiles") or [], field="docker.profiles", minimum=0, maximum=64
     )
@@ -215,12 +243,21 @@ def normalize_publication_spec(
         raise ImagePublicationError("docker.project_name is invalid")
 
     rollout_services = _require_service_list(
-        raw.get("rollout_services"), field="rollout_services", minimum=1, maximum=16
+        raw.get("rollout_services") or [],
+        field="rollout_services",
+        minimum=0,
+        maximum=16,
     )
-    if not set(rollout_services).issubset(compose_services):
+    if not set(rollout_services).issubset(compose_lifecycle_services):
         raise ImagePublicationError("rollout_services must be declared docker services")
     workload_service = _require_service_name(raw.get("workload_service"), field="workload_service")
-    if workload_service not in rollout_services:
+    build_only = not rollout_services
+    if build_only:
+        if workload_service not in compose_run_once_services:
+            raise ImagePublicationError(
+                "build-only workload_service must be a declared run-once service"
+            )
+    elif workload_service not in rollout_services:
         raise ImagePublicationError("workload_service must be included in rollout_services")
     migration_raw = raw.get("migration_service")
     migration_service = (
@@ -228,14 +265,29 @@ def normalize_publication_spec(
         if migration_raw is not None
         else None
     )
+    if build_only and migration_service is not None:
+        raise ImagePublicationError(
+            "build-only publication must not declare migration_service"
+        )
     if migration_service is not None and migration_service not in rollout_services:
         raise ImagePublicationError("migration_service must be included in rollout_services")
     container = raw.get("workload_container")
-    if not isinstance(container, str) or _SERVICE_NAME.fullmatch(container) is None:
-        raise ImagePublicationError("workload_container is invalid")
-
-    health_url = _require_loopback_http_url(raw.get("health_url"), field="health_url")
-    ready_url = _require_loopback_http_url(raw.get("ready_url"), field="ready_url")
+    if build_only:
+        if container is not None:
+            raise ImagePublicationError(
+                "build-only publication must not declare workload_container"
+            )
+        health_url = None
+        ready_url = None
+        if raw.get("health_url") is not None or raw.get("ready_url") is not None:
+            raise ImagePublicationError(
+                "build-only publication must not declare runtime health URLs"
+            )
+    else:
+        if not isinstance(container, str) or _SERVICE_NAME.fullmatch(container) is None:
+            raise ImagePublicationError("workload_container is invalid")
+        health_url = _require_loopback_http_url(raw.get("health_url"), field="health_url")
+        ready_url = _require_loopback_http_url(raw.get("ready_url"), field="ready_url")
     timeout = raw.get("health_timeout_seconds", 120)
     if type(timeout) is not int or not 10 <= timeout <= 600:
         raise ImagePublicationError("health_timeout_seconds must be from 10 through 600")
@@ -257,6 +309,7 @@ def normalize_publication_spec(
         context_paths=context_paths,
         source_root=source_root,
         source_exclude_directories=source_excludes,
+        build_only=build_only,
         rollout_services=rollout_services,
         migration_service=migration_service,
         workload_service=workload_service,
@@ -266,6 +319,8 @@ def normalize_publication_spec(
         health_timeout_seconds=timeout,
         compose_files=compose_files,
         compose_env_files=compose_env_files,
+        compose_lifecycle_services=compose_lifecycle_services,
+        compose_run_once_services=compose_run_once_services,
         compose_services=compose_services,
         compose_profiles=compose_profiles,
         compose_project_name=project_name,
@@ -280,7 +335,7 @@ def plan_publication(
     service_uid: int = 0,
     broker_database_path: Path | None = None,
     compose_renderer: Callable[..., bytes] = render_compose_effective_model,
-    compose_enrollment_verifier: Callable[[PublicationSpec, Mapping[str, Any], Any, Path], dict[str, Any]] | None = None,
+    compose_configuration_verifier: Callable[[PublicationSpec, Mapping[str, Any], Any, Path], dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Capture an immutable root-owned build snapshot without touching Docker."""
 
@@ -305,7 +360,7 @@ def plan_publication(
             specification,
             renderer=compose_renderer,
             broker_database_path=broker_database_path,
-            enrollment_verifier=compose_enrollment_verifier,
+            configuration_verifier=compose_configuration_verifier,
         )
         previous_image_id = docker_image_id(specification.image, required=False)
         build_inputs = build_input_evidence(snapshot_directory, specification)
@@ -339,13 +394,18 @@ def apply_publication(
     service_uid: int = 0,
     broker_database_path: Path | None = None,
     compose_renderer: Callable[..., bytes] = render_compose_effective_model,
-    compose_enrollment_verifier: Callable[[PublicationSpec, Mapping[str, Any], Any, Path], dict[str, Any]] | None = None,
+    compose_configuration_verifier: Callable[[PublicationSpec, Mapping[str, Any], Any, Path], dict[str, Any]] | None = None,
     docker_runner: Callable[[Sequence[str], float, Mapping[str, str]], subprocess.CompletedProcess[str]] | None = None,
     http_fetcher: Callable[[str, float], tuple[int, str]] | None = None,
     now: Callable[[], float] = time.time,
     rollout: bool = True,
 ) -> dict[str, Any]:
     """Build one planned snapshot and optionally recreate its declared workload."""
+
+    if rollout and specification.build_only:
+        raise ImagePublicationError(
+            "build-only publication cannot apply a long-lived workload rollout"
+        )
 
     directory, manifest = load_manifest(
         artifact_root=artifact_root,
@@ -358,10 +418,16 @@ def apply_publication(
         specification,
         broker_database_path=broker_database_path,
         compose_renderer=compose_renderer,
-        compose_enrollment_verifier=compose_enrollment_verifier,
+        compose_configuration_verifier=compose_configuration_verifier,
         now=now,
     )
-    if manifest.get("status") not in {"planned", "build_failed", "build_outcome_uncertain"}:
+    publication_status = manifest.get("status")
+    if publication_status not in {
+        "planned",
+        "build_failed",
+        "build_outcome_uncertain",
+        "built",
+    }:
         raise ImagePublicationError("publication is not in a buildable state")
 
     run_docker = docker_runner or _run_docker
@@ -370,47 +436,68 @@ def apply_publication(
     _require_real_directory(snapshot_directory)
     _require_snapshot_integrity(manifest, snapshot_directory, specification)
 
-    manifest["status"] = "building"
-    manifest["build_started_at"] = _utc_now()
-    write_manifest(directory, manifest, expected_uid=service_uid)
-    build_command = build_command_for(manifest, snapshot_directory, specification)
-    try:
-        result = run_docker(build_command, BUILD_TIMEOUT_SECONDS, environment)
-    except subprocess.TimeoutExpired as exc:
-        manifest["status"] = "build_outcome_uncertain"
-        manifest["build_error"] = "Docker build exceeded the bounded publication timeout."
-        manifest["build_finished_at"] = _utc_now()
+    if publication_status == "built":
+        retained_image = manifest.get("image")
+        retained_package = manifest.get("runtime_package")
+        if not isinstance(retained_image, Mapping) or not isinstance(
+            retained_package, str
+        ):
+            raise ImagePublicationError("built publication evidence is incomplete")
+        image = docker_image_evidence(
+            specification.image, run_docker=run_docker, environment=environment
+        )
+        _require_image_labels(image, manifest)
+        if image.get("image_id") != retained_image.get("image_id"):
+            raise ImagePublicationError("built publication image identity changed")
+        package_identity = installed_package_identity(
+            specification.image, run_docker=run_docker, environment=environment
+        )
+        if package_identity != retained_package:
+            raise ImagePublicationError("built publication package identity changed")
+    else:
+        manifest["status"] = "building"
+        manifest["build_started_at"] = _utc_now()
         write_manifest(directory, manifest, expected_uid=service_uid)
-        raise ImagePublicationError("image build outcome is uncertain") from exc
-    except OSError as exc:
-        manifest["status"] = "build_failed"
-        manifest["build_error"] = "Docker build could not be started."
-        manifest["build_finished_at"] = _utc_now()
-        write_manifest(directory, manifest, expected_uid=service_uid)
-        raise ImagePublicationError("image build could not be started") from exc
-    if not isinstance(result, subprocess.CompletedProcess):
-        raise ImagePublicationError("Docker runner returned invalid build evidence")
-    if result.returncode != 0:
-        manifest["status"] = "build_failed"
-        manifest["build_error"] = "Docker build returned a non-zero exit status."
-        manifest["build_exit_code"] = result.returncode
+        build_command = build_command_for(manifest, snapshot_directory, specification)
+        try:
+            result = run_docker(build_command, BUILD_TIMEOUT_SECONDS, environment)
+        except subprocess.TimeoutExpired as exc:
+            manifest["status"] = "build_outcome_uncertain"
+            manifest["build_error"] = "Docker build exceeded the bounded publication timeout."
+            manifest["build_finished_at"] = _utc_now()
+            write_manifest(directory, manifest, expected_uid=service_uid)
+            raise ImagePublicationError("image build outcome is uncertain") from exc
+        except OSError as exc:
+            manifest["status"] = "build_failed"
+            manifest["build_error"] = "Docker build could not be started."
+            manifest["build_finished_at"] = _utc_now()
+            write_manifest(directory, manifest, expected_uid=service_uid)
+            raise ImagePublicationError("image build could not be started") from exc
+        if not isinstance(result, subprocess.CompletedProcess):
+            raise ImagePublicationError("Docker runner returned invalid build evidence")
+        if result.returncode != 0:
+            manifest["status"] = "build_failed"
+            manifest["build_error"] = "Docker build returned a non-zero exit status."
+            manifest["build_exit_code"] = result.returncode
+            manifest["build_finished_at"] = _utc_now()
+            manifest["build_output_sha256"] = _output_fingerprint(result)
+            manifest["build_diagnostic"] = _build_failure_diagnostic(result)
+            write_manifest(directory, manifest, expected_uid=service_uid)
+            raise ImagePublicationError("image build failed")
+
+        image = docker_image_evidence(
+            specification.image, run_docker=run_docker, environment=environment
+        )
+        _require_image_labels(image, manifest)
+        package_identity = installed_package_identity(
+            specification.image, run_docker=run_docker, environment=environment
+        )
+        manifest["status"] = "built"
         manifest["build_finished_at"] = _utc_now()
         manifest["build_output_sha256"] = _output_fingerprint(result)
-        manifest["build_diagnostic"] = _build_failure_diagnostic(result)
+        manifest["image"] = image
+        manifest["runtime_package"] = package_identity
         write_manifest(directory, manifest, expected_uid=service_uid)
-        raise ImagePublicationError("image build failed")
-
-    image = docker_image_evidence(specification.image, run_docker=run_docker, environment=environment)
-    _require_image_labels(image, manifest)
-    package_identity = installed_package_identity(
-        specification.image, run_docker=run_docker, environment=environment
-    )
-    manifest["status"] = "built"
-    manifest["build_finished_at"] = _utc_now()
-    manifest["build_output_sha256"] = _output_fingerprint(result)
-    manifest["image"] = image
-    manifest["runtime_package"] = package_identity
-    write_manifest(directory, manifest, expected_uid=service_uid)
 
     if not rollout:
         return publication_summary(manifest, artifact_directory=directory)
@@ -484,7 +571,7 @@ def rollback_publication(
     service_uid: int = 0,
     broker_database_path: Path | None = None,
     compose_renderer: Callable[..., bytes] = render_compose_effective_model,
-    compose_enrollment_verifier: Callable[[PublicationSpec, Mapping[str, Any], Any, Path], dict[str, Any]] | None = None,
+    compose_configuration_verifier: Callable[[PublicationSpec, Mapping[str, Any], Any, Path], dict[str, Any]] | None = None,
     docker_runner: Callable[[Sequence[str], float, Mapping[str, str]], subprocess.CompletedProcess[str]] | None = None,
     http_fetcher: Callable[[str, float], tuple[int, str]] | None = None,
     now: Callable[[], float] = time.time,
@@ -508,7 +595,7 @@ def rollback_publication(
         specification,
         broker_database_path=broker_database_path,
         renderer=compose_renderer,
-        compose_enrollment_verifier=compose_enrollment_verifier,
+        compose_configuration_verifier=compose_configuration_verifier,
     )
     run_docker = docker_runner or _run_docker
     environment = _docker_environment()
@@ -553,7 +640,7 @@ def compose_evidence(
     *,
     renderer: Callable[..., bytes] = render_compose_effective_model,
     broker_database_path: Path | None = None,
-    enrollment_verifier: Callable[[PublicationSpec, Mapping[str, Any], Any, Path], dict[str, Any]] | None = None,
+    configuration_verifier: Callable[[PublicationSpec, Mapping[str, Any], Any, Path], dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Render and validate the exact sealed Compose model without storing secrets."""
 
@@ -561,7 +648,7 @@ def compose_evidence(
         specification,
         renderer=renderer,
         broker_database_path=broker_database_path,
-        enrollment_verifier=enrollment_verifier,
+        configuration_verifier=configuration_verifier,
     ).evidence
 
 
@@ -570,7 +657,7 @@ def capture_compose_material(
     *,
     renderer: Callable[..., bytes] = render_compose_effective_model,
     broker_database_path: Path | None = None,
-    enrollment_verifier: Callable[[PublicationSpec, Mapping[str, Any], Any, Path], dict[str, Any]] | None = None,
+    configuration_verifier: Callable[[PublicationSpec, Mapping[str, Any], Any, Path], dict[str, Any]] | None = None,
 ) -> ComposeMaterial:
     """Capture one exact sealed Compose input set and its rendered-model evidence."""
 
@@ -594,7 +681,7 @@ def capture_compose_material(
             pinned_cwd=pinned,
         )
     # Rendering with approval permitted here only lets us classify the model.
-    # The exact active broker enrollment is checked immediately below before
+    # The exact active broker configuration is checked immediately below before
     # any result can be used for a build or Compose mutation.
     effective = require_effective_compose_model(
         rendered,
@@ -620,22 +707,22 @@ def capture_compose_material(
     if not isinstance(workload, Mapping) or workload.get("image") != specification.image:
         raise ImagePublicationError("workload service image does not match the publication image")
     evidence = {
-        # Enrollment persists the canonical digest produced by the Compose
+        # Configuration persists the canonical digest produced by the Compose
         # contract, not the renderer's incidental whitespace or key ordering.
         "model_sha256": effective.model_sha256,
         "compose_files": _file_hashes(specification.project, specification.compose_files),
         "env_files": _file_hashes(specification.project, specification.compose_env_files),
         "project_name": specification.compose_project_name,
     }
-    verifier = enrollment_verifier or require_enrolled_compose_approval
+    verifier = configuration_verifier or require_configured_compose_approval
     if broker_database_path is None:
         raise ImagePublicationError(
-            "image publication requires an exact broker enrollment database"
+            "image publication requires an exact broker configuration database"
         )
-    enrollment = verifier(specification, evidence, effective, broker_database_path)
-    if not isinstance(enrollment, dict):
-        raise ImagePublicationError("broker enrollment verifier returned invalid evidence")
-    evidence["enrollment"] = enrollment
+    configuration = verifier(specification, evidence, effective, broker_database_path)
+    if not isinstance(configuration, dict):
+        raise ImagePublicationError("broker configuration verifier returned invalid evidence")
+    evidence["configuration"] = configuration
     # Re-check the paths after payload capture. The actual rollout consumes the
     # captured bytes, while this check rejects a source/config swap during plan.
     if evidence["compose_files"] != _file_hashes(specification.project, specification.compose_files):
@@ -649,18 +736,18 @@ def capture_compose_material(
     )
 
 
-def require_enrolled_compose_approval(
+def require_configured_compose_approval(
     specification: PublicationSpec,
     evidence: Mapping[str, Any],
     effective: Any,
     database_path: Path,
 ) -> dict[str, Any]:
-    """Bind publication to the live root-approved broker Compose enrollment.
+    """Bind publication to the live root-approved broker Compose configuration.
 
     A runtime JSON file is user-writable, so a root publisher must not accept a
     host bind mount merely because that file labels it as intended. The service
     store is the durable administrator approval record. This read-only lookup
-    also rejects a stale enrollment after any Compose or environment drift.
+    also rejects a stale configuration after any Compose or environment drift.
     """
 
     database = Path(database_path)
@@ -673,14 +760,15 @@ def require_enrolled_compose_approval(
         )
         connection.row_factory = sqlite3.Row
     except sqlite3.Error as exc:
-        raise ImagePublicationError("broker enrollment database is unavailable") from exc
+        raise ImagePublicationError("broker configuration database is unavailable") from exc
     try:
         rows = list(
             connection.execute(
                 """
                 SELECT d.compose_definition_id, d.definition_fingerprint,
                        d.project_name, d.cwd, d.enabled,
-                       e.model_sha256, e.services_json, e.profiles_json,
+                       e.model_sha256, e.services_json, e.model_services_json,
+                       e.profiles_json,
                        e.host_access_risks_json, e.host_access_approved,
                        e.approved_by_uid, e.approved_at
                 FROM broker_compose_definitions AS d
@@ -699,11 +787,11 @@ def require_enrolled_compose_approval(
             )
         )
     except sqlite3.Error as exc:
-        raise ImagePublicationError("broker enrollment evidence could not be read") from exc
+        raise ImagePublicationError("broker configuration evidence could not be read") from exc
     finally:
         connection.close()
     if len(rows) != 1:
-        raise ImagePublicationError("no single active broker Compose enrollment matches this publication")
+        raise ImagePublicationError("no single active broker Compose configuration matches this publication")
     row = rows[0]
     expected_model = evidence.get("model_sha256")
     if (
@@ -713,31 +801,38 @@ def require_enrolled_compose_approval(
     ):
         raise ImagePublicationError("publication Compose model digest is invalid")
     if row["model_sha256"] != expected_model:
-        raise ImagePublicationError("broker-enrolled Compose model differs from the publication model")
+        raise ImagePublicationError("broker-configured Compose model differs from the publication model")
     try:
-        enrolled_services = json.loads(str(row["services_json"]))
-        enrolled_profiles = json.loads(str(row["profiles_json"]))
-        enrolled_risks = json.loads(str(row["host_access_risks_json"]))
+        configured_services = json.loads(str(row["services_json"]))
+        configured_model_services = json.loads(str(row["model_services_json"]))
+        configured_profiles = json.loads(str(row["profiles_json"]))
+        configured_risks = json.loads(str(row["host_access_risks_json"]))
     except json.JSONDecodeError as exc:
-        raise ImagePublicationError("broker Compose enrollment evidence is malformed") from exc
-    if enrolled_services != sorted(specification.compose_services):
-        raise ImagePublicationError("broker-enrolled Compose services differ from publication services")
-    if enrolled_profiles != sorted(specification.compose_profiles):
-        raise ImagePublicationError("broker-enrolled Compose profiles differ from publication profiles")
+        raise ImagePublicationError("broker Compose configuration evidence is malformed") from exc
+    if configured_services != sorted(specification.compose_lifecycle_services):
+        raise ImagePublicationError(
+            "broker-configured Compose lifecycle services differ from publication services"
+        )
+    if configured_model_services != sorted(specification.compose_services):
+        raise ImagePublicationError(
+            "broker-configured Compose model services differ from publication services"
+        )
+    if configured_profiles != sorted(specification.compose_profiles):
+        raise ImagePublicationError("broker-configured Compose profiles differ from publication profiles")
     expected_risks = sorted(getattr(effective, "host_access_risks", ()))
-    if enrolled_risks != expected_risks:
-        raise ImagePublicationError("broker-enrolled host-access risks differ from the publication model")
+    if configured_risks != expected_risks:
+        raise ImagePublicationError("broker-configured host-access risks differ from the publication model")
     if expected_risks and int(row["host_access_approved"]) != 1:
         raise ImagePublicationError("effective Compose model requires an existing explicit host-access approval")
-    file_rows = _enrollment_file_rows(database, str(row["compose_definition_id"]), environment=False)
-    env_rows = _enrollment_file_rows(database, str(row["compose_definition_id"]), environment=True)
+    file_rows = _configuration_file_rows(database, str(row["compose_definition_id"]), environment=False)
+    env_rows = _configuration_file_rows(database, str(row["compose_definition_id"]), environment=True)
     expected_file_hashes = [str(item.get("sha256")) for item in evidence.get("compose_files") or ()]
     expected_env_hashes = [str(item.get("sha256")) for item in evidence.get("env_files") or ()]
     if file_rows != expected_file_hashes or env_rows != expected_env_hashes:
-        raise ImagePublicationError("broker-enrolled Compose input hashes differ from publication inputs")
+        raise ImagePublicationError("broker-configured Compose input hashes differ from publication inputs")
     definition_fingerprint = row["definition_fingerprint"]
     if not isinstance(definition_fingerprint, str) or not definition_fingerprint.startswith("sha256:"):
-        raise ImagePublicationError("broker Compose enrollment has an invalid definition fingerprint")
+        raise ImagePublicationError("broker Compose configuration has an invalid definition fingerprint")
     return {
         "compose_definition_id": str(row["compose_definition_id"]),
         "definition_fingerprint": definition_fingerprint,
@@ -752,7 +847,7 @@ def require_enrolled_compose_approval(
     }
 
 
-def _enrollment_file_rows(
+def _configuration_file_rows(
     database: Path, compose_definition_id: str, *, environment: bool
 ) -> list[str]:
     table = "broker_compose_env_file_evidence" if environment else "broker_compose_file_evidence"
@@ -1423,7 +1518,7 @@ def _require_plan_current(
     *,
     broker_database_path: Path | None,
     compose_renderer: Callable[..., bytes],
-    compose_enrollment_verifier: Callable[[PublicationSpec, Mapping[str, Any], Any, Path], dict[str, Any]] | None,
+    compose_configuration_verifier: Callable[[PublicationSpec, Mapping[str, Any], Any, Path], dict[str, Any]] | None,
     now: Callable[[], float],
 ) -> ComposeMaterial:
     publication = manifest.get("publication")
@@ -1451,7 +1546,7 @@ def _require_plan_current(
         specification,
         broker_database_path=broker_database_path,
         renderer=compose_renderer,
-        compose_enrollment_verifier=compose_enrollment_verifier,
+        compose_configuration_verifier=compose_configuration_verifier,
     )
     planned_previous = manifest.get("previous_image_id")
     current_previous = docker_image_id(specification.image, required=False)
@@ -1466,7 +1561,7 @@ def _require_compose_matches_plan(
     *,
     broker_database_path: Path | None,
     renderer: Callable[..., bytes],
-    compose_enrollment_verifier: Callable[[PublicationSpec, Mapping[str, Any], Any, Path], dict[str, Any]] | None,
+    compose_configuration_verifier: Callable[[PublicationSpec, Mapping[str, Any], Any, Path], dict[str, Any]] | None,
 ) -> ComposeMaterial:
     expected = manifest.get("compose")
     if not isinstance(expected, Mapping):
@@ -1475,7 +1570,7 @@ def _require_compose_matches_plan(
         specification,
         renderer=renderer,
         broker_database_path=broker_database_path,
-        enrollment_verifier=compose_enrollment_verifier,
+        configuration_verifier=compose_configuration_verifier,
     )
     if material.evidence != dict(expected):
         raise ImagePublicationError("sealed Compose model or inputs changed since image publication was planned")

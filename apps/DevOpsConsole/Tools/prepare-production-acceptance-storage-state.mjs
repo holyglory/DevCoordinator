@@ -26,7 +26,8 @@ export const PRODUCTION_CREDENTIAL_FILES = Object.freeze({
 });
 
 const USAGE = 'usage: prepare-production-acceptance-storage-state.mjs '
-  + '[--env-file ABSOLUTE_PATH] [--output ABSOLUTE_PATH]';
+  + '[--env-file ABSOLUTE_PATH] [--output ABSOLUTE_PATH] '
+  + '[--owner-uid UID --owner-gid GID]';
 
 function fail(message) {
   throw new Error(message);
@@ -41,18 +42,43 @@ function absolutePath(value, label) {
   return resolved;
 }
 
+function localIdentity(value, label) {
+  if (typeof value === 'number' && Number.isSafeInteger(value) && value >= 0) return value;
+  if (typeof value !== 'string' || !/^(?:0|[1-9][0-9]*)$/.test(value)) {
+    fail(`${label} must be a non-negative integer`);
+  }
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed)) fail(`${label} is outside the supported range`);
+  return parsed;
+}
+
 export function parseArgs(argv) {
   const values = {};
   for (let index = 0; index < argv.length; index += 2) {
     const flag = argv[index];
     const value = argv[index + 1];
-    if (!['--env-file', '--output'].includes(flag) || value === undefined) fail(USAGE);
+    if (!['--env-file', '--output', '--owner-uid', '--owner-gid'].includes(flag)
+        || value === undefined) fail(USAGE);
     if (Object.hasOwn(values, flag)) fail(`${flag} was provided more than once`);
     values[flag] = value;
+  }
+  const ownerWasProvided = Object.hasOwn(values, '--owner-uid')
+    || Object.hasOwn(values, '--owner-gid');
+  if (ownerWasProvided
+      && !(Object.hasOwn(values, '--owner-uid') && Object.hasOwn(values, '--owner-gid'))) {
+    fail('--owner-uid and --owner-gid must be provided together');
+  }
+  const ownerUid = localIdentity(values['--owner-uid'] ?? process.getuid(), '--owner-uid');
+  const ownerGid = localIdentity(values['--owner-gid'] ?? process.getgid(), '--owner-gid');
+  if ((ownerUid !== process.getuid() || ownerGid !== process.getgid())
+      && process.geteuid() !== 0) {
+    fail('only the privileged session preparer may hand storage state to another local identity');
   }
   return {
     envFile: absolutePath(values['--env-file'] || DEFAULT_ENV_FILE, '--env-file'),
     output: absolutePath(values['--output'] || DEFAULT_OUTPUT, '--output'),
+    ownerUid,
+    ownerGid,
   };
 }
 
@@ -123,7 +149,10 @@ export function buildStorageState(config) {
   };
 }
 
-export function atomicWriteStorageState(output, storageState) {
+export function atomicWriteStorageState(output, storageState, {
+  ownerUid = process.getuid(),
+  ownerGid = process.getgid(),
+} = {}) {
   const destination = absolutePath(output, '--output');
   const parent = path.dirname(destination);
   fs.mkdirSync(parent, { recursive: true, mode: 0o700 });
@@ -141,6 +170,11 @@ export function atomicWriteStorageState(output, storageState) {
     );
     fs.fchmodSync(descriptor, 0o600);
     fs.writeFileSync(descriptor, payload);
+    fs.fchownSync(
+      descriptor,
+      localIdentity(ownerUid, 'storage-state owner UID'),
+      localIdentity(ownerGid, 'storage-state owner GID'),
+    );
     fs.fsyncSync(descriptor);
     fs.closeSync(descriptor);
     descriptor = undefined;
@@ -163,9 +197,13 @@ export function atomicWriteStorageState(output, storageState) {
   return { bytes: payload.length, output: destination };
 }
 
-export function prepareProductionAcceptanceSession({ config, output }) {
+export function prepareProductionAcceptanceSession({ config, output, ownerUid, ownerGid }) {
   const issued = buildStorageState(config);
-  const published = atomicWriteStorageState(output, issued.storageState);
+  const published = atomicWriteStorageState(
+    output,
+    issued.storageState,
+    { ownerUid, ownerGid },
+  );
   return {
     ok: true,
     storage_state: published.output,
@@ -176,7 +214,12 @@ export function prepareProductionAcceptanceSession({ config, output }) {
 export function main(argv = process.argv.slice(2)) {
   const options = parseArgs(argv);
   const config = loadProductionConsoleConfig({ envFile: options.envFile });
-  const receipt = prepareProductionAcceptanceSession({ config, output: options.output });
+  const receipt = prepareProductionAcceptanceSession({
+    config,
+    output: options.output,
+    ownerUid: options.ownerUid,
+    ownerGid: options.ownerGid,
+  });
   process.stdout.write(`${JSON.stringify(receipt)}\n`);
 }
 

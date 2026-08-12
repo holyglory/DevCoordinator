@@ -16,8 +16,10 @@ from __future__ import annotations
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -30,13 +32,13 @@ from typing import Any, Mapping, Sequence
 
 
 ROOT = Path(__file__).resolve().parents[1]
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 PLAN_KIND = "devcoordinator-software-delivery-plan"
 STATE_KIND = "devcoordinator-software-delivery-state"
 REPORT_KIND = "devcoordinator-software-delivery-report"
 RELEASE_RE = re.compile(r"^[0-9a-f]{64}$")
 TOKEN_RE = re.compile(
-    r"\{(repo|run_root|release|release_digest|transaction_root|"
+    r"\{(repo|run_root|release|release_digest|transaction_root|caller_uid|caller_gid|"
     r"acceptance_execution_timeout_seconds|"
     r"acceptance_launch_timeout_seconds|acceptance_wait_timeout_seconds)\}"
 )
@@ -47,6 +49,31 @@ MAX_WAIT_TIMEOUT_SECONDS = 86_400
 
 class DeliveryError(RuntimeError):
     """A workflow contract or safety boundary failed."""
+
+
+@contextmanager
+def exclusive_run_root(run_root: Path):
+    """Prevent two delivery controllers from mutating one durable run journal."""
+
+    absolute = run_root.expanduser().absolute()
+    absolute.mkdir(parents=True, exist_ok=True)
+    lock_path = absolute / "delivery.lock"
+    descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
+    try:
+        os.fchmod(descriptor, 0o600)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise DeliveryError(
+                "another software-owned delivery is active for this run root; "
+                "wait for its durable report instead of starting a second controller"
+            ) from error
+        yield
+    finally:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
 
 
 def _timeout_value(value: object, *, name: str, maximum: int) -> int:
@@ -127,6 +154,7 @@ def validate_plan(value: object) -> dict[str, object]:
         "kind",
         "source_checks",
         "same_schema",
+        "acceptance_setup",
         "acceptance",
     }
     if not isinstance(value, Mapping) or set(value) != fields:
@@ -134,9 +162,14 @@ def validate_plan(value: object) -> dict[str, object]:
     if value.get("schema_version") != SCHEMA_VERSION or value.get("kind") != PLAN_KIND:
         raise DeliveryError("software delivery plan discriminator is invalid")
     source = value.get("source_checks")
+    acceptance_setup = value.get("acceptance_setup")
     acceptance = value.get("acceptance")
     same = value.get("same_schema")
-    if not isinstance(source, list) or not isinstance(acceptance, list):
+    if (
+        not isinstance(source, list)
+        or not isinstance(acceptance_setup, list)
+        or not isinstance(acceptance, list)
+    ):
         raise DeliveryError("software delivery command lists are invalid")
     if not isinstance(same, Mapping) or set(same) != {
         "prepare",
@@ -162,6 +195,9 @@ def validate_plan(value: object) -> dict[str, object]:
         "kind": PLAN_KIND,
         "source_checks": [
             step_from(item, default_blocking=True) for item in source
+        ],
+        "acceptance_setup": [
+            step_from(item, default_blocking=True) for item in acceptance_setup
         ],
         "same_schema": normalized_same,
         "acceptance": [
@@ -372,12 +408,17 @@ class Delivery:
         if isinstance(release, Mapping):
             release_path = str(release.get("path") or "")
             release_digest = str(release.get("digest") or "")
+        release_transaction_root = self.transaction_root
+        if RELEASE_RE.fullmatch(release_digest) is not None:
+            release_transaction_root = self.transaction_root / release_digest
         return {
             "repo": str(self.repo),
             "run_root": str(self.run_root),
             "release": release_path,
             "release_digest": release_digest,
-            "transaction_root": str(self.transaction_root),
+            "transaction_root": str(release_transaction_root),
+            "caller_uid": str(os.getuid()),
+            "caller_gid": str(os.getgid()),
             "acceptance_execution_timeout_seconds": (
                 ""
                 if self.acceptance_execution_timeout_seconds is None
@@ -516,7 +557,13 @@ class Delivery:
         builtins = [
             {
                 "name": "diff-check",
-                "argv": ["/usr/bin/git", "diff", "--check"],
+                "argv": [
+                    "/usr/bin/git",
+                    "-c",
+                    f"safe.directory={self.repo}",
+                    "diff",
+                    "--check",
+                ],
                 "blocking": True,
             },
             {
@@ -763,12 +810,18 @@ class Delivery:
         # grants, Telegram state, repositories, routes, and fixed ports remain
         # byte-for-byte inherited from the explicit template.
         patched["release"] = str(release["path"])
-        patched["rendered_units"] = str(self.transaction_root / "rendered-units")
-        patched["candidate_slot_source"] = str(
-            self.transaction_root / f"{release['digest']}.env"
+        release_digest = str(release["digest"])
+        if RELEASE_RE.fullmatch(release_digest) is None:
+            raise DeliveryError("reset requires a valid packaged release digest")
+        release_transaction_root = self.transaction_root / release_digest
+        patched["rendered_units"] = str(
+            release_transaction_root / "rendered-units"
         )
-        self.transaction_root.mkdir(parents=True, exist_ok=True)
-        output = self.transaction_root / "manifest.json"
+        patched["candidate_slot_source"] = str(
+            release_transaction_root / f"{release_digest}.env"
+        )
+        release_transaction_root.mkdir(parents=True, exist_ok=True)
+        output = release_transaction_root / "manifest.json"
         atomic_json(output, patched)
         os.chmod(output, 0o600)
         return output
@@ -778,6 +831,10 @@ class Delivery:
         release = self.state.get("release")
         if not isinstance(release, Mapping):
             raise DeliveryError("reset requires a packaged release")
+        release_digest = str(release.get("digest") or "")
+        if RELEASE_RE.fullmatch(release_digest) is None:
+            raise DeliveryError("reset requires a valid packaged release digest")
+        release_transaction_root = self.transaction_root / release_digest
         helper = str(Path(str(release["path"])) / "bin/devcoordinator-clean-adoption")
         plan = self.run_step(
             phase="reset-prepare",
@@ -799,9 +856,9 @@ class Delivery:
                 "--manifest",
                 str(manifest),
                 "--transaction-root",
-                str(self.transaction_root),
+                str(release_transaction_root),
                 "--journal",
-                str(self.transaction_root / "journal.json"),
+                str(release_transaction_root / "journal.json"),
                 "--expected-uid",
                 "0",
             ],
@@ -816,14 +873,24 @@ class Delivery:
         return [plan, apply]
 
     def acceptance(self) -> list[CommandResult]:
+        setup = self.plan.get("acceptance_setup", [])
         steps = self.plan.get("acceptance", [])
-        if not isinstance(steps, list):
+        if not isinstance(setup, list) or not isinstance(steps, list):
             raise DeliveryError("acceptance plan is invalid")
+        results = self.run_batch(
+            phase="acceptance-setup", steps=setup, parallel=False, root=True
+        )
         # Run every acceptance check even after a failure.  Sequential order
         # avoids Playwright/performance/harness checks distorting one another.
-        return self.run_batch(
-            phase="acceptance", steps=steps, parallel=False, root=True
+        # These are agent-facing acceptance journeys, including Codex policy
+        # discovery.  They must run as the actual delivery caller, not through
+        # the privileged prefix used only for package and host mutation.
+        results.extend(
+            self.run_batch(
+                phase="acceptance", steps=steps, parallel=False, root=False
+            )
         )
+        return results
 
     def report(self) -> dict[str, object]:
         raw_steps = self.state.get("steps", [])
@@ -831,7 +898,11 @@ class Delivery:
         failures = [item for item in steps if isinstance(item, Mapping) and not item.get("ok")]
         blocking = [item for item in failures if item.get("blocking") is True]
         health = [item for item in failures if item.get("phase") == "control-plane-health"]
-        acceptance = [item for item in failures if item.get("phase") == "acceptance"]
+        acceptance = [
+            item
+            for item in failures
+            if item.get("phase") in {"acceptance-setup", "acceptance"}
+        ]
         deployment = self.state.get("deployment")
         deployment_status = (
             deployment.get("status") if isinstance(deployment, Mapping) else None
@@ -1039,52 +1110,57 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 2
     try:
-        delivery = make_delivery(args)
-        if args.action == "source-check":
-            delivery.source_check()
-        elif args.action == "package":
-            delivery.package()
-        elif args.action == "acceptance":
-            delivery.acceptance()
-        elif args.action == "deploy":
-            if args.deployment_mode == "reset":
-                if args.reset_test_history:
-                    raise DeliveryError(
-                        "--reset-test-history is only valid for same-schema delivery"
-                    )
-                if args.adoption_template is None:
-                    raise DeliveryError("reset mode requires --adoption-template")
-                delivery.deploy_reset(args.adoption_template)
-            else:
-                delivery.deploy_same_schema(
-                    reset_test_history=args.reset_test_history
-                )
-        else:
-            source = delivery.source_check()
-            if not delivery._blocking_failed(source):
-                packaged = delivery.package()
-                if not delivery._blocking_failed(packaged):
-                    if args.deployment_mode == "reset":
-                        if args.reset_test_history:
-                            raise DeliveryError(
-                                "--reset-test-history is only valid for same-schema delivery"
-                            )
-                        if args.adoption_template is None:
-                            raise DeliveryError("reset mode requires --adoption-template")
-                        deployed = delivery.deploy_reset(args.adoption_template)
-                    else:
-                        deployed = delivery.deploy_same_schema(
-                            reset_test_history=args.reset_test_history
+        with exclusive_run_root(args.run_root):
+            delivery = make_delivery(args)
+            if args.action == "source-check":
+                delivery.source_check()
+            elif args.action == "package":
+                delivery.package()
+            elif args.action == "acceptance":
+                delivery.acceptance()
+            elif args.action == "deploy":
+                if args.deployment_mode == "reset":
+                    if args.reset_test_history:
+                        raise DeliveryError(
+                            "--reset-test-history is only valid for same-schema delivery"
                         )
-                    deployment = delivery.state.get("deployment")
-                    if (
-                        isinstance(deployment, Mapping)
-                        and deployment.get("status") == "healthy"
-                    ):
-                        delivery.acceptance()
-        report = delivery.report()
-        print(concise(report))
-        return 0 if report["conclusion"] in {"passed", "passed-with-findings"} else 1
+                    if args.adoption_template is None:
+                        raise DeliveryError("reset mode requires --adoption-template")
+                    delivery.deploy_reset(args.adoption_template)
+                else:
+                    delivery.deploy_same_schema(
+                        reset_test_history=args.reset_test_history
+                    )
+            else:
+                source = delivery.source_check()
+                if not delivery._blocking_failed(source):
+                    packaged = delivery.package()
+                    if not delivery._blocking_failed(packaged):
+                        if args.deployment_mode == "reset":
+                            if args.reset_test_history:
+                                raise DeliveryError(
+                                    "--reset-test-history is only valid for same-schema delivery"
+                                )
+                            if args.adoption_template is None:
+                                raise DeliveryError("reset mode requires --adoption-template")
+                            delivery.deploy_reset(args.adoption_template)
+                        else:
+                            delivery.deploy_same_schema(
+                                reset_test_history=args.reset_test_history
+                            )
+                        deployment = delivery.state.get("deployment")
+                        if (
+                            isinstance(deployment, Mapping)
+                            and deployment.get("status") == "healthy"
+                        ):
+                            delivery.acceptance()
+            report = delivery.report()
+            print(concise(report))
+            return (
+                0
+                if report["conclusion"] in {"passed", "passed-with-findings"}
+                else 1
+            )
     except (DeliveryError, OSError, ValueError) as error:
         print(json.dumps({"ok": False, "error": str(error)}, sort_keys=True), file=sys.stderr)
         return 2

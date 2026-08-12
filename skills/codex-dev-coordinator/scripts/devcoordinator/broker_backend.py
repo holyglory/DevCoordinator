@@ -1,13 +1,15 @@
 """Production store-backed broker mutation routing.
 
-The wire protocol never carries commands or filesystem paths.  Docker work is
-delegated through an exact typed host-action interface after the store resolves
-an immutable container ID and revalidates live policy, membership, control,
-and repository-fence state.
+The wire protocol never carries commands or filesystem paths. Most Docker work
+is delegated through an exact typed host-action interface after live policy and
+state validation. Developer-directed container deletion is deliberately
+simpler: one catalog target resolves to a native ID and one fixed forced-remove
+command, with no ownership, grant, archive, state, or fingerprint gate.
 """
 
 from __future__ import annotations
 
+import calendar
 from dataclasses import dataclass
 import hashlib
 import logging
@@ -28,7 +30,7 @@ from .call_journal import (
 )
 from .capabilities import broker_capabilities, release_digest
 from .broker import (
-    AuthorizedBrokerRequest,
+    AcceptedBrokerRequest,
     BrokerBackendError,
     BrokerError,
     BrokerOperation,
@@ -50,7 +52,7 @@ from .broker_persistence import (
     RegisteredDatabaseBackup,
     RuntimeDockerMutationTarget,
     RuntimeServiceLogTarget,
-    StoreBackedAuthorizer,
+    StoreBackedRequestAcceptor,
 )
 from .universal_test_runtime import (
     BrokerTestAttemptCoordinator,
@@ -67,11 +69,11 @@ from .universal_test_credentials import (
     DEFAULT_TEST_CREDENTIAL_RUNTIME_ROOT,
 )
 from .universal_test_admission import TestSubmissionAdmissionGate
-from .universal_test_capabilities import (
-    DEFAULT_TEST_CAPABILITY_PATH,
-    SealedTestCapabilityRegistry,
-)
-from .broker_enrollment import (
+from .broker_configuration import (
+    DeclaredComposeConfigurationError,
+    DeclaredRuntimeConfigurationError,
+    reconcile_declared_compose_first_use,
+    reconcile_declared_servers_first_use,
     revoke_repository_from_protected_profile,
     revoke_server_from_protected_profile,
 )
@@ -86,7 +88,12 @@ from .runtime_ensure import (
     RuntimeEnsureDecision,
     build_runtime_ensure_result,
     decide_runtime_ensure,
+    observed_runtime_state,
     worker_result_observation,
+)
+from .runtime_sessions import (
+    next_runtime_cleanup_at,
+    reap_expired_runtime_sessions,
 )
 from .broker_workers import BrokerWorkerOperations, WORKER_OPERATIONS
 from .worker_control import WorkerControlError, WorkerController, WorkerReplaceError
@@ -106,7 +113,7 @@ from .runtime_artifacts import (
     read_runtime_log_artifact,
 )
 from .host_lifecycle import CoordinatorHostLifecycleAdapter
-from .cleanup_lifecycle import CleanupLifecycle
+from .cleanup_lifecycle import CleanupLifecycle, DockerCleanupBackend
 from .observer import observation_owner_scope
 from .broker_host import (
     ComposeMutationOutcomeUncertain,
@@ -114,6 +121,7 @@ from .broker_host import (
     EphemeralDockerContainerTarget,
     EphemeralDockerCreateTarget,
     EphemeralDockerIdentity,
+    render_compose_effective_model,
 )
 from .compose_run_once import PublishedReceipt
 from .ephemeral_containers import (
@@ -137,7 +145,7 @@ from .lifecycle_cli import (
     _apply_result,
     _confirmed_repository_plan,
     _confirmed_retirement_plan,
-    _control_binding_contract,
+    _resource_catalog_contract,
     _repository_execution_plan,
     _require_plan_target_identity_unchanged,
     _require_repository_refresh_matches,
@@ -308,18 +316,18 @@ def _test_contract_diagnostic(error: Exception) -> str:
 _TEST_ACTOR_DELEGATION_ACCOUNT = "devcoordinator-api"
 
 
-def _test_run_actor(authorized: AuthorizedBrokerRequest) -> str:
-    """Resolve a durable run actor without treating it as authorization.
+def _test_run_actor(accepted: AcceptedBrokerRequest) -> str:
+    """Resolve a durable run actor without treating it as request validation.
 
     The current mutation contract accepts one canonical local ``codex:``
     attribution from any same-developer account. Only the dedicated Console API
     account may forward the ``google:`` identity it already authenticated.
-    Broker authorization still derives from exact repository and operation
+    Broker request validation still derives from exact repository and operation
     identity; this value is display/audit ownership, never an access claim.
     """
 
-    request = authorized.request
-    broker_actor = f"broker:{request.account_id}:uid:{authorized.peer.uid}"
+    request = accepted.request
+    broker_actor = f"broker:{request.account_id}:uid:{accepted.peer.uid}"
     if request.operation not in {
         BrokerOperation.TEST_RUN_SUBMIT,
         BrokerOperation.TEST_RUN_CANCEL,
@@ -519,6 +527,14 @@ class TypedHostMutationAPI(Protocol):
         *, safety_output_root: str,
     ) -> Mapping[str, Any]: ...
 
+    def postgres_reconcile_restore(
+        self,
+        target: DatabaseMutationTarget,
+        backup: RegisteredDatabaseBackup,
+        *,
+        safety_output_root: str,
+    ) -> Mapping[str, Any] | None: ...
+
 
 class StoreBackedMutationBackend:
     """Durable broker backend with no client-controlled command boundary."""
@@ -536,14 +552,18 @@ class StoreBackedMutationBackend:
         test_plane: TestPlaneClient | None = None,
         test_attempt_manager: NativeTestAttemptManager | None = None,
         test_submission_gate: TestSubmissionAdmissionGate | None = None,
-        test_capabilities: SealedTestCapabilityRegistry | None = None,
         temporary_dev_services: TemporaryDevServiceManager | None = None,
+        container_remover: Callable[[str], Mapping[str, Any]] | None = None,
     ) -> None:
         self._persistence = persistence
         self._host_mutations = host_mutations
         self._lifecycle_adapter = lifecycle_adapter or CoordinatorHostLifecycleAdapter()
         self._observe_before_lifecycle_plan = observe_before_lifecycle_plan
         self._host_observation_shutdown = threading.Event()
+        self._runtime_session_mutation_lock = threading.RLock()
+        self._runtime_reaper_stop = threading.Event()
+        self._runtime_reaper_wake = threading.Event()
+        self._runtime_reaper_thread: threading.Thread | None = None
         self._broker_instance_id = "broker-" + uuid.uuid4().hex
         self._secret_manager = secret_manager or VolatileRunSecretManager(
             expected_uid=persistence.expected_uid
@@ -556,11 +576,11 @@ class StoreBackedMutationBackend:
         self._test_submission_gate = (
             test_submission_gate or TestSubmissionAdmissionGate()
         )
-        self._test_capabilities = (
-            test_capabilities or SealedTestCapabilityRegistry()
-        )
         self._temporary_dev_services = (
             temporary_dev_services or TemporaryDevServiceManager()
+        )
+        self._container_remover = (
+            container_remover or DockerCleanupBackend().remove
         )
         self._test_attempts = (
             None
@@ -588,9 +608,9 @@ class StoreBackedMutationBackend:
         )
 
     def _execute_test_admission_admin(
-        self, authorized: AuthorizedBrokerRequest
+        self, accepted: AcceptedBrokerRequest
     ) -> Mapping[str, Any]:
-        request = authorized.request
+        request = accepted.request
         try:
             if request.operation is BrokerOperation.TEST_ADMISSION_DRAIN_STATUS:
                 proof = self._persistence.active_test_admission_proof()
@@ -604,7 +624,7 @@ class StoreBackedMutationBackend:
                 )
                 proof = self._persistence.activate_test_admission_drain(
                     activated_at_epoch=int(timing["activated_at_epoch"]),
-                    activated_by_uid=authorized.peer.uid,
+                    activated_by_uid=accepted.peer.uid,
                     drained_at_epoch=int(timing["drained_at_epoch"]),
                     broker_instance_id=self._broker_instance_id,
                 )
@@ -631,19 +651,19 @@ class StoreBackedMutationBackend:
         )
 
     def _execute_async_test(
-        self, authorized: AuthorizedBrokerRequest
+        self, accepted: AcceptedBrokerRequest
     ) -> Mapping[str, Any]:
-        """Route one authorized test-plane call without exposing its store."""
+        """Route one accepted test-plane call without exposing its store."""
 
         plane = self._test_plane
-        request = authorized.request
+        request = accepted.request
         if plane is None:
             raise BrokerBackendError(
                 "test_scheduler_unavailable",
                 "The asynchronous test scheduler is not connected; retry after testd is healthy.",
                 operation_id=request.operation_id,
             )
-        actor = _test_run_actor(authorized)
+        actor = _test_run_actor(accepted)
         resolving_run_id: str | None = None
         try:
             if request.operation is BrokerOperation.TEST_HEALTH:
@@ -674,7 +694,7 @@ class StoreBackedMutationBackend:
 
             if request.operation is BrokerOperation.TEST_FLEET_STATS_READ:
                 authority_rows = self._persistence.current_test_repositories(
-                    authorized
+                    accepted
                 )
                 if not authority_rows:
                     raise TestStoreContractError(
@@ -733,9 +753,10 @@ class StoreBackedMutationBackend:
                 return result
 
             if request.operation is BrokerOperation.TEST_PLAN_PREVIEW:
-                execution_authority = (
-                    self._persistence.test_repository_execution_authority(
+                execution_context = (
+                    self._persistence.test_repository_execution_context(
                         repo_id=request.project_id,
+                        execution_uid=accepted.attribution_uid,
                         operation_id=request.operation_id,
                     )
                 )
@@ -744,12 +765,8 @@ class StoreBackedMutationBackend:
                         repository_id=request.project_id,
                         intent=str(request.arguments["intent"]),
                         actor=actor,
-                        owner_uid=execution_authority.owner_uid,
-                        access_uid=(
-                            authorized.peer.uid
-                            if authorized.peer.uid > 0
-                            else execution_authority.owner_uid
-                        ),
+                        owner_uid=execution_context.execution_uid,
+                        access_uid=accepted.attribution_uid,
                         temporary_root=request.arguments.get("temporary_root"),
                         requested_targets=tuple(
                             request.arguments.get("requested_targets", ())
@@ -800,7 +817,7 @@ class StoreBackedMutationBackend:
                     allow_temporary=requested_temporary_root is not None,
                 )
                 self._require_test_plan_source(
-                    authorized,
+                    accepted,
                     preview_plan.source.to_document(),
                 )
                 capability_requests = result.get("capability_requests")
@@ -815,13 +832,6 @@ class StoreBackedMutationBackend:
                     raise TestStoreContractError(
                         "testd omitted selected-target capability requests"
                     )
-                result["capability_policy"] = self._test_capability_preflight(
-                    authorized,
-                    networks=tuple(capability_requests["networks"]),
-                    fixtures=tuple(capability_requests["fixtures"]),
-                    credentials=tuple(capability_requests["credentials"]),
-                    required=True,
-                )
                 preview_resources = _test_target_resources(
                     result.get("target_resources"),
                     selected_targets=preview_plan.selected_targets,
@@ -867,41 +877,11 @@ class StoreBackedMutationBackend:
                     raise TestStoreContractError(
                         "plan selection does not match the validated manifest"
                     )
-                self._require_test_plan_source(authorized, plan.source.to_document())
+                self._require_test_plan_source(accepted, plan.source.to_document())
                 if plan.source.mode is SourceMode.IMMUTABLE:
                     raise TestStoreContractError(
                         "immutable plans must be produced by repository-owned preview"
                     )
-                capability_policy = self._test_capability_preflight(
-                    authorized,
-                    networks=tuple(
-                        sorted(
-                            {
-                                manifest.targets[name].network
-                                for name in plan.selected_targets
-                            }
-                        )
-                    ),
-                    fixtures=tuple(
-                        sorted(
-                            {
-                                fixture
-                                for name in plan.selected_targets
-                                for fixture in manifest.targets[name].fixtures
-                            }
-                        )
-                    ),
-                    credentials=tuple(
-                        sorted(
-                            {
-                                manifest.credentials[credential].binding
-                                for name in plan.selected_targets
-                                for credential in manifest.targets[name].credentials
-                            }
-                        )
-                    ),
-                    required=True,
-                )
                 worktree_key = plan.source.temporary_root or plan.source.original_root
                 resources = {
                     name: TargetResources(
@@ -933,7 +913,6 @@ class StoreBackedMutationBackend:
                 # Client-supplied agent text is diagnostic only; the kernel UID
                 # and account remain the durable actor.
                 result["actor"] = actor
-                result["capability_policy"] = capability_policy
                 return result
 
             if request.operation is BrokerOperation.TEST_RUN_SUBMIT:
@@ -958,12 +937,13 @@ class StoreBackedMutationBackend:
                         "The test plan does not belong to the requested repository.",
                         operation_id=request.operation_id,
                     )
-                self._persistence.reauthorize_test_repository(
-                    authorized, repo_id=repository_id
+                self._persistence.retarget_test_repository(
+                    accepted, repo_id=repository_id
                 )
-                execution_authority = (
-                    self._persistence.test_repository_execution_authority(
+                execution_context = (
+                    self._persistence.test_repository_execution_context(
                         repo_id=repository_id,
+                        execution_uid=accepted.attribution_uid,
                         operation_id=request.operation_id,
                     )
                 )
@@ -973,7 +953,7 @@ class StoreBackedMutationBackend:
                         repository_id=repository_id,
                         operation_id=request.operation_id,
                         actor=actor,
-                        owner_uid=execution_authority.owner_uid,
+                        owner_uid=execution_context.execution_uid,
                     )
                 )
                 self._require_test_repository(result, repository_id)
@@ -1015,7 +995,7 @@ class StoreBackedMutationBackend:
 
             if request.operation is BrokerOperation.TEST_REPOSITORY_CATALOG:
                 authority_rows = self._persistence.current_test_repositories(
-                    authorized
+                    accepted
                 )
                 repository_ids = tuple(
                     str(row["repo_id"]) for row in authority_rows
@@ -1073,26 +1053,20 @@ class StoreBackedMutationBackend:
                 }
 
             if request.operation is BrokerOperation.TEST_REPOSITORY_SETUP:
-                execution_authority = (
-                    self._persistence.test_repository_execution_authority(
+                execution_context = (
+                    self._persistence.test_repository_execution_context(
                         repo_id=request.project_id,
+                        execution_uid=accepted.attribution_uid,
                         operation_id=request.operation_id,
                     )
                 )
                 result = dict(
                     plane.setup(
                         repository_id=request.project_id,
-                        owner_uid=execution_authority.owner_uid,
+                        owner_uid=execution_context.execution_uid,
                     )
                 )
                 self._require_test_repository(result, request.project_id)
-                result["capability_policy"] = self._test_capability_preflight(
-                    authorized,
-                    networks=tuple(result.get("network_requirements", ())),
-                    fixtures=tuple(result.get("fixtures", ())),
-                    credentials=tuple(result.get("credentials", ())),
-                    required=False,
-                )
                 return result
 
             run_id = str(request.arguments.get("run_id") or "")
@@ -1101,26 +1075,30 @@ class StoreBackedMutationBackend:
                 # protected binding and require it to match the repository the
                 # caller supplied before returning data or mutating state.
                 resolving_run_id = run_id
+                expected_run_repository_id = str(
+                    request.arguments.get("expected_repository_id")
+                    or request.project_id
+                )
                 status = dict(
                     plane.status(
                         run_id=run_id,
-                        repository_id=request.project_id,
+                        repository_id=expected_run_repository_id,
                     )
                 )
                 resolving_run_id = None
                 repository_id = self._require_test_run_result(
                     status,
                     expected_run_id=run_id,
-                    expected_repo_id=request.project_id,
+                    expected_repo_id=expected_run_repository_id,
                 )
-                if repository_id != request.project_id:
+                if repository_id != expected_run_repository_id:
                     raise BrokerBackendError(
                         "test_repository_mismatch",
                         "The test run does not belong to the requested repository.",
                         operation_id=request.operation_id,
                     )
-                self._persistence.reauthorize_test_repository(
-                    authorized, repo_id=repository_id
+                self._persistence.retarget_test_repository(
+                    accepted, repo_id=repository_id
                 )
             if request.operation is BrokerOperation.TEST_RUN_STATUS:
                 return status
@@ -1132,7 +1110,7 @@ class StoreBackedMutationBackend:
                     )
                 )
                 # Agent summaries intentionally omit repository path details;
-                # authorization was proved by the status read above.
+                # request validation was proved by the status read above.
                 self._require_test_run_result(
                     result,
                     expected_run_id=run_id,
@@ -1415,11 +1393,11 @@ class StoreBackedMutationBackend:
         )
 
     def _execute_test_attempt(
-        self, authorized: AuthorizedBrokerRequest
+        self, accepted: AcceptedBrokerRequest
     ) -> Mapping[str, Any]:
         """Execute one fixed-identity testd request at the root launch boundary."""
 
-        request = authorized.request
+        request = accepted.request
         coordinator = self._test_attempts
         if coordinator is None:
             raise BrokerBackendError(
@@ -1435,19 +1413,19 @@ class StoreBackedMutationBackend:
                 owner_uid = raw.get("owner_uid")
                 if type(owner_uid) is not int:
                     raise TestStoreContractError("test attempt owner UID is invalid")
-                authority = self._persistence.test_attempt_repository_authority(
+                repository_context = self._persistence.test_attempt_repository_context(
                     repo_id=request.project_id,
-                    owner_uid=owner_uid,
+                    execution_uid=owner_uid,
                     operation_id=request.operation_id,
                 )
                 descriptor = TestAttemptDescriptor.from_document(
-                    raw, repository_generation=authority.generation
+                    raw, repository_generation=repository_context.generation
                 )
                 if (
                     descriptor.repository_id != request.project_id
                     or descriptor.attempt_id != request.resource_id
-                    or descriptor.original_root != authority.canonical_root
-                    or descriptor.owner_uid != authority.owner_uid
+                    or descriptor.original_root != repository_context.canonical_root
+                    or descriptor.owner_uid != repository_context.execution_uid
                 ):
                     raise TestStoreConflict(
                         "test attempt descriptor contradicts broker repository authority"
@@ -1468,15 +1446,6 @@ class StoreBackedMutationBackend:
                     raise TestStoreConflict(
                         "immutable test attempt does not target an exact snapshot root"
                     )
-                capability_fingerprint = self._test_capabilities.authorize(
-                    descriptor
-                )
-                _LOGGER.info(
-                    "test attempt capability authorized repo=%s generation=%s policy=%s",
-                    descriptor.repository_id,
-                    descriptor.repository_generation,
-                    capability_fingerprint[:16],
-                )
                 return coordinator.issue(
                     descriptor,
                     launch_timeout_seconds=int(
@@ -1559,7 +1528,7 @@ class StoreBackedMutationBackend:
         if not expected_repo_id or str(result.get("repository_id") or "") != expected_repo_id:
             raise BrokerBackendError(
                 "test_repository_mismatch",
-                "The test-plane result does not belong to the authorized repository.",
+                "The test-plane result does not belong to the accepted repository.",
             )
 
     @staticmethod
@@ -1569,9 +1538,9 @@ class StoreBackedMutationBackend:
         expected_run_id: str,
         expected_repo_id: str,
     ) -> str:
-        """Bind one testd result to the broker-authorized run and repository.
+        """Bind one testd result to the broker-accepted run and repository.
 
-        Testd owns the high-volume store but it is not an authorization
+        Testd owns the high-volume store but it is not an request validation
         authority.  A malformed response must therefore fail at the broker
         boundary instead of allowing an exact run lookup to be cross-wired to
         another repository's evidence.
@@ -1595,7 +1564,7 @@ class StoreBackedMutationBackend:
         ):
             raise BrokerBackendError(
                 "test_repository_mismatch",
-                "The test-plane result does not belong to the authorized repository.",
+                "The test-plane result does not belong to the accepted repository.",
             )
         return returned_repo_id
 
@@ -1664,52 +1633,17 @@ class StoreBackedMutationBackend:
             if item.get("repository_id") != expected_repo_id:
                 raise BrokerBackendError(
                     "test_repository_mismatch",
-                    "The test-plane event does not belong to the authorized repository.",
+                    "The test-plane event does not belong to the accepted repository.",
                 )
-
-    def _test_capability_preflight(
-        self,
-        authorized: AuthorizedBrokerRequest,
-        *,
-        networks: tuple[str, ...],
-        fixtures: tuple[str, ...],
-        credentials: tuple[str, ...],
-        required: bool,
-    ) -> dict[str, object]:
-        request = authorized.request
-        authority = self._persistence.test_attempt_repository_authority(
-            repo_id=request.project_id,
-            owner_uid=None,
-            operation_id=request.operation_id,
-        )
-        result = dict(
-            self._test_capabilities.check_requests(
-                repository_id=request.project_id,
-                repository_generation=authority.generation,
-                networks=networks,
-                fixtures=fixtures,
-                credentials=credentials,
-            )
-        )
-        if required and result.get("ok") is not True:
-            missing = result.get("missing")
-            detail = ", ".join(missing) if isinstance(missing, list) else "unknown"
-            raise BrokerBackendError(
-                "test_capability_policy_missing",
-                "The sealed test capability policy does not authorize this plan: "
-                + detail,
-                operation_id=request.operation_id,
-            )
-        return result
 
     def _require_test_plan_source(
         self,
-        authorized: AuthorizedBrokerRequest,
+        accepted: AcceptedBrokerRequest,
         source: Mapping[str, Any],
     ) -> None:
         """Prove original/temporary roots from authority, never path inference."""
 
-        request = authorized.request
+        request = accepted.request
         original_root = str(source.get("original_root") or "")
         temporary_root = source.get("temporary_root")
         with CoordinatorStore.open(
@@ -1728,7 +1662,7 @@ class StoreBackedMutationBackend:
                     or str(root["canonical_root"]) != original_root
                 ):
                     raise TestStoreContractError(
-                        "plan source is not the exact authorized root repository"
+                        "plan source is not the exact accepted root repository"
                     )
                 if temporary_root is None:
                     return
@@ -1799,8 +1733,67 @@ class StoreBackedMutationBackend:
             operation_id=request.operation_id,
         ) from cause
 
+    def _reconcile_repository_runtime_contract(
+        self,
+        *,
+        request: BrokerRequest,
+        repo_id: str,
+        root: str,
+        execution_uid: int,
+    ) -> Mapping[str, Any]:
+        """Reconcile an older uncertain Compose result before resealing it."""
+
+        compose_definition_id = self._persistence.configured_compose_definition_id(
+            repo_id=repo_id
+        )
+        if compose_definition_id is not None:
+            prior_operation_id = (
+                self._persistence.reconcilable_compose_operation_for_definition(
+                    repo_id=repo_id,
+                    compose_definition_id=compose_definition_id,
+                )
+            )
+            if prior_operation_id is not None:
+                candidate = self._persistence.compose_reconciliation_candidate(
+                    prior_operation_id
+                )
+                if (
+                    candidate["repo_id"] != repo_id
+                    or candidate["compose_definition_id"]
+                    != compose_definition_id
+                ):
+                    raise BrokerBackendError(
+                        "compose_reconciliation_identity_mismatch",
+                        "The retained Compose operation no longer belongs to the exact repository definition.",
+                        operation_id=request.operation_id,
+                    )
+                evidence = self._observe_fresh_full_docker(
+                    request.operation_id,
+                    project_id=repo_id,
+                )
+                self._persistence.reconcile_compose_operation(
+                    prior_operation_id,
+                    evidence=evidence,
+                )
+        compose = reconcile_declared_compose_first_use(
+            self._persistence,
+            repo_id=repo_id,
+            root=Path(root),
+        )
+        servers = reconcile_declared_servers_first_use(
+            self._persistence,
+            repo_id=repo_id,
+            root=Path(root),
+            execution_uid=execution_uid,
+        )
+        return {
+            **dict(compose),
+            "changed": bool(compose.get("changed") or servers.get("changed")),
+            "servers": dict(servers.get("servers") or {}),
+        }
+
     def _execute_repository_ensure(
-        self, authorized: AuthorizedBrokerRequest
+        self, accepted: AcceptedBrokerRequest
     ) -> Mapping[str, Any]:
         """Adopt one repository while preserving safe, actionable failures."""
 
@@ -1809,7 +1802,7 @@ class StoreBackedMutationBackend:
             resolve_effective_repository_context,
         )
 
-        request = authorized.request
+        request = accepted.request
         try:
             context = resolve_effective_repository_context(
                 project=str(request.arguments["canonical_root"])
@@ -1829,20 +1822,36 @@ class StoreBackedMutationBackend:
             )
 
         try:
-            return self._persistence.ensure_repository_enrollment(
-                authorized,
+            return self._persistence.ensure_repository_catalog_entry(
+                accepted,
                 context=context,
+                reconcile_repository=lambda repo_id, root, execution_uid: (
+                    self._reconcile_repository_runtime_contract(
+                        request=request,
+                        repo_id=repo_id,
+                        root=root,
+                        execution_uid=execution_uid,
+                    )
+                ),
             )
         except BrokerError:
             # Deliberately typed policy/state failures already carry an exact
             # operation identity and must not be relabelled as storage faults.
             raise
+        except (DeclaredComposeConfigurationError, DeclaredRuntimeConfigurationError) as error:
+            failure_cause = error
+            code = "repository_runtime_contract_invalid"
+            message = _repository_adoption_message(
+                "Repository adoption could not catalog its declared runtime.",
+                "Correct the named .codex/dev-runtime.json or runtime dependency condition, then rerun the original runtime ensure command with a fresh operation ID.",
+                cause=error,
+            )
         except StoreInvariantError as error:
             failure_cause: BaseException = error
             code = "repository_adoption_invariant_failed"
             message = _repository_adoption_message(
                 "Repository adoption was rejected by a Coordinator authority invariant.",
-                "Correct the conflicting authority state named below, then rerun the original structured runtime serve command with a fresh operation ID.",
+                "Correct the conflicting catalog state named below, then rerun the original structured runtime serve command with a fresh operation ID.",
                 cause=error,
             )
         except sqlite3.IntegrityError as error:
@@ -1850,7 +1859,7 @@ class StoreBackedMutationBackend:
             code = "repository_adoption_constraint_failed"
             message = _repository_adoption_message(
                 "Repository adoption was rejected by an authority database constraint.",
-                "Correct the conflicting repository/enrollment identity named below, then rerun the original structured runtime serve command with a fresh operation ID.",
+                "Correct the conflicting repository/configuration identity named below, then rerun the original structured runtime serve command with a fresh operation ID.",
                 cause=error,
             )
         except (StoreError, sqlite3.DatabaseError, OSError) as error:
@@ -1863,13 +1872,10 @@ class StoreBackedMutationBackend:
             )
         except (ValueError, RuntimeError) as error:
             failure_cause = error
-            # Owner-authority establishment uses bounded ValueError/RuntimeError
-            # invariants. They are expected adoption rejections, not an opaque
-            # broker outage.
-            code = "repository_owner_authority_failed"
+            code = "repository_catalog_registration_failed"
             message = _repository_adoption_message(
-                "Repository adoption could not establish its execution-owner authority.",
-                "Correct the owner-authority conflict named below, then rerun the original structured runtime serve command with a fresh operation ID.",
+                "Repository adoption could not register its catalog and execution context.",
+                "Correct the catalog conflict named below, then rerun the original structured runtime serve command with a fresh operation ID.",
                 cause=error,
             )
         except Exception as error:
@@ -1891,20 +1897,20 @@ class StoreBackedMutationBackend:
             cause=failure_cause,
         )
 
-    def execute(self, authorized: AuthorizedBrokerRequest) -> Mapping[str, Any]:
-        request = authorized.request
+    def execute(self, accepted: AcceptedBrokerRequest) -> Mapping[str, Any]:
+        request = accepted.request
         if request.operation in {
             BrokerOperation.TEST_ADMISSION_DRAIN_BEGIN,
             BrokerOperation.TEST_ADMISSION_DRAIN_STATUS,
             BrokerOperation.TEST_ADMISSION_DRAIN_CLEAR,
         }:
-            return self._execute_test_admission_admin(authorized)
+            return self._execute_test_admission_admin(accepted)
         if request.operation in TESTD_INTERNAL_OPERATIONS:
-            return self._execute_test_attempt(authorized)
+            return self._execute_test_attempt(accepted)
         if request.operation in _ASYNC_TEST_OPERATIONS:
-            return self._execute_async_test(authorized)
+            return self._execute_async_test(accepted)
         if request.operation in _EPHEMERAL_OPERATIONS:
-            return self._ephemeral.execute(authorized)
+            return self._ephemeral.execute(accepted)
         if request.operation == BrokerOperation.CAPABILITIES_READ:
             return broker_capabilities(
                 protocol_version=PROTOCOL_VERSION,
@@ -1913,28 +1919,28 @@ class StoreBackedMutationBackend:
                 active_release_digest=release_digest(Path(__file__)),
             )
         if request.operation == BrokerOperation.REPOSITORY_RESOLVE:
-            return self._persistence.resolve_repository_enrollment(authorized)
+            return self._persistence.resolve_repository_catalog_entry(accepted)
         if request.operation == BrokerOperation.REPOSITORY_ENSURE:
-            return self._execute_repository_ensure(authorized)
+            return self._execute_repository_ensure(accepted)
         if request.operation == BrokerOperation.OPERATION_FOLLOW:
-            return self._persistence.operation_follow(authorized)
+            return self._persistence.operation_follow(accepted)
         if request.operation == BrokerOperation.INVENTORY_READ:
-            return self._persistence.inventory(authorized)
+            return self._persistence.inventory(accepted)
         if request.operation == BrokerOperation.EVENTS_READ:
-            return self._persistence.events(authorized)
+            return self._persistence.events(accepted)
         if request.operation == BrokerOperation.HOST_OBSERVE:
             return self._observe_committed_host(request.operation_id)
         if request.operation == BrokerOperation.RUNTIME_ENSURE:
-            return self._execute_runtime_ensure(authorized)
+            return self._execute_runtime_ensure(accepted)
         if request.operation == BrokerOperation.RUNTIME_REQUEST:
-            return self._execute_runtime_request(authorized)
+            return self._execute_runtime_request(accepted)
         if request.operation == BrokerOperation.COMPOSE_RUN_ONCE:
-            return self._execute_compose_run_once(authorized)
+            return self._execute_compose_run_once(accepted)
         if request.operation in WORKER_OPERATIONS:
-            return self._worker_operations.execute(authorized)
+            return self._worker_operations.execute(accepted)
         if request.operation == BrokerOperation.REPOSITORY_LIST_REMOVED:
             return {
-                "repositories": self._persistence.list_removed_repository(authorized)
+                "repositories": self._persistence.list_removed_repository(accepted)
             }
         if request.operation == BrokerOperation.ARCHIVES_READ:
             with CoordinatorStore.open(
@@ -1945,35 +1951,18 @@ class StoreBackedMutationBackend:
                 cleanup = CleanupLifecycle(
                     store,
                     lifecycle_adapter=self._lifecycle_adapter,
-                    authorize=lambda _cap, _kind, _target, _actor: self._persistence.authorize(
-                        authorized.peer, authorized.request
-                    ),
                 )
                 listing = cleanup.list_archives(
-                    actor=f"broker:{request.account_id}:uid:{authorized.peer.uid}"
+                    actor=f"broker:{request.account_id}:uid:{accepted.peer.uid}"
                 )
-                return {
-                    "archives": [
-                        item
-                        for item in listing["archives"]
-                        if (
-                            item.get("project_id") == request.project_id
-                            or (
-                                item.get("target_kind") == "project"
-                                and item.get("target_id") == request.project_id
-                            )
-                        )
-                    ]
-                }
+                return {"archives": list(listing["archives"])}
         listener_preflight: tuple[
             tuple[int, ...], int, str, Mapping[str, Any]
         ] | None = None
+        port_candidates_preflight: tuple[int, ...] | None = None
         compose_preflight: Mapping[str, Any] | None = None
-        if (
-            request.operation == BrokerOperation.PORT_LEASE
-            and bool(request.arguments.get("adopt_existing_listener"))
-        ):
-            existing = self._persistence.existing_operation_disposition(authorized)
+        if request.operation == BrokerOperation.PORT_LEASE:
+            existing = self._persistence.existing_operation_disposition(accepted)
             if existing is not None:
                 if existing.state == "completed":
                     return dict(existing.result or {})
@@ -1988,14 +1977,22 @@ class StoreBackedMutationBackend:
                     "This durable operation is already running or requires reconciliation; it was not executed again.",
                     operation_id=request.operation_id,
                 )
-            candidates = self._persistence.port_lease_candidates(authorized)
+            port_candidates_preflight = self._persistence.port_lease_candidates(
+                accepted
+            )
+        if (
+            request.operation == BrokerOperation.PORT_LEASE
+            and bool(request.arguments.get("adopt_existing_listener"))
+        ):
+            assert port_candidates_preflight is not None
+            candidates = port_candidates_preflight
             selected_port, canonical_root = (
-                self._persistence.listener_adoption_preflight_target(authorized)
+                self._persistence.listener_adoption_preflight_target(accepted)
             )
             if type(selected_port) is not int or selected_port not in candidates:
                 raise BrokerBackendError(
                     "invalid_host_observation",
-                    "Listener adoption target is outside the authorized port candidates.",
+                    "Listener adoption target is outside the accepted port candidates.",
                     operation_id=request.operation_id,
                 )
             listener_evidence = self._host_mutations.verify_owned_tcp_listener(
@@ -2008,7 +2005,7 @@ class StoreBackedMutationBackend:
                 listener_evidence,
             )
         if request.operation in _COMPOSE_OPERATIONS:
-            existing = self._persistence.existing_operation_disposition(authorized)
+            existing = self._persistence.existing_operation_disposition(accepted)
             if existing is not None:
                 if existing.state == "completed":
                     return dict(existing.result or {})
@@ -2024,13 +2021,13 @@ class StoreBackedMutationBackend:
                     operation_id=request.operation_id,
                 )
             try:
-                self._persistence.require_no_active_compose_operation(authorized)
+                self._persistence.require_no_active_compose_operation(accepted)
             except BrokerError as exc:
                 if exc.code != "compose_operation_pending":
                     raise
                 prior_operation_id = (
                     self._persistence.reconcilable_prior_compose_operation_id(
-                        authorized
+                        accepted
                     )
                 )
                 if prior_operation_id is None:
@@ -2050,22 +2047,22 @@ class StoreBackedMutationBackend:
                 self._persistence.reconcile_compose_operation(
                     prior_operation_id,
                     evidence=reconciliation_evidence,
-                    authorized=authorized,
+                    accepted=accepted,
                 )
-                self._persistence.require_no_active_compose_operation(authorized)
+                self._persistence.require_no_active_compose_operation(accepted)
             compose_preflight = self._observe_fresh_full_docker(
                 request.operation_id,
                 project_id=request.project_id,
             )
             self._persistence.require_compose_mutation_safe(
-                authorized,
+                accepted,
                 snapshot_id=str(compose_preflight["snapshot_id"]),
             )
         if compose_preflight is None:
-            disposition = self._persistence.reserve_operation(authorized)
+            disposition = self._persistence.reserve_operation(accepted)
         else:
             disposition = self._persistence.reserve_operation(
-                authorized,
+                accepted,
                 compose_preflight=compose_preflight,
             )
         replay_database_result: Mapping[str, Any] | None = None
@@ -2083,7 +2080,7 @@ class StoreBackedMutationBackend:
                 BrokerOperation.DATABASE_RESTORE,
             }:
                 replay_database_result = self._persistence.database_host_result(
-                    authorized
+                    accepted
                 )
             if replay_database_result is None:
                 raise BrokerBackendError(
@@ -2094,9 +2091,40 @@ class StoreBackedMutationBackend:
 
         try:
             if request.operation == BrokerOperation.TEST_RUN_START:
-                result = self._test_records.start(authorized)
+                result = self._test_records.start(accepted)
             elif request.operation == BrokerOperation.TEST_RUN_FINISH:
-                result = self._test_records.finish(authorized)
+                result = self._test_records.finish(accepted)
+            elif request.operation is BrokerOperation.CONTAINER_REMOVE:
+                target = self._persistence.direct_container_removal_target(
+                    accepted
+                )
+                removal = dict(
+                    self._container_remover(target.full_container_id)
+                )
+                if (
+                    type(removal.get("already_absent")) is not bool
+                    or removal.get("full_container_id")
+                    != target.full_container_id
+                ):
+                    raise BrokerBackendError(
+                        "container_remove_reply_invalid",
+                        "Direct Docker removal returned contradictory target evidence.",
+                        operation_id=request.operation_id,
+                    )
+                result = {
+                    "ok": True,
+                    "status": (
+                        "already_absent"
+                        if removal["already_absent"]
+                        else "removed"
+                    ),
+                    "action": "remove",
+                    "target_kind": "container",
+                    "target_id": target.docker_resource_id,
+                    "full_container_id": target.full_container_id,
+                    "reason": str(request.arguments["reason"]),
+                    **removal,
+                }
             elif request.operation in {
                 BrokerOperation.CLEANUP_PLAN,
                 BrokerOperation.CLEANUP_APPLY,
@@ -2110,27 +2138,24 @@ class StoreBackedMutationBackend:
                     cleanup = CleanupLifecycle(
                         store,
                         lifecycle_adapter=self._lifecycle_adapter,
-                        authorize=lambda _cap, _kind, _target, _actor: self._persistence.authorize(
-                            authorized.peer, authorized.request
-                        ),
                         prepare_apply=lambda plan, prepare_actor: self._prepare_worker_lifecycle_apply(
-                            authorized,
+                            accepted,
                             store=store,
                             plan=plan,
                             actor=prepare_actor,
                         ),
                     )
-                    actor = f"broker:{request.account_id}:uid:{authorized.peer.uid}"
+                    actor = f"broker:{request.account_id}:uid:{accepted.peer.uid}"
                     if request.operation is BrokerOperation.CLEANUP_PLAN:
                         if request.arguments["action"] == "archive":
                             result = self._plan_generic_archive(
-                                authorized, store=store, actor=actor
+                                accepted, store=store, actor=actor
                             )
                         else:
                             target_kind = str(request.arguments["target_kind"])
                             if target_kind in {"server", "container"}:
-                                self._authorize_generic_cleanup_resource(
-                                    authorized,
+                                self._resolve_generic_cleanup_resource(
+                                    accepted,
                                     store=store,
                                     target_kind=target_kind,
                                     target_id=str(request.arguments["target_id"]),
@@ -2142,10 +2167,10 @@ class StoreBackedMutationBackend:
                             )
                             if target_kind in {"server", "container"}:
                                 # Observation can change controller or host
-                                # truth.  Re-resolve and re-authorize before
+                                # truth.  Re-resolve and re-accept before
                                 # committing the plan snapshot.
-                                self._authorize_generic_cleanup_resource(
-                                    authorized,
+                                self._resolve_generic_cleanup_resource(
+                                    accepted,
                                     store=store,
                                     target_kind=target_kind,
                                     target_id=str(request.arguments["target_id"]),
@@ -2160,13 +2185,12 @@ class StoreBackedMutationBackend:
                             result["broker_observation"] = observation
                     elif request.operation is BrokerOperation.CLEANUP_APPLY:
                         result = self._apply_generic_lifecycle(
-                            authorized, store=store, cleanup=cleanup, actor=actor
+                            accepted, store=store, cleanup=cleanup, actor=actor
                         )
                     else:
-                        # Recheck live authorization at the service-owned DB
-                        # immediately before resolving and restoring the exact
-                        # archived target.
-                        self._persistence.authorize(authorized.peer, authorized.request)
+                        # Recheck database freshness immediately before
+                        # resolving and restoring the exact archived target.
+                        self._persistence.accept(accepted.peer, accepted.request)
                         target_kind = str(request.arguments["target_kind"])
                         target_id = str(request.arguments["target_id"])
                         reason = str(request.arguments["reason"])
@@ -2182,40 +2206,15 @@ class StoreBackedMutationBackend:
                                 explicit=True,
                             ).to_dict()
                         else:
-                            with store.read_transaction() as connection:
-                                binding = connection.execute(
-                                    """
-                                    SELECT binding_id FROM control_bindings
-                                    WHERE resource_kind = ? AND resource_id = ?
-                                      AND authority_state = 'authoritative'
-                                    ORDER BY priority DESC, binding_id LIMIT 1
-                                    """,
-                                    (target_kind, target_id),
-                                ).fetchone()
-                            if binding is None:
-                                raise LifecycleError(
-                                    "archived resource has no authoritative exact controller"
-                                )
                             exact, repo_id = lifecycle_persistence.resolve_resource(
                                 ResourceKind(target_kind),
                                 target_id,
-                                str(binding["binding_id"]),
                                 include_archived=True,
                             )
                             if repo_id != request.project_id:
                                 raise LifecycleError(
                                     "archived resource belongs to another project"
                                 )
-                            self._persistence.authorize_cleanup_resource(
-                                authorized,
-                                repo_id=repo_id,
-                                resource_kind=target_kind,
-                                resource_id=exact.resource_id,
-                                control_binding_id=exact.control_binding_id,
-                                immutable_fingerprint=exact.immutable_fingerprint,
-                                ownership_fingerprint=exact.control_contract_fingerprint,
-                                operation=BrokerOperation.RESOURCE_RESTORE,
-                            )
                             result = dict(
                                 lifecycle.restore_resource_archive(
                                     exact, actor=actor, reason=reason
@@ -2231,7 +2230,7 @@ class StoreBackedMutationBackend:
                         BrokerOperation.RESOURCE_PLAN_RETIRE,
                         BrokerOperation.RESOURCE_PLAN_ARCHIVE,
                     }:
-                        # Authorization just proved this exact active resource.
+                        # Request validation just proved this exact active resource.
                         # Preserve that identity across the mandatory fresh
                         # observation so generation-only controller churn can
                         # be distinguished from a changed controller.
@@ -2263,7 +2262,7 @@ class StoreBackedMutationBackend:
                     )
                     required_plan_observation = (
                         self._persistence.require_lifecycle_plan_observation(
-                            authorized
+                            accepted
                         )
                     )
                 elif request.operation == BrokerOperation.RESOURCE_RESTORE:
@@ -2272,13 +2271,13 @@ class StoreBackedMutationBackend:
                         project_id=request.project_id,
                     )
                 result = self._execute_lifecycle(
-                    authorized, resource_plan_basis=resource_plan_basis
+                    accepted, resource_plan_basis=resource_plan_basis
                 )
                 if observation_evidence is not None:
                     plan_id = str(result.get("plan_id") or "")
                     result["broker_observation"] = (
                         self._persistence.bind_lifecycle_plan_observation(
-                            authorized,
+                            accepted,
                             plan_id=plan_id,
                             evidence=observation_evidence,
                         )
@@ -2299,7 +2298,7 @@ class StoreBackedMutationBackend:
                         listener_evidence,
                     ) = listener_preflight
                     current_port, current_root = (
-                        self._persistence.listener_adoption_target(authorized)
+                        self._persistence.listener_adoption_target(accepted)
                     )
                     if current_port != selected_port or current_root != canonical_root:
                         raise BrokerBackendError(
@@ -2318,10 +2317,11 @@ class StoreBackedMutationBackend:
                         )
                     listener_evidence = current_evidence
                 else:
-                    candidates = self._persistence.port_lease_candidates(authorized)
+                    assert port_candidates_preflight is not None
+                    candidates = port_candidates_preflight
                     if bool(request.arguments.get("adopt_existing_listener")):
                         selected_port, canonical_root = (
-                            self._persistence.listener_adoption_target(authorized)
+                            self._persistence.listener_adoption_target(accepted)
                         )
                         listener_evidence = self._host_mutations.verify_owned_tcp_listener(
                             port=selected_port, canonical_root=canonical_root
@@ -2333,7 +2333,7 @@ class StoreBackedMutationBackend:
                 if selected_port is None:
                     raise BrokerBackendError(
                         "port_unavailable",
-                        "No authorized port is currently free in host listener observations.",
+                        "No accepted port is currently free in host listener observations.",
                         operation_id=request.operation_id,
                     )
                 if type(selected_port) is not int or selected_port not in candidates:
@@ -2343,14 +2343,14 @@ class StoreBackedMutationBackend:
                         operation_id=request.operation_id,
                     )
                 return self._persistence.complete_port_lease(
-                    authorized,
+                    accepted,
                     observed_available_port=selected_port,
                     listener_evidence=listener_evidence,
                 )
             elif request.operation == BrokerOperation.PORT_RELEASE:
-                return self._persistence.complete_port_release(authorized)
+                return self._persistence.complete_port_release(accepted)
             elif request.operation == BrokerOperation.SERVER_PUBLISH:
-                target = self._persistence.server_publication_target(authorized)
+                target = self._persistence.server_publication_target(accepted)
                 lifecycle = str(request.arguments["lifecycle"])
                 listener_evidence: Mapping[str, Any] | None = None
                 if lifecycle == "stopped":
@@ -2373,14 +2373,14 @@ class StoreBackedMutationBackend:
                     ):
                         raise BrokerBackendError(
                             "listener_process_mismatch",
-                            "Published process identity does not own the exact enrolled listener.",
+                            "Published process identity does not own the exact configured listener.",
                             operation_id=request.operation_id,
                         )
                 return self._persistence.complete_server_publication(
-                    authorized, listener_evidence=listener_evidence
+                    accepted, listener_evidence=listener_evidence
                 )
             elif request.operation == BrokerOperation.PORT_ASSIGN:
-                candidates = self._persistence.port_assignment_candidates(authorized)
+                candidates = self._persistence.port_assignment_candidates(accepted)
                 selected_port: Optional[int] = None
                 if candidates:
                     selected_port = self._host_mutations.select_available_port(
@@ -2399,17 +2399,26 @@ class StoreBackedMutationBackend:
                             operation_id=request.operation_id,
                         )
                 return self._persistence.complete_port_assignment(
-                    authorized, observed_available_port=selected_port
+                    accepted, observed_available_port=selected_port
                 )
             elif request.operation == BrokerOperation.PORT_UNASSIGN:
-                return self._persistence.complete_port_unassignment(authorized)
+                return self._persistence.complete_port_unassignment(accepted)
             elif request.operation in {
                 BrokerOperation.COMPOSE_UP,
                 BrokerOperation.COMPOSE_STOP,
                 BrokerOperation.COMPOSE_RESTART,
                 BrokerOperation.COMPOSE_DOWN,
             }:
-                target = self._persistence.compose_target(authorized)
+                target = self._persistence.compose_target(accepted)
+                previous_service: Mapping[str, Any] | None = None
+                if target.recreate_service is not None:
+                    previous_service = (
+                        self._persistence.compose_service_observation(
+                            accepted,
+                            snapshot_id=str(compose_preflight["snapshot_id"]),
+                            service=target.recreate_service,
+                        )
+                    )
                 if request.operation == BrokerOperation.COMPOSE_UP:
                     raw_result = self._host_mutations.compose_up(target)
                 elif request.operation == BrokerOperation.COMPOSE_STOP:
@@ -2431,17 +2440,52 @@ class StoreBackedMutationBackend:
                     result["broker_observation"] = observation
                     result["observed_resources"] = (
                         self._persistence.repository_container_observations(
-                            authorized,
+                            accepted,
                             snapshot_id=str(observation["snapshot_id"]),
                         )
                     )
                     result["compose_observation"] = (
                         self._persistence.compose_observation_result(
-                            authorized,
+                            accepted,
                             evidence=observation,
                         )
                     )
+                    if target.recreate_service is not None:
+                        recreated = self._persistence.compose_service_observation(
+                            accepted,
+                            snapshot_id=str(observation["snapshot_id"]),
+                            service=target.recreate_service,
+                        )
+                        if (
+                            previous_service is None
+                            or recreated["full_container_id"]
+                            == previous_service["full_container_id"]
+                            or recreated["lifecycle"] != "running"
+                            or str(recreated.get("health") or "").lower()
+                            in {"starting", "unhealthy"}
+                        ):
+                            raise BrokerBackendError(
+                                "compose_service_recreate_unproven",
+                                "Exact Compose recreation did not prove a new healthy container identity.",
+                                operation_id=request.operation_id,
+                            )
+                        result["service_recreation"] = {
+                            "service": target.recreate_service,
+                            "previous": dict(previous_service),
+                            "current": recreated,
+                            "volumes_preserved_from_sealed_model": True,
+                            "dependencies_recreated": False,
+                        }
                 except Exception as exc:
+                    if (
+                        isinstance(exc, BrokerError)
+                        and exc.code == "compose_observation_mismatch"
+                    ):
+                        # The authoritative observation committed and proved a
+                        # definite non-matching state. This is a typed failure,
+                        # not an uncertain host outcome.
+                        raise
+                    failure_code = _observation_failure_code(exc)
                     try:
                         self._persistence.mark_compose_operation_reconciliation_required(
                             request.operation_id,
@@ -2450,6 +2494,7 @@ class StoreBackedMutationBackend:
                             completed_phases=tuple(result.get("phases") or ()),
                             cleanup_failed=False,
                             observation=observation,
+                            failure_code=failure_code,
                         )
                     except Exception:
                         # If the authority itself is unavailable, the still-running
@@ -2465,7 +2510,7 @@ class StoreBackedMutationBackend:
                 BrokerOperation.DATABASE_BACKUP,
                 BrokerOperation.DATABASE_RESTORE,
             }:
-                target = self._persistence.database_target(authorized)
+                target = self._persistence.database_target(accepted)
                 if request.operation == BrokerOperation.DATABASE_BACKUP:
                     if replay_database_result is None:
                         raw_result = self._host_mutations.postgres_backup(
@@ -2474,7 +2519,7 @@ class StoreBackedMutationBackend:
                         journal_result = _json_safe_mapping(raw_result)
                         try:
                             self._persistence.save_database_host_result(
-                                authorized, journal_result
+                                accepted, journal_result
                             )
                         except Exception as exc:
                             raise BrokerBackendError(
@@ -2486,7 +2531,7 @@ class StoreBackedMutationBackend:
                         journal_result = dict(replay_database_result)
                     try:
                         result = self._persistence.register_database_backup_result(
-                            authorized, target, journal_result
+                            accepted, target, journal_result
                         )
                     except Exception as exc:
                         raise BrokerBackendError(
@@ -2496,7 +2541,7 @@ class StoreBackedMutationBackend:
                         ) from exc
                 else:
                     backup = self._persistence.registered_database_backup(
-                        authorized, target
+                        accepted, target
                     )
                     if replay_database_result is None:
                         raw_result = self._host_mutations.postgres_restore(
@@ -2509,7 +2554,7 @@ class StoreBackedMutationBackend:
                         journal_result = _json_safe_mapping(raw_result)
                         try:
                             self._persistence.save_database_host_result(
-                                authorized, journal_result
+                                accepted, journal_result
                             )
                         except Exception as exc:
                             raise BrokerBackendError(
@@ -2521,7 +2566,7 @@ class StoreBackedMutationBackend:
                         journal_result = dict(replay_database_result)
                     try:
                         result = self._persistence.register_database_restore_result(
-                            authorized,
+                            accepted,
                             target,
                             backup,
                             journal_result,
@@ -2533,11 +2578,10 @@ class StoreBackedMutationBackend:
                             operation_id=request.operation_id,
                         ) from exc
             elif request.operation not in _LIFECYCLE_OPERATIONS:
-                # Re-read the live ACL, repository fence, exact membership,
-                # control binding, immutable container ID, and observation
-                # revision after reservation and immediately before external
-                # work.
-                target = self._persistence.docker_target(authorized)
+                # Re-read the current catalog identity, immutable container ID,
+                # and observation revision after reservation and immediately
+                # before external work.
+                target = self._persistence.docker_target(accepted)
                 if request.operation == BrokerOperation.DOCKER_START:
                     raw_result = self._host_mutations.docker_start(target)
                 elif request.operation == BrokerOperation.DOCKER_STOP:
@@ -2559,15 +2603,26 @@ class StoreBackedMutationBackend:
                     result["broker_observation"] = observation
                     result["observed_resource"] = (
                         self._persistence.docker_observation_result(
-                            authorized, target
+                            accepted, target
                         )
                     )
                 except Exception as exc:
-                    raise BrokerBackendError(
-                        "operation_outcome_uncertain",
-                        "Docker action completed but authoritative service observation did not commit; reconciliation is required.",
-                        operation_id=request.operation_id,
-                    ) from exc
+                    if (
+                        isinstance(exc, BrokerError)
+                        and exc.code == "docker_observation_mismatch"
+                    ):
+                        raise
+                    self._raise_runtime_outcome_uncertain(
+                        request.operation_id,
+                        action=request.operation.value.removeprefix("docker."),
+                        failed_phase="observation",
+                        failure_code=_observation_failure_code(exc),
+                        message=(
+                            "Docker action completed but authoritative service "
+                            "observation did not commit; reconciliation is required."
+                        ),
+                        cause=exc,
+                    )
         except ComposeMutationOutcomeUncertain as exc:
             reconciliation_observation: Mapping[str, Any] | None = None
             # An action may be completed by observation only when exactly one
@@ -2595,7 +2650,7 @@ class StoreBackedMutationBackend:
             if can_settle_by_observation and reconciliation_observation is not None:
                 try:
                     proof = self._persistence.compose_observation_result(
-                        authorized,
+                        accepted,
                         evidence=reconciliation_observation,
                     )
                 except Exception:
@@ -2707,24 +2762,24 @@ class StoreBackedMutationBackend:
         return result
 
     def _execute_compose_run_once(
-        self, authorized: AuthorizedBrokerRequest
+        self, accepted: AcceptedBrokerRequest
     ) -> Mapping[str, Any]:
         """Execute or resume one broker-owned, manifest-sealed Compose service."""
 
-        request = authorized.request
-        existing = self._persistence.existing_operation_disposition(authorized)
+        request = accepted.request
+        existing = self._persistence.existing_operation_disposition(accepted)
         if existing is None:
-            self._persistence.require_no_active_compose_operation(authorized)
+            self._persistence.require_no_active_compose_operation(accepted)
             preflight = self._observe_fresh_full_docker(
                 request.operation_id,
                 project_id=request.project_id,
             )
             self._persistence.require_compose_mutation_safe(
-                authorized,
+                accepted,
                 snapshot_id=str(preflight["snapshot_id"]),
             )
             disposition = self._persistence.reserve_operation(
-                authorized,
+                accepted,
                 compose_preflight=preflight,
             )
         else:
@@ -2747,11 +2802,11 @@ class StoreBackedMutationBackend:
         fresh_create_intent = False
         empty_digest = "sha256:" + hashlib.sha256(b"").hexdigest()
         for _transition in range(32):
-            target = self._persistence.compose_run_once_target(authorized)
+            target = self._persistence.compose_run_once_target(accepted)
             phase = target.phase
             if phase == "reserved":
                 self._persistence.mark_compose_run_once_image_bind_intent(
-                    authorized
+                    accepted
                 )
                 continue
             if phase == "image_bind_intent":
@@ -2784,12 +2839,12 @@ class StoreBackedMutationBackend:
                         operation_id=request.operation_id,
                     ) from exc
                 self._persistence.bind_compose_run_once_image(
-                    authorized,
+                    accepted,
                     image_id=image_id,
                 )
                 continue
             if phase == "image_bound":
-                self._persistence.mark_compose_run_once_create_intent(authorized)
+                self._persistence.mark_compose_run_once_create_intent(accepted)
                 fresh_create_intent = True
                 continue
             if phase == "create_intent":
@@ -2814,7 +2869,7 @@ class StoreBackedMutationBackend:
                         )
                         if observed is None:
                             self._persistence.record_compose_run_once_terminal(
-                                authorized,
+                                accepted,
                                 exit_code=None,
                                 timed_out=False,
                                 error_code=(
@@ -2825,7 +2880,7 @@ class StoreBackedMutationBackend:
                             continue
                 elif observed is None:
                     self._persistence.record_compose_run_once_terminal(
-                        authorized,
+                        accepted,
                         exit_code=None,
                         timed_out=False,
                         error_code="compose_run_once_creation_ambiguous",
@@ -2836,14 +2891,14 @@ class StoreBackedMutationBackend:
                     expected_image_id=str(target.expected_image_id),
                 )
                 self._persistence.bind_compose_run_once_container(
-                    authorized,
+                    accepted,
                     full_container_id=observation["full_container_id"],
                     image_id=observation["image_id"],
                 )
                 fresh_create_intent = False
                 continue
             if phase == "container_bound":
-                self._persistence.mark_compose_run_once_start_intent(authorized)
+                self._persistence.mark_compose_run_once_start_intent(accepted)
                 continue
             if phase == "start_intent":
                 try:
@@ -2864,11 +2919,11 @@ class StoreBackedMutationBackend:
                         operation_id=request.operation_id,
                     ) from exc
                 if observation["status"] == "running":
-                    self._persistence.mark_compose_run_once_started(authorized)
+                    self._persistence.mark_compose_run_once_started(accepted)
                     continue
                 if observation["status"] in {"exited", "dead"}:
                     self._persistence.record_compose_run_once_terminal(
-                        authorized,
+                        accepted,
                         exit_code=observation["exit_code"],
                         timed_out=False,
                     )
@@ -2879,13 +2934,13 @@ class StoreBackedMutationBackend:
                     operation_id=request.operation_id,
                 )
             if phase == "started":
-                self._persistence.mark_compose_run_once_wait_intent(authorized)
+                self._persistence.mark_compose_run_once_wait_intent(accepted)
                 continue
             if phase == "wait_intent":
                 remaining_seconds = target.deadline_epoch - time.time()
                 if remaining_seconds <= 0:
                     self._persistence.mark_compose_run_once_stop_intent(
-                        authorized
+                        accepted
                     )
                     continue
                 try:
@@ -2912,14 +2967,14 @@ class StoreBackedMutationBackend:
                     ) from exc
                 if observation["status"] in {"exited", "dead"}:
                     self._persistence.record_compose_run_once_terminal(
-                        authorized,
+                        accepted,
                         exit_code=observation["exit_code"],
                         timed_out=False,
                     )
                     continue
                 if observation.get("timed_out") is True:
                     self._persistence.mark_compose_run_once_stop_intent(
-                        authorized
+                        accepted
                     )
                     continue
                 raise BrokerBackendError(
@@ -2952,14 +3007,14 @@ class StoreBackedMutationBackend:
                         operation_id=request.operation_id,
                     )
                 self._persistence.record_compose_run_once_terminal(
-                    authorized,
+                    accepted,
                     exit_code=observation["exit_code"],
                     timed_out=True,
                 )
                 continue
             if phase == "terminal":
                 self._persistence.mark_compose_run_once_evidence_intent(
-                    authorized
+                    accepted
                 )
                 continue
             if phase == "evidence_intent":
@@ -2996,7 +3051,7 @@ class StoreBackedMutationBackend:
                         operation_id=request.operation_id,
                     )
                 self._persistence.record_compose_run_once_evidence(
-                    authorized,
+                    accepted,
                     published_receipt=evidence.published_receipt,
                     stdout_sha256=evidence.stdout_sha256,
                     stdout_byte_size=evidence.stdout_byte_size,
@@ -3006,7 +3061,7 @@ class StoreBackedMutationBackend:
                 continue
             if phase == "evidence_captured":
                 self._persistence.mark_compose_run_once_cleanup_intent(
-                    authorized
+                    accepted
                 )
                 continue
             if phase == "cleanup_intent":
@@ -3038,13 +3093,13 @@ class StoreBackedMutationBackend:
                         )
                     cleanup_status = "removed"
                 self._persistence.mark_compose_run_once_cleaned(
-                    authorized,
+                    accepted,
                     cleanup_status=cleanup_status,
                 )
                 continue
             if phase == "cleaned":
                 result = self._persistence.compose_run_once_public_result(
-                    authorized
+                    accepted
                 )
                 try:
                     self._persistence.finish_operation(
@@ -3070,15 +3125,15 @@ class StoreBackedMutationBackend:
         )
 
     def _execute_runtime_ensure(
-        self, authorized: AuthorizedBrokerRequest
+        self, accepted: AcceptedBrokerRequest
     ) -> Mapping[str, Any]:
-        """Ensure one enrolled target state without delegating decisions."""
+        """Ensure one configured target state without delegating decisions."""
 
-        request = authorized.request
+        request = accepted.request
         desired_state = str(request.arguments["desired_state"])
         target_kind = str(request.arguments["target_kind"])
 
-        existing = self._persistence.existing_operation_disposition(authorized)
+        existing = self._persistence.existing_operation_disposition(accepted)
         if existing is not None:
             if existing.state == "completed":
                 return dict(existing.result or {})
@@ -3099,7 +3154,7 @@ class StoreBackedMutationBackend:
         # strand a durable mutation. The target state is then re-read and its
         # immutable identity rechecked inside the reserved root operation.
         host_evidence = self._observe_committed_host(request.operation_id)
-        disposition = self._persistence.reserve_operation(authorized)
+        disposition = self._persistence.reserve_operation(accepted)
         if disposition.state == "completed":
             return dict(disposition.result or {})
         if disposition.state == "failed":
@@ -3118,10 +3173,10 @@ class StoreBackedMutationBackend:
 
         try:
             context, _inventory, classification_evidence = (
-                self._persistence.runtime_snapshot(authorized)
+                self._persistence.runtime_snapshot(accepted)
             )
             before = self._persistence.runtime_ensure_observation(
-                authorized, require_reserved=True
+                accepted, require_reserved=True
             )
         except BrokerError as error:
             self._persistence.finish_operation(
@@ -3168,31 +3223,8 @@ class StoreBackedMutationBackend:
             return self._finish_runtime_ensure_result(request, result)
 
         if target_kind == "service":
-            if str(before.get("role") or "").lower() != "worker":
-                blocked = RuntimeEnsureDecision(
-                    desired_state,
-                    decision.observed_state,
-                    None,
-                    "attention_required",
-                    "runtime_supervisor_required",
-                )
-                result = build_runtime_ensure_result(
-                    operation_id=request.operation_id,
-                    repository_id=request.project_id,
-                    repository_generation=request.repository_generation,
-                    resource_kind=target_kind,
-                    resource_id=request.resource_id,
-                    desired_state=desired_state,
-                    decision=blocked,
-                    mutation_performed=False,
-                    terminal_observation=before,
-                    snapshot_id=str(host_evidence["snapshot_id"]),
-                    proof_source="broker_host_observation",
-                    family_classified=family_classified,
-                )
-                return self._finish_runtime_ensure_result(request, result)
             return self._execute_worker_runtime_ensure(
-                authorized,
+                accepted,
                 context=context,
                 before=before,
                 decision=decision,
@@ -3201,27 +3233,67 @@ class StoreBackedMutationBackend:
 
         invoked = False
         try:
-            target = self._persistence.runtime_docker_target(authorized)
+            target = self._persistence.runtime_docker_target(accepted)
             invoked = True
             if decision.action == "start":
                 self._host_mutations.docker_start(target)
             else:
                 self._host_mutations.docker_stop(target)
-            final_host_evidence = self._observe_committed_host(
-                request.operation_id
-            )
-            _context, _inventory, final_classification = (
-                self._persistence.runtime_snapshot(authorized)
-            )
-            terminal = self._persistence.runtime_ensure_observation(
-                authorized, require_reserved=True
+            (
+                final_host_evidence,
+                terminal,
+                final_classification,
+            ) = self._observe_runtime_ensure_convergence(
+                accepted,
+                desired_state=desired_state,
             )
             terminal_certain = (
                 final_host_evidence.get("docker_available") is True
             )
-        except Exception:
+        except Exception as error:
+            preflight_rejected = (
+                isinstance(error, BrokerBackendError)
+                and error.code
+                in {
+                    "project_isolation_mismatch",
+                    "project_isolation_unobservable",
+                }
+            )
+            if invoked and not preflight_rejected:
+                try:
+                    (
+                        final_host_evidence,
+                        terminal,
+                        final_classification,
+                    ) = self._observe_runtime_ensure_convergence(
+                        accepted,
+                        desired_state=desired_state,
+                    )
+                except Exception:
+                    pass
+                else:
+                    reconciled = build_runtime_ensure_result(
+                        operation_id=request.operation_id,
+                        repository_id=request.project_id,
+                        repository_generation=request.repository_generation,
+                        resource_kind=target_kind,
+                        resource_id=request.resource_id,
+                        desired_state=desired_state,
+                        decision=decision,
+                        mutation_performed=True,
+                        terminal_observation=terminal,
+                        snapshot_id=str(final_host_evidence["snapshot_id"]),
+                        proof_source="broker_host_observation",
+                        certain=(
+                            final_host_evidence.get("docker_available") is True
+                        ),
+                        family_classified=not final_classification,
+                    )
+                    return self._finish_runtime_ensure_result(
+                        request, reconciled
+                    )
             failure_decision = decision
-            if not invoked:
+            if not invoked or preflight_rejected:
                 failure_decision = RuntimeEnsureDecision(
                     desired_state,
                     decision.observed_state,
@@ -3237,11 +3309,11 @@ class StoreBackedMutationBackend:
                 resource_id=request.resource_id,
                 desired_state=desired_state,
                 decision=failure_decision,
-                mutation_performed=invoked,
+                mutation_performed=invoked and not preflight_rejected,
                 terminal_observation=before,
                 snapshot_id=str(host_evidence["snapshot_id"]),
                 proof_source="broker_host_observation",
-                certain=not invoked,
+                certain=not invoked or preflight_rejected,
                 family_classified=family_classified,
             )
             return self._finish_runtime_ensure_result(request, uncertain)
@@ -3263,9 +3335,53 @@ class StoreBackedMutationBackend:
         )
         return self._finish_runtime_ensure_result(request, result)
 
+    def _observe_runtime_ensure_convergence(
+        self,
+        accepted: AcceptedBrokerRequest,
+        *,
+        desired_state: str,
+    ) -> tuple[dict[str, Any], dict[str, Any], list[dict[str, Any]]]:
+        """Boundedly re-observe a Docker mutation through readiness startup.
+
+        ``docker start`` proves daemon acceptance, not that a container health
+        check or PostgreSQL probe has completed.  Each turn is a new committed
+        authority observation; transient observation failures are retried, and
+        the final non-ready state remains truthful attention evidence.
+        """
+
+        last_error: Exception | None = None
+        latest: tuple[dict[str, Any], dict[str, Any], list[dict[str, Any]]] | None = None
+        for delay_seconds in (0.0, 0.25, 0.5, 1.0, 2.0):
+            if delay_seconds:
+                time.sleep(delay_seconds)
+            try:
+                host_evidence = self._observe_committed_host(
+                    accepted.request.operation_id
+                )
+                _context, _inventory, classification = (
+                    self._persistence.runtime_snapshot(accepted)
+                )
+                terminal = self._persistence.runtime_ensure_observation(
+                    accepted, require_reserved=True
+                )
+                latest = (host_evidence, terminal, classification)
+                last_error = None
+                if (
+                    host_evidence.get("docker_available") is True
+                    and not classification
+                    and observed_runtime_state(terminal) == desired_state
+                ):
+                    return latest
+            except Exception as error:
+                last_error = error
+        if latest is not None:
+            return latest
+        assert last_error is not None
+        raise last_error
+
     def _execute_worker_runtime_ensure(
         self,
-        authorized: AuthorizedBrokerRequest,
+        accepted: AcceptedBrokerRequest,
         *,
         context: Mapping[str, Any],
         before: Mapping[str, Any],
@@ -3274,7 +3390,7 @@ class StoreBackedMutationBackend:
     ) -> Mapping[str, Any]:
         """Invoke only fixed start/stop on an exact supervised worker."""
 
-        request = authorized.request
+        request = accepted.request
         desired_state = str(request.arguments["desired_state"])
         canonical_repository = (
             context["temporary_repo"]
@@ -3288,8 +3404,11 @@ class StoreBackedMutationBackend:
                 raise WorkerControlError("worker repository context is unavailable")
             if not isinstance(name, str) or not name:
                 raise WorkerControlError("worker name is unavailable")
-            self._persistence.require_worker_runtime_operation_current(authorized)
-            execution_uid = self._persistence.worker_execution_uid(authorized)
+            self._persistence.require_worker_runtime_operation_current(accepted)
+            endpoint_target = self._persistence.runtime_service_endpoint_target(
+                accepted
+            )
+            execution_uid = self._persistence.worker_execution_uid(accepted)
             with AccountStore.open(
                 self._persistence.database_path,
                 expected_uid=self._persistence.expected_uid,
@@ -3313,7 +3432,11 @@ class StoreBackedMutationBackend:
                     controlled = controller.start(
                         **identity,
                         actor=str(request.arguments["agent"]),
-                        keep_alive=None,
+                        keep_alive=(
+                            False
+                            if before.get("breaker_state") is None
+                            else None
+                        ),
                         crash_limit=None,
                         crash_window_seconds=None,
                         rearm=False,
@@ -3323,7 +3446,53 @@ class StoreBackedMutationBackend:
                         **identity,
                         actor=str(request.arguments["agent"]),
                     )
-            self._persistence.require_worker_runtime_operation_current(authorized)
+            self._persistence.require_worker_runtime_operation_current(accepted)
+            try:
+                endpoint_proof = self._runtime_service_endpoint_proof(
+                    endpoint_target=endpoint_target,
+                    action=str(decision.action),
+                    controlled=controlled,
+                    operation_id=request.operation_id,
+                )
+            except Exception:
+                if decision.action != "start":
+                    raise
+                with AccountStore.open(
+                    self._persistence.database_path,
+                    expected_uid=self._persistence.expected_uid,
+                    busy_timeout_ms=self._persistence.busy_timeout_ms,
+                ) as rollback_store:
+                    rollback = WorkerController(
+                        rollback_store,
+                        coordinator_script=(
+                            Path(__file__).resolve().parent.parent
+                            / "dev_coordinator.py"
+                        ),
+                        execution_uid=execution_uid,
+                    ).stop(
+                        **identity,
+                        actor=str(request.arguments["agent"]),
+                    )
+                terminal = worker_result_observation(
+                    resource_id=request.resource_id,
+                    controlled=rollback,
+                )
+                result = build_runtime_ensure_result(
+                    operation_id=request.operation_id,
+                    repository_id=request.project_id,
+                    repository_generation=request.repository_generation,
+                    resource_kind="service",
+                    resource_id=request.resource_id,
+                    desired_state=desired_state,
+                    decision=decision,
+                    mutation_performed=True,
+                    terminal_observation=terminal,
+                    snapshot_id=None,
+                    proof_source="broker_service_supervisor",
+                    family_classified=family_classified,
+                )
+                return self._finish_runtime_ensure_result(request, result)
+            controlled = {**dict(controlled), "endpoint_proof": endpoint_proof}
             terminal = worker_result_observation(
                 resource_id=request.resource_id,
                 controlled=controlled,
@@ -3371,6 +3540,95 @@ class StoreBackedMutationBackend:
         )
         return self._finish_runtime_ensure_result(request, result)
 
+    def _runtime_service_endpoint_proof(
+        self,
+        *,
+        endpoint_target: Any,
+        action: str,
+        controlled: Mapping[str, Any],
+        operation_id: str,
+    ) -> dict[str, Any]:
+        """Prove the sealed cwd and any promised TCP endpoint after control."""
+
+        if not endpoint_target.listener_required:
+            return {
+                "certain": True,
+                "listener_required": False,
+                "cwd_binding": "sealed_definition",
+            }
+        port = endpoint_target.listener_port
+        if type(port) is not int:
+            raise BrokerBackendError(
+                "service_endpoint_binding_unavailable",
+                "Network service endpoint proof lost its exact port binding.",
+                operation_id=operation_id,
+            )
+        if action in {"start", "restart", "replace"}:
+            evidence = self._host_mutations.verify_owned_tcp_listener(
+                port=port,
+                canonical_root=endpoint_target.canonical_root,
+            )
+            pid = controlled.get("pid")
+            started = controlled.get("process_start_time")
+            observed_identity = evidence.get("process_identity")
+            expected_identities = {
+                f"linux:{pid}:{started}",
+                f"process:{pid}:{started}",
+            }
+            if (
+                type(pid) is not int
+                or pid <= 1
+                or not isinstance(started, str)
+                or not started
+                or evidence.get("pid") != pid
+                or evidence.get("cwd") != endpoint_target.cwd
+                or observed_identity not in expected_identities
+            ):
+                raise BrokerBackendError(
+                    "service_endpoint_identity_mismatch",
+                    "The observed listener does not match the exact supervised process and sealed cwd.",
+                    operation_id=operation_id,
+                )
+            return {
+                "certain": True,
+                "listener_required": True,
+                "state": "listening",
+                "port": port,
+                "pid": pid,
+                "process_identity": observed_identity,
+                "cwd_binding": "exact",
+            }
+        if action == "stop":
+            available = self._host_mutations.select_available_port(
+                candidates=(port,), protocol="tcp"
+            )
+            process_proof = controlled.get("terminal_process_proof")
+            if available != port or not (
+                isinstance(process_proof, Mapping)
+                and process_proof.get("certain") is True
+                and process_proof.get("state")
+                in {"absent", "pid_reused", "not_launched"}
+            ):
+                raise BrokerBackendError(
+                    "service_stop_identity_unproven",
+                    "Service stop did not prove both the exact process and listener absent.",
+                    operation_id=operation_id,
+                )
+            return {
+                "certain": True,
+                "listener_required": True,
+                "state": "stopped",
+                "port": port,
+                "process": dict(process_proof),
+                "listener": "absent",
+                "cwd_binding": "sealed_definition",
+            }
+        raise BrokerBackendError(
+            "unsupported_runtime_action",
+            "Service endpoint proof received an unsupported lifecycle action.",
+            operation_id=operation_id,
+        )
+
     def _finish_runtime_ensure_result(
         self, request: BrokerRequest, result: Mapping[str, Any]
     ) -> Mapping[str, Any]:
@@ -3387,24 +3645,380 @@ class StoreBackedMutationBackend:
             ) from error
         return result
 
+    def _runtime_replacement_subrequest(
+        self,
+        accepted: AcceptedBrokerRequest,
+        *,
+        operation_id: str,
+        resource_id: str,
+        operation: BrokerOperation,
+        arguments: Mapping[str, Any],
+    ) -> AcceptedBrokerRequest:
+        """Create and accept one deterministic typed replacement phase."""
+
+        parent = accepted.request
+        request = BrokerRequest.create(
+            operation_id=operation_id,
+            authority_generation=parent.authority_generation,
+            account_id=parent.account_id,
+            project_id=parent.project_id,
+            repository_generation=parent.repository_generation,
+            resource_id=resource_id,
+            operation=operation,
+            arguments=arguments,
+        )
+        return self._persistence.accept(accepted.peer, request)
+
+    def _execute_runtime_replacement(
+        self, accepted: AcceptedBrokerRequest
+    ) -> Mapping[str, Any]:
+        """Replace one Compose-backed container with durable identity/data proof."""
+
+        request = accepted.request
+        existing = self._persistence.existing_operation_disposition(accepted)
+        journal = self._persistence.runtime_replacement_record(accepted)
+        if existing is not None and existing.state == "completed":
+            return dict(existing.result or {})
+        if existing is not None and existing.state == "failed":
+            raise BrokerBackendError(
+                existing.error_code or "runtime_replace_failed",
+                existing.error_message or "Docker-backed replacement failed.",
+                operation_id=request.operation_id,
+            )
+
+        before_observation: Mapping[str, Any] | None = None
+        before_snapshot = None
+        if journal is None:
+            before_observation = self._observe_fresh_full_docker(
+                request.operation_id, project_id=request.project_id
+            )
+            if before_observation.get("docker_available") is not True:
+                raise BrokerBackendError(
+                    "lifecycle_observation_incomplete",
+                    "Replacement requires an available fresh service-owned Docker observation; no resource was changed.",
+                    operation_id=request.operation_id,
+                )
+            before_snapshot = load_broker_runtime_snapshot(
+                accepted, persistence=self._persistence
+            )
+            blocked = unclassified_broker_runtime_report(
+                accepted,
+                snapshot=before_snapshot,
+                observation=before_observation,
+            )
+            if blocked is not None:
+                return blocked
+            if existing is None:
+                disposition = self._persistence.reserve_operation(accepted)
+                if disposition.state == "completed":
+                    return dict(disposition.result or {})
+                if disposition.state == "failed":
+                    raise BrokerBackendError(
+                        disposition.error_code or "runtime_replace_failed",
+                        disposition.error_message
+                        or "Docker-backed replacement failed.",
+                        operation_id=request.operation_id,
+                    )
+                if disposition.state not in {"execute", "pending", "reconcile"}:
+                    raise BrokerBackendError(
+                        "operation_in_progress",
+                        "Replacement durable reservation is not executable.",
+                        operation_id=request.operation_id,
+                    )
+            try:
+                target = self._persistence.runtime_docker_target(accepted)
+                session_id = self._persistence.begin_broker_runtime_session(
+                    accepted, target=target
+                )
+                journal = self._persistence.prepare_runtime_replacement(
+                    accepted, evidence=before_observation
+                )
+                self._runtime_reaper_wake.set()
+            except BrokerError as error:
+                self._record_failure(
+                    request.operation_id,
+                    code=error.code,
+                    message=error.message,
+                )
+                raise BrokerBackendError(
+                    error.code,
+                    error.message,
+                    operation_id=request.operation_id,
+                ) from None
+        else:
+            session_id = self._persistence.broker_runtime_session_id(
+                request.operation_id
+            )
+            if session_id is None:
+                raise BrokerBackendError(
+                    "operation_state_conflict",
+                    "Replacement lost its durable cleanup session.",
+                    operation_id=request.operation_id,
+                )
+
+        assert journal is not None
+        backup_result: Mapping[str, Any] | None = None
+        if journal.resource_kind == "database_stack":
+            if journal.database_backup_id is None:
+                assert journal.backup_operation_id is not None
+                assert journal.database_name is not None
+                backup_request = self._runtime_replacement_subrequest(
+                    accepted,
+                    operation_id=journal.backup_operation_id,
+                    resource_id=journal.old_docker_resource_id,
+                    operation=BrokerOperation.DATABASE_BACKUP,
+                    arguments={"database_name": journal.database_name},
+                )
+                backup_result = self.execute(backup_request)
+                backup_id = str(
+                    backup_result.get("database_backup_id") or ""
+                )
+                journal = self._persistence.record_runtime_replacement_backup(
+                    accepted, database_backup_id=backup_id
+                )
+            else:
+                backup_result = {
+                    "database_backup_id": journal.database_backup_id,
+                    "verification_status": "strong",
+                    "status": "available",
+                    "replayed": True,
+                }
+
+        compose_request = self._runtime_replacement_subrequest(
+            accepted,
+            operation_id=journal.compose_operation_id,
+            resource_id=journal.compose_definition_id,
+            operation=BrokerOperation.COMPOSE_UP,
+            arguments={
+                "service": journal.compose_service,
+                "force_recreate": True,
+                "wait_timeout_seconds": 600,
+            },
+        )
+        compose_result: Mapping[str, Any] | None = None
+        replacement_observation: Mapping[str, Any] | None = None
+        if journal.phase not in {
+            "rebound",
+            "restore_intent",
+            "restore_complete",
+            "terminal",
+        }:
+            try:
+                compose_result = self.execute(compose_request)
+            except BrokerBackendError as error:
+                if error.code != "operation_outcome_uncertain":
+                    raise
+                # A lost Compose result is never reissued. Fresh exact state
+                # may still prove the new identity required by replacement;
+                # settle the nested generic operation as uncertain/failed and
+                # let the parent replacement own the stronger identity proof.
+                replacement_observation = self._observe_fresh_full_docker(
+                    request.operation_id, project_id=request.project_id
+                )
+                self._persistence.reconcile_compose_operation(
+                    journal.compose_operation_id,
+                    evidence=replacement_observation,
+                    accepted=compose_request,
+                )
+                compose_result = {
+                    "action": "up",
+                    "reconciled_without_reexecution": True,
+                    "nested_operation_status": "uncertain_terminal_failure",
+                }
+            if replacement_observation is None:
+                replacement_observation = self._observe_fresh_full_docker(
+                    request.operation_id, project_id=request.project_id
+                )
+            journal = self._persistence.rebind_runtime_replacement(
+                accepted, evidence=replacement_observation
+            )
+        else:
+            replacement_observation = {
+                "status": "already_rebound",
+                "new_docker_resource_id": journal.new_docker_resource_id,
+                "new_full_container_id": journal.new_full_container_id,
+            }
+
+        restore_result: Mapping[str, Any] | None = None
+        if journal.resource_kind == "database_stack" and journal.phase not in {
+            "restore_complete",
+            "terminal",
+        }:
+            phase_before_restore = journal.phase
+            target, backup, saved_restore = (
+                self._persistence.begin_runtime_replacement_restore(accepted)
+            )
+            if saved_restore is None:
+                recovered_restore: Mapping[str, Any] | None = None
+                if phase_before_restore == "restore_intent":
+                    recovered_restore = (
+                        self._host_mutations.postgres_reconcile_restore(
+                            target,
+                            backup,
+                            safety_output_root=str(
+                                self._postgres_backup_root / "pre-restore"
+                            ),
+                        )
+                    )
+                    if recovered_restore is None:
+                        raise BrokerBackendError(
+                            "operation_outcome_uncertain",
+                            "The prior PostgreSQL restore has no exact durable completion proof; it was not reexecuted.",
+                            operation_id=request.operation_id,
+                        )
+                raw_restore = (
+                    recovered_restore
+                    if recovered_restore is not None
+                    else self._host_mutations.postgres_restore(
+                        target,
+                        backup,
+                        safety_output_root=str(
+                            self._postgres_backup_root / "pre-restore"
+                        ),
+                    )
+                )
+                saved_restore = self._persistence.save_runtime_replacement_restore_result(
+                    accepted, result=_json_safe_mapping(raw_restore)
+                )
+            restore_result = self._persistence.complete_runtime_replacement_restore(
+                accepted,
+                target=target,
+                backup=backup,
+                result=saved_restore,
+            )
+            journal = self._persistence.runtime_replacement_record(accepted)
+            assert journal is not None
+        elif journal.resource_kind == "database_stack":
+            restore_result = {
+                "database_backup_id": journal.database_backup_id,
+                "status": "restored",
+                "replayed": True,
+            }
+
+        if journal.new_docker_resource_id is None or journal.new_full_container_id is None:
+            raise BrokerBackendError(
+                "runtime_replace_identity_unproven",
+                "Replacement has no exact new immutable container identity.",
+                operation_id=request.operation_id,
+            )
+        current_resource_id = (
+            journal.new_docker_resource_id
+            if journal.resource_kind == "docker"
+            else journal.requested_resource_id
+        )
+        report = {
+            "schema_version": 1,
+            "ok": True,
+            "ready": True,
+            "action": "replace",
+            "classification": "ready",
+            "authority": "broker",
+            "operation_id": request.operation_id,
+            "repository": {
+                "root_repo_id": request.arguments["root_repo_id"],
+                "effective_repo_id": request.project_id,
+                "kind": (
+                    "temporary"
+                    if request.arguments["temporary_repo_id"] is not None
+                    else "root"
+                ),
+            },
+            # Preserve the submitted logical target for the wire reply. Docker
+            # callers receive the new physical ID below and use it thereafter.
+            "target": {
+                "kind": journal.resource_kind,
+                "id": journal.requested_resource_id,
+            },
+            "run_id": session_id,
+            "replacement": {
+                "state": "created",
+                "compose_definition_id": journal.compose_definition_id,
+                "compose_service": journal.compose_service,
+                "previous": {
+                    "docker_resource_id": journal.old_docker_resource_id,
+                    "full_container_id": journal.old_full_container_id,
+                },
+                "current": {
+                    "resource_id": current_resource_id,
+                    "docker_resource_id": journal.new_docker_resource_id,
+                    "full_container_id": journal.new_full_container_id,
+                },
+                "old_identity_absent": True,
+                "volumes_preserved_from_sealed_model": True,
+                "dependencies_recreated": False,
+                "backup": None
+                if backup_result is None
+                else dict(backup_result),
+                "restore": None
+                if restore_result is None
+                else dict(restore_result),
+                "data_preservation_verified": (
+                    journal.resource_kind == "docker"
+                    or restore_result is not None
+                ),
+                "cleanup": {
+                    "ttl_seconds": request.arguments["ttl_seconds"],
+                    "kill_after_run": bool(
+                        request.arguments["kill_after_run"]
+                    ),
+                    "created_resource_disposition": (
+                        "remove"
+                        if request.arguments["ttl_seconds"] is not None
+                        or bool(request.arguments["kill_after_run"])
+                        else "retain"
+                    ),
+                },
+            },
+            "observation": {
+                "before": before_observation,
+                "after": replacement_observation,
+            },
+            "compose": None
+            if compose_result is None
+            else dict(compose_result),
+        }
+        try:
+            self._persistence.finish_runtime_replacement(
+                accepted, result=report
+            )
+        except Exception as error:
+            raise BrokerBackendError(
+                "operation_outcome_uncertain",
+                "Replacement completed but its durable terminal report did not commit; retry only this operation ID.",
+                operation_id=request.operation_id,
+            ) from error
+        if bool(request.arguments["kill_after_run"]):
+            # The session expiry is the operation creation time, so this turn
+            # performs the same idempotent cleanup the background reaper will
+            # recover after a crash or lost reply.
+            self.reap_broker_runtime_sessions_once()
+        return report
+
     def _execute_runtime_request(
-        self, authorized: AuthorizedBrokerRequest
+        self, accepted: AcceptedBrokerRequest
     ) -> Mapping[str, Any]:
         """Execute an ID-only shared runtime request through broker authority."""
 
-        request = authorized.request
+        request = accepted.request
         action = str(request.arguments["action"])
         target_kind = str(request.arguments["target_kind"])
         if action == "temporary_start":
-            return self._execute_temporary_dev_service(authorized)
+            return self._execute_temporary_dev_service(accepted)
         if action == "capture_logs":
             if target_kind == "service":
-                return self._execute_runtime_service_log_capture(authorized)
-            return self._execute_runtime_log_capture(authorized)
+                temporary = self._persistence.temporary_service_status(
+                    accepted
+                )
+                if temporary is not None:
+                    return self._execute_temporary_service_log_capture(
+                        accepted, temporary=temporary
+                    )
+                return self._execute_runtime_service_log_capture(accepted)
+            return self._execute_runtime_log_capture(accepted)
         if action == "status":
             if target_kind == "service":
                 temporary = self._persistence.temporary_service_status(
-                    authorized
+                    accepted
                 )
                 if temporary is not None:
                     observed = self._temporary_dev_services.status(
@@ -3423,10 +4037,10 @@ class StoreBackedMutationBackend:
                         state = observed_state
                     ready = state == "running"
                     snapshot = load_broker_runtime_snapshot(
-                        authorized, persistence=self._persistence
+                        accepted, persistence=self._persistence
                     )
                     return build_broker_runtime_snapshot_report(
-                        authorized,
+                        accepted,
                         snapshot=snapshot,
                         action_result={
                             "ok": True,
@@ -3452,38 +4066,48 @@ class StoreBackedMutationBackend:
                             "main_pid": observed["main_pid"],
                         },
                     )
-            # Status is an authority-owned observation for every enrolled
+            # Status is an authority-owned observation for every configured
             # runtime kind.  Service-role supervision is a mutation boundary;
             # it must not block this read-only path for ordinary web services.
             observation = self._observe_committed_host(request.operation_id)
             return execute_broker_runtime_request(
-                authorized,
+                accepted,
                 persistence=self._persistence,
                 observation=observation,
             )
 
         if target_kind == "service":
-            role = self._persistence.runtime_service_role(authorized)
-            if isinstance(role, str) and role.lower() == "worker":
-                return self._execute_worker_runtime_request(authorized)
-            raise BrokerBackendError(
-                "runtime_supervisor_required",
-                "Service lifecycle requires an installed worker-role definition and broker-owned peer-UID supervisor.",
-                operation_id=request.operation_id,
+            role = self._persistence.runtime_service_role(accepted)
+            if str(role or "").lower() == "temporary":
+                temporary = self._persistence.temporary_service_status(
+                    accepted
+                )
+                if temporary is None:
+                    raise BrokerBackendError(
+                        "temporary_service_catalog_invalid",
+                        "The temporary service has no retained lifecycle identity.",
+                        operation_id=request.operation_id,
+                    )
+                return self._execute_temporary_service_runtime_request(
+                    accepted, temporary=temporary
+                )
+            if action == "replace" and str(role or "").lower() != "worker":
+                raise BrokerBackendError(
+                    "runtime_supervisor_required",
+                    "Definition replacement remains available only for an installed worker-role service.",
+                    operation_id=request.operation_id,
+                )
+            return self._execute_worker_runtime_request(
+                accepted, service_role=role
             )
-        if request.arguments["ttl_seconds"] is not None:
-            raise BrokerBackendError(
-                "runtime_cleanup_owner_required",
-                "Shared start/restart with a TTL requires the broker-owned runtime reaper; no resource was changed.",
-                operation_id=request.operation_id,
-            )
-
-        existing = self._persistence.existing_operation_disposition(authorized)
+        if action == "replace":
+            return self._execute_runtime_replacement(accepted)
+        existing = self._persistence.existing_operation_disposition(accepted)
         if existing is not None:
             if existing.state == "completed":
                 return dict(existing.result or {})
             if existing.state == "reconcile":
-                return self._reconcile_runtime_request(authorized)
+                return self._reconcile_runtime_request(accepted)
             if existing.state == "failed":
                 raise BrokerBackendError(
                     existing.error_code or "mutation_failed",
@@ -3506,17 +4130,17 @@ class StoreBackedMutationBackend:
                 operation_id=request.operation_id,
             )
         before_snapshot = load_broker_runtime_snapshot(
-            authorized, persistence=self._persistence
+            accepted, persistence=self._persistence
         )
         blocked = unclassified_broker_runtime_report(
-            authorized,
+            accepted,
             snapshot=before_snapshot,
             observation=before_observation,
         )
         if blocked is not None:
             return blocked
 
-        disposition = self._persistence.reserve_operation(authorized)
+        disposition = self._persistence.reserve_operation(accepted)
         if disposition.state == "completed":
             return dict(disposition.result or {})
         if disposition.state == "failed":
@@ -3533,7 +4157,11 @@ class StoreBackedMutationBackend:
             )
 
         try:
-            target = self._persistence.runtime_docker_target(authorized)
+            target = self._persistence.runtime_docker_target(accepted)
+            session_id = self._persistence.begin_broker_runtime_session(
+                accepted, target=target
+            )
+            self._runtime_reaper_wake.set()
         except BrokerError as exc:
             self._record_failure(
                 request.operation_id, code=exc.code, message=exc.message
@@ -3543,18 +4171,19 @@ class StoreBackedMutationBackend:
             ) from None
 
         try:
-            if action == "start":
-                raw_result = self._host_mutations.docker_start(target)
-            elif action == "stop":
-                raw_result = self._host_mutations.docker_stop(target)
-            elif action == "restart":
-                raw_result = self._host_mutations.docker_restart(target)
-            else:  # wire validation makes this unreachable
-                raise BrokerBackendError(
-                    "unsupported_runtime_action",
-                    "Unsupported shared runtime lifecycle action.",
-                    operation_id=request.operation_id,
-                )
+            with self._runtime_session_mutation_lock:
+                if action == "start":
+                    raw_result = self._host_mutations.docker_start(target)
+                elif action == "stop":
+                    raw_result = self._host_mutations.docker_stop(target)
+                elif action == "restart":
+                    raw_result = self._host_mutations.docker_restart(target)
+                else:  # wire validation makes this unreachable
+                    raise BrokerBackendError(
+                        "unsupported_runtime_action",
+                        "Unsupported shared runtime lifecycle action.",
+                        operation_id=request.operation_id,
+                    )
         except Exception:
             self._raise_runtime_outcome_uncertain(
                 request.operation_id,
@@ -3571,7 +4200,7 @@ class StoreBackedMutationBackend:
                 request.operation_id, project_id=request.project_id
             )
             after_snapshot = load_broker_runtime_snapshot(
-                authorized, persistence=self._persistence
+                accepted, persistence=self._persistence
             )
         except Exception as exc:
             self._raise_runtime_outcome_uncertain(
@@ -3583,10 +4212,11 @@ class StoreBackedMutationBackend:
                     "observation did not commit; reconciliation is required."
                 ),
                 cause=exc,
+                failure_code=_observation_failure_code(exc),
             )
 
         try:
-            final_target = self._persistence.runtime_docker_target(authorized)
+            final_target = self._persistence.runtime_docker_target(accepted)
         except BrokerError as exc:
             if exc.code != "stale_resource_definition":
                 self._record_failure(
@@ -3628,7 +4258,7 @@ class StoreBackedMutationBackend:
             )
 
         final_blocked = unclassified_broker_runtime_report(
-            authorized,
+            accepted,
             snapshot=after_snapshot,
             observation=after_observation,
         )
@@ -3683,10 +4313,11 @@ class StoreBackedMutationBackend:
                 code, message, operation_id=request.operation_id
             )
         report = build_broker_runtime_snapshot_report(
-            authorized,
+            accepted,
             snapshot=after_snapshot,
             action_result=terminal,
         )
+        report["run_id"] = session_id
         try:
             self._persistence.finish_operation(
                 request.operation_id, result=report
@@ -3705,12 +4336,12 @@ class StoreBackedMutationBackend:
         return report
 
     def _execute_temporary_dev_service(
-        self, authorized: AuthorizedBrokerRequest
+        self, accepted: AcceptedBrokerRequest
     ) -> Mapping[str, Any]:
         """Start one repository-owned transient service with TTL cleanup."""
 
-        request = authorized.request
-        existing = self._persistence.existing_operation_disposition(authorized)
+        request = accepted.request
+        existing = self._persistence.existing_operation_disposition(accepted)
         if existing is not None:
             if existing.state == "completed":
                 return dict(existing.result or {})
@@ -3730,7 +4361,7 @@ class StoreBackedMutationBackend:
         disposition = (
             existing
             if existing is not None
-            else self._persistence.reserve_operation(authorized)
+            else self._persistence.reserve_operation(accepted)
         )
         if disposition.state == "completed":
             return dict(disposition.result or {})
@@ -3754,10 +4385,10 @@ class StoreBackedMutationBackend:
 
         try:
             expires_at, remaining_ttl_seconds = (
-                self._persistence.temporary_service_launch_deadline(authorized)
+                self._persistence.temporary_service_launch_deadline(accepted)
             )
             predecessor = self._persistence.temporary_service_predecessor(
-                authorized
+                accepted
             )
             if predecessor is not None:
                 predecessor_state = self._temporary_dev_services.status(
@@ -3770,7 +4401,7 @@ class StoreBackedMutationBackend:
                         "a temporary service with this repository/name identity is still active; use its exact status or wait for its TTL",
                     )
             execution = self._persistence.temporary_service_execution_context(
-                authorized
+                accepted
             )
             if execution.generation != request.repository_generation:
                 raise TemporaryDevServiceError(
@@ -3803,7 +4434,7 @@ class StoreBackedMutationBackend:
             }
             result["schema_version"] = 1
             result = self._persistence.finish_temporary_dev_service(
-                authorized, result=result
+                accepted, result=result
             )
             return result
         except TemporaryDevServiceError as error:
@@ -3833,15 +4464,15 @@ class StoreBackedMutationBackend:
             ) from error
 
     def _execute_runtime_log_capture(
-        self, authorized: AuthorizedBrokerRequest
+        self, accepted: AcceptedBrokerRequest
     ) -> Mapping[str, Any]:
         """Capture and descriptor-verify one exact Docker-backed log artifact."""
 
-        request = authorized.request
-        before = self._persistence.runtime_docker_read_target(authorized)
+        request = accepted.request
+        before = self._persistence.runtime_docker_read_target(accepted)
         try:
             raw, discarded = self._host_mutations.docker_capture_logs(before)
-            after = self._persistence.runtime_docker_read_target(authorized)
+            after = self._persistence.runtime_docker_read_target(accepted)
             if after.immutable_fingerprint != before.immutable_fingerprint:
                 raise BrokerBackendError(
                     "runtime_resource_identity_changed",
@@ -3859,7 +4490,7 @@ class StoreBackedMutationBackend:
                 input_discarded_bytes=discarded,
             )
         except BrokerBackendError as error:
-            after = self._persistence.runtime_docker_read_target(authorized)
+            after = self._persistence.runtime_docker_read_target(accepted)
             if (
                 after.immutable_fingerprint != before.immutable_fingerprint
                 or error.code == "runtime_resource_identity_changed"
@@ -3893,7 +4524,7 @@ class StoreBackedMutationBackend:
         ):
             raise BrokerBackendError(
                 "runtime_log_artifact_identity_mismatch",
-                "The runtime log artifact does not match the exact authorized target.",
+                "The runtime log artifact does not match the exact accepted target.",
                 operation_id=request.operation_id,
             )
         public_artifact = {
@@ -3926,17 +4557,165 @@ class StoreBackedMutationBackend:
             },
         }
 
+    def _execute_temporary_service_log_capture(
+        self,
+        accepted: AcceptedBrokerRequest,
+        *,
+        temporary: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        """Capture journal evidence for one exact retained transient unit."""
+
+        request = accepted.request
+        try:
+            observed = self._temporary_dev_services.capture_logs(
+                unit=str(temporary["unit"]), port=int(temporary["port"])
+            )
+        except TemporaryDevServiceError as error:
+            raise BrokerBackendError(
+                error.code,
+                public_temporary_dev_service_error(error),
+                operation_id=request.operation_id,
+            ) from None
+        capture = persist_service_log_artifact(
+            root=self._runtime_log_root,
+            target_resource_id=request.resource_id,
+            definition_fingerprint=str(temporary["definition_fingerprint"]),
+            source_file_identity=str(observed["source_identity"]),
+            raw=bytes(observed["raw"]),
+            request=dict(request.arguments),
+        )
+        manifest, payload = read_runtime_log_artifact(
+            root=self._runtime_log_root,
+            artifact_kind="service",
+            artifact_id=str(capture["artifact_id"]),
+        )
+        public_artifact = {
+            key: value for key, value in capture.items() if key != "path"
+        }
+        return {
+            "schema_version": 1,
+            "ok": True,
+            "action": "capture_logs",
+            "classification": "available",
+            "repository": {
+                "root_repo_id": request.arguments["root_repo_id"],
+                "effective_repo_id": request.project_id,
+                "kind": (
+                    "temporary"
+                    if request.arguments["temporary_repo_id"] is not None
+                    else "root"
+                ),
+            },
+            "target": {"kind": "service", "id": request.resource_id},
+            "artifact": public_artifact,
+            "artifact_content": {
+                "artifact_id": manifest["artifact_id"],
+                "text": payload.decode("utf-8", errors="strict"),
+            },
+        }
+
+    def _execute_temporary_service_runtime_request(
+        self,
+        accepted: AcceptedBrokerRequest,
+        *,
+        temporary: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        """Stop or restart one broker-created transient service by retained ID."""
+
+        request = accepted.request
+        action = str(request.arguments["action"])
+        if action not in {"stop", "restart"}:
+            raise BrokerBackendError(
+                "temporary_service_action_unsupported",
+                "Temporary services support status, capture_logs, stop, and restart.",
+                operation_id=request.operation_id,
+            )
+        disposition = self._persistence.existing_operation_disposition(accepted)
+        if disposition is None:
+            disposition = self._persistence.reserve_operation(accepted)
+        if disposition.state == "completed":
+            return dict(disposition.result or {})
+        if disposition.state == "failed":
+            raise BrokerBackendError(
+                disposition.error_code or "temporary_service_control_failed",
+                disposition.error_message or "Temporary service control failed.",
+                operation_id=request.operation_id,
+            )
+        if disposition.state != "execute":
+            raise BrokerBackendError(
+                "operation_outcome_uncertain",
+                "The temporary service operation is pending; inspect exact status before retrying.",
+                operation_id=request.operation_id,
+            )
+        try:
+            if action == "stop":
+                controlled = self._temporary_dev_services.stop(
+                    unit=str(temporary["unit"]), port=int(temporary["port"])
+                )
+            else:
+                if temporary.get("expired") is True:
+                    raise TemporaryDevServiceError(
+                        "temporary_service_expired",
+                        "the retained temporary service TTL has expired; launch it again",
+                    )
+                controlled = self._temporary_dev_services.restart(
+                    unit=str(temporary["unit"]),
+                    port=int(temporary["port"]),
+                    execution_uid=int(temporary["execution_uid"]),
+                )
+        except TemporaryDevServiceError as error:
+            if error.code != "operation_outcome_uncertain":
+                self._record_failure(
+                    request.operation_id,
+                    code=error.code,
+                    message=public_temporary_dev_service_error(error),
+                )
+            raise BrokerBackendError(
+                error.code,
+                public_temporary_dev_service_error(error),
+                operation_id=request.operation_id,
+            ) from None
+        state = str(controlled.get("state") or "unknown")
+        ready = state == "running" and controlled.get("ready") is True
+        snapshot = load_broker_runtime_snapshot(
+            accepted, persistence=self._persistence
+        )
+        report = build_broker_runtime_snapshot_report(
+            accepted,
+            snapshot=snapshot,
+            action_result={
+                **dict(controlled),
+                "ok": state == "stopped" if action == "stop" else ready,
+                "ready": ready,
+                "state": state,
+                "classification": "ready" if ready else "stopped",
+                "authority": "broker_temporary_service",
+                "operation_id": request.operation_id,
+            },
+        )
+        try:
+            self._persistence.finish_operation(
+                request.operation_id, result=report
+            )
+        except Exception as error:
+            raise BrokerBackendError(
+                "operation_outcome_uncertain",
+                "Temporary service control completed but its durable result did not commit; inspect exact status.",
+                operation_id=request.operation_id,
+            ) from error
+        return report
+
     def _execute_runtime_service_log_capture(
-        self, authorized: AuthorizedBrokerRequest
+        self, accepted: AcceptedBrokerRequest
     ) -> Mapping[str, Any]:
         """Capture one service-definition log through root broker authority."""
 
-        request = authorized.request
-        before = self._persistence.runtime_service_log_target(authorized)
+        request = accepted.request
+        before = self._persistence.runtime_service_log_target(accepted)
         raw, discarded, source_identity = self._host_mutations.service_capture_logs(
             before
         )
-        after = self._persistence.runtime_service_log_target(authorized)
+        after = self._persistence.runtime_service_log_target(accepted)
         if after != before:
             raise BrokerBackendError(
                 "runtime_resource_identity_changed",
@@ -3965,7 +4744,7 @@ class StoreBackedMutationBackend:
         ):
             raise BrokerBackendError(
                 "runtime_log_artifact_identity_mismatch",
-                "The service log artifact does not match the exact authorized definition.",
+                "The service log artifact does not match the exact accepted definition.",
                 operation_id=request.operation_id,
             )
         public_artifact = {
@@ -3994,11 +4773,14 @@ class StoreBackedMutationBackend:
         }
 
     def _execute_worker_runtime_request(
-        self, authorized: AuthorizedBrokerRequest
+        self,
+        accepted: AcceptedBrokerRequest,
+        *,
+        service_role: str | None,
     ) -> Mapping[str, Any]:
-        """Control one exact worker under its enrolled execution owner."""
+        """Control one exact service under its configured execution owner."""
 
-        request = authorized.request
+        request = accepted.request
         action = str(request.arguments["action"])
         if (
             action != "status"
@@ -4009,16 +4791,16 @@ class StoreBackedMutationBackend:
             )
         ):
             raise BrokerBackendError(
-                "supervised_worker_purpose_conflict",
-                "Persistent supervised workers require purpose=development, ttl_seconds=null, and kill_after_run=false.",
+                "supervised_service_purpose_conflict",
+                "Persistent supervised services require purpose=development, ttl_seconds=null, and kill_after_run=false.",
                 operation_id=request.operation_id,
             )
 
         snapshot = load_broker_runtime_snapshot(
-            authorized, persistence=self._persistence
+            accepted, persistence=self._persistence
         )
         blocked = unclassified_broker_runtime_report(
-            authorized,
+            accepted,
             snapshot=snapshot,
             observation={"source": "broker_authoritative_inventory"},
         )
@@ -4043,7 +4825,7 @@ class StoreBackedMutationBackend:
                 "The exact worker repository path is unavailable to system authority.",
                 operation_id=request.operation_id,
             )
-        execution_uid = self._persistence.worker_execution_uid(authorized)
+        execution_uid = self._persistence.worker_execution_uid(accepted)
         replacement_definition: dict[str, Any] | None = None
         if action == "replace":
             replacement_definition = _validated_broker_worker_replacement(
@@ -4054,7 +4836,7 @@ class StoreBackedMutationBackend:
             )
 
         if action != "status":
-            existing = self._persistence.existing_operation_disposition(authorized)
+            existing = self._persistence.existing_operation_disposition(accepted)
             if existing is not None:
                 if existing.state == "completed":
                     return dict(existing.result or {})
@@ -4069,7 +4851,10 @@ class StoreBackedMutationBackend:
                     "This exact worker control operation is pending; inspect status before issuing a new operation.",
                     operation_id=request.operation_id,
                 )
-            disposition = self._persistence.reserve_operation(authorized)
+            endpoint_target = self._persistence.runtime_service_endpoint_target(
+                accepted
+            )
+            disposition = self._persistence.reserve_operation(accepted)
             if disposition.state == "completed":
                 return dict(disposition.result or {})
             if disposition.state == "failed":
@@ -4086,7 +4871,7 @@ class StoreBackedMutationBackend:
                 )
             try:
                 self._persistence.require_worker_runtime_operation_current(
-                    authorized
+                    accepted
                 )
             except BrokerError as error:
                 self._record_failure(
@@ -4119,13 +4904,20 @@ class StoreBackedMutationBackend:
                     "canonical_repository": canonical_repository,
                     "name": name,
                 }
+                requested_keep_alive = request.arguments.get("keep_alive")
+                if (
+                    requested_keep_alive is None
+                    and not isinstance(target.get("supervision"), Mapping)
+                    and str(service_role or "").lower() != "worker"
+                ):
+                    requested_keep_alive = False
                 if action == "status":
                     controlled = controller.status(**identity)
                 elif action == "start":
                     controlled = controller.start(
                         **identity,
                         actor=str(request.arguments["agent"]),
-                        keep_alive=request.arguments.get("keep_alive"),
+                        keep_alive=requested_keep_alive,
                         crash_limit=request.arguments.get("restart_limit"),
                         crash_window_seconds=request.arguments.get(
                             "restart_window_seconds"
@@ -4143,7 +4935,7 @@ class StoreBackedMutationBackend:
                     controlled = controller.restart(
                         **identity,
                         actor=str(request.arguments["agent"]),
-                        keep_alive=request.arguments.get("keep_alive"),
+                        keep_alive=requested_keep_alive,
                         crash_limit=request.arguments.get("restart_limit"),
                         crash_window_seconds=request.arguments.get(
                             "restart_window_seconds"
@@ -4190,10 +4982,10 @@ class StoreBackedMutationBackend:
             }
             try:
                 after_failure = load_broker_runtime_snapshot(
-                    authorized, persistence=self._persistence
+                    accepted, persistence=self._persistence
                 )
                 report = build_broker_runtime_snapshot_report(
-                    authorized,
+                    accepted,
                     snapshot=after_failure,
                     action_result=failure,
                 )
@@ -4254,18 +5046,22 @@ class StoreBackedMutationBackend:
             "classification": (
                 "ready" if ready else "stopped" if state == "stopped" else "observed_not_ready"
             ),
-            "authority": "broker_worker_supervisor",
+            "authority": (
+                "broker_worker_supervisor"
+                if str(service_role or "").lower() == "worker"
+                else "broker_service_supervisor"
+            ),
             "operation_id": request.operation_id,
         }
         if action != "status":
             try:
                 if action == "replace":
                     self._persistence.require_worker_runtime_replacement_committed(
-                        authorized, replacement=controlled
+                        accepted, replacement=controlled
                     )
                 else:
                     self._persistence.require_worker_runtime_operation_current(
-                        authorized
+                        accepted
                     )
             except BrokerError as error:
                 code = "lifecycle_target_identity_changed"
@@ -4279,11 +5075,63 @@ class StoreBackedMutationBackend:
                 raise BrokerBackendError(
                     code, message, operation_id=request.operation_id
                 ) from error
+            if action == "replace":
+                endpoint_target = (
+                    self._persistence.runtime_service_endpoint_target(accepted)
+                )
+            try:
+                action_result["endpoint_proof"] = (
+                    self._runtime_service_endpoint_proof(
+                        endpoint_target=endpoint_target,
+                        action=action,
+                        controlled=controlled,
+                        operation_id=request.operation_id,
+                    )
+                )
+            except Exception as endpoint_error:
+                rollback: Mapping[str, Any] | None = None
+                if action in {"start", "restart"}:
+                    try:
+                        with AccountStore.open(
+                            self._persistence.database_path,
+                            expected_uid=self._persistence.expected_uid,
+                            busy_timeout_ms=self._persistence.busy_timeout_ms,
+                        ) as rollback_store:
+                            rollback = WorkerController(
+                                rollback_store,
+                                coordinator_script=(
+                                    Path(__file__).resolve().parent.parent
+                                    / "dev_coordinator.py"
+                                ),
+                                execution_uid=execution_uid,
+                            ).stop(
+                                **identity,
+                                actor=str(request.arguments["agent"]),
+                            )
+                    except Exception as rollback_error:
+                        rollback = {
+                            "ok": False,
+                            "error_type": type(rollback_error).__name__,
+                            "error": str(rollback_error),
+                        }
+                action_result.update(
+                    {
+                        "ok": False,
+                        "ready": False,
+                        "classification": "service_endpoint_identity_unproven",
+                        "error": str(endpoint_error),
+                        "endpoint_proof": {
+                            "certain": False,
+                            "error_type": type(endpoint_error).__name__,
+                        },
+                        "rollback": None if rollback is None else dict(rollback),
+                    }
+                )
         after = load_broker_runtime_snapshot(
-            authorized, persistence=self._persistence
+            accepted, persistence=self._persistence
         )
         report = build_broker_runtime_snapshot_report(
-            authorized,
+            accepted,
             snapshot=after,
             action_result=action_result,
         )
@@ -4308,12 +5156,14 @@ class StoreBackedMutationBackend:
         failed_phase: str,
         message: str,
         cause: BaseException | None = None,
+        failure_code: str | None = None,
     ) -> None:
         try:
             self._persistence.mark_runtime_operation_reconciliation_required(
                 operation_id,
                 action=action,
                 failed_phase=failed_phase,
+                failure_code=failure_code,
             )
         except Exception:
             # A still-running reservation remains a no-reexecution fence and
@@ -4327,11 +5177,11 @@ class StoreBackedMutationBackend:
         raise error from cause
 
     def _reconcile_runtime_request(
-        self, authorized: AuthorizedBrokerRequest
+        self, accepted: AcceptedBrokerRequest
     ) -> Mapping[str, Any]:
         """Settle an uncertain runtime operation from fresh state, never rerun it."""
 
-        request = authorized.request
+        request = accepted.request
         action = str(request.arguments["action"])
         try:
             observation = self._observe_fresh_full_docker(
@@ -4340,13 +5190,13 @@ class StoreBackedMutationBackend:
             if observation.get("docker_available") is not True:
                 raise RuntimeError("Docker observation is unavailable")
             snapshot = load_broker_runtime_snapshot(
-                authorized, persistence=self._persistence
+                accepted, persistence=self._persistence
             )
             if unclassified_broker_runtime_report(
-                authorized, snapshot=snapshot, observation=observation
+                accepted, snapshot=snapshot, observation=observation
             ) is not None:
                 raise RuntimeError("runtime family is not exactly classified")
-            target = self._persistence.runtime_docker_target(authorized)
+            target = self._persistence.runtime_docker_target(accepted)
         except BrokerError as exc:
             if exc.code == "stale_resource_definition":
                 code = "lifecycle_target_identity_changed"
@@ -4416,8 +5266,13 @@ class StoreBackedMutationBackend:
                 operation_id=request.operation_id,
             )
         report = build_broker_runtime_snapshot_report(
-            authorized, snapshot=snapshot, action_result=terminal
+            accepted, snapshot=snapshot, action_result=terminal
         )
+        session_id = self._persistence.broker_runtime_session_id(
+            request.operation_id
+        )
+        if session_id is not None:
+            report["run_id"] = session_id
         try:
             self._persistence.finish_runtime_reconciliation(
                 request.operation_id, result=report
@@ -4627,13 +5482,13 @@ class StoreBackedMutationBackend:
         """
 
         self._host_observation_shutdown.set()
-        return self._persistence.fail_owned_host_observations(
+        return self._persistence.fail_instance_host_observations(
             broker_instance_id=self._broker_instance_id
         )
 
     def acquire_ephemeral_secret_fd_delivery(
         self,
-        authorized: AuthorizedBrokerRequest,
+        accepted: AcceptedBrokerRequest,
         *,
         template_id: str,
         run_id: uuid.UUID,
@@ -4646,10 +5501,10 @@ class StoreBackedMutationBackend:
         records it in an operation result, or exposes a path to a client.
         """
 
-        request = authorized.request
+        request = accepted.request
         try:
             return self._ephemeral.acquire_secret_fd_delivery(
-                authorized,
+                accepted,
                 template_id=template_id,
                 run_id=run_id,
                 request_id=request_id,
@@ -4686,20 +5541,155 @@ class StoreBackedMutationBackend:
         fixtures = self._test_fixture_provider.recover_startup()
         return {**ephemeral, "test_fixtures": dict(fixtures)}
 
+    def _cleanup_broker_runtime_resources(
+        self,
+        _request: dict[str, Any],
+        resources: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        if len(resources) != 1:
+            raise BrokerBackendError(
+                "runtime_cleanup_identity_invalid",
+                "Broker runtime cleanup requires exactly one sealed resource.",
+            )
+        with self._runtime_session_mutation_lock:
+            cleanup = self._persistence.runtime_session_cleanup_target(
+                resources[0]
+            )
+            if cleanup.cleanup_disposition == "removed":
+                observation = self._observe_fresh_full_docker(
+                    cleanup.operation_id,
+                    project_id=cleanup.repo_id,
+                )
+                try:
+                    terminal = self._persistence.verify_runtime_session_removed(
+                        cleanup, evidence=observation
+                    )
+                    mutation = {
+                        "action": "remove",
+                        "already_absent": True,
+                        "full_container_id": cleanup.target.full_container_id,
+                    }
+                except BrokerError as error:
+                    if error.code != "runtime_cleanup_not_terminal":
+                        raise
+                    mutation = self._container_remover(
+                        cleanup.target.full_container_id
+                    )
+                    observation = self._observe_fresh_full_docker(
+                        cleanup.operation_id,
+                        project_id=cleanup.repo_id,
+                    )
+                    terminal = self._persistence.verify_runtime_session_removed(
+                        cleanup, evidence=observation
+                    )
+                state = "removed"
+                classification = "created_runtime_removed_at_expiry"
+            else:
+                mutation = self._host_mutations.docker_stop(cleanup.target)
+                observation = self._observe_fresh_full_docker(
+                    cleanup.operation_id,
+                    project_id=cleanup.repo_id,
+                )
+                terminal = self._persistence.verify_runtime_session_stopped(
+                    cleanup
+                )
+                state = "retained"
+                classification = "borrowed_runtime_stopped_at_expiry"
+            if observation.get("docker_available") is not True:
+                raise BrokerBackendError(
+                    "runtime_cleanup_observation_incomplete",
+                    "Runtime expiry cleanup could not prove Docker observation availability.",
+                    operation_id=cleanup.operation_id,
+                )
+        return {
+            "ok": True,
+            "state": state,
+            "classification": classification,
+            "mutation": _json_safe_mapping(mutation),
+            "terminal": terminal,
+            "observation": observation,
+        }
+
+    def reap_broker_runtime_sessions_once(
+        self, *, timestamp: str | None = None
+    ) -> list[dict[str, Any]]:
+        """Reap due broker-owned sessions without caller authentication."""
+
+        with AccountStore.open(
+            self._persistence.database_path,
+            expected_uid=self._persistence.expected_uid,
+            busy_timeout_ms=self._persistence.busy_timeout_ms,
+        ) as store:
+            return reap_expired_runtime_sessions(
+                store,
+                cleanup=self._cleanup_broker_runtime_resources,
+                timestamp=timestamp,
+            )
+
+    def _runtime_reaper_main(self) -> None:
+        while not self._runtime_reaper_stop.is_set():
+            try:
+                self.reap_broker_runtime_sessions_once()
+                with AccountStore.open(
+                    self._persistence.database_path,
+                    expected_uid=self._persistence.expected_uid,
+                    busy_timeout_ms=self._persistence.busy_timeout_ms,
+                ) as store:
+                    next_cleanup = next_runtime_cleanup_at(store)
+                if next_cleanup is None:
+                    delay = 300.0
+                else:
+                    deadline = calendar.timegm(
+                        time.strptime(next_cleanup, "%Y-%m-%dT%H:%M:%SZ")
+                    )
+                    delay = max(0.05, min(300.0, deadline - time.time()))
+            except BaseException:
+                _LOGGER.exception("broker runtime-session reaper turn failed")
+                delay = 60.0
+            self._runtime_reaper_wake.wait(timeout=delay)
+            self._runtime_reaper_wake.clear()
+
+    def _start_runtime_reaper(self) -> None:
+        thread = self._runtime_reaper_thread
+        if thread is not None and thread.is_alive():
+            return
+        self._runtime_reaper_stop.clear()
+        self._runtime_reaper_wake.clear()
+        thread = threading.Thread(
+            target=self._runtime_reaper_main,
+            name="devcoordinator-runtime-session-reaper",
+            daemon=True,
+        )
+        self._runtime_reaper_thread = thread
+        thread.start()
+
     def start_ephemeral_reaper(self) -> None:
         self._ephemeral.start_reaper()
         if self._test_fixture_provider is not None:
             self._test_fixture_provider.start_reaper()
+        self._start_runtime_reaper()
 
     def request_ephemeral_reaper_stop(self) -> None:
         self._ephemeral.request_reaper_stop()
         if self._test_fixture_provider is not None:
             self._test_fixture_provider.request_reaper_stop()
+        self._runtime_reaper_stop.set()
+        self._runtime_reaper_wake.set()
 
     def wait_ephemeral_reaper_stopped(self, timeout_seconds: float) -> None:
-        self._ephemeral.wait_reaper_stopped(timeout_seconds)
+        deadline = time.monotonic() + float(timeout_seconds)
+        self._ephemeral.wait_reaper_stopped(
+            max(0.0, deadline - time.monotonic())
+        )
         if self._test_fixture_provider is not None:
-            self._test_fixture_provider.wait_reaper_stopped(timeout_seconds)
+            self._test_fixture_provider.wait_reaper_stopped(
+                max(0.0, deadline - time.monotonic())
+            )
+        thread = self._runtime_reaper_thread
+        if thread is not None:
+            thread.join(max(0.0, deadline - time.monotonic()))
+            if thread.is_alive():
+                raise TimeoutError("runtime-session reaper did not stop")
 
     def stop_ephemeral_reaper(self, timeout_seconds: float = 10.0) -> None:
         """Compatibility helper; production shutdown owns a shared deadline."""
@@ -4769,81 +5759,51 @@ class StoreBackedMutationBackend:
         )
 
     @staticmethod
-    def _resolve_generic_cleanup_resource(
+    def _lookup_generic_cleanup_resource(
         store: CoordinatorStore,
         *,
         target_kind: str,
         target_id: str,
         include_archived: bool,
-        control_binding_id: str | None = None,
     ) -> tuple[ExactResourceRef, str]:
         persistence = SQLiteLifecyclePersistence(store)
-        binding_id = control_binding_id
-        if binding_id is None:
-            with store.read_transaction() as connection:
-                binding = connection.execute(
-                    """
-                    SELECT binding_id FROM control_bindings
-                    WHERE resource_kind = ? AND resource_id = ?
-                      AND authority_state = 'authoritative'
-                    ORDER BY priority DESC, binding_id LIMIT 1
-                    """,
-                    (target_kind, target_id),
-                ).fetchone()
-            if binding is None:
-                raise LifecycleError(
-                    "cleanup target has no authoritative exact controller"
-                )
-            binding_id = str(binding["binding_id"])
         exact, repo_id = persistence.resolve_resource(
             ResourceKind(target_kind),
             target_id,
-            binding_id,
             include_archived=include_archived,
         )
         if repo_id is None:
             raise LifecycleError("permanent cleanup target has no project boundary")
         return exact, repo_id
 
-    def _authorize_generic_cleanup_resource(
+    def _resolve_generic_cleanup_resource(
         self,
-        authorized: AuthorizedBrokerRequest,
+        accepted: AcceptedBrokerRequest,
         *,
         store: CoordinatorStore,
         target_kind: str,
         target_id: str,
         operation: BrokerOperation,
-        control_binding_id: str | None = None,
     ) -> tuple[ExactResourceRef, str]:
-        exact, repo_id = self._resolve_generic_cleanup_resource(
+        exact, repo_id = self._lookup_generic_cleanup_resource(
             store,
             target_kind=target_kind,
             target_id=target_id,
             include_archived=True,
-            control_binding_id=control_binding_id,
         )
-        if repo_id != authorized.request.project_id:
+        if repo_id != accepted.request.project_id:
             raise LifecycleError("cleanup target belongs to another project")
-        self._persistence.authorize_cleanup_resource(
-            authorized,
-            repo_id=repo_id,
-            resource_kind=target_kind,
-            resource_id=exact.resource_id,
-            control_binding_id=exact.control_binding_id,
-            immutable_fingerprint=exact.immutable_fingerprint,
-            ownership_fingerprint=exact.control_contract_fingerprint,
-            operation=operation,
-        )
+        del operation
         return exact, repo_id
 
     def _plan_generic_archive(
         self,
-        authorized: AuthorizedBrokerRequest,
+        accepted: AcceptedBrokerRequest,
         *,
         store: CoordinatorStore,
         actor: str,
     ) -> dict[str, Any]:
-        request = authorized.request
+        request = accepted.request
         target_kind = str(request.arguments["target_kind"])
         target_id = str(request.arguments["target_id"])
         reason = str(request.arguments["reason"])
@@ -4858,22 +5818,8 @@ class StoreBackedMutationBackend:
                 arguments={"reason": reason},
             )
         elif target_kind in {"server", "container"}:
-            with store.read_transaction() as connection:
-                binding = connection.execute(
-                    """
-                    SELECT binding_id FROM control_bindings
-                    WHERE resource_kind = ? AND resource_id = ?
-                      AND authority_state = 'authoritative'
-                    ORDER BY priority DESC, binding_id LIMIT 1
-                    """,
-                    (target_kind, target_id),
-                ).fetchone()
-            if binding is None:
-                raise LifecycleError(
-                    "archive target has no authoritative exact controller"
-                )
             resource_plan_basis, repo_id = persistence.resolve_resource(
-                ResourceKind(target_kind), target_id, str(binding["binding_id"])
+                ResourceKind(target_kind), target_id
             )
             if repo_id != request.project_id:
                 raise LifecycleError("archive target belongs to another project")
@@ -4884,19 +5830,17 @@ class StoreBackedMutationBackend:
                 resource_id=target_id,
                 arguments={
                     "resource_kind": target_kind,
-                    "control_binding_id": resource_plan_basis.control_binding_id,
                     "immutable_fingerprint": resource_plan_basis.immutable_fingerprint,
-                    "ownership_fingerprint": resource_plan_basis.ownership_fingerprint,
+                    "observation_fingerprint": resource_plan_basis.observation_fingerprint,
                     "reason": reason,
                 },
             )
         else:
             raise LifecycleError("linked worktrees cannot be archived")
-        # The generic browser route never carries exact controller identity.
-        # Resolve it above and require the corresponding exact archive grant
-        # before committing even an observation for this plan.
-        synthetic = self._persistence.authorize(
-            authorized.peer,
+        # Resolve the exact catalog identity above before committing an
+        # observation for this plan.
+        synthetic = self._persistence.accept(
+            accepted.peer,
             synthetic_request,
         )
         observation = self._observe_fresh_full_docker(
@@ -4915,13 +5859,13 @@ class StoreBackedMutationBackend:
 
     def _apply_generic_lifecycle(
         self,
-        authorized: AuthorizedBrokerRequest,
+        accepted: AcceptedBrokerRequest,
         *,
         store: CoordinatorStore,
         cleanup: CleanupLifecycle,
         actor: str,
     ) -> dict[str, Any]:
-        request = authorized.request
+        request = accepted.request
         plan_id = str(request.arguments["plan_id"])
         plan_fingerprint = str(request.arguments["plan_fingerprint"])
         confirmation_phrase = str(request.arguments["confirmation_phrase"])
@@ -4932,10 +5876,9 @@ class StoreBackedMutationBackend:
         if cleanup_row is not None:
             if str(cleanup_row["status"]) == "succeeded":
                 # Permanent cleanup intentionally deletes the exact live
-                # resource and its broker ACL projection. A later request with
-                # the same durable plan must validate the plan, confirmation,
-                # and current project authorization without trying to
-                # resurrect/re-resolve the deleted resource identity.
+                # resource. A later request with the same durable plan must
+                # validate the plan and confirmation without trying to
+                # resurrect or re-resolve the deleted resource identity.
                 result = cleanup.apply(
                     plan_id=plan_id,
                     plan_fingerprint=plan_fingerprint,
@@ -4952,20 +5895,19 @@ class StoreBackedMutationBackend:
                 if not isinstance(identity, Mapping):
                     raise LifecycleError("cleanup plan exact identity is missing")
                 planned_identity = identity
-                exact, repo_id = self._authorize_generic_cleanup_resource(
-                    authorized,
+                exact, repo_id = self._resolve_generic_cleanup_resource(
+                    accepted,
                     store=store,
                     target_kind=cleanup_plan.target_kind,
                     target_id=cleanup_plan.target_id,
-                    control_binding_id=str(identity.get("control_binding_id") or ""),
                     operation=BrokerOperation.CLEANUP_APPLY,
                 )
                 if (
                     repo_id != cleanup_plan.repo_id
                     or exact.immutable_fingerprint
                     != str(identity.get("immutable_fingerprint") or "")
-                    or exact.ownership_fingerprint
-                    != str(identity.get("ownership_fingerprint") or "")
+                    or exact.observation_fingerprint
+                    != str(identity.get("observation_fingerprint") or "")
                 ):
                     raise PlanDriftError(
                         "cleanup resource authority changed after planning"
@@ -4975,22 +5917,19 @@ class StoreBackedMutationBackend:
                 project_id=request.project_id,
             )
             if planned_identity is not None:
-                exact, repo_id = self._authorize_generic_cleanup_resource(
-                    authorized,
+                exact, repo_id = self._resolve_generic_cleanup_resource(
+                    accepted,
                     store=store,
                     target_kind=cleanup_plan.target_kind,
                     target_id=cleanup_plan.target_id,
-                    control_binding_id=str(
-                        planned_identity.get("control_binding_id") or ""
-                    ),
                     operation=BrokerOperation.CLEANUP_APPLY,
                 )
                 if (
                     repo_id != cleanup_plan.repo_id
                     or exact.immutable_fingerprint
                     != str(planned_identity.get("immutable_fingerprint") or "")
-                    or exact.ownership_fingerprint
-                    != str(planned_identity.get("ownership_fingerprint") or "")
+                    or exact.observation_fingerprint
+                    != str(planned_identity.get("observation_fingerprint") or "")
                 ):
                     raise PlanDriftError(
                         "cleanup resource authority changed during observation"
@@ -5028,19 +5967,17 @@ class StoreBackedMutationBackend:
                 resource_id=plan.target.resource_id,
                 arguments={
                     "resource_kind": plan.target.kind.value,
-                    "control_binding_id": plan.target.control_binding_id,
                     "immutable_fingerprint": plan.target.immutable_fingerprint,
-                    "ownership_fingerprint": plan.target.ownership_fingerprint,
+                    "observation_fingerprint": plan.target.observation_fingerprint,
                     "plan_id": plan_id,
                     "plan_fingerprint": plan_fingerprint,
                 },
             )
         else:
             raise LifecycleError("durable plan is not an HTTP archive or purge plan")
-        # Re-authorize the archive-specific project/resource capability using
-        # only the durable plan identity resolved by the service authority.
-        synthetic = self._persistence.authorize(
-            authorized.peer,
+        # Re-validate the archive-specific durable plan identity.
+        synthetic = self._persistence.accept(
+            accepted.peer,
             synthetic_request,
         )
         observation = self._observe_fresh_full_docker(
@@ -5063,12 +6000,12 @@ class StoreBackedMutationBackend:
 
     def _execute_lifecycle(
         self,
-        authorized: AuthorizedBrokerRequest,
+        accepted: AcceptedBrokerRequest,
         *,
         resource_plan_basis: ExactResourceRef | None = None,
     ) -> dict[str, Any]:
-        request = authorized.request
-        actor = f"broker:{request.account_id}:uid:{authorized.peer.uid}"
+        request = accepted.request
+        actor = f"broker:{request.account_id}:uid:{accepted.peer.uid}"
         with CoordinatorStore.open(
             self._persistence.database_path,
             expected_uid=self._persistence.expected_uid,
@@ -5079,7 +6016,7 @@ class StoreBackedMutationBackend:
                 persistence,
                 self._lifecycle_adapter,
                 prepare_apply=lambda plan, prepare_actor: self._prepare_worker_lifecycle_apply(
-                    authorized,
+                    accepted,
                     store=store,
                     plan=plan,
                     actor=prepare_actor,
@@ -5138,7 +6075,7 @@ class StoreBackedMutationBackend:
                     )
                 else:
                     current = persistence.repository_snapshot(request.project_id)
-                    bindings = _control_binding_contract(store, current.targets)
+                    bindings = _resource_catalog_contract(store, current.targets)
                     _require_repository_semantically_unchanged(
                         execution,
                         current,
@@ -5176,7 +6113,6 @@ class StoreBackedMutationBackend:
                 exact, attached_repo_id = persistence.resolve_resource(
                     resource_plan_basis.kind,
                     resource_plan_basis.resource_id,
-                    resource_plan_basis.control_binding_id,
                 )
                 _require_plan_target_identity_unchanged(resource_plan_basis, exact)
             else:
@@ -5241,7 +6177,6 @@ class StoreBackedMutationBackend:
                     plan_fingerprint=str(request.arguments["plan_fingerprint"]),
                     resource_kind=ResourceKind(str(request.arguments["resource_kind"])),
                     resource_id=request.resource_id,
-                    control_binding_id=str(request.arguments["control_binding_id"]),
                 )
                 execution = _retirement_execution_plan(persistence, confirmed)
                 progress = persistence.operation_progress(execution.plan_id)
@@ -5253,7 +6188,6 @@ class StoreBackedMutationBackend:
                     current, current_repo_id = persistence.resolve_resource(
                         execution.target.kind,
                         execution.target.resource_id,
-                        execution.target.control_binding_id,
                         include_archived=True,
                     )
                     if current_repo_id != execution.repo_id:
@@ -5266,7 +6200,6 @@ class StoreBackedMutationBackend:
                     current, current_repo_id = persistence.resolve_resource(
                         execution.target.kind,
                         execution.target.resource_id,
-                        execution.target.control_binding_id,
                         include_archived=True,
                     )
                     if current_repo_id != execution.repo_id:
@@ -5313,35 +6246,30 @@ class StoreBackedMutationBackend:
             expected = (
                 str(request.arguments["resource_kind"]),
                 request.resource_id,
-                str(request.arguments["control_binding_id"]),
                 str(request.arguments["immutable_fingerprint"]),
             )
             observed = (
                 exact.kind.value,
                 exact.resource_id,
-                exact.control_binding_id,
                 exact.immutable_fingerprint,
             )
         else:
             exact, _repo_id = persistence.resolve_resource(
                 ResourceKind(str(request.arguments["resource_kind"])),
                 request.resource_id,
-                str(request.arguments["control_binding_id"]),
                 include_archived=request.operation is BrokerOperation.RESOURCE_RESTORE,
             )
             expected = (
                 str(request.arguments["resource_kind"]),
                 request.resource_id,
-                str(request.arguments["control_binding_id"]),
                 str(request.arguments["immutable_fingerprint"]),
-                str(request.arguments["ownership_fingerprint"]),
+                str(request.arguments["observation_fingerprint"]),
             )
             observed = (
                 exact.kind.value,
                 exact.resource_id,
-                exact.control_binding_id,
                 exact.immutable_fingerprint,
-                exact.ownership_fingerprint,
+                exact.observation_fingerprint,
             )
         if observed != expected:
             raise LifecycleError(
@@ -5363,7 +6291,7 @@ class StoreBackedMutationBackend:
 
     def _prepare_worker_lifecycle_apply(
         self,
-        authorized: AuthorizedBrokerRequest,
+        accepted: AcceptedBrokerRequest,
         *,
         store: AccountStore,
         plan: Any,
@@ -5607,8 +6535,7 @@ def build_store_backed_broker_runtime(
     socket_path: str | os.PathLike[str],
     host_mutations: TypedHostMutationAPI,
     service_uid: Optional[int] = None,
-    access_gid: Optional[int] = None,
-    socket_mode: int = 0o660,
+    socket_mode: int = 0o666,
     max_clients: int = 32,
     shutdown_timeout_seconds: float = BROKER_SHUTDOWN_DRAIN_TIMEOUT_SECONDS,
     lifecycle_adapter: CoordinatorHostLifecycleAdapter | None = None,
@@ -5619,7 +6546,6 @@ def build_store_backed_broker_runtime(
     test_plane: TestPlaneClient | None = None,
     internal_testd_uid: int | None = None,
     test_attempt_manager: NativeTestAttemptManager | None = None,
-    test_capability_path: str | os.PathLike[str] = DEFAULT_TEST_CAPABILITY_PATH,
     test_credential_registry_path: str | os.PathLike[str] = (
         DEFAULT_TEST_CREDENTIAL_REGISTRY_PATH
     ),
@@ -5638,11 +6564,14 @@ def build_store_backed_broker_runtime(
     # Compatibility-only input retained for older service command lines. The
     # harness is a product capability, not something enabled by a special Unix
     # caller UID; exact test operations and repository generations remain the
-    # authorization boundary.
+    # request validation boundary.
     del internal_testd_uid
     uid = os.geteuid() if service_uid is None else service_uid
-    gid = os.getegid() if access_gid is None else access_gid
-    persistence = BrokerPersistence(database_path, expected_uid=uid)
+    persistence = BrokerPersistence(
+        database_path,
+        expected_uid=uid,
+        compose_model_renderer=render_compose_effective_model,
+    )
     active_test_admission_proof = persistence.active_test_admission_proof()
     test_submission_gate = TestSubmissionAdmissionGate(
         initially_fenced=active_test_admission_proof is not None
@@ -5664,9 +6593,6 @@ def build_store_backed_broker_runtime(
             fixture_provider=fixture_provider,
             credential_provider=credential_provider,
         )
-    test_capabilities = SealedTestCapabilityRegistry.load(
-        Path(test_capability_path), expected_uid=uid, allow_missing=True
-    )
     backend = StoreBackedMutationBackend(
         persistence,
         host_mutations,
@@ -5675,7 +6601,6 @@ def build_store_backed_broker_runtime(
         test_plane=test_plane,
         test_attempt_manager=test_attempt_manager,
         test_submission_gate=test_submission_gate,
-        test_capabilities=test_capabilities,
         secret_manager=secret_manager,
     )
     writer = SerializedMutationWriter(
@@ -5693,7 +6618,7 @@ def build_store_backed_broker_runtime(
         )
     )
     service = BrokerService(
-        StoreBackedAuthorizer(persistence),
+        StoreBackedRequestAcceptor(persistence),
         writer,
         secret_fd_retriever=backend,
         call_journal=call_journal,
@@ -5701,8 +6626,6 @@ def build_store_backed_broker_runtime(
     server = UnixBrokerServer(
         Path(socket_path),
         service,
-        expected_uid=uid,
-        expected_gid=gid,
         socket_mode=socket_mode,
         max_clients=max_clients,
         shutdown_timeout_seconds=shutdown_timeout_seconds,
@@ -5793,6 +6716,20 @@ def _json_safe_mapping(value: Any) -> dict[str, Any]:
     return dict(value)
 
 
+def _observation_failure_code(error: BaseException) -> str:
+    """Return one bounded path-free identity for retained recovery evidence."""
+
+    candidate = getattr(error, "code", None)
+    if isinstance(candidate, str) and re.fullmatch(
+        r"[a-z][a-z0-9_]{0,63}", candidate
+    ):
+        return candidate
+    normalized = re.sub(
+        r"[^a-z0-9]+", "_", type(error).__name__.lower()
+    ).strip("_")
+    return (normalized or "observation_failed")[:64]
+
+
 def _validated_broker_worker_replacement(
     *,
     canonical_repository: str,
@@ -5800,7 +6737,7 @@ def _validated_broker_worker_replacement(
     arguments: Mapping[str, Any],
     operation_id: str,
 ) -> dict[str, Any]:
-    """Anchor one structured replacement inside the enrolled repository."""
+    """Anchor one structured replacement inside the configured repository."""
 
     del execution_uid
 
@@ -5812,7 +6749,7 @@ def _validated_broker_worker_replacement(
     except (KeyError, OSError, RuntimeError, ValueError) as error:
         raise BrokerBackendError(
             "worker_replacement_path_denied",
-            "Worker replacement cwd must resolve to an existing directory inside the exact enrolled repository.",
+            "Worker replacement cwd must resolve to an existing directory inside the exact configured repository.",
             operation_id=operation_id,
         ) from error
     if (

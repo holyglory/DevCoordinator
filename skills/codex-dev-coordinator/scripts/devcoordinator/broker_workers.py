@@ -6,11 +6,11 @@ import json
 from typing import Any, Mapping
 
 from .broker import (
-    AuthorizedBrokerRequest,
+    AcceptedBrokerRequest,
     BrokerBackendError,
     BrokerError,
     BrokerOperation,
-    authenticated_request_fingerprint,
+    accepted_request_fingerprint,
 )
 from .broker_persistence import BrokerPersistence
 from .store import CoordinatorStore, canonical_json, utc_timestamp
@@ -49,18 +49,18 @@ class BrokerWorkerOperations:
     def __init__(self, persistence: BrokerPersistence) -> None:
         self._persistence = persistence
 
-    def execute(self, authorized: AuthorizedBrokerRequest) -> Mapping[str, Any]:
-        request = authorized.request
+    def execute(self, accepted: AcceptedBrokerRequest) -> Mapping[str, Any]:
+        request = accepted.request
         if request.operation not in WORKER_OPERATIONS:
             raise ValueError("request is not a worker broker operation")
         # Recheck live account/repository/resource policy at the backend
         # boundary. Keep the returned policy identity separate from caller
         # attribution.
-        authorized = self._persistence.authorize(authorized.peer, request)
+        accepted = self._persistence.accept(accepted.peer, request)
         if request.operation in WORKER_READ_OPERATIONS:
-            return self._execute_read(authorized)
+            return self._execute_read(accepted)
 
-        disposition = self._reserve(authorized)
+        disposition = self._reserve(accepted)
         if disposition["status"] == "succeeded":
             return dict(disposition["result"])
         if disposition["status"] == "failed":
@@ -72,44 +72,44 @@ class BrokerWorkerOperations:
 
         try:
             result = self._execute_mutation(
-                authorized, prepared=disposition.get("prepared")
+                accepted, prepared=disposition.get("prepared")
             )
         except WorkerNotConfigured as error:
-            self._fail(authorized, "worker_not_configured", str(error))
+            self._fail(accepted, "worker_not_configured", str(error))
             raise BrokerBackendError(
                 "worker_not_configured", str(error), operation_id=request.operation_id
             ) from None
         except WorkerCircuitOpen as error:
-            self._fail(authorized, "worker_crash_loop_tripped", str(error))
+            self._fail(accepted, "worker_crash_loop_tripped", str(error))
             raise BrokerBackendError(
                 "worker_crash_loop_tripped",
                 str(error),
                 operation_id=request.operation_id,
             ) from None
         except WorkerLaunchFenced as error:
-            self._fail(authorized, "worker_launch_fenced", str(error))
+            self._fail(accepted, "worker_launch_fenced", str(error))
             raise BrokerBackendError(
                 "worker_launch_fenced", str(error), operation_id=request.operation_id
             ) from None
         except WorkerSupervisionConflict as error:
-            self._fail(authorized, "worker_state_conflict", str(error))
+            self._fail(accepted, "worker_state_conflict", str(error))
             raise BrokerBackendError(
                 "worker_state_conflict", str(error), operation_id=request.operation_id
             ) from None
         except WorkerArtifactError as error:
-            self._fail(authorized, "worker_log_artifact_invalid", str(error))
+            self._fail(accepted, "worker_log_artifact_invalid", str(error))
             raise BrokerBackendError(
                 "worker_log_artifact_invalid",
                 str(error),
                 operation_id=request.operation_id,
             ) from None
         except ValueError as error:
-            self._fail(authorized, "worker_state_invalid", str(error))
+            self._fail(accepted, "worker_state_invalid", str(error))
             raise BrokerBackendError(
                 "worker_state_invalid", str(error), operation_id=request.operation_id
             ) from None
         except BrokerError as error:
-            self._fail(authorized, error.code, error.message)
+            self._fail(accepted, error.code, error.message)
             raise BrokerBackendError(
                 error.code, error.message, operation_id=request.operation_id
             ) from None
@@ -122,7 +122,7 @@ class BrokerWorkerOperations:
                 operation_id=request.operation_id,
             ) from error
         try:
-            return self._succeed(authorized, result)
+            return self._succeed(accepted, result)
         except BrokerError:
             raise
         except Exception as error:
@@ -133,14 +133,14 @@ class BrokerWorkerOperations:
             ) from error
 
     def _execute_read(
-        self, authorized: AuthorizedBrokerRequest
+        self, accepted: AcceptedBrokerRequest
     ) -> Mapping[str, Any]:
-        request = authorized.request
+        request = accepted.request
         try:
             with self._store() as store:
                 supervision = WorkerSupervision(store)
                 policy = supervision.policy(request.resource_id)
-                self._require_policy_identity(authorized, policy)
+                self._require_policy_identity(accepted, policy)
                 if request.operation is BrokerOperation.WORKER_POLICY_READ:
                     candidate: Mapping[str, Any] | None = None
                     launch_blocker: dict[str, str] | None = None
@@ -151,7 +151,7 @@ class BrokerWorkerOperations:
                                 server_definition_id=request.resource_id,
                                 supervisor_epoch=epoch,
                             )
-                            self._require_candidate_tokens(authorized, candidate)
+                            self._require_candidate_tokens(accepted, candidate)
                         except WorkerCircuitOpen as error:
                             launch_blocker = {
                                 "code": "worker_crash_loop_tripped",
@@ -174,7 +174,7 @@ class BrokerWorkerOperations:
                         "launch_blocker": launch_blocker,
                     }
                 attempt = supervision.attempt(str(request.arguments["attempt_id"]))
-                self._require_attempt_identity(authorized, attempt)
+                self._require_attempt_identity(accepted, attempt)
                 return {"status": "current", "policy": policy, "attempt": attempt}
         except WorkerNotConfigured as error:
             raise BrokerBackendError(
@@ -187,16 +187,16 @@ class BrokerWorkerOperations:
 
     def _execute_mutation(
         self,
-        authorized: AuthorizedBrokerRequest,
+        accepted: AcceptedBrokerRequest,
         *,
         prepared: Mapping[str, Any] | None,
     ) -> dict[str, Any]:
-        request = authorized.request
+        request = accepted.request
         arguments = request.arguments
         with self._store() as store:
             supervision = WorkerSupervision(store)
             policy = supervision.policy(request.resource_id)
-            self._require_policy_identity(authorized, policy)
+            self._require_policy_identity(accepted, policy)
             if request.operation is BrokerOperation.WORKER_LAUNCH_TICKET:
                 expected = (
                     int(arguments["expected_definition_generation"]),
@@ -208,9 +208,9 @@ class BrokerWorkerOperations:
                         server_definition_id=request.resource_id,
                         supervisor_epoch=str(arguments["supervisor_epoch"]),
                     )
-                    self._require_candidate_tokens(authorized, candidate)
+                    self._require_candidate_tokens(accepted, candidate)
                     prepared = self._prepare(
-                        authorized,
+                        accepted,
                         {
                             "candidate": {
                                 **dict(candidate),
@@ -219,8 +219,8 @@ class BrokerWorkerOperations:
                             }
                         },
                     )
-                candidate = self._prepared_candidate(authorized, prepared)
-                self._require_candidate_tokens(authorized, candidate)
+                candidate = self._prepared_candidate(accepted, prepared)
+                self._require_candidate_tokens(accepted, candidate)
                 actual = (
                     int(candidate["definition_generation"]),
                     int(candidate["policy_generation"]),
@@ -247,7 +247,7 @@ class BrokerWorkerOperations:
                 }
 
             attempt = supervision.attempt(str(arguments["attempt_id"]))
-            self._require_attempt_identity(authorized, attempt)
+            self._require_attempt_identity(accepted, attempt)
             if request.operation is BrokerOperation.WORKER_LAUNCHED:
                 result = supervision.mark_attempt_launched(
                     attempt_id=str(arguments["attempt_id"]),
@@ -274,7 +274,7 @@ class BrokerWorkerOperations:
                         sha256=str(artifact_request["sha256"]),
                     )
                     prepared = self._prepare(
-                        authorized, {"log_artifact": verified}
+                        accepted, {"log_artifact": verified}
                     )
                 artifact = self._prepared_log_artifact(prepared)
                 if (
@@ -307,9 +307,9 @@ class BrokerWorkerOperations:
             }
 
     def _require_policy_identity(
-        self, authorized: AuthorizedBrokerRequest, policy: Mapping[str, Any]
+        self, accepted: AcceptedBrokerRequest, policy: Mapping[str, Any]
     ) -> None:
-        request = authorized.request
+        request = accepted.request
         if (
             str(policy["server_definition_id"]) != request.resource_id
             or str(policy["repo_id"]) != request.project_id
@@ -321,9 +321,9 @@ class BrokerWorkerOperations:
             raise WorkerSupervisionConflict("worker execution identity is invalid")
 
     def _require_candidate_tokens(
-        self, authorized: AuthorizedBrokerRequest, candidate: Mapping[str, Any]
+        self, accepted: AcceptedBrokerRequest, candidate: Mapping[str, Any]
     ) -> None:
-        request = authorized.request
+        request = accepted.request
         if (
             str(candidate["server_definition_id"]) != request.resource_id
             or str(candidate["repo_id"]) != request.project_id
@@ -335,9 +335,9 @@ class BrokerWorkerOperations:
 
     @staticmethod
     def _require_attempt_identity(
-        authorized: AuthorizedBrokerRequest, attempt: Mapping[str, Any]
+        accepted: AcceptedBrokerRequest, attempt: Mapping[str, Any]
     ) -> None:
-        request = authorized.request
+        request = accepted.request
         if (
             str(attempt["server_definition_id"]) != request.resource_id
             or str(attempt["repo_id"]) != request.project_id
@@ -348,9 +348,9 @@ class BrokerWorkerOperations:
                 operation_id=request.operation_id,
             )
 
-    def _reserve(self, authorized: AuthorizedBrokerRequest) -> dict[str, Any]:
-        request = authorized.request
-        request_fingerprint = authenticated_request_fingerprint(authorized)
+    def _reserve(self, accepted: AcceptedBrokerRequest) -> dict[str, Any]:
+        request = accepted.request
+        request_fingerprint = accepted_request_fingerprint(accepted)
         now = utc_timestamp()
         with self._store() as store:
             with store.immediate_transaction() as connection:
@@ -372,7 +372,7 @@ class BrokerWorkerOperations:
                         """,
                         (
                             request.operation_id,
-                            authorized.peer.uid,
+                            accepted.peer.uid,
                             request.account_id,
                             request.project_id,
                             request.resource_id,
@@ -432,12 +432,12 @@ class BrokerWorkerOperations:
 
     def _prepare(
         self,
-        authorized: AuthorizedBrokerRequest,
+        accepted: AcceptedBrokerRequest,
         prepared: Mapping[str, Any],
     ) -> dict[str, Any]:
         """Commit external/pre-transition evidence before mutating worker state."""
 
-        request = authorized.request
+        request = accepted.request
         encoded = canonical_json(dict(prepared))
         normalized = json.loads(encoded)
         if not isinstance(normalized, dict):
@@ -500,7 +500,7 @@ class BrokerWorkerOperations:
 
     @staticmethod
     def _prepared_candidate(
-        authorized: AuthorizedBrokerRequest,
+        accepted: AcceptedBrokerRequest,
         prepared: Mapping[str, Any],
     ) -> dict[str, Any]:
         if set(prepared) != {"candidate"} or not isinstance(
@@ -509,7 +509,7 @@ class BrokerWorkerOperations:
             raise BrokerBackendError(
                 "operation_evidence_corrupt",
                 "Durable worker launch preparation is invalid.",
-                operation_id=authorized.request.operation_id,
+                operation_id=accepted.request.operation_id,
             )
         candidate = dict(prepared["candidate"])
         required = {
@@ -532,7 +532,7 @@ class BrokerWorkerOperations:
             raise BrokerBackendError(
                 "operation_evidence_corrupt",
                 "Durable worker launch candidate is incomplete.",
-                operation_id=authorized.request.operation_id,
+                operation_id=accepted.request.operation_id,
             )
         return candidate
 
@@ -554,9 +554,9 @@ class BrokerWorkerOperations:
         return dict(artifact)
 
     def _succeed(
-        self, authorized: AuthorizedBrokerRequest, result: Mapping[str, Any]
+        self, accepted: AcceptedBrokerRequest, result: Mapping[str, Any]
     ) -> dict[str, Any]:
-        request = authorized.request
+        request = accepted.request
         encoded = canonical_json(dict(result))
         with self._store() as store:
             with store.immediate_transaction() as connection:
@@ -591,9 +591,9 @@ class BrokerWorkerOperations:
         return dict(result)
 
     def _fail(
-        self, authorized: AuthorizedBrokerRequest, code: str, message: str
+        self, accepted: AcceptedBrokerRequest, code: str, message: str
     ) -> None:
-        request = authorized.request
+        request = accepted.request
         bounded_message = str(message)[:500]
         with self._store() as store:
             with store.immediate_transaction() as connection:

@@ -17,7 +17,6 @@ from .agent_contract import (
 
 MAX_TEST_RESULT_BYTES = 4 * 1024
 TEST_INTENTS = frozenset({"change", "checkpoint", "handoff", "release", "manual"})
-REVIEW_INTENTS = frozenset({"handoff", "release"})
 TERMINAL_STATES = frozenset(
     {
         "succeeded",
@@ -169,27 +168,6 @@ def enqueue_test(
         )
     plan_projection = _compact_plan(plan)
 
-    if intent in REVIEW_INTENTS:
-        return require_agent_result(
-            {
-                "schema_version": 1,
-                "ok": True,
-                "classification": "review_required",
-                "review_required": True,
-                "repository_id": repository.repo_id,
-                "operation_id": operation_id,
-                "continuation": continuation_handle("operation", operation_id),
-                "plan": plan_projection,
-                "plan_handle": continuation_handle("plan", plan_id),
-                "submission_performed": False,
-                "next_command": (
-                    f"devcoordinator test submit {continuation_handle('plan', plan_id)}"
-                ),
-            },
-            surface="test review",
-            maximum_bytes=MAX_TEST_RESULT_BYTES,
-        )
-
     submit_operation_id = child_operation_id(operation_id, "submit")
     submitted = profile.submit_test_plan(
         repository=repository.repo_id,
@@ -215,7 +193,6 @@ def enqueue_test(
             "schema_version": 1,
             "ok": True,
             "classification": "test_enqueued",
-            "review_required": False,
             "repository_id": repository.repo_id,
             "operation_id": operation_id,
             "submission_operation_id": submit_operation_id,
@@ -230,7 +207,7 @@ def enqueue_test(
     )
 
 
-def submit_reviewed_plan(
+def submit_test_plan(
     *,
     profile: Any,
     repository: Any,
@@ -286,6 +263,43 @@ def _small_mapping(value: object, *, limit: int) -> dict[str, Any]:
     return result
 
 
+def _scheduler_wait_projection(status: Mapping[str, Any]) -> dict[str, Any]:
+    """Expose bounded typed admission evidence for a pending exact run."""
+
+    waits: list[dict[str, Any]] = []
+    total = 0
+    targets = status.get("targets")
+    if isinstance(targets, list):
+        for raw_target in targets:
+            if not isinstance(raw_target, Mapping):
+                continue
+            raw_wait = raw_target.get("wait")
+            if not isinstance(raw_wait, Mapping) or raw_wait.get("code") is None:
+                continue
+            total += 1
+            if len(waits) >= 3:
+                continue
+            wait: dict[str, Any] = {
+                "target": bounded_text(
+                    raw_target.get("target_name") or raw_target.get("target_id") or "unknown",
+                    maximum_bytes=128,
+                ),
+                "code": bounded_text(raw_wait.get("code"), maximum_bytes=64),
+            }
+            for key in ("since", "required_mib", "available_mib", "reserve_mib"):
+                value = raw_wait.get(key)
+                if isinstance(value, bool):
+                    continue
+                if isinstance(value, (int, float)) and value == value and abs(value) != float("inf"):
+                    wait[key] = value
+            waits.append(wait)
+    return {
+        "target_count": total,
+        "targets": waits,
+        "truncated": total > len(waits),
+    }
+
+
 def project_test_follow(
     status: Mapping[str, Any],
     *,
@@ -317,6 +331,20 @@ def project_test_follow(
                 if raw.get(key) is not None
             }
             failures.append(failure)
+    counts = _small_mapping(source.get("counts"), limit=16)
+    declared_failure_records = (
+        source.get("failure_count")
+        if type(source.get("failure_count")) is int
+        else len(raw_failures)
+        if isinstance(raw_failures, list)
+        else len(failures)
+    )
+    failed_cases = (
+        counts.get("failed")
+        if type(counts.get("failed")) is int
+        else declared_failure_records
+    )
+    source_failure_count = max(declared_failure_records, len(failures))
     document: dict[str, Any] = {
         "schema_version": 1,
         "ok": True,
@@ -330,16 +358,20 @@ def project_test_follow(
             "wait_timed_out": status.get("wait_timed_out") is True,
         },
         "progress": _small_mapping(source.get("progress"), limit=12),
-        "counts": _small_mapping(source.get("counts"), limit=16),
+        "counts": counts,
         "timing": _small_mapping(source.get("timing"), limit=12),
+        "scheduler_wait": _scheduler_wait_projection(status),
         "failures": failures,
-        "failure_count": (
-            source.get("failure_count")
-            if type(source.get("failure_count")) is int
-            else len(failures)
-        ),
+        # ``counts.failed`` counts failed test cases, while the summary's
+        # ``failure_count`` counts independently retained failure records.
+        # Keep both dimensions explicit and make the long-standing public
+        # ``failure_count`` agree with the case counts callers compare it to.
+        "failure_count": failed_cases,
+        "failure_record_count": source_failure_count,
         "next_command": (
-            None
+            f"devcoordinator test failures {run_handle}"
+            if terminal and source_failure_count > 0
+            else None
             if terminal
             else f"devcoordinator test follow {run_handle} --wait-seconds 30"
         ),
@@ -347,7 +379,9 @@ def project_test_follow(
     for visible_failures in range(len(failures), -1, -1):
         candidate = dict(document)
         candidate["failures"] = failures[:visible_failures]
-        candidate["failures_truncated"] = visible_failures < len(failures)
+        candidate["failures_truncated"] = (
+            visible_failures < source_failure_count
+        )
         if len(canonical_json_bytes(candidate)) <= MAX_TEST_RESULT_BYTES:
             return require_agent_result(
                 candidate,
@@ -362,11 +396,10 @@ def project_test_follow(
 __all__ = [
     "AgentTestError",
     "MAX_TEST_RESULT_BYTES",
-    "REVIEW_INTENTS",
     "TERMINAL_STATES",
     "TEST_INTENTS",
     "child_operation_id",
     "enqueue_test",
     "project_test_follow",
-    "submit_reviewed_plan",
+    "submit_test_plan",
 ]

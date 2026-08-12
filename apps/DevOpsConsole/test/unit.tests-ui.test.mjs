@@ -163,10 +163,8 @@ test('Tests destination leads with fleet awareness and opens repository detail o
   assert.match(js, /if \(plan\.operation_id !== operationId\)/,
     'the Console must reject a contradictory planning-operation identity');
   assert.match(js, /function testSetupTargetEntries\(/);
-  assert.match(js, /blocked: \$\{blocked\.join\(', '\)\}/,
-    'Setup must map missing sealed capabilities to the affected target');
-  assert.match(js, /Blocked — administrator grant required/,
-    'Setup must distinguish unavailable capabilities from approved ones');
+  assert.doesNotMatch(js, /administrator grant required|missing sealed capabilities/i,
+    'repository test setup must not expose the removed capability-grant model');
   assert.match(js, /\/api\/tests\/repositories\/\$\{encodeURIComponent\(project\)\}\/setup/);
   assert.match(js, /new URLSearchParams\(\{ repo_id: project, limit: '50' \}\)/);
   assert.match(js, /\['ArrowLeft', 'ArrowRight', 'Home', 'End'\]/,

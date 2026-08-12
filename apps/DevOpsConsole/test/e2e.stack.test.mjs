@@ -249,7 +249,7 @@ print(json.dumps(dev_coordinator.docker_ps_inventory()))
       allowedEmails: [FIXTURE_EMAIL],
       coordinatorEnv,
       expectDocker: true,
-      repositoryOwnerRoots: [dockerProjectRoot],
+      repositoryRoots: [dockerProjectRoot],
       routes: ({ upstream, wsEcho }) => [
         // app -> ws-echo (answers plain GET too) — protected by default.
         { slug: 'app', kind: 'port', port: wsEcho.port },
@@ -1467,7 +1467,7 @@ print(json.dumps(dev_coordinator.docker_ps_inventory()))
     assert.equal(started.json?.result?.ok, true, `project start should succeed: ${started.text}`);
 
     try {
-      // The started member shows up in overview with project membership.
+      // The started member shows up in overview with project association.
       let member = null;
       const deadline = Date.now() + 15_000;
       while (Date.now() < deadline && !member) {

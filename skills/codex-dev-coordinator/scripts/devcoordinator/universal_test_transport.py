@@ -18,7 +18,7 @@ import stat
 import struct
 import threading
 import time
-from typing import Callable, Mapping, Sequence
+from typing import Callable, Mapping
 import uuid
 
 from .call_journal import (
@@ -692,7 +692,6 @@ class UnixTestPlaneServer:
         listener: socket.socket,
         service: TestPlaneClient,
         *,
-        allowed_peer_uids: Sequence[int] | None = None,
         peer_resolver: Callable[[socket.socket], int | None] = _peer_uid,
         request_timeout_seconds: float = DEFAULT_TEST_PLANE_TIMEOUT_SECONDS,
         max_concurrent_requests: int = DEFAULT_TEST_PLANE_CONCURRENCY,
@@ -701,10 +700,6 @@ class UnixTestPlaneServer:
     ) -> None:
         if listener.family != socket.AF_UNIX or listener.type & socket.SOCK_STREAM == 0:
             raise TestStoreContractError("test-plane listener must be a Unix stream socket")
-        # Retain the old keyword as a no-op while installed same-release
-        # callers converge. Connectivity, not an account allowlist, admits a
-        # local peer.
-        del allowed_peer_uids
         if request_timeout_seconds <= 0:
             raise TestStoreContractError("request timeout must be positive")
         if (
@@ -732,7 +727,6 @@ class UnixTestPlaneServer:
         socket_path: Path,
         service: TestPlaneClient,
         *,
-        allowed_peer_uids: Sequence[int] | None = None,
         socket_mode: int = 0o600,
         backlog: int = 64,
         max_concurrent_requests: int = DEFAULT_TEST_PLANE_CONCURRENCY,
@@ -757,7 +751,6 @@ class UnixTestPlaneServer:
             return cls(
                 listener,
                 service,
-                allowed_peer_uids=allowed_peer_uids,
                 max_concurrent_requests=max_concurrent_requests,
                 owned_socket_path=path,
                 call_journal=call_journal,

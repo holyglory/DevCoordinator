@@ -182,7 +182,7 @@ class UniversalTestOperationalCredentialTests(unittest.TestCase):
         for index, descriptor in enumerate(cases):
             with self.subTest(index=index):
                 with self.assertRaisesRegex(
-                    TestStoreConflict, "not authorized"
+                    TestStoreConflict, "not accepted"
                 ):
                     self.provider.provision(
                         descriptor,
@@ -687,10 +687,10 @@ class UniversalTestOperationalCredentialTests(unittest.TestCase):
             alias=self.ALIAS,
             expected_rotation_generation=2,
         )
-        with self.assertRaisesRegex(TestStoreConflict, "not authorized"):
+        with self.assertRaisesRegex(TestStoreConflict, "not accepted"):
             with self.provider.launch_guard(descriptor, rotated_lease):
                 self.fail("a revoked credential lease must never launch")
-        with self.assertRaisesRegex(TestStoreConflict, "not authorized"):
+        with self.assertRaisesRegex(TestStoreConflict, "not accepted"):
             self.provider.provision(
                 descriptor,
                 runtime_id="devcoordinator-test-after-revoke",
@@ -943,10 +943,10 @@ class UniversalTestOperationalCredentialTests(unittest.TestCase):
         binding = self.register()
         skill_root = Path(__file__).resolve().parents[3]
         repository_root = skill_root.parent.parent
-        enrolled_skill = repository_root / "skills" / skill_root.name
+        configured_skill = repository_root / "skills" / skill_root.name
         script = repository_root / "scripts" / "manage_universal_test_credentials.py"
         try:
-            source_tree_matches = enrolled_skill.samefile(skill_root)
+            source_tree_matches = configured_skill.samefile(skill_root)
         except OSError:
             source_tree_matches = False
         if not source_tree_matches or not script.is_file():

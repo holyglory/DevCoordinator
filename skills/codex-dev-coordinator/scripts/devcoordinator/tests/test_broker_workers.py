@@ -29,7 +29,7 @@ from devcoordinator.broker_backend import (  # noqa: E402
     StoreBackedMutationBackend,
 )
 from devcoordinator import broker_backend as broker_backend_module  # noqa: E402
-from devcoordinator.broker_persistence import StoreBackedAuthorizer  # noqa: E402
+from devcoordinator.broker_persistence import StoreBackedRequestAcceptor  # noqa: E402
 from devcoordinator.broker_profile import (  # noqa: E402
     BrokerClientProfile,
     BrokerProfileError,
@@ -37,7 +37,6 @@ from devcoordinator.broker_profile import (  # noqa: E402
     BrokerServiceProfile,
 )
 from devcoordinator.store import CoordinatorStore, utc_timestamp  # noqa: E402
-from devcoordinator.schema import establish_repository_owner_authority  # noqa: E402
 from devcoordinator.worker_supervision import WorkerSupervision  # noqa: E402
 import devcoordinator.worker_artifacts as worker_artifacts  # noqa: E402
 from devcoordinator.tests.test_broker import (  # noqa: E402
@@ -129,42 +128,29 @@ class WorkerBrokerWireTests(unittest.TestCase):
                     arguments={**self._exit_arguments(), **update},
                 )
 
-    def test_profile_worker_call_requires_an_exact_enrolled_server(self) -> None:
+    def test_profile_worker_call_requires_an_exact_configured_server(self) -> None:
         repository = BrokerRepositoryProfile(
             canonical_root="/repos/alpha",
             repo_id=PROJECT_ID,
             generation=0,
-            owner_uid=1000,
             server_ids={"web": SERVER_ID},
             container_ids={},
             compose_definition_id=None,
             compose_container_ids=frozenset(),
             compose_run_once_services={},
             ephemeral_templates={},
-            ephemeral_image_prefetch_template_ids=frozenset(),
             ephemeral_secret_policies={},
-            account_id=ACCOUNT_ID,
-            enabled=True,
-            issued_at="2026-07-26T00:00:00Z",
-            valid_until_epoch=int(time.time()) + 3600,
         )
         profile = BrokerClientProfile(
             service=BrokerServiceProfile(
                 socket_path=Path("/run/devcoordinator-authority.sock"),
-                service_uid=0,
-                socket_gid=100,
-                socket_mode=0o660,
                 database_generation="authority",
             ),
-            client_uid=os.geteuid(),
-            account_id=ACCOUNT_ID,
-            issued_at="2026-07-26T00:00:00Z",
-            valid_until_epoch=int(time.time()) + 3600,
             repositories={repository.canonical_root: repository},
         )
         self.assertIs(profile.repository_for_server_id(SERVER_ID), repository)
         with self.assertRaises(BrokerProfileError):
-            profile.repository_for_server_id("server-not-enrolled")
+            profile.repository_for_server_id("server-not-configured")
         with mock.patch.object(
             BrokerClientProfile,
             "call",
@@ -186,7 +172,7 @@ class WorkerBrokerWireTests(unittest.TestCase):
         with self.assertRaises(BrokerProfileError):
             profile.worker_call(
                 repository=repository,
-                server_id="server-not-enrolled",
+                server_id="server-not-configured",
                 operation=BrokerOperation.WORKER_POLICY_READ,
             )
         with self.assertRaises(ValueError):
@@ -200,26 +186,16 @@ class WorkerBrokerWireTests(unittest.TestCase):
             canonical_root="/repos/beta",
             repo_id="repo-beta",
             generation=0,
-            owner_uid=1000,
             server_ids={"worker": SERVER_ID},
             container_ids={},
             compose_definition_id=None,
             compose_container_ids=frozenset(),
             compose_run_once_services={},
             ephemeral_templates={},
-            ephemeral_image_prefetch_template_ids=frozenset(),
             ephemeral_secret_policies={},
-            account_id=profile.account_id,
-            enabled=True,
-            issued_at=profile.issued_at,
-            valid_until_epoch=profile.valid_until_epoch,
         )
         ambiguous = BrokerClientProfile(
             service=profile.service,
-            client_uid=profile.client_uid,
-            account_id=profile.account_id,
-            issued_at=profile.issued_at,
-            valid_until_epoch=profile.valid_until_epoch,
             repositories={
                 repository.canonical_root: repository,
                 duplicate.canonical_root: duplicate,
@@ -308,211 +284,6 @@ class WorkerBrokerStartupTests(unittest.TestCase):
         )
 
 
-class WorkerBrokerMigrationTests(unittest.TestCase):
-    def setUp(self) -> None:
-        self.temporary = CanonicalTemporaryDirectory()
-        self.root = self.temporary.__enter__()
-        self.persistence, _actions = seed_store_backed_broker(self.root)
-        self.uid = os.geteuid()
-        self.other_uid = self.uid + 10_001
-        self.runtime_revoked = str(uuid.uuid4())
-        self.non_worker = str(uuid.uuid4())
-        self.worker_acl_revoked = str(uuid.uuid4())
-        self.wrong_repo = str(uuid.uuid4())
-        now = utc_timestamp()
-
-        with CoordinatorStore.open(
-            self.persistence.database_path, expected_uid=self.uid
-        ) as store:
-            with store.immediate_transaction() as connection:
-                connection.execute(
-                    "UPDATE server_definitions SET role = 'worker' "
-                    "WHERE server_definition_id = ?",
-                    (SERVER_ID,),
-                )
-                for server_id, name, role in (
-                    (self.runtime_revoked, "runtime-revoked", "worker"),
-                    (self.non_worker, "ordinary-web", "web"),
-                    (self.worker_acl_revoked, "worker-acl-revoked", "worker"),
-                ):
-                    connection.execute(
-                        """
-                        INSERT INTO server_definitions(
-                            server_definition_id, repo_id, name, role, cwd,
-                            definition_fingerprint, generation,
-                            created_at, updated_at
-                        ) VALUES (?, ?, ?, ?, '/repos/alpha', ?, 0, ?, ?)
-                        """,
-                        (
-                            server_id,
-                            PROJECT_ID,
-                            name,
-                            role,
-                            "definition-" + server_id,
-                            now,
-                            now,
-                        ),
-                    )
-                host_id = str(
-                    connection.execute(
-                        "SELECT host_id FROM repositories WHERE repo_id = ?",
-                        (PROJECT_ID,),
-                    ).fetchone()[0]
-                )
-                connection.execute(
-                    """
-                    INSERT INTO repositories(
-                        repo_id, host_id, canonical_root, display_name, state,
-                        generation, created_at, updated_at
-                    ) VALUES (?, ?, '/repos/wrong', 'Wrong', 'active', 0, ?, ?)
-                    """,
-                    (self.wrong_repo, host_id, now, now),
-                )
-                connection.execute(
-                    """
-                    INSERT INTO repository_installations(
-                        repo_id, status, startup_fenced, generation, actor, updated_at
-                    ) VALUES (?, 'installed', 0, 0, 'fixture', ?)
-                    """,
-                    (self.wrong_repo, now),
-                )
-                establish_repository_owner_authority(
-                    connection,
-                    repository_id=self.wrong_repo,
-                    owner_uid=self.uid,
-                    repository_generation=0,
-                    operation_id="worker-broker-wrong-repo-owner-fixture",
-                    actor="worker-broker-migration-fixture",
-                    reason="explicit migration fixture owner",
-                    timestamp=now,
-                    evidence={
-                        "kind": "worker-broker-migration-owner-fixture",
-                        "repository_id": self.wrong_repo,
-                        "repository_generation": 0,
-                        "owner_uid": self.uid,
-                    },
-                )
-            supervision = WorkerSupervision(store)
-            for server_id in (
-                SERVER_ID,
-                self.runtime_revoked,
-                self.non_worker,
-                self.worker_acl_revoked,
-            ):
-                supervision.configure_policy(
-                    server_definition_id=server_id,
-                    actor="fixture",
-                    execution_uid=self.uid,
-                    keep_alive=True,
-                )
-
-        self.persistence.provision_principal(
-            uid=self.other_uid, account_id=ACCOUNT_ID
-        )
-        for uid, repo_id in (
-            (self.other_uid, PROJECT_ID),
-            (self.uid, self.wrong_repo),
-        ):
-            self.persistence.provision_repository_enrollment(
-                uid=uid,
-                repo_id=repo_id,
-                account_id=ACCOUNT_ID,
-                issued_at=now,
-                valid_until_epoch=int(time.time()) + 3600,
-            )
-
-        with CoordinatorStore.open(
-            self.persistence.database_path, expected_uid=self.uid
-        ) as store:
-            with store.immediate_transaction() as connection:
-                rows: list[tuple[int, str, str, str, int, str]] = []
-                for uid, repo_id, server_id in (
-                    (self.uid, PROJECT_ID, SERVER_ID),
-                    (self.uid, PROJECT_ID, self.runtime_revoked),
-                    (self.uid, PROJECT_ID, self.non_worker),
-                    (self.uid, PROJECT_ID, self.worker_acl_revoked),
-                    (self.other_uid, PROJECT_ID, SERVER_ID),
-                    (self.uid, self.wrong_repo, SERVER_ID),
-                ):
-                    for action in ("status", "start", "stop", "restart"):
-                        enabled = int(
-                            not (
-                                server_id == self.runtime_revoked
-                                and action == "restart"
-                            )
-                        )
-                        rows.append(
-                            (uid, repo_id, server_id, action, enabled, now)
-                        )
-                connection.executemany(
-                    """
-                    INSERT INTO broker_runtime_acl(
-                        uid, repo_id, resource_kind, resource_id,
-                        action, enabled, updated_at
-                    ) VALUES (?, ?, 'service', ?, ?, ?, ?)
-                    """,
-                    rows,
-                )
-        self.persistence.grant_worker(
-            uid=self.uid,
-            repo_id=PROJECT_ID,
-            server_definition_id=self.worker_acl_revoked,
-            operation=BrokerOperation.WORKER_LAUNCH_TICKET,
-            enabled=False,
-        )
-
-    def tearDown(self) -> None:
-        self.temporary.__exit__(None, None, None)
-
-    def test_worker_acl_upgrade_backfill_is_exact_revocation_safe_and_idempotent(
-        self,
-    ) -> None:
-        for _run in range(2):
-            self.persistence = type(self.persistence)(
-                self.persistence.database_path, expected_uid=self.uid
-            )
-
-        with CoordinatorStore.open(
-            self.persistence.database_path, expected_uid=self.uid
-        ) as store:
-            with store.read_transaction() as connection:
-                rows = list(
-                    connection.execute(
-                        """
-                        SELECT uid, repo_id, server_definition_id,
-                               operation, enabled
-                        FROM broker_worker_acl
-                        ORDER BY uid, repo_id, server_definition_id, operation
-                        """
-                    )
-                )
-        positive = [
-            row
-            for row in rows
-            if int(row["uid"]) == self.uid
-            and str(row["repo_id"]) == PROJECT_ID
-            and str(row["server_definition_id"]) == SERVER_ID
-        ]
-        self.assertEqual(len(positive), 5)
-        self.assertTrue(all(bool(row["enabled"]) for row in positive))
-        self.assertFalse(
-            any(str(row["server_definition_id"]) == self.runtime_revoked for row in rows)
-        )
-        self.assertFalse(
-            any(str(row["server_definition_id"]) == self.non_worker for row in rows)
-        )
-        explicit_revocation = [
-            row
-            for row in rows
-            if str(row["server_definition_id"]) == self.worker_acl_revoked
-        ]
-        self.assertEqual(len(explicit_revocation), 1)
-        self.assertFalse(bool(explicit_revocation[0]["enabled"]))
-        self.assertFalse(any(int(row["uid"]) == self.other_uid for row in rows))
-        self.assertFalse(
-            any(str(row["repo_id"]) == self.wrong_repo for row in rows)
-        )
-
 
 class WorkerBrokerBackendTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -520,13 +291,6 @@ class WorkerBrokerBackendTests(unittest.TestCase):
         self.root = self.temporary.__enter__()
         self.persistence, _actions = seed_store_backed_broker(self.root)
         self.actions = RecordingTypedHostActions()
-        self.persistence.replace_server_access(
-            uid=os.geteuid(),
-            repo_id=PROJECT_ID,
-            server_definition_ids=(SERVER_ID,),
-            start_port=3100,
-            end_port=3199,
-        )
         with CoordinatorStore.open(
             self.persistence.database_path, expected_uid=os.geteuid()
         ) as store:
@@ -591,7 +355,7 @@ class WorkerBrokerBackendTests(unittest.TestCase):
     def _service(self) -> BrokerService:
         backend = StoreBackedMutationBackend(self.persistence, self.actions)
         return BrokerService(
-            StoreBackedAuthorizer(self.persistence), SerializedMutationWriter(backend)
+            StoreBackedRequestAcceptor(self.persistence), SerializedMutationWriter(backend)
         )
 
     def _reply(
@@ -797,7 +561,7 @@ class WorkerBrokerBackendTests(unittest.TestCase):
         request = self._ticket_request()
         backend = StoreBackedMutationBackend(self.persistence, self.actions)
         interrupted = BrokerService(
-            StoreBackedAuthorizer(self.persistence), SerializedMutationWriter(backend)
+            StoreBackedRequestAcceptor(self.persistence), SerializedMutationWriter(backend)
         )
         with mock.patch.object(
             backend._worker_operations,
@@ -873,7 +637,7 @@ class WorkerBrokerBackendTests(unittest.TestCase):
         )
         backend = StoreBackedMutationBackend(self.persistence, self.actions)
         interrupted = BrokerService(
-            StoreBackedAuthorizer(self.persistence), SerializedMutationWriter(backend)
+            StoreBackedRequestAcceptor(self.persistence), SerializedMutationWriter(backend)
         )
         with mock.patch.object(
             backend._worker_operations,
@@ -893,69 +657,6 @@ class WorkerBrokerBackendTests(unittest.TestCase):
             recovered["result"]["attempt"]["log_artifact"]["path"], str(path)
         )
 
-    def test_local_peer_is_attribution_while_cross_worker_attempt_fails(self) -> None:
-        service = self._service()
-        request = self._ticket_request()
-        wrong_uid = os.geteuid() + 10_000
-        self.persistence.provision_principal(uid=wrong_uid, account_id=ACCOUNT_ID)
-        self.persistence.provision_repository_enrollment(
-            uid=wrong_uid,
-            repo_id=PROJECT_ID,
-            account_id=ACCOUNT_ID,
-            issued_at=utc_timestamp(),
-            valid_until_epoch=int(time.time()) + 3600,
-        )
-        self.persistence.grant_worker(
-            uid=wrong_uid,
-            repo_id=PROJECT_ID,
-            server_definition_id=SERVER_ID,
-            operation=BrokerOperation.WORKER_LAUNCH_TICKET,
-        )
-        wrong_peer = PeerCredentials(
-            uid=wrong_uid, gid=os.getegid(), pid=os.getpid()
-        )
-        local = self._reply(service, wrong_peer, request)
-        self.assertTrue(local["ok"], local)
-
-        peer = PeerCredentials(uid=os.geteuid(), gid=os.getegid(), pid=os.getpid())
-        ticket = self._reply(service, peer, request)["result"]
-        self.assertEqual(ticket, local["result"])
-        other_server = str(uuid.uuid4())
-        now = utc_timestamp()
-        with CoordinatorStore.open(
-            self.persistence.database_path, expected_uid=os.geteuid()
-        ) as store:
-            with store.immediate_transaction() as connection:
-                connection.execute(
-                    """
-                    INSERT INTO server_definitions(
-                        server_definition_id, repo_id, name, cwd,
-                        definition_fingerprint, generation, created_at, updated_at
-                    ) VALUES (?, ?, 'other', '/repos/alpha', 'other', 0, ?, ?)
-                    """,
-                    (other_server, PROJECT_ID, now, now),
-                )
-            WorkerSupervision(store).configure_policy(
-                server_definition_id=other_server,
-                actor="fixture",
-                execution_uid=os.geteuid(),
-                keep_alive=True,
-            )
-        self.persistence.grant_worker(
-            uid=os.geteuid(),
-            repo_id=PROJECT_ID,
-            server_definition_id=other_server,
-            operation=BrokerOperation.WORKER_ATTEMPT_READ,
-        )
-        cross = worker_request(
-            BrokerOperation.WORKER_ATTEMPT_READ,
-            authority_generation=self.authority_generation,
-            resource_id=other_server,
-            arguments={"attempt_id": ticket["attempt"]["attempt_id"]},
-        )
-        denied = self._reply(service, peer, cross)
-        self.assertFalse(denied["ok"])
-        self.assertEqual(denied["error"]["code"], "operation_access_denied")
 
     def test_artifact_id_path_and_digest_are_verified_without_mode_authorization(self) -> None:
         service = self._service()

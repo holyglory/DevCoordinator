@@ -381,7 +381,7 @@ def _record_docker_transition(
 def _real_git_worktree_marker(root: Path) -> str:
     """Return ``valid``, ``missing``, or ``invalid`` for one Git worktree.
 
-    Enrollment accepts only a real directory whose ``.git`` marker is a real
+    Configuration accepts only a real directory whose ``.git`` marker is a real
     directory or regular file. Observation must apply the same proof instead
     of treating a registered path as ownership authority by itself. ``lstat``
     is deliberate: a symlinked marker is not repository-controlled evidence,
@@ -451,7 +451,7 @@ def _repository_resolution(
     root_path: Path | None = None
     if registered:
         registered_root, registered_id = registered[0]
-        # A .git marker below the deepest enrolled ancestor is positive
+        # A .git marker below the deepest configured ancestor is positive
         # evidence of a distinct nested worktree. Do not silently collapse it
         # into the outer repository.
         for directory in (candidate, *candidate.parents):
@@ -484,13 +484,13 @@ def _repository_resolution(
     if row is not None:
         return str(row[0]), root, ""
     # Observation is not ownership authority.  A newly seen Git root remains
-    # explicitly unassigned until an administrator enrolls it with a sealed
+    # explicitly unassigned until a start-like command configures it with a sealed
     # repository owner UID; caller identity and inode UID are never promoted
     # into execution authority here.
     # Keep the persisted reason inside the long-lived normalized schema
-    # vocabulary.  ``missing_repo`` means there is no enrolled repository row
+    # vocabulary.  ``missing_repo`` means there is no configured repository row
     # (and therefore no explicit repository-owner authority); the suggested
-    # root retains the exact Git root an administrator may enroll later.
+    # root retains the exact Git root a start-like command may configure later.
     return None, root, "missing_repo"
 
 
@@ -1109,13 +1109,10 @@ def commit_host_inventory_observation(
             """
             SELECT o.lifecycle, o.health, o.restart_policy,
                    o.ports_fingerprint, o.labels_fingerprint,
-                   (
-                       SELECT m.repo_id FROM repository_memberships m
-                       WHERE m.resource_kind = 'container'
-                         AND m.host_resource_id = o.docker_resource_id
-                       LIMIT 1
-                   ) AS repo_id
-            FROM docker_observations o WHERE o.docker_resource_id = ?
+                   d.repo_id
+            FROM docker_observations o
+            JOIN docker_resources d USING(docker_resource_id)
+            WHERE o.docker_resource_id = ?
             """,
             (resource_id,),
         ).fetchone()
@@ -1250,21 +1247,20 @@ def commit_host_inventory_observation(
             (resource_id,),
         ).fetchone()
         retirement_status = str(retirement[0]) if retirement is not None else None
+        current_association = connection.execute(
+            "SELECT repo_id FROM docker_resources WHERE docker_resource_id = ?",
+            (resource_id,),
+        ).fetchone()
+        existing_repo_id = (
+            None
+            if current_association is None or current_association["repo_id"] is None
+            else str(current_association["repo_id"])
+        )
         if retirement_status in {"disabling", "retired"}:
             # Observation remains truthful after a standalone fence, but it may
             # never turn retained evidence back into an attachable resource.
             # A running retired container is projected separately as a
             # start_fence_violated attention item.
-            connection.execute(
-                """
-                UPDATE control_bindings
-                SET authority_state = 'retired', generation = generation + 1,
-                    updated_at = ?
-                WHERE resource_kind = 'container' AND resource_id = ?
-                  AND authority_state != 'retired'
-                """,
-                (timestamp, resource_id),
-            )
             connection.execute(
                 """
                 UPDATE unassigned_resources SET status = 'retired', updated_at = ?
@@ -1273,9 +1269,9 @@ def commit_host_inventory_observation(
                 """,
                 (timestamp, host_id, resource_id),
             )
-            repo_id = None
-            effective_repo_id = None
-            ownership_conflict = False
+            repo_id = existing_repo_id
+            effective_repo_id = existing_repo_id
+            association_conflict = False
         else:
             ephemeral_repo_id = (
                 _ephemeral_repository_attribution(
@@ -1299,104 +1295,25 @@ def commit_host_inventory_observation(
                     host_id,
                     container.get("project"),
                 )
-            binding_id = deterministic_id("control-binding", "container", resource_id)
-            existing_binding = connection.execute(
-                """
-                SELECT authority_state, provenance FROM control_bindings
-                WHERE binding_id = ?
-                """,
-                (binding_id,),
-            ).fetchone()
-            existing_membership = connection.execute(
-                """
-                SELECT m.repo_id, m.control_binding_id, b.provenance
-                FROM repository_memberships m
-                LEFT JOIN control_bindings b ON b.binding_id = m.control_binding_id
-                WHERE m.resource_kind = 'container' AND m.host_resource_id = ?
-                """,
-                (resource_id,),
-            ).fetchone()
-            existing_membership_provenance = (
-                str(existing_membership["provenance"] or "")
-                if existing_membership is not None
-                else ""
-            )
-            if (
-                ephemeral_repo_id is not None
-                and existing_membership is not None
-                and str(existing_membership["repo_id"]) != ephemeral_repo_id
-            ):
-                # A precommitted nonce plus all five exact immutable labels is
-                # stronger evidence than an earlier path claim or manual
-                # attachment for this Docker identity.
-                connection.execute(
-                    """
-                    DELETE FROM repository_memberships
-                    WHERE resource_kind = 'container' AND host_resource_id = ?
-                    """,
-                    (resource_id,),
-                )
-                existing_membership = None
-            ownership_conflict = bool(
+            association_conflict = bool(
                 ephemeral_repo_id is None
-                and (
-                    (
-                        repo_id is not None
-                        and existing_membership is not None
-                        and str(existing_membership["repo_id"]) != repo_id
-                    )
-                    or (
-                        repo_id is None
-                        and existing_membership is None
-                        and existing_binding is not None
-                        and str(existing_binding["authority_state"]) == "conflicting"
-                        and str(existing_binding["provenance"])
-                        == "conflicting_exact_claim"
-                    )
-                )
+                and repo_id is not None
+                and existing_repo_id is not None
+                and existing_repo_id != repo_id
             )
-            weak_membership_revoked = bool(
-                ephemeral_repo_id is None
-                and repo_id is None
-                and unresolved_reason == "not_git"
-                and ownership_observable
-                and existing_membership is not None
-                and existing_membership_provenance
-                not in _SEALED_MEMBERSHIP_PROVENANCE
-            )
-            if ownership_conflict:
-                # Only a contradictory exact Git-root claim can invalidate an
-                # existing membership. A pathless observation is absence of new
-                # attribution evidence and must preserve an explicit attach.
-                connection.execute(
-                    """
-                    DELETE FROM repository_memberships
-                    WHERE resource_kind = 'container' AND host_resource_id = ?
-                    """,
-                    (resource_id,),
-                )
-                effective_repo_id = None
-            elif weak_membership_revoked:
-                # A prior path-derived claim is not durable authority once an
-                # exact, inspect-backed observation proves that the registered
-                # root is not a real Git worktree. Preserve explicit operator,
-                # sealed ephemeral, and exact runtime-manifest provenance, but
-                # quarantine legacy/Compose attribution without touching the
-                # native container.
-                connection.execute(
-                    """
-                    DELETE FROM repository_memberships
-                    WHERE resource_kind = 'container' AND host_resource_id = ?
-                    """,
-                    (resource_id,),
-                )
+            if ephemeral_repo_id is not None:
+                effective_repo_id = ephemeral_repo_id
+            elif association_conflict:
                 effective_repo_id = None
             elif repo_id is not None:
                 effective_repo_id = repo_id
-            elif existing_membership is not None:
-                effective_repo_id = str(existing_membership["repo_id"])
             else:
-                effective_repo_id = None
+                effective_repo_id = existing_repo_id
+            connection.execute(
+                "UPDATE docker_resources SET repo_id = ?, updated_at = ? "
+                "WHERE docker_resource_id = ?",
+                (effective_repo_id, timestamp, resource_id),
+            )
         event_repo_id = effective_repo_id
         if event_repo_id is None and previous_observation is not None:
             event_repo_id = (
@@ -1456,60 +1373,7 @@ def commit_host_inventory_observation(
                     timestamp,
                 ),
             )
-            # Repository attribution and controller authority are separate
-            # facts. Contradictory exact roots are deliberately non-actionable;
-            # pathless observations retain an existing explicit membership.
-            authority_state = "conflicting" if ownership_conflict else "authoritative"
-            binding_provenance = (
-                "conflicting_exact_claim"
-                if ownership_conflict
-                else "coordinator_ephemeral"
-                if ephemeral_repo_id is not None
-                else str(container.get("metadata_source") or "observer")
-            )
-            connection.execute(
-                """
-                INSERT INTO control_bindings(
-                    binding_id, repo_id, source_resource_id, resource_kind,
-                    resource_id, source_id, capability, provenance,
-                    authority_state, priority, generation, created_at, updated_at
-                ) VALUES (?, ?, ?, 'container', ?, ?, 'lifecycle', ?, ?, ?, 0, ?, ?)
-                ON CONFLICT(binding_id) DO UPDATE SET
-                    repo_id = excluded.repo_id,
-                    source_resource_id = excluded.source_resource_id,
-                    provenance = CASE
-                        WHEN excluded.provenance = 'coordinator_ephemeral'
-                        THEN excluded.provenance
-                        WHEN control_bindings.provenance IN (
-                            'operator_attach', 'coordinator_ephemeral',
-                            'runtime_manifest'
-                        )
-                         AND excluded.authority_state = 'authoritative'
-                        THEN control_bindings.provenance
-                        WHEN excluded.provenance = 'inspection_unavailable'
-                         AND control_bindings.authority_state = 'authoritative'
-                        THEN control_bindings.provenance
-                        ELSE excluded.provenance
-                    END,
-                    authority_state = excluded.authority_state,
-                    priority = excluded.priority,
-                    generation = control_bindings.generation + 1,
-                    updated_at = excluded.updated_at
-                """,
-                (
-                    binding_id,
-                    effective_repo_id,
-                    source_resource_id,
-                    resource_id,
-                    source_id,
-                    binding_provenance,
-                    authority_state,
-                    100,
-                    timestamp,
-                    timestamp,
-                ),
-            )
-            if ownership_conflict or weak_membership_revoked:
+            if association_conflict:
                 connection.execute(
                     """
                     UPDATE startup_policies SET repo_id = NULL,
@@ -1526,28 +1390,16 @@ def commit_host_inventory_observation(
                     """,
                     (timestamp, resource_id),
                 )
-            elif repo_id is not None:
+            elif effective_repo_id is not None:
                 connection.execute(
-                    """
-                    INSERT INTO repository_memberships(
-                        membership_id, repo_id, resource_kind, host_resource_id,
-                        immutable_fingerprint, control_binding_id, created_at
-                    ) VALUES (?, ?, 'container', ?, ?, ?, ?)
-                    ON CONFLICT(resource_kind, host_resource_id) DO UPDATE SET
-                        immutable_fingerprint = excluded.immutable_fingerprint,
-                        control_binding_id = excluded.control_binding_id
-                    """,
-                    (
-                        deterministic_id("membership", repo_id, "container", resource_id),
-                        repo_id,
-                        resource_id,
-                        "sha256:"
-                        + fingerprint(
-                            {"engine_id": engine_id, "container_id": full_id}
-                        ),
-                        binding_id,
-                        timestamp,
-                    ),
+                    "UPDATE startup_policies SET repo_id = ?, updated_at = ? "
+                    "WHERE resource_kind = 'container' AND resource_id = ?",
+                    (effective_repo_id, timestamp, resource_id),
+                )
+                connection.execute(
+                    "UPDATE database_bindings SET repo_id = ?, updated_at = ? "
+                    "WHERE docker_resource_id = ?",
+                    (effective_repo_id, timestamp, resource_id),
                 )
                 connection.execute(
                     """
@@ -1605,7 +1457,7 @@ def commit_host_inventory_observation(
                 else:
                     reason = (
                         "conflicting_claims"
-                        if ownership_conflict
+                        if association_conflict
                         else "stale_observation"
                         if not ownership_observable
                         else unresolved_reason
@@ -1921,40 +1773,29 @@ def commit_host_inventory_observation(
 
     if compose_container_table is not None:
         for container in compose_containers:
-            owner_rows = list(
-                connection.execute(
-                    """
-                    SELECT DISTINCT membership.repo_id
-                    FROM repository_memberships membership
-                    JOIN control_bindings binding
-                      ON binding.binding_id = membership.control_binding_id
-                    WHERE membership.resource_kind = 'container'
-                      AND membership.host_resource_id = ?
-                      AND binding.authority_state = 'authoritative'
-                    ORDER BY membership.repo_id
-                    """,
-                    (container["docker_resource_id"],),
-                )
+            association = connection.execute(
+                "SELECT repo_id FROM docker_resources WHERE docker_resource_id = ?",
+                (container["docker_resource_id"],),
+            ).fetchone()
+            associated_repo_id = (
+                None
+                if association is None or association["repo_id"] is None
+                else str(association["repo_id"])
             )
-            owner_ids = tuple(str(row["repo_id"]) for row in owner_rows)
-            ownership_state = (
-                "exclusive"
-                if len(owner_ids) == 1
-                else ("missing" if not owner_ids else "conflicting")
-            )
+            association_state = "exclusive" if associated_repo_id else "missing"
             evidence = {
                 **container,
-                "ownership_state": ownership_state,
-                "authoritative_owner_repo_id": (
-                    owner_ids[0] if ownership_state == "exclusive" else None
+                "association_state": association_state,
+                "associated_repo_id": (
+                    associated_repo_id if association_state == "exclusive" else None
                 ),
             }
             connection.execute(
                 """
                 INSERT INTO broker_observed_compose_containers(
                     snapshot_id, docker_resource_id, full_container_id,
-                    project_name, service_name, lifecycle, ownership_state,
-                    authoritative_owner_repo_id, observation_fingerprint
+                    project_name, service_name, lifecycle, association_state,
+                    associated_repo_id, observation_fingerprint
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
@@ -1964,8 +1805,8 @@ def commit_host_inventory_observation(
                     evidence["project_name"],
                     evidence["service_name"],
                     evidence["lifecycle"],
-                    evidence["ownership_state"],
-                    evidence["authoritative_owner_repo_id"],
+                    evidence["association_state"],
+                    evidence["associated_repo_id"],
                     "sha256:" + fingerprint(evidence),
                 ),
             )
@@ -1980,12 +1821,7 @@ def commit_host_inventory_observation(
         rows = connection.execute(
             """
             SELECT d.docker_resource_id, d.current_name, o.lifecycle, o.health,
-                   (
-                       SELECT m.repo_id FROM repository_memberships m
-                       WHERE m.resource_kind = 'container'
-                         AND m.host_resource_id = d.docker_resource_id
-                       LIMIT 1
-                   ) AS repo_id
+                   d.repo_id
             FROM docker_resources d
             JOIN docker_observations o USING(docker_resource_id)
             WHERE d.engine_id = ?

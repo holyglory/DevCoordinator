@@ -41,7 +41,7 @@
     archives: null,      // owner-only GET /api/lifecycle/list ({ archives })
     tests: null,         // selected repository's Coordinator-owned test statistics
     testsFleet: null,    // retained fleet-wide test projection
-    testsRepositories: null, // lightweight enrolled repository catalog
+    testsRepositories: null, // lightweight configured repository catalog
     testsProject: null,
     testsDays: 30,
     testsHours: 24,
@@ -1554,7 +1554,16 @@
       if (isEdgePublicationError(err)) {
         await loadInvites({ force: true });
         showSectionPublicationError('invites-body', err, () => loadInvites({ force: true }));
-      } else if (err.status !== 401) showBanner(err, () => decideInvite(request, decision), 'invites');
+      } else if (err.status !== 401) {
+        // A successful background refresh may clear only the collection-load
+        // error.  Keep this action conflict visible until the operator retries
+        // or dismisses it instead of racing it against the refresh poll.
+        showBanner(
+          err,
+          () => decideInvite(request, decision),
+          `invite-action:${id}`,
+        );
+      }
     } finally {
       ui.busy.delete(busyKey);
       bump();
@@ -1720,13 +1729,16 @@
       || $('#telegram-dialog').contains(active)
       || active?.dataset?.telegramBot === pending.botId;
     if (!mayRestore) return;
-    setTimeout(() => {
-      if (pendingRegisteredTelegramFocus !== pending) return;
-      const row = telegramBotRow(pending.botId);
-      if (!row) return;
-      row.scrollIntoView({ block: 'nearest' });
-      row.focus({ preventScroll: true });
-    }, 0);
+    if (pendingRegisteredTelegramFocus !== pending) return;
+    const row = telegramBotRow(pending.botId);
+    if (!row) return;
+    // The success journey renders the new card before calling this helper.
+    // Focus it synchronously so a waiting browser client cannot observe the
+    // card in the brief interval before a zero-delay timer fires.  Retaining
+    // the pending marker still lets a subsequent polling render restore focus
+    // if it replaces the card while the confirmation context is active.
+    row.scrollIntoView({ block: 'nearest' });
+    row.focus({ preventScroll: true });
   }
 
   function requestRegisteredTelegramFocus(botId) {
@@ -1735,6 +1747,16 @@
     const pending = { botId: normalizedBotId };
     pendingRegisteredTelegramFocus = pending;
     restorePendingRegisteredTelegramFocus();
+    queueMicrotask(() => {
+      if (pendingRegisteredTelegramFocus === pending) {
+        restorePendingRegisteredTelegramFocus();
+      }
+    });
+    requestAnimationFrame(() => {
+      if (pendingRegisteredTelegramFocus === pending) {
+        restorePendingRegisteredTelegramFocus();
+      }
+    });
     setTimeout(() => {
       if (pendingRegisteredTelegramFocus === pending) pendingRegisteredTelegramFocus = null;
     }, 5_000);
@@ -1872,9 +1894,10 @@
         const registeredId = String(state.telegram?.registeredBotId || '');
         const registered = telegramBots().find((bot) => telegramBotId(bot) === registeredId)
           || telegramBots()[telegramBots().length - 1];
-        closeTelegramDialog();
         renderTelegram();
         requestRegisteredTelegramFocus(telegramBotId(registered));
+        closeTelegramDialog();
+        restorePendingRegisteredTelegramFocus();
         announce('Telegram bot registered');
       } catch (err) {
         const webhookActive = err.code === 'telegram_webhook_active'
@@ -2819,7 +2842,7 @@
   // Repository families come only from the coordinator's authoritative tree.
   // The browser joins resources by supplied immutable IDs and fails closed if
   // the producer omits or corrupts that tree; paths, names, and flat usage rows
-  // never manufacture project membership.
+  // never manufacture repository associations.
   function repositoryTreeContractProblemsOf(inv) {
     const invalid = (name) => [{ kind: 'inventory', name }];
     if (!inv || typeof inv !== 'object' || Array.isArray(inv)) {
@@ -2855,7 +2878,6 @@
         || !records(normalizedResources.servers)
         || !records(normalizedResources.docker)
         || !records(normalizedResources.databases)
-        || !records(inv.memberships)
         || !records(inv.observations?.docker)
         || !records(inv.observations?.databases)
         || !records(inv.unassigned_resources)
@@ -2897,14 +2919,13 @@
       matches.push(server);
       serversById.set(id, matches);
     }
-    const containerMembershipsById = new Map();
-    for (const membership of inv.memberships) {
-      if (membership.resource_kind !== 'container') continue;
-      const id = membership.host_resource_id;
-      if (typeof id !== 'string' || !id) return invalid('a container membership has no immutable ID');
-      const matches = containerMembershipsById.get(id) || [];
-      matches.push(membership);
-      containerMembershipsById.set(id, matches);
+    const containersById = new Map();
+    for (const container of normalizedResources.docker) {
+      const id = container.docker_resource_id;
+      if (typeof id !== 'string' || !id) return invalid('a container has no immutable ID');
+      const matches = containersById.get(id) || [];
+      matches.push(container);
+      containersById.set(id, matches);
     }
     const databasesById = new Map();
     for (const database of normalizedResources.databases) {
@@ -2966,7 +2987,7 @@
           classifiedServerIds.add(serverId);
         }
         for (const containerId of scope.container_resource_ids) {
-          const matches = containerMembershipsById.get(containerId);
+          const matches = containersById.get(containerId);
           if (!matches || matches.length !== 1 || matches[0].repo_id !== scope.repo_id
               || classifiedContainerIds.has(containerId)) {
             return invalid('a container is missing, duplicated, or assigned to the wrong repository scope');
@@ -3043,7 +3064,7 @@
 
         // A database binding is independent domain evidence. Its exact ID may
         // identify the backing Docker resource and the compatibility display
-        // row; neither names nor paths are used to establish membership.
+        // row; neither names nor paths are used to establish association.
         for (const bindingId of databaseBindingIds) {
           const database = databaseById.get(bindingId);
           const postgres = postgresByBindingId.get(bindingId);
@@ -5053,30 +5074,17 @@
   }
 
   function testSetupTargetEntries(setup) {
-    const missing = new Set(setup.capability_policy?.missing || []);
     if (!Array.isArray(setup.targets)) return setupEntries(setup.target_graph);
     return setup.targets.map((target) => {
       if (typeof target === 'string') return [target, ''];
       const requirements = [];
       if (target.network && target.network !== 'none') requirements.push(`network.${target.network}`);
       for (const fixture of target.fixtures || []) requirements.push(`fixture.${fixture}`);
-      const blocked = requirements.filter((requirement) => missing.has(requirement));
       const detail = [];
       if ((target.depends_on || []).length) detail.push(`after ${target.depends_on.join(', ')}`);
       if (requirements.length) detail.push(requirements.join(', '));
-      if (blocked.length) detail.push(`blocked: ${blocked.join(', ')}`);
       return [target.name || 'Unnamed target', detail.join(' · ')];
     });
-  }
-
-  function testSetupCapabilityEntries(setup) {
-    const policy = setup.capability_policy;
-    if (!policy || typeof policy !== 'object') return [];
-    const missing = new Set(policy.missing || []);
-    return (policy.requested || []).map((capability) => [
-      capability,
-      missing.has(capability) ? 'Blocked — administrator grant required' : 'Approved',
-    ]);
   }
 
   function renderTestSetupTab() {
@@ -5094,7 +5102,6 @@
     const policies = setupEntries(setup.evidence_policies || setup.policies);
     const fixtures = setupEntries(setup.fixtures);
     const isolation = setupEntries(setup.isolation || setup.capabilities || setup.network_requirements);
-    const capabilities = testSetupCapabilityEntries(setup);
     return [h('div', { class: 'test-setup-grid' },
       setupCard(
         `Manifest · ${setup.status || 'unknown'}`,
@@ -5104,7 +5111,7 @@
       ),
       setupCard('Target graph', 'Dependency-aware targets selected by repository inputs and intent.', targets, 'No targets are declared.'),
       setupCard('Evidence policies', 'Named policies are evaluated against exact immutable provenance.', policies, 'No evidence policies are declared.'),
-      setupCard('Capabilities & fixtures', 'Network and fixture requirements for these targets.', [...capabilities, ...isolation, ...fixtures], 'No additional capabilities or fixtures are required.'),
+      setupCard('Capabilities & fixtures', 'Network and fixture requirements for these targets.', [...isolation, ...fixtures], 'No additional capabilities or fixtures are required.'),
     )];
   }
 
@@ -5216,7 +5223,7 @@
     const previous = state.testsRunSourceSelections.get(repoId)
       || sourceKey(catalog?.default_source);
     if (state.testsRunSourceLoading && !catalog) {
-      select.replaceChildren(h('option', { value: '' }, 'Reading authorized sources…'));
+      select.replaceChildren(h('option', { value: '' }, 'Reading configured sources…'));
       select.disabled = true;
       updateTestRunPreviewAvailability();
       return;
@@ -5394,7 +5401,7 @@
       const intent = $('#test-run-intent').value;
       const source = selectedTestRunSource();
       if (!source) {
-        throw new ApiError('Choose an authorized repository source.', 400);
+        throw new ApiError('Choose a configured repository source.', 400);
       }
       const requestedTargets = intent === 'manual' ? selectedTestRunTargets() : [];
       if (intent === 'manual' && requestedTargets.length === 0) {
@@ -7664,6 +7671,14 @@
     return typeof server?.log_path === 'string' && server.log_path.trim().length > 0;
   }
 
+  function serverSupportsGenericLifecycle(server) {
+    // Temporary services are owned by their bounded runtime session. Finish,
+    // expiry, and the TTL reaper provide their exact cleanup path; exposing
+    // generic Archive would promise an authority the broker intentionally
+    // never grants to this resource class.
+    return String(server?.role || '').toLowerCase() !== 'temporary';
+  }
+
   function serverItem(o, s, hiddenRow = false) {
     const id = s.id;
     const open = ui.expanded.has(id);
@@ -7710,6 +7725,7 @@
     const stoppable = ['running', 'starting', 'unhealthy'].includes(s.status);
     const restartable = stoppable || s.status === 'stopped';
     const supervised = !!s.supervision;
+    const genericLifecycle = serverSupportsGenericLifecycle(s);
     const actions = h('span', { class: 'cell actions srv-actions' },
       supervised ? workerControlButtons(s, busy) : h('button', {
         class: `btn small act-restart${busy ? ' is-busy' : ''}`, type: 'button',
@@ -7742,12 +7758,16 @@
         : (s.status === 'stopped' ? hideButton('servers', s.key, s.name || 'server') : ghostIconSlot()),
       supervised
         ? workerRemoveButton(s, { compact: true })
-        : archiveButton(archiveTarget, { compact: true }));
+        : (genericLifecycle
+            ? archiveButton(archiveTarget, { compact: true })
+            : ghostIconSlot()));
 
     const row = h('div', {
       class: `row srv-grid expandable${hiddenRow ? ' is-hidden' : ''}`,
       tabindex: '-1',
-      'data-lifecycle-target': `${archiveTarget.target_kind}:${archiveTarget.target_id}`,
+      'data-lifecycle-target': genericLifecycle
+        ? `${archiveTarget.target_kind}:${archiveTarget.target_id}`
+        : null,
       onclick: (e) => {
         if (e.target.closest('button, a, input, select')) return;
         toggleServer(s);
@@ -8939,6 +8959,7 @@
     const stopped = s.status === 'stopped';
     const running = isServerRunning(s);
     const supervised = !!s.supervision;
+    const genericLifecycle = serverSupportsGenericLifecycle(s);
     const detail = supervised
       ? `${s.supervision.keep_alive === true ? 'Keep alive on' : 'Keep alive off'}${s.url ? ` · ${s.url}` : ''}`
       : (s.url || '');
@@ -8962,7 +8983,9 @@
     return h('div', {
       class: `row tree-grid tree-item${hiddenRow ? ' is-hidden' : ''}`,
       tabindex: '-1',
-      'data-lifecycle-target': `${archiveTarget.target_kind}:${archiveTarget.target_id}`,
+      'data-lifecycle-target': genericLifecycle
+        ? `${archiveTarget.target_kind}:${archiveTarget.target_id}`
+        : null,
     },
       h('span', { class: 'cell c-kind' },
         projectResourceKindTrigger(supervised ? 'worker' : 'server', s.id || s.key || s.name)),
@@ -8996,7 +9019,9 @@
           : (stopped ? hideButton('servers', s.key, s.name || 'server') : ghostIconSlot()),
         supervised
           ? workerRemoveButton(s, { compact: true })
-          : archiveButton(archiveTarget, { compact: true })));
+          : (genericLifecycle
+              ? archiveButton(archiveTarget, { compact: true })
+              : ghostIconSlot())));
   }
 
   function treeContainerRow(o, c, isDb, hiddenRow, webish = false) {

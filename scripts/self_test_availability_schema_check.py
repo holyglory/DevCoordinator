@@ -61,15 +61,36 @@ def main() -> int:
         database.chmod(0o600)
 
         profile = root / "client-profiles.json"
+        profile_document = {
+            "version": 2,
+            "service": {
+                "socket": "/run/devcoordinator-authority/broker.sock",
+                "database_generation": "generation-alpha",
+            },
+            "repositories": [
+                {
+                    "canonical_root": "/home/example/project",
+                    "repo_id": "repo-alpha",
+                    "generation": 0,
+                    "servers": {},
+                    "containers": {},
+                    "compose_definition_id": None,
+                    "compose_container_ids": [],
+                    "compose_run_once_services": {},
+                    "ephemeral_templates": {},
+                    "ephemeral_secret_policies": {},
+                }
+            ],
+        }
         profile.write_text(
-            json.dumps({"version": 1, "service": {}, "clients": {"1000": {}}}),
+            json.dumps(profile_document),
             encoding="utf-8",
         )
         profile.chmod(0o600)
         expect(
             CHECK.check_profile(
                 profile,
-                1,
+                2,
                 trusted_owner_uid=os.geteuid(),
                 trust_root=root,
             )["ok"],
@@ -78,7 +99,7 @@ def main() -> int:
         must_fail(
             lambda: CHECK.check_profile(
                 profile,
-                2,
+                1,
                 trusted_owner_uid=os.geteuid(),
                 trust_root=root,
             ),
@@ -88,7 +109,7 @@ def main() -> int:
         expect(
             CHECK.check_profile(
                 profile,
-                1,
+                2,
                 trusted_owner_uid=os.geteuid(),
                 trust_root=root,
             )["ok"],
@@ -100,7 +121,7 @@ def main() -> int:
         must_fail(
             lambda: CHECK.check_profile(
                 link,
-                1,
+                2,
                 trusted_owner_uid=os.geteuid(),
                 trust_root=root,
             ),
@@ -116,11 +137,25 @@ def main() -> int:
         must_fail(
             lambda: CHECK.check_profile(
                 bad_profile,
-                1,
+                2,
                 trusted_owner_uid=os.geteuid(),
                 trust_root=root,
             ),
             "replaceable profile ancestor",
+        )
+
+        legacy_profile = dict(profile_document)
+        legacy_profile.pop("repositories")
+        legacy_profile["clients"] = {"1000": {}}
+        profile.write_text(json.dumps(legacy_profile), encoding="utf-8")
+        must_fail(
+            lambda: CHECK.check_profile(
+                profile,
+                2,
+                trusted_owner_uid=os.geteuid(),
+                trust_root=root,
+            ),
+            "obsolete client-scoped profile",
         )
 
     print("availability schema check self-test ok")

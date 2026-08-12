@@ -2,7 +2,7 @@
 
 This module deliberately keeps password bytes out of broker SQLite state,
 profiles, logs, command arguments, and ordinary environment values.  The
-broker creates a root-owned runtime file only after an authorized run has a
+broker creates a root-owned runtime file only after an accepted run has a
 durable identity, mounts its material directory read-only into that one
 container, and can release one read-only copy to its exact owning runner.
 """

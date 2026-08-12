@@ -116,17 +116,12 @@
         "skills/codex-dev-coordinator/scripts/devcoordinator/authority_retention.py",
         "skills/codex-dev-coordinator/scripts/devcoordinator/broker*.py",
         "skills/codex-dev-coordinator/scripts/devcoordinator/events.py",
-        "skills/codex-dev-coordinator/scripts/devcoordinator/filesystem_acl.py",
         "skills/codex-dev-coordinator/scripts/devcoordinator/maintenance.py",
-        "skills/codex-dev-coordinator/scripts/devcoordinator/repository_owner_authority.py",
         "skills/codex-dev-coordinator/scripts/devcoordinator/schema.py",
         "skills/codex-dev-coordinator/scripts/devcoordinator/store.py",
         "skills/codex-dev-coordinator/scripts/devcoordinator/tests/test_broker*.py",
-        "skills/codex-dev-coordinator/scripts/devcoordinator/tests/test_enrollment_snapshot_fingerprints.py",
-        "skills/codex-dev-coordinator/scripts/devcoordinator/tests/test_filesystem_acl.py",
         "skills/codex-dev-coordinator/scripts/devcoordinator/tests/test_maintenance.py",
-        "skills/codex-dev-coordinator/scripts/devcoordinator/tests/test_project_profile_revocation.py",
-        "skills/codex-dev-coordinator/scripts/devcoordinator/tests/test_repository_owner_authority.py"
+        "skills/codex-dev-coordinator/scripts/devcoordinator/tests/test_project_profile_revocation.py"
       ],
       "intents": [
         "change",
@@ -135,6 +130,7 @@
         "release",
         "manual"
       ],
+      "network": "loopback",
       "reporter": "automation-events",
       "retry": {
         "max_attempts": 2,
@@ -205,7 +201,10 @@
         "scripts/run_coordinator_test_partition.py",
         "skills/codex-dev-coordinator/scripts/dev_coordinator.py",
         "skills/codex-dev-coordinator/scripts/devcoordinator/__init__.py",
+        "skills/codex-dev-coordinator/scripts/devcoordinator/agent_cli.py",
+        "skills/codex-dev-coordinator/scripts/devcoordinator/capabilities.py",
         "skills/codex-dev-coordinator/scripts/devcoordinator/cleanup_lifecycle.py",
+        "skills/codex-dev-coordinator/scripts/devcoordinator/docker_storage.py",
         "skills/codex-dev-coordinator/scripts/devcoordinator/events.py",
         "skills/codex-dev-coordinator/scripts/devcoordinator/host_*.py",
         "skills/codex-dev-coordinator/scripts/devcoordinator/image_publication.py",
@@ -223,12 +222,14 @@
         "skills/codex-dev-coordinator/scripts/devcoordinator/schema.py",
         "skills/codex-dev-coordinator/scripts/devcoordinator/store.py",
         "skills/codex-dev-coordinator/scripts/devcoordinator/systemd_activation.py",
+        "skills/codex-dev-coordinator/scripts/devcoordinator/tests/test_agent_cli.py",
+        "skills/codex-dev-coordinator/scripts/devcoordinator/tests/test_capabilities.py",
         "skills/codex-dev-coordinator/scripts/devcoordinator/tests/test_cli_modules.py",
+        "skills/codex-dev-coordinator/scripts/devcoordinator/tests/test_docker_storage.py",
         "skills/codex-dev-coordinator/scripts/devcoordinator/tests/test_generic_lifecycle.py",
         "skills/codex-dev-coordinator/scripts/devcoordinator/tests/test_image_publication.py",
         "skills/codex-dev-coordinator/scripts/devcoordinator/tests/test_lifecycle_cli_apply_observation.py",
         "skills/codex-dev-coordinator/scripts/devcoordinator/tests/test_live_fault_acceptance.py",
-        "skills/codex-dev-coordinator/scripts/devcoordinator/tests/test_nonworker_server_cleanup_revocation.py",
         "skills/codex-dev-coordinator/scripts/devcoordinator/tests/test_normalized_server_lifecycle.py",
         "skills/codex-dev-coordinator/scripts/devcoordinator/tests/test_observation_events.py",
         "skills/codex-dev-coordinator/scripts/devcoordinator/tests/test_observer.py",
@@ -245,6 +246,7 @@
         "release",
         "manual"
       ],
+      "network": "loopback",
       "reporter": "automation-events",
       "retry": {
         "max_attempts": 2,
@@ -286,6 +288,7 @@
         "release",
         "manual"
       ],
+      "network": "loopback",
       "reporter": "automation-events",
       "retry": {
         "max_attempts": 2,

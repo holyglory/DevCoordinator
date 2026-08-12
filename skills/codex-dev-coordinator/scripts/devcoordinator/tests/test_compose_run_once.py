@@ -17,7 +17,7 @@ import uuid
 from unittest import mock
 
 import dev_coordinator
-from devcoordinator import broker_enrollment, broker_host
+from devcoordinator import broker_configuration, broker_host
 from devcoordinator.broker import (
     BrokerBackendError,
     BrokerError,
@@ -305,19 +305,13 @@ class ComposeRunOnceManifestProfileAndCliTests(unittest.TestCase):
             canonical_root="/tmp/repo",
             repo_id="repo-alpha",
             generation=0,
-            owner_uid=max(1, os.geteuid()),
             server_ids={},
             container_ids={},
             compose_definition_id="compose-alpha",
             compose_container_ids=frozenset(),
             compose_run_once_services={"ingestion-once": 900},
             ephemeral_templates={},
-            ephemeral_image_prefetch_template_ids=frozenset(),
             ephemeral_secret_policies={},
-            account_id="account-alpha",
-            enabled=True,
-            issued_at="2026-08-03T00:00:00Z",
-            valid_until_epoch=4_102_444_800,
         )
         self.assertEqual(
             profile.compose_run_once_timeout(
@@ -326,7 +320,7 @@ class ComposeRunOnceManifestProfileAndCliTests(unittest.TestCase):
             ),
             600,
         )
-        with self.assertRaisesRegex(BrokerProfileError, "not explicitly enrolled"):
+        with self.assertRaisesRegex(BrokerProfileError, "not explicitly configured"):
             profile.compose_run_once_timeout(
                 "another-service",
                 timeout_seconds=600,
@@ -339,30 +333,19 @@ class ComposeRunOnceManifestProfileAndCliTests(unittest.TestCase):
         with self.assertRaisesRegex(BrokerProfileError, "policy is invalid"):
             _compose_run_once_service_mapping({"ingestion@once": 900})
 
-    def test_enrollment_grant_map_is_explicit_and_timeout_only(self) -> None:
+    def test_configuration_mapping_is_explicit_and_timeout_only(self) -> None:
         compose = {
             "declared": True,
             "run_once_services": [_policy_document()],
         }
         self.assertEqual(
-            broker_enrollment._compose_run_once_grant_mapping(
-                compose=compose,
-                allowed_run_once_services=("ingestion-once",),
-            ),
+            broker_configuration._compose_run_once_mapping(compose=compose),
             {"ingestion-once": 900},
         )
         self.assertEqual(
-            broker_enrollment._compose_run_once_grant_mapping(
-                compose=compose,
-                allowed_run_once_services=(),
-            ),
+            broker_configuration._compose_run_once_mapping(compose=None),
             {},
         )
-        with self.assertRaisesRegex(ValueError, "absent from the sealed manifest"):
-            broker_enrollment._compose_run_once_grant_mapping(
-                compose=compose,
-                allowed_run_once_services=("another-service",),
-            )
 
     def test_cli_default_is_ten_minutes_and_accepts_operation_replay_id(
         self,
@@ -552,13 +535,11 @@ class ComposeRunOncePersistenceAndBackendTests(unittest.TestCase):
             "project_name": "alpha-stack",
             "run_once_services": [_policy_document()],
         }
-        compose_id = broker_enrollment._provision_compose(
+        compose_id = broker_configuration._provision_compose(
             self.fixture.persistence,
             repo_id="repo-alpha",
-            client_uid=os.geteuid(),
             root=self.fixture.alpha_root,
             compose=self.manifest,
-            allowed_run_once_services=("ingestion-once",),
         )
         self.assertEqual(compose_id, COMPOSE_ALPHA)
 
@@ -588,7 +569,7 @@ class ComposeRunOncePersistenceAndBackendTests(unittest.TestCase):
 
     def _reserved_create_target(self):
         request = self._request()
-        authorized = self.fixture.persistence.authorize(
+        authorized = self.fixture.persistence.accept(
             self.fixture.peer(),
             request,
         )
@@ -620,9 +601,9 @@ class ComposeRunOncePersistenceAndBackendTests(unittest.TestCase):
             self.fixture.persistence.compose_run_once_target(authorized),
         )
 
-    def test_exact_grant_required_and_policy_timeout_enforced(self) -> None:
+    def test_declared_service_and_policy_timeout_are_enforced(self) -> None:
         request = self._request()
-        authorized = self.fixture.persistence.authorize(
+        authorized = self.fixture.persistence.accept(
             self.fixture.peer(),
             request,
         )
@@ -637,22 +618,64 @@ class ComposeRunOncePersistenceAndBackendTests(unittest.TestCase):
                 "timeout_seconds": 901,
             },
         )
-        with self.assertRaisesRegex(BrokerError, "not authorized"):
-            self.fixture.persistence.authorize(self.fixture.peer(), too_long)
+        def assert_policy_rejected(candidate) -> None:
+            accepted_candidate = self.fixture.persistence.accept(
+                self.fixture.peer(), candidate
+            )
+            with CoordinatorStore.open(
+                self.fixture.persistence.database_path,
+                expected_uid=os.geteuid(),
+            ) as store:
+                preflight = self.fixture.observe_full_docker(store)
+            self.fixture.persistence.require_compose_mutation_safe(
+                accepted_candidate,
+                snapshot_id=str(preflight["snapshot_id"]),
+            )
+            with self.assertRaisesRegex(
+                BrokerError, "outside the sealed service policy"
+            ):
+                self.fixture.persistence.reserve_operation(
+                    accepted_candidate,
+                    compose_preflight=preflight,
+                )
 
-        self.fixture.persistence.replace_compose_run_once_access(
-            uid=os.geteuid(),
-            repo_id="repo-alpha",
-            compose_definition_id=COMPOSE_ALPHA,
-            service_names=(),
+        assert_policy_rejected(too_long)
+
+        undeclared = self.fixture.request(
+            BrokerOperation.COMPOSE_RUN_ONCE,
+            resource_id=COMPOSE_ALPHA,
+            arguments={
+                "agent": "codex",
+                "service": "not-declared",
+                "timeout_seconds": 60,
+            },
         )
-        with self.assertRaisesRegex(BrokerError, "not authorized"):
-            self.fixture.persistence.authorize(self.fixture.peer(), request)
+        assert_policy_rejected(undeclared)
+
+    def test_trusted_local_run_once_is_shared_across_callers(
+        self,
+    ) -> None:
+        foreign_request = self.fixture.request(
+            BrokerOperation.COMPOSE_RUN_ONCE,
+            resource_id=COMPOSE_ALPHA,
+            arguments={
+                "agent": "codex",
+                "service": "ingestion-once",
+                "timeout_seconds": 600,
+            },
+            foreign=True,
+        )
+        authorized = self.fixture.persistence.accept(
+            self.fixture.peer(foreign=True), foreign_request
+        )
+        self.assertEqual(
+            authorized.request.arguments["service"], "ingestion-once"
+        )
 
     def test_success_is_durable_idempotent_and_raw_streams_stay_private(self) -> None:
         host = _SuccessfulRunOnceHost()
         request = self._request()
-        authorized = self.fixture.persistence.authorize(
+        authorized = self.fixture.persistence.accept(
             self.fixture.peer(),
             request,
         )
@@ -698,7 +721,7 @@ class ComposeRunOncePersistenceAndBackendTests(unittest.TestCase):
     def test_replay_after_ambiguous_create_intent_never_recreates(self) -> None:
         operation_id = str(uuid.uuid4())
         request = self._request(operation_id=operation_id)
-        authorized = self.fixture.persistence.authorize(
+        authorized = self.fixture.persistence.accept(
             self.fixture.peer(),
             request,
         )

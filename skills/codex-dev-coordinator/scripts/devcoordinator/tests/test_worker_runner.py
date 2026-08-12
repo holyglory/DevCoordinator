@@ -192,19 +192,13 @@ class WorkerRunnerTests(unittest.TestCase):
             canonical_root=str(self.project),
             repo_id=self.repo_id,
             generation=0,
-            owner_uid=1000,
             server_ids={"worker": self.worker_id},
             container_ids={},
             compose_definition_id=None,
             compose_container_ids=frozenset(),
             compose_run_once_services={},
             ephemeral_templates={},
-            ephemeral_image_prefetch_template_ids=frozenset(),
             ephemeral_secret_policies={},
-            account_id="account-runner",
-            enabled=True,
-            issued_at="2026-08-03T00:00:00Z",
-            valid_until_epoch=int(time.time()) + 3600,
         )
         profile = mock.Mock(spec=BrokerClientProfile)
         profile.client_uid = os.geteuid()
@@ -937,7 +931,7 @@ class WorkerRunnerTests(unittest.TestCase):
                 1,
             )
 
-    def test_broker_authority_uses_exact_enrollment_and_never_sends_log_path(self) -> None:
+    def test_broker_authority_uses_exact_configuration_and_never_sends_log_path(self) -> None:
         self._set_command((sys.executable, "-c", "raise SystemExit(7)"))
         self._start_policy(keep_alive=True)
         candidate = dict(

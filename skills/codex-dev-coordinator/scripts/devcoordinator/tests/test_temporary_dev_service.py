@@ -14,7 +14,7 @@ from unittest import mock
 
 from devcoordinator import agent_cli
 from devcoordinator.broker import (
-    AuthorizedBrokerRequest,
+    AcceptedBrokerRequest,
     BrokerBackendError,
     BrokerError,
     BrokerOperation,
@@ -27,7 +27,6 @@ from devcoordinator.temporary_dev_service import (
     TemporaryDevServiceError,
     TemporaryDevServiceManager,
     TemporaryDevServiceRequest,
-    _normalize_trusted_local_repository_access,
     public_temporary_dev_service_error,
     temporary_dev_service_id,
     validate_temporary_dev_service_definition,
@@ -82,6 +81,7 @@ class _Runner:
                     + self.active_state
                     + "\nSubState=running\n"
                     "MainPID=123\nControlGroup=/devcoordinator/test.service\n"
+                    "InvocationID=abcdef0123456789\n"
                 )
             else:
                 output = "LoadState=not-found\n"
@@ -92,12 +92,39 @@ class _Runner:
         if command[:2] == ("/usr/bin/systemctl", "stop"):
             self.active = False
             return subprocess.CompletedProcess(command, 0, "", "")
+        if command[:2] == ("/usr/bin/systemctl", "restart"):
+            self.active = True
+            return subprocess.CompletedProcess(command, 0, "", "")
         if command[0] == "/usr/bin/journalctl":
             return subprocess.CompletedProcess(command, 0, "diagnostic", "")
         raise AssertionError(command)
 
 
 class TemporaryDevServiceManagerTests(unittest.TestCase):
+    def test_retained_unit_supports_logs_stop_and_restart(self) -> None:
+        unit = "devcoordinator-dev-" + "1" * 32 + ".service"
+        runner = _Runner(active_initially=True)
+        manager = TemporaryDevServiceManager(
+            runner=runner,
+            port_probe=lambda _port: runner.active,
+            listener_ownership_probe=lambda _port, _state: True,
+            process_uid_probe=lambda pid, uid: pid == 123 and uid == os.getuid(),
+            monotonic=iter((0.0, 0.1)).__next__,
+            sleep=lambda _seconds: None,
+        )
+
+        capture = manager.capture_logs(unit=unit, port=4173)
+        restarted = manager.restart(
+            unit=unit, port=4173, execution_uid=os.getuid()
+        )
+        stopped = manager.stop(unit=unit, port=4173)
+
+        self.assertEqual(capture["raw"], b"diagnostic\n")
+        self.assertTrue(capture["source_identity"].startswith("sha256:"))
+        self.assertEqual(stopped["state"], "stopped")
+        self.assertEqual(restarted["state"], "running")
+        self.assertTrue(restarted["ready"])
+
     def test_public_launch_diagnostic_is_bounded_and_redacted(self) -> None:
         error = TemporaryDevServiceError(
             "temporary_service_launch_failed",
@@ -192,237 +219,6 @@ class TemporaryDevServiceManagerTests(unittest.TestCase):
         self.assertEqual(result["expires_at"], "2026-08-04T01:00:00Z")
         self.assertFalse(result["reused"])
 
-    def test_launch_removes_restrictive_local_modes_without_following_symlinks(self) -> None:
-        with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as outside:
-            root = Path(directory)
-            application = root / "prototype"
-            executable = application / "node_modules" / "vite" / "bin" / "vite.js"
-            data = application / "package.json"
-            git_metadata = application / ".git" / "config"
-            linked_worktree_git = application / "linked" / ".git"
-            external = Path(outside) / "external-tool"
-            executable.parent.mkdir(parents=True)
-            git_metadata.parent.mkdir()
-            linked_worktree_git.parent.mkdir()
-            executable.write_text("#!/usr/bin/env node\n", encoding="utf-8")
-            data.write_text("{}\n", encoding="utf-8")
-            git_metadata.write_text("[core]\n", encoding="utf-8")
-            linked_worktree_git.write_text("gitdir: ../metadata\n", encoding="utf-8")
-            external.write_text("external\n", encoding="utf-8")
-            executable.chmod(0o700)
-            data.chmod(0o600)
-            git_metadata.chmod(0o600)
-            linked_worktree_git.chmod(0o600)
-            external.chmod(0o600)
-            (application / "external-link").symlink_to(external)
-            application.chmod(0o700)
-            original_uid_gid = (executable.stat().st_uid, executable.stat().st_gid)
-
-            runner = _Runner()
-            probes = iter((False, True))
-            manager = TemporaryDevServiceManager(
-                runner=runner,
-                port_probe=lambda _port: next(probes),
-                listener_ownership_probe=lambda _port, _state: True,
-                process_uid_probe=lambda pid, uid: pid == 123 and uid == os.getuid(),
-                monotonic=iter((0.0, 0.1)).__next__,
-                sleep=lambda _seconds: None,
-            )
-            manager.start(_request(root, cwd="prototype"))
-
-            self.assertEqual(executable.stat().st_mode & 0o777, 0o770)
-            self.assertEqual(data.stat().st_mode & 0o777, 0o660)
-            self.assertEqual(application.stat().st_mode & 0o777, 0o770)
-            self.assertEqual(git_metadata.stat().st_mode & 0o777, 0o600)
-            self.assertEqual(linked_worktree_git.stat().st_mode & 0o777, 0o600)
-            self.assertEqual(external.stat().st_mode & 0o777, 0o600)
-            self.assertEqual(
-                (executable.stat().st_uid, executable.stat().st_gid),
-                original_uid_gid,
-            )
-            self.assertEqual(data.stat().st_mode & 0o111, 0)
-            self.assertEqual(executable.stat().st_mode & 0o007, 0)
-
-    def test_launch_does_not_change_multiply_linked_inode_outside_working_tree(self) -> None:
-        with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as outside:
-            root = Path(directory)
-            application = root / "prototype"
-            application.mkdir()
-            internal = application / "shared-tool"
-            external = Path(outside) / "shared-tool"
-            internal.write_text("shared\n", encoding="utf-8")
-            internal.chmod(0o600)
-            os.link(internal, external)
-
-            runner = _Runner()
-            probes = iter((False, True))
-            manager = TemporaryDevServiceManager(
-                runner=runner,
-                port_probe=lambda _port: next(probes),
-                listener_ownership_probe=lambda _port, _state: True,
-                process_uid_probe=lambda pid, uid: pid == 123 and uid == os.getuid(),
-                monotonic=iter((0.0, 0.1)).__next__,
-                sleep=lambda _seconds: None,
-            )
-            manager.start(_request(root, cwd="prototype"))
-
-            self.assertEqual(internal.stat().st_mode & 0o777, 0o600)
-            self.assertEqual(external.stat().st_mode & 0o777, 0o600)
-            self.assertEqual(internal.stat().st_ino, external.stat().st_ino)
-
-    def test_access_normalization_failure_prevents_systemd_launch(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            runner = _Runner()
-
-            def fail(_path: Path) -> None:
-                raise TemporaryDevServiceError(
-                    "repository_access_normalization_failed",
-                    "local repository access could not be normalized",
-                )
-
-            manager = TemporaryDevServiceManager(
-                runner=runner,
-                port_probe=lambda _port: False,
-                access_normalizer=fail,
-            )
-            with self.assertRaises(TemporaryDevServiceError) as raised:
-                manager.start(_request(Path(directory)))
-
-        self.assertEqual(
-            raised.exception.code, "repository_access_normalization_failed"
-        )
-        self.assertFalse(
-            any(call[0] == "/usr/bin/systemd-run" for call in runner.calls)
-        )
-
-    def test_read_only_authority_home_boundary_is_an_actionable_typed_failure(self) -> None:
-        for error_number in (errno.EACCES, errno.EPERM, errno.EROFS):
-            with (
-                self.subTest(errno=error_number),
-                tempfile.TemporaryDirectory() as directory,
-                mock.patch(
-                    "devcoordinator.temporary_dev_service.os.open",
-                    side_effect=OSError(error_number, os.strerror(error_number)),
-                ),
-            ):
-                with self.assertRaises(TemporaryDevServiceError) as raised:
-                    _normalize_trusted_local_repository_access(Path(directory))
-
-            self.assertEqual(
-                raised.exception.code, "repository_access_normalization_failed"
-            )
-            self.assertIn("authority sandbox", str(raised.exception))
-            self.assertIn("/home write boundary", str(raised.exception))
-            self.assertIn(f"errno={error_number}", str(raised.exception))
-
-    def test_sufficient_local_access_is_a_metadata_noop(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            application = root / "prototype"
-            executable = application / "node_modules" / "tool"
-            data = application / "package.json"
-            executable.parent.mkdir(parents=True)
-            executable.write_text("#!/bin/true\n", encoding="utf-8")
-            data.write_text("{}\n", encoding="utf-8")
-            application.chmod(0o770)
-            executable.parent.chmod(0o770)
-            executable.chmod(0o770)
-            data.chmod(0o660)
-            before = {
-                path: path.stat().st_ctime_ns
-                for path in (application, executable.parent, executable, data)
-            }
-
-            runner = _Runner()
-            probes = iter((False, True))
-            manager = TemporaryDevServiceManager(
-                runner=runner,
-                port_probe=lambda _port: next(probes),
-                listener_ownership_probe=lambda _port, _state: True,
-                process_uid_probe=lambda pid, uid: pid == 123 and uid == os.getuid(),
-                monotonic=iter((0.0, 0.1)).__next__,
-                sleep=lambda _seconds: None,
-            )
-            manager.start(_request(root, cwd="prototype"))
-
-            self.assertEqual(
-                {
-                    path: path.stat().st_ctime_ns
-                    for path in (application, executable.parent, executable, data)
-                },
-                before,
-            )
-
-    def test_prelaunch_port_conflict_does_not_normalize_repository(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            normalizations: list[Path] = []
-            manager = TemporaryDevServiceManager(
-                runner=_Runner(),
-                port_probe=lambda _port: True,
-                access_normalizer=normalizations.append,
-            )
-            with self.assertRaises(TemporaryDevServiceError):
-                manager.start(_request(Path(directory)))
-
-        self.assertEqual(normalizations, [])
-
-    def test_cross_account_launch_keeps_caller_uid_and_uses_all_source_compatibility_gids(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            runner = _Runner()
-            probes = iter((False, True))
-            account = SimpleNamespace(
-                pw_gid=1004,
-                pw_dir="/home/actual-caller",
-                pw_name="actual-caller",
-            )
-            manager = TemporaryDevServiceManager(
-                runner=runner,
-                port_probe=lambda _port: next(probes),
-                listener_ownership_probe=lambda _port, _state: True,
-                process_uid_probe=lambda pid, uid: (
-                    pid == 123 and uid == os.getuid()
-                ),
-                monotonic=iter((0.0, 0.1)).__next__,
-                sleep=lambda _seconds: None,
-            )
-            with mock.patch(
-                "devcoordinator.temporary_dev_service.pwd.getpwuid",
-                return_value=account,
-            ) as getpwuid, mock.patch(
-                "devcoordinator.temporary_dev_service.os.getgrouplist",
-                return_value=[0, account.pw_gid, 1007, 1003],
-            ), mock.patch(
-                "devcoordinator.temporary_dev_service._directory_compatibility_gids",
-                return_value=(0, 1003, 1006),
-            ):
-                manager.start(_request(root))
-
-        launch = next(call for call in runner.calls if call[0] == "/usr/bin/systemd-run")
-        getpwuid.assert_called_once_with(os.getuid())
-        separator = launch.index("--")
-        self.assertFalse(
-            any(
-                item.startswith("--uid=") or item.startswith("--gid=")
-                for item in launch[:separator]
-            )
-        )
-        self.assertEqual(
-            launch[separator + 1 : separator + 11],
-            (
-                "/usr/bin/setpriv",
-                "--reuid=" + str(os.getuid()),
-                "--regid=" + str(account.pw_gid),
-                "--groups=1003,1006,1007",
-                "--inh-caps=-all",
-                "--no-new-privs",
-                "--",
-                "/usr/bin/env",
-                "--chdir=" + str(root),
-                "--",
-            ),
-        )
-        self.assertNotIn("--groups=0", launch)
 
     def test_pre_catalog_systemd_rejection_falls_back_to_native_journal(self) -> None:
         class RejectingRunner(_Runner):
@@ -710,6 +506,86 @@ class TemporaryDevServiceWireTests(unittest.TestCase):
         self.assertEqual(request.arguments["argv"][0], "npm")
         self.assertEqual(request.arguments["cwd"], ".")
 
+    def test_temporary_service_stop_uses_transient_manager_not_worker_id(self) -> None:
+        operation_id = str(uuid.uuid4())
+        service_id = temporary_dev_service_id("repo-alpha", "prototype")
+        request = BrokerRequest.create(
+            account_id="account-current",
+            project_id="repo-alpha",
+            repository_generation=0,
+            resource_id=service_id,
+            operation=BrokerOperation.RUNTIME_REQUEST,
+            operation_id=operation_id,
+            arguments={
+                "action": "stop",
+                "agent": "codex:test",
+                "root_repo_id": "repo-alpha",
+                "temporary_repo_id": None,
+                "target_kind": "service",
+                "purpose": "development",
+                "ttl_seconds": None,
+                "kill_after_run": False,
+                "keep_alive": None,
+                "rearm_crash_loop": False,
+                "restart_limit": None,
+                "restart_window_seconds": None,
+            },
+            authority_generation="unbound-static-test",
+        )
+        authorized = AcceptedBrokerRequest(
+            peer=PeerCredentials(uid=os.getuid(), gid=os.getgid(), pid=os.getpid()),
+            request=request,
+        )
+
+        class Persistence:
+            completed = None
+
+            def existing_operation_disposition(self, _authorized):
+                return None
+
+            def reserve_operation(self, _authorized):
+                return DurableOperationDisposition("execute")
+
+            def finish_operation(self, _operation_id, *, result):
+                self.completed = result
+
+        manager = mock.Mock()
+        manager.stop.return_value = {
+            "state": "stopped",
+            "ready": False,
+            "main_pid": 0,
+        }
+        persistence = Persistence()
+        backend = object.__new__(StoreBackedMutationBackend)
+        backend._persistence = persistence
+        backend._temporary_dev_services = manager
+        temporary = {
+            "unit": "devcoordinator-dev-" + "1" * 32 + ".service",
+            "port": 4173,
+            "execution_uid": os.getuid(),
+            "expired": False,
+        }
+        with (
+            mock.patch(
+                "devcoordinator.broker_backend.load_broker_runtime_snapshot",
+                return_value=object(),
+            ),
+            mock.patch(
+                "devcoordinator.broker_backend.build_broker_runtime_snapshot_report",
+                side_effect=lambda _authorized, snapshot, action_result: dict(action_result),
+            ),
+        ):
+            result = backend._execute_temporary_service_runtime_request(
+                authorized, temporary=temporary
+            )
+
+        self.assertEqual(result["state"], "stopped")
+        self.assertTrue(result["ok"])
+        self.assertIs(persistence.completed, result)
+        manager.stop.assert_called_once_with(
+            unit=temporary["unit"], port=4173
+        )
+
     def test_durable_operation_target_uses_stable_catalog_service_identity(self) -> None:
         from devcoordinator.store import CoordinatorStore
         from devcoordinator.tests.test_broker import (
@@ -728,7 +604,7 @@ class TemporaryDevServiceWireTests(unittest.TestCase):
                 arguments=_runtime_arguments(),
                 operation_id=str(uuid.uuid4()),
             )
-            authorized = persistence.authorize(peer_for(), request)
+            authorized = persistence.accept(peer_for(), request)
             disposition = persistence.reserve_operation(authorized)
             self.assertEqual(disposition.state, "execute")
             expires_at, _remaining = persistence.temporary_service_launch_deadline(
@@ -807,56 +683,6 @@ class TemporaryDevServiceWireTests(unittest.TestCase):
         )
         self.assertEqual(str(target["action"]), "runtime.temporary_start")
 
-    def test_execution_context_uses_reserved_peer_1001_not_legacy_owner(self) -> None:
-        from devcoordinator.schema import establish_repository_owner_authority
-        from devcoordinator.tests.test_broker import (
-            PROJECT_ID,
-            peer_for,
-            request_for,
-            seed_store_backed_broker,
-        )
-
-        actual_peer_uid = 1001
-        legacy_owner_uid = 1000 if os.geteuid() != 1000 else 1002
-
-        def establish_legacy_owner(connection: object, **fields: object) -> None:
-            establish_repository_owner_authority(
-                connection,
-                **{**fields, "owner_uid": legacy_owner_uid},
-            )
-
-        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
-            root = Path(directory).resolve()
-            with mock.patch(
-                "devcoordinator.tests.test_broker.establish_repository_owner_authority",
-                side_effect=establish_legacy_owner,
-            ):
-                persistence, _actions = seed_store_backed_broker(root)
-            request = request_for(
-                BrokerOperation.RUNTIME_REQUEST,
-                resource_id=PROJECT_ID,
-                arguments=_runtime_arguments(),
-                operation_id=str(uuid.uuid4()),
-            )
-            authorized = persistence.authorize(peer_for(actual_peer_uid), request)
-            disposition = persistence.reserve_operation(authorized)
-            context = persistence.temporary_service_execution_context(authorized)
-            with self.assertRaises(BrokerError) as legacy_authority:
-                persistence.test_repository_execution_authority(
-                    repo_id=PROJECT_ID,
-                    operation_id=str(uuid.uuid4()),
-                )
-
-        self.assertEqual(disposition.state, "execute")
-        self.assertEqual(context.repo_id, PROJECT_ID)
-        self.assertEqual(context.canonical_root, "/repos/alpha")
-        self.assertEqual(context.generation, 0)
-        self.assertEqual(context.execution_uid, actual_peer_uid)
-        self.assertNotEqual(context.execution_uid, legacy_owner_uid)
-        self.assertEqual(
-            legacy_authority.exception.code,
-            "test_execution_owner_unavailable",
-        )
 
     def test_wire_rejects_shell_absolute_cwd_missing_ttl_and_invalid_port(self) -> None:
         invalid = (
@@ -916,7 +742,7 @@ class TemporaryDevServiceWireTests(unittest.TestCase):
             backend._persistence = persistence
             backend._temporary_dev_services = FailingManager()
             request = self._wire(_runtime_arguments())
-            authorized = AuthorizedBrokerRequest(
+            authorized = AcceptedBrokerRequest(
                 peer=PeerCredentials(uid=os.getuid(), gid=os.getgid(), pid=os.getpid()),
                 request=request,
             )
@@ -996,7 +822,7 @@ class TemporaryDevServiceWireTests(unittest.TestCase):
                 backend._persistence = persistence
                 backend._temporary_dev_services = manager
                 request = self._wire(_runtime_arguments())
-                authorized = AuthorizedBrokerRequest(
+                authorized = AcceptedBrokerRequest(
                     peer=PeerCredentials(uid=os.getuid(), gid=os.getgid(), pid=os.getpid()),
                     request=request,
                 )
@@ -1084,7 +910,7 @@ class TemporaryDevServiceWireTests(unittest.TestCase):
             backend._persistence = Persistence()
             backend._temporary_dev_services = manager
             request = self._wire(_runtime_arguments())
-            authorized = AuthorizedBrokerRequest(
+            authorized = AcceptedBrokerRequest(
                 peer=PeerCredentials(uid=os.getuid(), gid=os.getgid(), pid=os.getpid()),
                 request=request,
             )
@@ -1098,30 +924,32 @@ class TemporaryDevServiceWireTests(unittest.TestCase):
 class _Profile:
     def __init__(self, root: str) -> None:
         self.root = root
-        self.enrolled: dict[str, SimpleNamespace] = {}
+        self.configured: dict[str, SimpleNamespace] = {}
         self.ensure_mutations: list[tuple[str, str]] = []
+        self.ensure_arguments: list[dict[str, object]] = []
         self.runtime_calls: list[dict[str, object]] = []
 
-    def repository_if_enrolled(self, root: str) -> object | None:
-        return self.enrolled.get(root)
+    def repository_if_configured(self, root: str) -> object | None:
+        return self.configured.get(root)
 
     def ensure_repository_with_outcome(
         self, **arguments: object
     ) -> tuple[object, bool]:
+        self.ensure_arguments.append(dict(arguments))
         root = str(arguments["canonical_root"])
-        existing = self.enrolled.get(root)
+        existing = self.configured.get(root)
         if existing is not None:
             return existing, False
         repository = SimpleNamespace(repo_id="repo-adopted", generation=7)
-        self.enrolled[root] = repository
+        self.configured[root] = repository
         self.ensure_mutations.append((root, str(arguments["operation_id"])))
         return repository, True
 
     def repository(self, root: str) -> object:
-        return self.enrolled[root]
+        return self.configured[root]
 
     def resolve_repository(self, root: str) -> object | None:
-        return self.enrolled.get(root)
+        return self.configured.get(root)
 
     def call(self, **arguments: object) -> tuple[str, dict[str, object]]:
         self.runtime_calls.append(dict(arguments))
@@ -1139,11 +967,9 @@ class _Profile:
 class TemporaryDevServiceAgentCliTests(unittest.TestCase):
     def test_launch_failures_return_code_specific_recovery_guidance(self) -> None:
         cases = {
-            "repository_access_normalization_failed": "/home write boundary",
             "temporary_service_launch_failed": "missing executable",
             "temporary_service_exited": "exited before it opened",
             "temporary_service_readiness_timeout": "--launch-timeout-seconds",
-            "test_execution_owner_unavailable": "Coordinator state, not a project source",
         }
         for code, expected in cases.items():
             with self.subTest(code=code):
@@ -1256,6 +1082,10 @@ class TemporaryDevServiceAgentCliTests(unittest.TestCase):
             )
 
         self.assertEqual(len(profile.ensure_mutations), 1)
+        self.assertEqual(
+            profile.ensure_arguments[0]["transport_timeout_seconds"],
+            60.0,
+        )
         ensure_operation = profile.ensure_mutations[0][1]
         self.assertNotEqual(ensure_operation, operation_id)
         self.assertEqual(len(profile.runtime_calls), 2)
@@ -1300,7 +1130,7 @@ class TemporaryDevServiceAgentCliTests(unittest.TestCase):
         scope = SimpleNamespace(canonical_root=root, root_owner_uid=os.getuid())
 
         class BrokerResolvedProfile(_Profile):
-            def repository_if_enrolled(self, _root: str) -> object | None:
+            def repository_if_configured(self, _root: str) -> object | None:
                 return None
 
             def ensure_repository_with_outcome(
@@ -1308,7 +1138,7 @@ class TemporaryDevServiceAgentCliTests(unittest.TestCase):
             ) -> tuple[object, bool]:
                 canonical_root = str(arguments["canonical_root"])
                 repository = SimpleNamespace(repo_id="repo-existing", generation=4)
-                self.enrolled[canonical_root] = repository
+                self.configured[canonical_root] = repository
                 return repository, False
 
             def call(self, **arguments: object) -> tuple[str, dict[str, object]]:

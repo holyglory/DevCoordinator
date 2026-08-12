@@ -51,6 +51,7 @@ if str(ROOT / "scripts") not in sys.path:
 
 import orchestrate_availability_cutover as cutover  # noqa: E402
 import browser_lcp_acceptance as browser_lcp  # noqa: E402
+from devcoordinator.schema import SCHEMA_VERSION as COORDINATOR_SCHEMA_VERSION  # noqa: E402
 from server_wide_installer_fence import (  # noqa: E402
     InstallerFenceError,
     InstallerFenceHandle,
@@ -89,9 +90,6 @@ API_HANDOFF_PROFILE_PATH = Path(
 LEGACY_API_SERVICE_UNIT = "dev-coordinator.service"
 FIRST_ADOPTION_TRANSACTION_KIND = "devcoordinator-first-adoption-transaction"
 FIRST_ADOPTION_ATTESTATION_KIND = "devcoordinator-first-adoption-attestation"
-FIRST_ADOPTION_INSTALLATION_HARD_GATE_KIND = (
-    "devcoordinator-first-adoption-installation-hard-gate-attestation"
-)
 FIRST_ADOPTION_REQUEST_KIND = "devcoordinator-first-adoption-request"
 FIRST_ADOPTION_MINIMUM_HANDOFF_REMAINING_SECONDS = 300
 FIRST_ADOPTION_MANIFEST_TEMPLATE_KIND = (
@@ -104,9 +102,6 @@ FIRST_ADOPTION_GRAPH_JOURNAL_KIND = (
 FIRST_ADOPTION_FLEET_JOURNAL_KIND = (
     "devcoordinator-first-adoption-fleet-transaction"
 )
-FIRST_ADOPTION_FLEET_SAFETY_JOURNAL_KIND = (
-    "devcoordinator-first-adoption-fleet-safety-transaction"
-)
 FIRST_ADOPTION_FLEET_SETUP_CATALOG_MODE = (
     "availability-bootstrap-setup-catalog"
 )
@@ -115,9 +110,6 @@ CONSOLE_STATE_MIGRATION_JOURNAL_KIND = (
 )
 PROFILE_PUBLICATION_JOURNAL_KIND = (
     "devcoordinator-protected-profile-publication-journal"
-)
-CAPABILITY_POLICY_PUBLICATION_JOURNAL_KIND = (
-    "devcoordinator-capability-policy-publication-journal"
 )
 AUTHORITY_MAINTENANCE_RELEASE_JOURNAL_KIND = (
     "devcoordinator-authority-maintenance-release-journal"
@@ -179,14 +171,12 @@ FIRST_ADOPTION_STEPS = (
     "storage_split",
     "legacy_writer_retired",
     "snapshotd_ready",
-    "capability_policy_ready",
     "authority_test_plane_ready",
     "api_bootstrap_profile_ready",
     "api_handoff_ready",
     "api_final_profile_ready",
     "api_ready",
     "maintenance_released",
-    "api_delegation_verified",
     "profile_inventory_ready",
     "project_isolation_ready",
     "inventory_ready",
@@ -206,7 +196,6 @@ FIRST_ADOPTION_ROLLBACK_STEPS = (
     "cutover_state",
     "profiles",
     "api",
-    "policy",
     "graph",
     "legacy_writer",
     "console_state",
@@ -364,81 +353,11 @@ SERVICE_UNITS = (
     "devcoordinator-test-snapshotd.service",
 )
 FIRST_ADOPTION_INSTALLER_OWNER_KIND = (
-    cutover.SCHEMA13_FIRST_ADOPTION_INSTALLER_OWNER_KIND
+    cutover.FIRST_ADOPTION_INSTALLER_CLAIM_KIND
 )
-FINAL_HARD_GATE_SKILLS = ("codex-dev-coordinator", "postgres-docker-backup")
-FINAL_HARD_GATE_SKILL_ROOTS = (".codex/skills", ".claude/skills")
-CANONICAL_SKILL_SOURCE_ROOT = Path("/home/DevCoordinator/skills")
-FINAL_HARD_GATE_PROFILE = Path("/etc/devcoordinator/client-profiles.json")
-FINAL_HARD_GATE_LEGACY_UNIT = "devcoordinator-broker.service"
-
-
+LEGACY_BROKER_SERVICE_UNIT = "devcoordinator-broker.service"
 class ActivationError(RuntimeError):
     pass
-
-
-def _final_hard_gate_target(
-    *,
-    canonical_project: str,
-    canonical_repository_id: str,
-    owner_user: str,
-    collaborator_user: str,
-) -> dict[str, object]:
-    """Validate one explicit, machine-local installation acceptance target."""
-
-    if (
-        type(canonical_project) is not str
-        or not canonical_project
-        or len(canonical_project) > 4096
-        or re.search(r"[\x00-\x1f\x7f]", canonical_project) is not None
-    ):
-        raise ActivationError("final hard-gate canonical project is invalid")
-    project = Path(canonical_project)
-    if (
-        not project.is_absolute()
-        or canonical_project == "/"
-        or os.path.normpath(canonical_project) != canonical_project
-    ):
-        raise ActivationError("final hard-gate canonical project is invalid")
-    try:
-        repository_id = str(uuid.UUID(canonical_repository_id))
-    except (ValueError, TypeError, AttributeError) as error:
-        raise ActivationError("final hard-gate repository ID is invalid") from error
-    if (
-        repository_id != canonical_repository_id
-        or uuid.UUID(repository_id).int == 0
-    ):
-        raise ActivationError("final hard-gate repository ID is invalid")
-    users = (owner_user, collaborator_user)
-    if (
-        any(
-            type(user) is not str
-            or re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.-]{0,63}", user) is None
-            for user in users
-        )
-        or owner_user == collaborator_user
-    ):
-        raise ActivationError("final hard-gate user identities are invalid")
-    try:
-        accounts = tuple(pwd.getpwnam(user) for user in users)
-    except KeyError as error:
-        raise ActivationError("final hard-gate user account is unavailable") from error
-    if (
-        any(
-            account.pw_name != user or account.pw_uid <= 0
-            for user, account in zip(users, accounts)
-        )
-        or accounts[0].pw_uid == accounts[1].pw_uid
-    ):
-        raise ActivationError("final hard-gate user identities are invalid")
-    return {
-        "canonical_project": canonical_project,
-        "canonical_repository_id": repository_id,
-        "owner_user": owner_user,
-        "collaborator_user": collaborator_user,
-        "owner": accounts[0],
-        "collaborator": accounts[1],
-    }
 
 
 class BrowserAcceptancePending(ActivationError):
@@ -3104,305 +3023,6 @@ def _storage_split_api(release: Path) -> tuple[Callable[..., object], ...]:
     )
 
 
-def _repository_owner_authority_api(
-    release: Path,
-) -> tuple[
-    Callable[..., object],
-    Callable[..., object],
-    Callable[..., object],
-    str,
-    int,
-]:
-    """Load owner migration code only from the immutable candidate release."""
-
-    package_root = release / "skills/codex-dev-coordinator/scripts"
-    package = package_root / "devcoordinator"
-    required = {
-        "owner_authority": package / "repository_owner_authority.py",
-        "execution_scope": package / "repository_execution_scope.py",
-    }
-    if any(not path.is_file() or path.is_symlink() for path in required.values()):
-        raise ActivationError(
-            "immutable release lacks repository execution-owner scope authority"
-        )
-    package_text = str(package_root)
-    if package_text not in sys.path:
-        sys.path.insert(0, package_text)
-    loaded_package = sys.modules.get("devcoordinator")
-    if loaded_package is not None:
-        source = Path(str(getattr(loaded_package, "__file__", ""))).resolve()
-        if package.resolve() not in source.parents:
-            raise ActivationError(
-                "another devcoordinator package is already loaded; refusing a "
-                "mixed-release repository-owner migration"
-            )
-    try:
-        owner_module = importlib.import_module(
-            "devcoordinator.repository_owner_authority"
-        )
-        scope_module = importlib.import_module(
-            "devcoordinator.repository_execution_scope"
-        )
-    except ImportError as error:
-        raise ActivationError(
-            "immutable repository execution-owner scope authority could not be loaded"
-        ) from error
-    for module, source in (
-        (owner_module, required["owner_authority"]),
-        (scope_module, required["execution_scope"]),
-    ):
-        if Path(str(getattr(module, "__file__", ""))).resolve() != source.resolve():
-            raise ActivationError(
-                "repository execution-owner scope authority is not from the "
-                "activated release"
-            )
-    return (
-        owner_module.load_sealed_owner_map,
-        owner_module.apply_owner_map,
-        scope_module.validate_repository_execution_scope_transition,
-        str(owner_module.OWNER_MIGRATION_FENCE_KIND),
-        int(owner_module.OWNER_MIGRATION_FENCE_SCHEMA_VERSION),
-    )
-
-
-def _owner_migration_file_evidence(
-    path: Path, *, expected_uid: int
-) -> dict[str, object]:
-    """Capture one exact private regular file for the offline owner fence."""
-
-    path = _absolute(path, "repository owner migration evidence file")
-    info = path.lstat()
-    if (
-        stat.S_ISLNK(info.st_mode)
-        or not stat.S_ISREG(info.st_mode)
-        or info.st_uid != expected_uid
-        or info.st_nlink != 1
-        or stat.S_IMODE(info.st_mode) & 0o007
-    ):
-        raise ActivationError(
-            f"repository owner migration evidence file is unsafe: {path}"
-        )
-    return {
-        "path": str(path),
-        "device": int(info.st_dev),
-        "inode": int(info.st_ino),
-        "owner_uid": int(info.st_uid),
-        "owner_gid": int(info.st_gid),
-        "mode": f"{stat.S_IMODE(info.st_mode):04o}",
-        "nlink": int(info.st_nlink),
-        "size": int(info.st_size),
-        "mtime_ns": int(info.st_mtime_ns),
-        "ctime_ns": int(info.st_ctime_ns),
-        "sha256": "sha256:" + _sha256_file(path),
-    }
-
-
-def _owner_migration_database_evidence(
-    path: Path, *, expected_uid: int
-) -> dict[str, object]:
-    sidecars: list[dict[str, object]] = []
-    for suffix in ("-wal", "-shm"):
-        candidate = Path(str(path) + suffix)
-        if candidate.exists() or candidate.is_symlink():
-            sidecars.append(
-                _owner_migration_file_evidence(
-                    candidate, expected_uid=expected_uid
-                )
-            )
-    return {
-        "main": _owner_migration_file_evidence(
-            path, expected_uid=expected_uid
-        ),
-        "sidecars": sidecars,
-    }
-
-
-def _verify_repository_owner_authority(
-    database: Path,
-    owner_map: Mapping[str, object],
-    *,
-    expected_uid: int,
-    scope_transition_validator: Callable[..., object],
-) -> dict[str, object]:
-    """Verify a committed v13 owner map after commit or power-loss replay."""
-
-    identity = _sqlite_identity(database)
-    if identity["owner_uid"] != expected_uid or identity["schema_version"] != 13:
-        raise ActivationError(
-            "repository execution-owner authority has an unsafe identity or schema"
-        )
-    entries = owner_map.get("repositories")
-    if not isinstance(entries, list) or any(
-        not isinstance(item, Mapping) for item in entries
-    ):
-        raise ActivationError("repository execution-owner map entries are invalid")
-    unsigned = {
-        key: value
-        for key, value in owner_map.items()
-        if key != "document_sha256"
-    }
-    document_sha256 = "sha256:" + _sha256_bytes(_canonical(unsigned))
-    if owner_map.get("document_sha256") != document_sha256:
-        raise ActivationError("repository execution-owner map digest is invalid")
-    expected_rows = sorted(
-        (
-            str(item["repository_id"]),
-            int(item["owner_uid"]),
-            int(item["repository_generation"]),
-        )
-        for item in entries
-    )
-    source_scope = owner_map.get("repository_execution_scope")
-    if not isinstance(source_scope, Mapping):
-        raise ActivationError(
-            "repository execution-owner map lacks execution-scope evidence"
-        )
-    with closing(
-        sqlite3.connect(f"file:{database}?mode=ro", uri=True, timeout=30.0)
-    ) as connection:
-        metadata = connection.execute(
-            """
-            SELECT schema_version, database_generation, state_revision,
-                   migration_state
-            FROM schema_metadata WHERE singleton = 1
-            """
-        ).fetchone()
-        rows = list(
-            connection.execute(
-                """
-                SELECT repository.repo_id, owner.owner_uid,
-                       owner.repository_generation,
-                       owner.evidence_sha256, owner.operation_id,
-                       transfer.owner_uid, transfer.repository_generation,
-                       transfer.evidence_sha256, transfer.operation_id
-                FROM repositories repository
-                JOIN repository_owners owner USING(repo_id)
-                JOIN repository_owner_transfers transfer
-                  ON transfer.repo_id = owner.repo_id
-                 AND transfer.authority_generation = owner.authority_generation
-                ORDER BY repository.repo_id
-                """
-            )
-        )
-        foreign_keys = list(connection.execute("PRAGMA foreign_key_check"))
-        try:
-            committed_scope = scope_transition_validator(
-                connection,
-                source_scope,
-                target_schema_version=13,
-                target_database_generation=str(
-                    owner_map["target_database_generation"]
-                ),
-                target_state_revision=int(
-                    owner_map["source_state_revision"]
-                )
-                + 1,
-            )
-        except Exception as error:
-            raise ActivationError(
-                f"repository execution scope verification failed: {error}"
-            ) from error
-        if not isinstance(committed_scope, Mapping):
-            raise ActivationError(
-                "repository execution scope verifier returned invalid evidence"
-            )
-    if (
-        metadata is None
-        or int(metadata[0]) != 13
-        or str(metadata[1]) != owner_map.get("target_database_generation")
-        or int(metadata[2]) != int(owner_map.get("source_state_revision", -2)) + 1
-        or str(metadata[3]) != "ready"
-        or foreign_keys
-        or len(rows) != len(expected_rows)
-        or [
-            (str(row[0]), int(row[1]), int(row[2])) for row in rows
-        ]
-        != expected_rows
-        or any(
-            str(row[3]) != document_sha256
-            or str(row[4]) != owner_map.get("operation_id")
-            or int(row[5]) != int(row[1])
-            or int(row[6]) != int(row[2])
-            or str(row[7]) != str(row[3])
-            or str(row[8]) != str(row[4])
-            for row in rows
-        )
-    ):
-        raise ActivationError(
-            "repository execution-owner authority verification failed"
-        )
-    return {
-        "status": "applied",
-        "schema_version": 13,
-        "source_database_generation": str(
-            owner_map["source_database_generation"]
-        ),
-        "target_database_generation": str(metadata[1]),
-        "database_generation": str(metadata[1]),
-        "state_revision": int(metadata[2]),
-        "repository_count": int(committed_scope["repository_count"]),
-        "executable_repository_count": int(
-            committed_scope["executable_repository_count"]
-        ),
-        "excluded_terminal_repository_count": int(
-            committed_scope["excluded_terminal_repository_count"]
-        ),
-        "repository_execution_scope_sha256": str(
-            committed_scope["document_sha256"]
-        ),
-        "owner_map_sha256": document_sha256,
-        "operation_id": str(owner_map["operation_id"]),
-        "database_identity": identity,
-    }
-
-
-def _verify_base_split_after_owner_migration(
-    document: Mapping[str, object],
-    *,
-    source_database: Path,
-    inventory_database: Path,
-    attestation_path: Path,
-    expected_uid: int,
-    inventory_owner_uid: int,
-) -> dict[str, object]:
-    """Verify retained split evidence after the authority copy advanced to v13."""
-
-    unsigned = {
-        key: value for key, value in document.items() if key != "document_sha256"
-    }
-    if (
-        document.get("kind") != "devcoordinator-logical-storage-split"
-        or document.get("document_sha256") != _sha256_bytes(_canonical(unsigned))
-        or cutover.read_private_json(attestation_path, uid=expected_uid)
-        != dict(document)
-    ):
-        raise ActivationError("base storage split attestation changed")
-    source = document.get("source")
-    inventory = document.get("inventory")
-    inventory_file = (
-        inventory.get("database") if isinstance(inventory, Mapping) else None
-    )
-    if not isinstance(source, Mapping) or not isinstance(
-        inventory_file, Mapping
-    ):
-        raise ActivationError("base storage split evidence is invalid")
-    source_info = _regular_file_identity(
-        source_database, expected_uid=expected_uid
-    )
-    inventory_info = _regular_file_identity(
-        inventory_database, expected_uid=inventory_owner_uid
-    )
-    for field in ("device", "inode", "size", "mtime_ns", "mode", "owner_uid"):
-        if source_info.get(field) != source.get(field):
-            raise ActivationError("retained legacy authority changed after split")
-    if source_info["sha256"] != source.get("sha256") or any(
-        inventory_info.get(field) != inventory_file.get(field)
-        for field in ("size", "mode", "owner_uid", "owner_gid", "sha256")
-    ):
-        raise ActivationError("retained split store changed after owner migration")
-    return dict(document)
-
-
 def _regular_file_identity(path: Path, *, expected_uid: int) -> dict[str, object]:
     info = path.lstat()
     if (
@@ -3467,8 +3087,6 @@ def adopt_authority_database(
     inventory_owner_uid: int,
     inventory_owner_gid: int,
     operation_journal: Path,
-    owner_map_path: Path,
-    owner_map_sha256: str,
     console_access_source: Path | None = None,
     console_access_destination: Path | None = None,
     console_access_source_uid: int | None = None,
@@ -3519,16 +3137,6 @@ def adopt_authority_database(
     operation_journal = _absolute(
         operation_journal, "authority adoption operation journal"
     )
-    owner_map_path = _absolute(
-        owner_map_path, "repository execution-owner map"
-    )
-    if (
-        re.fullmatch(r"[0-9a-f]{64}", owner_map_sha256) is None
-        or _sha256_file(owner_map_path) != owner_map_sha256
-    ):
-        raise ActivationError(
-            "repository execution-owner map file digest changed"
-        )
     destinations = {
         authority_database,
         inventory_database,
@@ -3546,29 +3154,6 @@ def adopt_authority_database(
         verify_inventory,
         read_publication,
     ) = _storage_split_api(release)
-    (
-        load_owner_map,
-        apply_owner_map,
-        validate_owner_scope_transition,
-        owner_fence_kind,
-        owner_fence_schema,
-    ) = _repository_owner_authority_api(release)
-    owner_map_document = load_owner_map(
-        owner_map_path, expected_owner_uid=expected_uid
-    )
-    if not isinstance(owner_map_document, Mapping):
-        raise ActivationError("repository execution-owner map is invalid")
-    owner_operation_id = owner_map_document.get("operation_id")
-    try:
-        if str(uuid.UUID(str(owner_operation_id))) != owner_operation_id:
-            raise ValueError
-    except (ValueError, TypeError, AttributeError) as error:
-        raise ActivationError(
-            "repository execution-owner map operation identity is invalid"
-        ) from error
-    owner_map_identity = _owner_migration_file_evidence(
-        owner_map_path, expected_uid=expected_uid
-    )
     adoption_binding = {
         "release_digest": release.name,
         "source_database": str(source_database),
@@ -3586,8 +3171,6 @@ def adopt_authority_database(
         "authority_owner_gid": authority_owner_gid,
         "inventory_owner_uid": inventory_owner_uid,
         "inventory_owner_gid": inventory_owner_gid,
-        "owner_map_path": str(owner_map_path),
-        "owner_map_sha256": owner_map_sha256,
     }
     adoption_journal = _load_private_journal(
         operation_journal,
@@ -3615,7 +3198,7 @@ def adopt_authority_database(
             raise ActivationError(
                 "authority adoption requires the active legacy writer"
             )
-        operation_id = str(owner_operation_id)
+        operation_id = str(uuid.uuid4())
         split_journal = operation_journal.with_name(
             operation_journal.name + ".storage-split"
         )
@@ -3632,8 +3215,6 @@ def adopt_authority_database(
                     "enabled": legacy_enabled,
                 },
                 "split_journal": str(split_journal),
-                "owner_map": dict(owner_map_document),
-                "owner_map_file": owner_map_identity,
                 "created_at": _now(),
                 "updated_at": _now(),
             },
@@ -3648,17 +3229,12 @@ def adopt_authority_database(
         source_initial = adoption_journal.get("source_initial")
         legacy_unit = adoption_journal.get("legacy_unit")
         split_journal_value = adoption_journal.get("split_journal")
-        recorded_owner_map = adoption_journal.get("owner_map")
-        recorded_owner_map_file = adoption_journal.get("owner_map_file")
         if (
             not isinstance(source_initial, Mapping)
             or not isinstance(legacy_unit, Mapping)
             or legacy_unit.get("active") is not True
             or type(legacy_unit.get("enabled")) is not bool
             or not isinstance(split_journal_value, str)
-            or recorded_owner_map != owner_map_document
-            or recorded_owner_map_file != owner_map_identity
-            or operation_id != owner_operation_id
         ):
             raise ActivationError("authority adoption journal contract is invalid")
         legacy_active = True
@@ -3710,7 +3286,6 @@ def adopt_authority_database(
     descriptor: int | None = None
     legacy_state_observed = True
     split_document: Mapping[str, object] | None = None
-    owner_result: Mapping[str, object] | None = None
     publication_identity: Mapping[str, object] | None = None
     rotation_identity: Mapping[str, object] | None = None
     try:
@@ -3794,20 +3369,21 @@ def adopt_authority_database(
             else None
         )
         recorded_split = adoption_journal.get("storage_split")
-        if candidate_schema == 13:
+        if candidate_schema == 12:
             if not isinstance(recorded_split, Mapping):
                 raise ActivationError(
-                    "schema-v13 authority exists without its base split journal"
+                    "split authority exists without its storage-split journal"
                 )
-            split_document = _verify_base_split_after_owner_migration(
+            split_document = verify_split(
                 recorded_split,
                 source_database=split_source,
+                authority_database=authority_database,
                 inventory_database=inventory_database,
-                attestation_path=split_attestation,
                 expected_uid=expected_uid,
+                authority_owner_uid=authority_owner_uid,
                 inventory_owner_uid=inventory_owner_uid,
             )
-        elif candidate_schema in {None, 12}:
+        elif candidate_schema is None:
             split_document = split(
                 source_database=split_source,
                 authority_database=authority_database,
@@ -3847,141 +3423,6 @@ def adopt_authority_database(
                 "authority candidate has an unsupported schema during adoption"
             )
 
-        if candidate_schema != 13:
-            maintenance_state = load_maintenance(
-                expected_uid=expected_uid,
-                expected_gid=maintenance_gid,
-                maintenance_root=maintenance_root,
-            )
-            if (
-                maintenance_state is None
-                or maintenance_state.deployment_id != operation_id
-            ):
-                raise ActivationError(
-                    "repository owner migration maintenance fence is inactive"
-                )
-            if command.status(
-                [
-                    "/usr/bin/systemctl",
-                    "is-active",
-                    "--quiet",
-                    "devcoordinator-broker.service",
-                ]
-            ) == 0:
-                raise ActivationError(
-                    "repository owner migration broker fence is inactive"
-                )
-            marker = maintenance_root / "maintenance.json"
-            marker_file = _owner_migration_file_evidence(
-                marker, expected_uid=expected_uid
-            )
-            journal_file = _owner_migration_file_evidence(
-                operation_journal, expected_uid=expected_uid
-            )
-            split_file = _owner_migration_file_evidence(
-                split_attestation, expected_uid=expected_uid
-            )
-            lock_file = lock_path.lstat()
-            if (
-                descriptor is None
-                or lock_file.st_uid != expected_uid
-                or lock_file.st_nlink != 1
-                or not stat.S_ISREG(lock_file.st_mode)
-            ):
-                raise ActivationError(
-                    "repository owner migration lock evidence is unsafe"
-                )
-            fence: dict[str, object] = {
-                "schema_version": owner_fence_schema,
-                "kind": owner_fence_kind,
-                "operation_id": operation_id,
-                "maintenance": {
-                    "marker_path": str(marker),
-                    "marker_sha256": marker_file["sha256"],
-                    "deployment_id": maintenance_state.deployment_id,
-                    "active": True,
-                },
-                "journal": {
-                    "path": str(operation_journal),
-                    "sha256": journal_file["sha256"],
-                    "phase": "storage_split_complete",
-                },
-                "source_database": _owner_migration_database_evidence(
-                    split_source, expected_uid=expected_uid
-                ),
-                "candidate_database": _owner_migration_database_evidence(
-                    authority_database, expected_uid=authority_owner_uid
-                ),
-                "split_attestation": {
-                    "path": str(split_attestation),
-                    "sha256": split_file["sha256"],
-                },
-                "broker": {
-                    "active": False,
-                    "lock": {
-                        "path": str(lock_path),
-                        "device": int(lock_file.st_dev),
-                        "inode": int(lock_file.st_ino),
-                        "owner_uid": int(lock_file.st_uid),
-                        "owner_gid": int(lock_file.st_gid),
-                        "mode": f"{stat.S_IMODE(lock_file.st_mode):04o}",
-                        "nlink": int(lock_file.st_nlink),
-                        "held_exclusive": True,
-                    },
-                },
-            }
-            fence["fence_sha256"] = "sha256:" + _sha256_bytes(
-                _canonical(fence)
-            )
-            with closing(
-                sqlite3.connect(
-                    str(authority_database),
-                    timeout=30.0,
-                    isolation_level=None,
-                )
-            ) as owner_connection:
-                owner_connection.execute("PRAGMA foreign_keys = ON")
-                owner_connection.execute("BEGIN EXCLUSIVE")
-                try:
-                    apply_owner_map(
-                        owner_connection,
-                        owner_map_document,
-                        cutover_fence=fence,
-                    )
-                    owner_connection.commit()
-                except BaseException:
-                    owner_connection.rollback()
-                    raise
-            owner_result = _verify_repository_owner_authority(
-                authority_database,
-                owner_map_document,
-                expected_uid=authority_owner_uid,
-                scope_transition_validator=validate_owner_scope_transition,
-            )
-            if failpoint is not None:
-                failpoint("authority-owner-map-commit-before-journal")
-            persist_adoption(
-                "owner_authority_ready", owner_authority=owner_result
-            )
-        else:
-            owner_result = _verify_repository_owner_authority(
-                authority_database,
-                owner_map_document,
-                expected_uid=authority_owner_uid,
-                scope_transition_validator=validate_owner_scope_transition,
-            )
-            recorded_owner_result = adoption_journal.get("owner_authority")
-            if (
-                recorded_owner_result is not None
-                and recorded_owner_result != owner_result
-            ):
-                raise ActivationError(
-                    "repository execution-owner authority changed during resume"
-                )
-            if recorded_owner_result is None:
-                persist_adoption(
-                    "owner_authority_ready", owner_authority=owner_result
-                )
         retained = read_inventory(
             inventory_database,
             expected_owner_uid=inventory_owner_uid,
@@ -4047,7 +3488,6 @@ def adopt_authority_database(
                     "document_sha256": split_document["document_sha256"],
                     "base_authority_sha256": split_document["authority"]["file"]["sha256"],
                 },
-                "owner_authority": owner_result,
                 "pointer_path": str(pointer_file),
                 "legacy_source_original_path": str(source_database),
                 "source_rotated": source_rotated,
@@ -4098,36 +3538,15 @@ def adopt_authority_database(
                 cleanup_errors.append(f"inventory-publication: {cleanup_error}")
         if split_document is not None:
             try:
-                current_schema = (
-                    int(_sqlite_identity(authority_database)["schema_version"])
-                    if authority_database.exists()
-                    else None
+                verify_split(
+                    split_document,
+                    source_database=split_source,
+                    authority_database=authority_database,
+                    inventory_database=inventory_database,
+                    expected_uid=expected_uid,
+                    authority_owner_uid=authority_owner_uid,
+                    inventory_owner_uid=inventory_owner_uid,
                 )
-                if current_schema == 13:
-                    _verify_repository_owner_authority(
-                        authority_database,
-                        owner_map_document,
-                        expected_uid=authority_owner_uid,
-                        scope_transition_validator=validate_owner_scope_transition,
-                    )
-                    _verify_base_split_after_owner_migration(
-                        split_document,
-                        source_database=split_source,
-                        inventory_database=inventory_database,
-                        attestation_path=split_attestation,
-                        expected_uid=expected_uid,
-                        inventory_owner_uid=inventory_owner_uid,
-                    )
-                else:
-                    verify_split(
-                        split_document,
-                        source_database=split_source,
-                        authority_database=authority_database,
-                        inventory_database=inventory_database,
-                        expected_uid=expected_uid,
-                        authority_owner_uid=authority_owner_uid,
-                        inventory_owner_uid=inventory_owner_uid,
-                    )
             except BaseException as verification_error:
                 cleanup_errors.append(f"storage-split: {verification_error}")
             else:
@@ -4212,7 +3631,6 @@ def finalize_authority_adoption(
             "authority",
             "inventory",
             "storage_split",
-            "owner_authority",
             "pointer_path",
             "legacy_source_original_path",
             "source_rotated",
@@ -4255,7 +3673,6 @@ def _authority_maintenance_binding(
             "authority",
             "inventory",
             "storage_split",
-            "owner_authority",
             "pointer_path",
             "legacy_source_original_path",
             "source_rotated",
@@ -4485,7 +3902,7 @@ def rollback_authority_adoption(
     verified = cutover.verify_seal(
         adoption,
         kind=AUTHORITY_ADOPTION_KIND,
-        fields=("operation_id", "release_digest", "source", "authority", "inventory", "storage_split", "owner_authority", "pointer_path", "legacy_source_original_path", "source_rotated", "retained_source_is_rollback", "legacy_unit", "maintenance", "created_at"),
+        fields=("operation_id", "release_digest", "source", "authority", "inventory", "storage_split", "pointer_path", "legacy_source_original_path", "source_rotated", "retained_source_is_rollback", "legacy_unit", "maintenance", "created_at"),
     )
     authority = verified["authority"]
     source = verified["source"]
@@ -4589,12 +4006,13 @@ def rollback_authority_adoption(
         pointer_document = cutover.read_private_json(pointer_path, uid=expected_uid)
         if pointer_document != verified:
             raise ActivationError("authority adoption pointer changed before rollback")
-        _verify_base_split_after_owner_migration(
+        verify_split(
             split_document,
             source_database=retained,
+            authority_database=target,
             inventory_database=inventory_database,
-            attestation_path=split_path,
             expected_uid=expected_uid,
+            authority_owner_uid=int(authority["owner_uid"]),
             inventory_owner_uid=int(publication["owner_uid"]),
         )
         if _sqlite_identity(target) != authority:
@@ -6146,28 +5564,24 @@ def publish_first_adoption_profiles(
     *,
     authority_database: Path,
     destination: Path,
-    api_uid: int,
-    access_gid: int,
+    validation_uid: int,
     rollback_directory: Path,
     journal_file: Path,
-    source_authority_generation: str,
-    target_authority_generation: str,
     expected_uid: int,
-    now_epoch: int | None = None,
     failpoint: Callable[[str], None] | None = None,
 ) -> dict[str, object]:
-    """Crash-safely replace every client profile from post-migration authority."""
+    """Crash-safely publish host-wide routing metadata from the current catalog."""
 
     if os.geteuid() != expected_uid:
         raise ActivationError(
-            "protected profile publication must run as the authority UID"
+            "routing profile publication must run as the authority UID"
         )
     authority_database = _absolute(
-        authority_database, "protected profile authority database"
+        authority_database, "routing profile authority database"
     )
-    destination = _absolute(destination, "protected client profile")
+    destination = _absolute(destination, "host routing profile")
     journal_file = _absolute(
-        journal_file, "protected profile publication journal"
+        journal_file, "routing profile publication journal"
     )
     rollback_directory = _private_directory(
         rollback_directory, expected_uid=expected_uid
@@ -6175,10 +5589,7 @@ def publish_first_adoption_profiles(
     binding = {
         "authority_database": str(authority_database),
         "destination": str(destination),
-        "api_uid": api_uid,
-        "access_gid": access_gid,
-        "source_authority_generation": source_authority_generation,
-        "target_authority_generation": target_authority_generation,
+        "validation_uid": validation_uid,
     }
     journal = _load_private_journal(
         journal_file,
@@ -6208,14 +5619,14 @@ def publish_first_adoption_profiles(
         journal.get("prior_profile"), Mapping
     ):
         raise ActivationError(
-            "protected profile journal belongs to another publication"
+            "routing profile journal belongs to another publication"
         )
     prior_profile = dict(journal["prior_profile"])
     if journal.get("phase") == "complete":
         result = journal.get("result")
         if not isinstance(result, Mapping):
             raise ActivationError(
-                "completed protected profile journal lacks its result"
+                "completed routing profile journal lacks its result"
             )
         attestation = cutover.verify_seal(
             result.get("attestation"),
@@ -6227,24 +5638,19 @@ def publish_first_adoption_profiles(
             stat.S_ISLNK(info.st_mode)
             or not stat.S_ISREG(info.st_mode)
             or info.st_uid != expected_uid
-            or info.st_gid != access_gid
-            or stat.S_IMODE(info.st_mode) != 0o640
+            or stat.S_IMODE(info.st_mode) != 0o644
             or _sha256_file(destination) != attestation["profile_sha256"]
         ):
             raise ActivationError(
-                "completed protected profile publication changed"
+                "completed routing profile publication changed"
             )
         return dict(result)
     result = dict(
         cutover.reconstruct_api_profile_from_authority(
             authority_database=authority_database,
             destination=destination,
-            api_uid=api_uid,
-            access_gid=access_gid,
+            validation_uid=validation_uid,
             authority_uid=expected_uid,
-            source_authority_generation=source_authority_generation,
-            target_authority_generation=target_authority_generation,
-            now_epoch=now_epoch,
         )
     )
     result["prior_profile"] = prior_profile
@@ -6282,10 +5688,10 @@ def _restore_first_adoption_profile(
     if not isinstance(prior, Mapping):
         raise ActivationError("protected profile rollback evidence is invalid")
     destination = _absolute(
-        Path(str(attestation["profile_path"])), "protected client profile"
+        Path(str(attestation["profile_path"])), "host routing profile"
     )
     journal_file = _absolute(
-        journal_file, "protected profile publication journal"
+        journal_file, "routing profile publication journal"
     )
     journal = _load_private_journal(
         journal_file,
@@ -6299,7 +5705,7 @@ def _restore_first_adoption_profile(
         not in {"complete", "rollback_planned", "rolled_back"}
     ):
         raise ActivationError(
-            "protected profile rollback journal is contradictory"
+            "routing profile rollback journal is contradictory"
         )
 
     def published_matches() -> bool:
@@ -6310,8 +5716,7 @@ def _restore_first_adoption_profile(
             not stat.S_ISLNK(info.st_mode)
             and stat.S_ISREG(info.st_mode)
             and info.st_uid == expected_uid
-            and info.st_gid == int(attestation["profile_group_gid"])
-            and stat.S_IMODE(info.st_mode) == 0o640
+            and stat.S_IMODE(info.st_mode) == 0o644
             and _sha256_file(destination)
             == attestation["profile_sha256"]
         )
@@ -6437,289 +5842,6 @@ def _restore_first_adoption_profile(
         "prior_existed": prior.get("existed") is True,
         "replayed": False,
     }
-
-
-def publish_first_adoption_capability_policy(
-    *,
-    authority_database: Path,
-    snapshot_socket: Path,
-    destination: Path,
-    dogfood_repository_id: str,
-    rollback_directory: Path,
-    journal_file: Path,
-    expected_uid: int,
-    failpoint: Callable[[str], None] | None = None,
-) -> dict[str, object]:
-    """Crash-safely publish the post-split policy and preserve its prior bytes."""
-
-    destination = _absolute(destination, "test capability policy")
-    journal_file = _absolute(
-        journal_file, "test capability policy publication journal"
-    )
-    rollback_directory = _private_directory(
-        rollback_directory, expected_uid=expected_uid
-    )
-    binding = {
-        "authority_database": str(
-            _absolute(authority_database, "final authority database")
-        ),
-        "snapshot_socket": str(
-            _absolute(snapshot_socket, "snapshot service socket")
-        ),
-        "destination": str(destination),
-        "dogfood_repository_id": dogfood_repository_id,
-    }
-    journal = _load_private_journal(
-        journal_file,
-        kind=CAPABILITY_POLICY_PUBLICATION_JOURNAL_KIND,
-        expected_uid=expected_uid,
-    )
-    if journal is None:
-        journal = _write_private_journal(
-            journal_file,
-            kind=CAPABILITY_POLICY_PUBLICATION_JOURNAL_KIND,
-            payload={
-                "operation_id": str(uuid.uuid4()),
-                "binding": binding,
-                "phase": "planned",
-                "prior_policy": _capture_destination(
-                    destination,
-                    rollback_directory=rollback_directory,
-                    expected_uid=expected_uid,
-                ),
-                "created_at": _now(),
-                "updated_at": _now(),
-            },
-            expected_uid=expected_uid,
-        )
-    elif journal.get("binding") != binding or not isinstance(
-        journal.get("prior_policy"), Mapping
-    ):
-        raise ActivationError(
-            "capability policy journal belongs to another publication"
-        )
-    if journal.get("phase") == "complete":
-        result = journal.get("result")
-        if not isinstance(result, Mapping):
-            raise ActivationError(
-                "completed capability policy journal lacks its result"
-            )
-        attestation = cutover.verify_seal(
-            result.get("attestation"),
-            kind=cutover.CAPABILITY_POLICY_KIND,
-            fields=cutover.CAPABILITY_POLICY_FIELDS,
-        )
-        info = destination.lstat()
-        if (
-            stat.S_ISLNK(info.st_mode)
-            or not stat.S_ISREG(info.st_mode)
-            or info.st_uid != expected_uid
-            or stat.S_IMODE(info.st_mode) != 0o600
-            or _sha256_file(destination)
-            != attestation["policy_file_sha256"]
-        ):
-            raise ActivationError(
-                "completed capability policy publication changed"
-            )
-        return dict(result)
-    result = dict(
-        cutover.publish_test_capability_policy(
-            authority_database=Path(str(binding["authority_database"])),
-            snapshot_socket=Path(str(binding["snapshot_socket"])),
-            destination=destination,
-            dogfood_repository_id=dogfood_repository_id,
-            authority_uid=expected_uid,
-            owner_gid=expected_uid,
-            expected_snapshot_uid=expected_uid,
-        )
-    )
-    result["prior_policy"] = dict(journal["prior_policy"])
-    if failpoint is not None:
-        failpoint("capability-policy-publication-before-journal")
-    payload = {
-        key: value
-        for key, value in journal.items()
-        if key not in {"schema_version", "kind", "document_sha256"}
-    }
-    payload.update(
-        {"phase": "complete", "result": result, "updated_at": _now()}
-    )
-    _write_private_journal(
-        journal_file,
-        kind=CAPABILITY_POLICY_PUBLICATION_JOURNAL_KIND,
-        payload=payload,
-        expected_uid=expected_uid,
-    )
-    return result
-
-
-def _restore_first_adoption_capability_policy(
-    publication: Mapping[str, object],
-    *,
-    journal_file: Path,
-    expected_uid: int,
-) -> dict[str, object]:
-    attestation = cutover.verify_seal(
-        publication.get("attestation"),
-        kind=cutover.CAPABILITY_POLICY_KIND,
-        fields=cutover.CAPABILITY_POLICY_FIELDS,
-    )
-    prior = publication.get("prior_policy")
-    if not isinstance(prior, Mapping):
-        raise ActivationError("capability policy rollback evidence is invalid")
-    destination = _absolute(
-        Path(str(attestation["policy_path"])), "test capability policy"
-    )
-    journal_file = _absolute(
-        journal_file, "capability policy publication journal"
-    )
-    journal = _load_private_journal(
-        journal_file,
-        kind=CAPABILITY_POLICY_PUBLICATION_JOURNAL_KIND,
-        expected_uid=expected_uid,
-    )
-    if (
-        journal is None
-        or journal.get("result") != publication
-        or journal.get("phase")
-        not in {"complete", "rollback_planned", "rolled_back"}
-    ):
-        raise ActivationError(
-            "capability policy rollback journal is contradictory"
-        )
-
-    def published_matches() -> bool:
-        if not (destination.exists() or destination.is_symlink()):
-            return False
-        info = destination.lstat()
-        return (
-            not stat.S_ISLNK(info.st_mode)
-            and stat.S_ISREG(info.st_mode)
-            and info.st_uid == expected_uid
-            and stat.S_IMODE(info.st_mode) == 0o600
-            and _sha256_file(destination)
-            == attestation["policy_file_sha256"]
-        )
-
-    def prior_matches() -> bool:
-        if prior.get("existed") is False:
-            return not (
-                destination.exists() or destination.is_symlink()
-            )
-        if prior.get("existed") is not True or not destination.exists():
-            return False
-        info = destination.lstat()
-        return (
-            not stat.S_ISLNK(info.st_mode)
-            and stat.S_ISREG(info.st_mode)
-            and info.st_uid == int(prior["owner_uid"])
-            and info.st_gid == int(prior["owner_gid"])
-            and f"{stat.S_IMODE(info.st_mode):04o}" == prior["mode"]
-            and _sha256_file(destination) == prior["sha256"]
-        )
-
-    def persist(phase: str, **updates: object) -> None:
-        nonlocal journal
-        payload = {
-            key: value
-            for key, value in journal.items()
-            if key not in {"schema_version", "kind", "document_sha256"}
-        }
-        payload.update(updates)
-        payload.update({"phase": phase, "updated_at": _now()})
-        journal = _write_private_journal(
-            journal_file,
-            kind=CAPABILITY_POLICY_PUBLICATION_JOURNAL_KIND,
-            payload=payload,
-            expected_uid=expected_uid,
-        )
-
-    if journal["phase"] == "complete":
-        if not published_matches():
-            raise ActivationError(
-                "test capability policy changed before rollback"
-            )
-        persist("rollback_planned")
-    if journal["phase"] == "rolled_back":
-        if not prior_matches():
-            raise ActivationError(
-                "rolled-back capability policy changed"
-            )
-        return {
-            "restored": True,
-            "prior_existed": prior.get("existed") is True,
-            "replayed": True,
-        }
-    if published_matches():
-        if prior.get("existed") is False:
-            destination.unlink()
-        elif prior.get("existed") is True:
-            backup = _absolute(
-                Path(str(prior.get("backup"))),
-                "test capability policy rollback copy",
-            )
-            payload = _read_secret(
-                backup,
-                label="test capability policy rollback copy",
-                expected_uid=expected_uid,
-                maximum=MAX_JSON_BYTES,
-            )
-            if _sha256_bytes(payload) != prior.get("sha256"):
-                raise ActivationError(
-                    "test capability policy rollback copy changed"
-                )
-            temporary = destination.with_name(
-                f".{destination.name}.{uuid.uuid4().hex}.partial"
-            )
-            descriptor = os.open(
-                temporary,
-                os.O_WRONLY
-                | os.O_CREAT
-                | os.O_EXCL
-                | getattr(os, "O_NOFOLLOW", 0),
-                int(str(prior["mode"]), 8),
-            )
-            try:
-                os.write(descriptor, payload)
-                os.fchown(
-                    descriptor,
-                    int(prior["owner_uid"]),
-                    int(prior["owner_gid"]),
-                )
-                os.fchmod(descriptor, int(str(prior["mode"]), 8))
-                os.fsync(descriptor)
-            finally:
-                os.close(descriptor)
-            try:
-                os.replace(temporary, destination)
-            finally:
-                temporary.unlink(missing_ok=True)
-        else:
-            raise ActivationError(
-                "test capability policy prior existence is invalid"
-            )
-    elif not prior_matches():
-        raise ActivationError(
-            "capability policy rollback mutation is contradictory"
-        )
-    if not prior_matches():
-        raise ActivationError(
-            "capability policy rollback did not converge"
-        )
-    directory = os.open(
-        destination.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
-    )
-    try:
-        os.fsync(directory)
-    finally:
-        os.close(directory)
-    persist("rolled_back", rolled_back_at=_now())
-    return {
-        "restored": True,
-        "prior_existed": prior.get("existed") is True,
-        "replayed": False,
-    }
-
 
 def _plan_destination_prior(
     destination: Path,
@@ -7064,7 +6186,6 @@ def prepare_project_runtime_isolation(
     authority_database: Path,
     audit_path: Path,
     ledger_path: Path,
-    repository_owner_map: Path | None,
     expected_uid: int,
     runner: CommandRunner,
     observation_only: bool = False,
@@ -7086,11 +6207,6 @@ def prepare_project_runtime_isolation(
                 str(authority_database),
                 "--output",
                 str(audit_path),
-                *(
-                    ["--repository-owner-map", str(repository_owner_map)]
-                    if repository_owner_map is not None
-                    else []
-                ),
             ]
         )
         if captured.get("ok") is not True:
@@ -7098,16 +6214,10 @@ def prepare_project_runtime_isolation(
     verification_command = [
         str(executable), "verify", "--audit", str(audit_path),
         "--database", str(authority_database), "--require-fresh",
-        *(
-            ["--repository-owner-map", str(repository_owner_map)]
-            if repository_owner_map is not None
-            else []
-        ),
     ]
     base = runner.run_json(verification_command)
     counts = base.get("audit_counts")
     source_schema_version = base.get("source_schema_version")
-    owner_map_sha256 = base.get("repository_owner_map_sha256")
     if (
         base.get("ok") is not True
         or base.get("kind") != PROJECT_ISOLATION_VERIFICATION_KIND
@@ -7115,17 +6225,7 @@ def prepare_project_runtime_isolation(
         or set(counts)
         != {"compliant", "legacy_requires_recreation", "unobservable"}
         or any(type(value) is not int or value < 0 for value in counts.values())
-        or source_schema_version not in {12, 13}
-        or (repository_owner_map is not None and source_schema_version != 12)
-        or (repository_owner_map is None and source_schema_version != 13)
-        or (
-            source_schema_version == 12
-            and (
-                not isinstance(owner_map_sha256, str)
-                or re.fullmatch(r"sha256:[0-9a-f]{64}", owner_map_sha256) is None
-            )
-        )
-        or (source_schema_version == 13 and owner_map_sha256 is not None)
+        or source_schema_version != COORDINATOR_SCHEMA_VERSION
     ):
         raise ActivationError("project isolation verification contract is invalid")
     if type(observation_only) is not bool:
@@ -7215,7 +6315,6 @@ def prepare_candidate(
     *,
     state: Mapping[str, object],
     candidate_slot_source: Path,
-    test_capability_policy: Mapping[str, object] | None,
     host_preflight: Mapping[str, object] | None = None,
     legacy_console_env: Path,
     background_project_root: Path,
@@ -7239,7 +6338,6 @@ def prepare_candidate(
     first_adoption_defer_start: bool = False,
     clean_adoption_defer_start: bool = False,
     first_adoption_legacy_authority_database: Path | None = None,
-    repository_owner_map: Path | None = None,
     first_adoption_journal: Path | None = None,
     failpoint: Callable[[str], None] | None = None,
 ) -> tuple[dict[str, object], dict[str, object]]:
@@ -7256,11 +6354,8 @@ def prepare_candidate(
         raise ActivationError(
             "clean adoption is valid only for a deferred first installation"
         )
-    if current["phase"] != "sealed" or (
-        not first_adoption_defer_start
-        and "api-delegation" not in current["evidence"]
-    ):
-        raise ActivationError("candidate preparation requires sealed API delegation")
+    if current["phase"] != "sealed":
+        raise ActivationError("candidate preparation requires the sealed migration")
     if os.geteuid() != expected_uid:
         raise ActivationError("candidate preparation must run as the authority UID")
     release = Path(str(current["release"]))
@@ -7314,29 +6409,16 @@ def prepare_candidate(
         runner=command,
         legacy_console_uid=legacy_console_uid,
     )
-    if first_adoption_defer_start and test_capability_policy is not None:
-        raise ActivationError(
-            "deferred first-adoption graph must not consume a future policy"
-        )
     if first_adoption_defer_start:
         if first_adoption_legacy_authority_database is None:
             raise ActivationError(
                 "deferred installation requires an explicit authority database"
             )
-        if clean_adoption_defer_start:
-            if repository_owner_map is not None:
-                raise ActivationError(
-                    "clean adoption uses fresh schema-13 owner authority, not an owner map"
-                )
-        elif repository_owner_map is None:
-            raise ActivationError(
-                "deferred first-adoption graph requires a repository owner map"
-            )
         isolation_database = first_adoption_legacy_authority_database
     else:
-        if first_adoption_legacy_authority_database is not None or repository_owner_map is not None:
+        if first_adoption_legacy_authority_database is not None:
             raise ActivationError(
-                "ordinary candidate preparation must use post-split owner authority"
+                "ordinary candidate preparation must use the current coordinator database"
             )
         isolation_database = Path(str(current["authority_database"]))
     project_isolation = prepare_project_runtime_isolation(
@@ -7344,7 +6426,6 @@ def prepare_candidate(
         authority_database=Path(isolation_database),
         audit_path=project_isolation_audit,
         ledger_path=project_isolation_ledger,
-        repository_owner_map=repository_owner_map,
         expected_uid=expected_uid,
         runner=command,
         observation_only=clean_adoption_defer_start,
@@ -7353,18 +6434,6 @@ def prepare_candidate(
         project_isolation = require_complete_project_runtime_isolation(
             project_isolation
         )
-    if not first_adoption_defer_start:
-        if test_capability_policy is None:
-            raise ActivationError("candidate preparation lacks capability policy")
-        policy = cutover.verify_seal(
-            test_capability_policy,
-            kind=cutover.CAPABILITY_POLICY_KIND,
-            fields=cutover.CAPABILITY_POLICY_FIELDS,
-        )
-        delegation = current["evidence"].get("api-delegation")
-        if delegation is None:
-            raise ActivationError("candidate preparation lacks API delegation")
-        cutover._capability_policy_attestation(policy, delegation=delegation)
     current_credential = preflight_credentials(
         release_digest=digest,
         credentials=credentials,
@@ -7442,8 +6511,8 @@ def prepare_candidate(
         # the authority socket's shared runtime directory.  Deliberately keep
         # this file out of ``managed_units``: clean adoption must neither start
         # nor otherwise manage the retired broker.
-        sources[unit_root / FINAL_HARD_GATE_LEGACY_UNIT] = _read_install_source(
-            rendered / FINAL_HARD_GATE_LEGACY_UNIT,
+        sources[unit_root / LEGACY_BROKER_SERVICE_UNIT] = _read_install_source(
+            rendered / LEGACY_BROKER_SERVICE_UNIT,
             expected_uid=expected_uid,
         )
     if first_adoption_defer_start:
@@ -7806,7 +6875,6 @@ def prepare_candidate(
                 "test_database": current["test_database"],
                 "migration_seal_sha256": completion["document_sha256"],
                 "checks_passed": True,
-                "test_capability_policy": policy,
                 "preparation": preparation,
                 "created_at": _now(),
             },
@@ -8459,7 +7527,7 @@ def _default_live_rehearsal_profile_health(
     state: Mapping[str, object],
 ) -> dict[str, object]:
     try:
-        fresh = cutover.reverify_post_v13_profile_inventory_readiness(
+        fresh = cutover.reverify_profile_inventory_readiness(
             state=state,
             authority_uid=int(state["authority_uid"]),
         )
@@ -9376,10 +8444,6 @@ _FIRST_ADOPTION_ARGUMENTS: Mapping[str, Mapping[str, str]] = {
     },
     "candidate": {
         "slot_source": "candidate_slot_source",
-        "capability_policy": "test_capability_policy",
-        "capability_policy_evidence": "test_capability_policy_evidence",
-        "capability_policy_journal": "test_capability_policy_journal",
-        "dogfood_repository_id": "dogfood_repository_id",
         "rollback_directory": "candidate_rollback_directory",
         "legacy_console_env": "legacy_console_env",
         "background_project_root": "background_project_root",
@@ -9430,8 +8494,6 @@ _FIRST_ADOPTION_ARGUMENTS: Mapping[str, Mapping[str, str]] = {
         "inventory_uid": "inventory_uid",
         "inventory_gid": "inventory_gid",
         "operation_journal": "authority_operation_journal",
-        "owner_map": "repository_owner_map",
-        "owner_map_sha256": "repository_owner_map_sha256",
     },
     "api": {
         "handoff_port": "api_handoff_port",
@@ -9440,9 +8502,7 @@ _FIRST_ADOPTION_ARGUMENTS: Mapping[str, Mapping[str, str]] = {
         "bootstrap_profile_path": "api_bootstrap_profile_path",
         "bootstrap_profile_journal": "api_bootstrap_profile_journal",
         "final_profile_journal": "api_final_profile_journal",
-        "profile_access_gid": "protected_profile_access_gid",
         "api_uid": "api_service_uid",
-        "delegation_evidence": "api_delegation_evidence",
         "inventory_readiness_evidence": "profile_inventory_readiness_evidence",
     },
     "public": {
@@ -9561,9 +8621,7 @@ def _first_adoption_request(value: Mapping[str, object]) -> dict[str, object]:
             "dropin", "retirement_guard", "handoff_journal",
         },
         "candidate": {
-            "slot_source", "capability_policy", "capability_policy_evidence",
-            "capability_policy_journal", "dogfood_repository_id",
-            "rollback_directory",
+            "slot_source", "rollback_directory",
             "legacy_console_env", "background_project_root",
             "background_config_transaction", "project_isolation_audit",
             "project_isolation_ledger", "graph_evidence", "credential_evidence",
@@ -9580,13 +8638,11 @@ def _first_adoption_request(value: Mapping[str, object]) -> dict[str, object]:
             "inventory_publication", "split_attestation", "adoption_pointer",
             "maintenance_root", "maintenance_gid", "authority_uid", "authority_gid",
             "inventory_uid", "inventory_gid", "operation_journal",
-            "owner_map", "owner_map_sha256",
         },
         "api": {
             "handoff_port", "journal", "profile_path",
             "bootstrap_profile_path", "bootstrap_profile_journal",
-            "final_profile_journal", "profile_access_gid", "api_uid",
-            "delegation_evidence",
+            "final_profile_journal", "api_uid",
             "inventory_readiness_evidence",
         },
         "public": {
@@ -9630,7 +8686,7 @@ def _first_adoption_request(value: Mapping[str, object]) -> dict[str, object]:
             "bridge_transaction", "database", "profile", "socket",
             "dropin", "retirement_guard", "handoff_journal",
         },
-        "candidate": groups["candidate"] - {"dogfood_repository_id"},
+        "candidate": groups["candidate"],
         "console": groups["console"]
         - {
             "console_port",
@@ -9647,12 +8703,10 @@ def _first_adoption_request(value: Mapping[str, object]) -> dict[str, object]:
             "authority_gid",
             "inventory_uid",
             "inventory_gid",
-            "owner_map_sha256",
         },
         "api": {
             "journal", "profile_path", "bootstrap_profile_path",
             "bootstrap_profile_journal", "final_profile_journal",
-            "delegation_evidence",
             "inventory_readiness_evidence",
         },
         "public": {"publication", "handoff_journal"},
@@ -9728,10 +8782,6 @@ def _first_adoption_request(value: Mapping[str, object]) -> dict[str, object]:
             }
         )
         != 3
-        or re.fullmatch(
-            r"[0-9a-f]{64}", str(authority["owner_map_sha256"])
-        )
-        is None
     ):
         raise ActivationError("first-adoption authority must remain root-owned")
     fleet = normalized["fleet"]
@@ -9759,12 +8809,9 @@ def _first_adoption_request(value: Mapping[str, object]) -> dict[str, object]:
         or not isinstance(console, Mapping)
         or not isinstance(candidate, Mapping)
         or not isinstance(reservations, Mapping)
-        or candidate["capability_policy"]
-        != cutover.TEST_CAPABILITY_POLICY_PATH
         or api["profile_path"] != cutover.PROTECTED_PROFILE_PATH
         or api["bootstrap_profile_path"] != str(API_HANDOFF_PROFILE_PATH)
         or api["bootstrap_profile_path"] == api["profile_path"]
-        or int(api["profile_access_gid"]) <= 0
         or int(api["api_uid"]) <= 0
         or not 30000 <= int(api["handoff_port"]) <= 60999
         or not 30000 <= int(public["http_handoff_port"]) <= 60999
@@ -10293,7 +9340,7 @@ def _verify_first_adoption_repair(
         or "first-deployment-bootstrap" not in state["evidence"]
         or any(
             key in state["evidence"]
-            for key in ("api-delegation", "candidate", "activation")
+            for key in ("candidate", "activation")
         )
         or state["legacy_authority_database"] != authority["legacy_database"]
         or state["authority_database"] != authority["database"]
@@ -10316,7 +9363,6 @@ def _verify_first_adoption_repair(
     if not isinstance(candidate, Mapping) or not isinstance(api, Mapping):
         raise ActivationError("first-adoption evidence outputs changed")
     for output in (
-        api["delegation_evidence"],
         candidate["candidate_evidence"],
         candidate["activation_evidence"],
     ):
@@ -10589,7 +9635,7 @@ def _resume_first_adoption_graph(
     )
     isolation_allowed = {
         "ok", "kind", "audit_sha256", "source_schema_version",
-        "repository_owner_map_sha256", "audit_counts",
+        "audit_counts",
         "project_isolation_complete", "authority_database", "audit_path",
         "ledger_path", "ledger_sha256", "ledger_counts",
         "observation_only", "project_resources_mutated",
@@ -10598,21 +9644,15 @@ def _resume_first_adoption_graph(
         not isinstance(project_isolation, Mapping)
         or not {
             "ok", "kind", "audit_sha256", "source_schema_version",
-            "repository_owner_map_sha256", "audit_counts",
+            "audit_counts",
             "project_isolation_complete", "authority_database", "audit_path",
             "ledger_path",
         } <= set(project_isolation) <= isolation_allowed
         or project_isolation.get("ok") is not True
         or project_isolation.get("kind")
         != PROJECT_ISOLATION_VERIFICATION_KIND
-        or project_isolation.get("source_schema_version") != 12
-        or not isinstance(
-            project_isolation.get("repository_owner_map_sha256"), str
-        )
-        or re.fullmatch(
-            r"sha256:[0-9a-f]{64}",
-            str(project_isolation.get("repository_owner_map_sha256")),
-        ) is None
+        or project_isolation.get("source_schema_version")
+        != COORDINATOR_SCHEMA_VERSION
         or not isinstance(isolation_counts, Mapping)
         or set(isolation_counts)
         != {"compliant", "legacy_requires_recreation", "unobservable"}
@@ -10678,74 +9718,18 @@ def _fleet_transaction_path(
     )
 
 
-def _fleet_safety_transaction_path(
-    fleet: Mapping[str, object],
-) -> Path:
-    return Path(str(fleet["evidence_root"])) / (
-        "first-adoption-fleet-safety-transaction.json"
-    )
-
-
-def _fleet_transaction_binding(
-    *,
-    release: Path,
-    authority: Mapping[str, object],
-    fleet: Mapping[str, object],
-) -> dict[str, object]:
-    return {
-        "release": str(release),
-        "authority_database": str(authority["database"]),
-        "authority_export": str(fleet["authority_export"]),
-        "evidence_root": str(fleet["evidence_root"]),
-        "manifest_template_sha256": str(
-            fleet["manifest_template_sha256"]
-        ),
-        "manifest_set": str(fleet["manifest_set"]),
-        "adoption_request": str(fleet["adoption_request"]),
-        "helper": str(fleet["helper"]),
-    }
-
-
-def _fleet_safety_transaction_binding(
-    *,
-    release: Path,
-    authority: Mapping[str, object],
-    fleet: Mapping[str, object],
-    authority_export: Mapping[str, object],
-) -> dict[str, object]:
-    document_sha256 = authority_export.get("document_sha256")
-    authority_generation = authority_export.get("authority_generation")
-    if (
-        re.fullmatch(r"[0-9a-f]{64}", str(document_sha256)) is None
-        or not isinstance(authority_generation, str)
-        or not authority_generation
-    ):
-        raise ActivationError(
-            "fleet safety authority export binding is invalid"
-        )
-    return {
-        **_fleet_transaction_binding(
-            release=release,
-            authority=authority,
-            fleet=fleet,
-        ),
-        "authority_export_sha256": document_sha256,
-        "authority_generation": authority_generation,
-    }
-
 
 def _validate_first_adoption_fleet_catalog(
     catalog: object,
     *,
     authority_rows: Sequence[Mapping[str, object]],
-    allow_repairable: bool,
 ) -> tuple[dict[str, object], dict[str, Mapping[str, object]]]:
     if not isinstance(catalog, Mapping) or catalog.get("ok") is not True:
         raise ActivationError("fleet pre-adoption catalog is invalid")
     repositories = catalog.get("repositories")
     if not isinstance(repositories, list):
         raise ActivationError("fleet pre-adoption catalog is invalid")
-    expected: dict[str, tuple[object, object]] = {}
+    expected: dict[str, object] = {}
     for item in authority_rows:
         repository_id = item.get("repository_id")
         if (
@@ -10756,14 +9740,8 @@ def _validate_first_adoption_fleet_catalog(
             raise ActivationError(
                 "fleet authority export repository IDs are invalid"
             )
-        expected[repository_id] = (
-            item.get("repository_generation"),
-            item.get("owner_uid"),
-        )
+        expected[repository_id] = item.get("repository_generation")
     indexed: dict[str, Mapping[str, object]] = {}
-    allowed_safety = {"clean", "blocked"}
-    if allow_repairable:
-        allowed_safety.add("repairable")
     for item in repositories:
         if not isinstance(item, Mapping):
             raise ActivationError("fleet pre-adoption catalog is invalid")
@@ -10773,10 +9751,11 @@ def _validate_first_adoption_fleet_catalog(
         authority_identity = expected.get(repository_id)
         if (
             authority_identity is None
-            or item.get("repository_generation") != authority_identity[0]
-            or item.get("owner_uid") != authority_identity[1]
+            or item.get("repository_generation") != authority_identity
+            or type(item.get("execution_uid")) is not int
+            or int(item["execution_uid"]) <= 0
             or item.get("status") not in {"ready", "missing", "invalid"}
-            or item.get("safety_status") not in allowed_safety
+            or item.get("readability_status") not in {"clean", "blocked"}
         ):
             raise ActivationError(
                 "fleet pre-adoption catalog does not cover the authority export"
@@ -10793,20 +9772,17 @@ def _first_adoption_fleet_setup_result(
     catalog: object,
     *,
     authority_rows: Sequence[Mapping[str, object]],
-    dogfood_repository_id: str,
 ) -> dict[str, object]:
     """Validate a read-only fleet census for the availability cutover.
 
     First availability is intentionally not a fleet-wide manifest migration.
-    The Coordinator dogfood repository must already be runnable; every other
-    missing, invalid, or unsafe repository is exposed as Setup work and may be
-    adopted later through the explicit administrator transaction.
+    Every missing, invalid, or unreadable repository is exposed as Setup work
+    and may be cataloged later without becoming an availability admission gate.
     """
 
     normalized, catalog_by_id = _validate_first_adoption_fleet_catalog(
         catalog,
         authority_rows=authority_rows,
-        allow_repairable=True,
     )
     counts = normalized.get("counts")
     repositories = normalized.get("repositories")
@@ -10816,9 +9792,8 @@ def _first_adoption_fleet_setup_result(
     for item in catalog_by_id.values():
         expected_counts[str(item["status"])] += 1
         if (
-            type(item.get("safety_action_count")) is not int
-            or int(item["safety_action_count"]) < 0
-            or not isinstance(item.get("safety_blocker_codes"), list)
+            not isinstance(item.get("readability_blocker_codes"), list)
+            or type(item.get("has_readability_blockers")) is not bool
             or type(item.get("deletion_scan_complete")) is not bool
             or type(item.get("deleted_tracked_count")) is not int
             or int(item["deleted_tracked_count"]) < 0
@@ -10848,139 +9823,22 @@ def _first_adoption_fleet_setup_result(
         for repository_id, item in catalog_by_id.items()
         if item.get("status") == "ready"
         and item.get("adoption_ready") is True
-        and item.get("safety_status") == "clean"
+        and item.get("readability_status") == "clean"
     )
-    if dogfood_repository_id not in catalog_by_id:
-        raise ActivationError(
-            "first adoption dogfood repository is absent from authority"
-        )
-    if dogfood_repository_id not in runnable_ids:
-        dogfood = catalog_by_id[dogfood_repository_id]
-        raise ActivationError(
-            "first adoption dogfood repository must already have a valid, "
-            "clean test manifest; "
-            f"observed status={dogfood.get('status')} "
-            f"safety_status={dogfood.get('safety_status')}"
-        )
     setup_ids = sorted(set(catalog_by_id) - set(runnable_ids))
     return {
         "mode": FIRST_ADOPTION_FLEET_SETUP_CATALOG_MODE,
         "catalog": normalized,
-        "dogfood_repository_id": dogfood_repository_id,
         "runnable_repository_ids": runnable_ids,
         "setup_repository_ids": setup_ids,
         "blocked_repository_ids": sorted(
             repository_id
             for repository_id, item in catalog_by_id.items()
-            if item.get("safety_status") == "blocked"
-        ),
-        "repairable_repository_ids": sorted(
-            repository_id
-            for repository_id, item in catalog_by_id.items()
-            if item.get("safety_status") == "repairable"
+            if item.get("readability_status") == "blocked"
         ),
         "manifest_mutations": 0,
     }
 
-
-def _validate_first_adoption_fleet_safety_plan(
-    planned: object,
-    *,
-    catalog_by_id: Mapping[str, Mapping[str, object]],
-) -> dict[str, object]:
-    if (
-        not isinstance(planned, Mapping)
-        or planned.get("ok") is not True
-        or not isinstance(planned.get("plan_id"), str)
-        or not str(planned["plan_id"]).startswith(
-            "manifest-safety-repair-"
-        )
-        or re.fullmatch(
-            r"[0-9a-f]{64}", str(planned.get("plan_sha256"))
-        )
-        is None
-        or not isinstance(planned.get("repositories"), list)
-    ):
-        raise ActivationError("fleet manifest safety plan is invalid")
-    rows: dict[str, Mapping[str, object]] = {}
-    for item in planned["repositories"]:
-        if not isinstance(item, Mapping):
-            raise ActivationError("fleet manifest safety plan is invalid")
-        repository_id = item.get("repository_id")
-        catalog = catalog_by_id.get(str(repository_id))
-        if (
-            not isinstance(repository_id, str)
-            or repository_id in rows
-            or catalog is None
-            or item.get("repository_generation")
-            != catalog.get("repository_generation")
-            or item.get("owner_uid") != catalog.get("owner_uid")
-            or item.get("status") != catalog.get("safety_status")
-            or item.get("action_count")
-            != catalog.get("safety_action_count")
-            or item.get("blocker_codes")
-            != catalog.get("safety_blocker_codes")
-        ):
-            raise ActivationError(
-                "fleet manifest safety plan contradicts its catalog"
-            )
-        rows[repository_id] = item
-    if set(rows) != set(catalog_by_id) or not any(
-        item.get("status") == "repairable" for item in rows.values()
-    ):
-        raise ActivationError(
-            "fleet manifest safety plan does not cover repairable repositories"
-        )
-    return dict(planned)
-
-
-def _validate_first_adoption_fleet_safety_apply_identity(
-    applied: object, *, planned: Mapping[str, object]
-) -> dict[str, object]:
-    if (
-        not isinstance(applied, Mapping)
-        or applied.get("plan_id") != planned.get("plan_id")
-        or applied.get("plan_sha256") != planned.get("plan_sha256")
-        or re.fullmatch(
-            r"[0-9a-f]{64}", str(applied.get("result_sha256"))
-        )
-        is None
-    ):
-        raise ActivationError(
-            "fleet manifest safety apply result identity is invalid"
-        )
-    return dict(applied)
-
-
-def _validate_first_adoption_fleet_safety_apply(
-    applied: object, *, planned: Mapping[str, object]
-) -> dict[str, object]:
-    normalized = _validate_first_adoption_fleet_safety_apply_identity(
-        applied, planned=planned
-    )
-    if (
-        normalized.get("ok") is not True
-        or normalized.get("state")
-        not in {"applied", "applied_with_blockers"}
-    ):
-        raise ActivationError(
-            "fleet manifest safety repair did not apply exactly"
-        )
-    return normalized
-
-
-def _write_fleet_safety_transaction(
-    path: Path,
-    payload: Mapping[str, object],
-    *,
-    expected_uid: int,
-) -> dict[str, object]:
-    return _write_private_journal(
-        path,
-        kind=FIRST_ADOPTION_FLEET_SAFETY_JOURNAL_KIND,
-        payload=payload,
-        expected_uid=expected_uid,
-    )
 
 
 def _validate_first_adoption_fleet_plan(
@@ -11056,175 +9914,6 @@ def _write_fleet_transaction(
     )
 
 
-def _prepare_first_adoption_fleet_safety(
-    *,
-    release: Path,
-    authority: Mapping[str, object],
-    fleet: Mapping[str, object],
-    authority_export: Mapping[str, object],
-    export_path: Path,
-    prefix: Sequence[str],
-    expected_uid: int,
-    runner: CommandRunner,
-) -> tuple[dict[str, object], dict[str, Mapping[str, object]]]:
-    authority_rows_value = authority_export.get("repositories")
-    if not isinstance(authority_rows_value, list) or any(
-        not isinstance(item, Mapping) for item in authority_rows_value
-    ):
-        raise ActivationError(
-            "fleet authority export repository set is invalid"
-        )
-    authority_rows = [
-        item for item in authority_rows_value if isinstance(item, Mapping)
-    ]
-    observed_catalog, observed_by_id = _validate_first_adoption_fleet_catalog(
-        runner.run_json(
-            [*prefix, "catalog", "--authority-export", str(export_path)]
-        ),
-        authority_rows=authority_rows,
-        allow_repairable=True,
-    )
-    repairable = sorted(
-        repository_id
-        for repository_id, item in observed_by_id.items()
-        if item.get("safety_status") == "repairable"
-    )
-    journal_path = _fleet_safety_transaction_path(fleet)
-    journal = _load_private_journal(
-        journal_path,
-        kind=FIRST_ADOPTION_FLEET_SAFETY_JOURNAL_KIND,
-        expected_uid=expected_uid,
-    )
-    binding = _fleet_safety_transaction_binding(
-        release=release,
-        authority=authority,
-        fleet=fleet,
-        authority_export=authority_export,
-    )
-    allowed_phases = {
-        "planned",
-        "apply_intent",
-        "applied",
-        "complete",
-        "rolled_back",
-    }
-    if journal is not None and (
-        journal.get("binding") != binding
-        or journal.get("phase") not in allowed_phases
-    ):
-        raise ActivationError(
-            "fleet manifest safety journal belongs to another adoption"
-        )
-    if journal is not None and journal["phase"] == "rolled_back":
-        raise ActivationError(
-            "fleet manifest safety transaction was rolled back; use a fresh request"
-        )
-    if journal is None and not repairable:
-        return observed_catalog, observed_by_id
-    if journal is None:
-        planned = _validate_first_adoption_fleet_safety_plan(
-            runner.run_json(
-                [
-                    *prefix,
-                    "plan-safety-repair",
-                    "--authority-export",
-                    str(export_path),
-                ]
-            ),
-            catalog_by_id=observed_by_id,
-        )
-        journal = _write_fleet_safety_transaction(
-            journal_path,
-            {
-                "binding": binding,
-                "phase": "planned",
-                "catalog": observed_catalog,
-                "plan": planned,
-                "created_at": _now(),
-                "updated_at": _now(),
-            },
-            expected_uid=expected_uid,
-        )
-    else:
-        catalog_value = journal.get("catalog")
-        _catalog, catalog_by_id = _validate_first_adoption_fleet_catalog(
-            catalog_value,
-            authority_rows=authority_rows,
-            allow_repairable=True,
-        )
-        planned = _validate_first_adoption_fleet_safety_plan(
-            journal.get("plan"), catalog_by_id=catalog_by_id
-        )
-
-    def persist_safety(phase: str, **updates: object) -> None:
-        nonlocal journal
-        if journal is None:
-            raise ActivationError(
-                "fleet manifest safety journal disappeared"
-            )
-        payload = {
-            key: value
-            for key, value in journal.items()
-            if key not in {"schema_version", "kind", "document_sha256"}
-        }
-        payload.update(updates)
-        payload.update({"phase": phase, "updated_at": _now()})
-        journal = _write_fleet_safety_transaction(
-            journal_path, payload, expected_uid=expected_uid
-        )
-
-    if journal["phase"] == "complete":
-        if repairable:
-            raise ActivationError(
-                "fleet manifest safety metadata regressed after repair"
-            )
-        return observed_catalog, observed_by_id
-    if journal["phase"] == "planned":
-        persist_safety("apply_intent")
-    if journal["phase"] == "apply_intent":
-        outcome = _validate_first_adoption_fleet_safety_apply_identity(
-            runner.run_json(
-                [
-                    *prefix,
-                    "apply-safety-repair",
-                    "--plan-id",
-                    str(planned["plan_id"]),
-                    "--plan-sha256",
-                    str(planned["plan_sha256"]),
-                ]
-            ),
-            planned=planned,
-        )
-        if outcome.get("ok") is False and outcome.get("state") == "rolled_back":
-            rollback = {
-                "automatic": True,
-                "state": "rolled_back",
-                "plan_id": outcome["plan_id"],
-                "apply_result_sha256": outcome["result_sha256"],
-            }
-            persist_safety("rolled_back", rollback=rollback, apply=outcome)
-            raise ActivationError(
-                "fleet manifest safety repair failed and restored its exact metadata; "
-                "use a fresh first-adoption request"
-            )
-        applied = _validate_first_adoption_fleet_safety_apply(
-            outcome, planned=planned
-        )
-        persist_safety("applied", apply=applied)
-    else:
-        applied = _validate_first_adoption_fleet_safety_apply(
-            journal.get("apply"), planned=planned
-        )
-    post_catalog, post_by_id = _validate_first_adoption_fleet_catalog(
-        runner.run_json(
-            [*prefix, "catalog", "--authority-export", str(export_path)]
-        ),
-        authority_rows=authority_rows,
-        allow_repairable=False,
-    )
-    persist_safety("complete", post_catalog=post_catalog)
-    return post_catalog, post_by_id
-
 
 def _trusted_loopback_api_catalog(
     api_url: str = "http://127.0.0.1:29876/v1/test-repositories",
@@ -11273,140 +9962,6 @@ def _trusted_loopback_api_catalog(
     if not isinstance(document, dict):
         raise ActivationError("candidate API repository catalog is invalid")
     return document
-
-
-def _verify_trusted_api_profile_delegation(
-    *,
-    state: Mapping[str, object],
-    profile_repair: Mapping[str, object],
-    access_group_name: str = cutover.PROTECTED_PROFILE_GROUP,
-    authority_uid: int = 0,
-    api_url: str = "http://127.0.0.1:29876/v1/test-repositories",
-    created_at: str | None = None,
-) -> dict[str, object]:
-    """Prove profile-derived API scope over the trusted local HTTP boundary."""
-
-    current = cutover.validate_state(state)
-    if current["phase"] not in {"sealed", "api_delegated"}:
-        raise ActivationError(
-            "API profile verification requires the sealed migration or its exact delegation"
-        )
-    repair = cutover.verify_seal(
-        profile_repair,
-        kind=cutover.PROFILE_REPAIR_KIND,
-        fields=cutover.PROFILE_REPAIR_FIELDS,
-    )
-    completion = cutover._test_store_cutover_completion(current)
-    if (
-        authority_uid != os.geteuid()
-        or repair["source_authority_generation"]
-        != completion["authority_generation"]
-        or repair["authority_generation"] == repair["source_authority_generation"]
-        or repair["profile_path"] != cutover.PROTECTED_PROFILE_PATH
-        or repair["profile_owner_uid"] != authority_uid
-        or repair["profile_mode"] != "0640"
-        or repair["broker_account_id"] != cutover.API_BROKER_ACCOUNT
-        or repair["parser_verified"] is not True
-        or repair["all_clients_parser_verified"] is not True
-        or not isinstance(repair["client_uids"], list)
-        or int(repair["api_uid"]) not in repair["client_uids"]
-        or len(repair["client_uids"]) != len(set(repair["client_uids"]))
-        or any(type(uid) is not int or uid < 0 for uid in repair["client_uids"])
-        or not isinstance(repair["repository_bindings"], list)
-        or repair["atomic_publication_verified"] is not True
-        or repair["existing_profile_contents_reused"] is not False
-    ):
-        raise ActivationError("API profile repair evidence contradicts the cutover")
-    profile = cutover._absolute(str(repair["profile_path"]), "protected API profile")
-    info = profile.lstat()
-    if (
-        stat.S_ISLNK(info.st_mode)
-        or not stat.S_ISREG(info.st_mode)
-        or info.st_uid != authority_uid
-        or info.st_gid != int(repair["profile_group_gid"])
-        or stat.S_IMODE(info.st_mode) != 0o640
-        or cutover._file_digest(profile) != repair["profile_sha256"]
-    ):
-        raise ActivationError("protected API profile changed after reconstruction")
-    try:
-        profile_document = json.loads(profile.read_bytes())
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise ActivationError("protected profile is not strict JSON after publication") from error
-    observed_bindings: list[dict[str, object]] = []
-    for client_uid in repair["client_uids"]:
-        try:
-            parsed = cutover.profile_from_document(
-                profile_document, effective_uid=int(client_uid)
-            )
-        except cutover.BrokerProfileError as error:
-            raise ActivationError(
-                "published protected client profile failed strict parsing"
-            ) from error
-        for repository in parsed.repositories.values():
-            observed_bindings.append(
-                {
-                    "client_uid": int(client_uid),
-                    "account_id": parsed.account_id,
-                    "repository_id": repository.repo_id,
-                    "generation": repository.generation,
-                    "owner_uid": repository.owner_uid,
-                    "issued_at": repository.issued_at,
-                    "valid_until_epoch": repository.valid_until_epoch,
-                }
-            )
-    if observed_bindings != repair["repository_bindings"]:
-        raise ActivationError(
-            "published protected client profiles contradict authority bindings"
-        )
-    catalog = _trusted_loopback_api_catalog(api_url)
-    rows = catalog.get("repositories")
-    if not isinstance(rows, list) or not rows:
-        raise ActivationError("candidate API returned no repository catalog")
-    observed: list[str] = []
-    for row in rows:
-        if not isinstance(row, Mapping):
-            raise ActivationError("candidate API repository catalog entry is invalid")
-        repository_id = row.get("repo_id", row.get("repository_id"))
-        if not isinstance(repository_id, str) or not repository_id:
-            raise ActivationError("candidate API repository identity is invalid")
-        observed.append(repository_id)
-    wanted = list(repair["repository_ids"])
-    if len(observed) != len(set(observed)) or sorted(observed) != sorted(wanted):
-        raise ActivationError(
-            "candidate API broker catalog does not match the protected profile"
-        )
-    return cutover.seal(
-        cutover.DELEGATION_KIND,
-        {
-            "api_uid": int(repair["api_uid"]),
-            "broker_account_id": cutover.API_BROKER_ACCOUNT,
-            "source_authority_generation": str(repair["source_authority_generation"]),
-            "authority_generation": str(repair["authority_generation"]),
-            "profile_fingerprint": str(repair["profile_sha256"]),
-            "profile_path": str(profile),
-            "profile_owner_uid": authority_uid,
-            "profile_group_name": access_group_name,
-            "profile_group_gid": int(repair["profile_group_gid"]),
-            "profile_mode": "0640",
-            "profile_source_kind": "authority-reconstructed",
-            "profile_source_sha256": str(repair["authority_source_sha256"]),
-            "profile_authority_reconciled": True,
-            "profile_generation_matches_authority": True,
-            "atomic_publication_verified": True,
-            "existing_profile_contents_reused": False,
-            "google_actor_prefix": "google:",
-            "google_actor_policy": cutover.GOOGLE_ACTOR_POLICY,
-            "repository_grants": [
-                {
-                    "repository_id": repository_id,
-                    "permissions": ["tests:read", "tests:run", "tests:operate"],
-                }
-                for repository_id in sorted(wanted)
-            ],
-            "broker_verified": True,
-            "created_at": _now() if created_at is None else created_at,
-        },
-    )
 
 
 def _first_adoption_live_step(
@@ -11484,24 +10039,6 @@ def _first_adoption_live_step(
         }
     if step == "graph_prepared":
         state = cutover.load_state(state_path, authority_uid=expected_uid)
-        (
-            load_owner_map,
-            _apply_owner_map,
-            _scope_transition,
-            _fence_kind,
-            _fence_schema,
-        ) = (
-            _repository_owner_authority_api(release)
-        )
-        owner_map = load_owner_map(
-            Path(str(authority["owner_map"])), expected_owner_uid=expected_uid
-        )
-        if not isinstance(owner_map, Mapping) or not isinstance(
-            owner_map.get("document_sha256"), str
-        ):
-            raise ActivationError(
-                "first-adoption repository owner map is invalid"
-            )
         resumed = _resume_first_adoption_graph(
             graph_path=Path(str(candidate_request["graph_evidence"])),
             credential_path=Path(str(candidate_request["credential_evidence"])),
@@ -11519,8 +10056,6 @@ def _first_adoption_live_step(
                 or pre_split_isolation.get("authority_database")
                 != authority["legacy_database"]
                 or pre_split_isolation.get("source_schema_version") != 12
-                or pre_split_isolation.get("repository_owner_map_sha256")
-                != owner_map["document_sha256"]
                 or resumed.get("console_slot_ports")
                 != expected_console_ports
             ):
@@ -11531,7 +10066,6 @@ def _first_adoption_live_step(
         graph, credential = prepare_candidate(
             state=state,
             candidate_slot_source=Path(str(candidate_request["slot_source"])),
-            test_capability_policy=None,
             legacy_console_env=Path(str(candidate_request["legacy_console_env"])),
             background_project_root=Path(str(candidate_request["background_project_root"])),
             background_config_transaction=Path(str(candidate_request["background_config_transaction"])),
@@ -11546,7 +10080,6 @@ def _first_adoption_live_step(
             first_adoption_legacy_authority_database=Path(
                 str(authority["legacy_database"])
             ),
-            repository_owner_map=Path(str(authority["owner_map"])),
             first_adoption_journal=Path(str(candidate_request["graph_journal"])),
         )
         cutover._publish_evidence(
@@ -11645,8 +10178,6 @@ def _first_adoption_live_step(
             inventory_owner_uid=int(authority["inventory_uid"]),
             inventory_owner_gid=int(authority["inventory_gid"]),
             operation_journal=Path(str(authority["operation_journal"])),
-            owner_map_path=Path(str(authority["owner_map"])),
-            owner_map_sha256=str(authority["owner_map_sha256"]),
             expected_uid=expected_uid,
             runner=runner,
         )
@@ -11686,54 +10217,6 @@ def _first_adoption_live_step(
                 ),
             )
         }
-    if step == "capability_policy_ready":
-        adoption = steps.get("storage_split")
-        if not isinstance(adoption, Mapping):
-            raise ActivationError(
-                "capability policy requires the completed storage split"
-            )
-        published = publish_first_adoption_capability_policy(
-            authority_database=Path(str(authority["database"])),
-            snapshot_socket=Path(
-                "/run/devcoordinator-test-snapshotd/snapshot.sock"
-            ),
-            destination=Path(str(candidate_request["capability_policy"])),
-            dogfood_repository_id=str(
-                candidate_request["dogfood_repository_id"]
-            ),
-            rollback_directory=Path(
-                str(candidate_request["rollback_directory"])
-            ),
-            journal_file=Path(
-                str(candidate_request["capability_policy_journal"])
-            ),
-            expected_uid=expected_uid,
-        )
-        attestation = published.get("attestation")
-        if not isinstance(attestation, Mapping):
-            raise ActivationError(
-                "capability policy publisher returned no sealed attestation"
-            )
-        evidence_path = Path(
-            str(candidate_request["capability_policy_evidence"])
-        )
-        if evidence_path.exists() or evidence_path.is_symlink():
-            if (
-                cutover.read_private_json(evidence_path, uid=expected_uid)
-                != attestation
-            ):
-                raise ActivationError(
-                    "capability policy evidence changed during resume"
-                )
-        else:
-            cutover._publish_evidence(
-                evidence_path, attestation, uid=expected_uid
-            )
-        return {
-            "created": published.get("created") is True,
-            "attestation": dict(attestation),
-            "prior_policy": published.get("prior_policy"),
-        }
     if step == "authority_test_plane_ready":
         return {
             "ready_units": _start_exact_units(
@@ -11751,22 +10234,19 @@ def _first_adoption_live_step(
         "api_final_profile_ready",
     }:
         adoption = steps.get("storage_split")
-        owner_authority = (
-            adoption.get("owner_authority")
+        authority_identity = (
+            adoption.get("authority")
             if isinstance(adoption, Mapping)
             else None
         )
         if (
-            not isinstance(owner_authority, Mapping)
+            not isinstance(authority_identity, Mapping)
             or not isinstance(
-                owner_authority.get("source_database_generation"), str
-            )
-            or not isinstance(
-                owner_authority.get("target_database_generation"), str
+                authority_identity.get("database_generation"), str
             )
         ):
             raise ActivationError(
-                "protected profile publication lacks source generation evidence"
+                "protected profile publication lacks database generation evidence"
             )
         bootstrap = step == "api_bootstrap_profile_ready"
         return publish_first_adoption_profiles(
@@ -11780,8 +10260,7 @@ def _first_adoption_live_step(
                     ]
                 )
             ),
-            api_uid=int(api["api_uid"]),
-            access_gid=int(api["profile_access_gid"]),
+            validation_uid=int(api["api_uid"]),
             rollback_directory=Path(
                 str(candidate_request["rollback_directory"])
             ),
@@ -11793,12 +10272,6 @@ def _first_adoption_live_step(
                         else "final_profile_journal"
                     ]
                 )
-            ),
-            source_authority_generation=str(
-                owner_authority["source_database_generation"]
-            ),
-            target_authority_generation=str(
-                owner_authority["target_database_generation"]
             ),
             expected_uid=expected_uid,
         )
@@ -11825,79 +10298,6 @@ def _first_adoption_live_step(
             ),
             expected_uid=expected_uid,
         )
-    if step == "api_delegation_verified":
-        publication = steps.get("api_final_profile_ready")
-        adoption = steps.get("storage_split")
-        owner_authority = (
-            adoption.get("owner_authority")
-            if isinstance(adoption, Mapping)
-            else None
-        )
-        if not isinstance(publication, Mapping) or not isinstance(
-            publication.get("attestation"), Mapping
-        ) or not isinstance(owner_authority, Mapping):
-            raise ActivationError(
-                "API delegation requires the journaled v13 profile publication"
-            )
-        target_generation = owner_authority.get("target_database_generation")
-        if (
-            not isinstance(target_generation, str)
-            or publication["attestation"].get("authority_generation")
-            != target_generation
-        ):
-            raise ActivationError(
-                "API delegation profile does not match the sealed target generation"
-            )
-        current = cutover.load_state(state_path, authority_uid=expected_uid)
-        evidence_path = Path(str(api["delegation_evidence"]))
-        recorded_delegation: Mapping[str, object] | None = None
-        if evidence_path.exists() or evidence_path.is_symlink():
-            recorded_delegation = cutover._normalize_replay(
-                "api-delegation",
-                cutover.read_private_json(
-                    evidence_path, uid=expected_uid
-                ),
-            )
-        state_delegation = current["evidence"].get("api-delegation")
-        if isinstance(state_delegation, Mapping):
-            normalized_state = cutover._normalize_replay(
-                "api-delegation", state_delegation
-            )
-            if (
-                recorded_delegation is None
-                or recorded_delegation != normalized_state
-            ):
-                raise ActivationError(
-                    "recorded API delegation output is incomplete"
-                )
-        replay_created_at = (
-            str(recorded_delegation["created_at"])
-            if isinstance(recorded_delegation, Mapping)
-            else None
-        )
-        delegation = _verify_trusted_api_profile_delegation(
-            state=current,
-            profile_repair=publication["attestation"],
-            authority_uid=expected_uid,
-            created_at=replay_created_at,
-        )
-        if recorded_delegation is not None:
-            if recorded_delegation != delegation:
-                raise ActivationError(
-                    "API delegation evidence changed during first-adoption resume"
-                )
-        else:
-            cutover._publish_evidence(
-                evidence_path, delegation, uid=expected_uid
-            )
-        cutover.record_evidence(
-            state_path=state_path,
-            evidence_kind="api-delegation",
-            evidence_path=evidence_path,
-            authority_uid=expected_uid,
-            evidence_uid=expected_uid,
-        )
-        return delegation
     if step == "profile_inventory_ready":
         publication = steps.get("api_final_profile_ready")
         if not isinstance(publication, Mapping) or not isinstance(
@@ -11933,7 +10333,7 @@ def _first_adoption_live_step(
             if isinstance(recorded_readiness, Mapping)
             else None
         )
-        readiness = cutover.verify_post_v13_profile_inventory_readiness(
+        readiness = cutover.verify_profile_inventory_readiness(
             state=current,
             profile_repair=publication["attestation"],
             authority_database=Path(str(authority["database"])),
@@ -11967,7 +10367,6 @@ def _first_adoption_live_step(
             ledger_path=Path(
                 str(candidate_request["project_isolation_ledger"])
             ),
-            repository_owner_map=None,
             expected_uid=expected_uid,
             runner=runner,
         )
@@ -12004,9 +10403,11 @@ def _first_adoption_live_step(
             export = observed_export
             cutover._publish_evidence(export_path, export, uid=expected_uid)
         executable = release / "bin/devcoordinator-test-manifest-adoption"
+        execution_uid = int(api["api_uid"])
         prefix = [
             str(executable), "--authority-database", str(authority["database"]),
             "--helper", str(fleet["helper"]), "--evidence-root", str(fleet["evidence_root"]),
+            "--execution-uid", str(execution_uid),
         ]
         template = _first_adoption_manifest_template(
             cutover.read_private_json(
@@ -12027,7 +10428,10 @@ def _first_adoption_live_step(
         )
         fleet_journal_path = _fleet_transaction_path(fleet)
         binding = _fleet_transaction_binding(
-            release=release, authority=authority, fleet=fleet
+            release=release,
+            authority=authority,
+            fleet=fleet,
+            execution_uid=execution_uid,
         )
         fleet_journal = _load_private_journal(
             fleet_journal_path,
@@ -12073,9 +10477,6 @@ def _first_adoption_live_step(
                     for item in authority_repositories
                     if isinstance(item, Mapping)
                 ],
-                dogfood_repository_id=str(
-                    candidate_request["dogfood_repository_id"]
-                ),
             )
             if dict(result) != replay:
                 raise ActivationError(
@@ -12104,9 +10505,6 @@ def _first_adoption_live_step(
                 for item in authority_repositories
                 if isinstance(item, Mapping)
             ],
-            dogfood_repository_id=str(
-                candidate_request["dogfood_repository_id"]
-            ),
         )
         _write_fleet_transaction(
             fleet_journal_path,
@@ -12281,31 +10679,6 @@ def _first_adoption_live_step(
                 "socket_inodes": sockets,
             },
         )
-        policy = cutover.read_private_json(
-            Path(str(candidate_request["capability_policy_evidence"])),
-            uid=expected_uid,
-        )
-        delegation = current["evidence"].get("api-delegation")
-        if not isinstance(delegation, Mapping):
-            raise ActivationError(
-                "candidate recording lacks API delegation evidence"
-            )
-        cutover._capability_policy_attestation(
-            policy, delegation=delegation
-        )
-        policy_path = Path(str(candidate_request["capability_policy"]))
-        policy_info = policy_path.lstat()
-        if (
-            stat.S_ISLNK(policy_info.st_mode)
-            or not stat.S_ISREG(policy_info.st_mode)
-            or policy_info.st_uid != expected_uid
-            or stat.S_IMODE(policy_info.st_mode) != 0o600
-            or str(policy_path) != policy.get("policy_path")
-            or _sha256_file(policy_path) != policy.get("policy_file_sha256")
-        ):
-            raise ActivationError(
-                "candidate capability policy changed after publication"
-            )
         candidate = cutover.seal(
             cutover.CANDIDATE_KIND,
             {
@@ -12320,7 +10693,6 @@ def _first_adoption_live_step(
                     current
                 )["document_sha256"],
                 "checks_passed": True,
-                "test_capability_policy": policy,
                 "preparation": preparation,
                 "created_at": _now(),
             },
@@ -12578,11 +10950,6 @@ def _rollback_first_adoption_cutover_state(
             "profile_inventory_ready",
             Path(str(api_request["inventory_readiness_evidence"])),
         ),
-        (
-            "api-delegation",
-            "api_delegation_verified",
-            Path(str(api_request["delegation_evidence"])),
-        ),
     )
     state = cutover.load_state(state_path, authority_uid=expected_uid)
     indexed = dict(state["evidence"])
@@ -12680,6 +11047,7 @@ def _rollback_first_adoption_fleet(
     fleet_request: Mapping[str, object],
     fleet_evidence: Mapping[str, object],
     runner: CommandRunner,
+    execution_uid: int,
 ) -> Mapping[str, object]:
     planned = fleet_evidence.get("plan")
     applied = fleet_evidence.get("apply")
@@ -12710,6 +11078,8 @@ def _rollback_first_adoption_fleet(
             str(fleet_request["helper"]),
             "--evidence-root",
             str(fleet_request["evidence_root"]),
+            "--execution-uid",
+            str(execution_uid),
             "rollback",
             "--plan-id",
             str(planned["plan_id"]),
@@ -12727,164 +11097,6 @@ def _rollback_first_adoption_fleet(
     return result
 
 
-def _rollback_first_adoption_fleet_safety_transaction(
-    *,
-    release: Path,
-    authority: Mapping[str, object],
-    fleet_request: Mapping[str, object],
-    expected_uid: int,
-    runner: CommandRunner,
-) -> Mapping[str, object]:
-    journal_path = _fleet_safety_transaction_path(fleet_request)
-    journal = _load_private_journal(
-        journal_path,
-        kind=FIRST_ADOPTION_FLEET_SAFETY_JOURNAL_KIND,
-        expected_uid=expected_uid,
-    )
-    if journal is None:
-        return {"skipped": True}
-    export = cutover.verify_seal(
-        cutover.read_private_json(
-            Path(str(fleet_request["authority_export"])), uid=expected_uid
-        ),
-        kind=cutover.AUTHORITY_REPOSITORY_EXPORT_KIND,
-        fields=cutover.AUTHORITY_REPOSITORY_EXPORT_FIELDS,
-    )
-    binding = _fleet_safety_transaction_binding(
-        release=release,
-        authority=authority,
-        fleet=fleet_request,
-        authority_export=export,
-    )
-    if (
-        journal.get("binding") != binding
-        or journal.get("phase")
-        not in {
-            "planned",
-            "apply_intent",
-            "applied",
-            "complete",
-            "rolled_back",
-        }
-    ):
-        raise ActivationError(
-            "fleet manifest safety rollback journal is contradictory"
-        )
-    if journal["phase"] == "rolled_back":
-        result = journal.get("rollback")
-        if not isinstance(result, Mapping):
-            raise ActivationError(
-                "rolled-back fleet manifest safety journal lacks its result"
-            )
-        return dict(result)
-    authority_rows_value = export.get("repositories")
-    if not isinstance(authority_rows_value, list) or any(
-        not isinstance(item, Mapping) for item in authority_rows_value
-    ):
-        raise ActivationError(
-            "fleet manifest safety authority export is invalid"
-        )
-    _catalog, catalog_by_id = _validate_first_adoption_fleet_catalog(
-        journal.get("catalog"),
-        authority_rows=[
-            item
-            for item in authority_rows_value
-            if isinstance(item, Mapping)
-        ],
-        allow_repairable=True,
-    )
-    planned = _validate_first_adoption_fleet_safety_plan(
-        journal.get("plan"), catalog_by_id=catalog_by_id
-    )
-
-    def persist(phase: str, **updates: object) -> None:
-        nonlocal journal
-        payload = {
-            key: value
-            for key, value in journal.items()
-            if key not in {"schema_version", "kind", "document_sha256"}
-        }
-        payload.update(updates)
-        payload.update({"phase": phase, "updated_at": _now()})
-        journal = _write_fleet_safety_transaction(
-            journal_path, payload, expected_uid=expected_uid
-        )
-
-    if journal["phase"] == "planned":
-        result = {
-            "skipped": True,
-            "plan_id": planned["plan_id"],
-            "reason": "safety apply intent was not published",
-        }
-        persist("rolled_back", rollback=result)
-        return result
-    prefix = [
-        str(release / "bin/devcoordinator-test-manifest-adoption"),
-        "--authority-database",
-        str(authority["database"]),
-        "--helper",
-        str(fleet_request["helper"]),
-        "--evidence-root",
-        str(fleet_request["evidence_root"]),
-    ]
-    if journal["phase"] == "apply_intent":
-        outcome = _validate_first_adoption_fleet_safety_apply_identity(
-            runner.run_json(
-                [
-                    *prefix,
-                    "apply-safety-repair",
-                    "--plan-id",
-                    str(planned["plan_id"]),
-                    "--plan-sha256",
-                    str(planned["plan_sha256"]),
-                ]
-            ),
-            planned=planned,
-        )
-        if outcome.get("ok") is False and outcome.get("state") == "rolled_back":
-            result = {
-                "automatic": True,
-                "state": "rolled_back",
-                "plan_id": outcome["plan_id"],
-                "apply_result_sha256": outcome["result_sha256"],
-            }
-            persist("rolled_back", rollback=result, apply=outcome)
-            return result
-        applied = _validate_first_adoption_fleet_safety_apply(
-            outcome, planned=planned
-        )
-        persist("applied", apply=applied)
-    else:
-        applied = _validate_first_adoption_fleet_safety_apply(
-            journal.get("apply"), planned=planned
-        )
-    result_sha256 = str(applied["result_sha256"])
-    result = runner.run_json(
-        [
-            *prefix,
-            "rollback-safety-repair",
-            "--plan-id",
-            str(planned["plan_id"]),
-            "--result-sha256",
-            result_sha256,
-        ]
-    )
-    if (
-        result.get("ok") is not True
-        or result.get("state") != "rolled_back"
-        or result.get("plan_id") != planned["plan_id"]
-        or result.get("apply_result_sha256") != result_sha256
-        or re.fullmatch(
-            r"[0-9a-f]{64}", str(result.get("rollback_sha256"))
-        )
-        is None
-    ):
-        raise ActivationError(
-            "fleet manifest safety rollback did not restore the exact plan"
-        )
-    persist("rolled_back", rollback=dict(result))
-    return result
-
 
 def _rollback_first_adoption_fleet_transaction(
     *,
@@ -12894,6 +11106,7 @@ def _rollback_first_adoption_fleet_transaction(
     fleet_evidence: object,
     expected_uid: int,
     runner: CommandRunner,
+    execution_uid: int,
 ) -> Mapping[str, object]:
     journal_path = _fleet_transaction_path(fleet_request)
     journal = _load_private_journal(
@@ -12910,7 +11123,10 @@ def _rollback_first_adoption_fleet_transaction(
         manifest_result = {"skipped": True}
     else:
         binding = _fleet_transaction_binding(
-            release=release, authority=authority, fleet=fleet_request
+            release=release,
+            authority=authority,
+            fleet=fleet_request,
+            execution_uid=execution_uid,
         )
         if (
             journal.get("binding") != binding
@@ -12991,6 +11207,8 @@ def _rollback_first_adoption_fleet_transaction(
                         str(fleet_request["helper"]),
                         "--evidence-root",
                         str(fleet_request["evidence_root"]),
+                        "--execution-uid",
+                        str(execution_uid),
                     ]
                     applied = _validate_first_adoption_fleet_apply(
                         runner.run_json(
@@ -13024,16 +11242,10 @@ def _rollback_first_adoption_fleet_transaction(
                     fleet_request=fleet_request,
                     fleet_evidence=recovered,
                     runner=runner,
+                    execution_uid=execution_uid,
                 )
                 persist("rolled_back", rollback=dict(manifest_result))
-    safety_result = _rollback_first_adoption_fleet_safety_transaction(
-        release=release,
-        authority=authority,
-        fleet_request=fleet_request,
-        expected_uid=expected_uid,
-        runner=runner,
-    )
-    return {**dict(manifest_result), "safety": safety_result}
+    return dict(manifest_result)
 
 
 def _rollback_console_state_migration(
@@ -13275,18 +11487,15 @@ def _resume_profile_publication_for_rollback(
         and isinstance(journal.get("result"), Mapping)
     ):
         return dict(journal["result"])
-    owner_authority = (
-        adoption.get("owner_authority")
+    authority_identity = (
+        adoption.get("authority")
         if isinstance(adoption, Mapping)
         else None
     )
     if (
-        not isinstance(owner_authority, Mapping)
+        not isinstance(authority_identity, Mapping)
         or not isinstance(
-            owner_authority.get("source_database_generation"), str
-        )
-        or not isinstance(
-            owner_authority.get("target_database_generation"), str
+            authority_identity.get("database_generation"), str
         )
     ):
         raise ActivationError(
@@ -13295,16 +11504,9 @@ def _resume_profile_publication_for_rollback(
     return publish_first_adoption_profiles(
         authority_database=Path(str(authority["database"])),
         destination=Path(str(api[path_key])),
-        api_uid=int(api["api_uid"]),
-        access_gid=int(api["profile_access_gid"]),
+        validation_uid=int(api["api_uid"]),
         rollback_directory=Path(str(candidate["rollback_directory"])),
         journal_file=journal_path,
-        source_authority_generation=str(
-            owner_authority["source_database_generation"]
-        ),
-        target_authority_generation=str(
-            owner_authority["target_database_generation"]
-        ),
         expected_uid=expected_uid,
     )
 
@@ -13448,6 +11650,7 @@ def _resume_first_adoption_rollback(
                 fleet_evidence=fleet_evidence,
                 expected_uid=expected_uid,
                 runner=runner,
+                execution_uid=int(api["api_uid"]),
             )
         if step == "public":
             if public_journal is None:
@@ -13550,77 +11753,6 @@ def _resume_first_adoption_rollback(
                 expected_uid=expected_uid,
                 runner=runner,
             )
-        if step == "policy":
-            publication = live_steps.get("capability_policy_ready")
-            policy_journal = Path(
-                str(candidate["capability_policy_journal"])
-            )
-            if not isinstance(publication, Mapping) and (
-                policy_journal.exists() or policy_journal.is_symlink()
-            ):
-                recorded_policy = _load_private_journal(
-                    policy_journal,
-                    kind=CAPABILITY_POLICY_PUBLICATION_JOURNAL_KIND,
-                    expected_uid=expected_uid,
-                )
-                if (
-                    isinstance(recorded_policy, Mapping)
-                    and recorded_policy.get("phase") == "rolled_back"
-                    and isinstance(
-                        recorded_policy.get("result"), Mapping
-                    )
-                ):
-                    publication = dict(recorded_policy["result"])
-                else:
-                    publication = publish_first_adoption_capability_policy(
-                        authority_database=Path(
-                            str(authority["database"])
-                        ),
-                        snapshot_socket=Path(
-                            "/run/devcoordinator-test-snapshotd/snapshot.sock"
-                        ),
-                        destination=Path(
-                            str(candidate["capability_policy"])
-                        ),
-                        dogfood_repository_id=str(
-                            candidate["dogfood_repository_id"]
-                        ),
-                        rollback_directory=Path(
-                            str(candidate["rollback_directory"])
-                        ),
-                        journal_file=policy_journal,
-                        expected_uid=expected_uid,
-                    )
-            if not isinstance(publication, Mapping):
-                return {"skipped": True}
-            result = _restore_first_adoption_capability_policy(
-                publication,
-                journal_file=policy_journal,
-                expected_uid=expected_uid,
-            )
-            evidence_path = Path(
-                str(candidate["capability_policy_evidence"])
-            )
-            if evidence_path.exists() or evidence_path.is_symlink():
-                if (
-                    cutover.read_private_json(
-                        evidence_path, uid=expected_uid
-                    )
-                    != publication.get("attestation")
-                ):
-                    raise ActivationError(
-                        "capability policy evidence changed before rollback"
-                    )
-                evidence_path.unlink()
-                descriptor = os.open(
-                    evidence_path.parent,
-                    os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
-                )
-                try:
-                    os.fsync(descriptor)
-                finally:
-                    os.close(descriptor)
-            return result
         if step == "console_state":
             migration = live_steps.get("console_state_migrated")
             if not isinstance(migration, Mapping):
@@ -13893,35 +12025,6 @@ def execute_first_adoption_transaction(
         ) from error
 
 
-_FIRST_ADOPTION_HARD_GATE_FIELDS = frozenset(
-    {
-        "operation_id",
-        "binding_attestation_sha256",
-        "first_adoption_attestation_sha256",
-        "release_digest",
-        "release",
-        "profile",
-        "profile_sha256",
-        "authority_generation",
-        "canonical_project",
-        "repository_id",
-        "repository_generation",
-        "owner_user",
-        "owner_uid",
-        "collaborator_user",
-        "collaborator_uid",
-        "authority",
-        "inventory_sha256",
-        "inventory_client",
-        "inventory_client_sha256",
-        "installed_skill_links",
-        "units",
-        "legacy_broker_retired",
-        "verified_at",
-    }
-)
-
-
 def _completed_binding_attestation(
     path: Path,
     *,
@@ -13943,7 +12046,7 @@ def _completed_binding_attestation(
         result["operation_id"] != operation_id
         or result["outcome"] != "completed"
         or result["release_digest"] != release_digest
-        or result["service_unit"] != FINAL_HARD_GATE_LEGACY_UNIT
+        or result["service_unit"] != LEGACY_BROKER_SERVICE_UNIT
         or result["service_restored"] is not True
         or result["maintenance_cleared"] is not True
     ):
@@ -14006,548 +12109,6 @@ def _completed_first_adoption_attestation(
     return document
 
 
-def _read_final_hard_gate_profile(
-    path: Path, *, expected_uid: int
-) -> tuple[dict[str, object], bytes, os.stat_result]:
-    path = _absolute(path, "final protected broker profile")
-    parent = path.parent.lstat()
-    if (
-        stat.S_ISLNK(parent.st_mode)
-        or not stat.S_ISDIR(parent.st_mode)
-        or parent.st_uid != expected_uid
-        or stat.S_IMODE(parent.st_mode) & 0o022
-    ):
-        raise ActivationError("protected broker profile parent is unsafe")
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
-    descriptor = os.open(path, flags)
-    try:
-        before = os.fstat(descriptor)
-        path_before = path.lstat()
-        if (
-            not stat.S_ISREG(before.st_mode)
-            or before.st_uid != expected_uid
-            or stat.S_IMODE(before.st_mode) != 0o640
-            or before.st_gid <= 0
-            or before.st_nlink != 1
-            or before.st_size <= 0
-            or before.st_size > MAX_JSON_BYTES
-            or stat.S_ISLNK(path_before.st_mode)
-            or (path_before.st_dev, path_before.st_ino, path_before.st_size)
-            != (before.st_dev, before.st_ino, before.st_size)
-        ):
-            raise ActivationError("protected broker profile identity is unsafe")
-        payload = os.read(descriptor, int(before.st_size) + 1)
-        after = os.fstat(descriptor)
-        path_after = path.lstat()
-    finally:
-        os.close(descriptor)
-    before_identity = (
-        before.st_dev,
-        before.st_ino,
-        before.st_size,
-        before.st_mtime_ns,
-        before.st_ctime_ns,
-    )
-    if (
-        len(payload) != before.st_size
-        or (
-            after.st_dev,
-            after.st_ino,
-            after.st_size,
-            after.st_mtime_ns,
-            after.st_ctime_ns,
-        )
-        != before_identity
-        or (
-            path_after.st_dev,
-            path_after.st_ino,
-            path_after.st_size,
-            path_after.st_mtime_ns,
-            path_after.st_ctime_ns,
-        )
-        != before_identity
-    ):
-        raise ActivationError("protected broker profile changed while it was read")
-    try:
-        document = json.loads(payload)
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise ActivationError("protected broker profile is not strict JSON") from error
-    if not isinstance(document, dict):
-        raise ActivationError("protected broker profile must be an object")
-    return document, payload, before
-
-
-def _validate_final_hard_gate_profile(
-    profile: Path,
-    *,
-    expected_uid: int,
-    canonical_project: str,
-    canonical_repository_id: str,
-    owner_user: str,
-    collaborator_user: str,
-) -> dict[str, object]:
-    target = _final_hard_gate_target(
-        canonical_project=canonical_project,
-        canonical_repository_id=canonical_repository_id,
-        owner_user=owner_user,
-        collaborator_user=collaborator_user,
-    )
-    document, payload, metadata = _read_final_hard_gate_profile(
-        profile, expected_uid=expected_uid
-    )
-    clients = document.get("clients")
-    if not isinstance(clients, Mapping) or not clients:
-        raise ActivationError("protected broker profile has no clients")
-    parsed_by_uid: dict[int, object] = {}
-    try:
-        client_uids = sorted(int(value) for value in clients)
-    except (TypeError, ValueError) as error:
-        raise ActivationError("protected broker profile client UID is invalid") from error
-    if {str(value) for value in client_uids} != set(clients):
-        raise ActivationError("protected broker profile client UIDs are not canonical")
-    try:
-        for client_uid in client_uids:
-            parsed_by_uid[client_uid] = cutover.profile_from_document(
-                document, effective_uid=client_uid
-            )
-    except cutover.BrokerProfileError as error:
-        raise ActivationError(
-            "protected broker profile failed strict all-client parsing"
-        ) from error
-    owner = target["owner"]
-    collaborator = target["collaborator"]
-    target_profiles = []
-    for account in (owner, collaborator):
-        parsed = parsed_by_uid.get(account.pw_uid)
-        if parsed is None:
-            raise ActivationError(
-                f"protected broker profile omits required client {account.pw_name}"
-            )
-        try:
-            repository = parsed.repository(canonical_project)
-        except cutover.BrokerProfileError as error:
-            raise ActivationError(
-                "protected broker profile omits the hard-gate project for "
-                f"{account.pw_name}"
-            ) from error
-        if (
-            repository.repo_id != canonical_repository_id
-            or repository.owner_uid != owner.pw_uid
-            or repository.canonical_root != canonical_project
-            or repository.enabled is not True
-        ):
-            raise ActivationError(
-                "protected broker profile has a contradictory hard-gate grant for "
-                f"{account.pw_name}"
-            )
-        target_profiles.append((parsed, repository))
-    owner_profile, owner_repository = target_profiles[0]
-    collaborator_profile, collaborator_repository = target_profiles[1]
-    if (
-        owner_repository.generation != collaborator_repository.generation
-        or owner_profile.service != collaborator_profile.service
-        or owner_profile.service.socket_path
-        != Path(cutover.AUTHORITY_SOCKET_PATH)
-        or owner_profile.service.service_uid != expected_uid
-        or owner_profile.service.socket_gid != metadata.st_gid
-        or owner_profile.service.socket_mode != 0o666
-    ):
-        raise ActivationError(
-            "protected broker profile authority or hard-gate generation is contradictory"
-        )
-    return {
-        "profile_sha256": _sha256_bytes(payload),
-        "profile_gid": metadata.st_gid,
-        "authority_generation": owner_profile.service.database_generation,
-        "repository_generation": owner_repository.generation,
-        "owner_user": owner.pw_name,
-        "owner_uid": owner.pw_uid,
-        "collaborator_user": collaborator.pw_name,
-        "collaborator_uid": collaborator.pw_uid,
-    }
-
-
-def _validate_final_hard_gate_skill_links(
-    *, owner_user: str, collaborator_user: str
-) -> list[dict[str, object]]:
-    users = (owner_user, collaborator_user)
-    links: list[dict[str, object]] = []
-    for user in users:
-        try:
-            account = pwd.getpwnam(user)
-        except KeyError as error:
-            raise ActivationError(
-                f"installed skill account is unavailable: {user}"
-            ) from error
-        home = Path(account.pw_dir)
-        if not home.is_absolute():
-            raise ActivationError(f"installed skill home is invalid for {user}")
-        for relative_root in FINAL_HARD_GATE_SKILL_ROOTS:
-            install_root = home / relative_root
-            for skill in FINAL_HARD_GATE_SKILLS:
-                source = CANONICAL_SKILL_SOURCE_ROOT / skill
-                link = install_root / skill
-                source_info = source.lstat()
-                link_info = link.lstat()
-                if (
-                    stat.S_ISLNK(source_info.st_mode)
-                    or not stat.S_ISDIR(source_info.st_mode)
-                    or not stat.S_ISLNK(link_info.st_mode)
-                    or os.readlink(link) != str(source)
-                    or link.resolve(strict=True) != source.resolve(strict=True)
-                ):
-                    raise ActivationError(
-                        f"installed canonical skill link is invalid: {link}"
-                    )
-                links.append(
-                    {
-                        "user": user,
-                        "uid": account.pw_uid,
-                        "link": str(link),
-                        "source": str(source),
-                    }
-                )
-    if len(links) != (
-        len(users)
-        * len(FINAL_HARD_GATE_SKILL_ROOTS)
-        * len(FINAL_HARD_GATE_SKILLS)
-    ):
-        raise ActivationError("installed canonical skill link set is incomplete")
-    return links
-
-
-def _final_hard_gate_units(
-    *,
-    release: Path,
-    runner: CommandRunner,
-    expected_uid: int = 0,
-    expected_gid: int = 0,
-) -> dict[str, dict[str, str]]:
-    units = sorted(set(SOCKET_UNITS) | set(cutover._candidate_units(release.name)))
-    evidence: dict[str, dict[str, str]] = {}
-    for unit in units:
-        output = runner.text(
-            [
-                "/usr/bin/systemctl",
-                "show",
-                unit,
-                "--property=LoadState",
-                "--property=ActiveState",
-                "--property=UnitFileState",
-                "--property=FragmentPath",
-            ]
-        )
-        properties: dict[str, str] = {}
-        for line in output.splitlines():
-            if "=" in line:
-                key, value = line.split("=", 1)
-                properties[key] = value
-        allowed_unit_file_states = (
-            {"static"}
-            if unit.startswith("devcoordinator-console@")
-            else {"enabled", "enabled-runtime"}
-        )
-        if (
-            set(properties)
-            != {"LoadState", "ActiveState", "UnitFileState", "FragmentPath"}
-            or properties["LoadState"] != "loaded"
-            or properties["ActiveState"] != "active"
-            or properties["UnitFileState"] not in allowed_unit_file_states
-        ):
-            raise ActivationError(f"final control-plane unit is not ready: {unit}")
-        fragment = Path(properties["FragmentPath"])
-        expected_names = {unit}
-        if unit.startswith("devcoordinator-console@"):
-            expected_names.add("devcoordinator-console@.service")
-        info = fragment.lstat()
-        if (
-            fragment.parent != SYSTEMD_UNIT_ROOT
-            or fragment.name not in expected_names
-            or stat.S_ISLNK(info.st_mode)
-            or not stat.S_ISREG(info.st_mode)
-            or info.st_uid != expected_uid
-            or info.st_gid != expected_gid
-            or stat.S_IMODE(info.st_mode) != 0o644
-        ):
-            raise ActivationError(f"final control-plane unit fragment is unsafe: {unit}")
-        if unit.endswith(".service"):
-            unit_text = fragment.read_text(encoding="utf-8")
-            if str(release) not in unit_text and (
-                not unit.startswith("devcoordinator-console@")
-                or "/opt/devcoordinator/releases/%i/" not in unit_text
-            ):
-                raise ActivationError(
-                    f"final control-plane unit is not pinned to the release: {unit}"
-                )
-        evidence[unit] = dict(properties)
-    if _systemd_unit_state(runner, FINAL_HARD_GATE_LEGACY_UNIT) != (False, False):
-        raise ActivationError("legacy schema-12 broker is still active or enabled")
-    return evidence
-
-
-def verify_first_adoption_installation_hard_gate(
-    value: object,
-    *,
-    operation_id: str,
-    release: Path,
-    canonical_project: str,
-    canonical_repository_id: str,
-    owner_user: str,
-    collaborator_user: str,
-) -> dict[str, object]:
-    target = _final_hard_gate_target(
-        canonical_project=canonical_project,
-        canonical_repository_id=canonical_repository_id,
-        owner_user=owner_user,
-        collaborator_user=collaborator_user,
-    )
-    document = cutover.verify_seal(
-        value,
-        kind=FIRST_ADOPTION_INSTALLATION_HARD_GATE_KIND,
-        fields=_FIRST_ADOPTION_HARD_GATE_FIELDS,
-    )
-    try:
-        canonical_operation = str(uuid.UUID(operation_id))
-    except (ValueError, TypeError, AttributeError) as error:
-        raise ActivationError("final hard-gate operation ID is invalid") from error
-    authority = document.get("authority")
-    links = document.get("installed_skill_links")
-    units = document.get("units")
-    owner = target["owner"]
-    collaborator = target["collaborator"]
-    users = (owner_user, collaborator_user)
-    accounts = {owner_user: owner, collaborator_user: collaborator}
-    expected_links = {
-        (
-            user,
-            accounts[user].pw_uid,
-            str(Path(accounts[user].pw_dir) / relative / skill),
-            str(CANONICAL_SKILL_SOURCE_ROOT / skill),
-        )
-        for user in users
-        for relative in FINAL_HARD_GATE_SKILL_ROOTS
-        for skill in FINAL_HARD_GATE_SKILLS
-    }
-    recorded_links = (
-        {
-            (
-                item.get("user"),
-                item.get("uid"),
-                item.get("link"),
-                item.get("source"),
-            )
-            for item in links
-            if isinstance(item, Mapping)
-            and set(item) == {"user", "uid", "link", "source"}
-        }
-        if isinstance(links, list)
-        else set()
-    )
-    unit_fields_valid = isinstance(units, Mapping) and all(
-        isinstance(properties, Mapping)
-        and set(properties)
-        == {"LoadState", "ActiveState", "UnitFileState", "FragmentPath"}
-        and properties.get("LoadState") == "loaded"
-        and properties.get("ActiveState") == "active"
-        and properties.get("UnitFileState")
-        in (
-            {"static"}
-            if str(unit).startswith("devcoordinator-console@")
-            else {"enabled", "enabled-runtime"}
-        )
-        and isinstance(properties.get("FragmentPath"), str)
-        and properties.get("FragmentPath")
-        for unit, properties in units.items()
-    )
-    if (
-        document["operation_id"] != canonical_operation
-        or document["release"] != str(release)
-        or document["release_digest"] != release.name
-        or document["profile"] != str(FINAL_HARD_GATE_PROFILE)
-        or document["canonical_project"] != canonical_project
-        or document["repository_id"] != canonical_repository_id
-        or document["owner_user"] != owner_user
-        or document["owner_uid"] != owner.pw_uid
-        or document["collaborator_user"] != collaborator_user
-        or document["collaborator_uid"] != collaborator.pw_uid
-        or owner.pw_uid <= 0
-        or collaborator.pw_uid <= 0
-        or owner.pw_uid == collaborator.pw_uid
-        or type(document["repository_generation"]) is not int
-        or int(document["repository_generation"]) < 0
-        or not isinstance(authority, Mapping)
-        or set(authority)
-        != {
-            "scope",
-            "transport",
-            "socket",
-            "service_uid",
-            "database_generation",
-        }
-        or authority.get("scope") != "server-wide"
-        or authority.get("transport") != "authenticated-unix-socket"
-        or authority.get("socket") != cutover.AUTHORITY_SOCKET_PATH
-        or authority.get("service_uid") != 0
-        or authority.get("database_generation")
-        != document["authority_generation"]
-        or not isinstance(links, list)
-        or len(links) != len(expected_links)
-        or recorded_links != expected_links
-        or not isinstance(units, Mapping)
-        or set(units)
-        != set(SOCKET_UNITS) | set(cutover._candidate_units(release.name))
-        or not unit_fields_valid
-        or document["legacy_broker_retired"] is not True
-        or document["inventory_client"]
-        != str(
-            release
-            / "skills/codex-dev-coordinator/scripts/dev_coordinator.py"
-        )
-        or not isinstance(document["authority_generation"], str)
-        or not document["authority_generation"]
-        or not isinstance(document["verified_at"], str)
-        or not document["verified_at"].endswith("Z")
-        or any(
-            re.fullmatch(r"[0-9a-f]{64}", str(document[field])) is None
-            for field in (
-                "binding_attestation_sha256",
-                "first_adoption_attestation_sha256",
-                "profile_sha256",
-                "inventory_sha256",
-                "inventory_client_sha256",
-            )
-        )
-    ):
-        raise ActivationError("first-adoption installation hard gate is invalid")
-    return document
-
-
-def build_first_adoption_installation_hard_gate(
-    *,
-    operation_id: str,
-    binding_attestation: Path,
-    first_adoption_attestation: Path,
-    release: Path,
-    canonical_project: str,
-    canonical_repository_id: str,
-    owner_user: str,
-    collaborator_user: str,
-    profile: Path = FINAL_HARD_GATE_PROFILE,
-    expected_uid: int = 0,
-    runner: CommandRunner | None = None,
-    inventory_fetcher: Callable[..., Mapping[str, object]] | None = None,
-    skill_link_validator: Callable[[], list[dict[str, object]]] | None = None,
-    unit_validator: Callable[..., dict[str, dict[str, str]]] | None = None,
-    verified_at: str | None = None,
-) -> dict[str, object]:
-    """Verify the complete installed cutover before releasing global ownership."""
-
-    if os.geteuid() != expected_uid or expected_uid != 0:
-        raise ActivationError("first-adoption installation hard gate must run as root")
-    _final_hard_gate_target(
-        canonical_project=canonical_project,
-        canonical_repository_id=canonical_repository_id,
-        owner_user=owner_user,
-        collaborator_user=collaborator_user,
-    )
-    release = _absolute(release, "final immutable release")
-    client, client_sha256 = cutover._immutable_inventory_client(release)
-    binding = _completed_binding_attestation(
-        binding_attestation,
-        operation_id=operation_id,
-        release_digest=release.name,
-        expected_uid=expected_uid,
-    )
-    adoption = _completed_first_adoption_attestation(
-        first_adoption_attestation,
-        release=release,
-        expected_uid=expected_uid,
-    )
-    profile_result = _validate_final_hard_gate_profile(
-        profile,
-        expected_uid=expected_uid,
-        canonical_project=canonical_project,
-        canonical_repository_id=canonical_repository_id,
-        owner_user=owner_user,
-        collaborator_user=collaborator_user,
-    )
-    links = (
-        skill_link_validator()
-        if skill_link_validator is not None
-        else _validate_final_hard_gate_skill_links(
-            owner_user=owner_user,
-            collaborator_user=collaborator_user,
-        )
-    )
-    command = runner or CommandRunner()
-    units = (
-        unit_validator(release=release, runner=command)
-        if unit_validator is not None
-        else _final_hard_gate_units(
-            release=release, runner=command, expected_uid=expected_uid
-        )
-    )
-    fetch = inventory_fetcher or cutover._inventory_as_repository_owner
-    inventory = fetch(
-        release=release,
-        project=canonical_project,
-        owner_uid=int(profile_result["owner_uid"]),
-    )
-    if not isinstance(inventory, Mapping):
-        raise ActivationError("final hard-gate inventory proof is invalid")
-    try:
-        cutover._validate_owner_inventory_document(
-            inventory,
-            project=canonical_project,
-            repository_id=canonical_repository_id,
-            repository_generation=int(profile_result["repository_generation"]),
-            authority_generation=str(profile_result["authority_generation"]),
-            authority_uid=expected_uid,
-        )
-    except cutover.CutoverError as error:
-        raise ActivationError(
-            "hard-gate inventory does not prove the exact final authority"
-        ) from error
-    authority = dict(inventory["authority"])
-    document = cutover.seal(
-        FIRST_ADOPTION_INSTALLATION_HARD_GATE_KIND,
-        {
-            "operation_id": str(uuid.UUID(operation_id)),
-            "binding_attestation_sha256": binding["document_sha256"],
-            "first_adoption_attestation_sha256": adoption["document_sha256"],
-            "release_digest": release.name,
-            "release": str(release),
-            "profile": str(profile),
-            "profile_sha256": profile_result["profile_sha256"],
-            "authority_generation": profile_result["authority_generation"],
-            "canonical_project": canonical_project,
-            "repository_id": canonical_repository_id,
-            "repository_generation": profile_result["repository_generation"],
-            "owner_user": profile_result["owner_user"],
-            "owner_uid": profile_result["owner_uid"],
-            "collaborator_user": profile_result["collaborator_user"],
-            "collaborator_uid": profile_result["collaborator_uid"],
-            "authority": authority,
-            "inventory_sha256": _sha256_bytes(_canonical(inventory)),
-            "inventory_client": str(client),
-            "inventory_client_sha256": client_sha256,
-            "installed_skill_links": links,
-            "units": units,
-            "legacy_broker_retired": True,
-            "verified_at": _now() if verified_at is None else verified_at,
-        },
-    )
-    return verify_first_adoption_installation_hard_gate(
-        document,
-        operation_id=operation_id,
-        release=release,
-        canonical_project=canonical_project,
-        canonical_repository_id=canonical_repository_id,
-        owner_user=owner_user,
-        collaborator_user=collaborator_user,
-    )
-
-
 def _credential_paths(arguments: argparse.Namespace) -> dict[str, Path]:
     return {
         name: Path(
@@ -14560,13 +12121,6 @@ def _credential_paths(arguments: argparse.Namespace) -> dict[str, Path]:
 def _add_credentials(parser: argparse.ArgumentParser) -> None:
     for name, path in DEFAULT_CREDENTIALS.items():
         parser.add_argument(f"--{name}", default=str(path))
-
-
-def _add_final_hard_gate_target(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--canonical-project", required=True)
-    parser.add_argument("--canonical-repository-id", required=True)
-    parser.add_argument("--owner-user", required=True)
-    parser.add_argument("--collaborator-user", required=True)
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -14629,26 +12183,11 @@ def _parser() -> argparse.ArgumentParser:
     transaction.add_argument("--rollback-evidence", required=True)
     transaction.add_argument("--binding-attestation", required=True)
     transaction.add_argument("--operation-id", required=True)
-    transaction.add_argument("--hard-gate-attestation", required=True)
     transaction.add_argument("--expected-uid", type=int, default=0)
-    _add_final_hard_gate_target(transaction)
-
-    final_gate = actions.add_parser("finalize-first-adoption-installation")
-    final_gate.add_argument("--binding-attestation", required=True)
-    final_gate.add_argument("--operation-id", required=True)
-    final_gate.add_argument("--first-adoption-attestation", required=True)
-    final_gate.add_argument("--release", required=True)
-    final_gate.add_argument(
-        "--profile", default=str(FINAL_HARD_GATE_PROFILE)
-    )
-    final_gate.add_argument("--hard-gate-attestation", required=True)
-    final_gate.add_argument("--expected-uid", type=int, default=0)
-    _add_final_hard_gate_target(final_gate)
 
     prepare = actions.add_parser("prepare-candidate")
     prepare.add_argument("--state", required=True)
     prepare.add_argument("--candidate-slot-source", required=True)
-    prepare.add_argument("--test-capability-policy-evidence", required=True)
     prepare.add_argument("--rollback-directory", required=True)
     prepare.add_argument("--legacy-console-env", required=True)
     prepare.add_argument("--legacy-console-uid", type=int, required=True)
@@ -14672,7 +12211,6 @@ def _parser() -> argparse.ArgumentParser:
     prepare_first.add_argument("--project-isolation-audit", required=True)
     prepare_first.add_argument("--project-isolation-ledger", required=True)
     prepare_first.add_argument("--legacy-authority-database", required=True)
-    prepare_first.add_argument("--repository-owner-map", required=True)
     prepare_first.add_argument("--graph-evidence", required=True)
     prepare_first.add_argument("--graph-journal", required=True)
     prepare_first.add_argument("--credential-evidence", required=True)
@@ -14682,9 +12220,8 @@ def _parser() -> argparse.ArgumentParser:
     )
     prepare_first.add_argument("--binding-attestation", required=True)
     prepare_first.add_argument("--operation-id", required=True)
-    prepare_first.add_argument("--hard-gate-attestation", required=True)
+    prepare_first.add_argument("--first-adoption-attestation", required=True)
     prepare_first.add_argument("--authority-uid", type=int, default=0)
-    _add_final_hard_gate_target(prepare_first)
     _add_credentials(prepare_first)
 
     activate_parser = actions.add_parser("activate")
@@ -14784,12 +12321,6 @@ def main(argv: list[str] | None = None) -> int:
                 "document_sha256": document["document_sha256"],
             }
         elif arguments.action == "first-adoption":
-            _final_hard_gate_target(
-                canonical_project=arguments.canonical_project,
-                canonical_repository_id=arguments.canonical_repository_id,
-                owner_user=arguments.owner_user,
-                collaborator_user=arguments.collaborator_user,
-            )
             request = _first_adoption_request(cutover.read_private_json(
                 Path(arguments.request), uid=arguments.expected_uid
             ))
@@ -14798,7 +12329,7 @@ def main(argv: list[str] | None = None) -> int:
             )
             release_digest = str(state["release_digest"])
             release = Path(str(state["release"]))
-            hard_gate_path = Path(arguments.hard_gate_attestation)
+            completion_path = Path(arguments.attestation)
             _completed_binding_attestation(
                 Path(arguments.binding_attestation),
                 operation_id=arguments.operation_id,
@@ -14809,30 +12340,23 @@ def main(argv: list[str] | None = None) -> int:
                 owner_kind=FIRST_ADOPTION_INSTALLER_OWNER_KIND,
                 operation_id=arguments.operation_id,
                 transaction=Path(arguments.binding_attestation),
-                terminal=hard_gate_path,
+                terminal=completion_path,
                 action="recover",
                 expected_uid=arguments.expected_uid,
                 expected_gid=0,
             )
-            if hard_gate_path.exists() or hard_gate_path.is_symlink():
-                cutover._immutable_inventory_client(release)
-                final_gate = verify_first_adoption_installation_hard_gate(
-                    cutover.read_private_json(
-                        hard_gate_path, uid=arguments.expected_uid
-                    ),
-                    operation_id=arguments.operation_id,
+            if completion_path.exists() or completion_path.is_symlink():
+                document = _completed_first_adoption_attestation(
+                    completion_path,
                     release=release,
-                    canonical_project=arguments.canonical_project,
-                    canonical_repository_id=arguments.canonical_repository_id,
-                    owner_user=arguments.owner_user,
-                    collaborator_user=arguments.collaborator_user,
+                    expected_uid=arguments.expected_uid,
                 )
                 result = {
                     "ok": True,
-                    "phase": "installation-finalized",
+                    "phase": "complete",
                     "replayed": True,
-                    "attestation": arguments.hard_gate_attestation,
-                    "document_sha256": final_gate["document_sha256"],
+                    "attestation": arguments.attestation,
+                    "document_sha256": document["document_sha256"],
                 }
                 installer_fence.mark_complete()
             else:
@@ -14850,76 +12374,8 @@ def main(argv: list[str] | None = None) -> int:
                     "attestation": arguments.attestation,
                     "document_sha256": document["document_sha256"],
                 }
-        elif arguments.action == "finalize-first-adoption-installation":
-            _final_hard_gate_target(
-                canonical_project=arguments.canonical_project,
-                canonical_repository_id=arguments.canonical_repository_id,
-                owner_user=arguments.owner_user,
-                collaborator_user=arguments.collaborator_user,
-            )
-            release = _absolute(
-                Path(arguments.release), "final immutable release"
-            )
-            cutover._immutable_inventory_client(release)
-            hard_gate_path = Path(arguments.hard_gate_attestation)
-            installer_fence = acquire_transaction_fence(
-                owner_kind=FIRST_ADOPTION_INSTALLER_OWNER_KIND,
-                operation_id=arguments.operation_id,
-                transaction=Path(arguments.binding_attestation),
-                terminal=hard_gate_path,
-                action="finalize",
-                expected_uid=arguments.expected_uid,
-                expected_gid=0,
-            )
-            if hard_gate_path.exists() or hard_gate_path.is_symlink():
-                final_gate = verify_first_adoption_installation_hard_gate(
-                    cutover.read_private_json(
-                        hard_gate_path, uid=arguments.expected_uid
-                    ),
-                    operation_id=arguments.operation_id,
-                    release=release,
-                    canonical_project=arguments.canonical_project,
-                    canonical_repository_id=arguments.canonical_repository_id,
-                    owner_user=arguments.owner_user,
-                    collaborator_user=arguments.collaborator_user,
-                )
-                replayed = True
-            else:
-                final_gate = build_first_adoption_installation_hard_gate(
-                    operation_id=arguments.operation_id,
-                    binding_attestation=Path(arguments.binding_attestation),
-                    first_adoption_attestation=Path(
-                        arguments.first_adoption_attestation
-                    ),
-                    release=release,
-                    canonical_project=arguments.canonical_project,
-                    canonical_repository_id=arguments.canonical_repository_id,
-                    owner_user=arguments.owner_user,
-                    collaborator_user=arguments.collaborator_user,
-                    profile=Path(arguments.profile),
-                    expected_uid=arguments.expected_uid,
-                )
-                cutover._publish_evidence(
-                    hard_gate_path, final_gate, uid=arguments.expected_uid
-                )
-                replayed = False
-            installer_fence.mark_complete()
-            result = {
-                "ok": True,
-                "phase": "installation-finalized",
-                "replayed": replayed,
-                "attestation": arguments.hard_gate_attestation,
-                "document_sha256": final_gate["document_sha256"],
-                "inventory": {
-                    "scope": final_gate["authority"]["scope"],
-                    "transport": final_gate["authority"]["transport"],
-                    "canonical_project": final_gate["canonical_project"],
-                    "repository_id": final_gate["repository_id"],
-                    "repository_generation": final_gate[
-                        "repository_generation"
-                    ],
-                },
-            }
+                if document["phase"] == "complete":
+                    installer_fence.mark_complete()
         elif arguments.action == "first-adoption-preflight":
             document = first_adoption_handoff_preflight(
                 rendered_units=Path(arguments.rendered_units),
@@ -14941,22 +12397,15 @@ def main(argv: list[str] | None = None) -> int:
                 "document_sha256": document["document_sha256"],
             }
         elif arguments.action in {"prepare-candidate", "prepare-first-adoption"}:
-            if arguments.action == "prepare-first-adoption":
-                _final_hard_gate_target(
-                    canonical_project=arguments.canonical_project,
-                    canonical_repository_id=arguments.canonical_repository_id,
-                    owner_user=arguments.owner_user,
-                    collaborator_user=arguments.collaborator_user,
-                )
             state = cutover.load_state(
                 Path(arguments.state), authority_uid=arguments.authority_uid
             )
             expected_port_reservations = None
             if arguments.action == "prepare-first-adoption":
-                hard_gate_path = Path(arguments.hard_gate_attestation)
-                if hard_gate_path.exists() or hard_gate_path.is_symlink():
+                completion_path = Path(arguments.first_adoption_attestation)
+                if completion_path.exists() or completion_path.is_symlink():
                     raise ActivationError(
-                        "first-adoption installation is already finalized"
+                        "first-adoption transaction is already complete"
                     )
                 _completed_binding_attestation(
                     Path(arguments.binding_attestation),
@@ -14968,7 +12417,7 @@ def main(argv: list[str] | None = None) -> int:
                     owner_kind=FIRST_ADOPTION_INSTALLER_OWNER_KIND,
                     operation_id=arguments.operation_id,
                     transaction=Path(arguments.binding_attestation),
-                    terminal=hard_gate_path,
+                    terminal=completion_path,
                     action="recover",
                     expected_uid=arguments.authority_uid,
                     expected_gid=0,
@@ -15009,18 +12458,9 @@ def main(argv: list[str] | None = None) -> int:
                     else None
                     for role, item in bundle_rows.items()
                 }
-            policy = (
-                None
-                if arguments.action == "prepare-first-adoption"
-                else cutover.read_private_json(
-                    Path(arguments.test_capability_policy_evidence),
-                    uid=arguments.authority_uid,
-                )
-            )
             candidate, credential = prepare_candidate(
                 state=state,
                 candidate_slot_source=Path(arguments.candidate_slot_source),
-                test_capability_policy=policy,
                 legacy_console_env=Path(arguments.legacy_console_env),
                 background_project_root=Path(arguments.background_project_root),
                 background_config_transaction=Path(
@@ -15038,11 +12478,6 @@ def main(argv: list[str] | None = None) -> int:
                 ),
                 first_adoption_legacy_authority_database=(
                     Path(arguments.legacy_authority_database)
-                    if arguments.action == "prepare-first-adoption"
-                    else None
-                ),
-                repository_owner_map=(
-                    Path(arguments.repository_owner_map)
                     if arguments.action == "prepare-first-adoption"
                     else None
                 ),

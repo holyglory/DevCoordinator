@@ -431,7 +431,15 @@ class UniversalTestRunnerTests(unittest.TestCase):
         artifact = self.root / "trace.log"
         artifact.write_text(f"trace {secret}\n", encoding="utf-8")
         descriptor = replace(
-            self.descriptor(("/usr/bin/python3", "-c", "pass")),
+            self.descriptor(
+                (
+                    "/usr/bin/python3",
+                    "-c",
+                    "import os,pathlib; value=os.environ['CREDENTIALS_DIRECTORY']; "
+                    "assert pathlib.Path(value).is_absolute(); "
+                    "assert value==os.environ['DEVCOORDINATOR_FIXTURE_DIRECTORY']",
+                )
+            ),
             artifacts=(
                 {
                     "name": "trace",
@@ -819,6 +827,7 @@ class UniversalTestRunnerTests(unittest.TestCase):
 
             expected = {{
                 "HOME": {str(self.output / "home")!r},
+                "DEVCOORDINATOR_TEST_TMP_ROOT": "/tmp",
                 "DOTNET_CLI_HOME": {str(self.output / "dotnet-cli-home")!r},
                 "DOTNET_CLI_TELEMETRY_OPTOUT": "1",
                 "DOTNET_NOLOGO": "1",

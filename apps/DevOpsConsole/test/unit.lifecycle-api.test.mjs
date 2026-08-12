@@ -178,7 +178,6 @@ test('repository compatibility input and archive rows normalize to canonical pro
     target_id: 'repo-fixture-1',
     action: 'archive',
     reason: 'Canonical compatibility regression',
-    agent: 'devops-console:owner@example.test',
   });
 });
 
@@ -223,8 +222,6 @@ test('purge and restore are bound to advertised archived capabilities and exact 
     target_kind: 'project',
     target_id: 'repo-fixture-1',
     reason: 'Bring it back',
-    agent: 'devops-console:owner@example.test',
-    explicit: true,
   });
 
   archives[0].restorable = false;

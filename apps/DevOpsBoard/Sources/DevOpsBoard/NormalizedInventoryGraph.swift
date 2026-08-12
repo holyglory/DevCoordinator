@@ -1,9 +1,8 @@
 import Foundation
 
-/// Authoritative inventory consumed by DevOps Board. The coordinator may
-/// still emit a v1 compatibility object for external callers, but this model
-/// deliberately has no keys for that projection (or its duplicated top-level
-/// fields), so neither project identity nor action routing can fall back to it.
+/// Current inventory consumed by DevOps Board. Compatibility rows may remain
+/// available to external callers, but repository association and command
+/// routing use only the normalized graph.
 struct NormalizedInventoryGraph: Decodable, Sendable {
     let schemaVersion: Int
     let store: NormalizedStoreMetadata
@@ -11,7 +10,6 @@ struct NormalizedInventoryGraph: Decodable, Sendable {
     let repositoryTrees: [NormalizedRepositoryTree]?
     let coordinatorSources: [NormalizedCoordinatorSource]
     let dockerEngines: [NormalizedDockerEngine]
-    let memberships: [NormalizedMembership]
     let resources: NormalizedResources
     let leases: [NormalizedLease]
     let portAssignments: [NormalizedPortAssignment]
@@ -22,12 +20,11 @@ struct NormalizedInventoryGraph: Decodable, Sendable {
     let unassignedResources: [NormalizedUnassignedResource]
     let lifecycleViolations: [NormalizedUnassignedResource]
     let observations: NormalizedObservations
-    let controlBindings: [NormalizedControlBinding]
     let testStatistics: [TestStatistics]
 
     enum CodingKeys: String, CodingKey {
         case schemaVersion = "schema_version"
-        case store, repositories, memberships, resources, leases, events, observations
+        case store, repositories, resources, leases, events, observations
         case repositoryTrees = "repository_trees"
         case coordinatorSources = "coordinator_sources"
         case dockerEngines = "docker_engines"
@@ -37,21 +34,20 @@ struct NormalizedInventoryGraph: Decodable, Sendable {
         case databaseRestoreEvents = "database_restore_events"
         case unassignedResources = "unassigned_resources"
         case lifecycleViolations = "lifecycle_violations"
-        case controlBindings = "control_bindings"
         case testStatistics = "test_statistics"
     }
 
     init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
         schemaVersion = try values.decode(Int.self, forKey: .schemaVersion)
-        guard schemaVersion == 2 else {
+        guard schemaVersion == 3 else {
             throw DecodingError.dataCorruptedError(
                 forKey: .schemaVersion,
                 in: values,
-                debugDescription: "DevOps Board requires normalized inventory schema version 2"
+                debugDescription: "DevOps Board requires normalized inventory schema version 3"
             )
         }
-        // These six collections are the minimum normalized identity graph.
+        // These collections are the minimum normalized identity graph.
         // Requiring them makes a v1-only payload fail closed even if it labels
         // itself schema 2.
         store = try values.decode(NormalizedStoreMetadata.self, forKey: .store)
@@ -62,17 +58,12 @@ struct NormalizedInventoryGraph: Decodable, Sendable {
         repositoryTrees = values.contains(.repositoryTrees)
             ? try values.decode([NormalizedRepositoryTree].self, forKey: .repositoryTrees)
             : nil
-        memberships = try values.decode([NormalizedMembership].self, forKey: .memberships)
         resources = try values.decode(NormalizedResources.self, forKey: .resources)
         unassignedResources = try values.decode(
             [NormalizedUnassignedResource].self,
             forKey: .unassignedResources
         )
         observations = try values.decode(NormalizedObservations.self, forKey: .observations)
-        controlBindings = try values.decode(
-            [NormalizedControlBinding].self,
-            forKey: .controlBindings
-        )
         coordinatorSources = try values.decodeIfPresent(
             [NormalizedCoordinatorSource].self,
             forKey: .coordinatorSources
@@ -187,50 +178,6 @@ struct NormalizedDockerEngine: Decodable, Sendable {
     }
 }
 
-struct NormalizedMembership: Decodable, Sendable {
-    let membershipID: String
-    let repoID: String
-    let resourceKind: String
-    let hostResourceID: String
-    let immutableFingerprint: String
-    let controlBindingID: String?
-
-    enum CodingKeys: String, CodingKey {
-        case membershipID = "membership_id"
-        case repoID = "repo_id"
-        case resourceKind = "resource_kind"
-        case hostResourceID = "host_resource_id"
-        case immutableFingerprint = "immutable_fingerprint"
-        case controlBindingID = "control_binding_id"
-    }
-}
-
-struct NormalizedControlBinding: Decodable, Sendable {
-    let bindingID: String
-    let repoID: String?
-    let sourceResourceID: String?
-    let resourceKind: String
-    let resourceID: String
-    let sourceID: String
-    let capability: String
-    let provenance: String
-    let authorityState: String
-    let priority: Int
-    let generation: Int
-
-    enum CodingKeys: String, CodingKey {
-        case bindingID = "binding_id"
-        case repoID = "repo_id"
-        case sourceResourceID = "source_resource_id"
-        case resourceKind = "resource_kind"
-        case resourceID = "resource_id"
-        case sourceID = "source_id"
-        case capability, provenance
-        case authorityState = "authority_state"
-        case priority, generation
-    }
-}
-
 struct NormalizedResources: Decodable, Sendable {
     let servers: [NormalizedServerDefinition]
     let docker: [NormalizedDockerResource]
@@ -291,6 +238,7 @@ struct NormalizedServerDefinition: Decodable, Sendable {
 
 struct NormalizedDockerResource: Decodable, Sendable {
     let dockerResourceID: String
+    let repoID: String?
     let engineID: String
     let fullContainerID: String
     let currentName: String
@@ -300,6 +248,7 @@ struct NormalizedDockerResource: Decodable, Sendable {
 
     enum CodingKeys: String, CodingKey {
         case dockerResourceID = "docker_resource_id"
+        case repoID = "repo_id"
         case engineID = "engine_id"
         case fullContainerID = "full_container_id"
         case currentName = "current_name"
@@ -653,11 +602,9 @@ struct NormalizedUnassignedResource: Decodable, Sendable {
     let reasonCode: AttributionReasonCode
     let explanation: String
     let observedBy: [String]
-    let controller: String?
     let hostResourceID: String?
     let immutableFingerprint: String?
-    let controlBindingID: String?
-    let ownershipFingerprint: String?
+    let observationFingerprint: String?
     let canAttach: Bool
     let canRetire: Bool
     let lifecycleViolation: Bool
@@ -671,11 +618,9 @@ struct NormalizedUnassignedResource: Decodable, Sendable {
         case reasonCode = "reason_code"
         case explanation
         case observedBy = "observed_by"
-        case controller
         case hostResourceID = "host_resource_id"
         case immutableFingerprint = "immutable_fingerprint"
-        case controlBindingID = "control_binding_id"
-        case ownershipFingerprint = "ownership_fingerprint"
+        case observationFingerprint = "observation_fingerprint"
         case canAttach = "can_attach"
         case canRetire = "can_retire"
         case lifecycleViolation = "lifecycle_violation"
@@ -691,11 +636,9 @@ struct NormalizedUnassignedResource: Decodable, Sendable {
         reasonCode = try values.decodeIfPresent(AttributionReasonCode.self, forKey: .reasonCode) ?? .unknown
         explanation = try values.decodeIfPresent(String.self, forKey: .explanation) ?? reasonCode.title
         observedBy = try values.decodeIfPresent([String].self, forKey: .observedBy) ?? []
-        controller = try values.decodeIfPresent(String.self, forKey: .controller)
         hostResourceID = try values.decodeIfPresent(String.self, forKey: .hostResourceID)
         immutableFingerprint = try values.decodeIfPresent(String.self, forKey: .immutableFingerprint)
-        controlBindingID = try values.decodeIfPresent(String.self, forKey: .controlBindingID)
-        ownershipFingerprint = try values.decodeIfPresent(String.self, forKey: .ownershipFingerprint)
+        observationFingerprint = try values.decodeIfPresent(String.self, forKey: .observationFingerprint)
         canAttach = try values.decodeIfPresent(Bool.self, forKey: .canAttach) ?? false
         canRetire = try values.decodeIfPresent(Bool.self, forKey: .canRetire) ?? false
         lifecycleViolation = try values.decodeIfPresent(Bool.self, forKey: .lifecycleViolation) ?? false
@@ -707,11 +650,9 @@ struct NormalizedUnassignedResource: Decodable, Sendable {
             reasonCode: reasonCode,
             explanation: explanation,
             observedBy: observedBy,
-            controller: controller,
             hostResourceID: hostResourceID ?? resourceID,
             immutableFingerprint: immutableFingerprint,
-            controlBindingID: controlBindingID,
-            ownershipFingerprint: ownershipFingerprint,
+            observationFingerprint: observationFingerprint,
             canAttach: canAttach,
             canRetire: canRetire,
             lifecycleViolation: lifecycleViolation,
@@ -747,8 +688,13 @@ extension NormalizedInventoryGraph {
             Set(trees.flatMap(\.scopes).flatMap(\.databaseBindingIDs))
                 .union(reportedDatabaseIDs)
         }
-        let bindingsByID = Dictionary(uniqueKeysWithValues: controlBindings.map { ($0.bindingID, $0) })
-        let membershipsByRepository = Dictionary(grouping: memberships) { $0.repoID }
+        let repositoryIDByContainer = Dictionary(uniqueKeysWithValues:
+            (validatedRepositoryTrees ?? []).flatMap { tree in
+                tree.scopes.flatMap { scope in
+                    scope.containerResourceIDs.map { ($0, scope.repoID) }
+                }
+            }
+        )
         let serverObservations = Dictionary(uniqueKeysWithValues: observations.servers.map {
             ($0.serverDefinitionID, $0)
         })
@@ -784,27 +730,10 @@ extension NormalizedInventoryGraph {
             violations["\(item.resourceKind)|\(item.resourceID)"] = item
         }
 
-        func authoritative(_ membership: NormalizedMembership) -> Bool {
-            guard let bindingID = membership.controlBindingID,
-                  let binding = bindingsByID[bindingID]
-            else { return false }
-            return binding.repoID == membership.repoID
-                && binding.resourceKind == membership.resourceKind
-                && binding.resourceID == membership.hostResourceID
-                && binding.authorityState == "authoritative"
-                && coordinatorSources.contains { $0.sourceID == binding.sourceID }
-        }
-
         var serversByRepository: [String: [RepositoryManagedServer]] = [:]
         var serverPresentations: [ManagedServer] = []
         for definition in resources.servers {
             guard let repository = repositoriesByID[definition.repoID] else { continue }
-            let membership = memberships.first {
-                $0.repoID == definition.repoID
-                    && $0.resourceKind == "server"
-                    && $0.hostResourceID == definition.serverDefinitionID
-            }
-            let actionable = membership.map(authoritative) == true
             let observation = serverObservations[definition.serverDefinitionID]
             let violation = violations["server|\(definition.serverDefinitionID)"]
             let server = normalizedServerPresentation(
@@ -817,7 +746,6 @@ extension NormalizedInventoryGraph {
                     .first(where: { $0.status == "active" }),
                 repository: repository,
                 origin: origin,
-                actionable: actionable,
                 attribution: violation?.attribution
             )
             serverPresentations.append(server)
@@ -840,9 +768,9 @@ extension NormalizedInventoryGraph {
                     representative: server,
                     observations: [RepositoryServerObservation(sourceIdentity: sourceIdentity, server: server)],
                     conflict: nil,
-                    membershipConflicts: [],
-                    controlCandidates: actionable ? [origin] : [],
-                    actionOrigin: actionable ? origin : nil
+                    associationConflicts: [],
+                    routeCandidates: [origin],
+                    actionOrigin: origin
                 )
             )
         }
@@ -857,11 +785,8 @@ extension NormalizedInventoryGraph {
                !authoritativeContainerIDs.contains(resource.dockerResourceID) {
                 continue
             }
-            let membership = memberships.first {
-                $0.resourceKind == "container" && $0.hostResourceID == resource.dockerResourceID
-            }
-            let repository = membership.flatMap { repositoriesByID[$0.repoID] }
-            let actionable = membership.map(authoritative) == true
+            let repoID = resource.repoID ?? repositoryIDByContainer[resource.dockerResourceID]
+            let repository = repoID.flatMap { repositoriesByID[$0] }
             let violation = violations["container|\(resource.dockerResourceID)"]
             let container = normalizedDockerPresentation(
                 resource: resource,
@@ -870,13 +795,11 @@ extension NormalizedInventoryGraph {
                 telemetry: telemetryByResource["docker|\(resource.dockerResourceID)"] ?? [],
                 repository: repository,
                 origin: origin,
-                actionable: actionable,
-                metadataSource: membership?.controlBindingID
-                    .flatMap { bindingsByID[$0]?.provenance },
+                metadataSource: "normalized_store",
                 attribution: violation?.attribution
             )
             dockerPresentations[resource.dockerResourceID] = container
-            guard let membership, let repository else { continue }
+            guard let repoID, let repository else { continue }
             let identity = RepositoryIdentity(
                 repoID: repository.repoID,
                 canonicalRoot: repository.canonicalRoot,
@@ -886,7 +809,7 @@ extension NormalizedInventoryGraph {
                 rawValue: resource.dockerResourceID,
                 isImmutable: true
             )
-            dockerByRepository[membership.repoID, default: []].append(
+            dockerByRepository[repoID, default: []].append(
                 RepositoryDockerResource(
                     identity: physicalIdentity,
                     representative: container,
@@ -901,8 +824,8 @@ extension NormalizedInventoryGraph {
                         )
                     ],
                     repositoryCandidates: [identity],
-                    membershipError: actionable ? nil : container.ownershipError,
-                    controlCandidates: actionable ? [origin] : []
+                    associationError: nil,
+                    routeCandidates: [origin]
                 )
             )
         }
@@ -982,36 +905,6 @@ extension NormalizedInventoryGraph {
             )
             let servers = (serversByRepository[repository.repoID] ?? []).sorted { $0.id < $1.id }
             let docker = (dockerByRepository[repository.repoID] ?? []).sorted { $0.id < $1.id }
-            let repoMemberships = membershipsByRepository[repository.repoID] ?? []
-            let repositoryDockerResourceIDs = resources.docker.compactMap { resource -> String? in
-                let hasRepositoryControlBinding = controlBindings.contains {
-                    $0.repoID == repository.repoID
-                        && $0.resourceKind == "container"
-                        && $0.resourceID == resource.dockerResourceID
-                }
-                let hasRepositoryDatabaseBinding = resources.databases.contains {
-                    $0.repoID == repository.repoID
-                        && $0.dockerResourceID == resource.dockerResourceID
-                }
-                return hasRepositoryControlBinding || hasRepositoryDatabaseBinding
-                    ? resource.dockerResourceID
-                    : nil
-            }
-            let requiredMembershipKeys = Set(
-                resources.servers
-                    .filter { $0.repoID == repository.repoID }
-                    .map { "server|\($0.serverDefinitionID)" }
-                + repositoryDockerResourceIDs.map { "container|\($0)" }
-            )
-            let presentMembershipKeys = Set(
-                repoMemberships.map { "\($0.resourceKind)|\($0.hostResourceID)" }
-            )
-            // allSatisfy alone is vacuously true when a definition's
-            // membership is absent. Whole-project control requires both a
-            // complete definition-to-membership mapping and authoritative
-            // control for every membership in the repository.
-            let fullyControlled = requiredMembershipKeys.isSubset(of: presentMembershipKeys)
-                && repoMemberships.allSatisfy(authoritative)
             let usage = normalizedRepositoryUsage(
                 serverIDs: servers.map { $0.representative.coordinatorID ?? $0.representative.id },
                 docker: docker.map(\.representative),
@@ -1056,14 +949,17 @@ extension NormalizedInventoryGraph {
                     servers: servers,
                     docker: docker,
                     usage: usage,
-                    controlOrigin: fullyControlled ? origin : nil,
-                    serverMembershipConflicts: [],
-                    dockerMembershipConflicts: []
+                    routeOrigin: origin,
+                    serverAssociationConflicts: [],
+                    dockerAssociationConflicts: []
                 )
             )
         }
 
-        let assignedDockerIDs = Set(memberships.filter { $0.resourceKind == "container" }.map(\.hostResourceID))
+        let assignedDockerIDs = Set(resources.docker.compactMap { resource in
+            (resource.repoID ?? repositoryIDByContainer[resource.dockerResourceID]) == nil
+                ? nil : resource.dockerResourceID
+        })
         var unassignedServers: [RepositoryServerObservation] = []
         var unassignedDocker: [RepositoryDockerResource] = []
         var seenUnassigned = Set<String>()
@@ -1075,8 +971,8 @@ extension NormalizedInventoryGraph {
                 // attribution callout instead of duplicating it under
                 // Unassigned Resources.
                 if item.lifecycleViolation,
-                   memberships.contains(where: {
-                       $0.resourceKind == "server" && $0.hostResourceID == item.resourceID
+                   resources.servers.contains(where: {
+                       $0.serverDefinitionID == item.resourceID
                    }) {
                     continue
                 }
@@ -1096,7 +992,7 @@ extension NormalizedInventoryGraph {
                 container.project = nil
                 container.origin = origin
                 container.attribution = item.attribution
-                container.ownershipError = "Use the exact Attach or Retire action; repository ownership is not established."
+                container.associationError = "Use the exact Attach or Retire action; repository association is not established."
                 unassignedDocker.append(
                     RepositoryDockerResource(
                         identity: RepositoryDockerIdentity(rawValue: resource.dockerResourceID, isImmutable: true),
@@ -1112,13 +1008,13 @@ extension NormalizedInventoryGraph {
                             )
                         ],
                         repositoryCandidates: [],
-                        membershipError: nil,
-                        controlCandidates: item.canAttach || item.canRetire ? [origin] : []
+                        associationError: nil,
+                        routeCandidates: item.canAttach || item.canRetire ? [origin] : []
                     )
                 )
             }
         }
-        // A normalized resource without membership must never disappear merely
+        // A normalized resource without a repository association must never disappear merely
         // because an attribution diagnostic is temporarily absent.
         for resource in resources.docker
             where !assignedDockerIDs.contains(resource.dockerResourceID)
@@ -1126,15 +1022,15 @@ extension NormalizedInventoryGraph {
             guard var container = dockerPresentations[resource.dockerResourceID] else { continue }
             container.project = nil
             container.origin = nil
-            container.ownershipError = "Normalized inventory has no repository membership or exact attribution record."
+            container.associationError = "Normalized inventory has no repository association or exact attribution record."
             unassignedDocker.append(
                 RepositoryDockerResource(
                     identity: RepositoryDockerIdentity(rawValue: resource.dockerResourceID, isImmutable: true),
                     representative: container,
                     observations: [],
                     repositoryCandidates: [],
-                    membershipError: container.ownershipError,
-                    controlCandidates: []
+                    associationError: container.associationError,
+                    routeCandidates: []
                 )
             )
         }
@@ -1240,10 +1136,7 @@ extension NormalizedInventoryGraph {
         var classifiedContainerIDs = Set<String>()
         var classifiedDatabaseIDs = Set<String>()
         let serversByID = Dictionary(grouping: resources.servers, by: \.serverDefinitionID)
-        let containerMembershipsByID = Dictionary(
-            grouping: memberships.filter { $0.resourceKind == "container" },
-            by: \.hostResourceID
-        )
+        let containersByID = Dictionary(grouping: resources.docker, by: \.dockerResourceID)
         let databasesByID = Dictionary(grouping: resources.databases, by: \.databaseBindingID)
 
         let lifecycleServerIDs = Set(lifecycleViolations
@@ -1321,7 +1214,7 @@ extension NormalizedInventoryGraph {
                     }
                 }
                 for containerID in scope.containerResourceIDs {
-                    guard let matches = containerMembershipsByID[containerID],
+                    guard let matches = containersByID[containerID],
                           matches.count == 1,
                           matches[0].repoID == scope.repoID,
                           classifiedContainerIDs.insert(containerID).inserted
@@ -1357,7 +1250,7 @@ extension NormalizedInventoryGraph {
               observedDatabaseIDs.isSubset(of: classifiedDatabaseIDs.union(reportedDatabaseIDs))
         else {
             throw RuntimeError(
-                "Normalized inventory repository trees and explicit ownership problems do not cover every resource exactly once"
+                "Normalized inventory repository trees and explicit association problems do not cover every resource exactly once"
             )
         }
         return repositoryTrees
@@ -1372,7 +1265,6 @@ private func normalizedServerPresentation(
     lease: NormalizedLease?,
     repository: NormalizedRepository,
     origin: CoordinatorOrigin,
-    actionable: Bool,
     attribution: ResourceAttribution?
 ) -> ManagedServer {
     let active = ["running", "starting", "unhealthy"].contains(observation?.lifecycle ?? "")
@@ -1440,8 +1332,8 @@ private func normalizedServerPresentation(
         processUsage: processUsage,
         supervision: definition.supervision,
         attribution: attribution,
-        ownershipError: actionable ? nil : "No authoritative normalized control binding matches this server membership.",
-        ownershipCandidates: actionable ? [origin] : [],
+        associationError: nil,
+        routeCandidates: [origin],
         observationOrigins: [origin]
     )
 }
@@ -1486,8 +1378,8 @@ private func normalizedUnassignedServer(
         processUsage: nil,
         supervision: definition?.supervision,
         attribution: item.attribution,
-        ownershipError: "Use the exact Attach or Retire action; repository ownership is not established.",
-        ownershipCandidates: [origin],
+        associationError: "Use the exact Attach or Retire action; repository association is not established.",
+        routeCandidates: [origin],
         observationOrigins: [origin]
     )
 }
@@ -1499,7 +1391,6 @@ private func normalizedDockerPresentation(
     telemetry: [NormalizedTelemetrySample],
     repository: NormalizedRepository?,
     origin: CoordinatorOrigin,
-    actionable: Bool,
     metadataSource: String?,
     attribution: ResourceAttribution?
 ) -> DockerContainer {
@@ -1550,8 +1441,8 @@ private func normalizedDockerPresentation(
         databaseSizeBytes: nil,
         databaseDiscoveryError: nil,
         startedAt: nil,
-        ownershipError: actionable ? nil : "No authoritative normalized control binding matches this container membership.",
-        ownershipCandidates: actionable ? [origin] : [],
+        associationError: nil,
+        routeCandidates: [origin],
         observationOrigins: [origin],
         attribution: attribution
     )

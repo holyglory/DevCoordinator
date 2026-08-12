@@ -148,7 +148,6 @@ class UniversalTestTransportIsolationTests(unittest.TestCase):
         server = UnixTestPlaneServer(
             listener,  # type: ignore[arg-type]
             StoreTestPlaneAdapter(self.store),
-            allowed_peer_uids=(os.geteuid() + 10_000,),
             peer_resolver=lambda _connection: os.geteuid() + 20_000,
         )
         thread = threading.Thread(target=server.serve_forever, daemon=True)

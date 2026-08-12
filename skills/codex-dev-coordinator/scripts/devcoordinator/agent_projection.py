@@ -8,6 +8,7 @@ ownership from a name, path, image, port, or observation.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+import hashlib
 from typing import Any
 
 from .agent_contract import (
@@ -20,6 +21,7 @@ from .agent_contract import (
 
 MAX_TARGET_RESULT_BYTES = 2 * 1024
 MAX_STATUS_RESULT_BYTES = 2 * 1024
+MAX_RUNTIME_LOG_RESULT_BYTES = 8 * 1024
 DEFAULT_TARGET_LIMIT = 4
 
 
@@ -36,6 +38,30 @@ class AgentProjectionError(AgentContractError):
         super().__init__(message)
         self.code = code
         self.candidates = tuple(dict(item) for item in candidates[:4])
+
+
+def _sanitized_log_tail(value: str, *, maximum_bytes: int) -> tuple[str, bool]:
+    """Keep a printable multiline tail with a deterministic truncation seal."""
+
+    sanitized = "".join(
+        character
+        if character in "\n\t" or (character.isprintable() and ord(character) != 127)
+        else " "
+        for character in value
+    )
+    encoded = sanitized.encode("utf-8")
+    if len(encoded) <= maximum_bytes:
+        return sanitized, False
+    seal = hashlib.sha256(encoded).hexdigest()[:16]
+    prefix = f"[older log output omitted; sha256:{seal}]\n"
+    budget = maximum_bytes - len(prefix.encode("utf-8"))
+    if budget <= 0:
+        raise AgentProjectionError(
+            "runtime_log_projection_invalid",
+            "runtime log projection bound cannot contain its truncation marker",
+        )
+    tail = encoded[-budget:].decode("utf-8", errors="ignore")
+    return prefix + tail, True
 
 
 def _rows(value: Any, *, field: str) -> list[Mapping[str, Any]]:
@@ -338,16 +364,71 @@ def project_runtime_report(report: Mapping[str, Any]) -> dict[str, Any]:
             )
             if key in cleanup
         }
+    maximum_bytes = MAX_STATUS_RESULT_BYTES
+    if report.get("action") == "capture_logs" and report.get("ok") is True:
+        artifact = report.get("artifact")
+        content = report.get("artifact_content")
+        if not isinstance(artifact, Mapping) or not isinstance(content, Mapping):
+            raise AgentProjectionError(
+                "runtime_log_artifact_missing",
+                "successful runtime log capture omitted its artifact evidence",
+            )
+        artifact_id = artifact.get("artifact_id")
+        content_artifact_id = content.get("artifact_id")
+        log_text = content.get("text")
+        if (
+            not isinstance(artifact_id, str)
+            or not artifact_id
+            or content_artifact_id != artifact_id
+            or not isinstance(log_text, str)
+        ):
+            raise AgentProjectionError(
+                "runtime_log_artifact_invalid",
+                "runtime log artifact and content identities are contradictory",
+            )
+        document["artifact"] = {
+            key: artifact[key]
+            for key in (
+                "availability",
+                "artifact_id",
+                "resource_kind",
+                "target_resource_id",
+                "source",
+                "captured_at",
+                "bounds",
+                "truncated",
+                "retained",
+            )
+            if key in artifact
+        }
+        maximum_bytes = MAX_RUNTIME_LOG_RESULT_BYTES
+        for tail_bytes in (5 * 1024, 4 * 1024, 3 * 1024, 2 * 1024, 1024, 512):
+            projected_text, projection_truncated = _sanitized_log_tail(
+                log_text, maximum_bytes=tail_bytes
+            )
+            document["artifact_content"] = {
+                "artifact_id": artifact_id,
+                "text": projected_text,
+                "projection_truncated": projection_truncated,
+            }
+            if len(canonical_json_bytes(document)) <= maximum_bytes:
+                break
+        else:
+            raise AgentProjectionError(
+                "runtime_log_projection_too_large",
+                "runtime log artifact metadata exceeds the compact result contract",
+            )
     return require_agent_result(
         document,
         surface="runtime status projection",
-        maximum_bytes=MAX_STATUS_RESULT_BYTES,
+        maximum_bytes=maximum_bytes,
     )
 
 
 __all__ = [
     "AgentProjectionError",
     "DEFAULT_TARGET_LIMIT",
+    "MAX_RUNTIME_LOG_RESULT_BYTES",
     "MAX_STATUS_RESULT_BYTES",
     "MAX_TARGET_RESULT_BYTES",
     "project_runtime_report",

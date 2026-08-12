@@ -6,7 +6,7 @@ import unittest
 from unittest import mock
 
 from devcoordinator.broker import (
-    AuthorizedBrokerRequest,
+    AcceptedBrokerRequest,
     BrokerOperation,
     BrokerRequest,
     PeerCredentials,
@@ -17,7 +17,7 @@ from devcoordinator.agent_test import (
     child_operation_id,
     enqueue_test,
     project_test_follow,
-    submit_reviewed_plan,
+    submit_test_plan,
 )
 
 
@@ -64,7 +64,7 @@ class Profile:
     def submit_test_plan(self, **arguments):
         self.submit_calls.append(arguments)
         self.resolved_actor = _test_run_actor(
-            AuthorizedBrokerRequest(
+            AcceptedBrokerRequest(
                 peer=PeerCredentials(uid=1234, gid=1234, pid=99),
                 request=BrokerRequest.create(
                     account_id=self.account_id,
@@ -135,20 +135,20 @@ class AgentTestTests(unittest.TestCase):
             MAX_TEST_RESULT_BYTES,
         )
 
-    def test_handoff_is_review_first_and_does_not_submit(self) -> None:
+    def test_handoff_submits_without_a_permission_review(self) -> None:
         profile, result = self._enqueue(intent="handoff")
-        self.assertEqual(profile.submit_calls, [])
-        self.assertTrue(result["review_required"])
-        self.assertEqual(result["plan_handle"], "dc1:plan:plan-1")
+        self.assertEqual(len(profile.submit_calls), 1)
+        self.assertTrue(result["submission_performed"])
+        self.assertEqual(result["continuation"], "dc1:run:run-1")
 
     def test_routine_enqueue_codex_actor_survives_api_account_routing(self) -> None:
         profile, result = self._enqueue(account_id="devcoordinator-api")
         self.assertEqual(result["classification"], "test_enqueued")
         self.assertEqual(profile.resolved_actor, "codex:thread-1")
 
-    def test_reviewed_submit_forwards_the_current_actor_contract(self) -> None:
+    def test_plan_submit_forwards_the_current_actor_contract(self) -> None:
         profile = Profile(intent="handoff")
-        result = submit_reviewed_plan(
+        result = submit_test_plan(
             profile=profile,
             repository=SimpleNamespace(repo_id="repo-1"),
             plan_id="plan-1",
@@ -181,6 +181,54 @@ class AgentTestTests(unittest.TestCase):
         self.assertLessEqual(
             len(json.dumps(result, separators=(",", ":"), sort_keys=True).encode()),
             MAX_TEST_RESULT_BYTES,
+        )
+
+    def test_follow_exposes_bounded_typed_scheduler_waits(self) -> None:
+        status = {
+            "run_id": "run-1",
+            "state": "queued",
+            "targets": [
+                {
+                    "target_name": f"target-{index}",
+                    "wait": {
+                        "code": "exact_worktree_busy",
+                        "since": 100.0 + index,
+                        "required_mib": None,
+                    },
+                }
+                for index in range(5)
+            ],
+        }
+        result = project_test_follow(status, run_id="run-1")
+        self.assertEqual(result["scheduler_wait"]["target_count"], 5)
+        self.assertEqual(len(result["scheduler_wait"]["targets"]), 3)
+        self.assertTrue(result["scheduler_wait"]["truncated"])
+        self.assertEqual(
+            result["scheduler_wait"]["targets"][0]["code"],
+            "exact_worktree_busy",
+        )
+
+    def test_follow_distinguishes_failed_cases_from_retained_records(self) -> None:
+        status = {"run_id": "run-1", "state": "failed"}
+        summary = {
+            "run_id": "run-1",
+            "conclusion": "failed",
+            "counts": {"passed": 4, "failed": 487},
+            "failure_count": 129,
+            "failures": [
+                {"target": f"target-{index}", "message": "failed"}
+                for index in range(3)
+            ],
+        }
+
+        result = project_test_follow(status, run_id="run-1", summary=summary)
+
+        self.assertEqual(result["failure_count"], 487)
+        self.assertEqual(result["failure_record_count"], 129)
+        self.assertTrue(result["failures_truncated"])
+        self.assertEqual(
+            result["next_command"],
+            "devcoordinator test failures dc1:run:run-1",
         )
 
 

@@ -1926,6 +1926,86 @@ class UniversalTestStore:
             )
             return result
 
+    def recover_attempt_lease(
+        self,
+        attempt_id: str,
+        *,
+        generation: int,
+        lease_owner: str,
+        lease_seconds: int = DEFAULT_LEASE_SECONDS,
+        operation_id: str,
+    ) -> dict[str, object]:
+        """Grant one bounded lease to an exact durably recovered attempt.
+
+        A testd replacement can be absent longer than the ordinary heartbeat
+        lease while the independently supervised native runner remains alive.
+        Recovery is therefore allowed to cross the prior deadline, but only
+        while the attempt is still active and its generation and lease owner
+        match the private durable spool binding.  A reaped or terminal attempt
+        can never be resurrected through this path.
+        """
+
+        attempt_id = _safe_id("attempt_id", attempt_id)
+        lease_owner = _safe_id("lease_owner", lease_owner)
+        lease_seconds = _positive_int(
+            "lease_seconds", lease_seconds, maximum=MAX_LEASE_SECONDS
+        )
+        operation_id = _operation_id(operation_id)
+        request_fingerprint = deterministic_fingerprint(
+            {
+                "attempt_id": attempt_id,
+                "generation": generation,
+                "lease_owner": lease_owner,
+                "lease_seconds": lease_seconds,
+            }
+        )
+        timestamp = _now(self._clock)
+        with self._transaction() as connection:
+            replay = self._mutation_replay(
+                connection,
+                operation_id=operation_id,
+                operation_kind="lease_recovery",
+                request_fingerprint=request_fingerprint,
+            )
+            if replay is not None:
+                return replay
+            attempt = self._attempt(connection, attempt_id)
+            self._require_lease(attempt, generation=generation)
+            if str(attempt["lease_owner"]) != lease_owner:
+                raise TestStoreConflict("attempt lease owner changed before recovery")
+            expires = timestamp + lease_seconds
+            connection.execute(
+                """
+                UPDATE test_target_attempts
+                SET heartbeat_at = ?, lease_expires_at = ?, updated_at = ?
+                WHERE attempt_id = ? AND state IN ('leased', 'running')
+                  AND generation = ? AND lease_owner = ?
+                """,
+                (
+                    timestamp,
+                    expires,
+                    timestamp,
+                    attempt_id,
+                    generation,
+                    lease_owner,
+                ),
+            )
+            result = {
+                "attempt_id": attempt_id,
+                "state": str(attempt["state"]),
+                "lease_expires_at": expires,
+                "recovered": True,
+            }
+            self._record_mutation(
+                connection,
+                operation_id=operation_id,
+                operation_kind="lease_recovery",
+                request_fingerprint=request_fingerprint,
+                result=result,
+                created_at=timestamp,
+            )
+            return result
+
     def append_result_chunk(
         self,
         attempt_id: str,
@@ -1942,7 +2022,7 @@ class UniversalTestStore:
         timestamp = _now(self._clock)
         with self._transaction() as connection:
             attempt = self._attempt(connection, attempt_id)
-            self._require_lease(attempt, generation=generation)
+            self._require_lease(attempt, generation=generation, active=False)
             existing = connection.execute(
                 """
                 SELECT * FROM test_result_chunks
@@ -1958,6 +2038,7 @@ class UniversalTestStore:
                     "chunk_id": chunk.chunk_id,
                     "replayed": True,
                 }
+            self._require_lease(attempt, generation=generation)
             if bool(attempt["reporter_complete"]):
                 raise TestStoreConflict("reporter already published its final chunk")
             expected_index = int(

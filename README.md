@@ -1,6 +1,6 @@
 # DevCoordinator
 
-DevCoordinator is the host authority for local development runtimes shared by
+DevCoordinator is the host coordinator for local development runtimes shared by
 multiple Codex, Claude, desktop, and OS-user sessions. It owns attributed port
 leases, processes, Docker/Compose resources, local database stacks, telemetry,
 logs, lifecycle evidence, short-lived workload policy, repository-scoped test
@@ -16,7 +16,7 @@ The repository also contains:
 
 ## Architecture
 
-- One local broker and authority WAL store own exact repository/resource
+- One local broker and server-wide SQLite store own exact repository/resource
   identity, lifecycle policy, and generation fences; test, inventory, and
   Console state live in separate stores. Multiple Unix accounts are trusted
   execution contexts for one developer, not tenants; filesystem metadata is
@@ -25,18 +25,22 @@ The repository also contains:
   and retained Console content available across backend replacement.
 - The asynchronous test scheduler launches generation-fenced per-UID attempts
   outside the protected control slice and returns submissions immediately.
-- Manifest-sealed Compose one-shots accept only an exact enrolled service,
+- Declared Compose one-shots accept an exact cataloged service,
   bounded timeout, and replay UUID; the broker publishes a typed receipt and
   never exposes raw process streams.
 - One canonical Git worktree is one repository/project; repository families
   retain exact original and temporary-worktree identities.
-- Python owns observation, membership, lifecycle, cleanup, diagnostics, and
+- Python owns observation, repository association, lifecycle, cleanup, diagnostics, and
   the `repository_trees` UI model.
 - Inventory is a pure read; explicit observation updates host evidence.
-- Unknown ownership, stale identity, and partial cleanup fail closed.
+- Ordinary lifecycle paths fail closed on unknown target identity, stale generation,
+  and partial cleanup. Developer-directed container removal is the explicit
+  single-developer exception: one selected catalog target invokes only
+  `docker rm -f <full-id>` without repository association, archive, grant, state, plan, or
+  confirmation gates and without deleting volumes.
 
 See [Single-developer local trust](docs/architecture/single-developer-local-trust.md)
-for the deliberately simple same-server authorization model.
+for the deliberately simple trusted-local model.
 
 ## Agent quick start
 
@@ -122,13 +126,16 @@ binds/probes that never contacted Coordinator are caller misuse, not
 automatically Coordinator bugs.
 
 If only the governed test harness fails, report it first and keep coding with
-repository-native isolated unit/static checks labelled
-`local/advisory — non-governed; not Coordinator evidence`. They never establish
+static checks and repository-native tests that collect at most 20 cases and
+enforce at most 10 seconds of execution, labelled
+`local/advisory — non-governed; not Coordinator evidence`. Do not split a
+larger suite into repeated bounded commands. These checks never establish
 handoff or release readiness and the governed tests must run after repair. This
 fallback never covers host listeners, Docker/Compose, databases, shared
 processes, or host mutation. Ordinary measured assertion failures are project
 bugs, not Coordinator bugs. See
-[DC-2026-08-04-BUG-INTAKE-01](DecisionDetails/DC-2026-08-04-BUG-INTAKE-01.md)
+[DC-2026-08-09-TEST-BATCHING-01](DecisionDetails/DC-2026-08-09-TEST-BATCHING-01.md),
+[DC-2026-08-04-BUG-INTAKE-01](DecisionDetails/DC-2026-08-04-BUG-INTAKE-01.md),
 and the confirmed [security assumptions](security-assumptions.md).
 
 ## Install the skills

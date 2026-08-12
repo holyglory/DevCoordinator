@@ -53,8 +53,11 @@ def git_environment(*, home: Path) -> dict[str, str]:
 
 class RepositoryContextTests(unittest.TestCase):
     def setUp(self) -> None:
+        scratch_root = Path(
+            os.environ.get("DEVCOORDINATOR_TEST_TMP_ROOT", Path.home())
+        )
         self.temporary = tempfile.TemporaryDirectory(
-            prefix="devcoordinator-repository-context-", dir=Path.home()
+            prefix="devcoordinator-repository-context-", dir=scratch_root
         )
         self.test_root = Path(self.temporary.name).resolve()
         self.git_home = self.test_root / "git-home"
@@ -147,6 +150,22 @@ class RepositoryContextTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(RepositoryContextError, "primary Git worktree"):
             resolve_repository_context(root_repo=str(linked), temporary_repo=None)
+
+    @unittest.skipUnless(getattr(os, "O_PATH", 0), "O_PATH is Linux-specific")
+    def test_exact_repository_below_execute_only_ancestor_is_inspectable(self) -> None:
+        exact_parent = self.test_root / "exact-only"
+        exact_parent.mkdir(mode=0o700)
+        repository = exact_parent / "repository"
+        self._initialize_repository(repository)
+        exact_parent.chmod(0o111)
+        try:
+            context = resolve_repository_context(
+                root_repo=str(repository), temporary_repo=None
+            )
+        finally:
+            exact_parent.chmod(0o700)
+
+        self.assertEqual(context.root.canonical_root, str(repository))
 
     def test_effective_worktree_discovery_returns_explicit_root_and_temporary_scope(self) -> None:
         linked = self._linked()
@@ -273,7 +292,7 @@ class RepositoryContextTests(unittest.TestCase):
                 replacement.root.identity_fingerprint,
                 context.root.identity_fingerprint,
             )
-            with self.assertRaisesRegex(RepositoryContextError, "changed since enrollment"):
+            with self.assertRaisesRegex(RepositoryContextError, "changed since configuration"):
                 persist_repository_context(
                     store,
                     replacement,

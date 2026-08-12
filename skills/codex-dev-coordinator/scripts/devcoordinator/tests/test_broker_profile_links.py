@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+from dataclasses import replace
 import json
 import os
 from pathlib import Path
@@ -35,7 +36,6 @@ from devcoordinator.normalized_server_lifecycle import (
     NormalizedPortLifecycle,
     PortLeaseRequest,
 )
-from devcoordinator.schema import establish_repository_owner_authority
 from devcoordinator.store import AccountStore, utc_timestamp
 
 
@@ -48,7 +48,10 @@ class CanonicalTemporaryDirectory:
     """Use a test-owned canonical root rather than a host symlink alias."""
 
     def __init__(self, prefix: str) -> None:
-        home = Path(pwd.getpwuid(UID).pw_dir).resolve()
+        home = Path(
+            os.environ.get("DEVCOORDINATOR_TEST_TMP_ROOT")
+            or pwd.getpwuid(UID).pw_dir
+        ).resolve()
         self._temporary = tempfile.TemporaryDirectory(prefix=prefix, dir=str(home))
         self.path = Path(self._temporary.name).resolve()
 
@@ -65,47 +68,31 @@ def profile_document(
     client_uid: int = UID,
     valid_until_epoch: int | None = None,
 ) -> dict[str, object]:
-    expiry = int(time.time()) + 3_600 if valid_until_epoch is None else valid_until_epoch
+    del client_uid, valid_until_epoch
     return {
-        "version": 1,
+        "version": 2,
         "service": {
             "socket": "/run/devcoordinator-authority.sock",
-            "uid": 0,
-            "gid": 62000,
-            "mode": "0660",
             "database_generation": DATABASE_GENERATION,
         },
-        "clients": {
-            str(client_uid): {
-                "account_id": "account-alpha",
-                "issued_at": "2026-07-14T00:00:00Z",
-                "valid_until_epoch": expiry,
-                "repositories": [
-                    {
-                        "canonical_root": str(repository_root),
-                        "repo_id": REPO_ID,
-                        "generation": 7,
-                        "owner_uid": UID,
-                        "servers": {
-                            "web": "server-web",
-                            "worker": "server-worker",
-                            "database": "server-database",
-                        },
-                        "containers": {"postgres": "container-postgres"},
-                        "compose_definition_id": "compose-alpha",
-                        "compose_container_ids": [],
-                        "compose_run_once_services": {},
-                        "ephemeral_templates": {},
-                        "ephemeral_image_prefetch_templates": [],
-                        "ephemeral_secret_policies": {},
-                        "account_id": "account-alpha",
-                        "enabled": True,
-                        "issued_at": "2026-07-14T00:00:00Z",
-                        "valid_until_epoch": expiry,
-                    }
-                ],
+        "repositories": [
+            {
+                "canonical_root": str(repository_root),
+                "repo_id": REPO_ID,
+                "generation": 7,
+                "servers": {
+                    "web": "server-web",
+                    "worker": "server-worker",
+                    "database": "server-database",
+                },
+                "containers": {"postgres": "container-postgres"},
+                "compose_definition_id": "compose-alpha",
+                "compose_container_ids": [],
+                "compose_run_once_services": {},
+                "ephemeral_templates": {},
+                "ephemeral_secret_policies": {},
             }
-        },
+        ],
     }
 
 
@@ -116,32 +103,122 @@ def parsed_profile(repository_root: Path) -> BrokerClientProfile:
 
 
 class BrokerProfileTrustTests(unittest.TestCase):
-    def test_repository_if_enrolled_is_a_pure_exact_lookup(self) -> None:
-        with CanonicalTemporaryDirectory("profile-unenrolled-read-") as repository_root:
+    def test_test_submission_uses_authoritative_plan_identity_without_local_lookup(
+        self,
+    ) -> None:
+        with CanonicalTemporaryDirectory("profile-test-submit-") as repository_root:
+            profile = parsed_profile(repository_root)
+            operation_id = "00000000-0000-4000-8000-000000000095"
+            existing = profile.repository(str(repository_root))
+            duplicate = replace(
+                existing,
+                canonical_root=str(repository_root.parent / "duplicate-route"),
+            )
+            profile.repositories[duplicate.canonical_root] = duplicate
+            expected = {
+                "ok": True,
+                "run_id": "run-one",
+                "state": "queued",
+                "repository_id": REPO_ID,
+            }
+            with (
+                mock.patch.object(
+                    BrokerClientProfile,
+                    "repository_by_id",
+                    side_effect=AssertionError("local profile lookup is forbidden"),
+                ),
+                mock.patch.object(
+                    BrokerClientProfile,
+                    "call",
+                    return_value=(operation_id, expected),
+                ) as call,
+            ):
+                result = profile.submit_test_plan(
+                    repository=REPO_ID,
+                    plan_id="plan-one",
+                    operation_id=operation_id,
+                    actor="codex:task:submit",
+                )
+
+            self.assertEqual(
+                result,
+                {**expected, "operation_id": operation_id},
+            )
+            call.assert_called_once()
+            call_arguments = call.call_args.kwargs
+            self.assertIs(call_arguments["repository"], existing)
+            self.assertEqual(call_arguments["resource_id"], REPO_ID)
+            self.assertEqual(
+                call_arguments["operation"], BrokerOperation.TEST_RUN_SUBMIT
+            )
+            self.assertEqual(
+                call_arguments["arguments"],
+                {
+                    "plan_id": "plan-one",
+                    "expected_repository_id": REPO_ID,
+                    "actor": "codex:task:submit",
+                },
+            )
+            self.assertEqual(call_arguments["operation_id"], operation_id)
+            self.assertEqual(
+                call_arguments,
+                {
+                    "repository": existing,
+                    "resource_id": REPO_ID,
+                    "operation": BrokerOperation.TEST_RUN_SUBMIT,
+                    "arguments": {
+                        "plan_id": "plan-one",
+                        "expected_repository_id": REPO_ID,
+                        "actor": "codex:task:submit",
+                    },
+                    "operation_id": operation_id,
+                },
+            )
+
+    def test_repository_if_configured_is_a_pure_exact_lookup(self) -> None:
+        with CanonicalTemporaryDirectory("profile-unconfigured-read-") as repository_root:
             profile = parsed_profile(repository_root)
             missing = repository_root.parent / "new-repository"
 
-            self.assertIsNone(profile.repository_if_enrolled(str(missing)))
+            self.assertIsNone(profile.repository_if_configured(str(missing)))
             self.assertIs(
-                profile.repository_if_enrolled(str(repository_root)),
+                profile.repository_if_configured(str(repository_root)),
                 profile.repository(str(repository_root)),
+            )
+
+    def test_completed_run_uses_current_transport_without_current_run_repository(self) -> None:
+        with CanonicalTemporaryDirectory("profile-retired-run-") as repository_root:
+            profile = parsed_profile(repository_root)
+            response = {
+                "run_id": "run-retired",
+                "repository_id": "repo-retired",
+                "state": "failed",
+            }
+            with mock.patch.object(
+                BrokerClientProfile,
+                "call",
+                return_value=(str(uuid.uuid4()), response),
+            ) as call:
+                result = profile.test_run_status(
+                    repository="repo-retired", run_id="run-retired"
+                )
+
+            self.assertEqual(result, response)
+            self.assertIs(
+                call.call_args.kwargs["repository"],
+                profile._current_transport_anchor(),
+            )
+            self.assertEqual(
+                call.call_args.kwargs["resource_id"],
+                profile._current_transport_anchor().repo_id,
             )
 
     def test_start_like_ensure_reconciles_an_already_visible_repository(self) -> None:
         with CanonicalTemporaryDirectory("profile-reconcile-existing-") as repository_root:
             profile = parsed_profile(repository_root)
             operation_id = "00000000-0000-4000-8000-000000000094"
-            repository_document = dict(
-                profile_document(repository_root)["clients"][str(UID)][
-                    "repositories"
-                ][0]
-            )
-            repository_document.update(
-                {
-                    "execution_uid": UID,
-                    "filesystem_owner_uid": UID + 1,
-                }
-            )
+            repository_document = dict(profile_document(repository_root)["repositories"][0])
+            repository_document["execution_uid"] = UID
             reply = {
                 "schema_version": 1,
                 "ok": True,
@@ -157,7 +234,6 @@ class BrokerProfileTrustTests(unittest.TestCase):
             ) as call:
                 reconciled, changed = profile.ensure_repository_with_outcome(
                     canonical_root=str(repository_root),
-                    owner_uid=UID,
                     project_kind="primary",
                     agent="codex:task:first-use-reconcile",
                     operation_id=operation_id,
@@ -166,7 +242,6 @@ class BrokerProfileTrustTests(unittest.TestCase):
             self.assertTrue(changed)
             self.assertEqual(reconciled.repo_id, REPO_ID)
             self.assertEqual(reconciled.execution_uid, UID)
-            self.assertEqual(reconciled.filesystem_owner_uid, UID + 1)
             call.assert_called_once()
             arguments = call.call_args.kwargs
             self.assertEqual(arguments["repo_id"], REPO_ID)
@@ -174,25 +249,28 @@ class BrokerProfileTrustTests(unittest.TestCase):
             self.assertEqual(arguments["operation"], BrokerOperation.REPOSITORY_ENSURE)
             self.assertEqual(arguments["operation_id"], operation_id)
 
-    def test_repository_ensure_execution_evidence_is_paired_and_consistent(self) -> None:
+    def test_repository_profile_accepts_execution_attribution_only(self) -> None:
         with CanonicalTemporaryDirectory("profile-ensure-evidence-") as repository_root:
-            one_sided = profile_document(repository_root)
-            one_sided["clients"][str(UID)]["repositories"][0][
-                "execution_uid"
-            ] = UID
+            document = profile_document(repository_root)
+            document["repositories"][0]["execution_uid"] = UID
+            parsed = profile_from_document(document, effective_uid=UID)
+            self.assertEqual(parsed.repository(str(repository_root)).execution_uid, UID)
+
+            obsolete = profile_document(repository_root)
+            obsolete["repositories"][0]["owner_uid"] = UID
             with self.assertRaisesRegex(
                 BrokerProfileError, "repository profile fields are invalid"
             ):
-                profile_from_document(one_sided, effective_uid=UID)
+                profile_from_document(obsolete, effective_uid=UID)
 
-            contradictory = profile_document(repository_root)
-            repository = contradictory["clients"][str(UID)]["repositories"][0]
-            repository["execution_uid"] = UID + 1
-            repository["filesystem_owner_uid"] = UID + 2
+            retired_prefetch_acl = profile_document(repository_root)
+            retired_prefetch_acl["repositories"][0][
+                "ephemeral_image_prefetch_templates"
+            ] = []
             with self.assertRaisesRegex(
-                BrokerProfileError, "execution evidence contradicts"
+                BrokerProfileError, "repository profile fields are invalid"
             ):
-                profile_from_document(contradictory, effective_uid=UID)
+                profile_from_document(retired_prefetch_acl, effective_uid=UID)
 
     def test_ensure_repository_uses_one_anchor_and_augments_only_memory(self) -> None:
         with CanonicalTemporaryDirectory("profile-bootstrap-anchor-") as repository_root:
@@ -201,7 +279,7 @@ class BrokerProfileTrustTests(unittest.TestCase):
             operation_id = "00000000-0000-4000-8000-000000000091"
             document = profile_document(repository_root)
             repository_document = dict(
-                document["clients"][str(UID)]["repositories"][0]
+                document["repositories"][0]
             )
             repository_document.update(
                 {
@@ -230,7 +308,7 @@ class BrokerProfileTrustTests(unittest.TestCase):
                         {
                             "schema_version": 1,
                             "ok": True,
-                            "state": "unenrolled",
+                            "state": "unregistered",
                             "repository": None,
                         },
                     ),
@@ -239,7 +317,6 @@ class BrokerProfileTrustTests(unittest.TestCase):
             ) as call:
                 adopted = profile.ensure_repository(
                     canonical_root=str(new_root),
-                    owner_uid=UID,
                     project_kind="primary",
                     agent="codex:task:first-use",
                     operation_id=operation_id,
@@ -252,7 +329,7 @@ class BrokerProfileTrustTests(unittest.TestCase):
                 call.call_args_list[0],
                 mock.call(
                     service=profile.service,
-                    account_id="account-alpha",
+                    account_id="local",
                     repo_id=REPO_ID,
                     repository_generation=7,
                     resource_id=REPO_ID,
@@ -265,7 +342,7 @@ class BrokerProfileTrustTests(unittest.TestCase):
                 call.call_args_list[1],
                 mock.call(
                     service=profile.service,
-                    account_id="account-alpha",
+                    account_id="local",
                     repo_id=REPO_ID,
                     repository_generation=7,
                     resource_id=REPO_ID,
@@ -273,20 +350,19 @@ class BrokerProfileTrustTests(unittest.TestCase):
                     arguments={
                         "agent": "codex:task:first-use",
                         "canonical_root": str(new_root),
-                        "owner_uid": UID,
                         "project_kind": "primary",
                     },
                     operation_id=operation_id,
                 ),
             )
 
-    def test_resolve_repository_restores_broker_retained_dynamic_enrollment(self) -> None:
+    def test_resolve_repository_restores_broker_retained_dynamic_configuration(self) -> None:
         with CanonicalTemporaryDirectory("profile-dynamic-resolve-") as repository_root:
             profile = parsed_profile(repository_root)
             adopted_root = repository_root.parent / "adopted-in-prior-process"
             document = profile_document(repository_root)
             repository_document = dict(
-                document["clients"][str(UID)]["repositories"][0]
+                document["repositories"][0]
             )
             repository_document.update(
                 {
@@ -307,7 +383,7 @@ class BrokerProfileTrustTests(unittest.TestCase):
                     {
                         "schema_version": 1,
                         "ok": True,
-                        "state": "enrolled",
+                        "state": "available",
                         "repository": repository_document,
                     },
                 ),
@@ -319,7 +395,7 @@ class BrokerProfileTrustTests(unittest.TestCase):
             self.assertIs(profile.repository(str(adopted_root)), resolved)
             call.assert_called_once_with(
                 service=profile.service,
-                account_id="account-alpha",
+                account_id="local",
                 repo_id=REPO_ID,
                 repository_generation=7,
                 resource_id=REPO_ID,
@@ -336,7 +412,7 @@ class BrokerProfileTrustTests(unittest.TestCase):
             adopted_root = "/home/another-trusted-account/private-repository"
             document = profile_document(repository_root)
             repository_document = dict(
-                document["clients"][str(UID)]["repositories"][0]
+                document["repositories"][0]
             )
             repository_document.update(
                 {
@@ -358,7 +434,7 @@ class BrokerProfileTrustTests(unittest.TestCase):
                         {
                             "schema_version": 1,
                             "ok": True,
-                            "state": "enrolled",
+                            "state": "available",
                             "repository": repository_document,
                         },
                     ),
@@ -384,14 +460,12 @@ class BrokerProfileTrustTests(unittest.TestCase):
             self.assertEqual(empty_scope.compose_container_ids, frozenset())
 
             missing = profile_document(repository_root)
-            del missing["clients"][str(UID)]["repositories"][0][
-                "compose_container_ids"
-            ]
+            del missing["repositories"][0]["compose_container_ids"]
             with self.assertRaises(BrokerProfileError):
                 profile_from_document(missing, effective_uid=UID)
 
             document = profile_document(repository_root)
-            repository = document["clients"][str(UID)]["repositories"][0]
+            repository = document["repositories"][0]
             repository["containers"] = {
                 "web": "container-web",
                 "web-full-id": "container-web",
@@ -408,7 +482,7 @@ class BrokerProfileTrustTests(unittest.TestCase):
             for values in (["container-unknown"], ["container-postgres", "container-postgres"]):
                 with self.subTest(values=values):
                     document = profile_document(repository_root)
-                    document["clients"][str(UID)]["repositories"][0][
+                    document["repositories"][0][
                         "compose_container_ids"
                     ] = values
                     with self.assertRaises(BrokerProfileError):
@@ -420,7 +494,6 @@ class BrokerProfileTrustTests(unittest.TestCase):
             canonical_root=root,
             repo_id=REPO_ID,
             generation=4,
-            owner_uid=1000,
             server_ids={"worker": "server-worker", "web": "server-web"},
             container_ids={
                 "compose": "container-compose",
@@ -431,12 +504,7 @@ class BrokerProfileTrustTests(unittest.TestCase):
             compose_container_ids=frozenset({"container-compose"}),
             compose_run_once_services={},
             ephemeral_templates={},
-            ephemeral_image_prefetch_template_ids=frozenset(),
             ephemeral_secret_policies={},
-            account_id="account-alpha",
-            enabled=True,
-            issued_at="2026-07-14T00:00:00Z",
-            valid_until_epoch=int(time.time()) + 3600,
         )
         inventory = {
             "resources": {
@@ -449,10 +517,6 @@ class BrokerProfileTrustTests(unittest.TestCase):
                     {"docker_resource_id": "container-standalone"},
                 ],
             },
-            "memberships": [
-                {"repo_id": REPO_ID, "resource_kind": "container", "host_resource_id": "container-compose"},
-                {"repo_id": REPO_ID, "resource_kind": "container", "host_resource_id": "container-standalone"},
-            ],
             "observations": {
                 "servers": [
                     {"server_definition_id": "server-worker", "lifecycle": "running"},
@@ -517,23 +581,16 @@ class BrokerProfileTrustTests(unittest.TestCase):
             canonical_root=root,
             repo_id=REPO_ID,
             generation=4,
-            owner_uid=1000,
             server_ids={},
             container_ids={"standalone": "container-standalone"},
             compose_definition_id=None,
             compose_container_ids=frozenset(),
             compose_run_once_services={},
             ephemeral_templates={},
-            ephemeral_image_prefetch_template_ids=frozenset(),
             ephemeral_secret_policies={},
-            account_id="account-alpha",
-            enabled=True,
-            issued_at="2026-07-14T00:00:00Z",
-            valid_until_epoch=int(time.time()) + 3600,
         )
         inventory = {
             "resources": {"servers": [], "docker": [{"docker_resource_id": "container-standalone"}]},
-            "memberships": [{"repo_id": REPO_ID, "resource_kind": "container", "host_resource_id": "container-standalone"}],
             "observations": {"servers": [], "docker": [{"docker_resource_id": "container-standalone", "lifecycle": "running"}]},
             "v1_compatibility": {"servers": [], "docker": {"containers": [{"host_resource_id": "container-standalone", "status": "running"}]}},
         }
@@ -555,38 +612,25 @@ class BrokerProfileTrustTests(unittest.TestCase):
         )
         profile.call.assert_not_called()
 
-    def test_exact_enrolled_root_does_not_require_filesystem_traversal(self) -> None:
+    def test_exact_configured_root_does_not_require_filesystem_traversal(self) -> None:
         root = str(Path("/").joinpath("home", "private", "repository"))
         repository = BrokerRepositoryProfile(
             canonical_root=root,
             repo_id=REPO_ID,
             generation=1,
-            owner_uid=1000,
             server_ids={},
             container_ids={},
             compose_definition_id=None,
             compose_container_ids=frozenset(),
             compose_run_once_services={},
             ephemeral_templates={},
-            ephemeral_image_prefetch_template_ids=frozenset(),
             ephemeral_secret_policies={},
-            account_id="account-alpha",
-            enabled=True,
-            issued_at="2026-07-14T00:00:00Z",
-            valid_until_epoch=int(time.time()) + 3600,
         )
         profile = BrokerClientProfile(
             service=BrokerServiceProfile(
                 socket_path=Path("/run/devcoordinator.sock"),
-                service_uid=0,
-                socket_gid=62000,
-                socket_mode=0o660,
                 database_generation=DATABASE_GENERATION,
             ),
-            client_uid=1000,
-            account_id="account-alpha",
-            issued_at="2026-07-14T00:00:00Z",
-            valid_until_epoch=int(time.time()) + 3600,
             repositories={root: repository},
         )
         with mock.patch.object(
@@ -1158,17 +1202,17 @@ class BrokerProfileTrustTests(unittest.TestCase):
             publish.assert_called_once()
             self.assertEqual(result["broker"]["publication"]["status"], "published")
 
-    def test_system_stop_rejects_host_visible_unenrolled_server_before_client_state(self) -> None:
+    def test_system_stop_rejects_host_visible_unconfigured_server_before_client_state(self) -> None:
         with CanonicalTemporaryDirectory(".broker-stop-access-") as root:
-            enrolled_root = root / "prtzn-vpn"
+            configured_root = root / "prtzn-vpn"
             visible_root = root / "DevCoordinator"
-            for repository_root in (enrolled_root, visible_root):
+            for repository_root in (configured_root, visible_root):
                 repository_root.mkdir(mode=0o700)
                 (repository_root / ".git").mkdir(mode=0o700)
 
-            repository_denied = parsed_profile(enrolled_root)
+            repository_denied = parsed_profile(configured_root)
             server_denied_document = profile_document(visible_root)
-            server_denied_document["clients"][str(UID)]["repositories"][0][
+            server_denied_document["repositories"][0][
                 "servers"
             ] = {"other-server": "server-other"}
             server_denied = profile_from_document(
@@ -1176,8 +1220,8 @@ class BrokerProfileTrustTests(unittest.TestCase):
             )
 
             for profile, expected in (
-                (repository_denied, "repository.*not enrolled"),
-                (server_denied, "server 'devops-console'.*not enrolled"),
+                (repository_denied, "repository.*not configured"),
+                (server_denied, "server 'devops-console'.*not configured"),
             ):
                 with self.subTest(expected=expected):
                     with (
@@ -1198,28 +1242,28 @@ class BrokerProfileTrustTests(unittest.TestCase):
                             dev_coordinator,
                             "_normalized_server_from_options",
                             side_effect=AssertionError(
-                                "unenrolled stop opened the client journal"
+                                "unconfigured stop opened the client journal"
                             ),
                         ) as journal_lookup,
                         mock.patch.object(
                             AccountStore,
                             "open_default",
                             side_effect=AssertionError(
-                                "unenrolled stop opened mutable client state"
+                                "unconfigured stop opened mutable client state"
                             ),
                         ) as client_store,
                         mock.patch.object(
                             dev_coordinator.NormalizedServerLifecycle,
                             "reserve_stop",
                             side_effect=AssertionError(
-                                "unenrolled stop reserved a local lifecycle operation"
+                                "unconfigured stop reserved a local lifecycle operation"
                             ),
                         ) as reserve_stop,
                         mock.patch.object(
                             dev_coordinator,
                             "stop_pid",
                             side_effect=AssertionError(
-                                "unenrolled stop signaled a process"
+                                "unconfigured stop signaled a process"
                             ),
                         ) as stop_pid,
                     ):
@@ -1250,9 +1294,7 @@ class BrokerProfileTrustTests(unittest.TestCase):
                     self.assertEqual(payload["classification"], "maintenance")
                     self.assertEqual(payload["retry_after_seconds"], 37)
                     self.assertNotIn("matching server not found", payload["error"])
-                    maintenance_lookup.assert_called_once_with(
-                        expected_uid=0
-                    )
+                    maintenance_lookup.assert_called_once_with()
                     with (
                         mock.patch.object(
                             dev_coordinator,
@@ -1278,7 +1320,7 @@ class BrokerProfileTrustTests(unittest.TestCase):
                     reserve_stop.assert_not_called()
                     stop_pid.assert_not_called()
 
-    def test_system_stop_allows_exact_enrolled_owner_to_reach_existing_lifecycle(self) -> None:
+    def test_system_stop_allows_exact_configured_owner_to_reach_existing_lifecycle(self) -> None:
         class ExistingLifecycleReached(RuntimeError):
             pass
 
@@ -1287,7 +1329,7 @@ class BrokerProfileTrustTests(unittest.TestCase):
             repository_root.mkdir(mode=0o700)
             (repository_root / ".git").mkdir(mode=0o700)
             document = profile_document(repository_root)
-            document["clients"][str(UID)]["repositories"][0]["servers"] = {
+            document["repositories"][0]["servers"] = {
                 "devops-console": "server-console"
             }
             profile = profile_from_document(document, effective_uid=UID)
@@ -1306,7 +1348,7 @@ class BrokerProfileTrustTests(unittest.TestCase):
 
             def load_profile(*, required: bool = False) -> BrokerClientProfile:
                 self.assertTrue(required)
-                events.append("broker_enrollment")
+                events.append("broker_configuration")
                 return profile
 
             def journal_lookup(_options: object) -> dict[str, object]:
@@ -1377,7 +1419,7 @@ class BrokerProfileTrustTests(unittest.TestCase):
             self.assertEqual(
                 events,
                 [
-                    "broker_enrollment",
+                    "broker_configuration",
                     "journal_lookup",
                     "journal_store",
                     "reservation",
@@ -1392,7 +1434,7 @@ class BrokerProfileTrustTests(unittest.TestCase):
             (repository_root / ".git").mkdir(mode=0o700)
             profile = parsed_profile(repository_root)
             payload = {
-                "schema_version": 2,
+                "schema_version": 3,
                 "repositories": [],
                 "docker": {"available": None, "containers": [], "postgres": []},
                 "postgres": [],
@@ -1436,14 +1478,35 @@ class BrokerProfileTrustTests(unittest.TestCase):
             )
             self.assertEqual(result["authority"]["scope"], "server-wide")
 
-    def test_project_inventory_selects_the_requested_broker_enrollment(self) -> None:
+    def test_server_wide_inventory_rejects_host_observation_schema(self) -> None:
+        with CanonicalTemporaryDirectory(".broker-inventory-schema-") as root:
+            repository_root = root / "repository"
+            repository_root.mkdir(mode=0o700)
+            (repository_root / ".git").mkdir(mode=0o700)
+            profile = parsed_profile(repository_root)
+            with (
+                mock.patch.object(
+                    dev_coordinator,
+                    "configured_broker_profile",
+                    return_value=profile,
+                ),
+                mock.patch.object(
+                    BrokerClientProfile,
+                    "inventory",
+                    return_value={"schema_version": 2},
+                ),
+                self.assertRaisesRegex(BrokerError, "schema-v3 graph"),
+            ):
+                dev_coordinator.broker_authority_inventory()
+
+    def test_project_inventory_selects_the_requested_broker_configuration(self) -> None:
         with CanonicalTemporaryDirectory(".broker-project-inventory-") as root:
             repository_root = root / "GlobalFinance"
             repository_root.mkdir(mode=0o700)
             (repository_root / ".git").mkdir(mode=0o700)
             profile = parsed_profile(repository_root)
             payload = {
-                "schema_version": 2,
+                "schema_version": 3,
                 "repositories": [],
                 "docker": {"available": None, "containers": [], "postgres": []},
                 "postgres": [],
@@ -1491,7 +1554,7 @@ class BrokerProfileTrustTests(unittest.TestCase):
             "pid_alive": None,
         }
         payload = {
-            "schema_version": 2,
+            "schema_version": 3,
             "v1_compatibility": {
                 "urls": [],
                 "servers": [
@@ -1609,7 +1672,7 @@ class BrokerProfileTrustTests(unittest.TestCase):
             "identity": identity,
         }
         payload = {
-            "schema_version": 2,
+            "schema_version": 3,
             "v1_compatibility": {
                 "urls": [],
                 "servers": [
@@ -1680,7 +1743,7 @@ class BrokerProfileTrustTests(unittest.TestCase):
     def test_registration_inventory_uses_target_scoped_broker_in_system_mode(self) -> None:
         project = "/repos/alpha"
         payload = {
-            "schema_version": 2,
+            "schema_version": 3,
             "v1_compatibility": {
                 "urls": [],
                 "servers": [],
@@ -2171,10 +2234,9 @@ class BrokerProfileTrustTests(unittest.TestCase):
                 path=trusted,
                 effective_uid=UID,
                 required=True,
-                trusted_owner_uid=UID,
             )
             self.assertIsNotNone(loaded)
-            self.assertEqual(loaded.account_id, "account-alpha")
+            self.assertEqual(len(loaded.repositories), 1)
 
             symlink = root / "profile-link.json"
             symlink.symlink_to(trusted)
@@ -2183,7 +2245,6 @@ class BrokerProfileTrustTests(unittest.TestCase):
                     path=symlink,
                     effective_uid=UID,
                     required=True,
-                    trusted_owner_uid=UID,
                 )
 
     def test_profile_metadata_is_not_a_local_authorization_gate(self) -> None:
@@ -2213,14 +2274,12 @@ class BrokerProfileTrustTests(unittest.TestCase):
                 loaded = load_broker_profile(
                     effective_uid=UID,
                     required=True,
-                    trusted_owner_uid=0,
                 )
 
                 explicit = load_broker_profile(
                     path=profile,
                     effective_uid=UID,
                     required=True,
-                    trusted_owner_uid=0,
                 )
 
                 with mock.patch.dict(
@@ -2230,13 +2289,12 @@ class BrokerProfileTrustTests(unittest.TestCase):
                     configured = load_broker_profile(
                         effective_uid=UID,
                         required=True,
-                        trusted_owner_uid=0,
                     )
 
             self.assertIsNotNone(loaded)
             self.assertIsNotNone(explicit)
             self.assertIsNotNone(configured)
-            self.assertEqual(loaded.account_id, "account-alpha")
+            self.assertEqual(len(loaded.repositories), 1)
 
             replaceable = root / "replaceable"
             replaceable.mkdir(mode=0o700)
@@ -2250,55 +2308,9 @@ class BrokerProfileTrustTests(unittest.TestCase):
                 path=nested,
                 effective_uid=UID,
                 required=True,
-                trusted_owner_uid=UID,
             )
             self.assertIsNotNone(shared)
-            self.assertEqual(shared.account_id, "account-alpha")
-
-    def test_exact_and_host_profile_views_keep_repository_account_routing(self) -> None:
-        with CanonicalTemporaryDirectory(".broker-profile-expiry-") as root:
-            repository = root / "repository"
-            repository.mkdir()
-            stale = profile_document(
-                repository, valid_until_epoch=int(time.time()) - 1
-            )
-            stale_profile = profile_from_document(stale, effective_uid=UID)
-            self.assertEqual(
-                stale_profile.repository(str(repository)).repo_id,
-                "repo-alpha",
-            )
-
-            current = profile_document(repository)
-            other_uid = UID + 1
-            other = dict(current["clients"][str(UID)])
-            other["account_id"] = "account-newer"
-            other["valid_until_epoch"] = int(time.time()) + 100_000
-            other["repositories"] = [dict(other["repositories"][0])]
-            other["repositories"][0]["account_id"] = "account-newer"
-            current["clients"][str(other_uid)] = other
-            exact = profile_from_document(current, effective_uid=UID)
-            self.assertEqual(exact.account_id, "account-alpha")
-            self.assertEqual(len(exact.repositories), 1)
-
-            merged = host_profile_from_document(current, effective_uid=UID)
-            self.assertEqual(merged.client_uid, UID)
-            self.assertEqual(merged.account_id, "account-alpha")
-            selected = merged.repository(str(repository))
-            self.assertEqual(selected.repo_id, "repo-alpha")
-            self.assertEqual(selected.account_id, "account-alpha")
-
-            fallback = host_profile_from_document(
-                current, effective_uid=other_uid + 1
-            ).repository(str(repository))
-            self.assertEqual(fallback.account_id, "account-alpha")
-
-            other["repositories"][0]["generation"] = 8
-            current["clients"][str(other_uid)] = other
-            newer_generation = host_profile_from_document(
-                current, effective_uid=UID
-            ).repository(str(repository))
-            self.assertEqual(newer_generation.generation, 8)
-            self.assertEqual(newer_generation.account_id, "account-newer")
+            self.assertEqual(len(shared.repositories), 1)
 
     def test_profile_parsers_reject_one_malformed_repository_atomically(self) -> None:
         with CanonicalTemporaryDirectory(".broker-profile-atomic-") as root:
@@ -2307,15 +2319,11 @@ class BrokerProfileTrustTests(unittest.TestCase):
             first.mkdir()
             second.mkdir()
             document = profile_document(first)
-            other_uid = UID + 1
-            other_client = json.loads(json.dumps(document["clients"][str(UID)]))
-            other_client["account_id"] = "account-other"
-            other_repository = other_client["repositories"][0]
+            other_repository = json.loads(json.dumps(document["repositories"][0]))
             other_repository["canonical_root"] = str(second)
             other_repository["repo_id"] = "repo-other"
-            other_repository["account_id"] = "account-other"
             del other_repository["ephemeral_secret_policies"]
-            document["clients"][str(other_uid)] = other_client
+            document["repositories"].append(other_repository)
 
             for parser in (profile_from_document, host_profile_from_document):
                 with self.subTest(parser=parser.__name__), self.assertRaisesRegex(
@@ -2323,66 +2331,14 @@ class BrokerProfileTrustTests(unittest.TestCase):
                 ):
                     parser(document, effective_uid=UID)
 
-    def test_profile_parsers_reject_one_malformed_client_atomically(self) -> None:
-        with CanonicalTemporaryDirectory(".broker-client-atomic-") as root:
-            document = profile_document(root)
-            other_uid = UID + 1
-            document["clients"][str(other_uid)] = {
-                "account_id": "account-other",
-                "issued_at": "2026-07-14T00:00:00Z",
-                "valid_until_epoch": int(time.time()) + 3600,
-            }
-
-            for parser in (profile_from_document, host_profile_from_document):
-                with self.subTest(parser=parser.__name__), self.assertRaisesRegex(
-                    BrokerProfileError, "client profile fields are invalid"
-                ):
-                    parser(document, effective_uid=UID)
-
-    def test_repository_expiry_is_informational_across_profile(self) -> None:
-        with CanonicalTemporaryDirectory(".broker-repository-expiry-") as root:
-            first = root / "first"
-            second = root / "second"
-            first.mkdir()
-            second.mkdir()
-            now = int(time.time())
-            document = profile_document(first, valid_until_epoch=now + 7_200)
-            client = document["clients"][str(UID)]
-            repositories = client["repositories"]
-            first_repository = repositories[0]
-            first_repository.update(
-                {
-                    "account_id": "account-alpha",
-                    "enabled": True,
-                    "issued_at": "2026-07-14T00:00:00Z",
-                    "valid_until_epoch": now - 1,
-                }
-            )
-            second_repository = dict(first_repository)
-            second_repository.update(
-                {
-                    "canonical_root": str(second),
-                    "repo_id": "repo-beta",
-                    "valid_until_epoch": now + 7_200,
-                }
-            )
-            repositories.append(second_repository)
-            client["valid_until_epoch"] = now + 7_200
-
-            profile = profile_from_document(document, effective_uid=UID)
-
-            self.assertEqual(profile.repository(str(first)).repo_id, "repo-alpha")
-            self.assertEqual(profile.repository(str(second)).repo_id, "repo-beta")
-
-    def test_inventory_routes_only_through_explicit_enrolled_repository(self) -> None:
+    def test_inventory_routes_only_through_explicit_configured_repository(self) -> None:
         with CanonicalTemporaryDirectory(".broker-inventory-route-") as root:
             unrelated = root / "DevCoordinator"
             requested = root / "GlobalFinance"
             unrelated.mkdir()
             requested.mkdir()
             document = profile_document(unrelated)
-            client = document["clients"][str(UID)]
-            repositories = client["repositories"]
+            repositories = document["repositories"]
             requested_repository = dict(repositories[0])
             requested_repository.update(
                 {
@@ -2411,7 +2367,7 @@ class BrokerProfileTrustTests(unittest.TestCase):
                     (repository.repo_id, resource_id, operation, arguments)
                 )
                 if repository.repo_id != "repo-globalfinance":
-                    raise AssertionError("inventory used an unrelated enrollment")
+                    raise AssertionError("inventory used an unrelated configuration")
                 return "operation-inventory", {"routed_via": repository.repo_id}
 
             with mock.patch.object(BrokerClientProfile, "call", new=call):
@@ -2431,8 +2387,8 @@ class BrokerProfileTrustTests(unittest.TestCase):
             )
 
             with mock.patch.object(BrokerClientProfile, "call") as broker_call:
-                with self.assertRaisesRegex(BrokerProfileError, "not enrolled"):
-                    profile.inventory(canonical_root=str(root / "not-enrolled"))
+                with self.assertRaisesRegex(BrokerProfileError, "not configured"):
+                    profile.inventory(canonical_root=str(root / "not-configured"))
             broker_call.assert_not_called()
 
     def test_repository_lookup_and_resource_mappings_are_exact(self) -> None:
@@ -2441,18 +2397,18 @@ class BrokerProfileTrustTests(unittest.TestCase):
             repository.mkdir()
             profile = parsed_profile(repository)
 
-            enrolled = profile.repository(str(repository / "."))
-            self.assertEqual(enrolled.repo_id, REPO_ID)
-            self.assertEqual(enrolled.server_id("web"), "server-web")
-            self.assertEqual(enrolled.container_id("postgres"), "container-postgres")
-            self.assertEqual(enrolled.compose_id(), "compose-alpha")
+            configured = profile.repository(str(repository / "."))
+            self.assertEqual(configured.repo_id, REPO_ID)
+            self.assertEqual(configured.server_id("web"), "server-web")
+            self.assertEqual(configured.container_id("postgres"), "container-postgres")
+            self.assertEqual(configured.compose_id(), "compose-alpha")
 
-            with self.assertRaisesRegex(BrokerProfileError, "not enrolled"):
+            with self.assertRaisesRegex(BrokerProfileError, "not configured"):
                 profile.repository(str(root / "other-repository"))
-            with self.assertRaisesRegex(BrokerProfileError, "server 'api'.*not enrolled"):
-                enrolled.server_id("api")
-            with self.assertRaisesRegex(BrokerProfileError, "Docker resource.*not enrolled"):
-                enrolled.container_id("foreign-container")
+            with self.assertRaisesRegex(BrokerProfileError, "server 'api'.*not configured"):
+                configured.server_id("api")
+            with self.assertRaisesRegex(BrokerProfileError, "Docker resource.*not configured"):
+                configured.container_id("foreign-container")
 
     def test_call_binds_profile_database_generation_to_request(self) -> None:
         captured: list[object] = []
@@ -2469,9 +2425,6 @@ class BrokerProfileTrustTests(unittest.TestCase):
         operation_id = str(uuid.uuid4())
         service = BrokerServiceProfile(
             socket_path=Path("/run/devcoordinator-authority.sock"),
-            service_uid=17,
-            socket_gid=62000,
-            socket_mode=0o660,
             database_generation=DATABASE_GENERATION,
         )
         with mock.patch.object(
@@ -2498,12 +2451,7 @@ class BrokerProfileTrustTests(unittest.TestCase):
             [
                 (
                     Path("/run/devcoordinator-authority.sock"),
-                    {
-                        "expected_broker_uid": 17,
-                        "expected_socket_gid": 62000,
-                        "expected_socket_mode": 0o660,
-                        "timeout_seconds": 10.0,
-                    },
+                    {"timeout_seconds": 10.0},
                 )
             ],
         )
@@ -2536,9 +2484,6 @@ class BrokerProfileTrustTests(unittest.TestCase):
 
         service = BrokerServiceProfile(
             socket_path=Path("/run/devcoordinator-authority.sock"),
-            service_uid=17,
-            socket_gid=62000,
-            socket_mode=0o660,
             database_generation=DATABASE_GENERATION,
         )
         cases = (
@@ -2626,6 +2571,13 @@ class BrokerProfileTrustTests(unittest.TestCase):
                 ),
                 1077.0,
             )
+            self.assertEqual(
+                broker_profile_module._broker_client_timeout_seconds(
+                    BrokerOperation.REPOSITORY_ENSURE,
+                    arguments={},
+                ),
+                60.0,
+            )
             for invalid_arguments in (
                 None,
                 {},
@@ -2661,9 +2613,6 @@ class BrokerProfileTrustTests(unittest.TestCase):
 
         service = BrokerServiceProfile(
             socket_path=Path("/run/devcoordinator-authority.sock"),
-            service_uid=17,
-            socket_gid=62000,
-            socket_mode=0o660,
             database_generation=DATABASE_GENERATION,
         )
         with mock.patch.object(
@@ -2891,7 +2840,7 @@ class SystemBrokerOnlyPortAndRuntimeTests(unittest.TestCase):
             }
         ]
         inventory = {
-            "schema_version": 2,
+            "schema_version": 3,
             "v1_compatibility": {
                 "servers": servers,
                 "leases": [],
@@ -3073,7 +3022,7 @@ class SystemBrokerOnlyPortAndRuntimeTests(unittest.TestCase):
         adopted_root = str(self.repository_root.parent / "design-doc-engine")
         document = profile_document(self.repository_root)
         repository_document = dict(
-            document["clients"][str(UID)]["repositories"][0]
+            document["repositories"][0]
         )
         repository_document.update(
             {
@@ -3083,7 +3032,6 @@ class SystemBrokerOnlyPortAndRuntimeTests(unittest.TestCase):
                 "servers": {"design-doc": "server-design-doc"},
                 "containers": {},
                 "compose_definition_id": None,
-                "account_id": "repository-owner-route",
             }
         )
         artifact_id = "55555555-5555-4555-8555-555555555555"
@@ -3092,18 +3040,18 @@ class SystemBrokerOnlyPortAndRuntimeTests(unittest.TestCase):
         def broker_call(**kwargs: object) -> tuple[str, dict[str, object]]:
             calls.append(dict(kwargs))
             if kwargs["operation"] == BrokerOperation.REPOSITORY_RESOLVE:
-                self.assertEqual(kwargs["account_id"], self.repository.account_id)
+                self.assertEqual(kwargs["account_id"], "local")
                 self.assertEqual(kwargs["repo_id"], self.repository.repo_id)
                 return "operation-resolve", {
                     "schema_version": 1,
                     "ok": True,
-                    "state": "enrolled",
+                    "state": "available",
                     "repository": repository_document,
                 }
             self.assertEqual(kwargs["operation"], BrokerOperation.RUNTIME_REQUEST)
             self.assertEqual(kwargs["resource_id"], "server-design-doc")
             self.assertEqual(kwargs["repo_id"], "repo-design-doc-engine")
-            self.assertEqual(kwargs["account_id"], "repository-owner-route")
+            self.assertEqual(kwargs["account_id"], "local")
             return "operation-capture", {
                 "schema_version": 1,
                 "ok": True,
@@ -3160,12 +3108,9 @@ class SystemBrokerOnlyPortAndRuntimeTests(unittest.TestCase):
             [call["operation"] for call in calls],
             [BrokerOperation.REPOSITORY_RESOLVE, BrokerOperation.RUNTIME_REQUEST],
         )
-        self.assertEqual(calls[0]["account_id"], self.repository.account_id)
-        self.assertEqual(calls[1]["account_id"], "repository-owner-route")
-        self.assertEqual(
-            self.profile.repository(adopted_root).account_id,
-            "repository-owner-route",
-        )
+        self.assertEqual(calls[0]["account_id"], "local")
+        self.assertEqual(calls[1]["account_id"], "local")
+        self.assertEqual(self.profile.repository(adopted_root).repo_id, "repo-design-doc-engine")
 
     def test_system_runtime_remove_and_account_artifact_never_open_client_store(self) -> None:
         request = {
@@ -3284,47 +3229,11 @@ class BrokerAwarePortReleaseFallbackTests(unittest.TestCase):
         )
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0]["service"], self.profile.service)
-        self.assertEqual(calls[0]["account_id"], "account-alpha")
+        self.assertEqual(calls[0]["account_id"], "local")
         self.assertEqual(calls[0]["repo_id"], REPO_ID)
         self.assertEqual(calls[0]["resource_id"], broker_lease_id)
         self.assertEqual(calls[0]["operation"], BrokerOperation.PORT_RELEASE)
         self.assertIsNone(calls[0]["arguments"])
-
-    def test_broker_only_release_propagates_cross_account_or_repo_denial(self) -> None:
-        calls: list[dict[str, object]] = []
-
-        def call_broker(**kwargs: object) -> tuple[str, dict[str, object]]:
-            calls.append(dict(kwargs))
-            raise BrokerError(
-                "resource_access_denied",
-                "The exact lease belongs to another account or repository.",
-            )
-
-        with (
-            self._client_journal(),
-            mock.patch.object(
-                dev_coordinator,
-                "configured_broker_context",
-                return_value=(self.profile, self.repository),
-            ),
-            mock.patch.object(
-                broker_profile_module,
-                "call_broker",
-                side_effect=call_broker,
-            ),
-            self.assertRaisesRegex(BrokerError, "another account or repository"),
-        ):
-            self._release("broker-foreign-lease")
-
-        self.assertEqual(len(calls), 1)
-        self.assertEqual(calls[0]["account_id"], "account-alpha")
-        self.assertEqual(calls[0]["repo_id"], REPO_ID)
-        self.assertEqual(calls[0]["resource_id"], "broker-foreign-lease")
-        self.assertEqual(calls[0]["operation"], BrokerOperation.PORT_RELEASE)
-        with AccountStore.open_default(self.client_home) as store:
-            self.assertEqual(
-                NormalizedPortLifecycle(store).list_leases(active_only=False), []
-            )
 
     def test_broker_only_release_refuses_missing_or_invalid_profile(self) -> None:
         with self._client_journal(), mock.patch.object(
@@ -3431,22 +3340,6 @@ class BrokerLinkStoreTests(unittest.TestCase):
                 ) VALUES (?, ?, ?, 'Alpha', 'active', 7, ?, ?)
                 """,
                 (REPO_ID, host_id, str(self.repository_root), now, now),
-            )
-            establish_repository_owner_authority(
-                connection,
-                repository_id=REPO_ID,
-                owner_uid=UID,
-                repository_generation=7,
-                operation_id="fixture-repository-owner-alpha",
-                actor="fixture",
-                reason="broker link fixture owner authority",
-                timestamp=now,
-                evidence={
-                    "kind": "broker-link-fixture-owner",
-                    "repository_id": REPO_ID,
-                    "repository_generation": 7,
-                    "owner_uid": UID,
-                },
             )
             connection.execute(
                 """
@@ -4157,19 +4050,13 @@ class BrokerLinkStoreTests(unittest.TestCase):
             canonical_root=str(self.repository_root),
             repo_id="repo-foreign",
             generation=0,
-            owner_uid=1000,
             server_ids={"web": "server-web"},
             container_ids={},
             compose_definition_id=None,
             compose_container_ids=frozenset(),
             compose_run_once_services={},
             ephemeral_templates={},
-            ephemeral_image_prefetch_template_ids=frozenset(),
             ephemeral_secret_policies={},
-            account_id="account-alpha",
-            enabled=True,
-            issued_at="2026-07-14T00:00:00Z",
-            valid_until_epoch=int(time.time()) + 3600,
         )
         with self.assertRaisesRegex(RuntimeError, "does not match"):
             self.links.reserve_lease(
@@ -4281,28 +4168,16 @@ class BrokerLinkStoreTests(unittest.TestCase):
             canonical_root=self.repository.canonical_root,
             repo_id=self.repository.repo_id,
             generation=self.repository.generation,
-            owner_uid=self.repository.owner_uid,
             server_ids={**self.repository.server_ids, "worker": "server-worker-v2"},
             container_ids=self.repository.container_ids,
             compose_definition_id=self.repository.compose_definition_id,
             compose_container_ids=self.repository.compose_container_ids,
             compose_run_once_services=self.repository.compose_run_once_services,
             ephemeral_templates=self.repository.ephemeral_templates,
-            ephemeral_image_prefetch_template_ids=(
-                self.repository.ephemeral_image_prefetch_template_ids
-            ),
             ephemeral_secret_policies=self.repository.ephemeral_secret_policies,
-            account_id=self.repository.account_id,
-            enabled=self.repository.enabled,
-            issued_at=self.repository.issued_at,
-            valid_until_epoch=self.repository.valid_until_epoch,
         )
         replacement_profile = BrokerClientProfile(
             service=self.profile.service,
-            client_uid=self.profile.client_uid,
-            account_id=self.profile.account_id,
-            issued_at=self.profile.issued_at,
-            valid_until_epoch=self.profile.valid_until_epoch,
             repositories={
                 replacement_repository.canonical_root: replacement_repository
             },

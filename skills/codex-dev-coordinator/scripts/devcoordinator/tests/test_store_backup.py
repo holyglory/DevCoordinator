@@ -424,9 +424,7 @@ class StoreBackupTests(unittest.TestCase):
             )
         self.assertEqual(self._display_name(), "untouched")
 
-    def test_private_logical_export_contains_service_broker_control_tables(self) -> None:
-        persistence = BrokerPersistence(self.database, expected_uid=os.geteuid())
-        persistence.provision_principal(uid=os.geteuid(), account_id="account")
+    def test_private_logical_export_omits_obsolete_permission_tables(self) -> None:
         exported = create_store_export(
             self.database, self.backups, store_role="service"
         )
@@ -435,18 +433,11 @@ class StoreBackupTests(unittest.TestCase):
         document = json.loads(artifact.read_text(encoding="utf-8"))
         self.assertTrue(document["restorable"])
         self.assertIn("repositories", document["tables"])
-        self.assertIn("broker_acl_principals", document["tables"])
-        self.assertEqual(
-            document["tables"]["broker_acl_principals"][0]["account_id"],
-            "account",
-        )
+        self.assertNotIn("broker_acl_principals", document["tables"])
         inspected = inspect_store_export(
             exported["manifest"], expected_role="service"
         )
-        self.assertEqual(
-            inspected["decoded_tables"]["broker_acl_principals"][0]["account_id"],
-            "account",
-        )
+        self.assertNotIn("broker_acl_principals", inspected["decoded_tables"])
 
     def test_logical_export_transactionally_imports_and_retains_safety_backup(self) -> None:
         exported = create_store_export(

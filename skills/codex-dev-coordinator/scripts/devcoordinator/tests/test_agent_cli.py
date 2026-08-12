@@ -67,6 +67,7 @@ class AgentCliTests(unittest.TestCase):
         cases = (
             ["capabilities", "--project", "/repo"],
             ["targets", "--project", "/repo"],
+            ["storage", "inventory", "--project", "/repo"],
             ["runtime", "status", "service-1", "--project", "/repo"],
             [
                 "runtime",
@@ -87,6 +88,11 @@ class AgentCliTests(unittest.TestCase):
             ["test", "enqueue", "--project", "/repo"],
             ["test", "submit", "plan-1", "--project", "/repo"],
             ["test", "follow", "run-1", "--project", "/repo"],
+            ["test", "failures", "run-1", "--project", "/repo"],
+            ["test", "artifact", "run-1", "artifact-1", "--project", "/repo"],
+            ["test", "status", "run-1", "--project", "/repo"],
+            ["test", "summary", "run-1", "--project", "/repo"],
+            ["test", "wait", "run-1", "--timeout-seconds", "1", "--project", "/repo"],
         )
         for argv in cases:
             with self.subTest(argv=argv):
@@ -168,11 +174,11 @@ class AgentCliTests(unittest.TestCase):
             namespace = agent_cli._parser().parse_args(["capabilities"])
             result = agent_cli._execute(namespace)
         self.assertTrue(result["ok"])
-        self.assertEqual(result["repository"]["state"], "enrolled")
+        self.assertEqual(result["repository"]["state"], "configured")
         self.assertEqual(result["repository"]["id"], "repo-1")
         self.assertNotIn("root", result["repository"])
 
-    def test_unenrolled_capabilities_are_pure_and_advertise_bootstrap(self) -> None:
+    def test_unconfigured_capabilities_are_pure_and_advertise_bootstrap(self) -> None:
         profile = mock.Mock()
         profile.resolve_repository.return_value = None
         capabilities = {
@@ -193,13 +199,13 @@ class AgentCliTests(unittest.TestCase):
             )
 
         self.assertTrue(result["ok"])
-        self.assertEqual(result["repository"]["state"], "unenrolled")
+        self.assertEqual(result["repository"]["state"], "unconfigured")
         self.assertTrue(result["repository"]["bootstrap_supported"])
         self.assertNotIn("id", result["repository"])
         profile.repository.assert_not_called()
         profile.inventory.assert_not_called()
 
-    def test_unenrolled_targets_are_empty_without_inventory_or_mutation(self) -> None:
+    def test_unconfigured_targets_are_empty_without_inventory_or_mutation(self) -> None:
         profile = mock.Mock()
         profile.resolve_repository.return_value = None
 
@@ -211,13 +217,13 @@ class AgentCliTests(unittest.TestCase):
             limit=4,
         )
 
-        self.assertEqual(result["repository"]["state"], "unenrolled")
+        self.assertEqual(result["repository"]["state"], "unconfigured")
         self.assertTrue(result["repository"]["bootstrap_supported"])
         self.assertEqual(result["target_count"], 0)
         self.assertEqual(result["targets"], [])
         profile.inventory.assert_not_called()
 
-    def test_unenrolled_target_selector_explains_first_use_bootstrap(self) -> None:
+    def test_unconfigured_target_selector_explains_first_use_bootstrap(self) -> None:
         profile = mock.Mock()
         profile.resolve_repository.return_value = None
 
@@ -230,15 +236,236 @@ class AgentCliTests(unittest.TestCase):
                 limit=4,
             )
 
-        self.assertEqual(raised.exception.code, "repository_unenrolled")
+        self.assertEqual(raised.exception.code, "repository_unconfigured")
         self.assertEqual(
             raised.exception.classification, "repository_bootstrap_required"
         )
         profile.inventory.assert_not_called()
 
-    def test_unenrolled_error_is_actionable_without_claiming_broker_failure(self) -> None:
+    def test_storage_inventory_returns_only_current_repository_attribution(self) -> None:
+        repository = mock.Mock(repo_id="repo-1")
+        profile = mock.Mock()
+        profile.resolve_repository.return_value = repository
+        profile.inventory.return_value = {
+            "docker_storage": {
+                "available": True,
+                "sampled_at": "2026-08-09T00:00:00Z",
+                "evidence_fingerprint": "sha256:" + "a" * 64,
+                "projects": [
+                    {
+                        "repo_id": "repo-1",
+                        "exclusive_physical_bytes": 10,
+                        "referenced_shared_bytes": 2,
+                        "components": {"container_writable_bytes": 10},
+                    },
+                    {"repo_id": "repo-2", "exclusive_physical_bytes": 999},
+                ],
+                "cleanup_plans": [
+                    {
+                        "target_kind": "container",
+                        "target_id": "container-1",
+                        "project_ids": ["repo-1"],
+                        "reclaimable_bytes": 10,
+                    },
+                    {
+                        "target_kind": "container",
+                        "target_id": "container-2",
+                        "project_ids": ["repo-2"],
+                        "reclaimable_bytes": 999,
+                    },
+                ],
+            }
+        }
+
+        result = agent_cli._storage(
+            agent_cli._parser().parse_args(["storage", "inventory"]),
+            profile=profile,
+            context=_Context(),
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["repository"]["repo_id"], "repo-1")
+        self.assertEqual(result["cleanup_plan_count"], 1)
+        self.assertEqual(result["cleanup_plans"][0]["target_id"], "container-1")
+
+    def test_storage_remove_deletes_one_selected_container_without_plan(self) -> None:
+        from devcoordinator.broker import BrokerOperation
+
+        operation_id = "00000000-0000-4000-8000-000000000123"
+        repository = mock.Mock(repo_id="repo-1")
+        profile = mock.Mock()
+        profile.resolve_repository.return_value = repository
+        profile.call.return_value = (
+            operation_id,
+            {
+                "ok": True,
+                "status": "removed",
+                "target_kind": "container",
+                "target_id": "container-1",
+                "full_container_id": "b" * 64,
+            },
+        )
+
+        execution_state = {
+            "broker_contacted": False,
+            "mutation_performed": False,
+        }
+        result = agent_cli._storage(
+            agent_cli._parser().parse_args(
+                [
+                    "storage",
+                    "remove",
+                    "container",
+                    "container-1",
+                    "--reason",
+                    "obsolete one-off",
+                    "--operation-id",
+                    operation_id,
+                ]
+            ),
+            profile=profile,
+            context=_Context(),
+            execution_state=execution_state,
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(execution_state["broker_contacted"])
+        self.assertTrue(execution_state["mutation_performed"])
+        self.assertEqual(result["status"], "removed")
+        profile.inventory.assert_not_called()
+        profile.call.assert_called_once_with(
+            repository=repository,
+            resource_id="container-1",
+            operation=BrokerOperation.CONTAINER_REMOVE,
+            arguments={
+                "target_id": "container-1",
+                "reason": "obsolete one-off",
+            },
+            operation_id=operation_id,
+        )
+
+    def test_storage_plan_creates_one_durable_confirmation_bound_volume_plan(self) -> None:
+        from devcoordinator.broker import BrokerOperation
+
+        operation_id = "00000000-0000-4000-8000-000000000125"
+        repository = mock.Mock(repo_id="repo-1")
+        profile = mock.Mock()
+        profile.resolve_repository.return_value = repository
+        profile.inventory.return_value = {
+            "docker_storage": {
+                "available": True,
+                "sampled_at": "2026-08-09T00:00:00Z",
+                "evidence_fingerprint": "sha256:" + "a" * 64,
+                "projects": [{"repo_id": "repo-1"}],
+                "cleanup_plans": [
+                    {
+                        "target_kind": "volume",
+                        "target_id": "example_data",
+                        "project_ids": ["repo-1"],
+                        "proof": [
+                            "unreferenced_by_any_container",
+                            "exclusive_project_ownership",
+                            "exact_identity",
+                        ],
+                        "apply_supported": True,
+                    }
+                ],
+            }
+        }
+        profile.call.return_value = (
+            operation_id,
+            {
+                "plan_id": operation_id,
+                "plan_fingerprint": "sha256:" + "c" * 64,
+                "confirmation_phrase": "PURGE VOLUME example_data",
+                "status": "planned",
+            },
+        )
+
+        result = agent_cli._storage(
+            agent_cli._parser().parse_args(
+                [
+                    "storage",
+                    "plan",
+                    "volume",
+                    "example_data",
+                    "--reason",
+                    "retired project data",
+                    "--operation-id",
+                    operation_id,
+                ]
+            ),
+            profile=profile,
+            context=_Context(),
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["plan"]["confirmation_phrase"], "PURGE VOLUME example_data")
+        profile.call.assert_called_once_with(
+            repository=repository,
+            resource_id="example_data",
+            operation=BrokerOperation.CLEANUP_PLAN,
+            arguments={
+                "action": "purge",
+                "target_kind": "volume",
+                "target_id": "example_data",
+                "reason": "retired project data",
+            },
+            operation_id=operation_id,
+        )
+
+    def test_storage_apply_uses_only_the_exact_durable_plan(self) -> None:
+        from devcoordinator.broker import BrokerOperation
+
+        operation_id = "00000000-0000-4000-8000-000000000124"
+        plan_id = "00000000-0000-4000-8000-000000000123"
+        plan_fingerprint = "sha256:" + "c" * 64
+        confirmation = "PURGE CONTAINER example-run-1"
+        repository = mock.Mock(repo_id="repo-1")
+        profile = mock.Mock()
+        profile.resolve_repository.return_value = repository
+        profile.call.return_value = (
+            operation_id,
+            {"ok": True, "status": "succeeded", "target_absent": True},
+        )
+
+        result = agent_cli._storage(
+            agent_cli._parser().parse_args(
+                [
+                    "storage",
+                    "apply",
+                    "--plan",
+                    plan_id,
+                    "--fingerprint",
+                    plan_fingerprint,
+                    "--confirm",
+                    confirmation,
+                    "--operation-id",
+                    operation_id,
+                ]
+            ),
+            profile=profile,
+            context=_Context(),
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["continuation"], f"dc1:operation:{operation_id}")
+        profile.inventory.assert_not_called()
+        profile.call.assert_called_once_with(
+            repository=repository,
+            resource_id="repo-1",
+            operation=BrokerOperation.CLEANUP_APPLY,
+            arguments={
+                "plan_id": plan_id,
+                "plan_fingerprint": plan_fingerprint,
+                "confirmation_phrase": confirmation,
+            },
+            operation_id=operation_id,
+        )
+
+    def test_unconfigured_error_is_actionable_without_claiming_broker_failure(self) -> None:
         error = agent_cli.AgentCliError(
-            "repository_unenrolled",
+            "repository_unconfigured",
             "first start-like use adopts this repository",
             classification="repository_bootstrap_required",
         )
@@ -260,7 +487,7 @@ class AgentCliTests(unittest.TestCase):
     def test_local_fallback_boundary_is_typed_as_first_use_not_broker_outage(self) -> None:
         error = BrokerProfileError(
             "repository is not adopted; local fallback is intentionally disabled",
-            code="repository_unenrolled",
+            code="repository_unconfigured",
             classification="repository_bootstrap_required",
         )
 
@@ -298,28 +525,6 @@ class AgentCliTests(unittest.TestCase):
         self.assertEqual(result["outcome"], "certain")
         self.assertIn("launch diagnostic", result["message"])
         self.assertIn("systemd unit could not start", result["next_action"])
-
-    def test_repository_access_preparation_failure_is_not_broker_outage(self) -> None:
-        operation_id = "00000000-0000-4000-8000-000000000125"
-        result = agent_cli._failure(
-            BrokerError(
-                "repository_access_normalization_failed",
-                "authority sandbox cannot update the validated working tree",
-                operation_id=operation_id,
-            ),
-            mutation_attempted=True,
-            operation_id_hint=operation_id,
-            broker_contacted=True,
-            observed_mutation=False,
-        )
-
-        self.assertEqual(result["classification"], "infrastructure_failure")
-        self.assertEqual(result["phase"], "launch")
-        self.assertEqual(result["stage"], "launch")
-        self.assertTrue(result["broker_contacted"])
-        self.assertFalse(result["mutation_performed"])
-        self.assertIn("/home write boundary", result["next_action"])
-        self.assertNotEqual(result["classification"], "broker_unavailable")
 
     def test_actual_root_execution_identity_is_an_invalid_launch_request(self) -> None:
         operation_id = "00000000-0000-4000-8000-000000000124"
@@ -467,7 +672,7 @@ class AgentCliTests(unittest.TestCase):
         )
         namespace.argv = ["/usr/bin/npm", "run", "dev"]
         profile = mock.Mock()
-        profile.repository_if_enrolled.return_value = None
+        profile.repository_if_configured.return_value = None
         profile.ensure_repository_with_outcome.side_effect = BrokerError(
             "repository_context_changed",
             "The proven repository context changed before adoption.",
@@ -580,6 +785,45 @@ class AgentCliTests(unittest.TestCase):
         )
         self.assertEqual(str(__import__("uuid").UUID(namespace.operation_id)), namespace.operation_id)
 
+    def test_test_parser_exposes_every_advertised_agent_action(self) -> None:
+        test_parser = agent_cli._parser()._subparsers._group_actions[0].choices["test"]
+        actions = test_parser._subparsers._group_actions[0].choices
+        self.assertEqual(
+            set(actions),
+            {
+                "artifact",
+                "cancel",
+                "enqueue",
+                "failures",
+                "follow",
+                "retry",
+                "status",
+                "submit",
+                "summary",
+                "wait",
+            },
+        )
+
+    def test_test_mutation_failure_always_emits_structured_stdout(self) -> None:
+        stream = mock.Mock()
+        stream.buffer = io.BytesIO()
+        stream.flush = mock.Mock()
+        failure = BrokerError("mutation_failed", "mutation was rejected")
+        with (
+            mock.patch.object(agent_cli.sys, "stdout", stream),
+            mock.patch(
+                "devcoordinator.call_journal.configured_call_journal",
+                return_value=None,
+            ),
+            mock.patch.object(agent_cli, "_execute", side_effect=failure),
+        ):
+            returncode = agent_cli.main(["test", "enqueue"])
+
+        self.assertEqual(returncode, 1)
+        result = json.loads(stream.buffer.getvalue())
+        self.assertEqual(result["code"], "mutation_failed")
+        self.assertFalse(result["ok"])
+
     def test_operation_follow_uses_the_exact_handle_and_bounded_projection(self) -> None:
         operation_id = "00000000-0000-4000-8000-000000000001"
         profile = mock.Mock()
@@ -612,12 +856,49 @@ class AgentCliTests(unittest.TestCase):
         self.assertEqual(result["operation"]["operation_id"], operation_id)
         self.assertEqual(
             result["next_command"],
-            f"devcoordinator operation follow dc1:operation:{operation_id}",
+            (
+                "devcoordinator operation --project /repo follow "
+                f"dc1:operation:{operation_id}"
+            ),
         )
         profile.operation_follow.assert_called_once_with(
             repository=profile.resolve_repository.return_value,
             operation_id=operation_id,
         )
+
+    def test_scoped_continuations_are_shell_safe_and_cwd_independent(self) -> None:
+        handle = "dc1:operation:00000000-0000-4000-8000-000000000001"
+        project = "/repo with spaces"
+
+        operation = agent_cli._operation_follow_command(
+            handle, project=project
+        )
+        test_result = agent_cli._scope_test_result(
+            {"next_command": "devcoordinator test follow dc1:run:run-1"},
+            project=project,
+        )
+        failure = agent_cli._failure(
+            BrokerError(
+                "operation_outcome_uncertain",
+                "Host outcome requires reconciliation.",
+                operation_id="00000000-0000-4000-8000-000000000001",
+            ),
+            mutation_attempted=True,
+            broker_contacted=True,
+            observed_mutation=True,
+            project_hint=project,
+        )
+
+        self.assertEqual(
+            operation,
+            "devcoordinator operation --project '/repo with spaces' follow "
+            + handle,
+        )
+        self.assertEqual(
+            test_result["next_command"],
+            "devcoordinator test follow dc1:run:run-1 --project '/repo with spaces'",
+        )
+        self.assertEqual(failure["next_command"], operation)
 
     def test_operation_follow_requires_advertised_capability(self) -> None:
         namespace = agent_cli._parser().parse_args(
@@ -777,6 +1058,221 @@ class AgentCliTests(unittest.TestCase):
             operation_id=operation_id,
         )
 
+    def test_runtime_ensure_bootstraps_exact_declared_compose_target(self) -> None:
+        operation_id = "00000000-0000-4000-8000-000000000001"
+        child_operation_id = str(
+            uuid.uuid5(uuid.UUID(operation_id), "compose.bootstrap:postgres")
+        )
+        repository = mock.Mock(repo_id="repo-1")
+        repository.compose_id.return_value = "compose-1"
+        profile = mock.Mock()
+        profile.resolve_repository.return_value = repository
+        profile.call.return_value = (child_operation_id, {"ok": True})
+        profile.runtime_ensure.return_value = {
+            "schema_version": 1,
+            "ok": True,
+            "operation_id": operation_id,
+        }
+        missing = agent_cli.AgentCliError(
+            "target_not_found", "no observed target"
+        )
+        namespace = agent_cli._parser().parse_args(
+            [
+                "runtime",
+                "ensure",
+                "postgres",
+                "--desired",
+                "ready",
+                "--operation-id",
+                operation_id,
+            ]
+        )
+        namespace.argv = []
+
+        with (
+            mock.patch.object(
+                agent_cli,
+                "_declared_compose_selector",
+                return_value=True,
+            ),
+            mock.patch.object(
+                agent_cli,
+                "_runtime_target",
+                side_effect=[missing, {"id": "database-1", "kind": "database_stack"}],
+            ),
+        ):
+            result = agent_cli._runtime(
+                namespace,
+                profile=profile,
+                capabilities={"runtime": {"ensure_states": ["ready"]}},
+                context=_Context(),
+            )
+
+        self.assertTrue(result["ok"])
+        profile.call.assert_called_once_with(
+            repository=repository,
+            resource_id="compose-1",
+            operation=mock.ANY,
+            arguments={},
+            operation_id=child_operation_id,
+        )
+        profile.runtime_ensure.assert_called_once_with(
+            repository=repository,
+            resource_id="database-1",
+            target_kind="database_stack",
+            desired_state="ready",
+            agent=mock.ANY,
+            root_repo_id="repo-1",
+            temporary_repo_id=None,
+            operation_id=operation_id,
+        )
+
+    def test_runtime_ensure_seals_missing_declared_compose_before_bootstrap(self) -> None:
+        operation_id = "00000000-0000-4000-8000-000000000001"
+        configuration_operation_id = str(
+            uuid.uuid5(
+                uuid.UUID(operation_id),
+                "repository.compose.ensure:/repo",
+            )
+        )
+        catalog_operation_id = str(
+            uuid.uuid5(
+                uuid.UUID(operation_id),
+                "repository.catalog:/repo",
+            )
+        )
+        bootstrap_operation_id = str(
+            uuid.uuid5(uuid.UUID(operation_id), "compose.bootstrap:postgres")
+        )
+        initial = mock.Mock(repo_id="repo-1")
+        initial.compose_id.side_effect = BrokerProfileError("missing Compose")
+        refreshed = mock.Mock(repo_id="repo-1")
+        refreshed.compose_id.return_value = "compose-1"
+        profile = mock.Mock()
+        profile.resolve_repository.side_effect = [initial, refreshed, refreshed]
+        profile.refresh_repository.return_value = refreshed
+        profile.ensure_repository_with_outcome.return_value = (refreshed, True)
+        profile.call.return_value = (bootstrap_operation_id, {"ok": True})
+        profile.runtime_ensure.return_value = {
+            "schema_version": 1,
+            "ok": True,
+            "operation_id": operation_id,
+        }
+        missing = agent_cli.AgentCliError(
+            "target_not_found", "no observed target"
+        )
+        namespace = agent_cli._parser().parse_args(
+            [
+                "runtime",
+                "ensure",
+                "postgres",
+                "--desired",
+                "ready",
+                "--operation-id",
+                operation_id,
+            ]
+        )
+        namespace.argv = []
+
+        with (
+            mock.patch.object(
+                agent_cli, "_declared_compose_selector", return_value=True
+            ),
+            mock.patch.object(
+                agent_cli,
+                "_runtime_target",
+                side_effect=[
+                    missing,
+                    {"id": "database-1", "kind": "database_stack"},
+                ],
+            ),
+        ):
+            result = agent_cli._runtime(
+                namespace,
+                profile=profile,
+                capabilities={"runtime": {"ensure_states": ["ready"]}},
+                context=_Context(),
+            )
+
+        self.assertTrue(result["ok"])
+        profile.ensure_repository_with_outcome.assert_has_calls(
+            [
+                mock.call(
+                    canonical_root="/repo",
+                    project_kind="primary",
+                    agent=mock.ANY,
+                    operation_id=catalog_operation_id,
+                ),
+                mock.call(
+                    canonical_root="/repo",
+                    project_kind="primary",
+                    agent=mock.ANY,
+                    operation_id=configuration_operation_id,
+                ),
+            ]
+        )
+        profile.refresh_repository.assert_called_once_with("/repo")
+        profile.call.assert_called_once_with(
+            repository=refreshed,
+            resource_id="compose-1",
+            operation=mock.ANY,
+            arguments={},
+            operation_id=bootstrap_operation_id,
+        )
+
+    def test_runtime_replace_forwards_complete_structured_definition(self) -> None:
+        operation_id = "00000000-0000-4000-8000-000000000001"
+        repository = mock.Mock(repo_id="repo-1")
+        profile = mock.Mock()
+        profile.resolve_repository.return_value = repository
+        profile.call.return_value = (
+            operation_id,
+            {"operation_id": operation_id, "resources": [], "result": {}},
+        )
+        namespace = agent_cli._parser().parse_args(
+            [
+                "runtime",
+                "replace",
+                "worker-1",
+                "--kind",
+                "service",
+                "--cwd",
+                ".",
+                "--expected-generation",
+                "4",
+                "--env",
+                "MODE=dev",
+                "--operation-id",
+                operation_id,
+            ]
+        )
+        namespace.argv = ["/usr/bin/python3", "worker.py"]
+        with (
+            mock.patch.object(
+                agent_cli,
+                "_runtime_target",
+                return_value={"id": "worker-1", "kind": "service"},
+            ),
+            mock.patch(
+                "devcoordinator.agent_projection.project_runtime_report",
+                return_value={"schema_version": 1, "ok": True},
+            ),
+        ):
+            result = agent_cli._runtime(
+                namespace,
+                profile=profile,
+                capabilities={"runtime": {"actions": ["replace"]}},
+                context=_Context(),
+            )
+
+        self.assertTrue(result["ok"])
+        arguments = profile.call.call_args.kwargs["arguments"]
+        self.assertEqual(arguments["action"], "replace")
+        self.assertEqual(arguments["expected_definition_generation"], 4)
+        self.assertEqual(arguments["argv"], ["/usr/bin/python3", "worker.py"])
+        self.assertEqual(arguments["cwd"], ".")
+        self.assertEqual(arguments["environment"], {"MODE": "dev"})
+
     def test_runtime_ensure_rejects_legacy_lifecycle_options(self) -> None:
         namespace = agent_cli._parser().parse_args(
             [
@@ -798,7 +1294,31 @@ class AgentCliTests(unittest.TestCase):
             )
         self.assertEqual(raised.exception.code, "ensure_option_forbidden")
 
-    def test_exact_enrolled_runtime_id_skips_inventory_projection(self) -> None:
+    def test_runtime_ensure_rejects_replacement_definition_options(self) -> None:
+        namespace = agent_cli._parser().parse_args(
+            [
+                "runtime",
+                "ensure",
+                "container-1",
+                "--desired",
+                "ready",
+                "--expected-generation",
+                "3",
+                "--env",
+                "MODE=dev",
+            ]
+        )
+        namespace.argv = []
+        with self.assertRaises(agent_cli.AgentCliError) as raised:
+            agent_cli._runtime(
+                namespace,
+                profile=mock.Mock(),
+                capabilities={"runtime": {"ensure_states": ["ready"]}},
+                context=_Context(),
+            )
+        self.assertEqual(raised.exception.code, "ensure_option_forbidden")
+
+    def test_exact_configured_runtime_id_skips_inventory_projection(self) -> None:
         profile = mock.Mock()
         repository = mock.Mock()
         repository.server_ids = {"api": "service-1"}

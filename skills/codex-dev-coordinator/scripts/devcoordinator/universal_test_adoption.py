@@ -1,11 +1,11 @@
 """Evidence-bound adoption of repository test manifests on one trusted host.
 
 The adoption manager never scans for repositories and never invents commands.
-An administrator supplies one explicit final manifest for each exact enrolled
+An administrator supplies one explicit final manifest for each exact configured
 repository identity. Repository inspection and mutation run through the fixed
 UID helper so framework commands execute in the repository's account context.
-UID/GID, modes and ACLs are diagnostics only; adoption attempts real reads and
-never repairs or authorizes through filesystem metadata.
+Filesystem metadata is not an authorization model. Adoption attempts real
+reads and reports unreadable content without changing repository metadata.
 """
 
 from __future__ import annotations
@@ -17,7 +17,6 @@ from pathlib import Path
 from pathlib import PurePosixPath
 import re
 import stat
-import subprocess
 import tempfile
 from time import time
 from typing import Mapping, Protocol, Sequence
@@ -30,7 +29,6 @@ from .universal_test_store import TestStoreConflict, TestStoreContractError
 ADOPTION_SCHEMA_VERSION = 1
 MAX_ADOPTION_REPOSITORIES = 512
 MAX_ADOPTION_PLAN_BYTES = 64 * 1024 * 1024
-MAX_ACL_BYTES = 64 * 1024
 AUTHORITY_REPOSITORY_EXPORT_KIND = "devcoordinator-authority-repository-export"
 AUTHORITY_REPOSITORY_EXPORT_FIELDS = frozenset(
     {"authority_generation", "repositories", "exported_at"}
@@ -39,11 +37,6 @@ _REPOSITORY_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:@/-]{0,255}$")
 _PLAN_ID = re.compile(r"^manifest-(?:adoption|safety-repair)-[0-9a-f]{32}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _SHORT_SHA256 = re.compile(r"^[0-9a-f]{16}$")
-_ACL_PERMISSION = re.compile(r"^[r-][w-][x-]$")
-_ACL_ENTRY = re.compile(
-    r"^(?:default:)?(?:user|group):(?:[0-9]+)?:[r-][w-][x-]$"
-    r"|^(?:default:)?(?:mask|other)::[r-][w-][x-]$"
-)
 _METADATA_IDENTITY_FIELDS = frozenset(
     {"device", "inode", "kind", "size"}
 )
@@ -69,7 +62,7 @@ _SAFETY_IDENTITY_FIELDS = frozenset(
 
 
 class AdoptionAuthority(Protocol):
-    def repository(self, *, repository_id: str, owner_uid: int) -> Mapping[str, object]: ...
+    def repository(self, *, repository_id: str) -> Mapping[str, object]: ...
 
 
 class AdoptionUIDHelper(Protocol):
@@ -80,14 +73,6 @@ class AdoptionUIDHelper(Protocol):
         owner_uid: int,
         arguments: Mapping[str, object],
     ) -> Mapping[str, object]: ...
-
-
-class AdoptionACLBackend(Protocol):
-    def read(self, path: Path) -> tuple[str, ...]: ...
-
-    def read_descriptor(self, descriptor: int) -> tuple[str, ...]: ...
-
-    def replace_descriptor(self, descriptor: int, entries: Sequence[str]) -> None: ...
 
 
 def _json_bytes(value: object, *, maximum: int = MAX_ADOPTION_PLAN_BYTES) -> bytes:
@@ -156,165 +141,6 @@ def _safe_relative_path(value: object) -> str:
     return path.as_posix()
 
 
-def _validate_acl_entries(value: object) -> tuple[str, ...]:
-    if (
-        not isinstance(value, Sequence)
-        or isinstance(value, (str, bytes))
-        or not 3 <= len(value) <= 1024
-        or any(not isinstance(item, str) or _ACL_ENTRY.fullmatch(item) is None for item in value)
-    ):
-        raise TestStoreContractError("manifest safety ACL is invalid")
-    entries = tuple(value)
-    if len(entries) != len(set(entries)):
-        raise TestStoreContractError("manifest safety ACL contains duplicate entries")
-    encoded = ("\n".join(entries) + "\n").encode("ascii")
-    if len(encoded) > MAX_ACL_BYTES:
-        raise TestStoreContractError("manifest safety ACL exceeds its byte bound")
-    return entries
-
-
-def _acl_permissions_union(current: str, required: str) -> str:
-    if _ACL_PERMISSION.fullmatch(current) is None or _ACL_PERMISSION.fullmatch(required) is None:
-        raise TestStoreContractError("manifest safety ACL permissions are invalid")
-    return "".join(
-        marker if left == marker or right == marker else "-"
-        for marker, left, right in zip("rwx", current, required, strict=True)
-    )
-
-
-def _grant_named_user_acl(
-    entries: Sequence[str], *, uid: int, required_permissions: str
-) -> tuple[str, ...]:
-    current = list(_validate_acl_entries(entries))
-    required = str(required_permissions)
-    if _ACL_PERMISSION.fullmatch(required) is None:
-        raise TestStoreContractError("manifest safety required ACL is invalid")
-    mask_entries = [item for item in current if item.startswith("mask::")]
-    if len(mask_entries) != 1:
-        raise TestStoreConflict(
-            "manifest safety ACL requires one existing access mask"
-        )
-    mask_permissions = mask_entries[0].rsplit(":", 1)[-1]
-    if _acl_permissions_union(mask_permissions, required) != mask_permissions:
-        raise TestStoreConflict(
-            "manifest safety ACL mask cannot grant the required owner access"
-        )
-    prefix = f"user:{uid}:"
-    matches = [index for index, item in enumerate(current) if item.startswith(prefix)]
-    if len(matches) > 1:
-        raise TestStoreContractError("manifest safety owner ACL is ambiguous")
-    if matches:
-        index = matches[0]
-        current_permissions = current[index].rsplit(":", 1)[-1]
-        current[index] = prefix + _acl_permissions_union(
-            current_permissions, required
-        )
-    else:
-        owner_indexes = [
-            index for index, item in enumerate(current) if item.startswith("user::")
-        ]
-        if len(owner_indexes) != 1:
-            raise TestStoreContractError("manifest safety ACL owner entry is invalid")
-        current.insert(owner_indexes[0] + 1, prefix + required)
-    return _validate_acl_entries(current)
-
-
-class PosixACLBackend:
-    """Read and replace one exact POSIX ACL without recursion or shell parsing."""
-
-    _GETFACL = "/usr/bin/getfacl"
-    _SETFACL = "/usr/bin/setfacl"
-    _ENVIRONMENT = {"LC_ALL": "C", "PATH": "/usr/bin:/bin"}
-
-    def _read_target(
-        self,
-        target: str,
-        *,
-        pass_fds: tuple[int, ...] = (),
-        physical: bool = True,
-    ) -> tuple[str, ...]:
-        command = [
-            self._GETFACL,
-            "--absolute-names",
-            "--numeric",
-            "--omit-header",
-            "--no-effective",
-        ]
-        if physical:
-            command.append("--physical")
-        command.append(target)
-        try:
-            result = subprocess.run(
-                command,
-                check=False,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                env=self._ENVIRONMENT,
-                pass_fds=pass_fds,
-                timeout=10,
-            )
-        except (OSError, subprocess.SubprocessError) as error:
-            raise TestStoreConflict("manifest safety ACL inspection failed") from error
-        if (
-            result.returncode != 0
-            or len(result.stdout) > MAX_ACL_BYTES
-            or len(result.stderr) > MAX_ACL_BYTES
-        ):
-            raise TestStoreConflict("manifest safety ACL inspection failed")
-        try:
-            lines = tuple(
-                line
-                for line in result.stdout.decode("ascii", errors="strict").splitlines()
-                if line
-            )
-        except UnicodeError as error:
-            raise TestStoreContractError("manifest safety ACL output is invalid") from error
-        return _validate_acl_entries(lines)
-
-    def read(self, path: Path) -> tuple[str, ...]:
-        return self._read_target(str(path))
-
-    def read_descriptor(self, descriptor: int) -> tuple[str, ...]:
-        return self._read_target(
-            f"/proc/self/fd/{descriptor}",
-            pass_fds=(descriptor,),
-            physical=False,
-        )
-
-    def replace_descriptor(self, descriptor: int, entries: Sequence[str]) -> None:
-        normalized = _validate_acl_entries(entries)
-        payload = ("\n".join(normalized) + "\n").encode("ascii")
-        target = f"/proc/self/fd/{descriptor}"
-        try:
-            result = subprocess.run(
-                [
-                    self._SETFACL,
-                    "--no-mask",
-                    "--set-file=-",
-                    "--",
-                    target,
-                ],
-                check=False,
-                input=payload,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                env=self._ENVIRONMENT,
-                pass_fds=(descriptor,),
-                timeout=10,
-            )
-        except (OSError, subprocess.SubprocessError) as error:
-            raise TestStoreConflict("manifest safety ACL replacement failed") from error
-        if (
-            result.returncode != 0
-            or len(result.stdout) > MAX_ACL_BYTES
-            or len(result.stderr) > MAX_ACL_BYTES
-        ):
-            raise TestStoreConflict("manifest safety ACL replacement failed")
-        if self.read_descriptor(descriptor) != normalized:
-            raise TestStoreConflict("manifest safety ACL verification failed")
-
-
 def _metadata_identity_from_stat(metadata: os.stat_result) -> dict[str, object]:
     mode = metadata.st_mode
     kind = (
@@ -332,38 +158,6 @@ def _metadata_identity_from_stat(metadata: os.stat_result) -> dict[str, object]:
         "kind": kind,
         "size": metadata.st_size,
     }
-
-
-def _path_identity(path: Path) -> dict[str, object]:
-    refuse_symlink_components(path)
-    return _metadata_identity_from_stat(path.lstat())
-
-
-def _open_exact_path(path: Path, expected: Mapping[str, object]) -> int:
-    refuse_symlink_components(path)
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-    if expected.get("kind") == "directory":
-        flags |= getattr(os, "O_DIRECTORY", 0)
-    descriptor = os.open(path, flags)
-    opened = _metadata_identity_from_stat(os.fstat(descriptor))
-    if opened != dict(expected):
-        os.close(descriptor)
-        raise TestStoreConflict("manifest safety action identity changed")
-    return descriptor
-
-
-def _descriptor_sha256(descriptor: int, *, maximum: int = MAX_ADOPTION_PLAN_BYTES) -> str:
-    os.lseek(descriptor, 0, os.SEEK_SET)
-    payload = _read_bounded(descriptor, maximum)
-    os.lseek(descriptor, 0, os.SEEK_SET)
-    return hashlib.sha256(payload).hexdigest()
-
-
-def _identity_with_metadata(
-    expected: Mapping[str, object], *, uid: int, gid: int, mode: int
-) -> dict[str, object]:
-    del uid, gid, mode
-    return dict(expected)
 
 
 def _validate_authority_export(value: Mapping[str, object]) -> dict[str, object]:
@@ -412,7 +206,6 @@ def _validate_authority_export(value: Mapping[str, object]) -> dict[str, object]
     for item in repositories:
         if not isinstance(item, Mapping) or set(item) != {
             "repository_id",
-            "owner_uid",
             "repository_generation",
         }:
             raise TestStoreContractError(
@@ -423,7 +216,6 @@ def _validate_authority_export(value: Mapping[str, object]) -> dict[str, object]
         normalized.append(
             {
                 "repository_id": repository_id,
-                "owner_uid": _positive_integer("owner UID", item["owner_uid"]),
                 "repository_generation": _nonnegative_integer(
                     "repository generation", item["repository_generation"]
                 ),
@@ -633,7 +425,6 @@ def _validate_safety_identity(value: Mapping[str, object]) -> dict[str, object]:
             "relative_path",
             "path_hash",
             "identity",
-            "required_permissions",
         }:
             raise TestStoreContractError("manifest safety unreadable entry is invalid")
         relative_path = _safe_relative_path(item["relative_path"])
@@ -641,25 +432,11 @@ def _validate_safety_identity(value: Mapping[str, object]) -> dict[str, object]:
         identity = _validate_metadata_identity(
             item["identity"], field="unreadable tracked entry"
         )
-        required = item["required_permissions"]
         if (
             not isinstance(path_hash, str)
             or _SHORT_SHA256.fullmatch(path_hash) is None
             or hashlib.sha256(relative_path.encode("utf-8")).hexdigest()[:16]
             != path_hash
-            or (
-                required is not None
-                and (
-                    not isinstance(required, str)
-                    or _ACL_PERMISSION.fullmatch(required) is None
-                )
-            )
-            or (identity is None and required is not None)
-            or (
-                identity is not None
-                and identity["kind"] != "regular"
-                and required is not None
-            )
         ):
             raise TestStoreContractError("manifest safety unreadable entry is invalid")
         paths.append(relative_path)
@@ -668,7 +445,6 @@ def _validate_safety_identity(value: Mapping[str, object]) -> dict[str, object]:
                 "relative_path": relative_path,
                 "path_hash": path_hash,
                 "identity": identity,
-                "required_permissions": required,
             }
         )
     if paths != sorted(paths) or len(paths) != len(set(paths)):
@@ -726,11 +502,11 @@ def _validate_safety_identity(value: Mapping[str, object]) -> dict[str, object]:
 
 
 def _assess_safety_identity(
-    identity: Mapping[str, object], *, owner_uid: int
+    identity: Mapping[str, object], *, execution_uid: int
 ) -> dict[str, object]:
     """Classify repository readability without treating metadata as authority."""
 
-    del owner_uid
+    del execution_uid
     blockers: list[str] = []
     if identity["problem_code"] is not None:
         blockers.append(str(identity["problem_code"]))
@@ -786,8 +562,8 @@ class TestManifestAdoptionManager:
         authority: AdoptionAuthority,
         helper: AdoptionUIDHelper,
         evidence_root: Path,
+        execution_uid: int,
         expected_evidence_uid: int = 0,
-        acl_backend: AdoptionACLBackend | None = None,
     ) -> None:
         self.authority = authority
         self.helper = helper
@@ -800,7 +576,7 @@ class TestManifestAdoptionManager:
         if not stat.S_ISDIR(metadata.st_mode):
             raise TestStoreContractError("manifest adoption evidence root is unsafe")
         self.expected_evidence_uid = expected_evidence_uid
-        self.acl_backend = acl_backend or PosixACLBackend()
+        self.execution_uid = _positive_integer("execution UID", execution_uid)
 
     def _directory(self, plan_id: str, *, create: bool = False) -> Path:
         if _PLAN_ID.fullmatch(plan_id) is None:
@@ -946,7 +722,7 @@ class TestManifestAdoptionManager:
             if set(item) != {
                 "repository_id",
                 "repository_generation",
-                "owner_uid",
+                "execution_uid",
                 "manifest",
             }:
                 raise TestStoreContractError("manifest adoption repository fields are invalid")
@@ -954,7 +730,7 @@ class TestManifestAdoptionManager:
             _nonnegative_integer(
                 "repository generation", item["repository_generation"]
             )
-            _positive_integer("owner UID", item["owner_uid"])
+            _positive_integer("execution UID", item["execution_uid"])
             if not isinstance(item["manifest"], Mapping):
                 raise TestStoreContractError(
                     "manifest adoption requires an explicit final manifest document"
@@ -976,10 +752,10 @@ class TestManifestAdoptionManager:
             if not isinstance(item, Mapping) or set(item) != {
                 "repository_id",
                 "repository_generation",
-                "owner_uid",
+                "execution_uid",
                 "classification",
-                "safety_status",
-                "safety_blocker_codes",
+                "readability_status",
+                "readability_blocker_codes",
             }:
                 raise TestStoreContractError(
                     "manifest adoption excluded repository is invalid"
@@ -989,11 +765,11 @@ class TestManifestAdoptionManager:
             _nonnegative_integer(
                 "repository generation", item["repository_generation"]
             )
-            _positive_integer("owner UID", item["owner_uid"])
-            blockers = item["safety_blocker_codes"]
+            _positive_integer("execution UID", item["execution_uid"])
+            blockers = item["readability_blocker_codes"]
             if (
                 item["classification"] not in {"missing", "invalid"}
-                or item["safety_status"] != "blocked"
+                or item["readability_status"] != "blocked"
                 or not isinstance(blockers, list)
                 or not blockers
                 or any(not isinstance(code, str) or not code for code in blockers)
@@ -1015,14 +791,17 @@ class TestManifestAdoptionManager:
         return entries
 
     def _authority(
-        self, *, repository_id: str, owner_uid: int, generation: int
+        self,
+        *,
+        repository_id: str,
+        generation: int,
+        execution_uid: int | None = None,
     ) -> Mapping[str, object]:
-        authority = self.authority.repository(
-            repository_id=repository_id, owner_uid=owner_uid
-        )
+        if execution_uid is not None and execution_uid != self.execution_uid:
+            raise TestStoreConflict("manifest adoption execution identity changed")
+        authority = self.authority.repository(repository_id=repository_id)
         if (
             authority.get("repository_id") != repository_id
-            or authority.get("owner_uid") != owner_uid
             or authority.get("generation") != generation
             or not isinstance(authority.get("canonical_root"), str)
         ):
@@ -1040,19 +819,18 @@ class TestManifestAdoptionManager:
                     "manifest adoption authority export entry is invalid"
                 )
             repository_id = _safe_repository_id(item["repository_id"])
-            owner_uid = _positive_integer("owner UID", item["owner_uid"])
+            execution_uid = self.execution_uid
             generation = _nonnegative_integer(
                 "repository generation", item["repository_generation"]
             )
             authority = self._authority(
                 repository_id=repository_id,
-                owner_uid=owner_uid,
                 generation=generation,
             )
             state = _validate_catalog_state(
                 self.helper.call(
                     "adoption_catalog",
-                    owner_uid=owner_uid,
+                    owner_uid=execution_uid,
                     arguments={"repository_root": authority["canonical_root"]},
                 )
             )
@@ -1060,17 +838,17 @@ class TestManifestAdoptionManager:
                 _validate_safety_identity(
                     self.helper.call(
                         "adoption_safety_identity",
-                        owner_uid=owner_uid,
+                        owner_uid=execution_uid,
                         arguments={"repository_root": authority["canonical_root"]},
                     )
                 ),
-                owner_uid=owner_uid,
+                execution_uid=execution_uid,
             )
             rows.append(
                 {
                     "repository_id": repository_id,
                     "repository_generation": generation,
-                    "owner_uid": owner_uid,
+                    "execution_uid": execution_uid,
                     "canonical_root": authority["canonical_root"],
                     "state": state,
                     "safety": safety,
@@ -1098,7 +876,7 @@ class TestManifestAdoptionManager:
                 {
                     "repository_id": row["repository_id"],
                     "repository_generation": row["repository_generation"],
-                    "owner_uid": row["owner_uid"],
+                    "execution_uid": row["execution_uid"],
                     "status": row["state"]["status"],  # type: ignore[index]
                     "current_digest": row["state"]["current_digest"],  # type: ignore[index]
                     "problem_code": row["state"]["problem_code"],  # type: ignore[index]
@@ -1106,11 +884,10 @@ class TestManifestAdoptionManager:
                     and row["safety"]["status"] == "clean",  # type: ignore[index]
                     "requires_explicit_manifest": row["state"]["status"]  # type: ignore[index]
                     != "ready",
-                    "requires_safety_repair": row["safety"]["status"]  # type: ignore[index]
+                    "has_readability_blockers": row["safety"]["status"]  # type: ignore[index]
                     != "clean",
-                    "safety_status": row["safety"]["status"],  # type: ignore[index]
-                    "safety_action_count": len(row["safety"]["actions"]),  # type: ignore[index]
-                    "safety_blocker_codes": row["safety"]["blockers"],  # type: ignore[index]
+                    "readability_status": row["safety"]["status"],  # type: ignore[index]
+                    "readability_blocker_codes": row["safety"]["blockers"],  # type: ignore[index]
                     "unreadable_tracked_count": row["safety"]["identity"]["unreadable_tracked_count"],  # type: ignore[index]
                     "deletion_scan_complete": row["safety"]["identity"]["deletion_scan_complete"],  # type: ignore[index]
                     "deleted_tracked_count": row["safety"]["identity"]["deleted_tracked_count"],  # type: ignore[index]
@@ -1119,667 +896,6 @@ class TestManifestAdoptionManager:
             ],
         }
 
-    def _seal_safety_action(
-        self,
-        *,
-        canonical_root: str,
-        owner_uid: int,
-        action: Mapping[str, object],
-    ) -> dict[str, object]:
-        del canonical_root, owner_uid, action
-        raise TestStoreContractError(
-            "filesystem metadata repair actions are obsolete on a trusted local server"
-        )
-        # Retained below only so pre-conversion evidence remains structurally
-        # understandable; this path is intentionally unreachable.
-        expected_fields = {
-            "entry",
-            "relative_path",
-            "expected_identity",
-            "expected_sha256",
-            "desired_uid",
-            "desired_mode",
-        }
-        if action.get("entry") == "tracked_acl":
-            expected_fields.add("required_permissions")
-        if set(action) != expected_fields:
-            raise TestStoreContractError("manifest safety action fields are invalid")
-        entry = action.get("entry")
-        if entry not in {"codex_directory", "manifest_file", "tracked_acl"}:
-            raise TestStoreContractError("manifest safety action kind is invalid")
-        relative_path = _safe_relative_path(action.get("relative_path"))
-        if entry == "codex_directory" and relative_path != ".codex":
-            raise TestStoreContractError("manifest safety directory action is invalid")
-        if entry == "manifest_file" and relative_path != ".codex/tests.json":
-            raise TestStoreContractError("manifest safety file action is invalid")
-        expected = _validate_metadata_identity(
-            action.get("expected_identity"), field="action"
-        )
-        if expected is None:
-            raise TestStoreContractError("manifest safety action identity is missing")
-        if entry == "tracked_acl" and expected["kind"] != "regular":
-            raise TestStoreConflict(
-                "manifest safety tracked ACL action is not an isolated regular file"
-            )
-        root = Path(canonical_root)
-        candidate = root / relative_path
-        if _path_identity(candidate) != expected:
-            raise TestStoreConflict("manifest safety action identity changed")
-        descriptor = _open_exact_path(candidate, expected)
-        try:
-            expected_content_sha256 = (
-                _descriptor_sha256(descriptor)
-                if expected["kind"] == "regular"
-                else None
-            )
-            helper_digest = action.get("expected_sha256")
-            if helper_digest is not None and helper_digest != expected_content_sha256:
-                raise TestStoreConflict("manifest safety action content changed")
-            expected_acl = self.acl_backend.read_descriptor(descriptor)
-        finally:
-            os.close(descriptor)
-        desired_acl: tuple[str, ...] | None = None
-        required_permissions: str | None = None
-        if entry == "tracked_acl":
-            required_permissions = str(action.get("required_permissions"))
-            desired_acl = _grant_named_user_acl(
-                expected_acl,
-                uid=owner_uid,
-                required_permissions=required_permissions,
-            )
-            if desired_acl == expected_acl:
-                raise TestStoreConflict(
-                    "manifest safety tracked ACL action is already satisfied"
-                )
-            desired_uid = int(expected["uid"])
-            desired_mode = int(expected["mode"])
-        else:
-            desired_uid = _positive_integer("desired owner UID", action.get("desired_uid"))
-            desired_mode = action.get("desired_mode")
-            if (
-                desired_uid != owner_uid
-                or type(desired_mode) is not int
-                or not 0 <= desired_mode <= 0o7777
-            ):
-                raise TestStoreContractError(
-                    "manifest safety desired metadata is invalid"
-                )
-        return {
-            "entry": entry,
-            "relative_path": relative_path,
-            "expected_identity": expected,
-            "expected_content_sha256": expected_content_sha256,
-            "expected_acl": list(expected_acl),
-            "desired_uid": desired_uid,
-            "desired_gid": int(expected["gid"]),
-            "desired_mode": desired_mode,
-            "desired_acl": list(desired_acl) if desired_acl is not None else None,
-            "required_permissions": required_permissions,
-        }
-
-    def plan_safety_repair(
-        self, authority_export: Mapping[str, object]
-    ) -> Mapping[str, object]:
-        """Report real readability blockers without proposing metadata repair.
-
-        The operation name remains for API compatibility. On a trusted local
-        server it produces no chmod/chown/ACL actions; unreadable tracked
-        content remains a concrete I/O blocker for the repository owner.
-        """
-
-        exported, rows = self._catalog_export(authority_export)
-        entries: list[dict[str, object]] = []
-        for row in rows:
-            repository_id = str(row["repository_id"])
-            owner_uid = int(row["owner_uid"])
-            safety = row["safety"]
-            if not isinstance(safety, Mapping):
-                raise TestStoreContractError("manifest safety assessment is invalid")
-            blockers = list(safety["blockers"])
-            sealed_actions: list[dict[str, object]] = []
-            if not blockers:
-                try:
-                    sealed_actions = [
-                        self._seal_safety_action(
-                            canonical_root=str(row["canonical_root"]),
-                            owner_uid=owner_uid,
-                            action=action,
-                        )
-                        for action in safety["actions"]
-                        if isinstance(action, Mapping)
-                    ]
-                    if len(sealed_actions) != len(safety["actions"]):
-                        raise TestStoreContractError(
-                            "manifest safety action is invalid"
-                        )
-                except (OSError, TestStoreConflict, TestStoreContractError):
-                    sealed_actions = []
-                    blockers = ["exact_safety_repair_unavailable"]
-            entries.append(
-                {
-                    "repository_id": repository_id,
-                    "repository_generation": row["repository_generation"],
-                    "owner_uid": owner_uid,
-                    "canonical_root": row["canonical_root"],
-                    "catalog_status": row["state"]["status"],  # type: ignore[index]
-                    "catalog_problem_code": row["state"]["problem_code"],  # type: ignore[index]
-                    "identity": safety["identity"],
-                    "actions": sealed_actions,
-                    "blockers": sorted(set(blockers)),
-                }
-            )
-
-        plan_id = "manifest-safety-repair-" + uuid.uuid4().hex
-        plan = {
-            "schema_version": ADOPTION_SCHEMA_VERSION,
-            "kind": "manifest-safety-repair",
-            "plan_id": plan_id,
-            "authority_generation": exported["authority_generation"],
-            "authority_export_sha256": exported["document_sha256"],
-            "created_at_epoch": int(time()),
-            "repositories": entries,
-        }
-        directory = self._directory(plan_id, create=True)
-        plan_sha256 = self._write_once(directory / "plan.json", plan)
-        return {
-            "schema_version": ADOPTION_SCHEMA_VERSION,
-            "ok": True,
-            "plan_id": plan_id,
-            "plan_sha256": plan_sha256,
-            "authority_generation": exported["authority_generation"],
-            "repositories": [
-                {
-                    "repository_id": entry["repository_id"],
-                    "repository_generation": entry["repository_generation"],
-                    "owner_uid": entry["owner_uid"],
-                    "status": (
-                        "blocked"
-                        if entry["blockers"]
-                        else "repairable"
-                        if entry["actions"]
-                        else "clean"
-                    ),
-                    "action_count": len(entry["actions"]),
-                    "blocker_codes": entry["blockers"],
-                    "unreadable_tracked_count": entry["identity"]["unreadable_tracked_count"],  # type: ignore[index]
-                    "deletion_scan_complete": entry["identity"]["deletion_scan_complete"],  # type: ignore[index]
-                    "deleted_tracked_count": entry["identity"]["deleted_tracked_count"],  # type: ignore[index]
-                }
-                for entry in entries
-            ],
-        }
-
-    @staticmethod
-    def _validate_sealed_safety_action(value: object) -> dict[str, object]:
-        del value
-        raise TestStoreContractError(
-            "filesystem metadata repair actions are obsolete on a trusted local server"
-        )
-        # Retained below only to document the retired evidence shape.
-        expected_fields = {
-            "entry",
-            "relative_path",
-            "expected_identity",
-            "expected_content_sha256",
-            "expected_acl",
-            "desired_uid",
-            "desired_gid",
-            "desired_mode",
-            "desired_acl",
-            "required_permissions",
-        }
-        if not isinstance(value, Mapping) or set(value) != expected_fields:
-            raise TestStoreContractError("sealed manifest safety action is invalid")
-        entry = value.get("entry")
-        relative_path = _safe_relative_path(value.get("relative_path"))
-        if entry not in {"codex_directory", "manifest_file", "tracked_acl"}:
-            raise TestStoreContractError("sealed manifest safety action is invalid")
-        if entry == "codex_directory" and relative_path != ".codex":
-            raise TestStoreContractError("sealed manifest safety directory is invalid")
-        if entry == "manifest_file" and relative_path != ".codex/tests.json":
-            raise TestStoreContractError("sealed manifest safety file is invalid")
-        identity = _validate_metadata_identity(
-            value.get("expected_identity"), field="sealed action"
-        )
-        if identity is None:
-            raise TestStoreContractError("sealed manifest safety identity is missing")
-        digest = value.get("expected_content_sha256")
-        if digest is not None and (
-            not isinstance(digest, str) or _SHA256.fullmatch(digest) is None
-        ):
-            raise TestStoreContractError("sealed manifest safety digest is invalid")
-        if (identity["kind"] == "regular") != (digest is not None):
-            raise TestStoreContractError(
-                "sealed manifest safety content evidence is contradictory"
-            )
-        expected_acl = _validate_acl_entries(value.get("expected_acl"))
-        desired_uid = _positive_integer("desired owner UID", value.get("desired_uid"))
-        desired_gid = _nonnegative_integer("desired group ID", value.get("desired_gid"))
-        desired_mode = value.get("desired_mode")
-        if type(desired_mode) is not int or not 0 <= desired_mode <= 0o7777:
-            raise TestStoreContractError("sealed manifest safety mode is invalid")
-        desired_acl_value = value.get("desired_acl")
-        required = value.get("required_permissions")
-        if entry == "tracked_acl":
-            if (
-                identity["kind"] != "regular"
-                or not isinstance(required, str)
-                or _ACL_PERMISSION.fullmatch(required) is None
-                or desired_acl_value is None
-            ):
-                raise TestStoreContractError(
-                    "sealed manifest safety ACL action is invalid"
-                )
-            desired_acl = _validate_acl_entries(desired_acl_value)
-            if desired_acl == expected_acl:
-                raise TestStoreContractError(
-                    "sealed manifest safety ACL action has no effect"
-                )
-        else:
-            if desired_acl_value is not None or required is not None:
-                raise TestStoreContractError(
-                    "sealed manifest safety metadata action is invalid"
-                )
-            desired_acl = None
-        return {
-            "entry": entry,
-            "relative_path": relative_path,
-            "expected_identity": identity,
-            "expected_content_sha256": digest,
-            "expected_acl": list(expected_acl),
-            "desired_uid": desired_uid,
-            "desired_gid": desired_gid,
-            "desired_mode": desired_mode,
-            "desired_acl": list(desired_acl) if desired_acl is not None else None,
-            "required_permissions": required,
-        }
-
-    def _safety_action_state(
-        self, root: Path, action: Mapping[str, object]
-    ) -> tuple[str, dict[str, object], tuple[str, ...]]:
-        sealed = self._validate_sealed_safety_action(action)
-        path = root / str(sealed["relative_path"])
-        expected = sealed["expected_identity"]
-        if not isinstance(expected, Mapping):
-            raise TestStoreContractError("sealed manifest safety identity is invalid")
-        observed = _path_identity(path)
-        desired_identity = _identity_with_metadata(
-            expected,
-            uid=int(sealed["desired_uid"]),
-            gid=int(sealed["desired_gid"]),
-            mode=int(sealed["desired_mode"]),
-        )
-        if observed != dict(expected) and observed != desired_identity:
-            raise TestStoreConflict("manifest safety action metadata drifted")
-        descriptor = _open_exact_path(path, observed)
-        try:
-            digest = (
-                _descriptor_sha256(descriptor)
-                if observed["kind"] == "regular"
-                else None
-            )
-            if digest != sealed["expected_content_sha256"]:
-                raise TestStoreConflict("manifest safety action content drifted")
-            acl = self.acl_backend.read_descriptor(descriptor)
-        finally:
-            os.close(descriptor)
-        expected_acl = tuple(sealed["expected_acl"])  # type: ignore[arg-type]
-        desired_acl_value = sealed["desired_acl"]
-        desired_acl = (
-            tuple(desired_acl_value)
-            if isinstance(desired_acl_value, list)
-            else None
-        )
-        if sealed["entry"] == "tracked_acl":
-            if observed != dict(expected):
-                raise TestStoreConflict("manifest safety ACL action changed metadata")
-            if acl == expected_acl:
-                return "expected", observed, acl
-            if desired_acl is not None and acl == desired_acl:
-                return "desired", observed, acl
-        else:
-            if observed == dict(expected) and acl == expected_acl:
-                return "expected", observed, acl
-            if observed == desired_identity:
-                return "desired", observed, acl
-        raise TestStoreConflict("manifest safety action ACL drifted")
-
-    def _apply_safety_action(
-        self, root: Path, action: Mapping[str, object]
-    ) -> dict[str, object]:
-        sealed = self._validate_sealed_safety_action(action)
-        state, observed, acl = self._safety_action_state(root, sealed)
-        path = root / str(sealed["relative_path"])
-        if state == "expected":
-            descriptor = _open_exact_path(path, observed)
-            try:
-                if sealed["entry"] == "tracked_acl":
-                    desired_acl = sealed["desired_acl"]
-                    if not isinstance(desired_acl, list):
-                        raise TestStoreContractError(
-                            "sealed manifest safety ACL is invalid"
-                        )
-                    self.acl_backend.replace_descriptor(descriptor, desired_acl)
-                else:
-                    os.fchown(
-                        descriptor,
-                        int(sealed["desired_uid"]),
-                        int(sealed["desired_gid"]),
-                    )
-                    os.fchmod(descriptor, int(sealed["desired_mode"]))
-                    os.fsync(descriptor)
-            finally:
-                os.close(descriptor)
-            state, observed, acl = self._safety_action_state(root, sealed)
-        if state != "desired":
-            raise TestStoreConflict("manifest safety action failed verification")
-        return {
-            "relative_path": sealed["relative_path"],
-            "entry": sealed["entry"],
-            "final_identity": observed,
-            "final_acl": list(acl),
-        }
-
-    def _restore_safety_action(
-        self, root: Path, action: Mapping[str, object]
-    ) -> dict[str, object]:
-        sealed = self._validate_sealed_safety_action(action)
-        state, observed, _acl = self._safety_action_state(root, sealed)
-        path = root / str(sealed["relative_path"])
-        if state == "desired":
-            descriptor = _open_exact_path(path, observed)
-            expected = sealed["expected_identity"]
-            if not isinstance(expected, Mapping):
-                os.close(descriptor)
-                raise TestStoreContractError(
-                    "sealed manifest safety identity is invalid"
-                )
-            try:
-                os.fchown(descriptor, int(expected["uid"]), int(expected["gid"]))
-                self.acl_backend.replace_descriptor(
-                    descriptor, sealed["expected_acl"]  # type: ignore[arg-type]
-                )
-                os.fchmod(descriptor, int(expected["mode"]))
-                os.fsync(descriptor)
-            finally:
-                os.close(descriptor)
-            state, _observed, _acl = self._safety_action_state(root, sealed)
-        if state != "expected":
-            raise TestStoreConflict("manifest safety rollback failed verification")
-        return {
-            "relative_path": sealed["relative_path"],
-            "entry": sealed["entry"],
-        }
-
-    def _load_safety_plan(
-        self, plan_id: str, plan_sha256: str
-    ) -> Mapping[str, object]:
-        plan = self._load_plan(plan_id, plan_sha256)
-        if (
-            plan.get("kind") != "manifest-safety-repair"
-            or not isinstance(plan.get("authority_export_sha256"), str)
-            or not isinstance(plan.get("authority_generation"), str)
-        ):
-            raise TestStoreContractError("manifest safety repair plan is invalid")
-        return plan
-
-    @staticmethod
-    def _public_safety_apply(
-        result: Mapping[str, object], *, result_sha256: str
-    ) -> Mapping[str, object]:
-        repositories = result.get("repositories")
-        return {
-            "schema_version": ADOPTION_SCHEMA_VERSION,
-            "ok": result.get("ok"),
-            "state": result.get("state"),
-            "plan_id": result.get("plan_id"),
-            "plan_sha256": result.get("plan_sha256"),
-            "result_sha256": result_sha256,
-            "repositories": [
-                {
-                    "repository_id": item.get("repository_id"),
-                    "action_count": item.get("action_count"),
-                    "status": item.get("status"),
-                }
-                for item in repositories
-                if isinstance(item, Mapping)
-            ]
-            if isinstance(repositories, list)
-            else [],
-            "remaining_blocked_repository_ids": result.get(
-                "remaining_blocked_repository_ids", []
-            ),
-            "error": result.get("error"),
-            "rollback_error": result.get("rollback_error"),
-        }
-
-    def apply_safety_repair(
-        self, *, plan_id: str, plan_sha256: str
-    ) -> Mapping[str, object]:
-        directory = self._directory(plan_id)
-        result_path = directory / "safety-apply-result.json"
-        if result_path.exists():
-            result = self._read(result_path)
-            if result.get("plan_sha256") != plan_sha256:
-                raise TestStoreConflict("manifest safety apply identity changed")
-            return self._public_safety_apply(
-                result, result_sha256=self._file_sha256(result_path)
-            )
-        plan = self._load_safety_plan(plan_id, plan_sha256)
-        repositories = plan.get("repositories")
-        if not isinstance(repositories, list):
-            raise TestStoreContractError("manifest safety repositories are invalid")
-
-        normalized: list[dict[str, object]] = []
-        for entry in repositories:
-            if not isinstance(entry, Mapping):
-                raise TestStoreContractError("manifest safety repository is invalid")
-            repository_id = _safe_repository_id(entry.get("repository_id"))
-            owner_uid = _positive_integer("owner UID", entry.get("owner_uid"))
-            generation = _nonnegative_integer(
-                "repository generation", entry.get("repository_generation")
-            )
-            authority = self._authority(
-                repository_id=repository_id,
-                owner_uid=owner_uid,
-                generation=generation,
-            )
-            if authority["canonical_root"] != entry.get("canonical_root"):
-                raise TestStoreConflict("manifest safety canonical root changed")
-            identity = _validate_safety_identity(
-                self.helper.call(
-                    "adoption_safety_identity",
-                    owner_uid=owner_uid,
-                    arguments={"repository_root": authority["canonical_root"]},
-                )
-            )
-            expected_identity = entry.get("identity")
-            if not isinstance(expected_identity, Mapping) or _digest(identity) != _digest(
-                expected_identity
-            ):
-                raise TestStoreConflict("manifest safety repository evidence drifted")
-            actions_value = entry.get("actions")
-            blockers = entry.get("blockers")
-            if (
-                not isinstance(actions_value, list)
-                or not isinstance(blockers, list)
-                or any(not isinstance(item, str) for item in blockers)
-                or (blockers and actions_value)
-            ):
-                raise TestStoreContractError("manifest safety repository plan is invalid")
-            actions = [
-                self._validate_sealed_safety_action(item) for item in actions_value
-            ]
-            root = Path(str(authority["canonical_root"]))
-            for action in actions:
-                self._safety_action_state(root, action)
-            normalized.append(
-                {
-                    "repository_id": repository_id,
-                    "repository_generation": generation,
-                    "owner_uid": owner_uid,
-                    "canonical_root": str(authority["canonical_root"]),
-                    "actions": actions,
-                    "blockers": list(blockers),
-                }
-            )
-
-        applied: list[dict[str, object]] = []
-        failure: Exception | None = None
-        try:
-            for entry in normalized:
-                root = Path(str(entry["canonical_root"]))
-                for action in entry["actions"]:  # type: ignore[assignment]
-                    evidence = self._apply_safety_action(root, action)
-                    applied.append(
-                        {
-                            "repository_id": entry["repository_id"],
-                            "repository_generation": entry["repository_generation"],
-                            "owner_uid": entry["owner_uid"],
-                            "canonical_root": entry["canonical_root"],
-                            "action": action,
-                            "evidence": evidence,
-                        }
-                    )
-            repaired_ids = {
-                str(item["repository_id"])
-                for item in normalized
-                if item["actions"]
-            }
-            for entry in normalized:
-                if entry["repository_id"] not in repaired_ids:
-                    continue
-                safety = _assess_safety_identity(
-                    _validate_safety_identity(
-                        self.helper.call(
-                            "adoption_safety_identity",
-                            owner_uid=int(entry["owner_uid"]),
-                            arguments={"repository_root": entry["canonical_root"]},
-                        )
-                    ),
-                    owner_uid=int(entry["owner_uid"]),
-                )
-                if safety["status"] != "clean":
-                    raise TestStoreConflict(
-                        "manifest safety repair did not produce a clean repository"
-                    )
-        except Exception as error:
-            failure = error
-
-        restored: list[dict[str, object]] = []
-        rollback_failure: Exception | None = None
-        if failure is not None:
-            for item in reversed(applied):
-                try:
-                    restored.append(
-                        {
-                            "repository_id": item["repository_id"],
-                            **self._restore_safety_action(
-                                Path(str(item["canonical_root"])),
-                                item["action"],  # type: ignore[arg-type]
-                            ),
-                        }
-                    )
-                except Exception as error:
-                    rollback_failure = error
-                    break
-        remaining = sorted(
-            str(item["repository_id"])
-            for item in normalized
-            if item["blockers"]
-        )
-        state = (
-            "applied_with_blockers"
-            if failure is None and remaining
-            else "applied"
-            if failure is None
-            else "rolled_back"
-            if rollback_failure is None and len(restored) == len(applied)
-            else "rollback_incomplete"
-        )
-        repository_results = [
-            {
-                "repository_id": item["repository_id"],
-                "action_count": len(item["actions"]),
-                "status": (
-                    "blocked"
-                    if item["blockers"]
-                    else "clean"
-                    if not item["actions"] or failure is None
-                    else "restored"
-                ),
-            }
-            for item in normalized
-        ]
-        result = {
-            "schema_version": ADOPTION_SCHEMA_VERSION,
-            "ok": failure is None,
-            "state": state,
-            "plan_id": plan_id,
-            "plan_sha256": plan_sha256,
-            "repositories": repository_results,
-            "remaining_blocked_repository_ids": remaining,
-            "applied_actions": applied,
-            "automatic_rollback": restored,
-            "error": None if failure is None else str(failure)[:2048],
-            "rollback_error": (
-                None if rollback_failure is None else str(rollback_failure)[:2048]
-            ),
-        }
-        result_sha256 = self._write_once(result_path, result)
-        return self._public_safety_apply(result, result_sha256=result_sha256)
-
-    def rollback_safety_repair(
-        self, *, plan_id: str, result_sha256: str
-    ) -> Mapping[str, object]:
-        if _SHA256.fullmatch(result_sha256) is None:
-            raise TestStoreContractError("manifest safety result digest is invalid")
-        directory = self._directory(plan_id)
-        result_path = directory / "safety-apply-result.json"
-        result = self._read(result_path, expected_sha256=result_sha256)
-        if result.get("state") not in {
-            "applied",
-            "applied_with_blockers",
-            "rollback_incomplete",
-        }:
-            raise TestStoreConflict("manifest safety result is not rollback-eligible")
-        rollback_path = directory / "safety-rollback-result.json"
-        if rollback_path.exists():
-            return self._read(rollback_path)
-        applied = result.get("applied_actions")
-        if not isinstance(applied, list):
-            raise TestStoreContractError("manifest safety applied actions are invalid")
-        restored: list[dict[str, object]] = []
-        for item in reversed(applied):
-            if not isinstance(item, Mapping) or not isinstance(item.get("action"), Mapping):
-                raise TestStoreContractError("manifest safety applied action is invalid")
-            authority = self._authority(
-                repository_id=_safe_repository_id(item.get("repository_id")),
-                owner_uid=_positive_integer("owner UID", item.get("owner_uid")),
-                generation=_nonnegative_integer(
-                    "repository generation", item.get("repository_generation")
-                ),
-            )
-            if authority["canonical_root"] != item.get("canonical_root"):
-                raise TestStoreConflict("manifest safety canonical root changed")
-            restored.append(
-                {
-                    "repository_id": item["repository_id"],
-                    **self._restore_safety_action(
-                        Path(str(authority["canonical_root"])), item["action"]
-                    ),
-                }
-            )
-        rollback = {
-            "schema_version": ADOPTION_SCHEMA_VERSION,
-            "ok": True,
-            "state": "rolled_back",
-            "plan_id": plan_id,
-            "apply_result_sha256": result_sha256,
-            "restored_actions": restored,
-        }
-        digest = self._write_once(rollback_path, rollback)
-        return {**rollback, "rollback_sha256": digest}
 
     def prepare_request(
         self,
@@ -1867,20 +983,20 @@ class TestManifestAdoptionManager:
                 blockers = safety["blockers"]
                 if safety["status"] != "blocked" or not isinstance(blockers, list) or not blockers:
                     raise TestStoreContractError(
-                        "manifest adoption requires exact safety repair before preparation"
+                        "manifest adoption cannot inspect unreadable repository content"
                     )
                 excluded_rows.append(
                     {
                         "repository_id": repository_id,
                         "repository_generation": row["repository_generation"],
-                        "owner_uid": row["owner_uid"],
+                        "execution_uid": row["execution_uid"],
                         "classification": (
                             state["status"]
                             if state["status"] in {"missing", "invalid"}
                             else "invalid"
                         ),
-                        "safety_status": "blocked",
-                        "safety_blocker_codes": list(blockers),
+                        "readability_status": "blocked",
+                        "readability_blocker_codes": list(blockers),
                     }
                 )
                 continue
@@ -1889,12 +1005,12 @@ class TestManifestAdoptionManager:
                 if state["status"] == "ready" and isinstance(state["current_manifest"], Mapping)
                 else supplied[repository_id]
             )
-            # Reparse every final document under the repository owner UID before
+            # Reparse every final document under the repository execution UID before
             # it can enter the root-owned request.
             inspection = _validate_inspection(
                 self.helper.call(
                     "adoption_inspect",
-                    owner_uid=int(row["owner_uid"]),
+                    owner_uid=int(row["execution_uid"]),
                     arguments={
                         "repository_root": row["canonical_root"],
                         "proposed_manifest": final_manifest,
@@ -1912,7 +1028,7 @@ class TestManifestAdoptionManager:
                 {
                     "repository_id": repository_id,
                     "repository_generation": row["repository_generation"],
-                    "owner_uid": row["owner_uid"],
+                    "execution_uid": row["execution_uid"],
                     "manifest": final_manifest,
                 }
             )
@@ -1930,19 +1046,19 @@ class TestManifestAdoptionManager:
         self, item: Mapping[str, object]
     ) -> dict[str, object]:
         repository_id = _safe_repository_id(item.get("repository_id"))
-        owner_uid = _positive_integer("owner UID", item.get("owner_uid"))
+        execution_uid = _positive_integer("execution UID", item.get("execution_uid"))
         generation = _nonnegative_integer(
             "repository generation", item.get("repository_generation")
         )
         authority = self._authority(
             repository_id=repository_id,
-            owner_uid=owner_uid,
+            execution_uid=execution_uid,
             generation=generation,
         )
         state = _validate_catalog_state(
             self.helper.call(
                 "adoption_catalog",
-                owner_uid=owner_uid,
+                owner_uid=execution_uid,
                 arguments={"repository_root": authority["canonical_root"]},
             )
         )
@@ -1950,18 +1066,18 @@ class TestManifestAdoptionManager:
             _validate_safety_identity(
                 self.helper.call(
                     "adoption_safety_identity",
-                    owner_uid=owner_uid,
+                    owner_uid=execution_uid,
                     arguments={"repository_root": authority["canonical_root"]},
                 )
             ),
-            owner_uid=owner_uid,
+            execution_uid=execution_uid,
         )
         classification = state["status"] if state["status"] != "ready" else "invalid"
         if (
             safety["status"] != "blocked"
             or classification != item.get("classification")
-            or safety["blockers"] != item.get("safety_blocker_codes")
-            or item.get("safety_status") != "blocked"
+            or safety["blockers"] != item.get("readability_blocker_codes")
+            or item.get("readability_status") != "blocked"
         ):
             raise TestStoreConflict(
                 "manifest adoption excluded repository evidence drifted"
@@ -1969,10 +1085,10 @@ class TestManifestAdoptionManager:
         return {
             "repository_id": repository_id,
             "repository_generation": generation,
-            "owner_uid": owner_uid,
+            "execution_uid": execution_uid,
             "classification": classification,
-            "safety_status": "blocked",
-            "safety_blocker_codes": list(safety["blockers"]),
+            "readability_status": "blocked",
+            "readability_blocker_codes": list(safety["blockers"]),
         }
 
     def plan(self, request: Mapping[str, object]) -> Mapping[str, object]:
@@ -1994,19 +1110,19 @@ class TestManifestAdoptionManager:
         entries: list[dict[str, object]] = []
         for item in self._request_entries(request):
             repository_id = _safe_repository_id(item["repository_id"])
-            owner_uid = _positive_integer("owner UID", item["owner_uid"])
+            execution_uid = _positive_integer("execution UID", item["execution_uid"])
             generation = _nonnegative_integer(
                 "repository generation", item["repository_generation"]
             )
             authority = self._authority(
                 repository_id=repository_id,
-                owner_uid=owner_uid,
+                execution_uid=execution_uid,
                 generation=generation,
             )
             inspection = _validate_inspection(
                 self.helper.call(
                     "adoption_inspect",
-                    owner_uid=owner_uid,
+                    owner_uid=execution_uid,
                     arguments={
                         "repository_root": authority["canonical_root"],
                         "proposed_manifest": dict(item["manifest"]),
@@ -2017,7 +1133,7 @@ class TestManifestAdoptionManager:
                 {
                     "repository_id": repository_id,
                     "repository_generation": generation,
-                    "owner_uid": owner_uid,
+                    "execution_uid": execution_uid,
                     "canonical_root": authority["canonical_root"],
                     "proposed_manifest": dict(item["manifest"]),
                     "inspection": inspection,
@@ -2044,7 +1160,7 @@ class TestManifestAdoptionManager:
                 {
                     "repository_id": entry["repository_id"],
                     "repository_generation": entry["repository_generation"],
-                    "owner_uid": entry["owner_uid"],
+                    "execution_uid": entry["execution_uid"],
                     "status": entry["inspection"]["status"],  # type: ignore[index]
                     "action": entry["inspection"]["action"],  # type: ignore[index]
                     "proposed_matches": entry["inspection"]["proposed_matches"],  # type: ignore[index]
@@ -2085,7 +1201,7 @@ class TestManifestAdoptionManager:
         return {
             "repository_id": entry["repository_id"],
             "repository_generation": entry["repository_generation"],
-            "owner_uid": entry["owner_uid"],
+            "execution_uid": entry["execution_uid"],
             "canonical_root": entry["canonical_root"],
             "original_status": inspection["status"],
             "original_digest": inspection["current_digest"],
@@ -2097,11 +1213,11 @@ class TestManifestAdoptionManager:
     def _restore_entry(
         self, item: Mapping[str, object], *, operation_id: object
     ) -> dict[str, object]:
-        owner_uid = _positive_integer("owner UID", item.get("owner_uid"))
+        execution_uid = _positive_integer("execution UID", item.get("execution_uid"))
         current = _validate_catalog_state(
             self.helper.call(
                 "adoption_catalog",
-                owner_uid=owner_uid,
+                owner_uid=execution_uid,
                 arguments={"repository_root": item.get("canonical_root")},
             )
         )
@@ -2122,7 +1238,7 @@ class TestManifestAdoptionManager:
         if not already_restored:
             restored = self.helper.call(
                 "adoption_rollback",
-                owner_uid=owner_uid,
+                owner_uid=execution_uid,
                 arguments={
                     "repository_root": item.get("canonical_root"),
                     "expected_final_digest": item.get("final_digest"),
@@ -2203,7 +1319,7 @@ class TestManifestAdoptionManager:
                 raise TestStoreContractError("manifest adoption plan entry is invalid")
             authority = self._authority(
                 repository_id=_safe_repository_id(entry.get("repository_id")),
-                owner_uid=_positive_integer("owner UID", entry.get("owner_uid")),
+                execution_uid=_positive_integer("execution UID", entry.get("execution_uid")),
                 generation=_nonnegative_integer(
                     "repository generation", entry.get("repository_generation")
                 ),
@@ -2213,7 +1329,7 @@ class TestManifestAdoptionManager:
             observed = _validate_inspection(
                 self.helper.call(
                     "adoption_inspect",
-                    owner_uid=int(entry["owner_uid"]),
+                    owner_uid=int(entry["execution_uid"]),
                     arguments={
                         "repository_root": entry["canonical_root"],
                         "proposed_manifest": entry["proposed_manifest"],
@@ -2228,7 +1344,7 @@ class TestManifestAdoptionManager:
                 and observed["status"] == "ready"
                 and observed["current_digest"] == expected_inspection.get("proposed_digest")
             ):
-                # A prior root process may have died after the owner-UID atomic
+                # A prior root process may have died after the execution-UID atomic
                 # replace but before sealing apply-result.json. Exact intended
                 # bytes are safe to resume and retain the original plan backup.
                 repository_id = str(entry["repository_id"])
@@ -2257,7 +1373,7 @@ class TestManifestAdoptionManager:
             try:
                 applied_result = self.helper.call(
                     "adoption_apply",
-                    owner_uid=int(entry["owner_uid"]),
+                    owner_uid=int(entry["execution_uid"]),
                     arguments={
                         "repository_root": entry["canonical_root"],
                         "expected_status": inspection["status"],
@@ -2284,7 +1400,7 @@ class TestManifestAdoptionManager:
                     observed = _validate_inspection(
                         self.helper.call(
                             "adoption_inspect",
-                            owner_uid=int(entry["owner_uid"]),
+                            owner_uid=int(entry["execution_uid"]),
                             arguments={
                                 "repository_root": entry["canonical_root"],
                                 "proposed_manifest": entry["proposed_manifest"],
@@ -2363,7 +1479,7 @@ class TestManifestAdoptionManager:
                 raise TestStoreContractError("manifest adoption rollback entry is invalid")
             self._authority(
                 repository_id=_safe_repository_id(item.get("repository_id")),
-                owner_uid=_positive_integer("owner UID", item.get("owner_uid")),
+                execution_uid=_positive_integer("execution UID", item.get("execution_uid")),
                 generation=_nonnegative_integer(
                     "repository generation", item.get("repository_generation")
                 ),

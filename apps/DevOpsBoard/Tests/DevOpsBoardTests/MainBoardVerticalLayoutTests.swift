@@ -301,18 +301,18 @@ final class MainBoardVerticalLayoutTests: XCTestCase {
         let origin = try XCTUnwrap(discovery.origins().first)
         let staleFailure = CommandExecution(
             stdout: "",
-            stderr: #"{"ok":false,"code":"lifecycle_plan_stale","classification":"lifecycle_target_identity_changed","mutation_performed":false,"error":"Resource ownership generation changed after planning.","action_required":"Refresh authoritative inventory, review a newly generated lifecycle plan, and retry."}"#,
+            stderr: #"{"ok":false,"code":"lifecycle_plan_stale","classification":"lifecycle_target_identity_changed","mutation_performed":false,"error":"Resource association generation changed after planning.","action_required":"Refresh authoritative inventory, review a newly generated lifecycle plan, and retry."}"#,
             exitStatus: 1
         )
         let firstPlan = retirementVisualPlanJSON(
             planID: "retire-plan-visual-1",
             planFingerprint: "retire-fingerprint-visual-1",
-            ownershipFingerprint: "planned-ownership-generation-2"
+            observationFingerprint: "planned-association-generation-2"
         )
         let replacementPlan = retirementVisualPlanJSON(
             planID: "retire-plan-visual-2",
             planFingerprint: "retire-fingerprint-visual-2",
-            ownershipFingerprint: "planned-ownership-generation-4"
+            observationFingerprint: "planned-association-generation-4"
         )
         _ = try JSONDecoder().decode(
             StandaloneRetirementPlan.self,
@@ -321,17 +321,17 @@ final class MainBoardVerticalLayoutTests: XCTestCase {
         let service = RetirementVisualCoordinatorService(results: [
             try retirementVisualInventoryExecution(
                 home: origin.home,
-                ownershipFingerprint: "ownership-fingerprint-1"
+                observationFingerprint: "association-fingerprint-1"
             ),
             CommandExecution(stdout: firstPlan, stderr: "", exitStatus: 0),
             staleFailure,
             try retirementVisualInventoryExecution(
                 home: origin.home,
-                ownershipFingerprint: "refreshed-ownership-generation-3"
+                observationFingerprint: "refreshed-association-generation-3"
             ),
             try retirementVisualInventoryExecution(
                 home: origin.home,
-                ownershipFingerprint: "refreshed-ownership-generation-3"
+                observationFingerprint: "refreshed-association-generation-3"
             ),
             CommandExecution(stdout: replacementPlan, stderr: "", exitStatus: 0),
         ])
@@ -375,8 +375,8 @@ final class MainBoardVerticalLayoutTests: XCTestCase {
                 && store.actionResults[store.selectedActionResultID!]?.phase == .failed
                 && store.selectedRetirementRecoveryActionTitle == "Refresh & re-plan"
                 && store.repositoryCatalog.unassigned.docker.contains {
-                    $0.representative.exactUnassignedResource?.ownershipFingerprint
-                        == "refreshed-ownership-generation-3"
+                    $0.representative.exactUnassignedResource?.observationFingerprint
+                        == "refreshed-association-generation-3"
                 }
         }
 
@@ -457,7 +457,7 @@ final class MainBoardVerticalLayoutTests: XCTestCase {
         let renderedText = descendantViews(of: NSTextField.self, in: designAcceptanceView)
             .map(\.stringValue)
         XCTAssertTrue(renderedText.contains(
-            "The controller fingerprint changed, indicating a modification to the host resource controller or its configuration since the plan was created. No retirement mutation was performed."
+            "The observation fingerprint changed, indicating a modification to the host resource or its configuration since the plan was created. No retirement mutation was performed."
         ))
         XCTAssertTrue(renderedText.contains("Re-run the retirement plan once validated."))
         XCTAssertTrue(
@@ -531,7 +531,7 @@ final class MainBoardVerticalLayoutTests: XCTestCase {
         XCTAssertTrue(
             descendantViews(of: NSTextField.self, in: selectedRetirementView)
                 .contains {
-                    $0.stringValue == "The retirement failed because the host resource controller fingerprint changed after the retirement plan was reviewed but before the retire action executed."
+                    $0.stringValue == "The retirement failed because the host resource observation fingerprint changed after the retirement plan was reviewed but before the retire action executed."
                 },
             "the selected retirement must remain the rendered Activity detail when an unrelated alert arrives"
         )
@@ -575,7 +575,7 @@ final class MainBoardVerticalLayoutTests: XCTestCase {
         XCTAssertTrue(arguments(calls[5].1, contain: ["resource", "plan-retire"]))
         XCTAssertTrue(
             arguments(calls[5].1, contain: [
-                "--ownership-fingerprint", "refreshed-ownership-generation-3",
+                "--association-fingerprint", "refreshed-association-generation-3",
             ])
         )
 
@@ -898,16 +898,16 @@ private actor RetirementVisualCoordinatorService: CoordinatorServing {
 private func retirementVisualPlanJSON(
     planID: String,
     planFingerprint: String,
-    ownershipFingerprint: String
+    observationFingerprint: String
 ) -> String {
     """
-    {"schema_version":1,"kind":"standalone_resource_retirement","plan_id":"\(planID)","resource_id":"docker:immutable-copy-pg","fingerprint":"\(planFingerprint)","created_at":"2026-07-26T18:39:00Z","actor":"tester","reason":"Retired from DevOps Board","retained_data":["containers","volumes","databases","backups","audit_history"],"targets":[{"target_id":"docker:immutable-copy-pg","kind":"container","host_resource_id":"docker:immutable-copy-pg","immutable_fingerprint":"container-fingerprint-1","control_binding_id":"docker-binding-1","ownership_fingerprint":"\(ownershipFingerprint)","control_contract_fingerprint":"planned-controller-contract-1","display_name":"kosttracking-prod-copy-pg","current_state":"stopped","policies":[{"policy_id":"docker-policy-1","kind":"restart_policy","immutable_fingerprint":"restart-policy-fingerprint-1","disabled_value":"no"}],"allocations":[]}]}
+    {"schema_version":1,"kind":"standalone_resource_retirement","plan_id":"\(planID)","resource_id":"docker:immutable-copy-pg","fingerprint":"\(planFingerprint)","created_at":"2026-07-26T18:39:00Z","actor":"tester","reason":"Retired from DevOps Board","retained_data":["containers","volumes","databases","backups","audit_history"],"targets":[{"target_id":"docker:immutable-copy-pg","kind":"container","host_resource_id":"docker:immutable-copy-pg","immutable_fingerprint":"container-fingerprint-1","observation_fingerprint":"\(observationFingerprint)","stable_identity_fingerprint":"planned-controller-contract-1","display_name":"kosttracking-prod-copy-pg","current_state":"stopped","policies":[{"policy_id":"docker-policy-1","kind":"restart_policy","immutable_fingerprint":"restart-policy-fingerprint-1","disabled_value":"no"}],"allocations":[]}]}
     """
 }
 
 private func retirementVisualInventoryExecution(
     home: String,
-    ownershipFingerprint: String
+    observationFingerprint: String
 ) throws -> CommandExecution {
     let timestamp = "2026-07-26T18:39:00Z"
     let hostID = "host-retirement"
@@ -970,56 +970,6 @@ private func retirementVisualInventoryExecution(
         "installation_generation": 1,
     ])
 
-    let memberships: [[String: Any]] = serverSpecs.map { spec in
-        [
-            "membership_id": "membership-\(spec.id)",
-            "repo_id": spec.repoID,
-            "resource_kind": "server",
-            "host_resource_id": spec.id,
-            "immutable_fingerprint": "fingerprint-\(spec.id)",
-            "control_binding_id": "binding-\(spec.id)",
-        ]
-    } + assignedDockerSpecs.map { spec in
-        [
-            "membership_id": "membership-\(spec.id)",
-            "repo_id": spec.repoID,
-            "resource_kind": "container",
-            "host_resource_id": spec.id,
-            "immutable_fingerprint": "fingerprint-\(spec.id)",
-            "control_binding_id": "binding-\(spec.id)",
-        ]
-    }
-
-    let authoritativeBindings: [[String: Any]] = serverSpecs.map { spec in
-        [
-            "binding_id": "binding-\(spec.id)",
-            "repo_id": spec.repoID,
-            "source_resource_id": spec.id,
-            "resource_kind": "server",
-            "resource_id": spec.id,
-            "source_id": sourceID,
-            "capability": "lifecycle",
-            "provenance": "normalized_fixture",
-            "authority_state": "authoritative",
-            "priority": 100,
-            "generation": 1,
-        ]
-    } + assignedDockerSpecs.map { spec in
-        [
-            "binding_id": "binding-\(spec.id)",
-            "repo_id": spec.repoID,
-            "source_resource_id": spec.id,
-            "resource_kind": "container",
-            "resource_id": spec.id,
-            "source_id": sourceID,
-            "capability": "lifecycle",
-            "provenance": "normalized_fixture",
-            "authority_state": "authoritative",
-            "priority": 100,
-            "generation": 1,
-        ]
-    }
-
     let serverDefinitions: [[String: Any]] = serverSpecs.map { spec in
         let root = (rootSpecs.first { $0.id == spec.repoID }?.root) ?? temporarySpec.root
         return [
@@ -1037,6 +987,7 @@ private func retirementVisualInventoryExecution(
     let dockerResources: [[String: Any]] = assignedDockerSpecs.map { spec in
         [
             "docker_resource_id": spec.id,
+            "repo_id": spec.repoID,
             "engine_id": "engine-retirement",
             "full_container_id": "container-\(spec.id)",
             "current_name": spec.name,
@@ -1141,7 +1092,7 @@ private func retirementVisualInventoryExecution(
     }
 
     let object: [String: Any] = [
-        "schema_version": 2,
+        "schema_version": 3,
         "store": [
             "database_generation": "retirement-fixture-generation",
             "state_revision": 3,
@@ -1163,7 +1114,6 @@ private func retirementVisualInventoryExecution(
             "host_id": hostID,
             "capability_state": "available",
         ]],
-        "memberships": memberships,
         "resources": [
             "servers": serverDefinitions,
             "docker": dockerResources,
@@ -1191,30 +1141,15 @@ private func retirementVisualInventoryExecution(
             "reason_code": "ambiguous_control",
             "explanation": "Only a resource name was observed; no authoritative repository path was provided.",
             "observed_by": ["\(home)/coordinator.sqlite3"],
-            "controller": "\(home)/coordinator.sqlite3",
             "host_resource_id": "docker:immutable-copy-pg",
             "immutable_fingerprint": "container-fingerprint-1",
-            "control_binding_id": "docker-binding-1",
-            "ownership_fingerprint": ownershipFingerprint,
+            "observation_fingerprint": observationFingerprint,
             "can_attach": true,
             "can_retire": true,
             "lifecycle_violation": false,
             "recommended_next_step": "Attach it to its root repository, or retire it to stop and hide it without deleting data.",
         ]],
         "lifecycle_violations": [],
-        "control_bindings": authoritativeBindings + [[
-            "binding_id": "docker-binding-1",
-            "repo_id": NSNull(),
-            "source_resource_id": "immutable-copy-pg",
-            "resource_kind": "container",
-            "resource_id": "immutable-copy-pg",
-            "source_id": sourceID,
-            "capability": "lifecycle",
-            "provenance": "host_observation",
-            "authority_state": "observed",
-            "priority": 10,
-            "generation": 1,
-        ]],
         "test_statistics": [],
     ]
     let data = try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])

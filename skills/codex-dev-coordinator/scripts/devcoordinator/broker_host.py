@@ -1,4 +1,4 @@
-"""Typed host effects for the authorized cross-user broker service.
+"""Typed host effects for the accepted cross-user broker service.
 
 Only exact normalized container identities and bounded port candidates reach
 this module.  It deliberately has no command-string, shell, path, or display-
@@ -383,7 +383,7 @@ class LocalBrokerHostMutations:
         ):
             raise BrokerBackendError(
                 "listener_identity_unobservable",
-                "Host listener verifier did not prove the exact enrolled repository listener.",
+                "Host listener verifier did not prove the exact configured repository listener.",
             )
         return normalized
 
@@ -433,7 +433,7 @@ class LocalBrokerHostMutations:
     def service_capture_logs(
         self, target: RuntimeServiceLogTarget
     ) -> tuple[bytes, int, str]:
-        """Read one bounded log from the exact enrolled service definition."""
+        """Read one bounded log from the exact configured service definition."""
 
         if (
             not target.server_definition_id
@@ -442,7 +442,7 @@ class LocalBrokerHostMutations:
         ):
             raise BrokerBackendError(
                 "runtime_log_identity_invalid",
-                "Service log capture requires one exact enrolled definition.",
+                "Service log capture requires one exact configured definition.",
             )
         return self._read_bounded_service_log(
             target.log_path,
@@ -1725,13 +1725,57 @@ class LocalBrokerHostMutations:
             )
         )
 
+    def postgres_reconcile_restore(
+        self,
+        target: DatabaseMutationTarget,
+        backup: RegisteredDatabaseBackup,
+        *,
+        safety_output_root: str,
+    ) -> Mapping[str, Any] | None:
+        """Prove a lost restore reply from live data and retained safety evidence."""
+
+        full_id = _validate_database_target(target)
+        if backup.database_binding_id != target.database_binding_id:
+            raise ValueError("registered backup belongs to another database binding")
+        safety_root = _require_service_output_root(safety_output_root)
+        result = self._postgres_command(
+            (
+                sys.executable,
+                str(_postgres_backup_tool()),
+                "reconcile-restore",
+                "--container",
+                full_id,
+                "--expect-container-id",
+                full_id,
+                "--database",
+                target.database_name,
+                "--file",
+                backup.artifact_path,
+                "--format",
+                "custom",
+                "--scope",
+                "database",
+                "--safety-out-dir",
+                str(safety_root),
+            )
+        )
+        if result.get("matched") is not True:
+            return None
+        return result
+
     def _postgres_command(self, command: tuple[str, ...]) -> dict[str, Any]:
         environment = dict(os.environ)
         environment["DEVCOORDINATOR_BACKUP_REGISTRY"] = "off"
         environment["DEVCOORDINATOR_BROKER_INTERNAL"] = "1"
-        completed = self._postgres_runner(
-            command, self._postgres_timeout_seconds, environment
-        )
+        try:
+            completed = self._postgres_runner(
+                command, self._postgres_timeout_seconds, environment
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise BrokerBackendError(
+                "operation_outcome_uncertain",
+                "PostgreSQL helper exceeded its bounded deadline; exact database reconciliation is required before retry.",
+            ) from exc
         if completed.returncode != 0:
             raise RuntimeError(
                 "service-owned PostgreSQL action failed with exit "
@@ -1888,6 +1932,11 @@ class LocalBrokerHostMutations:
                     for file_path in snapshot_compose_files:
                         command.extend(("--file", file_path))
                     phases = ("stop", "up") if action == "restart" else (action,)
+                    scoped_services = (
+                        (target.recreate_service,)
+                        if target.recreate_service is not None
+                        else target.services
+                    )
                     completed_phases: list[str] = []
                     for phase in phases:
                         if not _compose_target_paths_are_current(target):
@@ -1903,20 +1952,37 @@ class LocalBrokerHostMutations:
                             )
                         phase_command = [*command, phase]
                         if phase == "up":
-                            # Enrollment may retain ``build:`` as non-executed
+                            # Configuration may retain ``build:`` as non-executed
                             # model metadata, but lifecycle control consumes
                             # only pre-existing images.  Both direct up and
                             # restart's start phase must therefore suppress
                             # Compose's implicit build path.
                             phase_command.append("--no-build")
                             # The persisted service allowlist is the complete
-                            # authorized scope.  Compose otherwise expands a
+                            # accepted scope.  Compose otherwise expands a
                             # requested service through ``depends_on`` and
                             # ``links``, allowing undeclared containers to be
                             # created by a root-owned broker invocation.
                             phase_command.extend(("--detach", "--no-deps"))
+                            if target.recreate_service is not None:
+                                if (
+                                    target.recreate_service not in target.services
+                                    or target.wait_timeout_seconds is None
+                                ):
+                                    raise BrokerBackendError(
+                                        "compose_recreate_binding_invalid",
+                                        "Exact Compose recreation lost its sealed service binding.",
+                                    )
+                                phase_command.extend(
+                                    (
+                                        "--force-recreate",
+                                        "--wait",
+                                        "--wait-timeout",
+                                        str(target.wait_timeout_seconds),
+                                    )
+                                )
                         if phase in {"up", "stop"}:
-                            phase_command.extend(target.services)
+                            phase_command.extend(scoped_services)
                         try:
                             completed = self._compose_runner(
                                 tuple(phase_command),
@@ -2141,15 +2207,43 @@ class LocalBrokerHostMutations:
         timeout_seconds: float,
         environment: Mapping[str, str],
     ) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(
+        process = subprocess.Popen(
             list(command),
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
             env=dict(environment),
-            timeout=timeout_seconds,
-            check=False,
+            start_new_session=True,
+        )
+        try:
+            stdout, stderr = process.communicate(timeout=timeout_seconds)
+        except subprocess.TimeoutExpired as exc:
+            # The helper and every local docker/pg client it launches inherit
+            # this private process group. A timeout can still leave a daemon-
+            # side Docker exec briefly unresolved, so never report terminal
+            # failure or success; kill the local tree and retain the broker's
+            # exact operation reservation for observation-only reconciliation.
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGTERM)
+            try:
+                process.communicate(timeout=5.0)
+            except subprocess.TimeoutExpired:
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(process.pid, signal.SIGKILL)
+                try:
+                    process.communicate(timeout=5.0)
+                except subprocess.TimeoutExpired:
+                    pass
+            raise BrokerBackendError(
+                "operation_outcome_uncertain",
+                "PostgreSQL helper exceeded its bounded deadline; exact database reconciliation is required before retry.",
+            ) from exc
+        return subprocess.CompletedProcess(
+            tuple(command),
+            int(process.returncode),
+            stdout,
+            stderr,
         )
 
 
@@ -3416,9 +3510,9 @@ def render_compose_effective_model(
             command.extend(("--profile", profile))
         for file_path in compose_files:
             command.extend(("--file", file_path))
-        # Enrollment needs the effective service graph and host-capability
+        # Configuration needs the effective service graph and host-capability
         # shape, not project secrets.  Keep variable expressions opaque so a
-        # repository can be enrolled and observed even when role-specific
+        # repository can be configured and observed even when role-specific
         # runtime values are injected only by its actual launcher.
         command.extend(("config", "--no-interpolate", "--format", "json"))
         try:
@@ -3426,18 +3520,18 @@ def render_compose_effective_model(
         except Exception as exc:
             raise BrokerBackendError(
                 "compose_effective_model_unavailable",
-                "Docker Compose could not render the merged enrollment model.",
+                "Docker Compose could not render the merged configuration model.",
             ) from exc
         if completed.returncode != 0:
             raise BrokerBackendError(
                 "compose_effective_model_invalid",
-                "Docker Compose rejected the merged enrollment model.",
+                "Docker Compose rejected the merged configuration model.",
             )
         payload = completed.stdout.encode("utf-8")
         if len(payload) > 16 * 1024 * 1024:
             raise BrokerBackendError(
                 "compose_effective_model_invalid",
-                "Docker Compose rendered an oversized enrollment model.",
+                "Docker Compose rendered an oversized configuration model.",
             )
         return payload
 
@@ -3649,7 +3743,7 @@ def _port_available(port: int, protocol: str) -> bool:
 
 
 def _verify_owned_tcp_listener(port: int, canonical_root: str) -> Mapping[str, Any]:
-    """Prove one exact TCP listener runs from the enrolled worktree.
+    """Prove one exact TCP listener runs from the configured worktree.
 
     The broker service—not the client—performs both listener and cwd
     observation. A missing tool, multiple listeners, PID reuse, zombie, or

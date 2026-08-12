@@ -44,7 +44,6 @@ from .repository_lifecycle import (
     TargetProgress,
 )
 from .store import CoordinatorStore, canonical_json, deterministic_id, fingerprint, utc_timestamp
-from .schema import advance_repository_owner_generation
 
 
 REPOSITORY_TARGET_KIND = "repository"
@@ -83,7 +82,6 @@ class SQLiteLifecyclePersistence:
         self,
         resource_kind: ResourceKind,
         resource_id: str,
-        control_binding_id: str,
     ) -> ExactResourceRef:
         """Resolve exact normalized IDs to a mutation ref without name inference."""
 
@@ -102,7 +100,6 @@ class SQLiteLifecyclePersistence:
                 connection,
                 resource_kind,
                 resource_id,
-                control_binding_id,
                 allow_retired=False,
             )
 
@@ -110,7 +107,6 @@ class SQLiteLifecyclePersistence:
         self,
         resource_kind: ResourceKind,
         resource_id: str,
-        control_binding_id: str,
     ) -> ExactResourceRef:
         """Resolve current controller semantics while a lifecycle fence is active."""
 
@@ -119,7 +115,6 @@ class SQLiteLifecyclePersistence:
                 connection,
                 resource_kind,
                 resource_id,
-                control_binding_id,
                 allow_retired=True,
             )
 
@@ -128,20 +123,13 @@ class SQLiteLifecyclePersistence:
         connection: sqlite3.Connection,
         resource_kind: ResourceKind,
         resource_id: str,
-        control_binding_id: str,
         *,
         allow_retired: bool,
     ) -> ExactResourceRef:
-        binding = connection.execute(
-            """
-            SELECT * FROM control_bindings
-            WHERE binding_id = ? AND resource_kind = ? AND resource_id = ?
-            """,
-            (control_binding_id, resource_kind.value, resource_id),
-        ).fetchone()
-        allowed_authority = {"authoritative", "retired"} if allow_retired else {"authoritative"}
-        if binding is None or str(binding["authority_state"]) not in allowed_authority:
-            raise OwnershipError("resource has no exact authoritative control binding")
+        del allow_retired
+        binding = _catalog_resource_row(connection, resource_kind, resource_id)
+        if binding is None:
+            raise OwnershipError("resource is not current in the catalog")
         native_identity, conflict = self._native_identity(
             connection, resource_kind, resource_id
         )
@@ -161,19 +149,17 @@ class SQLiteLifecyclePersistence:
             resource_id=resource_id,
             kind=resource_kind,
             immutable_fingerprint=immutable,
-            control_binding_id=control_binding_id,
-            ownership_fingerprint=_binding_fingerprint(binding),
+            observation_fingerprint=_observation_fingerprint(binding),
             policies=policies,
             allocations=(),
             native_identity=native_identity,
-            control_contract_fingerprint=_binding_control_contract(binding),
+            stable_identity_fingerprint=_stable_identity_fingerprint(binding),
         )
 
     def resolve_resource(
         self,
         resource_kind: ResourceKind,
         resource_id: str,
-        control_binding_id: str,
         *,
         include_archived: bool = False,
         current_authority: bool = False,
@@ -184,27 +170,22 @@ class SQLiteLifecyclePersistence:
         By default an archived standalone resource is reconstructed from its
         immutable durable archive plan. Resume validation sets
         ``current_authority`` so the current normalized binding, native
-        identity, policies, and stable controller contract are returned
+        identity, policies, and stable stable identity are returned
         instead of making a plan-to-plan comparison tautological.
         """
 
         with self.store.read_transaction() as connection:
-            membership = connection.execute(
-                """
-                SELECT repo_id FROM repository_memberships
-                WHERE resource_kind = ? AND host_resource_id = ?
-                """,
-                (resource_kind.value, resource_id),
-            ).fetchone()
-            if membership is not None:
-                repo_id = str(membership["repo_id"])
+            associated_repo_id = _associated_repository_id(
+                connection, resource_kind, resource_id
+            )
+            if associated_repo_id is not None:
+                repo_id = associated_repo_id
                 snapshot = self._repository_snapshot(connection, repo_id)
                 matches = [
                     target
                     for target in snapshot.targets
                     if target.kind is resource_kind
                     and target.resource_id == resource_id
-                    and target.control_binding_id == control_binding_id
                 ]
                 if len(matches) != 1:
                     raise OwnershipError("attached resource has no exact repository target")
@@ -234,7 +215,6 @@ class SQLiteLifecyclePersistence:
                         isinstance(plan, StandaloneRetirementPlan)
                         and plan.target.kind is resource_kind
                         and plan.target.resource_id == resource_id
-                        and plan.target.control_binding_id == control_binding_id
                     ):
                         return plan.target, plan.repo_id
 
@@ -243,7 +223,7 @@ class SQLiteLifecyclePersistence:
             if current_authority
             else self.resolve_standalone_resource
         )
-        return (resolver(resource_kind, resource_id, control_binding_id), None)
+        return (resolver(resource_kind, resource_id), None)
 
     def describe_resource(
         self, resource: ExactResourceRef, repo_id: str | None
@@ -676,8 +656,8 @@ class SQLiteLifecyclePersistence:
                     raise PlanDriftError("resource changed after archive planning")
                 if current.attached_repo_id != plan.repo_id:
                     raise OwnershipError("resource repository attachment changed after planning")
-                if current.authority_state != "authoritative":
-                    raise OwnershipError("resource controller is not authoritative")
+                if not current.catalogued:
+                    raise OwnershipError("resource is not current in the catalog")
                 active_guard = connection.execute(
                     """
                     SELECT o.operation_id FROM operations o
@@ -945,14 +925,13 @@ class SQLiteLifecyclePersistence:
                 INSERT INTO startup_policy_restore_states(
                     policy_id, repo_id, resource_kind, resource_id, policy_kind,
                     policy_immutable_fingerprint, target_immutable_fingerprint,
-                    control_binding_id, ownership_fingerprint,
                     native_identity_fingerprint, captured_value,
                     restore_required, status, docker_restart_policy,
                     supervisor_manager, supervisor_unit_file_state,
                     supervisor_loaded, supervisor_enabled,
                     captured_operation_id, capture_generation,
                     captured_at, restored_at, last_restore_permit_id, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                           COALESCE((SELECT capture_generation + 1
                                     FROM startup_policy_restore_states
                                     WHERE policy_id = ?), 0),
@@ -964,8 +943,6 @@ class SQLiteLifecyclePersistence:
                     policy_kind = excluded.policy_kind,
                     policy_immutable_fingerprint = excluded.policy_immutable_fingerprint,
                     target_immutable_fingerprint = excluded.target_immutable_fingerprint,
-                    control_binding_id = excluded.control_binding_id,
-                    ownership_fingerprint = excluded.ownership_fingerprint,
                     native_identity_fingerprint = excluded.native_identity_fingerprint,
                     captured_value = excluded.captured_value,
                     restore_required = excluded.restore_required,
@@ -990,8 +967,6 @@ class SQLiteLifecyclePersistence:
                     policy.kind.value,
                     policy.immutable_fingerprint,
                     target.immutable_fingerprint,
-                    target.control_binding_id,
-                    target.ownership_fingerprint,
                     native_fingerprint,
                     captured_value,
                     int(restore_required),
@@ -1135,22 +1110,16 @@ class SQLiteLifecyclePersistence:
                 self._verify_no_active_allocations(connection, plan.repo_id)
                 self._verify_policies_disabled(connection, repo_id=plan.repo_id)
                 self._verify_policy_captures(connection, repo_id=plan.repo_id)
-                current_memberships = {
-                    (row["resource_kind"], row["host_resource_id"], row["immutable_fingerprint"])
-                    for row in connection.execute(
-                        """
-                        SELECT resource_kind, host_resource_id, immutable_fingerprint
-                        FROM repository_memberships WHERE repo_id = ?
-                        """,
-                        (plan.repo_id,),
-                    )
+                current_targets = {
+                    (item.kind.value, item.resource_id, item.immutable_fingerprint)
+                    for item in self._repository_snapshot(connection, plan.repo_id).targets
                 }
-                planned_memberships = {
+                planned_targets = {
                     (item.kind.value, item.resource_id, item.immutable_fingerprint)
                     for item in plan.targets
                 }
-                if current_memberships != planned_memberships:
-                    raise PlanDriftError("repository membership changed while fenced")
+                if current_targets != planned_targets:
+                    raise PlanDriftError("repository target set changed while fenced")
                 timestamp = utc_timestamp()
                 for target in plan.targets:
                     self._record_verified_stopped(
@@ -1258,8 +1227,8 @@ class SQLiteLifecyclePersistence:
                 ).rowcount
                 if changed != 1:
                     raise PlanDriftError("resource retirement fence changed")
-                # Archive is reversible.  Keep the authoritative controller
-                # and repository membership; the retirement row is the start
+                # Archive is reversible. Keep the resource definition and
+                # repository association; the retirement row is the start
                 # fence and active inventory projection.  Standalone rows are
                 # hidden until an explicit restore clears that fence.
                 connection.execute(
@@ -1292,7 +1261,6 @@ class SQLiteLifecyclePersistence:
                         plan.reason,
                         canonical_json(
                             {
-                                "control_binding_id": plan.target.control_binding_id,
                                 "attached": plan.repo_id is not None,
                                 "retained": True,
                             }
@@ -1899,15 +1867,9 @@ class SQLiteLifecyclePersistence:
                 raise OwnershipError("resource is already attached to this repository")
             if current.retirement_status is not None:
                 raise ActionFencedError("retired resource requires an explicit restore")
-            if current.authority_state != "authoritative":
-                raise OwnershipError("standalone controller is not authoritative")
-            current_binding = connection.execute(
-                "SELECT provenance FROM control_bindings WHERE binding_id = ?",
-                (resource.control_binding_id,),
-            ).fetchone()
-            if current_binding is None:
-                raise OwnershipError("resource control binding disappeared")
-            if already_attached and str(current_binding["provenance"]) == provenance:
+            if not current.catalogued:
+                raise OwnershipError("standalone resource is not current in the catalog")
+            if already_attached:
                 return AttachResult(
                     repo_id,
                     resource.resource_id,
@@ -1916,54 +1878,15 @@ class SQLiteLifecyclePersistence:
                     False,
                 )
             timestamp = utc_timestamp()
-            owner = connection.execute(
-                """
-                SELECT repository.generation, authority.owner_uid,
-                       authority.repository_generation
-                FROM repositories repository
-                JOIN repository_owners authority USING(repo_id)
-                WHERE repository.repo_id = ?
-                """,
-                (repo_id,),
-            ).fetchone()
-            if (
-                owner is None
-                or int(owner["generation"]) != int(owner["repository_generation"])
-            ):
-                raise OwnershipError("repository owner authority is missing or stale")
-            prior_repository_generation = int(owner["generation"])
-            owner_uid = int(owner["owner_uid"])
-            membership_id = deterministic_id(
-                "membership", repo_id, resource.kind.value, resource.resource_id
+            association_id = deterministic_id(
+                "association", repo_id, resource.kind.value, resource.resource_id
             )
-            connection.execute(
-                """
-                INSERT INTO repository_memberships(
-                    membership_id, repo_id, resource_kind, host_resource_id,
-                    immutable_fingerprint, control_binding_id, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(resource_kind, host_resource_id) DO UPDATE SET
-                    repo_id = excluded.repo_id,
-                    immutable_fingerprint = excluded.immutable_fingerprint,
-                    control_binding_id = excluded.control_binding_id
-                """,
-                (
-                    membership_id,
-                    repo_id,
-                    resource.kind.value,
-                    resource.resource_id,
-                    resource.immutable_fingerprint,
-                    resource.control_binding_id,
-                    timestamp,
-                ),
-            )
-            connection.execute(
-                """
-                UPDATE control_bindings SET repo_id = ?, generation = generation + 1,
-                    provenance = ?, updated_at = ?
-                WHERE binding_id = ? AND authority_state = 'authoritative'
-                """,
-                (repo_id, provenance, timestamp, resource.control_binding_id),
+            _set_resource_repository(
+                connection,
+                resource_kind=resource.kind,
+                resource_id=resource.resource_id,
+                repo_id=repo_id,
+                timestamp=timestamp,
             )
             connection.execute(
                 """
@@ -1983,40 +1906,11 @@ class SQLiteLifecyclePersistence:
             if changed < 1 and not already_attached:
                 raise PlanDriftError("resource is no longer an active unassigned resource")
             if provenance == "operator_attach":
-                # A human attachment changes the repository's explicit
-                # lifecycle authority, so keep repository and owner
-                # generations in lockstep. Runtime-manifest adoption is an
-                # observation-derived reconstruction of already-declared
-                # membership; advancing the repository generation there would
-                # unnecessarily invalidate every installed client profile.
+                # Explicit attachment changes the repository catalog snapshot.
                 connection.execute(
                     "UPDATE repositories SET generation = generation + 1, "
                     "updated_at = ? WHERE repo_id = ?",
                     (timestamp, repo_id),
-                )
-                advance_repository_owner_generation(
-                    connection,
-                    repository_id=repo_id,
-                    owner_uid=owner_uid,
-                    prior_repository_generation=prior_repository_generation,
-                    repository_generation=prior_repository_generation + 1,
-                    operation_id=deterministic_id(
-                        "repository-owner-resource-attach", membership_id, timestamp
-                    ),
-                    actor=actor,
-                    reason="explicit resource attachment generation advance",
-                    timestamp=timestamp,
-                    evidence={
-                        "kind": "repository-resource-attachment",
-                        "provenance": provenance,
-                        "repository_id": repo_id,
-                        "resource_kind": resource.kind.value,
-                        "resource_id": resource.resource_id,
-                        "immutable_fingerprint": resource.immutable_fingerprint,
-                        "prior_repository_generation": prior_repository_generation,
-                        "repository_generation": prior_repository_generation + 1,
-                        "owner_uid": owner_uid,
-                    },
                 )
             connection.execute(
                 """
@@ -2025,7 +1919,7 @@ class SQLiteLifecyclePersistence:
                 VALUES (?, ?, 'resource.attached', ?, ?, ?, ?)
                 """,
                 (
-                    deterministic_id("event", membership_id, timestamp),
+                    deterministic_id("event", association_id, timestamp),
                     repo_id,
                     (
                         "runtime_manifest_attachment"
@@ -2155,8 +2049,8 @@ class SQLiteLifecyclePersistence:
             if retirement is not None and retirement["status"] in {"disabling", "retired"}:
                 raise ActionFencedError("resource retirement fence is active")
             current = self._standalone_snapshot(connection, resource)
-            if current.authority_state != "authoritative":
-                raise OwnershipError("resource controller is not authoritative")
+            if not current.catalogued:
+                raise OwnershipError("resource is not current in the catalog")
             conflict = connection.execute(
                 """
                 SELECT o.operation_id FROM operations o
@@ -2402,19 +2296,28 @@ class SQLiteLifecyclePersistence:
     ) -> RepositorySnapshot:
         repository = _repository_row(connection, repo_id)
         installation = _installation_row(connection, repo_id)
-        membership_rows = list(
-            connection.execute(
-                """
-                SELECT m.*, b.authority_state, b.resource_kind AS binding_kind,
-                       b.resource_id AS binding_resource_id, b.source_id,
-                       b.source_resource_id AS binding_source_resource_id,
-                       b.capability, b.provenance, b.priority AS binding_priority,
-                       b.generation AS binding_generation,
-                       b.repo_id AS binding_repo_id
-                FROM repository_memberships m
-                LEFT JOIN control_bindings b ON b.binding_id = m.control_binding_id
-                WHERE m.repo_id = ? ORDER BY m.resource_kind, m.host_resource_id
-                """,
+        associations = [
+            (ResourceKind.SERVER, str(row[0]))
+            for row in connection.execute(
+                "SELECT server_definition_id FROM server_definitions "
+                "WHERE repo_id = ? ORDER BY server_definition_id",
+                (repo_id,),
+            )
+        ]
+        associations.extend(
+            (ResourceKind.CONTAINER, str(row[0]))
+            for row in connection.execute(
+                "SELECT docker_resource_id FROM docker_resources "
+                "WHERE repo_id = ? ORDER BY docker_resource_id",
+                (repo_id,),
+            )
+        )
+        associations.extend(
+            (ResourceKind.SUPERVISOR, str(row[0]))
+            for row in connection.execute(
+                "SELECT native_id FROM source_resources "
+                "WHERE repo_id = ? AND resource_kind = 'supervisor' "
+                "ORDER BY native_id",
                 (repo_id,),
             )
         )
@@ -2424,26 +2327,21 @@ class SQLiteLifecyclePersistence:
         )
         targets: list[ExactResourceRef] = []
         conflicts: list[str] = []
-        binding_rows: list[Mapping[str, Any]] = []
         policy_rows: list[Mapping[str, Any]] = []
-        for row in membership_rows:
-            key = (str(row["resource_kind"]), str(row["host_resource_id"]))
-            if row["control_binding_id"] is None or row["authority_state"] != "authoritative":
-                conflicts.append(f"{key[0]}:{key[1]} has no authoritative binding")
-            elif (
-                row["binding_kind"] != row["resource_kind"]
-                or row["binding_resource_id"] != row["host_resource_id"]
-                or row["binding_repo_id"] not in {None, repo_id}
-            ):
-                conflicts.append(f"{key[0]}:{key[1]} binding conflicts with membership")
-            binding = dict(row)
-            binding_rows.append(binding)
+        association_rows: list[Mapping[str, Any]] = []
+        for kind, resource_id in associations:
+            key = (kind.value, resource_id)
+            binding = _catalog_resource_row(connection, kind, resource_id)
+            if binding is None:
+                conflicts.append(f"{key[0]}:{key[1]} is missing from the catalog")
+                continue
+            association_rows.append(binding)
             target_policies = tuple(policies.get(key, ()))
             policy_rows.extend(item.to_dict() for item in target_policies)
             native_identity, native_conflict = self._native_identity(
-                connection, ResourceKind(key[0]), key[1]
+                connection, kind, resource_id
             )
-            if ResourceKind(key[0]) is ResourceKind.CONTAINER:
+            if kind is ResourceKind.CONTAINER:
                 docker_boundary = connection.execute(
                     """
                     SELECT e.capability_state, o.restart_policy,
@@ -2500,34 +2398,34 @@ class SQLiteLifecyclePersistence:
                         ),
                     }
                 )
-            if ResourceKind(key[0]) is ResourceKind.SUPERVISOR:
+            if kind is ResourceKind.SUPERVISOR:
                 native_identity = _supervisor_native_identity(
                     native_identity,
-                    str(row["capability"] or ""),
-                    str(row["provenance"] or ""),
+                    str(binding["capability"] or ""),
+                    str(binding["provenance"] or ""),
                 )
             if native_conflict:
                 conflicts.append(native_conflict)
-            ownership_fingerprint = _binding_fingerprint(row)
+            immutable_fingerprint = _standalone_immutable_fingerprint(
+                kind, resource_id, native_identity
+            )
             targets.append(
                 ExactResourceRef(
-                    resource_id=key[1],
-                    kind=ResourceKind(key[0]),
-                    immutable_fingerprint=str(row["immutable_fingerprint"]),
-                    control_binding_id=str(row["control_binding_id"] or ""),
-                    ownership_fingerprint=ownership_fingerprint,
+                    resource_id=resource_id,
+                    kind=kind,
+                    immutable_fingerprint=immutable_fingerprint,
+                    observation_fingerprint=_observation_fingerprint(binding),
                     policies=target_policies,
                     allocations=tuple(allocations_by_target.get(key, ())),
                     native_identity=native_identity,
-                    control_contract_fingerprint=_binding_control_contract(row),
+                    stable_identity_fingerprint=_stable_identity_fingerprint(binding),
                 )
             )
         repository_fingerprint = _sha(
             {
                 "repository": dict(repository),
                 "installation": dict(installation),
-                "memberships": [dict(row) for row in membership_rows],
-                "bindings": binding_rows,
+                "associations": association_rows,
                 "policies": policy_rows,
                 "allocations": allocation_rows,
             }
@@ -2547,16 +2445,12 @@ class SQLiteLifecyclePersistence:
     def _standalone_snapshot(
         self, connection: sqlite3.Connection, resource: ExactResourceRef
     ) -> StandaloneSnapshot:
-        binding = connection.execute(
-            """
-            SELECT * FROM control_bindings
-            WHERE binding_id = ? AND resource_kind = ? AND resource_id = ?
-            """,
-            (resource.control_binding_id, resource.kind.value, resource.resource_id),
-        ).fetchone()
+        binding = _catalog_resource_row(
+            connection, resource.kind, resource.resource_id
+        )
         if binding is None:
-            raise OwnershipError("exact standalone control binding does not exist")
-        ownership_fingerprint = _binding_fingerprint(binding)
+            raise OwnershipError("exact standalone resource is not current in the catalog")
+        observation_fingerprint = _observation_fingerprint(binding)
         native_identity, native_conflict = self._native_identity(
             connection, resource.kind, resource.resource_id
         )
@@ -2601,10 +2495,10 @@ class SQLiteLifecyclePersistence:
                 )
         rebuilt = replace(
             resource,
-            ownership_fingerprint=ownership_fingerprint,
+            observation_fingerprint=observation_fingerprint,
             policies=policies,
             native_identity=native_identity,
-            control_contract_fingerprint=_binding_control_contract(binding),
+            stable_identity_fingerprint=_stable_identity_fingerprint(binding),
         )
         expected_immutable = _standalone_immutable_fingerprint(
             resource.kind, resource.resource_id, native_identity
@@ -2613,13 +2507,9 @@ class SQLiteLifecyclePersistence:
             raise PlanDriftError("standalone immutable host identity changed")
         if rebuilt != resource:
             raise PlanDriftError("exact standalone resource fingerprint or policy set changed")
-        membership = connection.execute(
-            """
-            SELECT repo_id FROM repository_memberships
-            WHERE resource_kind = ? AND host_resource_id = ?
-            """,
-            (resource.kind.value, resource.resource_id),
-        ).fetchone()
+        associated_repo_id = _associated_repository_id(
+            connection, resource.kind, resource.resource_id
+        )
         retirement = connection.execute(
             """
             SELECT status FROM resource_retirements
@@ -2630,8 +2520,8 @@ class SQLiteLifecyclePersistence:
         return StandaloneSnapshot(
             resource=resource,
             retirement_status=str(retirement["status"]) if retirement else None,
-            attached_repo_id=str(membership["repo_id"]) if membership else None,
-            authority_state=str(binding["authority_state"]),
+            attached_repo_id=associated_repo_id,
+            catalogued=True,
         )
 
     def _load_plan(self, connection: sqlite3.Connection, plan_id: str) -> LifecyclePlan:
@@ -2789,9 +2679,8 @@ class SQLiteLifecyclePersistence:
             ),
         )
         parameters: dict[str, Any] = {
-            "control_binding_id": target.control_binding_id,
-            "ownership_fingerprint": target.ownership_fingerprint,
-            "control_contract_fingerprint": target.control_contract_fingerprint,
+            "observation_fingerprint": target.observation_fingerprint,
+            "stable_identity_fingerprint": target.stable_identity_fingerprint,
         }
         for key, value in target.native_identity:
             parameters[f"native.{key}"] = value
@@ -2814,13 +2703,12 @@ class SQLiteLifecyclePersistence:
             resource_id=str(row["target_id"]),
             kind=ResourceKind(str(row["target_kind"])),
             immutable_fingerprint=str(row["immutable_fingerprint"]),
-            control_binding_id=str(parameters["control_binding_id"]),
-            ownership_fingerprint=str(parameters["ownership_fingerprint"]),
+            observation_fingerprint=str(parameters["observation_fingerprint"]),
             policies=_decode_policies(parameters),
             allocations=_decode_allocations(parameters, "allocation"),
             native_identity=native_identity,
-            control_contract_fingerprint=str(
-                parameters.get("control_contract_fingerprint") or ""
+            stable_identity_fingerprint=str(
+                parameters.get("stable_identity_fingerprint") or ""
             ),
         )
 
@@ -2871,11 +2759,11 @@ class SQLiteLifecyclePersistence:
         repository: list[AllocationRef] = []
         raw_rows: list[Mapping[str, Any]] = []
         managed_server_ids = {
-            str(row["host_resource_id"])
+            str(row["server_definition_id"])
             for row in connection.execute(
                 """
-                SELECT host_resource_id FROM repository_memberships
-                WHERE repo_id = ? AND resource_kind = 'server'
+                SELECT server_definition_id FROM server_definitions
+                WHERE repo_id = ?
                 """,
                 (repo_id,),
             )
@@ -3101,8 +2989,6 @@ def _captured_policy_state(row: Mapping[str, Any]) -> CapturedStartupPolicyState
         policy_kind=PolicyKind(str(row["policy_kind"])),
         policy_immutable_fingerprint=str(row["policy_immutable_fingerprint"]),
         target_immutable_fingerprint=str(row["target_immutable_fingerprint"]),
-        control_binding_id=str(row["control_binding_id"]),
-        ownership_fingerprint=str(row["ownership_fingerprint"]),
         native_identity_fingerprint=str(row["native_identity_fingerprint"]),
         captured_value=str(row["captured_value"]),
         restore_required=bool(row["restore_required"]),
@@ -3150,8 +3036,6 @@ def _verify_capture_identity(
         or captured.policy_kind is not policy.kind
         or captured.policy_immutable_fingerprint != policy.immutable_fingerprint
         or captured.target_immutable_fingerprint != target.immutable_fingerprint
-        or captured.control_binding_id != target.control_binding_id
-        or captured.ownership_fingerprint != target.ownership_fingerprint
         or captured.native_identity_fingerprint != native_identity_fingerprint
     ):
         raise PlanDriftError("captured startup policy provenance changed")
@@ -3237,55 +3121,144 @@ def _sha(value: Any) -> str:
     return "sha256:" + fingerprint(value)
 
 
-def _binding_fingerprint(row: Mapping[str, Any]) -> str:
+def _set_resource_repository(
+    connection: sqlite3.Connection,
+    *,
+    resource_kind: ResourceKind,
+    resource_id: str,
+    repo_id: str | None,
+    timestamp: str,
+) -> None:
+    """Update optional catalog association; it is never an access decision."""
+
+    if resource_kind is ResourceKind.CONTAINER:
+        changed = connection.execute(
+            "UPDATE docker_resources SET repo_id = ?, updated_at = ? "
+            "WHERE docker_resource_id = ?",
+            (repo_id, timestamp, resource_id),
+        ).rowcount
+    elif resource_kind is ResourceKind.SERVER:
+        changed = connection.execute(
+            "UPDATE server_definitions SET repo_id = ?, updated_at = ? "
+            "WHERE server_definition_id = ?",
+            (repo_id, timestamp, resource_id),
+        ).rowcount
+    else:
+        changed = connection.execute(
+            "UPDATE source_resources SET repo_id = ? "
+            "WHERE resource_kind = 'supervisor' AND native_id = ?",
+            (repo_id, resource_id),
+        ).rowcount
+    if changed != 1:
+        raise PlanDriftError("resource catalog identity changed before association")
+
+
+def _associated_repository_id(
+    connection: sqlite3.Connection,
+    resource_kind: ResourceKind,
+    resource_id: str,
+) -> str | None:
+    if resource_kind is ResourceKind.CONTAINER:
+        row = connection.execute(
+            "SELECT repo_id FROM docker_resources WHERE docker_resource_id = ?",
+            (resource_id,),
+        ).fetchone()
+    elif resource_kind is ResourceKind.SERVER:
+        row = connection.execute(
+            "SELECT repo_id FROM server_definitions WHERE server_definition_id = ?",
+            (resource_id,),
+        ).fetchone()
+    else:
+        row = connection.execute(
+            "SELECT repo_id FROM source_resources "
+            "WHERE resource_kind = 'supervisor' AND native_id = ?",
+            (resource_id,),
+        ).fetchone()
+    if row is None or row["repo_id"] is None:
+        return None
+    return str(row["repo_id"])
+
+
+def _catalog_resource_row(
+    connection: sqlite3.Connection,
+    resource_kind: ResourceKind,
+    resource_id: str,
+) -> dict[str, Any] | None:
+    metadata = connection.execute(
+        "SELECT observation_revision FROM schema_metadata WHERE singleton = 1"
+    ).fetchone()
+    revision = 0 if metadata is None else int(metadata["observation_revision"])
+    if resource_kind is ResourceKind.CONTAINER:
+        row = connection.execute(
+            "SELECT repo_id, engine_id, full_container_id, updated_at "
+            "FROM docker_resources WHERE docker_resource_id = ?",
+            (resource_id,),
+        ).fetchone()
+        capability = "docker_lifecycle"
+        provenance = "docker_catalog"
+        source_resource_id = None
+        source_id = None
+    elif resource_kind is ResourceKind.SERVER:
+        row = connection.execute(
+            "SELECT repo_id, definition_fingerprint, generation, updated_at "
+            "FROM server_definitions WHERE server_definition_id = ?",
+            (resource_id,),
+        ).fetchone()
+        capability = "service_lifecycle"
+        provenance = "service_catalog"
+        source_resource_id = None
+        source_id = None
+    else:
+        row = connection.execute(
+            "SELECT repo_id, source_resource_id, source_id, payload_sha256, "
+            "created_at AS updated_at FROM source_resources "
+            "WHERE resource_kind = 'supervisor' AND native_id = ?",
+            (resource_id,),
+        ).fetchone()
+        capability = "supervisor_lifecycle"
+        provenance = "supervisor_catalog"
+        source_resource_id = None if row is None else row["source_resource_id"]
+        source_id = None if row is None else row["source_id"]
+    if row is None:
+        return None
+    return {
+        "resource_kind": resource_kind.value,
+        "resource_id": resource_id,
+        "repo_id": row["repo_id"],
+        "source_resource_id": source_resource_id,
+        "source_id": source_id,
+        "capability": capability,
+        "provenance": provenance,
+        "generation": revision,
+    }
+
+
+def _observation_fingerprint(row: Mapping[str, Any]) -> str:
     return _sha(
         {
-            "binding_id": row["control_binding_id"] if "control_binding_id" in row.keys() else row["binding_id"],
-            "resource_kind": row["binding_kind"] if "binding_kind" in row.keys() else row["resource_kind"],
-            "resource_id": row["binding_resource_id"] if "binding_resource_id" in row.keys() else row["resource_id"],
+            "resource_kind": row["resource_kind"],
+            "resource_id": row["resource_id"],
+            "repo_id": row["repo_id"],
             "source_id": row["source_id"],
             "capability": row["capability"],
             "provenance": row["provenance"],
-            "authority_state": row["authority_state"],
-            "generation": row["binding_generation"] if "binding_generation" in row.keys() else row["generation"],
+            "generation": row["generation"],
         }
     )
 
 
-def _binding_control_contract(row: Mapping[str, Any]) -> str:
-    """Controller meaning, deliberately excluding refresh-only generation."""
+def _stable_identity_fingerprint(row: Mapping[str, Any]) -> str:
+    """Stable catalog identity, excluding observation-generation churn."""
 
-    keys = row.keys()
     return _sha(
         {
-            "binding_id": (
-                row["control_binding_id"]
-                if "control_binding_id" in keys
-                else row["binding_id"]
-            ),
-            "repo_id": (
-                row["binding_repo_id"] if "binding_repo_id" in keys else row["repo_id"]
-            ),
-            "source_resource_id": (
-                row["binding_source_resource_id"]
-                if "binding_source_resource_id" in keys
-                else row["source_resource_id"]
-            ),
-            "resource_kind": (
-                row["binding_kind"] if "binding_kind" in keys else row["resource_kind"]
-            ),
-            "resource_id": (
-                row["binding_resource_id"]
-                if "binding_resource_id" in keys
-                else row["resource_id"]
-            ),
+            "repo_id": row["repo_id"],
+            "source_resource_id": row["source_resource_id"],
+            "resource_kind": row["resource_kind"],
+            "resource_id": row["resource_id"],
             "source_id": row["source_id"],
             "capability": row["capability"],
             "provenance": row["provenance"],
-            "authority_state": row["authority_state"],
-            "priority": (
-                row["binding_priority"] if "binding_priority" in keys else row["priority"]
-            ),
         }
     )
 

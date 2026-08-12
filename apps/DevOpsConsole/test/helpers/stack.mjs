@@ -42,7 +42,8 @@ export const COORDINATOR_SCRIPT = path.join(
 import { DEV_CERT, DEV_KEY, ensureDevCert } from './dev-cert.mjs';
 
 const execFileAsync = promisify(execFile);
-const INVENTORY_WIRE_SCHEMA_VERSION = 2;
+const OBSERVATION_WIRE_SCHEMA_VERSION = 2;
+const INVENTORY_WIRE_SCHEMA_VERSION = 3;
 // The real-stack fixture runs the Coordinator from this checkout. Read its
 // canonical schema declaration so a valid migration does not strand browser
 // verification on an obsolete duplicated number.
@@ -416,27 +417,20 @@ async function runNormalizedObservation({
   }
 }
 
-async function enrollFixtureRepositoryOwners(home, roots, extraEnv = {}) {
+async function catalogFixtureRepositories(home, roots, extraEnv = {}) {
   if (!Array.isArray(roots) || roots.length === 0) return;
-  const ownerUid = process.getuid?.();
-  if (!Number.isInteger(ownerUid) || ownerUid <= 0) {
-    throw new Error('E2E repository owner authority requires a positive non-root UID');
-  }
   const script = String.raw`
 import json
 import sys
-import uuid
 from pathlib import Path
 
 sys.path.insert(0, sys.argv[1])
 from devcoordinator.repository_lifecycle import RepositoryLifecycle
-from devcoordinator.schema import establish_repository_owner_authority
 from devcoordinator.sqlite_lifecycle import SQLiteLifecyclePersistence
 from devcoordinator.store import AccountStore, deterministic_id, utc_timestamp
 
 home = Path(sys.argv[2])
-owner_uid = int(sys.argv[3])
-roots = json.loads(sys.argv[4])
+roots = json.loads(sys.argv[3])
 with AccountStore.open_default(home) as store:
     host_id = store.ensure_local_host()
     for raw_root in roots:
@@ -448,13 +442,8 @@ with AccountStore.open_default(home) as store:
         timestamp = utc_timestamp()
         with store.immediate_transaction() as connection:
             existing = connection.execute(
-                '''
-                SELECT repository.repo_id, repository.generation,
-                       owner.owner_uid, owner.repository_generation
-                FROM repositories repository
-                LEFT JOIN repository_owners owner USING(repo_id)
-                WHERE repository.host_id = ? AND repository.canonical_root = ?
-                ''',
+                '''SELECT repo_id FROM repositories
+                   WHERE host_id = ? AND canonical_root = ?''',
                 (host_id, str(root)),
             ).fetchone()
             if existing is None:
@@ -467,29 +456,8 @@ with AccountStore.open_default(home) as store:
                     ''',
                     (repository_id, host_id, str(root), root.name or str(root), timestamp, timestamp),
                 )
-                establish_repository_owner_authority(
-                    connection,
-                    repository_id=repository_id,
-                    owner_uid=owner_uid,
-                    repository_generation=0,
-                    operation_id=str(uuid.uuid4()),
-                    actor='devops-console-e2e-bootstrap',
-                    reason='explicit E2E fixture repository enrollment',
-                    timestamp=timestamp,
-                    evidence={
-                        'kind': 'devops-console-e2e-repository-owner',
-                        'repository_id': repository_id,
-                        'canonical_root': str(root),
-                        'repository_generation': 0,
-                        'owner_uid': owner_uid,
-                    },
-                )
-            elif (
-                str(existing['repo_id']) != repository_id
-                or int(existing['owner_uid']) != owner_uid
-                or int(existing['repository_generation']) != int(existing['generation'])
-            ):
-                raise RuntimeError(f'fixture repository owner authority conflicts for {root}')
+            elif str(existing['repo_id']) != repository_id:
+                raise RuntimeError(f'fixture repository identity conflicts for {root}')
         persistence = SQLiteLifecyclePersistence(store)
         with store.read_transaction() as connection:
             installed = connection.execute(
@@ -500,13 +468,13 @@ with AccountStore.open_default(home) as store:
             RepositoryLifecycle(persistence, object()).install_repository(
                 repository_id,
                 actor='devops-console-e2e-bootstrap',
-                reason='explicit E2E fixture repository enrollment',
+                reason='E2E fixture repository catalog setup',
                 explicit=True,
             )
 `;
   await execFileAsync(
     'python3',
-    ['-c', script, path.dirname(COORDINATOR_SCRIPT), home, String(ownerUid), JSON.stringify(roots)],
+    ['-c', script, path.dirname(COORDINATOR_SCRIPT), home, JSON.stringify(roots)],
     {
       env: { ...process.env, ...extraEnv, CODEX_AGENT_COORDINATOR_HOME: home },
       timeout: 60_000,
@@ -518,7 +486,7 @@ with AccountStore.open_default(home) as store:
 async function initializeNormalizedCoordinator(
   home,
   extraEnv = {},
-  { expectDocker = false, repositoryOwnerRoots = [] } = {},
+  { expectDocker = false, repositoryRoots = [] } = {},
 ) {
   // A production SQLite mutation deliberately discovers every eligible
   // same-UID legacy home before it establishes authority. E2E must not import
@@ -553,7 +521,7 @@ async function initializeNormalizedCoordinator(
   // Observation deliberately never invents execution ownership from Docker
   // labels or filesystem UID. Test Docker projects therefore use the same
   // explicit owner-authority boundary as production enrollment.
-  await enrollFixtureRepositoryOwners(home, repositoryOwnerRoots, extraEnv);
+  await catalogFixtureRepositories(home, repositoryRoots, extraEnv);
 
   const observation = await runNormalizedObservation({
     home,
@@ -565,7 +533,7 @@ async function initializeNormalizedCoordinator(
 
   const imported = observation?.imported;
   if (
-    observation?.schema_version !== INVENTORY_WIRE_SCHEMA_VERSION
+    observation?.schema_version !== OBSERVATION_WIRE_SCHEMA_VERSION
     || observation?.status !== 'completed'
     || observation?.observer_domain !== 'host-runtime-v2:full-docker'
     || imported?.committed !== true
@@ -573,7 +541,7 @@ async function initializeNormalizedCoordinator(
     || imported?.blocking_conflict_count !== 0
   ) {
     throw new Error(
-      `E2E coordinator bootstrap must commit one conflict-free legacy seed into a wire-schema-v${INVENTORY_WIRE_SCHEMA_VERSION} full-Docker observation: ${JSON.stringify(observation)}`,
+      `E2E coordinator bootstrap must commit one conflict-free legacy seed into a wire-schema-v${OBSERVATION_WIRE_SCHEMA_VERSION} full-Docker observation: ${JSON.stringify(observation)}`,
     );
   }
   if (expectDocker && observation?.observed !== true) {
@@ -610,11 +578,11 @@ async function assertNormalizedCoordinatorAuthority(coordinator, initialization,
 async function spawnCoordinator(
   home,
   extraEnv = {},
-  { expectDocker = false, repositoryOwnerRoots = [] } = {},
+  { expectDocker = false, repositoryRoots = [] } = {},
 ) {
   const initialization = await initializeNormalizedCoordinator(home, extraEnv, {
     expectDocker,
-    repositoryOwnerRoots,
+    repositoryRoots,
   });
   const proc = spawn(
     'python3',
@@ -730,7 +698,7 @@ async function spawnCoordinator(
       project,
     });
     if (
-      result?.schema_version !== INVENTORY_WIRE_SCHEMA_VERSION
+      result?.schema_version !== OBSERVATION_WIRE_SCHEMA_VERSION
       || result?.status !== 'completed'
       || result?.observer_domain !== 'host-runtime-v2:full-docker'
       || (result?.imported?.blocking_conflict_count ?? 0) !== 0
@@ -776,7 +744,7 @@ async function stopProcess(proc) {
  *   process only (e.g. a PATH with a fake `docker` first).
  * @param {boolean} [options.expectDocker] require the supplied Docker fixture
  *   to be available in the committed normalized observation.
- * @param {string[]} [options.repositoryOwnerRoots] explicitly enrolled E2E
+ * @param {string[]} [options.repositoryRoots] E2E fixture repositories to catalog
  *   repository roots needed by pre-existing observed resources.
  */
 export async function startStack({
@@ -786,7 +754,7 @@ export async function startStack({
   routes = [],
   coordinatorEnv = {},
   expectDocker = false,
-  repositoryOwnerRoots = [],
+  repositoryRoots = [],
 } = {}) {
   ensureDevCert(); // fresh clones (CI) generate the throwaway TLS fixture
   const cleanups = []; // LIFO
@@ -815,7 +783,7 @@ export async function startStack({
 
     const coordinator = await spawnCoordinator(coordHome, coordinatorEnv, {
       expectDocker,
-      repositoryOwnerRoots,
+      repositoryRoots,
     });
     cleanups.push(async () => {
       // Stop any servers the coordinator still manages (e.g. a test failed

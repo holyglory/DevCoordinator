@@ -1,6 +1,6 @@
-// Persistent per-Google-account authorization for the Console and protected
-// route hosts. Configured ALLOWED_EMAILS remain immutable owners; invited
-// users and their exact grants live in <stateDir>/access-control.json.
+// Persistent sign-in access for the Console and protected route hosts.
+// Repository commands are intentionally outside this policy on a trusted
+// single-developer server.
 
 import crypto from 'node:crypto';
 import { constants as fsConstants, promises as fsp } from 'node:fs';
@@ -8,7 +8,7 @@ import path from 'node:path';
 
 const EMAIL_RE = /^[^\s@<>(),;:\\"\[\]]+@[^\s@<>(),;:\\"\[\]]+\.[^\s@<>(),;:\\"\[\]]+$/;
 const ROUTE_GRANT_RE = /^route:([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)$/;
-const TEST_GRANT_RE = /^tests:(read|run|operate):([A-Za-z0-9][A-Za-z0-9_.@-]{0,255})$/;
+const LEGACY_TEST_GRANT_RE = /^tests:(read|run|operate):([A-Za-z0-9][A-Za-z0-9_.@-]{0,255})$/;
 const MAX_USERS = 1000;
 const MAX_GRANTS = 1000;
 const MAX_PENDING_REQUESTS = 1000;
@@ -23,12 +23,6 @@ const NO_CHANGE = Symbol('no-change');
 
 export const CONSOLE_GRANT = 'console';
 export const routeGrant = (slug) => `route:${String(slug ?? '').trim().toLowerCase()}`;
-export const testGrant = (repoId, scope) => {
-  const grant = `tests:${String(scope ?? '').trim().toLowerCase()}:${String(repoId ?? '').trim()}`;
-  if (!TEST_GRANT_RE.test(grant)) throw new AccessError(400, 'test grant identity is invalid');
-  return grant;
-};
-
 export class AccessError extends Error {
   constructor(status, message, { retryAfter = null } = {}) {
     super(message);
@@ -94,19 +88,12 @@ export function createAccessStore({
 
   function grantExists(grant) {
     if (grant === CONSOLE_GRANT) return true;
-    // Repository ids are immutable and never reassigned. Keeping an exact
-    // tests grant after a project is archived cannot authorize a successor;
-    // the Console still verifies the id against the live catalog per call.
-    if (TEST_GRANT_RE.test(grant)) return true;
     const match = typeof grant === 'string' ? grant.match(ROUTE_GRANT_RE) : null;
     return Boolean(match && routeStore?.get(match[1]));
   }
 
   function resourceInstance(grant) {
     if (grant === CONSOLE_GRANT) return CONSOLE_INSTANCE;
-    if (TEST_GRANT_RE.test(grant)) {
-      return `repository-tests:v1:${crypto.createHash('sha256').update(grant, 'utf8').digest('hex')}`;
-    }
     const match = typeof grant === 'string' ? grant.match(ROUTE_GRANT_RE) : null;
     if (!match) return null;
     const route = routeStore?.get(match[1]);
@@ -124,8 +111,9 @@ export function createAccessStore({
     for (const value of values) {
       if (typeof value !== 'string') throw new AccessError(400, 'each grant must be a string');
       const trimmed = value.trim();
-      const grant = TEST_GRANT_RE.test(trimmed) ? trimmed : trimmed.toLowerCase();
-      if (grant !== CONSOLE_GRANT && !ROUTE_GRANT_RE.test(grant) && !TEST_GRANT_RE.test(grant)) {
+      if (LEGACY_TEST_GRANT_RE.test(trimmed)) continue;
+      const grant = trimmed.toLowerCase();
+      if (grant !== CONSOLE_GRANT && !ROUTE_GRANT_RE.test(grant)) {
         throw new AccessError(400, `unknown access resource '${grant.slice(0, 100)}'`);
       }
       if (requireCurrent && !grantExists(grant)) {
@@ -145,7 +133,7 @@ export function createAccessStore({
     for (const id of [...nextRequests.keys()].sort()) {
       serializedRequests[id] = nextRequests.get(id);
     }
-    return `${JSON.stringify({ version: 2, users: serialized, requests: serializedRequests }, null, 2)}\n`;
+    return `${JSON.stringify({ version: 3, users: serialized, requests: serializedRequests }, null, 2)}\n`;
   }
 
   async function persist(nextUsers, nextRequests) {
@@ -230,7 +218,7 @@ export function createAccessStore({
       parsed = null;
     }
     const valid = parsed && typeof parsed === 'object' && !Array.isArray(parsed)
-      && (parsed.version === 1 || parsed.version === 2) && parsed.users && typeof parsed.users === 'object'
+      && [1, 2, 3].includes(parsed.version) && parsed.users && typeof parsed.users === 'object'
       && !Array.isArray(parsed.users);
     if (!valid) {
       const backup = `${file}.corrupt-${Date.now()}`;
@@ -242,7 +230,7 @@ export function createAccessStore({
     }
 
     const next = new Map();
-    let pruned = parsed.version === 1;
+    let pruned = parsed.version !== 3;
     for (const [rawEmail, value] of Object.entries(parsed.users)) {
       let email;
       try {
@@ -273,7 +261,7 @@ export function createAccessStore({
     users = next;
 
     const nextRequests = new Map();
-    if (parsed.version === 2) {
+    if (parsed.version >= 2) {
       if (!parsed.requests || typeof parsed.requests !== 'object' || Array.isArray(parsed.requests)) {
         pruned = true;
       } else {
@@ -293,7 +281,7 @@ export function createAccessStore({
             typeof id === 'string' && /^[0-9a-f-]{16,64}$/i.test(id)
             && typeof raw.subjectHash === 'string' && /^[0-9a-f]{64}$/.test(raw.subjectHash)
             && typeof raw.resource === 'string'
-            && (raw.resource === CONSOLE_GRANT || ROUTE_GRANT_RE.test(raw.resource) || TEST_GRANT_RE.test(raw.resource))
+            && (raw.resource === CONSOLE_GRANT || ROUTE_GRANT_RE.test(raw.resource))
             && typeof raw.resourceInstance === 'string' && raw.resourceInstance.length > 0
             && raw.resourceInstance.length <= 200 && !/[\u0000-\u001f\u007f]/.test(raw.resourceInstance)
             && typeof raw.host === 'string' && raw.host.length > 0 && raw.host.length <= 300

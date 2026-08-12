@@ -12,14 +12,13 @@ test('published HTTP contract describes normalized query-only inventory and its 
     new URL('../docs/coordinator-http-api.json', import.meta.url),
     'utf8',
   ));
-  assert.equal(contract.inventory_contract.schema_version, 2);
+  assert.equal(contract.inventory_contract.schema_version, 3);
   assert.equal(contract.inventory_contract.read_semantics, 'query-only');
   assert.deepEqual(contract.inventory_contract.normalized_top_level, [
     'store',
     'repositories',
     'coordinator_sources',
     'docker_engines',
-    'memberships',
     'resources',
     'leases',
     'port_assignments',
@@ -30,7 +29,6 @@ test('published HTTP contract describes normalized query-only inventory and its 
     'unassigned_resources',
     'lifecycle_violations',
     'observations',
-    'control_bindings',
     'test_statistics',
     'agent_browsers',
   ]);
@@ -727,7 +725,6 @@ test('overview inventory excludes audit history after deriving the current Conso
     store: { state_revision: 7, observation_revision: 11 },
     repositories: [],
     repository_trees: [],
-    memberships: [],
     resources: { servers: [], docker: [], docker_ports: [], databases: [] },
     unassigned_resources: [],
     lifecycle_violations: [],
@@ -982,7 +979,7 @@ test('schema-v2 inventory projects only its declared v1 compatibility rows for C
   assert.deepEqual(inventory.port_assignments, compatibility.port_assignments);
   assert.deepEqual(inventory.servers, [compatibility.servers[0]]);
   assert.deepEqual(inventory.project_usage[0].server_ids, ['server-1'],
-    'control-only definitions must not enter Console project membership');
+    'control-only definitions must not enter Console project association');
   assert.deepEqual(inventory.repositories, payload.repositories,
     'the Console projection must retain non-conflicting normalized evidence');
   assert.deepEqual(inventory.repository_trees, payload.repository_trees,

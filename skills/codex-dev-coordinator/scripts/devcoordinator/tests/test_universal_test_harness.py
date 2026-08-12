@@ -10,7 +10,7 @@ import unittest
 import uuid
 
 from devcoordinator.broker import (
-    AuthorizedBrokerRequest,
+    AcceptedBrokerRequest,
     BrokerBackendError,
     BrokerError,
     BrokerOperation,
@@ -20,14 +20,9 @@ from devcoordinator.broker import (
 from devcoordinator.broker_backend import StoreBackedMutationBackend
 from devcoordinator.broker_persistence import BrokerPersistence
 from devcoordinator.store import CoordinatorStore
-from devcoordinator.schema import establish_repository_owner_authority
 from devcoordinator.test_records import CoordinatorTestRecords
 from devcoordinator.test_runner import TestHarnessError, load_manifest
 from devcoordinator.universal_test_contract import SourceMode, parse_test_manifest
-from devcoordinator.universal_test_capabilities import (
-    RepositoryTestCapabilities,
-    SealedTestCapabilityRegistry,
-)
 from devcoordinator.universal_test_planner import SourceIdentity, create_test_plan
 from devcoordinator.universal_test_snapshot_service import SnapshotAuthority
 from devcoordinator.universal_test_store import TestStoreContractError
@@ -149,17 +144,6 @@ class UniversalTestHarnessTests(unittest.TestCase):
                     "INSERT INTO repository_installations(repo_id, status, startup_fenced, actor, updated_at) VALUES (?, 'installed', 0, 'test', ?)",
                     (self.repo_id, now),
                 )
-                establish_repository_owner_authority(
-                    connection,
-                    repository_id=self.repo_id,
-                    owner_uid=os.geteuid(),
-                    repository_generation=0,
-                    operation_id=str(uuid.uuid4()),
-                    actor="test",
-                    reason="universal harness fixture owner",
-                    timestamp=now,
-                    evidence={"kind": "universal-harness-fixture"},
-                )
                 connection.execute(
                     "UPDATE schema_metadata SET migration_state = 'ready' WHERE singleton = 1"
                 )
@@ -172,14 +156,6 @@ class UniversalTestHarnessTests(unittest.TestCase):
                         "SELECT database_generation FROM schema_metadata WHERE singleton = 1"
                     ).fetchone()[0]
                 )
-                connection.execute(
-                    "INSERT INTO broker_acl_principals(uid, account_id, enabled, updated_at) VALUES (?, 'account-tests', 1, ?)",
-                    (os.geteuid(), now),
-                )
-                connection.execute(
-                    "INSERT INTO broker_repository_enrollments(uid, repo_id, account_id, enabled, issued_at, valid_until_epoch, updated_at) VALUES (?, ?, 'account-tests', 1, ?, ?, ?)",
-                    (os.geteuid(), self.repo_id, now, 4_102_444_800, now),
-                )
         self.records = CoordinatorTestRecords(
             self.database, expected_uid=os.geteuid(), busy_timeout_ms=5_000
         )
@@ -187,70 +163,14 @@ class UniversalTestHarnessTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
-    def test_execution_owner_is_independent_of_authorized_collaborator(self) -> None:
-        collaborator_uid = os.geteuid() + 1000
-        self.persistence.provision_principal(
-            uid=collaborator_uid, account_id="account-collaborator"
-        )
-        self.persistence.provision_repository_enrollment(
-            uid=collaborator_uid,
-            repo_id=self.repo_id,
-            account_id="account-collaborator",
-            issued_at=datetime.now(UTC).isoformat(),
-            valid_until_epoch=4_102_444_800,
-        )
-        authority = self.persistence.test_repository_execution_authority(
-            repo_id=self.repo_id,
-            operation_id=str(uuid.uuid4()),
-        )
-        self.assertEqual(authority.owner_uid, os.geteuid())
-        snapshot_authority = SnapshotAuthority(
-            self.database, expected_uid=os.geteuid()
-        )
-        self.assertEqual(
-            snapshot_authority.repository(repository_id=self.repo_id)["owner_uid"],
-            os.geteuid(),
-        )
-        with self.assertRaisesRegex(
-            TestStoreContractError, "test_execution_owner_unavailable"
-        ):
-            snapshot_authority.repository(
-                repository_id=self.repo_id, owner_uid=collaborator_uid
-            )
-        attempt_authority = self.persistence.test_attempt_repository_authority(
-            repo_id=self.repo_id,
-            owner_uid=collaborator_uid,
-            operation_id=str(uuid.uuid4()),
-        )
-        self.assertEqual(attempt_authority.owner_uid, os.geteuid())
-
-    def test_execution_owner_fails_closed_when_owner_enrollment_is_disabled(self) -> None:
-        with CoordinatorStore.open(self.database) as store:
-            with store.immediate_transaction() as connection:
-                connection.execute(
-                    """
-                    UPDATE broker_repository_enrollments SET enabled = 0
-                    WHERE repo_id = ? AND uid = ?
-                    """,
-                    (self.repo_id, os.geteuid()),
-                )
-        with self.assertRaises(BrokerError) as unavailable:
-            self.persistence.test_repository_execution_authority(
-                repo_id=self.repo_id,
-                operation_id=str(uuid.uuid4()),
-            )
-        self.assertEqual(
-            unavailable.exception.code, "test_execution_owner_unavailable"
-        )
-
     def request(
         self,
         operation: BrokerOperation,
         arguments: dict[str, object],
         *,
         operation_id: str | None = None,
-    ) -> AuthorizedBrokerRequest:
-        return AuthorizedBrokerRequest(
+    ) -> AcceptedBrokerRequest:
+        return AcceptedBrokerRequest(
             peer=PeerCredentials(uid=os.geteuid(), gid=os.getegid(), pid=os.getpid()),
             request=BrokerRequest.create(
                 account_id="account-tests",
@@ -262,6 +182,7 @@ class UniversalTestHarnessTests(unittest.TestCase):
                 authority_generation=self.generation,
             ),
         )
+
 
     def test_records_exact_case_timings_and_repository_statistics(self) -> None:
         run_id = str(uuid.uuid4())
@@ -579,7 +500,7 @@ class UniversalTestHarnessTests(unittest.TestCase):
             },
             operation_id=run_id,
         )
-        authorized = self.persistence.authorize(
+        authorized = self.persistence.accept(
             start_request.peer, start_request.request
         )
         self.assertEqual(backend.execute(authorized)["status"], "running")
@@ -595,7 +516,7 @@ class UniversalTestHarnessTests(unittest.TestCase):
                 "cases": [],
             },
         )
-        authorized_finish = self.persistence.authorize(
+        authorized_finish = self.persistence.accept(
             finish_request.peer, finish_request.request
         )
         self.assertEqual(backend.execute(authorized_finish)["status"], "passed")
@@ -618,31 +539,17 @@ class UniversalTestHarnessTests(unittest.TestCase):
             )
 
         valid_plane = PreviewTestPlane(selected(self.root))
-        repository_generation = self.persistence.test_attempt_repository_authority(
-            repo_id=self.repo_id,
-            owner_uid=os.geteuid(),
-            operation_id=str(uuid.uuid4()),
-        ).generation
-        capabilities = SealedTestCapabilityRegistry(
-            {
-                self.repo_id: RepositoryTestCapabilities(
-                    generation=repository_generation,
-                    capabilities=frozenset(),
-                )
-            }
-        )
         backend = StoreBackedMutationBackend(
             self.persistence,
             object(),  # type: ignore[arg-type]
             test_plane=valid_plane,  # type: ignore[arg-type]
-            test_capabilities=capabilities,
         )
         preview = self.request(
             BrokerOperation.TEST_PLAN_PREVIEW,
             self.preview_arguments("release"),
         )
         result = backend.execute(
-            self.persistence.authorize(preview.peer, preview.request)
+            self.persistence.accept(preview.peer, preview.request)
         )
         self.assertEqual(result["plan_id"], valid_plane.selected_plan.plan_id)
         self.assertEqual(len(valid_plane.registered), 1)
@@ -654,21 +561,20 @@ class UniversalTestHarnessTests(unittest.TestCase):
             self.persistence,
             object(),  # type: ignore[arg-type]
             test_plane=invalid_plane,  # type: ignore[arg-type]
-            test_capabilities=capabilities,
         )
         with self.assertLogs("devcoordinator.broker_backend", level="WARNING") as logs:
             with self.assertRaises(BrokerBackendError) as rejected:
                 invalid_backend.execute(
-                    self.persistence.authorize(preview.peer, preview.request)
+                    self.persistence.accept(preview.peer, preview.request)
                 )
         self.assertEqual(rejected.exception.code, "test_contract_invalid")
         self.assertIn(
-            "plan source is not the exact authorized root repository",
+            "plan source is not the exact accepted root repository",
             str(rejected.exception),
         )
         self.assertIn(preview.request.operation_id, "\n".join(logs.output))
         self.assertIn(
-            "plan source is not the exact authorized root repository",
+            "plan source is not the exact accepted root repository",
             "\n".join(logs.output),
         )
         self.assertEqual(invalid_plane.registered, [])
@@ -677,14 +583,14 @@ class UniversalTestHarnessTests(unittest.TestCase):
             BrokerOperation.TEST_FLEET_STATS_READ,
             {"hours": 24},
         )
-        authorized_fleet = self.persistence.authorize(
+        authorized_fleet = self.persistence.accept(
             fleet_request.peer, fleet_request.request
         )
         self.assertEqual(backend.execute(authorized_fleet)["schema_version"], 2)
 
         health_request = self.request(BrokerOperation.TEST_HEALTH, {})
         health = backend.execute(
-            self.persistence.authorize(health_request.peer, health_request.request)
+            self.persistence.accept(health_request.peer, health_request.request)
         )
         self.assertEqual(health["status"], "ok")
         self.assertEqual(health["test_store_schema_version"], 5)
@@ -700,7 +606,7 @@ class UniversalTestHarnessTests(unittest.TestCase):
             authority_generation=self.generation,
         )
         with self.assertRaises(Exception):
-            self.persistence.authorize(start_request.peer, wrong_resource)
+            self.persistence.accept(start_request.peer, wrong_resource)
 
         with self.assertRaises(BrokerError):
             BrokerRequest.create(
@@ -712,8 +618,7 @@ class UniversalTestHarnessTests(unittest.TestCase):
                 authority_generation=self.generation,
             )
 
-    def test_fleet_projection_is_limited_to_current_peer_enrollments(self) -> None:
-        """A repository enrollment is not authority to enumerate other accounts."""
+    def test_fleet_projection_is_server_wide_for_every_trusted_local_peer(self) -> None:
 
         other_repo = "repo-private-other-account"
         other_uid = os.geteuid() + 10_000
@@ -728,39 +633,20 @@ class UniversalTestHarnessTests(unittest.TestCase):
                     "INSERT INTO repository_installations(repo_id, status, startup_fenced, actor, updated_at) VALUES (?, 'installed', 0, 'test', ?)",
                     (other_repo, now),
                 )
-                establish_repository_owner_authority(
-                    connection,
-                    repository_id=other_repo,
-                    owner_uid=other_uid,
-                    repository_generation=0,
-                    operation_id=str(uuid.uuid4()),
-                    actor="test",
-                    reason="private fleet fixture owner",
-                    timestamp=now,
-                    evidence={"kind": "private-fleet-fixture"},
-                )
-                connection.execute(
-                    "INSERT INTO broker_acl_principals(uid, account_id, enabled, updated_at) VALUES (?, 'account-other', 1, ?)",
-                    (other_uid, now),
-                )
-                connection.execute(
-                    "INSERT INTO broker_repository_enrollments(uid, repo_id, account_id, enabled, issued_at, valid_until_epoch, updated_at) VALUES (?, ?, 'account-other', 1, ?, ?, ?)",
-                    (other_uid, other_repo, now, 4_102_444_800, now),
-                )
 
         unscoped = self.records.fleet_overview(hours=24)
         self.assertEqual(
             {item["repo_id"] for item in unscoped["repositories"]},
             {self.repo_id, other_repo},
         )
-        scoped = self.records.fleet(
+        trusted_local = self.records.fleet(
             self.request(BrokerOperation.TEST_FLEET_STATS_READ, {"hours": 24})
         )
         self.assertEqual(
-            [item["repo_id"] for item in scoped["repositories"]], [self.repo_id]
+            {item["repo_id"] for item in trusted_local["repositories"]},
+            {self.repo_id, other_repo},
         )
-        self.assertEqual(scoped["summary"]["repository_count"], 1)
-        self.assertNotIn(other_repo, json.dumps(scoped))
+        self.assertEqual(trusted_local["summary"]["repository_count"], 2)
 
     def test_snapshot_source_failure_exposes_only_actionable_bounded_detail(self) -> None:
         plane = PreviewTestPlane(object())
@@ -780,7 +666,7 @@ class UniversalTestHarnessTests(unittest.TestCase):
         )
 
         with self.assertRaises(BrokerBackendError) as raised:
-            backend.execute(self.persistence.authorize(preview.peer, preview.request))
+            backend.execute(self.persistence.accept(preview.peer, preview.request))
 
         self.assertEqual(raised.exception.code, "test_plan_source_invalid")
         self.assertEqual(
@@ -794,7 +680,7 @@ class UniversalTestHarnessTests(unittest.TestCase):
             "test_plan_source_invalid", "unexpected secret at /outside/path"
         )
         with self.assertRaises(BrokerBackendError) as opaque:
-            backend.execute(self.persistence.authorize(preview.peer, preview.request))
+            backend.execute(self.persistence.accept(preview.peer, preview.request))
         self.assertNotIn("/outside/path", opaque.exception.message)
 
         plane.preview_error = TestPlaneTransportError(
@@ -803,7 +689,7 @@ class UniversalTestHarnessTests(unittest.TestCase):
             "[Errno 2] No such file or directory: 'tests.json'",
         )
         with self.assertRaises(BrokerBackendError) as missing:
-            backend.execute(self.persistence.authorize(preview.peer, preview.request))
+            backend.execute(self.persistence.accept(preview.peer, preview.request))
         self.assertEqual(missing.exception.code, "test_plan_source_invalid")
         self.assertEqual(
             missing.exception.message,
@@ -815,7 +701,7 @@ class UniversalTestHarnessTests(unittest.TestCase):
         preview = self.request(
             BrokerOperation.TEST_PLAN_PREVIEW, self.preview_arguments("manual")
         )
-        authorized = self.persistence.authorize(preview.peer, preview.request)
+        authorized = self.persistence.accept(preview.peer, preview.request)
         self.assertEqual(authorized.request.project_id, self.repo_id)
         self.assertEqual(authorized.request.resource_id, self.repo_id)
         self.assertEqual(

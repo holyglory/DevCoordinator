@@ -22,6 +22,7 @@ from typing import Iterable
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_UNIT_DIR = ROOT / "deploy"
+API_PROFILE_SCHEMA = 2
 
 
 @dataclass(frozen=True)
@@ -575,10 +576,7 @@ def validate_service(
             )
     if path.name == "devcoordinator-authority.service":
         command = one(unit, "Service", "ExecStart") or ""
-        for flag in (
-            "--test-plane-socket",
-            "--test-capability-policy",
-        ):
+        for flag in ("--test-plane-socket",):
             if flag not in command:
                 findings.append(
                     violation(
@@ -665,6 +663,14 @@ def validate_service(
                     "authority must retain the durable fixture journal root and an optional runtime credential root",
                 )
             )
+        if "/var/lib/devcoordinator-browser-lifecycle" not in writable_paths:
+            findings.append(
+                violation(
+                    "authority_browser_lifecycle_storage_missing",
+                    path,
+                    "authority must write browser telemetry through its dedicated caller-readable state root",
+                )
+            )
         if "/home" not in writable_paths:
             findings.append(
                 violation(
@@ -693,6 +699,14 @@ def validate_service(
         "devcoordinator-authority.service",
         "devcoordinator-broker.service",
     }:
+        if one(unit, "Service", "StateDirectoryMode") != "0711":
+            findings.append(
+                violation(
+                    "authority_state_parent_traversal_invalid",
+                    path,
+                    "the shared authority state parent must be traverse-only so actual-caller clients can read explicitly published non-secret telemetry",
+                )
+            )
         runtime_directories = {
             item
             for declaration in values(unit, "Service", "RuntimeDirectory")
@@ -712,7 +726,7 @@ def validate_service(
                 violation(
                     "api_repository_visibility_invalid",
                     path,
-                    "API services must read enrolled repository identities below /home",
+                    "API services must read cataloged repository identities below /home",
                 )
             )
         credentials = values(unit, "Service", "LoadCredential")
@@ -743,12 +757,13 @@ def validate_service(
         if (
             f"--profile {expected_profile}" not in command
             or f"--profile {expected_profile}" not in preflight
+            or f"--expected-schema {API_PROFILE_SCHEMA}" not in preflight
         ):
             findings.append(
                 violation(
                     "api_profile_contract_invalid",
                     path,
-                    "stable and handoff APIs must use their exact distinct protected profiles",
+                    "stable and handoff APIs must use their exact profiles at the current schema",
                 )
             )
         expected_role = (
@@ -997,6 +1012,19 @@ def validate_service(
         writable_paths = set(
             (one(unit, "Service", "ReadWritePaths") or "").split()
         )
+        state_directories = {
+            item
+            for declaration in values(unit, "Service", "StateDirectory")
+            for item in declaration.split()
+        }
+        if "devcoordinator-test-runs" in state_directories:
+            findings.append(
+                violation(
+                    "snapshotd_attempt_root_lifecycle_conflict",
+                    path,
+                    "snapshotd must not lifecycle-manage the shared attempt root because its private StateDirectoryMode strands attributed repository-UID runners during replacement",
+                )
+            )
         if "/var/lib/devcoordinator" not in writable_paths:
             findings.append(
                 violation(
@@ -1300,8 +1328,13 @@ def validate_tmpfiles(path: Path) -> list[Violation]:
         "/etc/devcoordinator/console-slots": ("d", "0755", "root", "root"),
         "/etc/devcoordinator/client-profiles.json": ("z", "0644", "root", "root"),
         "/etc/devcoordinator/api-handoff-profile.json": ("z", "0644", "root", "root"),
+        "/etc/devcoordinator/browser-runtime-lock.json": ("z", "0644", "root", "root"),
         "/run/devcoordinator": ("d", "0755", "root", "root"),
         "/run/devcoordinator-maintenance": ("d", "0755", "root", "root"),
+        "/var/lib/devcoordinator": ("d", "0711", "root", "root"),
+        "/var/lib/devcoordinator-browser-lifecycle": ("d", "0755", "root", "root"),
+        "/var/lib/devcoordinator-browser-lifecycle/browser-lifecycle.json": ("z", "0644", "root", "root"),
+        "/var/lib/devcoordinator-browser-lifecycle/browser-lifecycle.json.lock": ("z", "0644", "root", "root"),
         "/var/lib/devcoordinator-bugs": ("d", "0777", "root", "root"),
         "/var/lib/devcoordinator-bugs/open": ("d", "0777", "root", "root"),
         "/var/lib/devcoordinator-edge": ("d", "0700", "devcoordinator-edge", "devcoordinator-edge"),
@@ -1311,7 +1344,7 @@ def validate_tmpfiles(path: Path) -> list[Violation]:
         "/var/lib/devcoordinator-testd/spool": ("d", "0700", "devcoordinator-testd", "devcoordinator-testd"),
         "/var/lib/devcoordinator-test-snapshots": ("d", "0711", "root", "root"),
         "/var/lib/devcoordinator-test-snapshot-catalog": ("d", "0700", "root", "root"),
-        "/var/lib/devcoordinator-test-runs": ("d", "0700", "root", "root"),
+        "/var/lib/devcoordinator-test-runs": ("d", "0711", "root", "root"),
         "/var/lib/devcoordinator-test-fixtures": ("d", "0700", "root", "root"),
         "/run/devcoordinator/test-fixture-credentials": ("d", "0700", "root", "root"),
         "/run/devcoordinator-test-snapshotd": ("d", "0755", "root", "root"),

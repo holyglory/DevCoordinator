@@ -54,8 +54,9 @@ removal, artifact drill-down, and other admin surfaces remain lower-level.
 | Read state | `devcoordinator runtime status SELECTOR [--kind KIND]` | Fresh exact observation and bounded state/attention projection |
 | Converge state | `devcoordinator runtime ensure SELECTOR --desired ready\|stopped [--kind KIND]` | Observation, no-op or safe start/stop selection, durable mutation, terminal proof |
 | Start a new bounded development service | `devcoordinator runtime serve NAME --cwd RELATIVE --port PORT --ttl-seconds N --kill-after-run BOOL --launch-timeout-seconds N -- ARGV...` | Pure context validation, atomic first-use adoption when needed, exact-port launch without a shell, supervision, expiry and control-group cleanup |
+| Remove one selected Docker container | `devcoordinator storage remove container EXACT_RESOURCE_ID --reason REASON` | Resolve the current catalog target to its full native ID and invoke only `docker rm -f <id>` without `-v`, ownership, cleanup-grant, archive, state, fingerprint, plan, confirmation, or observation gates |
 | Recover mutation | `devcoordinator operation follow HANDLE` | Exact operation lookup, certainty and next-transition projection |
-| Routine shared tests | `devcoordinator test enqueue --intent change\|checkpoint\|manual` | Manifest validation, policy plan, registration, submission, run handle |
+| Governed test batches | `devcoordinator test enqueue --intent change\|checkpoint\|manual` | Manifest validation, policy plan, registration, submission, run handle |
 | Reviewed tests | `devcoordinator test enqueue --intent handoff\|release` then returned `test submit` | Immutable plan first; submission only after semantic review |
 | Read/wait for tests | `devcoordinator test follow RUN [--wait-seconds N]` | Broker polling, terminal summary, bounded failures and next action |
 
@@ -65,6 +66,22 @@ exact ID or unique enrolled name; the runtime command resolves it internally.
 A routine test enqueue plans and submits in one call. A handoff/release workflow
 requires two calls by design because plan review is a semantic gate. Follow is
 one call per immediate read or bounded wait.
+
+### Local feedback versus governed batches
+
+Direct local test execution is limited to one focused invocation whose selector
+is proven before launch to collect at most 20 cases, whose runner enforces an
+execution deadline of at most 10 seconds, and which needs no host-visible or
+shared state. Unit-test isolation alone is not proof of local eligibility.
+Static checks remain local and are not counted as test cases.
+
+If the collected-case count or runtime bound is unknown, collection would
+exceed 20 cases, execution may exceed 10 seconds, the deadline cannot be
+enforced, or durable shared evidence is required, enqueue one governed batch.
+Do not reproduce the batch by looping over test files, packages, or targets in
+separate local commands. A repository without a valid `.codex/tests.json` may
+run only a bounded focused subset locally; its broad suite remains a manifest
+setup gap rather than an authorized local fallback.
 
 ### New repository first use
 
@@ -113,7 +130,6 @@ The error envelope distinguishes the cases without inference:
 | Invalid serve shape, `broker_contacted=false`, `mutation_performed=false` | Client validation rejected the call before adoption | Run the returned `devcoordinator runtime serve --help`, correct the named field, and resubmit |
 | Typed broker rejection, `broker_contacted=true`, `mutation_performed=false` | Broker received the request and changed nothing | Correct the typed cause. For `port_in_use`, keep the exact port, stop or wait for its owner, then submit a fresh operation |
 | Typed broker rejection, `broker_contacted=true`, `mutation_performed=true` | A durable first-use adoption occurred before the later launch rejection | Do not re-enroll. Correct the typed launch cause and submit the stated fresh operation |
-| `test_execution_owner_unavailable`, `broker_contacted=true` | Authorization succeeded, but the Coordinator's durable repository-owner state is missing, stale, fenced, or internally inconsistent | This is Coordinator state, not application code, dependencies, the requested port, or the coding sandbox. Preserve the operation ID, file the structured report below, and do not launch host-visible work directly |
 | Contact or mutation is `null`; operation handle returned | The reply cannot prove the mutation outcome | Run the exact returned `devcoordinator operation follow dc1:operation:…` command; do not create another operation |
 
 Malformed serve calls name the rejected field and return a bounded corrective
@@ -258,9 +274,11 @@ physically removes the exact report, with no closed table, archive, or
 tombstone. Re-reporting the same failure after close creates a new identity.
 
 If the failure is in the governed test harness, it blocks shared evidence but
-not ordinary source development. After reporting it, the agent may run only
-repository-native isolated unit or static checks that do not need shared or
-host-visible state. Every result is labelled exactly
+not ordinary source development. After reporting it, the agent may run static
+checks and only repository-native test invocations that still collect at most
+20 cases, enforce at most 10 seconds of execution, and need no shared or
+host-visible state. It must not split a larger suite into repeated bounded
+local commands. Every result is labelled exactly
 `local/advisory — non-governed; not Coordinator evidence`; it is not ingested
 into Coordinator statistics, cannot establish handoff or release readiness,
 and must be followed by a governed rerun after repair. The report can record
@@ -311,7 +329,7 @@ advertise that hint because the semantic action creates workflow state, even
 though an explicit operation UUID still enables exact transport replay.
 
 Tool annotations advertise read-only, destructive, idempotent, and closed-world
-hints, but the broker remains the authorization and mutation authority. The
+hints, while the broker remains the mutation and lifecycle coordinator. The
 server uses its process cwd for repository context, so start it in the intended
 worktree for runtime/test calls; bug tools are context-independent. MCP bounded
 waits are capped at 300 seconds. Tool results use the same compact decision

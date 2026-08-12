@@ -38,10 +38,10 @@ def _load_repository_cli(*, test_file: Path, filename: str, module_name: str):
 
     skill_root = test_file.resolve().parents[3]
     repository_root = skill_root.parent.parent
-    enrolled_skill = repository_root / "skills" / skill_root.name
+    configured_skill = repository_root / "skills" / skill_root.name
     cli_path = repository_root / "scripts" / filename
     try:
-        source_tree_matches = enrolled_skill.samefile(skill_root)
+        source_tree_matches = configured_skill.samefile(skill_root)
     except OSError:
         source_tree_matches = False
     if not source_tree_matches or not cli_path.is_file():
@@ -65,11 +65,8 @@ class FakeAuthority:
     def __init__(self, records: dict[str, dict[str, object]]) -> None:
         self.records = records
 
-    def repository(self, *, repository_id: str, owner_uid: int):
-        record = self.records[repository_id]
-        if record["owner_uid"] != owner_uid:
-            raise TestStoreConflict("repository owner authority is unavailable")
-        return dict(record)
+    def repository(self, *, repository_id: str):
+        return dict(self.records[repository_id])
 
 
 class LocalUIDHelper:
@@ -157,63 +154,6 @@ class UnreadableTrackedSafetyHelper(LocalUIDHelper):
         return result
 
 
-class RepairableThenCleanSafetyHelper(LocalUIDHelper):
-    def __init__(self) -> None:
-        self.safety_calls = 0
-
-    def call(self, operation: str, *, owner_uid: int, arguments):
-        result = super().call(operation, owner_uid=owner_uid, arguments=arguments)
-        if operation != "adoption_safety_identity":
-            return result
-        self.safety_calls += 1
-        if self.safety_calls > 2:
-            return result
-        relative = "tracked.txt"
-        path_hash = hashlib.sha256(relative.encode("utf-8")).hexdigest()[:16]
-        root = Path(arguments["repository_root"])
-        return {
-            **result,
-            "deletion_scan_complete": False,
-            "deleted_tracked_count": None,
-            "unreadable_tracked_count": 1,
-            "unreadable_tracked_sample": [path_hash],
-            "unreadable_tracked_entries_complete": True,
-            "unreadable_tracked_entries": [
-                {
-                    "relative_path": relative,
-                    "path_hash": path_hash,
-                    "identity": uid_helper._metadata_identity(root / relative),  # type: ignore[attr-defined]
-                    "required_permissions": "r--",
-                }
-            ],
-        }
-
-
-class InMemoryACLBackend:
-    def __init__(self) -> None:
-        self.values: dict[tuple[int, int], tuple[str, ...]] = {}
-
-    @staticmethod
-    def _key(metadata) -> tuple[int, int]:
-        return metadata.st_dev, metadata.st_ino
-
-    def read(self, path: Path) -> tuple[str, ...]:
-        metadata = path.stat()
-        return self.values.setdefault(
-            self._key(metadata),
-            ("user::rw-", "group::r--", "mask::r--", "other::---"),
-        )
-
-    def read_descriptor(self, descriptor: int) -> tuple[str, ...]:
-        metadata = os.fstat(descriptor)
-        return self.values.setdefault(
-            self._key(metadata),
-            ("user::rw-", "group::r--", "mask::r--", "other::---"),
-        )
-
-    def replace_descriptor(self, descriptor: int, entries) -> None:
-        metadata = os.fstat(descriptor)
-        self.values[self._key(metadata)] = tuple(entries)
 
 
 class UniversalTestManifestAdoptionTests(unittest.TestCase):
@@ -257,7 +197,6 @@ class UniversalTestManifestAdoptionTests(unittest.TestCase):
             "repository_id": repository_id,
             "canonical_root": str(root),
             "generation": generation,
-            "owner_uid": self.uid,
         }
         return root
 
@@ -272,7 +211,6 @@ class UniversalTestManifestAdoptionTests(unittest.TestCase):
             "repositories": [
                 {
                     "repository_id": repository_id,
-                    "owner_uid": record["owner_uid"],
                     "repository_generation": record["generation"],
                 }
                 for repository_id, record in sorted(self.records.items())
@@ -308,13 +246,13 @@ class UniversalTestManifestAdoptionTests(unittest.TestCase):
         with self.assertRaises(unittest.SkipTest):
             unavailable._write_private_once
 
-    def manager(self, helper=None, acl_backend=None) -> TestManifestAdoptionManager:
+    def manager(self, helper=None) -> TestManifestAdoptionManager:
         return TestManifestAdoptionManager(
             authority=FakeAuthority(self.records),
             helper=helper or LocalUIDHelper(),
             evidence_root=self.evidence,
+            execution_uid=self.uid,
             expected_evidence_uid=self.uid,
-            acl_backend=acl_backend,
         )
 
     def request(self, proposals: dict[str, dict[str, object]]) -> dict[str, object]:
@@ -326,7 +264,7 @@ class UniversalTestManifestAdoptionTests(unittest.TestCase):
                 {
                     "repository_id": repository_id,
                     "repository_generation": self.records[repository_id]["generation"],
-                    "owner_uid": self.uid,
+                    "execution_uid": self.uid,
                     "manifest": proposal,
                 }
                 for repository_id, proposal in sorted(proposals.items())
@@ -475,7 +413,7 @@ class UniversalTestManifestAdoptionTests(unittest.TestCase):
             None,
         )
         self.assertEqual(rows["repo-shared"]["status"], "missing")
-        self.assertFalse(rows["repo-shared"]["requires_safety_repair"])
+        self.assertFalse(rows["repo-shared"]["has_readability_blockers"])
         self.assertNotIn(str(shared), json.dumps(catalog, sort_keys=True))
 
         manifest_set = {
@@ -493,143 +431,6 @@ class UniversalTestManifestAdoptionTests(unittest.TestCase):
             ["repo-missing", "repo-shared"],
         )
 
-    def test_safety_repair_plan_is_exact_private_and_never_mutates_repository(self) -> None:
-        root = self.git_repository("repo-repair")
-        codex = root / ".codex"
-        codex.mkdir(mode=0o755)
-        codex.chmod(0o775)
-        manifest = codex / "tests.json"
-        manifest.write_text(
-            json.dumps(_manifest_template(), indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
-        )
-        manifest.chmod(0o664)
-        before = {
-            "codex": (codex.stat().st_uid, stat.S_IMODE(codex.stat().st_mode)),
-            "manifest": (
-                manifest.stat().st_uid,
-                stat.S_IMODE(manifest.stat().st_mode),
-                hashlib.sha256(manifest.read_bytes()).hexdigest(),
-            ),
-        }
-
-        planned = self.manager().plan_safety_repair(self.authority_export())
-        self.assertTrue(planned["ok"])
-        self.assertEqual(
-            planned["repositories"],
-            [
-                {
-                    "repository_id": "repo-repair",
-                    "repository_generation": 0,
-                    "owner_uid": self.uid,
-                    "status": "clean",
-                    "action_count": 0,
-                    "blocker_codes": [],
-                    "deletion_scan_complete": True,
-                    "deleted_tracked_count": 0,
-                    "unreadable_tracked_count": 0,
-                }
-            ],
-        )
-        private_path = self.evidence / planned["plan_id"] / "plan.json"
-        self.assertEqual(stat.S_IMODE(private_path.stat().st_mode), 0o600)
-        private = json.loads(private_path.read_text(encoding="utf-8"))
-        actions = private["repositories"][0]["actions"]
-        self.assertEqual(actions, [])
-        self.assertNotIn("tracked.txt", json.dumps(private, sort_keys=True))
-        self.assertNotIn(str(root), json.dumps(planned, sort_keys=True))
-        self.assertEqual(
-            (codex.stat().st_uid, stat.S_IMODE(codex.stat().st_mode)),
-            before["codex"],
-        )
-        self.assertEqual(
-            (
-                manifest.stat().st_uid,
-                stat.S_IMODE(manifest.stat().st_mode),
-                hashlib.sha256(manifest.read_bytes()).hexdigest(),
-            ),
-            before["manifest"],
-        )
-
-    def test_safety_repair_never_proposes_chowning_unreadable_tracked_tree(self) -> None:
-        root = self.git_repository("repo-blocked")
-        codex = root / ".codex"
-        codex.mkdir(mode=0o755)
-        codex.chmod(0o775)
-        planned = self.manager(
-            UnreadableTrackedSafetyHelper()
-        ).plan_safety_repair(self.authority_export())
-        self.assertEqual(planned["repositories"][0]["status"], "blocked")
-        self.assertEqual(planned["repositories"][0]["action_count"], 0)
-        self.assertIn(
-            "unreadable_tracked_entries",
-            planned["repositories"][0]["blocker_codes"],
-        )
-
-    def test_unreadable_tracked_content_is_not_reclassified_as_acl_repair(self) -> None:
-        root = self.git_repository("repo-acl-repair")
-        tracked = root / "tracked.txt"
-        original_payload = tracked.read_bytes()
-        original_metadata = tracked.stat()
-        helper = RepairableThenCleanSafetyHelper()
-        acl = InMemoryACLBackend()
-        original_acl = acl.read(tracked)
-        manager = self.manager(helper, acl_backend=acl)
-
-        planned = manager.plan_safety_repair(self.authority_export())
-        self.assertEqual(planned["repositories"][0]["status"], "blocked")
-        self.assertEqual(planned["repositories"][0]["action_count"], 0)
-        self.assertIn(
-            "unreadable_tracked_entries",
-            planned["repositories"][0]["blocker_codes"],
-        )
-        private = json.loads(
-            (
-                self.evidence
-                / planned["plan_id"]
-                / "plan.json"
-            ).read_text(encoding="utf-8")
-        )
-        self.assertEqual(private["repositories"][0]["actions"], [])
-
-        applied = manager.apply_safety_repair(
-            plan_id=planned["plan_id"], plan_sha256=planned["plan_sha256"]
-        )
-        self.assertTrue(applied["ok"])
-        self.assertEqual(applied["state"], "applied_with_blockers")
-        self.assertEqual(
-            applied["remaining_blocked_repository_ids"], ["repo-acl-repair"]
-        )
-        self.assertEqual(acl.read(tracked), original_acl)
-        self.assertEqual(tracked.read_bytes(), original_payload)
-        self.assertEqual(tracked.stat().st_ino, original_metadata.st_ino)
-
-    def test_safety_apply_never_changes_shared_local_metadata_or_manifest_bytes(self) -> None:
-        root = self.git_repository("repo-metadata-repair")
-        codex = root / ".codex"
-        codex.mkdir(mode=0o755)
-        codex.chmod(0o775)
-        manifest = codex / "tests.json"
-        payload = json.dumps(_manifest_template(), indent=2, sort_keys=True).encode() + b"\n"
-        manifest.write_bytes(payload)
-        manifest.chmod(0o664)
-        manager = self.manager(acl_backend=InMemoryACLBackend())
-
-        planned = manager.plan_safety_repair(self.authority_export())
-        applied = manager.apply_safety_repair(
-            plan_id=planned["plan_id"], plan_sha256=planned["plan_sha256"]
-        )
-        self.assertTrue(applied["ok"])
-        self.assertEqual(stat.S_IMODE(codex.stat().st_mode), 0o775)
-        self.assertEqual(stat.S_IMODE(manifest.stat().st_mode), 0o664)
-        self.assertEqual(manifest.read_bytes(), payload)
-
-        manager.rollback_safety_repair(
-            plan_id=planned["plan_id"], result_sha256=applied["result_sha256"]
-        )
-        self.assertEqual(stat.S_IMODE(codex.stat().st_mode), 0o775)
-        self.assertEqual(stat.S_IMODE(manifest.stat().st_mode), 0o664)
-        self.assertEqual(manifest.read_bytes(), payload)
 
     def test_git_proven_tracked_deletion_is_not_an_ownership_blocker(self) -> None:
         root = self.git_repository("repo-deletion")
@@ -640,11 +441,11 @@ class UniversalTestManifestAdoptionTests(unittest.TestCase):
         catalog = manager.catalog(authority_export)
         row = catalog["repositories"][0]
         self.assertEqual(row["status"], "missing")
-        self.assertEqual(row["safety_status"], "clean")
+        self.assertEqual(row["readability_status"], "clean")
         self.assertTrue(row["deletion_scan_complete"])
         self.assertEqual(row["deleted_tracked_count"], 1)
         self.assertEqual(row["unreadable_tracked_count"], 0)
-        self.assertFalse(row["requires_safety_repair"])
+        self.assertFalse(row["has_readability_blockers"])
 
         manifest_set = {
             "schema_version": 1,
@@ -665,11 +466,13 @@ class UniversalTestManifestAdoptionTests(unittest.TestCase):
         catalog = manager.catalog(authority_export)
         row = catalog["repositories"][0]
         self.assertEqual(row["status"], "missing")
-        self.assertEqual(row["safety_status"], "blocked")
+        self.assertEqual(row["readability_status"], "blocked")
         self.assertFalse(row["adoption_ready"])
-        self.assertTrue(row["requires_safety_repair"])
+        self.assertTrue(row["has_readability_blockers"])
         self.assertEqual(row["unreadable_tracked_count"], 1)
-        self.assertIn("unreadable_tracked_entries", row["safety_blocker_codes"])
+        self.assertIn(
+            "unreadable_tracked_entries", row["readability_blocker_codes"]
+        )
 
         manifest_set = {
             "schema_version": 1,
@@ -770,20 +573,13 @@ class UniversalTestManifestAdoptionTests(unittest.TestCase):
         self.assertEqual(applied["applied"], [])
         self.assertEqual(manifest_path.read_bytes(), before)
 
-    def test_symlink_owner_and_generation_attacks_fail_closed(self) -> None:
+    def test_symlink_and_generation_drift_fail_closed(self) -> None:
         escaped = self.repository("repo-symlink")
         outside = self.base / "outside"
         outside.mkdir()
         (escaped / ".codex").symlink_to(outside, target_is_directory=True)
         with self.assertRaisesRegex(SnapshotMaterializationError, "unsafe"):
             self.manager().plan(self.request({"repo-symlink": _manifest_template()}))
-
-        owner = self.repository("repo-owner")
-        self.records["repo-owner"]["owner_uid"] = self.uid + 1
-        owner_request = self.request({"repo-owner": _manifest_template()})
-        owner_request["repositories"][0]["owner_uid"] = self.uid + 1  # type: ignore[index]
-        with self.assertRaisesRegex(SnapshotMaterializationError, "execution identity"):
-            self.manager().plan(owner_request)
 
         generation = self.repository("repo-generation", generation=7)
         manager = self.manager()

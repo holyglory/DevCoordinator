@@ -19,7 +19,7 @@ from typing import Any, Mapping
 import uuid
 
 from .broker import (
-    AuthorizedBrokerRequest,
+    AcceptedBrokerRequest,
     BrokerBackendError,
     BrokerError,
     BrokerOperation,
@@ -33,7 +33,7 @@ from .broker_persistence import (
     BrokerPersistence,
     DurableOperationDisposition,
     EphemeralContainerTarget,
-    _authorize_connection,
+    _validate_connection_request,
     _finish_operation,
     _normalize_ephemeral_image_cache_proof,
 )
@@ -67,7 +67,7 @@ _DEFAULT_EPHEMERAL_MEMORY_BYTES = 512 * 1024 * 1024
 _DEFAULT_EPHEMERAL_CPU_MILLIS = 1000
 # This service hard ceiling cannot be raised by a client request or repository
 # manifest.  Repository and template limits normally stop admission first; the
-# host ceiling remains a final guard when many independently enrolled
+# host ceiling remains a final guard when many independently configured
 # repositories are active at once or older state was provisioned too loosely.
 _HOST_MAX_ACTIVE_EPHEMERAL_RUNS = 128
 _STARTUP_RECOVERY_BATCH_LIMIT = 4
@@ -99,7 +99,7 @@ class EphemeralSecretDeliveryLease:
 
     The lease is intentionally opaque to transport callers.  Its sole lifecycle
     effect is releasing the coordinator lock after the local descriptor has
-    been closed, so Finish, Renew, and reaping cannot invalidate an authorized
+    been closed, so Finish, Renew, and reaping cannot invalidate an accepted
     one-shot descriptor while it is still being sent.
     """
 
@@ -146,13 +146,13 @@ class EphemeralContainerCoordinator:
         self._wake = threading.Event()
         self._thread: threading.Thread | None = None
 
-    def execute(self, authorized: AuthorizedBrokerRequest) -> Mapping[str, Any]:
-        request = authorized.request
+    def execute(self, accepted: AcceptedBrokerRequest) -> Mapping[str, Any]:
+        request = accepted.request
         operation = request.operation
         if operation is BrokerOperation.EPHEMERAL_STATUS:
-            return self._status(authorized)
+            return self._status(accepted)
         if operation is BrokerOperation.EPHEMERAL_IMAGE_STATUS:
-            target = self._persistence.ephemeral_image_target(authorized)
+            target = self._persistence.ephemeral_image_target(accepted)
             return self._host.docker_inspect_ephemeral_image(target)
         if operation not in {
             BrokerOperation.EPHEMERAL_START,
@@ -163,25 +163,25 @@ class EphemeralContainerCoordinator:
             raise BrokerBackendError(
                 "unknown_operation",
                 "Requested broker operation is not an ephemeral-container operation.",
-                operation_id=authorized.request.operation_id,
+                operation_id=accepted.request.operation_id,
             )
         with self._mutation_lock:
-            disposition = self._persistence.reserve_operation(authorized)
+            disposition = self._persistence.reserve_operation(accepted)
             replay = (
-                self._resolve_image_prefetch_disposition(authorized, disposition)
+                self._resolve_image_prefetch_disposition(accepted, disposition)
                 if operation is BrokerOperation.EPHEMERAL_IMAGE_PREFETCH
-                else self._resolve_disposition(authorized, disposition)
+                else self._resolve_disposition(accepted, disposition)
             )
             if replay is not None:
                 return replay
             try:
                 if operation is BrokerOperation.EPHEMERAL_START:
-                    return self._start(authorized)
+                    return self._start(accepted)
                 if operation is BrokerOperation.EPHEMERAL_IMAGE_PREFETCH:
-                    return self._prefetch_image(authorized)
+                    return self._prefetch_image(accepted)
                 if operation is BrokerOperation.EPHEMERAL_RENEW:
-                    return self._renew(authorized)
-                return self._finish(authorized)
+                    return self._renew(accepted)
+                return self._finish(accepted)
             except BrokerError as error:
                 self._terminalize_reserved_start_before_host(
                     request,
@@ -228,7 +228,7 @@ class EphemeralContainerCoordinator:
 
     def acquire_secret_fd_delivery(
         self,
-        authorized: AuthorizedBrokerRequest,
+        accepted: AcceptedBrokerRequest,
         *,
         template_id: str,
         run_id: uuid.UUID,
@@ -237,14 +237,14 @@ class EphemeralContainerCoordinator:
         """Consume one descriptor payload while blocking all run mutations.
 
         The caller must close the returned lease only after its local copy of
-        the descriptor is closed.  This spans exact durable authorization,
+        the descriptor is closed. This spans exact durable run validation,
         volatile one-time consumption, and Unix descriptor transmission.
         """
 
         self._mutation_lock.acquire()
         try:
             target = self._persistence.ephemeral_secret_fd_target(
-                authorized,
+                accepted,
                 template_id=template_id,
                 run_id=run_id,
             )
@@ -475,7 +475,7 @@ class EphemeralContainerCoordinator:
 
     def _resolve_disposition(
         self,
-        authorized: AuthorizedBrokerRequest,
+        accepted: AcceptedBrokerRequest,
         disposition: DurableOperationDisposition,
     ) -> dict[str, Any] | None:
         if disposition.state == "completed":
@@ -484,14 +484,14 @@ class EphemeralContainerCoordinator:
             raise BrokerBackendError(
                 disposition.error_code or "mutation_failed",
                 disposition.error_message or "Ephemeral-container operation failed.",
-                operation_id=authorized.request.operation_id,
+                operation_id=accepted.request.operation_id,
             )
         if disposition.state == "execute":
             return None
 
         # A retry may be the first caller after an uncertain host result.  Try
         # exact nonce/label reconciliation once instead of blindly replaying.
-        request = authorized.request
+        request = accepted.request
         run_id = (
             request.operation_id
             if request.operation is BrokerOperation.EPHEMERAL_START
@@ -503,7 +503,7 @@ class EphemeralContainerCoordinator:
                 self._recover_target(target)
             except Exception:
                 pass
-        replay = self._persistence.existing_operation_disposition(authorized)
+        replay = self._persistence.existing_operation_disposition(accepted)
         if replay is not None and replay.state == "completed":
             return dict(replay.result or {})
         if replay is not None and replay.state == "failed":
@@ -520,7 +520,7 @@ class EphemeralContainerCoordinator:
 
     def _resolve_image_prefetch_disposition(
         self,
-        authorized: AuthorizedBrokerRequest,
+        accepted: AcceptedBrokerRequest,
         disposition: DurableOperationDisposition,
     ) -> dict[str, Any] | None:
         """Reconcile a pending pull only by exact local proof, never another pull."""
@@ -531,12 +531,12 @@ class EphemeralContainerCoordinator:
             raise BrokerBackendError(
                 disposition.error_code or "mutation_failed",
                 disposition.error_message or "Ephemeral image prefetch failed.",
-                operation_id=authorized.request.operation_id,
+                operation_id=accepted.request.operation_id,
             )
         if disposition.state == "execute":
             return None
         target = self._persistence.ephemeral_image_target(
-            authorized, require_reserved_operation=True
+            accepted, require_reserved_operation=True
         )
         try:
             proof = self._host.docker_inspect_ephemeral_image(target)
@@ -544,11 +544,11 @@ class EphemeralContainerCoordinator:
             raise BrokerBackendError(
                 "operation_outcome_uncertain",
                 "The prior sealed image prefetch cannot yet be reconciled; retry with the same operation ID.",
-                operation_id=authorized.request.operation_id,
+                operation_id=accepted.request.operation_id,
             ) from error
         if proof.get("cached") is True:
             return self._persistence.complete_ephemeral_image_prefetch(
-                authorized,
+                accepted,
                 target=target,
                 proof=proof,
                 cache_origin="reconciled",
@@ -557,14 +557,14 @@ class EphemeralContainerCoordinator:
         raise BrokerBackendError(
             "operation_outcome_uncertain",
             "The prior sealed image prefetch has no exact cache proof yet; it was not replayed.",
-            operation_id=authorized.request.operation_id,
+            operation_id=accepted.request.operation_id,
         )
 
-    def _prefetch_image(self, authorized: AuthorizedBrokerRequest) -> dict[str, Any]:
+    def _prefetch_image(self, accepted: AcceptedBrokerRequest) -> dict[str, Any]:
         """Perform one explicit sealed image prefetch after durable reservation."""
 
         target = self._persistence.ephemeral_image_target(
-            authorized, require_reserved_operation=True
+            accepted, require_reserved_operation=True
         )
         outcome = self._host.docker_prefetch_ephemeral_image(target)
         cache_origin = outcome.get("cache_origin")
@@ -573,7 +573,7 @@ class EphemeralContainerCoordinator:
             raise BrokerBackendError(
                 "ephemeral_image_inspect_unobservable",
                 "The service did not return complete sealed image cache evidence.",
-                operation_id=authorized.request.operation_id,
+                operation_id=accepted.request.operation_id,
             )
         proof = {
             key: outcome.get(key)
@@ -587,23 +587,23 @@ class EphemeralContainerCoordinator:
             )
         }
         return self._persistence.complete_ephemeral_image_prefetch(
-            authorized,
+            accepted,
             target=target,
             proof=proof,
             cache_origin=cache_origin,
             changed=changed,
         )
 
-    def _start(self, authorized: AuthorizedBrokerRequest) -> dict[str, Any]:
-        request = authorized.request
+    def _start(self, accepted: AcceptedBrokerRequest) -> dict[str, Any]:
+        request = accepted.request
         image_target = self._persistence.ephemeral_image_target(
-            authorized, require_reserved_operation=True
+            accepted, require_reserved_operation=True
         )
         cache_proof = self._host.docker_inspect_ephemeral_image(image_target)
         if cache_proof.get("cached") is not True:
             raise BrokerBackendError(
                 "ephemeral_image_not_cached",
-                "The exact sealed image is not verified in the local cache; use the authorized image-prefetch action first.",
+                "The exact sealed image is not verified in the local cache; use the accepted image-prefetch action first.",
                 operation_id=request.operation_id,
             )
         try:
@@ -617,7 +617,7 @@ class EphemeralContainerCoordinator:
                 operation_id=request.operation_id,
             ) from error
         target = self._prepare_start(
-            authorized,
+            accepted,
             expected_image_ref=image_target.image_ref,
             expected_template_fingerprint=image_target.template_fingerprint,
         )
@@ -625,7 +625,7 @@ class EphemeralContainerCoordinator:
         try:
             secret_mount = self._provision_secret_for_start(target)
             if target.container_tcp_port is not None and target.host_port is None:
-                candidates = self._port_candidates(authorized, target.run_id)
+                candidates = self._port_candidates(accepted, target.run_id)
                 selected = self._host.select_available_port(
                     candidates=candidates, protocol="tcp"
                 )
@@ -633,25 +633,25 @@ class EphemeralContainerCoordinator:
                     self._fail_before_create(
                         target.run_id,
                         code="port_unavailable",
-                        message="No authorized ephemeral host port is currently free.",
+                        message="No accepted ephemeral host port is currently free.",
                     )
                     raise BrokerBackendError(
                         "port_unavailable",
-                        "No authorized ephemeral host port is currently free.",
+                        "No accepted ephemeral host port is currently free.",
                         operation_id=request.operation_id,
                     )
                 if type(selected) is not int or selected not in candidates:
                     self._fail_before_create(
                         target.run_id,
                         code="invalid_host_observation",
-                        message="The host port observer returned an unauthorized candidate.",
+                        message="The host port observer returned a candidate outside the accepted range.",
                     )
                     raise BrokerBackendError(
                         "invalid_host_observation",
-                        "The host port observer returned an unauthorized candidate.",
+                        "The host port observer returned a candidate outside the accepted range.",
                         operation_id=request.operation_id,
                     )
-                target = self._bind_port(authorized, target.run_id, selected)
+                target = self._bind_port(accepted, target.run_id, selected)
 
             self._transition(
                 target.run_id,
@@ -665,7 +665,7 @@ class EphemeralContainerCoordinator:
             )
             full_id = _full_id(created.get("full_container_id"))
             target = self._record_container(
-                target.run_id, full_id, authorized=authorized
+                target.run_id, full_id, accepted=accepted
             )
             if int(self._clock()) >= target.expires_at_epoch:
                 code = "ephemeral_start_deadline_expired"
@@ -688,7 +688,7 @@ class EphemeralContainerCoordinator:
             if not self._recovery_start_permitted(target):
                 code = "ephemeral_start_no_longer_permitted"
                 message = (
-                    "Ephemeral start authority was revoked before Docker start; "
+                    "The template or repository became unavailable before Docker start; "
                     "the stopped container was removed."
                 )
                 self._cleanup(
@@ -713,7 +713,7 @@ class EphemeralContainerCoordinator:
                 self._container_target(target, require_material=True)
             )
             result = self._complete_running(
-                authorized, target.run_id, host_result=started
+                accepted, target.run_id, host_result=started
             )
             self._wake.set()
             return result
@@ -754,14 +754,14 @@ class EphemeralContainerCoordinator:
                 operation_id=request.operation_id,
             ) from error
 
-    def _renew(self, authorized: AuthorizedBrokerRequest) -> dict[str, Any]:
+    def _renew(self, accepted: AcceptedBrokerRequest) -> dict[str, Any]:
         """Renew through a durable DB/file transition, never a silent mismatch."""
 
-        request = authorized.request
+        request = accepted.request
         now_epoch = int(self._clock())
         ttl = int(request.arguments["ttl_seconds"])
         target, new_expiry = self._prepare_renewal_journal(
-            authorized,
+            accepted,
             ttl_seconds=ttl,
             now_epoch=now_epoch,
         )
@@ -789,7 +789,7 @@ class EphemeralContainerCoordinator:
         self._renewal_checkpoint("volatile_prepared")
         try:
             committed = self._commit_renewal_journal(
-                authorized,
+                accepted,
                 target,
                 new_expires_at_epoch=new_expiry,
                 now_epoch=now_epoch,
@@ -855,16 +855,16 @@ class EphemeralContainerCoordinator:
 
     def _prepare_renewal_journal(
         self,
-        authorized: AuthorizedBrokerRequest,
+        accepted: AcceptedBrokerRequest,
         *,
         ttl_seconds: int,
         now_epoch: int,
     ) -> tuple[EphemeralContainerTarget, int]:
-        request = authorized.request
+        request = accepted.request
         now = utc_timestamp(now_epoch)
         with self._persistence._store() as store:
             with store.immediate_transaction() as connection:
-                _authorize_connection(connection, peer=authorized.peer, request=request)
+                _validate_connection_request(connection, peer=accepted.peer, request=request)
                 target = _target(connection, request.resource_id)
                 if ttl_seconds > target.max_ttl_seconds:
                     raise BrokerError(
@@ -945,18 +945,18 @@ class EphemeralContainerCoordinator:
 
     def _commit_renewal_journal(
         self,
-        authorized: AuthorizedBrokerRequest,
+        accepted: AcceptedBrokerRequest,
         target: EphemeralContainerTarget,
         *,
         new_expires_at_epoch: int,
         now_epoch: int,
     ) -> EphemeralContainerTarget:
-        request = authorized.request
+        request = accepted.request
         old_expiry = target.expires_at_epoch
         now = utc_timestamp(now_epoch)
         with self._persistence._store() as store:
             with store.immediate_transaction() as connection:
-                _authorize_connection(connection, peer=authorized.peer, request=request)
+                _validate_connection_request(connection, peer=accepted.peer, request=request)
                 current = _target(connection, target.run_id)
                 self._require_renewal_transition(
                     current,
@@ -1414,10 +1414,10 @@ class EphemeralContainerCoordinator:
     def _renewal_checkpoint(self, phase: str) -> None:
         """Test seam for crash-window recovery without a production side effect."""
 
-    def _finish(self, authorized: AuthorizedBrokerRequest) -> dict[str, Any]:
-        request = authorized.request
+    def _finish(self, accepted: AcceptedBrokerRequest) -> dict[str, Any]:
+        request = accepted.request
         target = self._prepare_cleanup(
-            authorized, reason=str(request.arguments["reason"])
+            accepted, reason=str(request.arguments["reason"])
         )
         if target.status == "cleaned":
             result = {**_public_target(target), "action": "finish", "changed": False}
@@ -1933,26 +1933,23 @@ class EphemeralContainerCoordinator:
 
     def _prepare_start(
         self,
-        authorized: AuthorizedBrokerRequest,
+        accepted: AcceptedBrokerRequest,
         *,
         expected_image_ref: str | None = None,
         expected_template_fingerprint: str | None = None,
     ) -> EphemeralContainerTarget:
-        request = authorized.request
+        request = accepted.request
         if request.operation is not BrokerOperation.EPHEMERAL_START:
             raise ValueError("request is not ephemeral.start")
         if (expected_image_ref is None) != (expected_template_fingerprint is None):
             raise ValueError("sealed image and template fingerprint must be supplied together")
-        execution_uid = self._persistence.test_repository_execution_authority(
-            repo_id=request.project_id,
-            operation_id=request.operation_id,
-        ).owner_uid
+        execution_uid = accepted.attribution_uid
         now_epoch = int(self._clock())
         now = utc_timestamp(now_epoch)
         with self._persistence._store() as store:
             with store.immediate_transaction() as connection:
-                _authorize_connection(
-                    connection, peer=authorized.peer, request=request
+                _validate_connection_request(
+                    connection, peer=accepted.peer, request=request
                 )
                 existing = connection.execute(
                     "SELECT run_id FROM ephemeral_container_runs WHERE run_id = ?",
@@ -2188,13 +2185,13 @@ class EphemeralContainerCoordinator:
             )
 
     def _port_candidates(
-        self, authorized: AuthorizedBrokerRequest, run_id: str
+        self, accepted: AcceptedBrokerRequest, run_id: str
     ) -> tuple[int, ...]:
-        request = authorized.request
+        request = accepted.request
         with self._persistence._store() as store:
             with store.read_transaction() as connection:
-                _authorize_connection(
-                    connection, peer=authorized.peer, request=request
+                _validate_connection_request(
+                    connection, peer=accepted.peer, request=request
                 )
                 target = _target(connection, run_id)
                 if target.host_port is not None:
@@ -2207,7 +2204,7 @@ class EphemeralContainerCoordinator:
                 ).fetchone()
                 if host is None:
                     raise BrokerError(
-                        "project_access_denied", "Ephemeral repository is unavailable."
+                        "repository_unavailable", "Ephemeral repository is unavailable."
                     )
                 occupied = {
                     int(row[0])
@@ -2229,16 +2226,16 @@ class EphemeralContainerCoordinator:
 
     def _bind_port(
         self,
-        authorized: AuthorizedBrokerRequest,
+        accepted: AcceptedBrokerRequest,
         run_id: str,
         selected_port: int,
     ) -> EphemeralContainerTarget:
-        request = authorized.request
+        request = accepted.request
         now = utc_timestamp()
         with self._persistence._store() as store:
             with store.immediate_transaction() as connection:
-                _authorize_connection(
-                    connection, peer=authorized.peer, request=request
+                _validate_connection_request(
+                    connection, peer=accepted.peer, request=request
                 )
                 target = _target(connection, run_id)
                 if target.host_port is not None:
@@ -2267,7 +2264,7 @@ class EphemeralContainerCoordinator:
                 ).fetchone()
                 if host is None:
                     raise BrokerError(
-                        "project_access_denied", "Ephemeral repository is unavailable."
+                        "repository_unavailable", "Ephemeral repository is unavailable."
                     )
                 occupied = connection.execute(
                     """
@@ -2344,17 +2341,17 @@ class EphemeralContainerCoordinator:
         run_id: str,
         full_container_id: str,
         *,
-        authorized: AuthorizedBrokerRequest | None = None,
+        accepted: AcceptedBrokerRequest | None = None,
     ) -> EphemeralContainerTarget:
         full_id = _full_id(full_container_id)
         now = utc_timestamp()
         with self._persistence._store() as store:
             with store.immediate_transaction() as connection:
-                if authorized is not None:
-                    _authorize_connection(
+                if accepted is not None:
+                    _validate_connection_request(
                         connection,
-                        peer=authorized.peer,
-                        request=authorized.request,
+                        peer=accepted.peer,
+                        request=accepted.request,
                     )
                 target = _target(connection, run_id)
                 if target.full_container_id is not None and target.full_container_id != full_id:
@@ -2581,16 +2578,16 @@ class EphemeralContainerCoordinator:
 
     def _complete_running(
         self,
-        authorized: AuthorizedBrokerRequest,
+        accepted: AcceptedBrokerRequest,
         run_id: str,
         *,
         host_result: Mapping[str, Any],
     ) -> dict[str, Any]:
-        request = authorized.request
+        request = accepted.request
         with self._persistence._store() as store:
             with store.immediate_transaction() as connection:
-                _authorize_connection(
-                    connection, peer=authorized.peer, request=request
+                _validate_connection_request(
+                    connection, peer=accepted.peer, request=request
                 )
                 return self._complete_running_connection(
                     connection,
@@ -2712,14 +2709,14 @@ class EphemeralContainerCoordinator:
         return result
 
     def _prepare_cleanup(
-        self, authorized: AuthorizedBrokerRequest, *, reason: str
+        self, accepted: AcceptedBrokerRequest, *, reason: str
     ) -> EphemeralContainerTarget:
-        request = authorized.request
+        request = accepted.request
         now = utc_timestamp()
         with self._persistence._store() as store:
             with store.immediate_transaction() as connection:
-                _authorize_connection(
-                    connection, peer=authorized.peer, request=request
+                _validate_connection_request(
+                    connection, peer=accepted.peer, request=request
                 )
                 target = _target(connection, request.resource_id)
                 if target.status == "cleaned":
@@ -3083,12 +3080,12 @@ class EphemeralContainerCoordinator:
                         error_message=message,
                     )
 
-    def _status(self, authorized: AuthorizedBrokerRequest) -> dict[str, Any]:
-        request = authorized.request
+    def _status(self, accepted: AcceptedBrokerRequest) -> dict[str, Any]:
+        request = accepted.request
         with self._persistence._store() as store:
             with store.read_transaction() as connection:
-                _authorize_connection(
-                    connection, peer=authorized.peer, request=request
+                _validate_connection_request(
+                    connection, peer=accepted.peer, request=request
                 )
                 target = _target(connection, request.resource_id)
                 return {**_public_target(target), "action": "status"}
@@ -3218,7 +3215,7 @@ class EphemeralContainerCoordinator:
     def _recovery_start_permitted(self, target: EphemeralContainerTarget) -> bool:
         """Revalidate exact resource availability before starting the container.
 
-        Local principal, enrollment, ACL, and expiry rows are not an
+        Local principal, configuration, ACL, and expiry rows are not an
         authorization boundary on a single-developer server.  The durable run
         already carries its exact repository/template binding and execution
         identity.  Revalidation therefore fences only actual resource state;
@@ -3288,7 +3285,7 @@ class EphemeralContainerCoordinator:
     ) -> EphemeralDockerContainerTarget:
         if target.full_container_id is None:
             raise BrokerError(
-                "control_binding_unavailable",
+                "resource_identity_unavailable",
                 "Ephemeral run has no persisted immutable container ID.",
             )
         return EphemeralDockerContainerTarget(
@@ -3376,7 +3373,7 @@ def _target(
     ).fetchone()
     if row is None:
         raise BrokerError(
-            "resource_access_denied", "Ephemeral run is unavailable."
+            "resource_unavailable", "Ephemeral run is unavailable."
         )
     command = tuple(
         str(item["argument"])

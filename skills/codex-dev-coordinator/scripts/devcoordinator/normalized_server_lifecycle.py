@@ -903,7 +903,7 @@ class NormalizedServerLifecycle:
                 argv=request.argv,
                 environment=request.environment,
             )
-            self._ensure_server_authority(
+            self._ensure_server_catalog_policy(
                 connection,
                 repository=repository,
                 definition_id=definition_id,
@@ -1251,13 +1251,6 @@ class NormalizedServerLifecycle:
                 definition_id=server_definition_id,
                 argv=argv,
                 environment=environment,
-            )
-            connection.execute(
-                """
-                UPDATE repository_memberships SET immutable_fingerprint = ?
-                WHERE resource_kind = 'server' AND host_resource_id = ?
-                """,
-                (definition_fingerprint, server_definition_id),
             )
             connection.execute(
                 """
@@ -1695,7 +1688,7 @@ class NormalizedServerLifecycle:
                 argv=request.argv,
                 environment=request.environment,
             )
-            self._ensure_server_authority(
+            self._ensure_server_catalog_policy(
                 connection,
                 repository=repository,
                 definition_id=definition_id,
@@ -2492,30 +2485,6 @@ class NormalizedServerLifecycle:
             )
             connection.execute(
                 """
-                UPDATE repository_memberships SET repo_id = ?,
-                    immutable_fingerprint = ?
-                WHERE resource_kind = 'server' AND host_resource_id = ?
-                """,
-                (
-                    new_repository["repo_id"],
-                    definition_fingerprint,
-                    definition["server_definition_id"],
-                ),
-            )
-            connection.execute(
-                """
-                UPDATE control_bindings SET repo_id = ?,
-                    generation = generation + 1, updated_at = ?
-                WHERE resource_kind = 'server' AND resource_id = ?
-                """,
-                (
-                    new_repository["repo_id"],
-                    timestamp,
-                    definition["server_definition_id"],
-                ),
-            )
-            connection.execute(
-                """
                 UPDATE startup_policies SET repo_id = ?,
                     immutable_fingerprint = ?, generation = generation + 1,
                     updated_at = ?
@@ -2951,7 +2920,7 @@ class NormalizedServerLifecycle:
                 (definition_id, str(name), str(value)),
             )
 
-    def _ensure_server_authority(
+    def _ensure_server_catalog_policy(
         self,
         connection: sqlite3.Connection,
         *,
@@ -2960,103 +2929,6 @@ class NormalizedServerLifecycle:
         definition_fingerprint: str,
         timestamp: str,
     ) -> None:
-        source_id = deterministic_id(
-            "normalized-account-source",
-            str(repository["host_id"]),
-            str(self.store.path.parent),
-        )
-        connection.execute(
-            """
-            INSERT INTO coordinator_sources(
-                source_id, host_id, canonical_home, state_path, effective_uid,
-                status, captured_revision, captured_sha256, imported_at,
-                retired_at, late_writer_detected_at, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, 'imported', NULL, NULL, ?, NULL, NULL, ?, ?)
-            ON CONFLICT(host_id, canonical_home) DO UPDATE SET
-                state_path = excluded.state_path, status = 'imported',
-                imported_at = COALESCE(coordinator_sources.imported_at,
-                                       excluded.imported_at),
-                updated_at = excluded.updated_at
-            """,
-            (
-                source_id,
-                repository["host_id"],
-                str(self.store.path),
-                str(self.store.path),
-                self.store.expected_uid,
-                timestamp,
-                timestamp,
-                timestamp,
-            ),
-        )
-        authoritative = connection.execute(
-            """
-            SELECT * FROM control_bindings
-            WHERE resource_kind = 'server' AND resource_id = ?
-              AND authority_state = 'authoritative'
-            """,
-            (definition_id,),
-        ).fetchone()
-        binding_id = (
-            str(authoritative["binding_id"])
-            if authoritative is not None
-            else deterministic_id("control-binding", "server", definition_id)
-        )
-        source_resource_id = (
-            authoritative["source_resource_id"]
-            if authoritative is not None
-            else None
-        )
-        connection.execute(
-            """
-            INSERT INTO control_bindings(
-                binding_id, repo_id, source_resource_id, resource_kind,
-                resource_id, source_id, capability, provenance,
-                authority_state, priority, generation, created_at, updated_at
-            ) VALUES (?, ?, ?, 'server', ?, ?, 'lifecycle',
-                      'normalized_direct_control', 'authoritative', 100, 0, ?, ?)
-            ON CONFLICT(binding_id) DO UPDATE SET
-                repo_id = excluded.repo_id,
-                source_id = excluded.source_id,
-                capability = excluded.capability,
-                provenance = excluded.provenance,
-                authority_state = 'authoritative', priority = 100,
-                generation = control_bindings.generation + 1,
-                updated_at = excluded.updated_at
-            """,
-            (
-                binding_id,
-                repository["repo_id"],
-                source_resource_id,
-                definition_id,
-                source_id,
-                timestamp,
-                timestamp,
-            ),
-        )
-        membership_id = deterministic_id(
-            "membership", str(repository["repo_id"]), "server", definition_id
-        )
-        connection.execute(
-            """
-            INSERT INTO repository_memberships(
-                membership_id, repo_id, resource_kind, host_resource_id,
-                immutable_fingerprint, control_binding_id, created_at
-            ) VALUES (?, ?, 'server', ?, ?, ?, ?)
-            ON CONFLICT(resource_kind, host_resource_id) DO UPDATE SET
-                repo_id = excluded.repo_id,
-                immutable_fingerprint = excluded.immutable_fingerprint,
-                control_binding_id = excluded.control_binding_id
-            """,
-            (
-                membership_id,
-                repository["repo_id"],
-                definition_id,
-                definition_fingerprint,
-                binding_id,
-                timestamp,
-            ),
-        )
         policy_id = deterministic_id(
             "startup-policy", "server", definition_id, "coordinator"
         )

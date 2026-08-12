@@ -20,7 +20,7 @@ from devcoordinator.broker import (  # noqa: E402
     SerializedMutationWriter,
 )
 from devcoordinator.broker_backend import StoreBackedMutationBackend  # noqa: E402
-from devcoordinator.broker_persistence import StoreBackedAuthorizer  # noqa: E402
+from devcoordinator.broker_persistence import StoreBackedRequestAcceptor  # noqa: E402
 from devcoordinator.store import CoordinatorStore  # noqa: E402
 from devcoordinator.universal_test_admission import (  # noqa: E402
     TestSubmissionAdmissionGate,
@@ -78,7 +78,7 @@ class BrokerTestAdmissionDrainTests(unittest.TestCase):
                 test_submission_gate=gate,
             )
             service = BrokerService(
-                StoreBackedAuthorizer(persistence),
+                StoreBackedRequestAcceptor(persistence),
                 SerializedMutationWriter(backend, test_submission_gate=gate),
             )
             peer = peer_for()

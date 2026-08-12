@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-import errno
+import hashlib
 import os
 from pathlib import Path, PurePosixPath
 import pwd
@@ -313,39 +313,14 @@ def _default_listener_ownership_probe(
     return False
 
 
-def _directory_compatibility_gids(cwd: Path, *, primary_gid: int) -> tuple[int, ...]:
-    """Return non-root filesystem groups needed along one resolved cwd chain.
-
-    These groups are execution compatibility metadata for one transient unit,
-    not authorization or persistent account membership.  The root group is
-    deliberately excluded; root-owned ancestors must remain traversable by
-    their ordinary mode rather than granting group 0 to repository code.
-    """
-
-    directories: list[Path] = [cwd]
-    directories.extend(cwd.parents)
-    gids: set[int] = set()
-    try:
-        for directory in directories:
-            gid = int(directory.stat(follow_symlinks=False).st_gid)
-            if gid not in {0, primary_gid}:
-                gids.add(gid)
-    except OSError as error:
-        raise TemporaryDevServiceError(
-            "cwd_unavailable",
-            "temporary service working-directory chain is unavailable",
-        ) from error
-    return tuple(sorted(gids))
-
-
 def _execution_supplementary_gids(
-    account: pwd.struct_passwd, *, cwd: Path
+    account: pwd.struct_passwd,
 ) -> tuple[int, ...]:
-    """Return the caller's normal and source-compatibility groups for one unit.
+    """Return the execution account's ordinary supplementary groups.
 
-    The set is explicit so the trusted credential-drop shim never inherits the
-    broker's root groups. Group zero and the caller's primary group are omitted
-    because setpriv carries the primary group separately.
+    The set is explicit so the credential-drop shim never inherits service
+    process groups. Group zero and the primary group are omitted because
+    setpriv carries the primary group separately.
     """
 
     try:
@@ -358,129 +333,8 @@ def _execution_supplementary_gids(
             "execution_identity_unavailable",
             "temporary service caller groups could not be resolved",
         ) from error
-    gids.update(
-        _directory_compatibility_gids(cwd, primary_gid=account.pw_gid)
-    )
     gids.difference_update({0, int(account.pw_gid)})
     return tuple(sorted(gids))
-
-
-def _normalize_trusted_local_repository_access(working_tree: Path) -> None:
-    """Remove Unix-mode friction inside one validated working tree.
-
-    Local accounts on this host are execution and accounting domains for the
-    same developer, not authorization tenants.  A repository can nevertheless
-    contain generated files created by another account with a restrictive
-    umask (for example ``node_modules/.bin`` targets at mode 0700).  The kernel
-    would then reject the correctly attributed caller before repository code
-    starts.
-
-    The server's repository roots already carry named ACL entries for its local
-    developer accounts. A restrictive creator umask can collapse the ACL mask
-    to ``---`` even though the caller entry remains present. Add only the local
-    group-class ``rwX`` bits, which restores that mask without adding world
-    access. Existing executable intent is preserved: regular non-executable
-    files stay non-executable. The operation changes no bytes, owner, group,
-    named ACL entry, or world bit. It may widen the POSIX ACL mask represented
-    by the group-class mode bits. Git internals, symlinks, and multiply-linked
-    regular files are skipped, so an inode reachable outside the working tree
-    is never changed.
-    """
-
-    try:
-        root = working_tree.resolve(strict=True)
-        root_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
-        if hasattr(os, "O_NOFOLLOW"):
-            root_flags |= os.O_NOFOLLOW
-        root_fd = os.open(root, root_flags)
-        try:
-            before = os.fstat(root_fd)
-            before_identity = (before.st_dev, before.st_ino)
-            for _directory, directories, files, directory_fd in os.fwalk(
-                ".",
-                topdown=True,
-                follow_symlinks=False,
-                dir_fd=root_fd,
-            ):
-                directories[:] = [name for name in directories if name != ".git"]
-                directory_metadata = os.fstat(directory_fd)
-                directory_mode = stat.S_IMODE(directory_metadata.st_mode)
-                desired_directory_mode = directory_mode | 0o070
-                if desired_directory_mode != directory_mode:
-                    os.fchmod(directory_fd, desired_directory_mode)
-                for name in files:
-                    if name == ".git":
-                        continue
-                    try:
-                        entry = os.stat(
-                            name,
-                            dir_fd=directory_fd,
-                            follow_symlinks=False,
-                        )
-                    except FileNotFoundError:
-                        continue
-                    if not stat.S_ISREG(entry.st_mode):
-                        continue
-                    entry_mode = stat.S_IMODE(entry.st_mode)
-                    entry_access = 0o070 if entry_mode & 0o111 else 0o060
-                    if entry_mode | entry_access == entry_mode:
-                        continue
-                    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK
-                    if hasattr(os, "O_NOFOLLOW"):
-                        flags |= os.O_NOFOLLOW
-                    try:
-                        file_fd = os.open(name, flags, dir_fd=directory_fd)
-                    except OSError as error:
-                        # Concurrent editor/build cleanup is normal. A later
-                        # start normalizes any replacement that survives.
-                        if error.errno in {errno.ENOENT, errno.ELOOP}:
-                            continue
-                        raise
-                    try:
-                        metadata = os.fstat(file_fd)
-                        if not stat.S_ISREG(metadata.st_mode):
-                            continue
-                        # chmod affects an inode, not one directory entry. Do
-                        # not widen an inode that may also be reachable outside
-                        # this exact working tree.
-                        if metadata.st_nlink != 1:
-                            continue
-                        mode = stat.S_IMODE(metadata.st_mode)
-                        access = 0o070 if mode & 0o111 else 0o060
-                        desired_mode = mode | access
-                        if desired_mode != mode:
-                            os.fchmod(file_fd, desired_mode)
-                    finally:
-                        os.close(file_fd)
-            after_fd = os.fstat(root_fd)
-            after_path = root.stat(follow_symlinks=False)
-            if (
-                (after_fd.st_dev, after_fd.st_ino) != before_identity
-                or (after_path.st_dev, after_path.st_ino) != before_identity
-            ):
-                raise TemporaryDevServiceError(
-                    "repository_identity_changed",
-                    "the validated repository changed identity during local access normalization",
-                )
-        finally:
-            os.close(root_fd)
-    except OSError as error:
-        if error.errno in {errno.EACCES, errno.EPERM, errno.EROFS}:
-            message = (
-                "Coordinator's authority sandbox cannot update local access inside "
-                "the validated working tree; restore its /home write boundary "
-                f"(errno={error.errno})"
-            )
-        else:
-            message = (
-                "Coordinator could not remove local Unix permission friction inside "
-                "the validated working tree "
-                f"({type(error).__name__}, errno={error.errno})"
-            )
-        raise TemporaryDevServiceError(
-            "repository_access_normalization_failed",
-            message,
-        ) from error
 
 
 def _default_process_uid_probe(pid: int, expected_uid: int) -> bool:
@@ -544,9 +398,6 @@ class TemporaryDevServiceManager:
             [int, Mapping[str, str]], bool
         ] = _default_listener_ownership_probe,
         process_uid_probe: Callable[[int, int], bool] = _default_process_uid_probe,
-        access_normalizer: Callable[
-            [Path], None
-        ] = _normalize_trusted_local_repository_access,
         monotonic: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
         wall_time: Callable[[], datetime] | None = None,
@@ -555,7 +406,6 @@ class TemporaryDevServiceManager:
         self._port_probe = port_probe
         self._listener_ownership_probe = listener_ownership_probe
         self._process_uid_probe = process_uid_probe
-        self._access_normalizer = access_normalizer
         self._monotonic = monotonic
         self._sleep = sleep
         self._wall_time = wall_time or (lambda: datetime.now(timezone.utc))
@@ -571,6 +421,7 @@ class TemporaryDevServiceManager:
                 "--property=SubState",
                 "--property=MainPID",
                 "--property=ControlGroup",
+                "--property=InvocationID",
             ),
             timeout=5.0,
         )
@@ -626,6 +477,128 @@ class TemporaryDevServiceManager:
             "ready": lifecycle == "running",
             "main_pid": int(state.get("MainPID") or 0),
         }
+
+    def capture_logs(self, *, unit: str, port: int) -> dict[str, Any]:
+        """Capture bounded journal input for one retained transient unit."""
+
+        status = self.status(unit=unit, port=port)
+        state = self._show(unit)
+        if state.get("LoadState") == "not-found":
+            raise TemporaryDevServiceError(
+                "temporary_service_logs_unavailable",
+                "the retained temporary service unit is no longer available",
+            )
+        result = self._runner(
+            (
+                "/usr/bin/journalctl",
+                "--unit",
+                unit,
+                "--lines=2000",
+                "--output=cat",
+                "--no-pager",
+            ),
+            timeout=10.0,
+        )
+        if result.returncode != 0:
+            raise TemporaryDevServiceError(
+                "temporary_service_logs_unavailable",
+                "system authority could not read the retained temporary service journal",
+                diagnostic=(result.stdout + "\n" + result.stderr).strip()[:4096],
+            )
+        invocation = str(state.get("InvocationID") or "unavailable")
+        return {
+            **status,
+            "raw": (result.stdout + "\n" + result.stderr).encode("utf-8"),
+            "source_identity": "sha256:"
+            + hashlib.sha256((unit + "\0" + invocation).encode("utf-8")).hexdigest(),
+        }
+
+    def stop(self, *, unit: str, port: int) -> dict[str, Any]:
+        """Stop one exact retained transient unit and prove it inactive."""
+
+        before = self.status(unit=unit, port=port)
+        if before["state"] == "stopped":
+            return {**before, "reused": True}
+        result = self._runner(
+            ("/usr/bin/systemctl", "stop", unit), timeout=15.0
+        )
+        if result.returncode != 0:
+            raise TemporaryDevServiceError(
+                "temporary_service_stop_failed",
+                "system authority could not stop the retained temporary service",
+                diagnostic=(result.stdout + "\n" + result.stderr).strip()[:4096],
+            )
+        after = self.status(unit=unit, port=port)
+        if after["state"] != "stopped":
+            raise TemporaryDevServiceError(
+                "operation_outcome_uncertain",
+                "the temporary service stop did not reach a provable inactive state",
+            )
+        return {**after, "reused": False}
+
+    def restart(
+        self,
+        *,
+        unit: str,
+        port: int,
+        execution_uid: int,
+        timeout_seconds: int = 30,
+    ) -> dict[str, Any]:
+        """Restart one still-retained transient unit and prove its listener."""
+
+        before = self._show(unit)
+        if before.get("LoadState") == "not-found":
+            raise TemporaryDevServiceError(
+                "temporary_service_definition_expired",
+                "the transient unit definition is no longer retained; launch the service again",
+            )
+        result = self._runner(
+            ("/usr/bin/systemctl", "restart", unit), timeout=15.0
+        )
+        if result.returncode != 0:
+            raise TemporaryDevServiceError(
+                "temporary_service_restart_failed",
+                "system authority could not restart the retained temporary service",
+                diagnostic=(result.stdout + "\n" + result.stderr).strip()[:4096],
+            )
+        deadline = self._monotonic() + timeout_seconds
+        while self._monotonic() < deadline:
+            state = self._show(unit)
+            if state.get("ActiveState") in {"failed", "inactive"}:
+                raise TemporaryDevServiceError(
+                    "temporary_service_exited",
+                    "the temporary service exited during restart",
+                    diagnostic=self._diagnostic(unit),
+                )
+            if self._port_probe(port):
+                if not self._listener_ownership_probe(port, state):
+                    raise TemporaryDevServiceError(
+                        "port_ownership_mismatch",
+                        "the restarted listener does not belong to the retained temporary service",
+                    )
+                main_pid = int(state.get("MainPID") or 0)
+                if main_pid <= 1 or not self._process_uid_probe(
+                    main_pid, execution_uid
+                ):
+                    self._runner(
+                        ("/usr/bin/systemctl", "stop", unit), timeout=15.0
+                    )
+                    raise TemporaryDevServiceError(
+                        "temporary_service_execution_identity_mismatch",
+                        "Coordinator stopped the temporary service because its actual-caller UID could not be proven",
+                    )
+                return {
+                    "state": "running",
+                    "ready": True,
+                    "main_pid": main_pid,
+                    "reused": False,
+                }
+            self._sleep(0.1)
+        raise TemporaryDevServiceError(
+            "temporary_service_readiness_timeout",
+            "the restarted temporary service did not become ready before the bounded deadline",
+            diagnostic=self._diagnostic(unit),
+        )
 
     def _require_execution_identity(
         self,
@@ -702,10 +675,7 @@ class TemporaryDevServiceManager:
                 "execution_identity_unavailable",
                 "temporary service caller account no longer exists",
             ) from error
-        self._access_normalizer(cwd)
-        supplementary_gids = _execution_supplementary_gids(
-            account, cwd=cwd
-        )
+        supplementary_gids = _execution_supplementary_gids(account)
         command = (
             "/usr/bin/systemd-run",
             "--collect",

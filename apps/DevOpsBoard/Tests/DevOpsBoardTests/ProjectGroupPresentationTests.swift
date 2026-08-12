@@ -23,7 +23,7 @@ final class ProjectGroupPresentationTests: XCTestCase {
             usage: nil,
             kind: .unassigned,
             observedOrigins: [right, left, right],
-            usesCatalogControlBinding: true
+            usesCatalogRouting: true
         )
 
         XCTAssertFalse(projectGroupShowsProjectActions(group))
@@ -59,7 +59,7 @@ final class ProjectGroupPresentationTests: XCTestCase {
             kind: .repository,
             observedOrigins: [left, right],
             serverConflicts: [conflict],
-            usesCatalogControlBinding: true
+            usesCatalogRouting: true
         )
 
         XCTAssertTrue(projectGroupShowsProjectActions(group))
@@ -78,9 +78,9 @@ final class ProjectGroupPresentationTests: XCTestCase {
             databases: [],
             usage: nil,
             kind: .repository,
-            controlOrigin: left,
+            routeOrigin: left,
             observedOrigins: [left],
-            usesCatalogControlBinding: true
+            usesCatalogRouting: true
         )
 
         XCTAssertTrue(projectGroupShowsProjectActions(group))

@@ -1,5 +1,5 @@
-// Unit tests for the access policy store: configured-owner recovery,
-// per-resource grants, durability/privacy, concurrent mutation merging,
+// Unit tests for the external sign-in and route policy store: administrator
+// recovery, per-domain grants, durability/privacy, concurrent mutation merging,
 // fail-closed recovery, and write-failure rollback.
 
 import assert from 'node:assert/strict';
@@ -13,7 +13,6 @@ import {
   CONSOLE_GRANT,
   createAccessStore,
   routeGrant,
-  testGrant,
 } from '../src/access.mjs';
 
 async function fixture({ routes = ['app', 'echo'], admins = ['owner@gmail.com'] } = {}) {
@@ -44,13 +43,8 @@ describe('access policy store', () => {
     assert.equal(store.canAccess('viewer@gmail.com', routeGrant('echo')), false);
     assert.equal(store.canAccess('viewer@gmail.com', CONSOLE_GRANT), false);
 
-    const immutableGrant = testGrant('Repo-ID.MixedCase', 'read');
-    await store.setGrant('viewer@gmail.com', immutableGrant, true);
-    assert.equal(store.canAccess('viewer@gmail.com', immutableGrant), true);
-    assert.equal(store.canAccess('viewer@gmail.com', testGrant('repo-id.mixedcase', 'read')), false);
-
     const onDisk = JSON.parse(await fsp.readFile(file, 'utf8'));
-    assert.deepEqual(onDisk.users['viewer@gmail.com'].grants, ['route:app', immutableGrant]);
+    assert.deepEqual(onDisk.users['viewer@gmail.com'].grants, ['route:app']);
     assert.equal((await fsp.stat(file)).mode & 0o777, 0o600, 'email policy is private on disk');
 
     const reloaded = createAccessStore({
@@ -208,7 +202,7 @@ describe('access policy store', () => {
     assert.deepEqual(onDisk.users['viewer@gmail.com'].grants, ['console']);
   });
 
-  it('migrates schema v1 to v2 without changing users or grants', async () => {
+  it('migrates schema v1 to v3 without changing users or grants', async () => {
     const { file, routeStore } = await fixture();
     await fsp.writeFile(file, `${JSON.stringify({
       version: 1,
@@ -219,7 +213,7 @@ describe('access policy store', () => {
 
     assert.equal(store.canAccess('viewer@gmail.com', 'route:app'), true);
     const migrated = JSON.parse(await fsp.readFile(file, 'utf8'));
-    assert.equal(migrated.version, 2);
+    assert.equal(migrated.version, 3);
     assert.deepEqual(migrated.requests, {});
     assert.deepEqual(migrated.users['viewer@gmail.com'].grants, ['route:app']);
   });

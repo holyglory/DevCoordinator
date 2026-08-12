@@ -13,6 +13,8 @@ and repository tests do not need this reference.
 - [Fleet test-manifest adoption](#fleet-test-manifest-adoption)
 - [Docker admission](#docker-admission)
 - [Sealed project capabilities](#sealed-project-capabilities)
+- [Exact Compose service recreation](#exact-compose-service-recreation)
+- [Project systemd commissioning](#project-systemd-commissioning)
 - [Database protection](#database-protection)
 - [Headless browser lifecycle](#headless-browser-lifecycle)
 
@@ -43,7 +45,7 @@ available; only incompatible mutations receive the typed maintenance reply.
 Use the fixed maintenance operation owned by the delivery workflow. Never
 publish project progress or an ordinary code rollout through the global
 marker. An active valid marker means wait and retry. An invalid marker or
-authorization/profile drift requires the installed verifier; never bypass the
+routing-profile drift requires the installed verifier; never bypass the
 broker with direct state, Docker, process, or database access.
 
 Service startup performs no implicit migration. Same-schema service changes
@@ -121,6 +123,40 @@ Use executable help for the current contracts:
 python3 "$COORDINATOR" ephemeral --help
 python3 "$COORDINATOR" docker compose-run-once --help
 ```
+
+## Exact Compose service recreation
+
+Use `docker compose-recreate-service` when one enrolled, single-replica
+lifecycle service must be recreated without rebuilding an image or recreating
+its dependencies. The broker resolves the sealed Compose definition, invokes
+only `up --no-build --detach --no-deps --force-recreate --wait` for the named
+service, preserves its declared volume model, and requires a fresh different
+container identity in running readiness before success.
+
+```bash
+python3 "$COORDINATOR" docker compose-recreate-service --help
+```
+
+Do not use this operation for a run-once service, a scaled service, or a model
+change. Those require their respective sealed enrollment/publication workflow.
+
+## Project systemd commissioning
+
+`systemd-unit` is a confirmation-bound administrative capability for one
+canonical project `deploy/systemd/<unit>.service` and optional same-name timer.
+Only a non-root, hardened `Type=oneshot` service with fixed absolute execution
+and the exact sibling timer contract is eligible. `status` and `plan` are
+read-only. `apply` requires the exact plan fingerprint and a canonical operation
+UUID; its durable journal prevents uncertain run-once replay.
+
+```bash
+python3 "$COORDINATOR" systemd-unit plan --help
+python3 "$COORDINATOR" systemd-unit apply --help
+```
+
+Commissioning installs and reloads without activating the service. Running the
+one-shot or enabling its timer are separate desired states and require the
+user's explicit confirmation for that exact unit.
 
 ## Database protection
 
