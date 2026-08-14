@@ -216,6 +216,11 @@ FORBIDDEN_PARTS = {
 FORBIDDEN_SUFFIXES = (".env", ".key", ".pem", ".sqlite", ".sqlite3", ".log")
 
 WRAPPERS = {
+    "devcoordinator-image": (
+        "python",
+        "skills/codex-dev-coordinator/scripts/dev_coordinator.py",
+        ("broker", "publish-image"),
+    ),
     "devcoordinator-systemd-unit": (
         "python",
         "skills/codex-dev-coordinator/scripts/dev_coordinator.py",

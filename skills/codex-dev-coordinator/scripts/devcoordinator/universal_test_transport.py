@@ -60,6 +60,7 @@ TEST_PLAN_REGISTER = "test.plan_register"
 TEST_PLAN_REPOSITORY = "test.plan_repository"
 TEST_RUN_SUBMIT = "test.run_submit"
 TEST_RUN_LIST = "test.run_list"
+TEST_QUEUE_STATUS = "test.queue_status"
 TEST_RUN_STATUS = "test.run_status"
 TEST_RUN_SUMMARY = "test.run_summary"
 TEST_RUN_FAILURES = "test.run_failures"
@@ -87,6 +88,7 @@ TEST_PLANE_OPERATIONS = frozenset(
         TEST_PLAN_REPOSITORY,
         TEST_RUN_SUBMIT,
         TEST_RUN_LIST,
+        TEST_QUEUE_STATUS,
         TEST_RUN_STATUS,
         TEST_RUN_SUMMARY,
         TEST_RUN_FAILURES,
@@ -153,6 +155,7 @@ _OPERATION_ARGUMENTS = {
         frozenset({"repository_id"}),
         frozenset({"after", "limit", "state"}),
     ),
+    TEST_QUEUE_STATUS: (frozenset({"repository_id"}), frozenset()),
     TEST_RUN_STATUS: (frozenset({"run_id", "repository_id"}), frozenset()),
     TEST_RUN_SUMMARY: (frozenset({"run_id", "repository_id"}), frozenset()),
     TEST_RUN_FAILURES: (
@@ -655,6 +658,8 @@ class TestPlaneDispatcher:
             return self.service.submit(**values)
         if operation == TEST_RUN_LIST:
             return self.service.runs(**arguments)
+        if operation == TEST_QUEUE_STATUS:
+            return self.service.queue_status(**arguments)
         if operation == TEST_RUN_STATUS:
             return self.service.status(**arguments)
         if operation == TEST_RUN_SUMMARY:
@@ -1415,6 +1420,12 @@ class UnixTestPlaneClient:
 
     def runs(self, **arguments):
         return self._call(TEST_RUN_LIST, arguments)
+
+    def queue_status(self, *, repository_id: str):
+        return self._call(
+            TEST_QUEUE_STATUS,
+            {"repository_id": repository_id},
+        )
 
     def status(self, *, run_id: str, repository_id: str):
         return self._call(

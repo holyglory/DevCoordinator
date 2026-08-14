@@ -12,6 +12,7 @@ import uuid
 from devcoordinator.systemd_commissioning import (
     SystemdCommissioningError,
     apply_commissioning,
+    commissioning_status,
     plan_commissioning,
 )
 
@@ -153,6 +154,24 @@ class SystemdCommissioningTests(unittest.TestCase):
         self.assertEqual(timer["returncode"], 1)
         with self.assertRaisesRegex(SystemdCommissioningError, "unobservable"):
             self._plan("timer-enabled")
+
+    def test_status_reports_missing_source_and_unloaded_unit_without_mutation(self) -> None:
+        for source in self.units.iterdir():
+            source.unlink()
+        self.runner.unobservable.add(f"{UNIT}.service")
+
+        status = commissioning_status(
+            project=self.project,
+            unit=f"{UNIT}.service",
+            desired="timer-enabled",
+            installed_root=self.installed,
+            runner=self.runner,
+        )
+
+        self.assertFalse(status["source_available"])
+        self.assertEqual(status["sources"], [])
+        self.assertFalse(status["states"][0]["observable"])
+        self.assertFalse(status["mutation_performed"])
 
     def test_commission_installs_exact_files_and_only_reloads(self) -> None:
         result = self._apply("commissioned", self._plan("commissioned"))

@@ -396,6 +396,66 @@ class RuntimeEnsureBackendTests(unittest.TestCase):
             [("start", CONTAINER_ID, "a" * 64)],
         )
 
+    def test_ready_ensure_reconciles_prior_uncertain_restart_without_reexecution(
+        self,
+    ) -> None:
+        seed_postgres_database(self.fixture.persistence)
+
+        class UncertainRestart(type(self.fixture.actions)):
+            def docker_restart(inner_self, target):
+                inner_self.calls.append(
+                    ("restart", target.docker_resource_id, target.full_container_id)
+                )
+                raise RuntimeError("injected uncertain restart")
+
+        actions = UncertainRestart()
+
+        def observer(store: CoordinatorStore) -> dict[str, object]:
+            return self.fixture._runtime_observer(
+                store,
+                lifecycle="running",
+                database_available=True,
+            )
+
+        service = self.fixture._service(observer=observer, actions=actions)
+        prior_id = "dddddddd-dddd-4ddd-8ddd-dddddddddddd"
+        prior = service.reply_for_document(
+            peer_for(),
+            self.fixture._request(
+                action="restart",
+                target_kind="database_stack",
+                resource_id=DATABASE_ID,
+                operation_id=prior_id,
+            ).to_wire(),
+        )
+        self.assertFalse(prior["ok"], prior)
+        self.assertEqual(prior["error"]["code"], "operation_outcome_uncertain")
+
+        ensured = self._reply(
+            request=self._request(
+                target_kind="database_stack",
+                resource_id=DATABASE_ID,
+                operation_id="eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+            ),
+            service=service,
+        )
+
+        self.assertTrue(ensured["ok"], ensured)
+        self.assertEqual(ensured["result"]["classification"], "already_ready")
+        self.assertFalse(ensured["result"]["mutation_performed"])
+        self.assertEqual([call[0] for call in actions.calls], ["restart"])
+        followed = self._follow(prior_id)
+        self.assertEqual(followed["result"]["status"], "failed")
+        with CoordinatorStore.open(
+            self.fixture.persistence.database_path, expected_uid=os.geteuid()
+        ) as store:
+            with store.read_transaction() as connection:
+                durable = connection.execute(
+                    "SELECT error_code FROM operations WHERE operation_id = ?",
+                    (prior_id,),
+                ).fetchone()
+        self.assertEqual(durable["error_code"], "runtime_outcome_reconciled")
+
     def test_database_start_waits_for_fresh_readiness_convergence(self) -> None:
         seed_postgres_database(self.fixture.persistence)
         after_start_observations = 0

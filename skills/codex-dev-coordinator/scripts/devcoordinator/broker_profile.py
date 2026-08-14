@@ -841,6 +841,14 @@ class BrokerClientProfile:
             arguments=arguments,
         )
 
+    def test_queue_status(self, *, repository: str) -> dict[str, Any]:
+        configured = self.repository_by_id(repository)
+        return self._test_call(
+            repository=configured,
+            operation=BrokerOperation.TEST_QUEUE_STATUS,
+            arguments={"expected_repository_id": str(repository)},
+        )
+
     def test_run_summary(self, *, repository: str, run_id: str) -> dict[str, Any]:
         result = self._test_run_call(
             repository=repository,

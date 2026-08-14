@@ -94,6 +94,7 @@ from devcoordinator.image_publication import (
 from devcoordinator.systemd_commissioning import (
     DESIRED_STATES as SYSTEMD_COMMISSIONING_STATES,
     apply_commissioning as apply_systemd_commissioning,
+    commissioning_status as systemd_commissioning_status,
     plan_commissioning as plan_systemd_commissioning,
 )
 from devcoordinator.maintenance import (
@@ -15332,7 +15333,15 @@ def coordinated_systemd_unit(args: argparse.Namespace) -> dict[str, Any]:
 
     project = Path(canonical_project(str(args.project)))
     desired = str(args.desired)
-    if args.systemd_action in {"plan", "status"}:
+    if args.systemd_action == "status":
+        result = systemd_commissioning_status(
+            project=project,
+            unit=str(args.unit),
+            desired=desired,
+        )
+        result["action"] = "status"
+        return result
+    if args.systemd_action == "plan":
         result = plan_systemd_commissioning(
             project=project,
             unit=str(args.unit),

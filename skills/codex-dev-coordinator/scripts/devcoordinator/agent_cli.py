@@ -166,6 +166,24 @@ def _parser() -> argparse.ArgumentParser:
     )
     _add_scoped_project(storage)
 
+    database = commands.add_parser(
+        "database", help="run one sealed database-stack operation"
+    )
+    database.add_argument("action", choices=("backup",))
+    database.add_argument("selector", help="exact database-stack ID or unique name")
+    database.add_argument("--database-name", required=True)
+    database.add_argument("--operation-id")
+    _add_scoped_project(database)
+
+    compose = commands.add_parser(
+        "compose", help="run one sealed exact Compose operation"
+    )
+    compose.add_argument("action", choices=("recreate-service",))
+    compose.add_argument("service", help="exact declared Compose service name")
+    compose.add_argument("--wait-timeout-seconds", type=int, default=120)
+    compose.add_argument("--operation-id")
+    _add_scoped_project(compose)
+
     runtime = commands.add_parser(
         "runtime", help="execute one exact configured runtime lifecycle action"
     )
@@ -294,6 +312,12 @@ def _parser() -> argparse.ArgumentParser:
         help="broker-side status polling deadline, from 0 through 86400",
     )
     _add_scoped_project(follow)
+
+    queue_status = test_actions.add_parser(
+        "queue-status",
+        help="read bounded current queue state without requiring a run handle",
+    )
+    _add_scoped_project(queue_status)
 
     for action, help_text in (
         ("status", "read compact current state for one run"),
@@ -1620,6 +1644,130 @@ def _storage(
     )
 
 
+def _database(
+    namespace: argparse.Namespace,
+    *,
+    profile: Any,
+    capabilities: Mapping[str, Any],
+    context: Any,
+) -> dict[str, Any]:
+    from .broker import BrokerOperation
+
+    advertised = capabilities.get("database")
+    if (
+        not isinstance(advertised, Mapping)
+        or namespace.action not in advertised.get("actions", [])
+    ):
+        raise AgentCliError(
+            "capability_unavailable",
+            "active authority does not advertise database backup",
+            classification="unsupported_capability",
+            phase="handshake",
+        )
+    target = _runtime_target(
+        profile=profile,
+        context=context,
+        selector=namespace.selector,
+        kind="database_stack",
+    )
+    repository = _require_resolved_repository(
+        profile, context.effective.canonical_root
+    )
+    operation_id = _canonical_operation_id(namespace.operation_id, mutate=True)
+    namespace.operation_id = operation_id
+    returned_operation_id, result = profile.call(
+        repository=repository,
+        resource_id=str(target["id"]),
+        operation=BrokerOperation.DATABASE_BACKUP,
+        arguments={"database_name": namespace.database_name},
+        operation_id=operation_id,
+    )
+    if returned_operation_id != operation_id or not isinstance(result, Mapping):
+        raise AgentCliError(
+            "database_backup_reply_invalid",
+            "database backup reply contradicted its durable operation identity",
+            classification="invalid_reply",
+            phase="transport",
+        )
+    document = {
+        "schema_version": 1,
+        "ok": result.get("status") == "available"
+        and result.get("verification_status") == "strong",
+        "classification": "database_backup",
+        "operation_id": operation_id,
+        "continuation": continuation_handle("operation", operation_id),
+        "database_backup_id": result.get("database_backup_id"),
+        "database_binding_id": result.get("database_binding_id"),
+        "database_name": result.get("database_name"),
+        "status": result.get("status"),
+        "verification_status": result.get("verification_status"),
+    }
+    return require_agent_result(document, surface="database backup")
+
+
+def _compose(
+    namespace: argparse.Namespace,
+    *,
+    profile: Any,
+    capabilities: Mapping[str, Any],
+    context: Any,
+) -> dict[str, Any]:
+    from .broker import BrokerOperation
+
+    advertised = capabilities.get("compose")
+    if (
+        not isinstance(advertised, Mapping)
+        or namespace.action not in advertised.get("actions", [])
+    ):
+        raise AgentCliError(
+            "capability_unavailable",
+            "active authority does not advertise exact Compose service recreation",
+            classification="unsupported_capability",
+            phase="handshake",
+        )
+    if not 10 <= namespace.wait_timeout_seconds <= 600:
+        raise AgentCliError(
+            "compose_wait_timeout_invalid",
+            "--wait-timeout-seconds must be from 10 through 600",
+        )
+    repository = _require_resolved_repository(
+        profile, context.effective.canonical_root
+    )
+    operation_id = _canonical_operation_id(namespace.operation_id, mutate=True)
+    namespace.operation_id = operation_id
+    returned_operation_id, result = profile.call(
+        repository=repository,
+        resource_id=repository.compose_id(),
+        operation=BrokerOperation.COMPOSE_UP,
+        arguments={
+            "service": namespace.service,
+            "force_recreate": True,
+            "wait_timeout_seconds": namespace.wait_timeout_seconds,
+        },
+        operation_id=operation_id,
+    )
+    if returned_operation_id != operation_id or not isinstance(result, Mapping):
+        raise AgentCliError(
+            "compose_recreate_reply_invalid",
+            "Compose recreate reply contradicted its durable operation identity",
+            classification="invalid_reply",
+            phase="transport",
+        )
+    return require_agent_result(
+        {
+            "schema_version": 1,
+            "ok": result.get("ok") is True,
+            "classification": "compose_service_recreated",
+            "operation_id": operation_id,
+            "continuation": continuation_handle("operation", operation_id),
+            "service": namespace.service,
+            "result": dict(result),
+        },
+        surface="Compose service recreate",
+        maximum_bytes=6 * 1024,
+    )
+
+
 def _test(
     namespace: argparse.Namespace,
     *,
@@ -1629,6 +1777,7 @@ def _test(
 ) -> dict[str, Any]:
     from .agent_test import (
         enqueue_test,
+        project_queue_status,
         project_test_follow,
         submit_test_plan,
     )
@@ -1674,6 +1823,19 @@ def _test(
             actor=_attribution(),
             operation_id=namespace.operation_id,
         ), project=context.root.canonical_root)
+    if action == "queue-status":
+        status = profile.test_queue_status(repository=root.repo_id)
+        if not isinstance(status, Mapping):
+            raise AgentCliError(
+                "test_reply_invalid",
+                "test queue status reply is not an object",
+                classification="invalid_reply",
+                phase="transport",
+            )
+        return _scope_test_result(
+            project_queue_status(status, repository_id=root.repo_id),
+            project=context.root.canonical_root,
+        )
     if action in {"follow", "status", "summary", "wait"}:
         wait_seconds = (
             namespace.timeout_seconds
@@ -1857,6 +2019,20 @@ def _execute(
             context=context,
             execution_state=execution_state,
         )
+    if namespace.command == "database":
+        return _database(
+            namespace,
+            profile=profile,
+            capabilities=capabilities,
+            context=context,
+        )
+    if namespace.command == "compose":
+        return _compose(
+            namespace,
+            profile=profile,
+            capabilities=capabilities,
+            context=context,
+        )
     if namespace.command == "runtime":
         return _runtime(
             namespace,
@@ -1894,6 +2070,8 @@ def _command_mutates(namespace: argparse.Namespace | None) -> bool:
         return namespace.action not in {"status", "capture_logs"}
     if namespace.command == "storage":
         return namespace.action in {"remove", "plan", "apply"}
+    if namespace.command in {"database", "compose"}:
+        return True
     return namespace.command == "test" and namespace.test_action in {
         "cancel",
         "enqueue",
@@ -2447,6 +2625,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             namespace.operation_id = _canonical_operation_id(
                 namespace.operation_id, mutate=True
             )
+        elif namespace.command in {"database", "compose"}:
+            namespace.operation_id = _canonical_operation_id(
+                namespace.operation_id, mutate=True
+            )
         elif namespace.command == "test" and namespace.test_action in {
             "cancel",
             "enqueue",
@@ -2460,6 +2642,35 @@ def main(argv: Sequence[str] | None = None) -> int:
         # broker transport.  A caller can therefore recover a lost reply from
         # the bounded journal without inventing or guessing an operation ID.
         record("received", "received")
+        if namespace.command == "test" and namespace.test_action == "enqueue":
+            operation_handle = continuation_handle(
+                "operation", namespace.operation_id
+            )
+            replay_arguments = list(raw_arguments)
+            if "--operation-id" not in replay_arguments:
+                replay_arguments.extend(["--operation-id", namespace.operation_id])
+            queue_arguments = ["devcoordinator", "test", "queue-status"]
+            if getattr(namespace, "project", None):
+                queue_arguments.extend(["--project", namespace.project])
+            _emit(
+                {
+                    "schema_version": 1,
+                    "ok": True,
+                    "classification": "test_enqueue_started",
+                    "status": "snapshot_planning",
+                    "operation_id": namespace.operation_id,
+                    "continuation": operation_handle,
+                    "mutation_performed": False,
+                    "next_command": (
+                        f"devcoordinator operation follow {operation_handle}"
+                    ),
+                    "queue_status_command": shlex.join(queue_arguments),
+                    "replay_command": shlex.join(
+                        ["devcoordinator", *replay_arguments]
+                    ),
+                },
+                stream=sys.stderr,
+            )
         if namespace.command == "runtime" and namespace.action == "serve":
             _validate_runtime_serve_namespace(namespace)
         result = _execute(namespace, execution_state=execution_state)

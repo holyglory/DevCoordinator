@@ -481,6 +481,38 @@ class TestdEngineTests(EngineFixture):
         self.assertIn("exact_worktree_busy", reasons)
         self.assertEqual(len(self.launcher.requests), 1)
 
+    def test_slow_later_launch_cannot_expire_an_active_attempt(self) -> None:
+        first = self.submit_live()
+        self.engine.schedule(launch_batch=1)
+        second_plan = plan(
+            mode=SourceMode.LIVE,
+            fingerprint=uuid.uuid4().hex * 2,
+            temporary_root="/home/example/other-worktree",
+        )
+        self.store.submit_plan(
+            second_plan,
+            operation_id=operation_id(),
+            actor="codex:testd",
+            owner_uid=1001,
+            target_resources={
+                name: TargetResources(
+                    cpu_millis=1_000,
+                    memory_mib=1_024,
+                    pids=128,
+                    worktree_key="/home/example/other-worktree",
+                )
+                for name in second_plan.selected_targets
+            },
+        )
+        self.issuer.issue_delay_seconds = 40
+
+        launched = self.engine.schedule(launch_batch=1)
+        reaped = self.engine.reap()
+
+        self.assertEqual(len(launched["launched_target_ids"]), 1)
+        self.assertEqual(reaped["running_heartbeat_lost_attempt_ids"], [])
+        self.assertEqual(self.store.get_run(first.run_id)["state"], "running")
+
     def test_just_launched_memory_commitment_survives_later_scheduler_tick(self) -> None:
         self.engine.scheduler = WeightedFairScheduler(
             memory_probe=lambda: HostMemorySnapshot(

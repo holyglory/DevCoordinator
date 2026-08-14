@@ -281,6 +281,33 @@ class StoreFixture(unittest.TestCase):
 
 
 class UniversalTestStoreTests(StoreFixture):
+    def test_queue_status_needs_no_run_handle_and_reports_typed_blockers(self) -> None:
+        submitted = self.submit()
+
+        queued = self.store.queue_status(repository_id="repo-tests")
+
+        self.assertEqual(queued["phase"], "scheduler")
+        self.assertEqual(queued["global_targets"]["queued"], 2)
+        self.assertEqual(queued["repository_targets"]["queued"], 2)
+        self.assertEqual(queued["repository_runnable_targets"], 1)
+        self.assertEqual(queued["approximate_first_position"], 1)
+        self.assertEqual(
+            queued["blockers"],
+            [{"code": "dependency_wave", "target_count": 1}],
+        )
+        self.assertEqual(queued["worker_capacity"]["limit"], None)
+
+        grant = self.lease_lint(submitted.run_id)
+        self.store.acknowledge_launch(
+            grant.attempt_id,
+            generation=grant.generation,
+            launch_ack_id="launch-" + grant.attempt_id,
+            operation_id=operation_id(),
+        )
+        running = self.store.queue_status(repository_id="repo-tests")
+        self.assertEqual(running["phase"], "execution")
+        self.assertEqual(running["repository_targets"]["running"], 1)
+
     def test_schema_preparation_attests_fresh_v5_and_replays(self) -> None:
         mutation = operation_id()
         first = prepare_test_store_schema_v5(

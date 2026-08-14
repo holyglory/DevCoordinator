@@ -851,6 +851,15 @@ def exercise_release_packaging_contract() -> None:
         "immutable test lifecycle wrapper is missing or too broad",
     )
     expect(
+        switch.installer.WRAPPERS.get("devcoordinator-image")
+        == (
+            "python",
+            "skills/codex-dev-coordinator/scripts/dev_coordinator.py",
+            ("broker", "publish-image"),
+        ),
+        "immutable image publication wrapper is missing or too broad",
+    )
+    expect(
         switch.installer.WRAPPERS.get("devcoordinator-codex-test-access-verify")
         == ("python", "scripts/verify_codex_test_access.py", ()),
         "non-root Codex test access verifier is absent from immutable releases",
@@ -872,6 +881,7 @@ def exercise_release_packaging_contract() -> None:
         == Path("/usr/local/bin/devcoordinator-call-log")
         and switch.SYSTEMD_UNIT_LAUNCHER
         == Path("/usr/local/bin/devcoordinator-systemd-unit")
+        and switch.IMAGE_LAUNCHER == Path("/usr/local/bin/devcoordinator-image")
         and switch.READ_ONLY_RULE
         == Path("/etc/codex/rules/devcoordinator-read-only.rules")
         and switch.TEST_RULE == Path("/etc/codex/rules/devcoordinator-test.rules"),
@@ -893,6 +903,11 @@ def exercise_release_packaging_contract() -> None:
         )
         == (switch.SYSTEMD_UNIT_LAUNCHER, "devcoordinator-systemd-unit"),
         "systemd commissioning launcher is absent from the stable activation transaction",
+    )
+    expect(
+        switch.STABLE_LAUNCHERS.get(switch.IMAGE_LAUNCHER_RENDERED)
+        == (switch.IMAGE_LAUNCHER, "devcoordinator-image"),
+        "image publication launcher is absent from the stable activation transaction",
     )
     expect(
         all(

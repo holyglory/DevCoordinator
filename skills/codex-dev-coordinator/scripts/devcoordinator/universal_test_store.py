@@ -1560,6 +1560,92 @@ class UniversalTestStore:
         finally:
             connection.close()
 
+    def queue_status(self, *, repository_id: str) -> dict[str, object]:
+        """Return bounded current queue evidence without requiring a run ID."""
+
+        repository_id = _safe_id("repository_id", repository_id)
+        connection = self._connect(readonly=True)
+        try:
+            rows = connection.execute(
+                """
+                SELECT run.repository_id, target.state, COUNT(*) AS count
+                FROM test_run_targets AS target
+                JOIN test_runs AS run ON run.run_id = target.run_id
+                WHERE target.state IN ('queued', 'leased', 'running')
+                  AND run.state IN ('queued', 'running', 'cancelling', 'superseding')
+                GROUP BY run.repository_id, target.state
+                """
+            ).fetchall()
+            global_counts = {"queued": 0, "leased": 0, "running": 0}
+            repository_counts = {"queued": 0, "leased": 0, "running": 0}
+            for row in rows:
+                state = str(row["state"])
+                count = int(row["count"])
+                global_counts[state] += count
+                if str(row["repository_id"]) == repository_id:
+                    repository_counts[state] += count
+            blockers = [
+                {"code": str(row["wait_code"]), "target_count": int(row["count"])}
+                for row in connection.execute(
+                    """
+                    SELECT target.wait_code, COUNT(*) AS count
+                    FROM test_run_targets AS target
+                    JOIN test_runs AS run ON run.run_id = target.run_id
+                    WHERE run.repository_id = ?
+                      AND target.state = 'queued'
+                      AND target.wait_code IS NOT NULL
+                    GROUP BY target.wait_code
+                    ORDER BY target.wait_code
+                    LIMIT 16
+                    """,
+                    (repository_id,),
+                ).fetchall()
+            ]
+        finally:
+            connection.close()
+
+        runnable = self.runnable_targets(limit=10_000)
+        repository_positions = [
+            index
+            for index, candidate in enumerate(runnable, start=1)
+            if candidate.repository_id == repository_id
+        ]
+        runnable_count = len(repository_positions)
+        dependency_blocked = max(0, repository_counts["queued"] - runnable_count)
+        if dependency_blocked:
+            blockers.append(
+                {"code": "dependency_wave", "target_count": dependency_blocked}
+            )
+        phase = (
+            "execution"
+            if repository_counts["running"]
+            else "launch"
+            if repository_counts["leased"]
+            else "scheduler"
+            if repository_counts["queued"]
+            else "idle"
+        )
+        return {
+            "repository_id": repository_id,
+            "sampled_at": _now(self._clock),
+            "phase": phase,
+            "global_targets": global_counts,
+            "repository_targets": repository_counts,
+            "repository_runnable_targets": runnable_count,
+            "approximate_first_position": (
+                min(repository_positions) if repository_positions else None
+            ),
+            "position_population_truncated": len(runnable) == 10_000,
+            "blockers": blockers[:16],
+            # Admission is dynamic and memory-based; there is deliberately no
+            # invented fixed worker count or unobserved available capacity.
+            "worker_capacity": {
+                "model": "dynamic_memory_admission",
+                "limit": None,
+                "available": None,
+            },
+        }
+
     def record_schedule_decision(
         self,
         *,

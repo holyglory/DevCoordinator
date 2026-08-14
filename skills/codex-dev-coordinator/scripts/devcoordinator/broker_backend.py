@@ -272,6 +272,7 @@ _ASYNC_TEST_OPERATIONS = frozenset(
         BrokerOperation.TEST_PLAN_REGISTER,
         BrokerOperation.TEST_RUN_SUBMIT,
         BrokerOperation.TEST_RUN_LIST,
+        BrokerOperation.TEST_QUEUE_STATUS,
         BrokerOperation.TEST_RUN_STATUS,
         BrokerOperation.TEST_RUN_SUMMARY,
         BrokerOperation.TEST_RUN_FAILURES,
@@ -981,6 +982,23 @@ class StoreBackedMutationBackend:
                     expected_repo_id=request.project_id,
                     maximum_items=int(request.arguments["limit"]),
                 )
+                return result
+
+            if request.operation is BrokerOperation.TEST_QUEUE_STATUS:
+                expected_repository_id = str(
+                    request.arguments.get("expected_repository_id")
+                    or request.project_id
+                )
+                if expected_repository_id != request.project_id:
+                    raise BrokerBackendError(
+                        "test_repository_mismatch",
+                        "The queue status repository is contradictory.",
+                        operation_id=request.operation_id,
+                    )
+                result = dict(
+                    plane.queue_status(repository_id=request.project_id)
+                )
+                self._require_test_repository(result, request.project_id)
                 return result
 
             if request.operation is BrokerOperation.TEST_EVENTS_READ:
@@ -2107,6 +2125,22 @@ class StoreBackedMutationBackend:
                 replay_database_result = self._persistence.database_host_result(
                     accepted
                 )
+            if (
+                request.operation is BrokerOperation.DATABASE_BACKUP
+                and replay_database_result is None
+                and self._persistence.database_backup_was_interrupted(accepted)
+            ):
+                code = "database_backup_interrupted"
+                message = (
+                    "The prior broker stopped before the read-only PostgreSQL "
+                    "backup produced durable host evidence; submit a new backup operation."
+                )
+                self._record_failure(
+                    request.operation_id, code=code, message=message
+                )
+                raise BrokerBackendError(
+                    code, message, operation_id=request.operation_id
+                )
             if replay_database_result is None:
                 raise BrokerBackendError(
                     "operation_in_progress",
@@ -2538,9 +2572,22 @@ class StoreBackedMutationBackend:
                 target = self._persistence.database_target(accepted)
                 if request.operation == BrokerOperation.DATABASE_BACKUP:
                     if replay_database_result is None:
-                        raw_result = self._host_mutations.postgres_backup(
-                            target, output_root=str(self._postgres_backup_root)
-                        )
+                        try:
+                            raw_result = self._host_mutations.postgres_backup(
+                                target, output_root=str(self._postgres_backup_root)
+                            )
+                        except BrokerError as exc:
+                            if exc.code != "operation_outcome_uncertain":
+                                raise
+                            # The helper process group has been terminated and
+                            # backup never mutates the source database. Treat
+                            # its missing durable evidence as a terminal failed
+                            # attempt rather than an indefinite mutation fence.
+                            raise BrokerBackendError(
+                                "database_backup_timeout",
+                                "PostgreSQL backup exceeded its bounded phase deadline without durable evidence.",
+                                operation_id=request.operation_id,
+                            ) from exc
                         journal_result = _json_safe_mapping(raw_result)
                         try:
                             self._persistence.save_database_host_result(
@@ -3179,6 +3226,37 @@ class StoreBackedMutationBackend:
         # strand a durable mutation. The target state is then re-read and its
         # immutable identity rechecked inside the reserved root operation.
         host_evidence = self._observe_committed_host(request.operation_id)
+        if target_kind in {"docker", "database_stack"}:
+            prior = self._persistence.reconcilable_prior_runtime_operation(
+                accepted
+            )
+            if prior is not None:
+                if host_evidence.get("docker_available") is not True:
+                    raise BrokerBackendError(
+                        "docker_observer_unavailable",
+                        "Fresh Docker evidence is required before reconciling the prior runtime action.",
+                        operation_id=request.operation_id,
+                    )
+                current = self._persistence.runtime_ensure_observation(accepted)
+                if (
+                    current.get("exact") is not True
+                    or current.get("docker_resource_id")
+                    != prior["docker_resource_id"]
+                    or current.get("sampled_at") is None
+                ):
+                    raise BrokerBackendError(
+                        "runtime_reconciliation_observation_incomplete",
+                        "Fresh exact target evidence did not match the prior runtime action.",
+                        operation_id=request.operation_id,
+                    )
+                self._persistence.finish_runtime_reconciliation(
+                    prior["operation_id"],
+                    error_code="runtime_outcome_reconciled",
+                    error_message=(
+                        "Fresh exact state cannot prove the historical runtime action; "
+                        "the prior operation was settled as a terminal failure without reexecution."
+                    ),
+                )
         disposition = self._persistence.reserve_operation(accepted)
         if disposition.state == "completed":
             return dict(disposition.result or {})
@@ -3852,11 +3930,12 @@ class StoreBackedMutationBackend:
         if journal.resource_kind == "database_stack":
             if journal.database_backup_id is None:
                 assert journal.backup_operation_id is not None
+                assert journal.database_binding_id is not None
                 assert journal.database_name is not None
                 backup_request = self._runtime_replacement_subrequest(
                     accepted,
                     operation_id=journal.backup_operation_id,
-                    resource_id=journal.old_docker_resource_id,
+                    resource_id=journal.database_binding_id,
                     operation=BrokerOperation.DATABASE_BACKUP,
                     arguments={"database_name": journal.database_name},
                 )

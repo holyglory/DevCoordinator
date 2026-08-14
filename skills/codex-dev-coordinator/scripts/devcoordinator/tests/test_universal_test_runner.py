@@ -389,6 +389,62 @@ class UniversalTestRunnerTests(unittest.TestCase):
         with self.assertRaisesRegex(TestStoreConflict, "identity"):
             second_manager._collect_result_artifacts(runtime_id, escaped)
 
+    def test_failed_automation_links_declared_directory_text_diagnostic(self) -> None:
+        descriptor = replace(
+            self.descriptor(
+                (
+                    "/usr/bin/python3",
+                    "-c",
+                    "import pathlib,sys; d=pathlib.Path('diagnostics'); d.mkdir(); "
+                    f"(d/'database.log').write_text('connection refused at {self.root}/data\\n'); "
+                    "(d/'image.bin').write_bytes(b'\\x00\\x01'); "
+                    "sys.stderr.write('build warning\\n'); sys.exit(1)",
+                )
+            ),
+            driver="automation",
+            reporter="automation-events",
+            artifacts=(
+                {
+                    "name": "diagnostics",
+                    "path": "diagnostics",
+                    "kind": "directory",
+                    "required": True,
+                    "max_bytes": 1024 * 1024,
+                },
+            ),
+        )
+        result_path = self.output / "result.json"
+
+        self.assertEqual(run(descriptor, self.output, result_path), 1)
+
+        result = json.loads(result_path.read_text(encoding="utf-8"))
+        chunks = [
+            json.loads((self.output / item["file_name"]).read_text(encoding="utf-8"))
+            for item in result["chunk_manifest"]
+        ]
+        artifacts = [item for chunk in chunks for item in chunk["artifacts"]]
+        failure = next(
+            item
+            for chunk in chunks
+            for item in chunk["failures"]
+            if item["classification"] == "test_failure"
+        )
+        diagnostic = next(
+            item for item in artifacts if item["artifact_id"] == failure["artifact_id"]
+        )
+        self.assertEqual(diagnostic["kind"], "log")
+        source = next(
+            item
+            for item in result["artifact_sources"]
+            if item["artifact_id"] == diagnostic["artifact_id"]
+        )
+        payload = (self.output / source["relative_path"]).read_text(encoding="utf-8")
+        self.assertIn("== database.log ==", payload)
+        self.assertIn("connection refused", payload)
+        self.assertIn("<repository>/data", payload)
+        self.assertNotIn("image.bin", payload)
+        self.assertNotIn(str(self.root), payload)
+
     def test_missing_declared_executable_publishes_bounded_infrastructure_result(self) -> None:
         missing = self.root / ".venv-v2" / "bin" / "python"
         descriptor = self.descriptor((str(missing.relative_to(self.root)), "-V"))

@@ -1663,7 +1663,9 @@ class LocalBrokerHostMutations:
                 "database",
                 "--out-dir",
                 str(root),
-            )
+            ),
+            failure_code="database_backup_failed",
+            failure_label="PostgreSQL backup",
         )
         artifact = backup.get("backup")
         manifest = backup.get("manifest")
@@ -1684,7 +1686,9 @@ class LocalBrokerHostMutations:
                 "--file",
                 artifact,
                 "--test-restore",
-            )
+            ),
+            failure_code="database_backup_verification_failed",
+            failure_label="PostgreSQL backup verification",
         )
         if verification.get("ok") is not True or not verification.get("test_restore"):
             raise RuntimeError("PostgreSQL backup strong verification did not complete")
@@ -1722,7 +1726,9 @@ class LocalBrokerHostMutations:
                 "--confirm-restore",
                 "--safety-out-dir",
                 str(safety_root),
-            )
+            ),
+            failure_code="database_restore_failed",
+            failure_label="PostgreSQL restore",
         )
 
     def postgres_reconcile_restore(
@@ -1757,13 +1763,21 @@ class LocalBrokerHostMutations:
                 "database",
                 "--safety-out-dir",
                 str(safety_root),
-            )
+            ),
+            failure_code="database_restore_reconciliation_failed",
+            failure_label="PostgreSQL restore reconciliation",
         )
         if result.get("matched") is not True:
             return None
         return result
 
-    def _postgres_command(self, command: tuple[str, ...]) -> dict[str, Any]:
+    def _postgres_command(
+        self,
+        command: tuple[str, ...],
+        *,
+        failure_code: str,
+        failure_label: str,
+    ) -> dict[str, Any]:
         environment = dict(os.environ)
         environment["DEVCOORDINATOR_BACKUP_REGISTRY"] = "off"
         environment["DEVCOORDINATOR_BROKER_INTERNAL"] = "1"
@@ -1777,8 +1791,9 @@ class LocalBrokerHostMutations:
                 "PostgreSQL helper exceeded its bounded deadline; exact database reconciliation is required before retry.",
             ) from exc
         if completed.returncode != 0:
-            raise RuntimeError(
-                "service-owned PostgreSQL action failed with exit "
+            raise BrokerBackendError(
+                failure_code,
+                f"{failure_label} failed with exit "
                 f"{completed.returncode}: "
                 f"{_bounded_output(completed.stderr) or 'no diagnostic output'}"
             )

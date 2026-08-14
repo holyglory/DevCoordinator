@@ -341,6 +341,20 @@ class BlockingPostgresHostActions(RecordingPostgresHostActions):
         )
 
 
+class TimedOutPostgresHostActions(RecordingPostgresHostActions):
+    def postgres_backup(
+        self, target: Any, *, output_root: str
+    ) -> Mapping[str, Any]:
+        del output_root
+        self.postgres_calls.append(
+            ("backup", target.full_container_id, target.database_name)
+        )
+        raise BrokerError(
+            "operation_outcome_uncertain",
+            "injected bounded PostgreSQL helper timeout",
+        )
+
+
 class BlockingTypedHostActions(RecordingTypedHostActions):
     def __init__(self, entered: threading.Event, release: threading.Event) -> None:
         super().__init__()
@@ -407,14 +421,22 @@ class ExactLifecycleAdapter:
 def request_for(
     operation: BrokerOperation = BrokerOperation.DOCKER_STOP,
     *,
-    resource_id: str = CONTAINER_ID,
+    resource_id: Optional[str] = None,
     arguments: Optional[Mapping[str, Any]] = None,
     operation_id: Optional[str] = None,
 ) -> BrokerRequest:
+    resolved_resource_id = resource_id
+    if resolved_resource_id is None:
+        resolved_resource_id = (
+            DATABASE_ID
+            if operation
+            in {BrokerOperation.DATABASE_BACKUP, BrokerOperation.DATABASE_RESTORE}
+            else CONTAINER_ID
+        )
     return BrokerRequest.create(
         account_id=ACCOUNT_ID,
         project_id=PROJECT_ID,
-        resource_id=resource_id,
+        resource_id=resolved_resource_id,
         operation=operation,
         arguments=arguments,
         operation_id=operation_id,
@@ -3474,6 +3496,72 @@ class StoreBackedBrokerTests(unittest.TestCase):
                     ).fetchone()[0]
             self.assertEqual(operation["status"], "failed")
             self.assertEqual(backup_count, 0)
+
+    def test_postgres_backup_timeout_is_terminal_not_an_indefinite_fence(self) -> None:
+        with CanonicalTemporaryDirectory() as root:
+            persistence, _unused = seed_store_backed_broker(root)
+            seed_postgres_database(persistence)
+            actions = TimedOutPostgresHostActions()
+            service = store_backed_service(persistence, actions)
+            request = request_for(
+                BrokerOperation.DATABASE_BACKUP,
+                arguments={"database_name": DATABASE_NAME},
+            )
+
+            first = service.reply_for_document(peer_for(), request.to_wire())
+            replay = service.reply_for_document(peer_for(), request.to_wire())
+
+            self.assertFalse(first["ok"], first)
+            self.assertEqual(first["error"]["code"], "database_backup_timeout")
+            self.assertFalse(replay["ok"], replay)
+            self.assertEqual(replay["error"]["code"], "database_backup_timeout")
+            self.assertEqual(
+                actions.postgres_calls,
+                [("backup", "a" * 64, DATABASE_NAME)],
+            )
+
+    def test_replacement_broker_settles_abandoned_database_backup(self) -> None:
+        with CanonicalTemporaryDirectory() as root:
+            persistence, _unused = seed_store_backed_broker(root)
+            seed_postgres_database(persistence)
+            request = request_for(
+                BrokerOperation.DATABASE_BACKUP,
+                arguments={"database_name": DATABASE_NAME},
+            )
+            accepted = StoreBackedRequestAcceptor(persistence).accept(
+                peer_for(), request
+            )
+            persistence.reserve_operation(accepted)
+            with CoordinatorStore.open(
+                persistence.database_path, expected_uid=os.geteuid()
+            ) as store:
+                with store.immediate_transaction() as connection:
+                    connection.execute(
+                        """
+                        UPDATE operations SET process_fingerprint = 'departed-broker'
+                        WHERE operation_id = ?
+                        """,
+                        (request.operation_id,),
+                    )
+            actions = RecordingPostgresHostActions()
+            service = store_backed_service(persistence, actions)
+
+            reply = service.reply_for_document(peer_for(), request.to_wire())
+
+            self.assertFalse(reply["ok"], reply)
+            self.assertEqual(
+                reply["error"]["code"], "database_backup_interrupted"
+            )
+            self.assertEqual(actions.postgres_calls, [])
+            with CoordinatorStore.open(
+                persistence.database_path, expected_uid=os.geteuid()
+            ) as store:
+                with store.read_transaction() as connection:
+                    status = connection.execute(
+                        "SELECT status FROM operations WHERE operation_id = ?",
+                        (request.operation_id,),
+                    ).fetchone()["status"]
+            self.assertEqual(status, "failed")
 
     def test_postgres_registry_uncertainty_replays_journal_without_second_dump(self) -> None:
         with CanonicalTemporaryDirectory() as root:

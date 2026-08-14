@@ -73,7 +73,7 @@ MAX_EPHEMERAL_SECRET_BYTES = 512
 # Repository lifecycle plans can also exceed this budget; their recovery
 # contract is durable per-target phase checkpoints plus idempotent
 # re-observation, rather than completion inside this timeout.
-DEFAULT_POSTGRES_COMMAND_TIMEOUT_SECONDS = 30 * 60.0
+DEFAULT_POSTGRES_COMMAND_TIMEOUT_SECONDS = 60 * 60.0
 DATABASE_BACKUP_CUMULATIVE_TIMEOUT_SECONDS = (
     2 * DEFAULT_POSTGRES_COMMAND_TIMEOUT_SECONDS
 )
@@ -131,6 +131,7 @@ class BrokerOperation(str, Enum):
     TEST_PLAN_REGISTER = "test.plan_register"
     TEST_RUN_SUBMIT = "test.run_submit"
     TEST_RUN_LIST = "test.run_list"
+    TEST_QUEUE_STATUS = "test.queue_status"
     TEST_RUN_STATUS = "test.run_status"
     TEST_RUN_SUMMARY = "test.run_summary"
     TEST_RUN_FAILURES = "test.run_failures"
@@ -724,6 +725,7 @@ class SerializedMutationWriter:
             BrokerOperation.TEST_HEALTH,
             BrokerOperation.TEST_FLEET_STATS_READ,
             BrokerOperation.TEST_RUN_LIST,
+            BrokerOperation.TEST_QUEUE_STATUS,
             BrokerOperation.TEST_RUN_STATUS,
             BrokerOperation.TEST_RUN_SUMMARY,
             BrokerOperation.TEST_RUN_FAILURES,
@@ -2651,6 +2653,22 @@ def _validate_arguments(
                     operation_id=operation_id,
                 )
             normalized["state"] = state
+        return normalized
+
+    if operation == BrokerOperation.TEST_QUEUE_STATUS:
+        if set(value) - {"expected_repository_id"}:
+            raise BrokerError(
+                "invalid_arguments",
+                "Test queue status accepts no selectors.",
+                operation_id=operation_id,
+            )
+        normalized = {}
+        if "expected_repository_id" in value:
+            normalized["expected_repository_id"] = _opaque_argument(
+                value["expected_repository_id"],
+                "expected_repository_id",
+                operation_id,
+            )
         return normalized
 
     if operation in {BrokerOperation.TEST_RUN_STATUS, BrokerOperation.TEST_RUN_SUMMARY}:

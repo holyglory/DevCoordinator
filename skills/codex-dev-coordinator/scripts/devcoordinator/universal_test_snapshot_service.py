@@ -587,6 +587,144 @@ class RootSnapshotService:
         # path; they cannot list or mutate the root-owned store.
         self.snapshot_root.chmod(0o711)
 
+    @classmethod
+    def _stage_python_dependency(
+        cls,
+        binding: Mapping[str, object],
+        *,
+        materialized_root: Path,
+    ) -> Mapping[str, object]:
+        """Publish a root-owned, caller-readable venv beside its snapshot."""
+
+        if binding.get("kind") != "python-venv":
+            return dict(binding)
+        source = Path(str(binding["source_root"]))
+        dependencies = materialized_root.parent / ".dependencies"
+        try:
+            dependencies.mkdir(mode=0o711, exist_ok=True)
+            metadata = dependencies.lstat()
+            if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+                raise TestStoreConflict(
+                    "snapshot dependency staging root is unsafe"
+                )
+        except OSError as error:
+            raise TestStoreConflict(
+                "snapshot dependency staging root is unavailable"
+            ) from error
+        identity = hashlib.sha256(
+            json.dumps(
+                {
+                    "destination": binding["destination"],
+                    "source_device": binding["source_device"],
+                    "source_inode": binding["source_inode"],
+                    "marker_sha256": binding["marker_sha256"],
+                    "installation_sha256": binding["installation_sha256"],
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        staged = dependencies / f"python-{identity}"
+        if not staged.exists():
+            dependencies.chmod(0o700)
+            temporary = Path(tempfile.mkdtemp(prefix=".python-staging-", dir=dependencies))
+            copied = temporary / "root"
+            published = False
+            try:
+                shutil.copytree(
+                    source,
+                    copied,
+                    symlinks=True,
+                    copy_function=shutil.copy2,
+                )
+                try:
+                    copied.rename(staged)
+                    published = True
+                except FileExistsError:
+                    pass
+                directories: list[Path] = []
+                if published:
+                    for directory, child_directories, files in os.walk(
+                        staged, topdown=True, followlinks=False
+                    ):
+                        current = Path(directory)
+                        current_metadata = current.lstat()
+                        if not stat.S_ISDIR(current_metadata.st_mode):
+                            raise TestStoreConflict(
+                                "staged immutable Python dependency is unsafe"
+                            )
+                        directories.append(current)
+                        for name in files:
+                            path = current / name
+                            item = path.lstat()
+                            if stat.S_ISLNK(item.st_mode):
+                                continue
+                            if not stat.S_ISREG(item.st_mode):
+                                raise TestStoreConflict(
+                                    "staged immutable Python dependency is unsafe"
+                                )
+                            path.chmod(
+                                0o555
+                                if stat.S_IMODE(item.st_mode) & 0o111
+                                else 0o444
+                            )
+                        child_directories[:] = [
+                            name
+                            for name in child_directories
+                            if not (current / name).is_symlink()
+                        ]
+                for directory in reversed(directories):
+                    directory.chmod(0o555)
+            except (OSError, shutil.Error) as error:
+                if published:
+                    shutil.rmtree(staged, ignore_errors=True)
+                raise TestStoreConflict(
+                    "immutable Python dependency could not be staged"
+                ) from error
+            finally:
+                shutil.rmtree(temporary, ignore_errors=True)
+                dependencies.chmod(0o711)
+        else:
+            dependencies.chmod(0o711)
+        try:
+            staged_metadata = staged.lstat()
+        except OSError as error:
+            raise TestStoreConflict(
+                "staged immutable Python dependency is unavailable"
+            ) from error
+        if not stat.S_ISDIR(staged_metadata.st_mode) or stat.S_ISLNK(
+            staged_metadata.st_mode
+        ):
+            raise TestStoreConflict(
+                "staged immutable Python dependency is unsafe"
+            )
+        marker_path = str(binding["marker_path"])
+        if cls._dependency_file_digest(
+            staged,
+            PurePosixPath(marker_path),
+            field="staged immutable Python dependency marker",
+        ) != binding["marker_sha256"]:
+            raise TestStoreConflict(
+                "staged immutable Python dependency identity differs"
+            )
+        staged_identity = cls._installation_manifest_identity(
+            staged, kind=str(binding["installation_kind"])
+        )
+        if staged_identity != (
+            binding["installation_sha256"],
+            binding["installation_files"],
+            binding["installation_bytes"],
+        ):
+            raise TestStoreConflict(
+                "staged immutable Python dependency identity differs"
+            )
+        return {
+            **binding,
+            "staged_root": str(staged),
+            "staged_device": staged_metadata.st_dev,
+            "staged_inode": staged_metadata.st_ino,
+        }
+
     def setup(self, arguments: Mapping[str, object]) -> Mapping[str, object]:
         if set(arguments) != {"repository_id", "owner_uid"}:
             raise TestStoreContractError("snapshot setup arguments are invalid")
@@ -1175,23 +1313,24 @@ class RootSnapshotService:
         destination: PurePosixPath | None = None
         executable_name: str | None = None
         if raw_executable == "{python}":
-            candidates: list[PurePosixPath] = []
             parents = [cwd]
             if cwd != PurePosixPath("."):
                 parents.append(PurePosixPath("."))
+            # The names above are an explicit preference order, not a set of
+            # competing identities. Repositories can intentionally retain a
+            # legacy environment while migrating to .venv-v2; select the
+            # closest preferred environment deterministically.
+            destination = None
             for parent in parents:
                 for name in _PYTHON_ENVIRONMENT_NAMES:
                     candidate = parent / name
                     source = original_root.joinpath(*candidate.parts)
                     if source.exists() or source.is_symlink():
-                        candidates.append(candidate)
-            candidates = list(dict.fromkeys(candidates))
-            if len(candidates) > 1:
-                raise TestStoreConflict(
-                    "immutable Python environment selection is ambiguous"
-                )
-            if candidates:
-                destination = candidates[0]
+                        destination = candidate
+                        break
+                if destination is not None:
+                    break
+            if destination is not None:
                 for name in ("python", "python3"):
                     candidate = original_root.joinpath(
                         *destination.parts, "bin", name
@@ -2020,6 +2159,13 @@ class RootSnapshotService:
                 source_provenance=source_provenance,
                 owner_uid=candidate.owner_uid,
                 account_uids=account_uids,
+            )
+            dependency_bindings = tuple(
+                self._stage_python_dependency(
+                    binding,
+                    materialized_root=Path(candidate.worktree_key),
+                )
+                for binding in dependency_bindings
             )
         supplementary_gids = self._supplementary_developer_gids(account_uids)
         descriptor = TestAttemptDescriptor(

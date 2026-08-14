@@ -21,7 +21,11 @@ from devcoordinator.broker_host import (
     LocalBrokerHostMutations,
     _port_available,
 )
-from devcoordinator.broker_persistence import DockerMutationTarget, EphemeralImageTarget
+from devcoordinator.broker_persistence import (
+    DatabaseMutationTarget,
+    DockerMutationTarget,
+    EphemeralImageTarget,
+)
 from devcoordinator.ephemeral_secrets import EphemeralSecretMount, EphemeralSecretPolicy
 from devcoordinator.worker_native import project_repository_slice
 
@@ -44,6 +48,17 @@ def _docker_target(
         control_generation,
         repo_id="repo-123",
         owner_uid=501,
+    )
+
+
+def _database_target() -> DatabaseMutationTarget:
+    return DatabaseMutationTarget(
+        database_binding_id="database-binding",
+        docker_resource_id="docker-resource",
+        full_container_id=_FULL_ID,
+        database_name="app",
+        observation_revision=1,
+        control_generation=1,
     )
 
 
@@ -163,6 +178,51 @@ def _anonymous_image_volume_mount(
 
 
 class BrokerHostMutationTests(unittest.TestCase):
+    def test_postgres_backup_surfaces_bounded_strong_verification_diagnostic(
+        self,
+    ) -> None:
+        calls: list[tuple[str, ...]] = []
+
+        def runner(
+            command: tuple[str, ...],
+            _timeout: float,
+            _environment: dict[str, str],
+        ) -> subprocess.CompletedProcess[str]:
+            calls.append(command)
+            if command[2] == "backup":
+                return subprocess.CompletedProcess(
+                    command,
+                    0,
+                    stdout=json.dumps(
+                        {
+                            "backup": "/service/backup.dump",
+                            "manifest": "/service/backup.dump.manifest.json",
+                            "sha256": "b" * 64,
+                        }
+                    ),
+                    stderr="",
+                )
+            return subprocess.CompletedProcess(
+                command,
+                2,
+                stdout="",
+                stderr="scratch restore failed: no space left on device",
+            )
+
+        host = LocalBrokerHostMutations(postgres_runner=runner)
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaises(BrokerBackendError) as raised:
+                host.postgres_backup(
+                    _database_target(),
+                    output_root=str(Path(directory) / "postgres-backups"),
+                )
+
+        self.assertEqual(
+            raised.exception.code, "database_backup_verification_failed"
+        )
+        self.assertIn("no space left on device", str(raised.exception))
+        self.assertEqual([command[2] for command in calls], ["backup", "verify"])
+
     @unittest.skipUnless(sys.platform.startswith("linux"), "Linux procfs observer")
     def test_linux_listener_proof_does_not_depend_on_lsof(self) -> None:
         with tempfile.TemporaryDirectory(

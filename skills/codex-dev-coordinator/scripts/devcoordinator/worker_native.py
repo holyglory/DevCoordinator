@@ -8,7 +8,7 @@ Coordinator authority and is the parent of the actual worker process.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import grp
 import hashlib
 import os
@@ -61,6 +61,9 @@ class NativeWorkerState:
     state: str
     pid: int | None
     exit_status: int | None
+    control_group: str | None = None
+    cgroup_populated: bool | None = None
+    termination_method: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -72,6 +75,9 @@ class NativeWorkerState:
             "state": self.state,
             "pid": self.pid,
             "exit_status": self.exit_status,
+            "control_group": self.control_group,
+            "cgroup_populated": self.cgroup_populated,
+            "termination_method": self.termination_method,
         }
 
 
@@ -231,6 +237,7 @@ class SystemdWorkerManager:
         python_executable: str = "/usr/bin/python3",
         systemd_run_executable: str = "/usr/bin/systemd-run",
         systemctl_executable: str = "/usr/bin/systemctl",
+        cgroup_root: Path = Path("/sys/fs/cgroup"),
         runner: Runner = subprocess.run,
     ) -> None:
         self.coordinator_script = _trusted_script(coordinator_script)
@@ -243,6 +250,7 @@ class SystemdWorkerManager:
         self.systemctl_executable = _trusted_executable(
             systemctl_executable, description="systemctl executable"
         )
+        self.cgroup_root = cgroup_root
         self.runner = runner
 
     @staticmethod
@@ -273,7 +281,7 @@ class SystemdWorkerManager:
             "--service-type=exec",
             "--property=Restart=on-failure",
             "--property=RestartSec=2s",
-            "--property=KillMode=mixed",
+            "--property=KillMode=control-group",
             "--property=NoNewPrivileges=yes",
             "--property=PrivateTmp=yes",
             "--property=ProtectControlGroups=yes",
@@ -298,8 +306,14 @@ class SystemdWorkerManager:
         ]
         _run(self.runner, argv)
         state = self.status(worker_id=worker_id)
-        if not state.loaded:
-            raise WorkerNativeError("systemd accepted the runner but did not load its unit")
+        if (
+            not state.loaded
+            or state.control_group is None
+            or state.cgroup_populated is not True
+        ):
+            raise WorkerNativeError(
+                "systemd did not prove one populated private worker control group"
+            )
         try:
             self.require_project_isolation(
                 worker_id=worker_id,
@@ -350,8 +364,31 @@ class SystemdWorkerManager:
         current = self.status(worker_id=worker_id, allow_missing=True)
         if not current.loaded:
             return current
+        terminated_control_group: str | None = None
+        if current.active:
+            if current.control_group is None:
+                raise WorkerNativeError(
+                    "systemd did not expose the worker control group before termination"
+                )
+            self._kill_control_group(current.control_group)
+            terminated_control_group = current.control_group
         _run(self.runner, [self.systemctl_executable, "stop", unit])
-        return self.status(worker_id=worker_id, allow_missing=True)
+        stopped = self.status(worker_id=worker_id, allow_missing=True)
+        if terminated_control_group is not None:
+            populated = self._control_group_populated(
+                terminated_control_group, allow_missing=True
+            )
+            if populated:
+                raise WorkerNativeError(
+                    "worker control group remained populated after cgroup.kill"
+                )
+            stopped = replace(
+                stopped,
+                control_group=terminated_control_group,
+                cgroup_populated=False,
+                termination_method="cgroup.kill",
+            )
+        return stopped
 
     def remove(self, *, worker_id: str) -> NativeWorkerState:
         """Stop and collect the exact transient runner registration."""
@@ -371,7 +408,62 @@ class SystemdWorkerManager:
             raise WorkerNativeError(
                 "systemd did not collect the exact transient worker runner"
             )
+        if stopped.termination_method is not None:
+            removed = replace(
+                removed,
+                control_group=stopped.control_group,
+                cgroup_populated=False,
+                termination_method=stopped.termination_method,
+            )
         return removed
+
+    def _control_group_path(self, control_group: str) -> Path:
+        if (
+            not isinstance(control_group, str)
+            or not control_group.startswith("/")
+            or "\x00" in control_group
+            or any(part in {"", ".", ".."} for part in control_group.split("/")[1:])
+        ):
+            raise WorkerNativeError("systemd returned an invalid worker control group")
+        return self.cgroup_root.joinpath(*control_group.split("/")[1:])
+
+    def _control_group_populated(
+        self, control_group: str, *, allow_missing: bool = False
+    ) -> bool:
+        events = self._control_group_path(control_group) / "cgroup.events"
+        try:
+            payload = events.read_text(encoding="ascii")
+        except FileNotFoundError:
+            if allow_missing:
+                return False
+            raise WorkerNativeError("worker cgroup.events is unavailable")
+        except OSError as error:
+            raise WorkerNativeError("worker cgroup.events is unavailable") from error
+        values = dict(
+            line.split(" ", 1)
+            for line in payload.splitlines()
+            if " " in line
+        )
+        if values.get("populated") not in {"0", "1"}:
+            raise WorkerNativeError("worker cgroup.events has invalid populated evidence")
+        return values["populated"] == "1"
+
+    def _kill_control_group(self, control_group: str) -> None:
+        if os.geteuid() != 0:
+            raise WorkerNativeError("cgroup.kill requires root authority")
+        target = self._control_group_path(control_group) / "cgroup.kill"
+        try:
+            descriptor = os.open(
+                target,
+                os.O_WRONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            )
+            try:
+                if os.write(descriptor, b"1") != 1:
+                    raise OSError("short cgroup.kill write")
+            finally:
+                os.close(descriptor)
+        except OSError as error:
+            raise WorkerNativeError("worker cgroup.kill is unavailable") from error
 
     def status(
         self, *, worker_id: str, allow_missing: bool = False
@@ -390,6 +482,7 @@ class SystemdWorkerManager:
                     "--property=SubState",
                     "--property=MainPID",
                     "--property=ExecMainStatus",
+                    "--property=ControlGroup",
                     "--no-pager",
                 ],
             )
@@ -427,6 +520,12 @@ class SystemdWorkerManager:
         ):
             raise WorkerNativeError("systemd returned an invalid exit status")
         exit_status = int(status_text) if status_text not in {None, ""} else None
+        control_group = values.get("ControlGroup") or None
+        populated = (
+            None
+            if control_group is None
+            else self._control_group_populated(control_group, allow_missing=True)
+        )
         return NativeWorkerState(
             worker_id=worker_id,
             manager="systemd",
@@ -436,6 +535,8 @@ class SystemdWorkerManager:
             state=sub_state,
             pid=pid,
             exit_status=exit_status,
+            control_group=control_group,
+            cgroup_populated=populated,
         )
 
 

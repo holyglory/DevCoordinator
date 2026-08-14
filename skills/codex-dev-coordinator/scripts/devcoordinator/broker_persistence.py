@@ -255,6 +255,7 @@ _TEST_OPERATIONS = frozenset(
         BrokerOperation.TEST_PLAN_REGISTER,
         BrokerOperation.TEST_RUN_SUBMIT,
         BrokerOperation.TEST_RUN_LIST,
+        BrokerOperation.TEST_QUEUE_STATUS,
         BrokerOperation.TEST_RUN_STATUS,
         BrokerOperation.TEST_RUN_SUMMARY,
         BrokerOperation.TEST_RUN_FAILURES,
@@ -4738,7 +4739,8 @@ class BrokerPersistence:
                         request_fingerprint,
                         accepted.peer.uid,
                         _operation_actor(accepted),
-                        f"pid:{os.getpid()}",
+                        runtime_process_identity(os.getpid())
+                        or f"pid:{os.getpid()}",
                         now,
                         now,
                     ),
@@ -7399,7 +7401,7 @@ class BrokerPersistence:
                     FROM database_bindings db
                     JOIN docker_resources d USING(docker_resource_id)
                     CROSS JOIN schema_metadata m
-                    WHERE db.repo_id = ? AND db.docker_resource_id = ?
+                    WHERE db.repo_id = ? AND db.database_binding_id = ?
                       AND db.database_name = ? AND db.engine_kind = 'postgresql'
                     """,
                     (
@@ -7568,6 +7570,45 @@ class BrokerPersistence:
                 operation_id=request.operation_id,
             )
         return decoded
+
+    def database_backup_was_interrupted(
+        self, accepted: AcceptedBrokerRequest
+    ) -> bool:
+        """Recognize a reservation whose owning broker no longer exists."""
+
+        request = accepted.request
+        if request.operation is not BrokerOperation.DATABASE_BACKUP:
+            raise ValueError("request is not a database backup")
+        request_fingerprint = accepted_request_fingerprint(accepted)
+        current_owner = runtime_process_identity(os.getpid()) or f"pid:{os.getpid()}"
+        with self._store() as store:
+            with store.read_transaction() as connection:
+                _validate_connection_request(
+                    connection, peer=accepted.peer, request=request
+                )
+                disposition = self._existing_operation_disposition(
+                    connection,
+                    accepted=accepted,
+                    fingerprint=request_fingerprint,
+                )
+                if disposition is None or disposition.state != "pending":
+                    return False
+                row = connection.execute(
+                    """
+                    SELECT o.kind, o.process_fingerprint,
+                           h.operation_id AS host_result_operation_id
+                    FROM operations o
+                    LEFT JOIN broker_database_host_results h USING(operation_id)
+                    WHERE o.operation_id = ? AND o.status = 'running'
+                    """,
+                    (request.operation_id,),
+                ).fetchone()
+        return bool(
+            row is not None
+            and str(row["kind"]) == "broker.database.backup"
+            and row["host_result_operation_id"] is None
+            and str(row["process_fingerprint"] or "") != current_owner
+        )
 
     def docker_observation_result(
         self,
@@ -9329,6 +9370,78 @@ class BrokerPersistence:
                             operation_id=request.operation_id,
                         )
                 return observation
+
+    def reconcilable_prior_runtime_operation(
+        self, accepted: AcceptedBrokerRequest
+    ) -> dict[str, str] | None:
+        """Find one exact uncertain runtime action blocking an ensure.
+
+        The current resource resolution and immutable fingerprint must still
+        match the prior reservation. This is association and stale-identity
+        protection, not a caller permission decision.
+        """
+
+        request = accepted.request
+        if (
+            request.operation is not BrokerOperation.RUNTIME_ENSURE
+            or request.arguments["target_kind"] not in {"docker", "database_stack"}
+        ):
+            raise ValueError("request is not a Docker-backed runtime ensure")
+        with self._store() as store:
+            with store.read_transaction() as connection:
+                _validate_connection_request(
+                    connection, peer=accepted.peer, request=request
+                )
+                current = _runtime_mutation_row(connection, request=request)
+                current_fingerprint = _runtime_target_fingerprint(
+                    current, requested_resource_id=request.resource_id
+                )
+                row = connection.execute(
+                    """
+                    SELECT operation.operation_id, target.action,
+                           resource.full_container_id
+                    FROM operations operation
+                    JOIN operation_targets target USING(operation_id)
+                    JOIN docker_resources resource
+                      ON resource.docker_resource_id = target.target_id
+                    WHERE operation.repo_id = ?
+                      AND target.target_kind = 'container'
+                      AND target.target_id = ?
+                      AND target.immutable_fingerprint = ?
+                      AND operation.operation_id != ?
+                      AND operation.kind = 'broker.runtime.request'
+                      AND operation.status = 'needs_attention'
+                      AND operation.phase = 'reconciliation_required'
+                      AND target.status = 'failed'
+                      AND target.phase = 'reconciliation_required'
+                      AND target.action IN (
+                          'runtime.start', 'runtime.stop', 'runtime.restart'
+                      )
+                    ORDER BY operation.created_at, operation.operation_id
+                    LIMIT 1
+                    """,
+                    (
+                        request.project_id,
+                        str(current["docker_resource_id"]),
+                        current_fingerprint,
+                        request.operation_id,
+                    ),
+                ).fetchone()
+                if row is None:
+                    return None
+                full_container_id = str(row["full_container_id"]).lower()
+                if full_container_id != str(current["full_container_id"]).lower():
+                    raise BrokerError(
+                        "stale_resource_definition",
+                        "The uncertain runtime action no longer matches the current immutable container.",
+                        operation_id=request.operation_id,
+                    )
+                return {
+                    "operation_id": str(row["operation_id"]),
+                    "action": str(row["action"]),
+                    "docker_resource_id": str(current["docker_resource_id"]),
+                    "full_container_id": full_container_id,
+                }
 
     def runtime_snapshot(
         self, accepted: AcceptedBrokerRequest
@@ -12665,7 +12778,7 @@ def _reserved_target_fingerprint(
             FROM database_bindings db
             JOIN docker_resources d USING(docker_resource_id)
             CROSS JOIN schema_metadata m
-            WHERE db.repo_id = ? AND db.docker_resource_id = ?
+            WHERE db.repo_id = ? AND db.database_binding_id = ?
               AND db.database_name = ? AND db.engine_kind = 'postgresql'
             """,
             (

@@ -99,6 +99,24 @@ def broker_capabilities(
             "exact_reclaim_plans": True,
             "durable_confirmation_bound_apply": True,
         },
+        "database": {
+            "actions": ["backup"],
+        },
+        "compose": {
+            "actions": ["recreate-service"],
+        },
+        "image_publication": {
+            "actions": ["status", "plan", "build", "apply", "rollback"],
+            "cli": "devcoordinator-image",
+        },
+        "route_publication": {
+            "actions": ["inspect", "publish"],
+            "surface": "console:#/routes",
+        },
+        "process_isolation": {
+            "termination": "cgroup.kill",
+            "empty_proof": "populated=0",
+        },
         "tests": {
             "actions": [
                 "artifact",
@@ -106,6 +124,7 @@ def broker_capabilities(
                 "enqueue",
                 "failures",
                 "follow",
+                "queue-status",
                 "retry",
                 "status",
                 "submit",

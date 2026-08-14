@@ -586,8 +586,17 @@ class TestAttemptDescriptor:
             "installation_bytes",
             "toolchain",
         }
+        staged_dependency_fields = {
+            "staged_root",
+            "staged_device",
+            "staged_inode",
+        }
         for raw in self.dependency_bindings:
-            if not isinstance(raw, Mapping) or set(raw) != dependency_fields:
+            if (
+                not isinstance(raw, Mapping)
+                or not dependency_fields <= set(raw)
+                or set(raw) - dependency_fields - staged_dependency_fields
+            ):
                 raise TestStoreContractError(
                     "test attempt dependency binding fields are invalid"
                 )
@@ -607,6 +616,37 @@ class TestAttemptDescriptor:
                 raw["source_inode"],
                 maximum=(1 << 63) - 1,
             )
+            raw_staged_root = raw.get("staged_root")
+            raw_staged_device = raw.get("staged_device")
+            raw_staged_inode = raw.get("staged_inode")
+            if (
+                raw_staged_root is None
+                or raw_staged_device is None
+                or raw_staged_inode is None
+            ):
+                if not (
+                    raw_staged_root is None
+                    and raw_staged_device is None
+                    and raw_staged_inode is None
+                ):
+                    raise TestStoreContractError(
+                        "test attempt staged dependency identity is incomplete"
+                    )
+                staged_root = None
+                staged_device = None
+                staged_inode = None
+            else:
+                staged_root = _absolute_path(
+                    "dependency binding staged_root", raw_staged_root
+                )
+                staged_device = _nonnegative_integer(
+                    "dependency binding staged_device", raw_staged_device
+                )
+                staged_inode = _positive_integer(
+                    "dependency binding staged_inode",
+                    raw_staged_inode,
+                    maximum=(1 << 63) - 1,
+                )
             destination = _relative_path(
                 "dependency binding destination", raw["destination"]
             )
@@ -780,6 +820,10 @@ class TestAttemptDescriptor:
                     raise TestStoreContractError(
                         "test attempt Python dependency binding is invalid"
                     )
+                if staged_root is not None and Path(staged_root) == Path(source_root):
+                    raise TestStoreContractError(
+                        "test attempt staged Python dependency is not isolated"
+                    )
             elif kind == "node-modules":
                 if (
                     destination_path.name != "node_modules"
@@ -791,6 +835,10 @@ class TestAttemptDescriptor:
                 ):
                     raise TestStoreContractError(
                         "test attempt Node dependency binding is invalid"
+                    )
+                if staged_root is not None:
+                    raise TestStoreContractError(
+                        "test attempt Node dependency cannot claim staging"
                     )
             elif (
                 destination != _DOTNET_PACKAGES_DESTINATION
@@ -806,6 +854,10 @@ class TestAttemptDescriptor:
             ):
                 raise TestStoreContractError(
                     "test attempt .NET dependency binding is invalid"
+                )
+            elif staged_root is not None:
+                raise TestStoreContractError(
+                    "test attempt .NET dependency cannot claim staging"
                 )
             if kind == "dotnet-packages":
                 local_package_roots = {
@@ -823,6 +875,9 @@ class TestAttemptDescriptor:
                     "source_root": source_root,
                     "source_device": source_device,
                     "source_inode": source_inode,
+                    "staged_root": staged_root,
+                    "staged_device": staged_device,
+                    "staged_inode": staged_inode,
                     "destination": destination,
                     "locks": dict(sorted(locks.items())),
                     "marker_path": marker_path,
@@ -2034,7 +2089,53 @@ class SystemdTestAttemptManager:
                 raise TestStoreConflict(
                     "test dependency mount destination escapes execution root"
                 )
-        return source_root, destination
+        mount_source = source_root
+        if kind == "python-venv":
+            raw_staged_root = binding.get("staged_root")
+            if raw_staged_root is None:
+                raise TestStoreConflict(
+                    "immutable Python dependency has no root-staged source"
+                )
+            staged_root = Path(str(raw_staged_root))
+            expected_parent = Path(descriptor.worktree_key).parent / ".dependencies"
+            if staged_root.parent != expected_parent:
+                raise TestStoreConflict(
+                    "staged immutable Python dependency escapes its snapshot"
+                )
+            staged_metadata = cls._require_real_directory(
+                staged_root, field="staged immutable Python dependency"
+            )
+            if (
+                staged_metadata.st_dev != binding.get("staged_device")
+                or staged_metadata.st_ino != binding.get("staged_inode")
+            ):
+                raise TestStoreConflict(
+                    "staged immutable Python dependency was substituted"
+                )
+            if marker_path is not None and (
+                cls._dependency_file_digest(
+                    staged_root,
+                    str(marker_path),
+                    field="staged immutable Python dependency marker",
+                )
+                != marker_sha256
+            ):
+                raise TestStoreConflict(
+                    "staged immutable Python dependency identity differs"
+                )
+            staged_identity = cls._installation_manifest_identity(
+                staged_root, kind=str(binding["installation_kind"])
+            )
+            if staged_identity != (
+                binding["installation_sha256"],
+                binding["installation_files"],
+                binding["installation_bytes"],
+            ):
+                raise TestStoreConflict(
+                    "staged immutable Python dependency identity differs"
+                )
+            mount_source = staged_root
+        return mount_source, destination
 
     @classmethod
     def _prepare_dependency_mountpoints(

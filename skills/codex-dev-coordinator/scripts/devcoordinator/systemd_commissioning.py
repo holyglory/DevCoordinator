@@ -280,6 +280,84 @@ def _installed_evidence(installed_root: Path, source: UnitSource) -> dict[str, A
     }
 
 
+def commissioning_status(
+    *,
+    project: Path,
+    unit: str,
+    desired: str,
+    installed_root: Path = Path("/etc/systemd/system"),
+    runner: Callable[[Sequence[str]], subprocess.CompletedProcess[str]] = _default_runner,
+) -> dict[str, Any]:
+    """Observe an exact unit even when its project source is unavailable.
+
+    Status is diagnostic and never authorizes a mutation, so missing/unloaded
+    units remain typed evidence instead of becoming an internal error.
+    """
+
+    if desired not in DESIRED_STATES:
+        raise SystemdCommissioningError("systemd desired state is invalid")
+    unit = _unit_stem(unit)
+    try:
+        project_info = project.lstat()
+        resolved = project.resolve(strict=True)
+    except OSError as exc:
+        raise SystemdCommissioningError("project directory is unavailable") from exc
+    if project.is_symlink() or not stat.S_ISDIR(project_info.st_mode) or resolved != project:
+        raise SystemdCommissioningError(
+            "project must be one canonical non-symlink directory"
+        )
+
+    service_source = project / "deploy" / "systemd" / f"{unit}.service"
+    source_available = service_source.exists()
+    sources = load_unit_sources(project, unit) if source_available else ()
+    source_by_name = {source.name: source for source in sources}
+    names = {f"{unit}.service"}
+    if f"{unit}.timer" in source_by_name or (
+        installed_root / f"{unit}.timer"
+    ).exists():
+        names.add(f"{unit}.timer")
+
+    installed: list[dict[str, Any]] = []
+    for name in sorted(names):
+        payload = _read_regular(installed_root / name, required=False)
+        source = source_by_name.get(name)
+        installed.append(
+            {
+                "name": name,
+                "present": payload is not None,
+                "sha256": (
+                    None
+                    if payload is None
+                    else "sha256:" + hashlib.sha256(payload).hexdigest()
+                ),
+                "matches_source": (
+                    None if source is None else payload == source.payload
+                ),
+            }
+        )
+    return {
+        "schema_version": 1,
+        "project": str(project),
+        "project_identity": {
+            "device": project_info.st_dev,
+            "inode": project_info.st_ino,
+        },
+        "unit": unit,
+        "desired": desired,
+        "source_available": source_available,
+        "sources": [
+            {"name": source.name, "sha256": source.sha256}
+            for source in sources
+        ],
+        "installed": installed,
+        "states": [
+            _systemd_state(name, runner=runner, allow_unobservable=True)
+            for name in sorted(names)
+        ],
+        "mutation_performed": False,
+    }
+
+
 def plan_commissioning(
     *,
     project: Path,

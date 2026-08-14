@@ -63,6 +63,12 @@ class WorkerNativeTests(unittest.TestCase):
         self.systemctl = self._program("systemctl")
         self.launchctl = self._program("launchctl")
         self.worker_id = str(uuid.uuid4())
+        self.control_group = f"/system.slice/devcoordinator-worker-{self.worker_id}.service"
+        self.cgroup_root = self.root / "cgroup"
+        cgroup = self.cgroup_root.joinpath(*self.control_group.split("/")[1:])
+        cgroup.mkdir(parents=True)
+        (cgroup / "cgroup.events").write_text("populated 1\n", encoding="ascii")
+        (cgroup / "cgroup.kill").write_text("", encoding="ascii")
 
     def tearDown(self) -> None:
         self.temp.cleanup()
@@ -79,6 +85,7 @@ class WorkerNativeTests(unittest.TestCase):
             python_executable=str(self.python),
             systemd_run_executable=str(self.systemd_run),
             systemctl_executable=str(self.systemctl),
+            cgroup_root=self.cgroup_root,
             runner=runner,
         )
 
@@ -118,7 +125,8 @@ class WorkerNativeTests(unittest.TestCase):
                 (
                     0,
                     "LoadState=loaded\nActiveState=active\nSubState=running\n"
-                    "MainPID=4312\nExecMainStatus=0\n",
+                    "MainPID=4312\nExecMainStatus=0\n"
+                    f"ControlGroup={self.control_group}\n",
                     "",
                 ),
                 (
@@ -151,7 +159,7 @@ class WorkerNativeTests(unittest.TestCase):
                 "--service-type=exec",
                 "--property=Restart=on-failure",
                 "--property=RestartSec=2s",
-                "--property=KillMode=mixed",
+                "--property=KillMode=control-group",
                 "--property=NoNewPrivileges=yes",
                 "--property=PrivateTmp=yes",
                 "--property=ProtectControlGroups=yes",
@@ -199,6 +207,8 @@ class WorkerNativeTests(unittest.TestCase):
         )
         self.assertTrue(state.active)
         self.assertEqual(state.pid, 4312)
+        self.assertEqual(state.control_group, self.control_group)
+        self.assertTrue(state.cgroup_populated)
 
     def test_systemd_rejects_non_root_manager_and_root_worker(self) -> None:
         manager = self._systemd(FakeRunner())
@@ -292,14 +302,16 @@ class WorkerNativeTests(unittest.TestCase):
                 (
                     0,
                     "LoadState=loaded\nActiveState=active\nSubState=running\n"
-                    "MainPID=4312\nExecMainStatus=0\n",
+                    "MainPID=4312\nExecMainStatus=0\n"
+                    f"ControlGroup={self.control_group}\n",
                     "",
                 ),
                 (0, "", ""),
                 (
                     0,
                     "LoadState=loaded\nActiveState=inactive\nSubState=dead\n"
-                    "MainPID=0\nExecMainStatus=0\n",
+                    "MainPID=0\nExecMainStatus=0\n"
+                    f"ControlGroup={self.control_group}\n",
                     "",
                 ),
                 (0, "", ""),
@@ -307,7 +319,15 @@ class WorkerNativeTests(unittest.TestCase):
             ]
         )
         manager = self._systemd(runner)
-        state = manager.remove(worker_id=self.worker_id)
+        with (
+            mock.patch("devcoordinator.worker_native.os.geteuid", return_value=0),
+            mock.patch.object(
+                manager,
+                "_control_group_populated",
+                side_effect=[True, False, False],
+            ),
+        ):
+            state = manager.remove(worker_id=self.worker_id)
 
         unit = f"devcoordinator-worker-{self.worker_id}.service"
         self.assertFalse(state.loaded)
@@ -323,6 +343,7 @@ class WorkerNativeTests(unittest.TestCase):
                     "--property=SubState",
                     "--property=MainPID",
                     "--property=ExecMainStatus",
+                    "--property=ControlGroup",
                     "--no-pager",
                 ],
                 [str(self.systemctl.resolve()), "stop", unit],
@@ -335,6 +356,7 @@ class WorkerNativeTests(unittest.TestCase):
                     "--property=SubState",
                     "--property=MainPID",
                     "--property=ExecMainStatus",
+                    "--property=ControlGroup",
                     "--no-pager",
                 ],
                 [str(self.systemctl.resolve()), "reset-failed", unit],
@@ -347,9 +369,18 @@ class WorkerNativeTests(unittest.TestCase):
                     "--property=SubState",
                     "--property=MainPID",
                     "--property=ExecMainStatus",
+                    "--property=ControlGroup",
                     "--no-pager",
                 ],
             ],
+        )
+        self.assertEqual(state.termination_method, "cgroup.kill")
+        self.assertFalse(state.cgroup_populated)
+        self.assertEqual(
+            self.cgroup_root.joinpath(
+                *self.control_group.split("/")[1:], "cgroup.kill"
+            ).read_text(encoding="ascii"),
+            "1",
         )
 
     @unittest.skipIf(os.geteuid() == 0, "per-user launchd requires a non-root test account")

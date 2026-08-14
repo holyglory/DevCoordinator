@@ -64,6 +64,7 @@ BUG_LAUNCHER = Path("/usr/local/bin/devcoordinator-bug")
 TEST_LAUNCHER = Path("/usr/local/bin/devcoordinator-test")
 CALL_LOG_LAUNCHER = Path("/usr/local/bin/devcoordinator-call-log")
 SYSTEMD_UNIT_LAUNCHER = Path("/usr/local/bin/devcoordinator-systemd-unit")
+IMAGE_LAUNCHER = Path("/usr/local/bin/devcoordinator-image")
 READ_ONLY_RULE = CODEX_RULE_ROOT / "devcoordinator-read-only.rules"
 TEST_RULE = CODEX_RULE_ROOT / "devcoordinator-test.rules"
 CLIENT_LAUNCHER_RENDERED = "devcoordinator-launcher"
@@ -72,6 +73,7 @@ BUG_LAUNCHER_RENDERED = "devcoordinator-bug-launcher"
 TEST_LAUNCHER_RENDERED = "devcoordinator-test-launcher"
 CALL_LOG_LAUNCHER_RENDERED = "devcoordinator-call-log-launcher"
 SYSTEMD_UNIT_LAUNCHER_RENDERED = "devcoordinator-systemd-unit-launcher"
+IMAGE_LAUNCHER_RENDERED = "devcoordinator-image-launcher"
 READ_ONLY_RULE_RENDERED = "devcoordinator-read-only.rules"
 TEST_RULE_RENDERED = "devcoordinator-test.rules"
 BROWSER_ACCOUNTING_CAPABILITY = "headless_browser_accounting"
@@ -115,6 +117,7 @@ STABLE_LAUNCHERS = {
         SYSTEMD_UNIT_LAUNCHER,
         "devcoordinator-systemd-unit",
     ),
+    IMAGE_LAUNCHER_RENDERED: (IMAGE_LAUNCHER, "devcoordinator-image"),
 }
 TEST_HISTORY_WRAPPER = "devcoordinator-test-history"
 TESTD_USER = "devcoordinator-testd"

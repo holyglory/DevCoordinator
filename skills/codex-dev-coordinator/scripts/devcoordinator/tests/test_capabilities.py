@@ -39,13 +39,19 @@ class CapabilityContractTests(unittest.TestCase):
         document = broker_capabilities(
             protocol_version=1,
             authority_schema_version=13,
-            authority_generation="generation-1",
+            authority_generation="g" * 64,
             active_release_digest="a" * 64,
         )
         self.assertEqual(document["runtime"]["ensure_states"], ["ready", "stopped"])
         self.assertEqual(
             document["tests"]["enqueue_intents"],
             ["change", "checkpoint", "handoff", "release", "manual"],
+        )
+        self.assertIn("queue-status", document["tests"]["actions"])
+        self.assertEqual(document["database"]["actions"], ["backup"])
+        self.assertEqual(document["compose"]["actions"], ["recreate-service"])
+        self.assertEqual(
+            document["image_publication"]["cli"], "devcoordinator-image"
         )
         self.assertTrue(document["runtime"]["operation_replay"])
         self.assertEqual(

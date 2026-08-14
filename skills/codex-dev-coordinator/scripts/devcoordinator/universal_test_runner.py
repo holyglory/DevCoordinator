@@ -17,6 +17,7 @@ import signal
 import stat
 import subprocess
 import sys
+import tarfile
 import threading
 import time
 from typing import Mapping, NamedTuple, Sequence
@@ -44,6 +45,8 @@ MAX_REPORT_BYTES = 32 * 1024 * 1024
 MAX_CASES = 100_000
 MAX_FAILURES = 64
 MAX_ARTIFACTS = 64
+MAX_FAILURE_DIAGNOSTIC_BYTES = 256 * 1024
+MAX_FAILURE_DIAGNOSTIC_FILE_BYTES = 64 * 1024
 MAX_TOOLCHAIN_BYTES = 1024 * 1024 * 1024
 MAX_DOTNET_GLOBAL_JSON_BYTES = 64 * 1024
 MAX_DOTNET_READINESS_STREAM_BYTES = 256 * 1024
@@ -913,6 +916,87 @@ def _generated_artifact(
         "verified": True,
         "_source_path": str(path),
     }
+
+
+def _directory_failure_diagnostic(
+    descriptor: TestAttemptDescriptor,
+    artifacts: Sequence[Mapping[str, object]],
+    *,
+    output: Path,
+) -> Mapping[str, object] | None:
+    """Project bounded text tails from already verified directory archives."""
+
+    chunks: list[bytes] = []
+    retained = 0
+    allowed_suffixes = {".json", ".jsonl", ".log", ".txt", ".xml"}
+    private_roots: dict[str, bytes] = {}
+    for private_root, replacement in (
+        (descriptor.original_root, b"<repository>"),
+        (descriptor.execution_root, b"<execution-root>"),
+        (descriptor.worktree_key, b"<worktree>"),
+        (str(output), b"<attempt-output>"),
+    ):
+        private_roots.setdefault(str(Path(private_root)), replacement)
+    if descriptor.temporary_root is not None:
+        private_roots.setdefault(str(Path(descriptor.temporary_root)),
+            b"<temporary-repository>"
+        )
+    for artifact in artifacts:
+        if artifact.get("kind") != "directory":
+            continue
+        archive_text = artifact.get("_source_path")
+        if not isinstance(archive_text, str):
+            raise TestStoreContractError("runner directory artifact source is missing")
+        archive = Path(archive_text)
+        with tarfile.open(archive, mode="r:") as packaged:
+            for member in packaged.getmembers():
+                member_path = PurePosixPath(member.name)
+                if (
+                    not member.isfile()
+                    or member.size <= 0
+                    or member.size > MAX_REPORT_BYTES
+                    or member_path.is_absolute()
+                    or any(part in {".", ".."} for part in member_path.parts)
+                    or member_path.suffix.lower() not in allowed_suffixes
+                ):
+                    continue
+                source = packaged.extractfile(member)
+                if source is None:
+                    continue
+                payload = source.read(MAX_REPORT_BYTES + 1)
+                if len(payload) != member.size or b"\0" in payload:
+                    continue
+                tail = payload[-MAX_FAILURE_DIAGNOSTIC_FILE_BYTES:]
+                for private_root, replacement in sorted(
+                    private_roots.items(), key=lambda item: len(item[0]), reverse=True
+                ):
+                    tail = tail.replace(os.fsencode(private_root), replacement)
+                text = tail.decode("utf-8", errors="replace")
+                if text and (
+                    sum(character.isprintable() or character in "\r\n\t" for character in text)
+                    / len(text)
+                ) < 0.85:
+                    continue
+                header = f"== {member_path.as_posix()} ==\n".encode("utf-8")
+                candidate = header + tail + (b"" if tail.endswith(b"\n") else b"\n")
+                available = MAX_FAILURE_DIAGNOSTIC_BYTES - retained
+                if available <= 0:
+                    break
+                selected = candidate[:available]
+                chunks.append(selected)
+                retained += len(selected)
+            if retained >= MAX_FAILURE_DIAGNOSTIC_BYTES:
+                break
+    if not chunks:
+        return None
+    path = output / "failure-diagnostics.log"
+    path.write_bytes(b"".join(chunks))
+    return _generated_artifact(
+        descriptor,
+        path,
+        kind="log",
+        name="failure-diagnostics",
+    )
 
 
 def _artifact_sources(
@@ -2342,6 +2426,15 @@ def run(
                     "artifact_id": None,
                 }
             )
+    failure_diagnostic_artifact: Mapping[str, object] | None = None
+    if returncode != 0 and launch_error is None and not project_timed_out:
+        failure_diagnostic_artifact = _directory_failure_diagnostic(
+            descriptor,
+            artifacts,
+            output=output,
+        )
+        if failure_diagnostic_artifact is not None:
+            artifacts.append(failure_diagnostic_artifact)
     if len(artifacts) > MAX_ARTIFACTS:
         incomplete = True
         artifacts = artifacts[:MAX_ARTIFACTS]
@@ -2435,7 +2528,7 @@ def run(
         # produced no failing case (or failed before it could do so).  Link the
         # concise failure to bounded evidence without copying arbitrary project
         # output into the agent summary.
-        evidence = (
+        evidence = failure_diagnostic_artifact or (
             stderr_artifact
             if int(stderr_state.get("observed_bytes", 0)) > 0
             else stdout_artifact

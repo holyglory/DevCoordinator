@@ -1170,6 +1170,10 @@ class TestPlaneClient(Protocol):
         self, *, run_id: str, repository_id: str
     ) -> Mapping[str, object]: ...
 
+    def queue_status(
+        self, *, repository_id: str
+    ) -> Mapping[str, object]: ...
+
     def runs(
         self,
         *,
@@ -2248,6 +2252,14 @@ class StoreTestPlaneAdapter:
             self._status_document(
                 self._store.get_run(run_id, repository_id=repository_id)
             )
+        )
+
+    def queue_status(self, *, repository_id: str) -> Mapping[str, object]:
+        return self._bounded(
+            {
+                "schema_version": 1,
+                **self._store.queue_status(repository_id=repository_id),
+            }
         )
 
     def runs(

@@ -41,6 +41,7 @@ from .universal_test_store import (
     FailureClassification,
     FailureRecord,
     LeaseGrant,
+    MAX_LEASE_SECONDS,
     RunnableTarget,
     TestStoreConflict,
     TestStoreContractError,
@@ -1000,6 +1001,11 @@ class TestdEngine:
         launched: list[str] = []
         failed: list[dict[str, str]] = []
         for candidate in decision.selected:
+            # Runtime submission is intentionally serialized and may consume
+            # most of its bounded launch deadline. Protect every already
+            # supervised attempt before that blocking call so a later reaper
+            # cannot mistake scheduler latency for a lost testd heartbeat.
+            self._renew_active_leases(lease_seconds=MAX_LEASE_SECONDS)
             try:
                 self._launch(candidate)
                 launched.append(candidate.target_id)
@@ -1028,6 +1034,8 @@ class TestdEngine:
                         "stage": "launch",
                     }
                 )
+            finally:
+                self._renew_active_leases(lease_seconds=self.lease_seconds)
         return {
             "launched_target_ids": launched,
             "launch_failures": failed,
@@ -1044,6 +1052,21 @@ class TestdEngine:
             "spool": replay,
             "reconciled": reconciled,
         }
+
+    def _renew_active_leases(self, *, lease_seconds: int) -> None:
+        for active in tuple(self._active.values()):
+            effective_lease_seconds = (
+                self._pending_launch_lease_seconds(active)
+                if lease_seconds == self.lease_seconds
+                and not active.handle.launch_confirmed
+                else lease_seconds
+            )
+            self.store.heartbeat_attempt(
+                active.lease.attempt_id,
+                generation=active.lease.generation,
+                lease_seconds=effective_lease_seconds,
+                operation_id=str(uuid.uuid4()),
+            )
 
     def _allocation(self, value: Mapping[str, object]) -> ActiveAllocation:
         retained = self._active.get(str(value["attempt_id"]))

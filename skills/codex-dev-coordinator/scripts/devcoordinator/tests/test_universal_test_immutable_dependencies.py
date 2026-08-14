@@ -143,6 +143,15 @@ class ImmutableDependencyBindingTests(unittest.TestCase):
             dependency_bindings=tuple(bindings),
         )
 
+    def staged(self, *bindings):
+        return tuple(
+            RootSnapshotService._stage_python_dependency(
+                binding,
+                materialized_root=self.materialized,
+            )
+            for binding in bindings
+        )
+
     def test_python_and_node_bindings_are_derived_from_locks_not_manifest_mounts(self) -> None:
         python_bindings, python_executable, _dotnet = self.derive(
             {
@@ -176,10 +185,14 @@ class ImmutableDependencyBindingTests(unittest.TestCase):
             python_executable=python_executable,
         )
         self.assertEqual(rewritten[0], ".venv-v2/bin/python")
+        staged_python_bindings = self.staged(*python_bindings)
         round_trip = TestAttemptDescriptor.from_document(
-            self.descriptor(*python_bindings).to_document()
+            self.descriptor(*staged_python_bindings).to_document()
         )
-        self.assertEqual(round_trip.dependency_bindings, python_bindings)
+        self.assertEqual(
+            round_trip.dependency_bindings,
+            self.descriptor(*staged_python_bindings).dependency_bindings,
+        )
         before_fingerprint = round_trip.fingerprint
         metadata = (
             self.original
@@ -197,6 +210,26 @@ class ImmutableDependencyBindingTests(unittest.TestCase):
             before_fingerprint,
             self.descriptor(*changed_bindings).fingerprint,
         )
+
+    def test_preferred_python_environment_wins_over_retained_legacy_environment(self) -> None:
+        legacy_python = self.original / ".venv" / "bin" / "python"
+        legacy_python.parent.mkdir(parents=True)
+        legacy_python.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        legacy_python.chmod(0o755)
+        (self.original / ".venv" / "pyvenv.cfg").write_text(
+            "home = /usr/bin\n", encoding="utf-8"
+        )
+
+        bindings, executable, _dotnet = self.derive(
+            {
+                "driver": "pytest",
+                "cwd": ".",
+                "argv": ["{python}", "-m", "pytest"],
+            }
+        )
+
+        self.assertEqual(executable, ".venv-v2/bin/python")
+        self.assertEqual(bindings[0]["destination"], ".venv-v2")
 
     def test_lock_digest_comes_from_a_real_snapshot_scan(self) -> None:
         manifest_document = {
@@ -311,7 +344,7 @@ class ImmutableDependencyBindingTests(unittest.TestCase):
         (attempt_root / "uv.lock").write_text("python-lock\n", encoding="utf-8")
         with self.assertRaisesRegex(TestStoreConflict, "root was substituted"):
             SystemdTestAttemptManager._prepare_dependency_mountpoints(
-                self.descriptor(*python_bindings),
+                self.descriptor(*self.staged(*python_bindings)),
                 execution_root=attempt_root,
                 owner_gid=os.getegid(),
             )
@@ -355,7 +388,7 @@ class ImmutableDependencyBindingTests(unittest.TestCase):
             binding["toolchain"]["link_target"],
             str(alias / "bin" / "python3.13"),
         )
-        descriptor = self.descriptor(*bindings)
+        descriptor = self.descriptor(*self.staged(*bindings))
         attempt_root = self.base / "python-toolchain-attempt"
         attempt_root.mkdir()
         (attempt_root / "uv.lock").write_text("python-lock\n", encoding="utf-8")
@@ -413,14 +446,18 @@ class ImmutableDependencyBindingTests(unittest.TestCase):
                 "argv": ["npm", "test"],
             }
         )
-        attempt_root = self.base / "private-attempt"
-        attempt_root.mkdir()
+        attempt_root = self.base / "attempts" / "private-attempt"
+        attempt_root.mkdir(parents=True)
         (attempt_root / "uv.lock").write_text("python-lock\n", encoding="utf-8")
         (attempt_root / "ui").mkdir()
         (attempt_root / "ui" / "package-lock.json").write_text(
             '{"lockfileVersion":3}\n', encoding="utf-8"
         )
-        descriptor = self.descriptor(*python_bindings, *node_bindings)
+        source_native = self.original / ".venv-v2/lib/python3.13/site-packages/native.so"
+        source_native.write_bytes(b"native")
+        source_native.chmod(0o400)
+        staged_bindings = self.staged(*python_bindings, *node_bindings)
+        descriptor = self.descriptor(*staged_bindings)
         descriptor = replace(
             descriptor, supplementary_gids=(1003, 1004, 65534)
         )
@@ -440,11 +477,29 @@ class ImmutableDependencyBindingTests(unittest.TestCase):
         self.assertIn(
             "--property=SupplementaryGroups=1003 1004 65534", properties
         )
+        python_staged = Path(str(staged_bindings[0]["staged_root"]))
         self.assertIn(
             "--property=BindReadOnlyPaths="
-            f"{self.original / '.venv-v2'}:{attempt_root / '.venv-v2'}",
+            f"{python_staged}:{attempt_root / '.venv-v2'}",
             properties,
         )
+        staged_native = python_staged / "lib/python3.13/site-packages/native.so"
+        self.assertTrue(stat.S_IMODE(staged_native.stat().st_mode) & stat.S_IRUSR)
+        self.assertEqual(stat.S_IMODE(source_native.stat().st_mode), 0o400)
+        staged_marker = python_staged / "pyvenv.cfg"
+        staged_marker_payload = staged_marker.read_bytes()
+        staged_marker.chmod(0o644)
+        staged_marker.write_text("tampered = true\n", encoding="utf-8")
+        with self.assertRaisesRegex(
+            TestStoreConflict, "staged immutable Python dependency identity differs"
+        ):
+            SystemdTestAttemptManager._systemd_properties(
+                descriptor,
+                execution_root=attempt_root,
+                output_root=self.base / "output",
+            )
+        staged_marker.write_bytes(staged_marker_payload)
+        staged_marker.chmod(0o444)
         self.assertIn(
             "--property=BindReadOnlyPaths="
             f"{self.original / 'ui' / 'node_modules'}:"

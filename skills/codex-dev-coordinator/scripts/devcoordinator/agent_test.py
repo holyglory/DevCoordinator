@@ -251,6 +251,67 @@ def submit_test_plan(
     )
 
 
+def project_queue_status(
+    status: Mapping[str, Any], *, repository_id: str
+) -> dict[str, Any]:
+    """Validate and bound repository queue evidence for agent callers."""
+
+    if status.get("repository_id") != repository_id:
+        raise AgentTestError(
+            "test_reply_invalid", "queue status contradicted repository identity"
+        )
+    result = {
+        "schema_version": 1,
+        "ok": True,
+        "classification": "test_queue_status",
+        "repository_id": repository_id,
+        "sampled_at": status.get("sampled_at"),
+        "phase": bounded_text(status.get("phase", "unknown"), maximum_bytes=64),
+        "global_targets": _small_mapping(status.get("global_targets"), limit=3),
+        "repository_targets": _small_mapping(
+            status.get("repository_targets"), limit=3
+        ),
+        "repository_runnable_targets": status.get("repository_runnable_targets"),
+        "approximate_first_position": status.get("approximate_first_position"),
+        "position_population_truncated": bool(
+            status.get("position_population_truncated")
+        ),
+        "blockers": [
+            {
+                "code": bounded_text(item.get("code", "unknown"), maximum_bytes=64),
+                "target_count": item.get("target_count"),
+            }
+            for item in status.get("blockers", [])[:16]
+            if isinstance(item, Mapping)
+        ],
+        "worker_capacity": {
+            "model": bounded_text(
+                (
+                    status.get("worker_capacity", {}).get("model", "unknown")
+                    if isinstance(status.get("worker_capacity"), Mapping)
+                    else "unknown"
+                ),
+                maximum_bytes=64,
+            ),
+            "limit": (
+                status.get("worker_capacity", {}).get("limit")
+                if isinstance(status.get("worker_capacity"), Mapping)
+                else None
+            ),
+            "available": (
+                status.get("worker_capacity", {}).get("available")
+                if isinstance(status.get("worker_capacity"), Mapping)
+                else None
+            ),
+        },
+    }
+    return require_agent_result(
+        result,
+        surface="test queue status",
+        maximum_bytes=MAX_TEST_RESULT_BYTES,
+    )
+
+
 def _small_mapping(value: object, *, limit: int) -> dict[str, Any]:
     if not isinstance(value, Mapping):
         return {}
@@ -435,6 +496,7 @@ __all__ = [
     "TEST_INTENTS",
     "child_operation_id",
     "enqueue_test",
+    "project_queue_status",
     "project_test_follow",
     "submit_test_plan",
 ]

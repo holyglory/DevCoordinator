@@ -16,6 +16,7 @@ from devcoordinator.agent_test import (
     MAX_TEST_RESULT_BYTES,
     child_operation_id,
     enqueue_test,
+    project_queue_status,
     project_test_follow,
     submit_test_plan,
 )
@@ -90,6 +91,31 @@ class Profile:
 
 
 class AgentTestTests(unittest.TestCase):
+    def test_queue_status_projection_is_bounded_without_run_identity(self) -> None:
+        result = project_queue_status(
+            {
+                "repository_id": "repo-1",
+                "sampled_at": 123.0,
+                "phase": "scheduler",
+                "global_targets": {"queued": 4, "leased": 1, "running": 2},
+                "repository_targets": {"queued": 2, "leased": 0, "running": 0},
+                "repository_runnable_targets": 1,
+                "approximate_first_position": 3,
+                "position_population_truncated": False,
+                "blockers": [{"code": "host_memory", "target_count": 1}],
+                "worker_capacity": {
+                    "model": "dynamic_memory_admission",
+                    "limit": None,
+                    "available": None,
+                },
+            },
+            repository_id="repo-1",
+        )
+
+        self.assertEqual(result["classification"], "test_queue_status")
+        self.assertEqual(result["approximate_first_position"], 3)
+        self.assertNotIn("run_id", result)
+
     def _enqueue(
         self, *, intent: str = "change", account_id: str = "account-tests"
     ):

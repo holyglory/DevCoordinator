@@ -28,6 +28,49 @@ class _Context:
 
 
 class AgentCliTests(unittest.TestCase):
+    def test_enqueue_emits_prompt_replay_safe_progress_before_execution(self) -> None:
+        stdout = mock.Mock()
+        stdout.buffer = io.BytesIO()
+        stdout.flush = mock.Mock()
+        stderr = mock.Mock()
+        stderr.buffer = io.BytesIO()
+        stderr.flush = mock.Mock()
+        operation_id = "00000000-0000-4000-8000-000000000001"
+        with (
+            mock.patch.object(agent_cli.sys, "stdout", stdout),
+            mock.patch.object(agent_cli.sys, "stderr", stderr),
+            mock.patch(
+                "devcoordinator.call_journal.configured_call_journal",
+                return_value=None,
+            ),
+            mock.patch.object(
+                agent_cli,
+                "_execute",
+                return_value={"schema_version": 1, "ok": True},
+            ) as execute,
+        ):
+            returncode = agent_cli.main(
+                [
+                    "test",
+                    "enqueue",
+                    "--intent",
+                    "manual",
+                    "--target",
+                    "web-verify",
+                    "--operation-id",
+                    operation_id,
+                ]
+            )
+
+        self.assertEqual(returncode, 0)
+        execute.assert_called_once()
+        progress = json.loads(stderr.buffer.getvalue())
+        self.assertEqual(progress["classification"], "test_enqueue_started")
+        self.assertEqual(progress["status"], "snapshot_planning")
+        self.assertEqual(progress["operation_id"], operation_id)
+        self.assertIn(operation_id, progress["replay_command"])
+        self.assertIn("queue-status", progress["queue_status_command"])
+
     def test_repository_context_uses_authority_published_immutable_route(self) -> None:
         namespace = mock.Mock(project="/snapshots/snapshot-a/root/subdirectory")
         binding = mock.Mock(original_root="/source/repository")
@@ -850,6 +893,7 @@ class AgentCliTests(unittest.TestCase):
                 "enqueue",
                 "failures",
                 "follow",
+                "queue-status",
                 "retry",
                 "status",
                 "submit",
