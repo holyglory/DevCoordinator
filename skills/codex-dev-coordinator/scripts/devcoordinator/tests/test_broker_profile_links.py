@@ -2488,12 +2488,21 @@ class BrokerProfileTrustTests(unittest.TestCase):
         )
         cases = (
             (BrokerOperation.DOCKER_STOP, 10.0),
-            (BrokerOperation.RUNTIME_REQUEST, 60.0),
+            (BrokerOperation.RUNTIME_REQUEST, 5 * 60.0),
             (BrokerOperation.COMPOSE_UP, 5 * 60.0),
             (
                 BrokerOperation.INVENTORY_READ,
                 broker_profile_module.INVENTORY_READ_CLIENT_TIMEOUT_SECONDS,
             ),
+            (
+                BrokerOperation.TEST_REPOSITORY_CATALOG,
+                broker_profile_module.TEST_CATALOG_READ_CLIENT_TIMEOUT_SECONDS,
+            ),
+            (
+                BrokerOperation.TEST_REPOSITORY_SETUP,
+                broker_profile_module.TEST_SETUP_READ_CLIENT_TIMEOUT_SECONDS,
+            ),
+            (BrokerOperation.TEST_RUN_SUBMIT, 60.0),
             (BrokerOperation.REPOSITORY_REMOVE, 60.0),
             (
                 BrokerOperation.HOST_OBSERVE,
@@ -2528,7 +2537,13 @@ class BrokerProfileTrustTests(unittest.TestCase):
                         ),
                         operation=operation,
                         arguments=(
-                            {"database_name": "app"}
+                            {
+                                "plan_id": "plan-" + "a" * 32,
+                                "expected_repository_id": REPO_ID,
+                                "actor": "timeout-test",
+                            }
+                            if operation == BrokerOperation.TEST_RUN_SUBMIT
+                            else {"database_name": "app"}
                             if operation == BrokerOperation.DATABASE_BACKUP
                             else (
                                 {

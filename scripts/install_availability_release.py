@@ -474,6 +474,7 @@ AGENT_CLIENT_RUNTIME_PATHS = (
     "skills/codex-dev-coordinator/scripts/devcoordinator/agent_projection.py",
     "skills/codex-dev-coordinator/scripts/devcoordinator/agent_test.py",
     "skills/codex-dev-coordinator/scripts/devcoordinator/capabilities.py",
+    "skills/codex-dev-coordinator/scripts/devcoordinator/efficiency_registry.py",
     "skills/codex-dev-coordinator/scripts/devcoordinator/call_journal.py",
     "skills/codex-dev-coordinator/scripts/devcoordinator/bug_registry.py",
     "skills/codex-dev-coordinator/scripts/devcoordinator/repository_context.py",
@@ -504,6 +505,7 @@ AGENT_NARROW_IMPORT_MODULES = (
     "agent_test",
     "capabilities",
     "call_journal",
+    "efficiency_registry",
     "bug_registry",
     "runtime_ensure",
 )

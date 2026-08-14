@@ -81,6 +81,7 @@ export function createConsoleApi({
   config, log, coordinator, routeStore, upstreamAuthStore, accessStore, guard, certManager, metrics, prefs,
   telegram = null,
   bugStore = null,
+  efficiencyStore = null,
   edgePublication = null,
 }) {
   const clog = typeof log?.child === 'function' ? log.child({ mod: 'api' }) : log;
@@ -2300,6 +2301,29 @@ export function createConsoleApi({
         return sendJson(res, 200, await bugStore.close(safeDecode(bugMatch[1])));
       }
 
+      if (method === 'GET' && pathname === '/api/efficiency') {
+        if (!efficiencyStore) {
+          return sendJson(res, 200, { schema_version: 1, available: false, repositories: [] });
+        }
+        const projection = await efficiencyStore.list();
+        if (!projection.available) return sendJson(res, 200, projection);
+        let names = new Map();
+        try {
+          const inventory = await coordinator.inventory({ maxAgeMs: 5000 });
+          names = new Map((inventory?.repositories || []).map((repository) => [
+            repository?.repo_id,
+            repository?.display_name || repository?.name || repository?.repo_id,
+          ]));
+        } catch { /* retained efficiency projection remains independently readable */ }
+        return sendJson(res, 200, {
+          ...projection,
+          repositories: projection.repositories.map((repository) => ({
+            ...repository,
+            display_name: names.get(repository.repository_id) || 'Repository unavailable',
+          })),
+        });
+      }
+
       if (method === 'GET' && pathname === '/api/overview') {
         return await handleOverview(res, { fresh: searchParams.get('fresh') === '1' });
       }
@@ -2574,6 +2598,7 @@ export function createConsoleApi({
           exp: session.exp ?? null,
           accessAdmin: accessStore.isAdmin(session.email),
           lifecycleAvailable: config.lifecycleEnabled === true,
+          efficiencyAvailable: efficiencyStore !== null,
         });
       }
       if (method === 'GET' && pathname === '/api/access') {

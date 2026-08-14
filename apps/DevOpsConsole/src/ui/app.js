@@ -1,6 +1,6 @@
 /* DevOps Console control panel.
  * Vanilla JS, no dependencies. Talks only to same-origin /api/*.
- * Hash-routed pages (#/projects, #/tests, #/bugs, #/servers, #/routes, #/docker, #/ports,
+ * Hash-routed pages (#/projects, #/tests, #/efficiency, #/bugs, #/servers, #/routes, #/docker, #/ports,
  * #/performance, #/access, #/invites, #/telegram)
  * share one sticky status bar. Polls GET /api/overview every 6s and
  * GET /api/metrics/history every 10s (both paused while the tab is hidden),
@@ -38,6 +38,9 @@
     bugsLoading: false,
     bugsClosing: new Set(),
     bugsTransferBusy: false,
+    efficiency: null,    // independent optional delivery-efficiency projection
+    efficiencyError: null,
+    efficiencyLoading: false,
     archives: null,      // owner-only GET /api/lifecycle/list ({ archives })
     tests: null,         // selected repository's Coordinator-owned test statistics
     testsFleet: null,    // retained fleet-wide test projection
@@ -107,6 +110,8 @@
     lifecycleFocus: null,  // target revealed after a successful archive/restore/purge
     bugFocusAfterClose: null, // logical row to focus after an exact report disappears
     bugTransferReturnFocus: null,
+    efficiencyRepositoryId: null,
+    efficiencyReturnFocus: null,
     version: 0,            // bumped on any ui-state change to invalidate sigs
   };
   const bump = () => { ui.version += 1; };
@@ -198,6 +203,11 @@
     if (seconds < 60) return `${seconds.toFixed(seconds < 10 ? 2 : 1)} s`;
     const minutes = Math.floor(seconds / 60);
     return `${minutes}m ${Math.round(seconds % 60)}s`;
+  }
+
+  function fmtIntegerString(value) {
+    if (typeof value !== 'string' || !/^(0|[1-9][0-9]*)$/.test(value)) return 'Unknown';
+    try { return BigInt(value).toLocaleString(); } catch { return 'Unknown'; }
   }
 
   // Accepts an ISO string, epoch-ms number, or epoch-seconds float.
@@ -629,6 +639,7 @@
   const PAGES = [
     { id: 'projects', title: 'Projects' },
     { id: 'tests', title: 'Tests' },
+    { id: 'efficiency', title: 'Efficiency' },
     { id: 'bugs', title: 'Bugs' },
     { id: 'servers', title: 'Servers' },
     { id: 'routes', title: 'Routes' },
@@ -644,6 +655,7 @@
     const m = /^#\/([a-z-]+)/.exec(location.hash || '');
     const id = m ? m[1] : '';
     if (!PAGES.some((p) => p.id === id)) return 'projects';
+    if (id === 'efficiency' && state.efficiency?.available === false) return 'projects';
     if ((id === 'access' || id === 'invites') && state.session?.accessAdmin !== true) return 'projects';
     return id;
   }
@@ -664,6 +676,9 @@
       clearBanner('overview');
     }
     if (page !== 'tests' && $('#test-detail-dialog')?.open) closeTestDetail();
+    if (page !== 'efficiency' && $('#efficiency-detail-dialog')?.open) {
+      closeEfficiencyDetail({ restoreFocus: false });
+    }
     if (page !== 'bugs') {
       closeBugTransfer('export', { restoreFocus: false });
       closeBugTransfer('import', { restoreFocus: false });
@@ -684,7 +699,7 @@
     // Hash navigation changes which dynamic body is allowed to stay mounted.
     // Rebuild immediately from the latest overview instead of waiting for the
     // next six-second poll.
-    if (state.overview || page === 'bugs') renderAll(true);
+    if (state.overview || page === 'bugs' || page === 'efficiency') renderAll(true);
     // The performance page charts use a longer history window than sparklines.
     if (page === 'performance') refreshMetrics();
     if (page === 'tests') {
@@ -692,6 +707,7 @@
       loadTests({ force: true });
     }
     if (page === 'bugs') loadBugs();
+    if (page === 'efficiency') loadEfficiency();
     if (page === 'access' && state.session?.accessAdmin === true) loadAccess();
     if (page === 'invites' && state.session?.accessAdmin === true) loadInvites();
     if (page === 'telegram' && state.session?.email) loadTelegram();
@@ -716,6 +732,13 @@
     });
     $('#tests-run').addEventListener('click', () => openTestRunDialog());
     $('#bugs-refresh').addEventListener('click', () => loadBugs({ force: true }));
+    $('#efficiency-refresh').addEventListener('click', () => loadEfficiency({ force: true }));
+    $('#efficiency-detail-close').append(icon('x'));
+    $('#efficiency-detail-close').addEventListener('click', () => closeEfficiencyDetail());
+    $('#efficiency-detail-dialog').addEventListener('cancel', (event) => {
+      event.preventDefault();
+      closeEfficiencyDetail();
+    });
     $('#bugs-export').addEventListener('click', openBugExport);
     $('#bugs-import').addEventListener('click', openBugImport);
     $('#bugs-export-close').append(icon('x'));
@@ -820,6 +843,179 @@
   }
 
   // ---------------------------------------------------------------- open Coordinator bugs
+
+  function efficiencyAvailable() {
+    return state.efficiency?.available === true;
+  }
+
+  function syncEfficiencyVisibility() {
+    const available = efficiencyAvailable();
+    $('#nav-efficiency').hidden = !available;
+    if (!available && /^#\/efficiency(?:$|[/?])/.test(location.hash || '')) {
+      location.hash = '#/projects';
+    }
+  }
+
+  async function loadEfficiency({ force = false } = {}) {
+    if (state.efficiencyLoading && !force) return;
+    state.efficiencyLoading = true;
+    if (currentPage() === 'efficiency') renderEfficiency(true);
+    try {
+      const payload = await api('/api/efficiency');
+      if (!payload || payload.schema_version !== 1 || typeof payload.available !== 'boolean'
+        || !Array.isArray(payload.repositories)) {
+        throw new ApiError('Efficiency response is invalid', 502);
+      }
+      state.efficiency = payload;
+      state.efficiencyError = null;
+      syncEfficiencyVisibility();
+      if (currentPage() === 'efficiency') renderEfficiency(true);
+    } catch (error) {
+      state.efficiencyError = error;
+      if (!state.efficiency) syncEfficiencyVisibility();
+      if (currentPage() === 'efficiency') renderEfficiency(true);
+    } finally {
+      state.efficiencyLoading = false;
+      if (currentPage() === 'efficiency') renderEfficiency(true);
+    }
+  }
+
+  function efficiencyKnown(counter) {
+    return counter?.known_sum === null || counter?.known_sum === undefined
+      ? 'Unknown' : fmtIntegerString(counter.known_sum);
+  }
+
+  function efficiencyCoverage(counter) {
+    if (!counter || counter.coverage === 'unknown') return 'No measured tasks';
+    return `${counter.known_task_count} of ${counter.task_count} tasks measured`;
+  }
+
+  function efficiencyPhaseCoverage(repository) {
+    const phases = repository?.tokens_by_phase || {};
+    const total = Object.values(phases).reduce(
+      (sum, phase) => sum + (Number(phase?.usage_event_count) || 0), 0);
+    const unattributed = Number(phases.unattributed?.usage_event_count) || 0;
+    if (total === 0) return 'Unknown';
+    const attributed = Math.max(0, total - unattributed);
+    return `${Math.round((attributed / total) * 100)}% (${attributed}/${total})`;
+  }
+
+  function efficiencyRepository(repository) {
+    return state.efficiency?.repositories?.find(
+      (item) => item.repository_id === repository.repository_id) || repository;
+  }
+
+  function buildEfficiencyRepositories() {
+    if (state.efficiencyLoading && !state.efficiency) {
+      return [h('div', { class: 'skel', 'aria-hidden': 'true' }), h('div', { class: 'skel', 'aria-hidden': 'true' })];
+    }
+    if (state.efficiencyError && !state.efficiency) {
+      return [emptyState(`Efficiency statistics are unavailable: ${state.efficiencyError.message}`)];
+    }
+    const repositories = state.efficiency?.repositories || [];
+    if (!repositories.length) return [emptyState('No recorded repository tasks yet.')];
+    const rows = [h('div', { class: 'grid-head efficiency-grid', 'aria-hidden': 'true' },
+      h('span', null, 'Repository'), h('span', null, 'Tasks'), h('span', null, 'Accounts'),
+      h('span', null, 'Input'), h('span', null, 'Output'), h('span', null, 'Phase attribution'))];
+    for (const repository of repositories) {
+      const name = repository.display_name || 'Repository unavailable';
+      const button = h('button', {
+        class: 'row efficiency-grid efficiency-row', type: 'button',
+        'aria-label': `View efficiency details for ${name}`,
+        onclick: (event) => openEfficiencyDetail(repository.repository_id, event.currentTarget),
+      },
+      h('span', { class: 'cell efficiency-name', 'data-label': 'Repository' }, name),
+      h('span', { class: 'cell', 'data-label': 'Tasks' }, String(repository.task_count)),
+      h('span', { class: 'cell', 'data-label': 'Accounts' }, String(repository.accounts?.length || 0)),
+      h('span', { class: 'cell', 'data-label': 'Input' }, efficiencyKnown(repository.tokens?.input)),
+      h('span', { class: 'cell', 'data-label': 'Output' }, efficiencyKnown(repository.tokens?.output)),
+      h('span', { class: 'cell', 'data-label': 'Phase attribution' }, efficiencyPhaseCoverage(repository)));
+      rows.push(h('div', { class: 'item' }, button));
+    }
+    return rows;
+  }
+
+  function renderEfficiency(force = false) {
+    setSection('efficiency-body', sig(state.efficiency, state.efficiencyError?.message, state.efficiencyLoading),
+      buildEfficiencyRepositories, force);
+    const count = efficiencyAvailable() ? state.efficiency.repositories.length : null;
+    setCount('efficiency-count', count);
+    setNavCount('efficiency', count);
+    if ($('#efficiency-detail-dialog')?.open) renderEfficiencyDetail();
+  }
+
+  function openEfficiencyDetail(repositoryId, trigger) {
+    ui.efficiencyRepositoryId = repositoryId;
+    ui.efficiencyReturnFocus = trigger;
+    renderEfficiencyDetail();
+    $('#efficiency-detail-dialog').showModal();
+  }
+
+  function closeEfficiencyDetail({ restoreFocus = true } = {}) {
+    const dialog = $('#efficiency-detail-dialog');
+    if (dialog.open) dialog.close();
+    const target = ui.efficiencyReturnFocus;
+    ui.efficiencyRepositoryId = null;
+    ui.efficiencyReturnFocus = null;
+    if (restoreFocus && target?.isConnected) target.focus({ preventScroll: true });
+  }
+
+  function efficiencyTokenRows(tokens) {
+    const labels = {
+      input: 'Input', cached_input: 'Cached input', output: 'Output',
+      reasoning_output: 'Reasoning output', tool: 'Tool', other: 'Other',
+    };
+    return Object.entries(labels).map(([key, label]) => h('div', { class: 'efficiency-detail-row' },
+      h('span', null, label), h('strong', null, efficiencyKnown(tokens?.[key])),
+      h('span', { class: 'meta-passive' }, efficiencyCoverage(tokens?.[key]))));
+  }
+
+  function renderEfficiencyDetail() {
+    const repository = state.efficiency?.repositories?.find(
+      (item) => item.repository_id === ui.efficiencyRepositoryId);
+    if (!repository) {
+      closeEfficiencyDetail({ restoreFocus: false });
+      return;
+    }
+    $('#efficiency-detail-h').textContent = repository.display_name || 'Repository efficiency';
+    const body = $('#efficiency-detail-body');
+    const phaseLabels = {
+      planning: 'Planning', implementation: 'Implementation', testing: 'Testing',
+      deployment: 'Deployment', reporting: 'Reporting', unattributed: 'Unattributed',
+    };
+    const phaseRows = Object.entries(phaseLabels).map(([key, label]) => {
+      const phase = repository.tokens_by_phase?.[key];
+      return h('div', { class: 'efficiency-phase-row' }, h('strong', null, label),
+        h('span', null, efficiencyKnown(phase?.input)),
+        h('span', null, efficiencyKnown(phase?.output)),
+        h('span', null, String(phase?.usage_event_count || 0)));
+    });
+    const accounts = (repository.accounts || []).map((account, index) => h('div', { class: 'efficiency-account-row' },
+      h('strong', null, `Account ${index + 1}`),
+      h('span', null, `${account.task_count} task${account.task_count === 1 ? '' : 's'}`),
+      h('span', null, `Input ${efficiencyKnown(account.tokens?.input)}`),
+      h('span', null, `Output ${efficiencyKnown(account.tokens?.output)}`)));
+    const opportunities = (repository.automation_opportunities || []).map((item) => h('li', null,
+      h('strong', null, `${item.task_type} · ${item.scope_size} · ${item.current_method}`),
+      h('span', null, `${item.occurrence_count} comparable tasks. ${item.recommendation}.`)));
+    body.replaceChildren(
+      h('div', { class: 'efficiency-summary' },
+        kv('Tasks', String(repository.task_count)),
+        kv('Completed', String(repository.complete_task_count)),
+        kv('Accounts', String(repository.accounts?.length || 0)),
+        kv('Phase attribution', efficiencyPhaseCoverage(repository))),
+      h('section', { class: 'efficiency-detail-section' }, h('h3', null, 'Provider token categories'),
+        ...efficiencyTokenRows(repository.tokens)),
+      h('section', { class: 'efficiency-detail-section' }, h('h3', null, 'Tokens by phase'),
+        h('div', { class: 'efficiency-phase-head', 'aria-hidden': 'true' },
+          h('span', null, 'Phase'), h('span', null, 'Input'), h('span', null, 'Output'), h('span', null, 'Events')),
+        ...phaseRows),
+      h('section', { class: 'efficiency-detail-section' }, h('h3', null, 'Accounts'),
+        ...(accounts.length ? accounts : [emptyState('No account projections.')])),
+      h('section', { class: 'efficiency-detail-section' }, h('h3', null, 'Automation candidates'),
+        opportunities.length ? h('ul', { class: 'efficiency-opportunities' }, ...opportunities)
+          : emptyState('No repeated deterministic-workflow candidate has reached the evidence threshold.')));
+  }
 
   function validBugsPayload(payload) {
     if (!payload || payload.schema_version !== 1 || !Array.isArray(payload.bugs)) return false;
@@ -6018,6 +6214,7 @@
   const SECTION_BODY_PAGES = Object.freeze({
     'projects-body': 'projects',
     'tests-body': 'tests',
+    'efficiency-body': 'efficiency',
     'bugs-body': 'bugs',
     'routes-body': 'routes',
     'servers-body': 'servers',
@@ -6047,6 +6244,11 @@
     if (page === 'bugs') {
       if (o) renderHeader();
       renderBugs(force);
+      return;
+    }
+    if (page === 'efficiency') {
+      if (o) renderHeader();
+      renderEfficiency(force);
       return;
     }
     if (!o) {
@@ -10875,6 +11077,7 @@
           loadTelegram({ force: true });
         }
         loadBugs({ force: true });
+        if (efficiencyAvailable()) loadEfficiency({ force: true });
       }
     }, POLL_MS);
     setInterval(() => {
@@ -10885,6 +11088,12 @@
     window.addEventListener('online', refreshTestsInPlace);
     window.addEventListener('focus', () => loadBugs({ force: true }));
     window.addEventListener('online', () => loadBugs({ force: true }));
+    window.addEventListener('focus', () => {
+      if (currentPage() === 'efficiency') loadEfficiency({ force: true });
+    });
+    window.addEventListener('online', () => {
+      if (currentPage() === 'efficiency') loadEfficiency({ force: true });
+    });
     document.addEventListener('visibilitychange', () => {
       if (!document.hidden) {
         refreshOverview();
@@ -10896,6 +11105,7 @@
         if (state.session?.accessAdmin === true) loadInvites({ force: true });
         if (state.session?.email) loadTelegram({ force: true });
         loadBugs({ force: true });
+        if (efficiencyAvailable()) loadEfficiency({ force: true });
         if (lifecycleAvailable()) loadArchives({ force: true });
       }
     });
@@ -10942,6 +11152,7 @@
         if (lifecycleAvailable()) {
           loadArchives();
         }
+        if (s.efficiencyAvailable === true) loadEfficiency();
         loadTelegram();
       })
       .catch((err) => {
@@ -10958,6 +11169,7 @@
             if (lifecycleAvailable()) {
               loadArchives();
             }
+            if (s.efficiencyAvailable === true) loadEfficiency();
             loadTelegram();
           }).catch(() => {}));
         }

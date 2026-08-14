@@ -31,6 +31,43 @@ def parser() -> argparse.ArgumentParser:
 
 
 class LifecycleParserContractTests(unittest.TestCase):
+    def test_legacy_absolute_project_route_does_not_require_local_stat(self) -> None:
+        route = Path("/another-account/private/repository")
+        dev_coordinator._PROJECT_ROOT_CACHE.pop(str(route), None)
+        with (
+            mock.patch.object(Path, "resolve", return_value=route),
+            mock.patch.object(
+                dev_coordinator,
+                "resolve_immutable_repository_binding",
+                return_value=None,
+            ),
+            mock.patch.object(
+                Path,
+                "is_dir",
+                side_effect=PermissionError(13, "permission denied"),
+            ),
+        ):
+            self.assertEqual(
+                dev_coordinator.canonical_project(str(route), refresh=True),
+                str(route),
+            )
+
+    def test_legacy_project_resolution_uses_immutable_snapshot_route(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            snapshot = Path(raw) / "snapshot" / "root"
+            snapshot.mkdir(parents=True)
+            binding = mock.Mock(original_root="/source/repository")
+            with mock.patch.object(
+                dev_coordinator,
+                "resolve_immutable_repository_binding",
+                return_value=binding,
+            ) as resolve_binding:
+                self.assertEqual(
+                    dev_coordinator.canonical_project(str(snapshot), refresh=True),
+                    "/source/repository",
+                )
+            resolve_binding.assert_called_once_with(snapshot.resolve())
+
     def test_services_only_runtime_cannot_resurrect_discovered_legacy_compose(
         self,
     ) -> None:
@@ -1267,6 +1304,32 @@ class LifecycleParserContractTests(unittest.TestCase):
         ):
             dev_coordinator.handle_cli(args)
 
+    def test_legacy_inventory_cli_projects_current_graph_through_v2_envelope(self) -> None:
+        args = dev_coordinator.build_parser().parse_args(
+            ["inventory", "--project", "/repository", "--compact-json"]
+        )
+        current = {
+            "schema_version": dev_coordinator.INVENTORY_SCHEMA_VERSION,
+            "repositories": [{"repo_id": "repo-alpha"}],
+            "v1_compatibility": {"servers": []},
+        }
+        with mock.patch.object(
+            dev_coordinator,
+            "coordinated_build_inventory",
+            return_value=current,
+        ) as inventory:
+            result = dev_coordinator.handle_cli(args)
+
+        self.assertEqual(result["schema_version"], 2)
+        self.assertEqual(result["repositories"], [{"repo_id": "repo-alpha"}])
+        self.assertEqual(result["v1_compatibility"], {"servers": []})
+        inventory.assert_called_once_with(
+            project="/repository",
+            include_docker=True,
+            backup_dirs=None,
+            stats_history_limit=dev_coordinator.DOCKER_STATS_HISTORY_LIMIT,
+        )
+
     def test_production_cli_registers_lifecycle_and_broker_dispatch_groups(
         self,
     ) -> None:
@@ -2132,8 +2195,8 @@ class BrokerCLIContractTests(unittest.TestCase):
                 self.fenced = False
                 self.begin_shutdown_calls = 0
 
-            def reconcile_workers_on_startup(self) -> dict[str, object]:
-                events.append("workers-reconciled")
+            def fence_workers_on_startup(self) -> dict[str, object]:
+                events.append("workers-fenced")
                 return {
                     "ok": True,
                     "supervisor_epoch": "epoch-a",
@@ -2190,7 +2253,7 @@ class BrokerCLIContractTests(unittest.TestCase):
         self.assertEqual(
             events,
             [
-                "workers-reconciled",
+                "workers-fenced",
                 "server-started",
                 "mutation-fenced",
                 "runtime-closed",
@@ -2225,8 +2288,8 @@ class BrokerCLIContractTests(unittest.TestCase):
                 self.backend = mock.Mock()
                 self.begin_shutdown_calls = 0
 
-            def reconcile_workers_on_startup(self) -> dict[str, object]:
-                events.append("workers-reconciled")
+            def fence_workers_on_startup(self) -> dict[str, object]:
+                events.append("workers-fenced")
                 return {
                     "ok": True,
                     "supervisor_epoch": "epoch-a",
@@ -2310,11 +2373,106 @@ class BrokerCLIContractTests(unittest.TestCase):
         self.assertEqual(
             events,
             [
-                "workers-reconciled",
+                "workers-fenced",
                 "server-started",
                 "mutation-fenced",
                 "drain-started",
                 "drain-finished",
+            ],
+        )
+
+    def test_worker_autostart_begins_only_after_server_admission(self) -> None:
+        events: list[str] = []
+        handlers: dict[int, object] = {}
+
+        class FakeServer:
+            @staticmethod
+            def start() -> None:
+                events.append("server-started")
+
+        class FakeRuntime:
+            def __init__(self) -> None:
+                self.server = FakeServer()
+                self.persistence = mock.Mock()
+                self.backend = mock.Mock()
+
+            @staticmethod
+            def fence_workers_on_startup() -> dict[str, object]:
+                events.append("workers-fenced")
+                return {
+                    "ok": True,
+                    "supervisor_epoch": "epoch-after-admission",
+                    "fenced_old_runners": ["worker-old"],
+                    "started": [],
+                    "errors": [],
+                }
+
+            @staticmethod
+            def autostart_workers_after_admission(
+                *, fenced: object
+            ) -> dict[str, object]:
+                if events != ["workers-fenced", "server-started"]:
+                    raise AssertionError("worker autostart ran before broker admission")
+                events.append("workers-autostarted")
+                handlers[broker_cli_module.signal.SIGTERM](
+                    broker_cli_module.signal.SIGTERM, None
+                )
+                return {
+                    **dict(fenced),
+                    "started": [{"worker_id": "worker-old"}],
+                }
+
+            @staticmethod
+            def begin_shutdown() -> int:
+                events.append("mutation-fenced")
+                return 1
+
+            @staticmethod
+            def close() -> None:
+                events.append("runtime-closed")
+
+        def install_handler(signum: int, handler: object) -> None:
+            handlers[signum] = handler
+
+        temporary = tempfile.TemporaryDirectory(
+            prefix="devcoordinator-broker-worker-order-"
+        )
+        self.addCleanup(temporary.cleanup)
+        args = argparse.Namespace(
+            access_group=None,
+            database=str(Path(temporary.name) / "coordinator.sqlite3"),
+            socket="/run/devcoordinator-authority.sock",
+            max_clients=4,
+        )
+        runtime = FakeRuntime()
+        with (
+            mock.patch.object(
+                broker_cli_module,
+                "build_store_backed_broker_runtime",
+                return_value=runtime,
+            ),
+            mock.patch.object(
+                broker_cli_module.signal,
+                "getsignal",
+                return_value=broker_cli_module.signal.SIG_DFL,
+            ),
+            mock.patch.object(
+                broker_cli_module.signal,
+                "signal",
+                side_effect=install_handler,
+            ),
+            mock.patch("builtins.print"),
+        ):
+            serve_broker(args, host_mutations_factory=mock.Mock)
+
+        self.assertEqual(
+            events,
+            [
+                "workers-fenced",
+                "server-started",
+                "workers-autostarted",
+                "mutation-fenced",
+                "runtime-closed",
             ],
         )
 
@@ -2368,7 +2526,7 @@ class BrokerCLIContractTests(unittest.TestCase):
                     self.begin_shutdown_calls = 0
 
                 @staticmethod
-                def reconcile_workers_on_startup() -> dict[str, object]:
+                def fence_workers_on_startup() -> dict[str, object]:
                     return {
                         "ok": True,
                         "supervisor_epoch": "socket-reclaim-test",
@@ -2465,7 +2623,7 @@ class BrokerCLIContractTests(unittest.TestCase):
                         self.backend = mock.Mock()
 
                     @staticmethod
-                    def reconcile_workers_on_startup() -> dict[str, object]:
+                    def fence_workers_on_startup() -> dict[str, object]:
                         return {
                             "ok": True,
                             "supervisor_epoch": "socket-guard-test",

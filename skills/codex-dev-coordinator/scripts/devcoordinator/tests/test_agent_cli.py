@@ -28,6 +28,38 @@ class _Context:
 
 
 class AgentCliTests(unittest.TestCase):
+    def test_repository_context_uses_authority_published_immutable_route(self) -> None:
+        namespace = mock.Mock(project="/snapshots/snapshot-a/root/subdirectory")
+        binding = mock.Mock(original_root="/source/repository")
+        context = _Context()
+        context.root = _Scope("/source/repository")
+        context.effective = context.root
+
+        with (
+            mock.patch(
+                "devcoordinator.universal_test_repository_binding."
+                "resolve_immutable_repository_binding",
+                return_value=binding,
+            ) as resolve_binding,
+            mock.patch(
+                "devcoordinator.universal_test_repository_binding."
+                "immutable_repository_route_context",
+                return_value=context,
+            ) as route_context,
+            mock.patch(
+                "devcoordinator.repository_context.resolve_effective_repository_context"
+            ) as git_context,
+        ):
+            resolved = agent_cli._repository_context(namespace)
+
+        self.assertIs(resolved, context)
+        self.assertEqual(namespace._resolved_project, "/source/repository")
+        resolve_binding.assert_called_once_with(
+            "/snapshots/snapshot-a/root/subdirectory"
+        )
+        route_context.assert_called_once_with(binding)
+        git_context.assert_not_called()
+
     @staticmethod
     def _main_failure(argv: list[str]) -> dict[str, object]:
         stream = mock.Mock()
@@ -105,14 +137,15 @@ class AgentCliTests(unittest.TestCase):
         with (
             mock.patch.object(agent_cli.os, "getcwd", return_value="/unrelated/cwd"),
             mock.patch(
-                "devcoordinator.repository_context.resolve_effective_repository_context",
+                "devcoordinator.universal_test_repository_binding."
+                "repository_route_context",
                 return_value=_Context(),
             ) as resolve,
         ):
             context = agent_cli._repository_context(namespace)
 
         self.assertIs(context, resolve.return_value)
-        resolve.assert_called_once_with(project="/canonical/repo")
+        resolve.assert_called_once_with("/canonical/repo")
 
     def test_retired_global_context_and_attribution_inputs_are_rejected(self) -> None:
         cases = (
@@ -274,6 +307,23 @@ class AgentCliTests(unittest.TestCase):
                         "reclaimable_bytes": 999,
                     },
                 ],
+                "containers": [
+                    {
+                        "docker_resource_id": "container-stopped-repo-1",
+                        "project_ids": ["repo-1"],
+                        "running": False,
+                    },
+                    {
+                        "docker_resource_id": "container-running-repo-1",
+                        "project_ids": ["repo-1"],
+                        "running": True,
+                    },
+                    {
+                        "docker_resource_id": "container-stopped-repo-2",
+                        "project_ids": ["repo-2"],
+                        "running": False,
+                    },
+                ],
             }
         }
 
@@ -287,6 +337,10 @@ class AgentCliTests(unittest.TestCase):
         self.assertEqual(result["repository"]["repo_id"], "repo-1")
         self.assertEqual(result["cleanup_plan_count"], 1)
         self.assertEqual(result["cleanup_plans"][0]["target_id"], "container-1")
+        self.assertEqual(result["stopped_container_count"], 1)
+        self.assertEqual(
+            result["stopped_containers"], [{"id": "container-stopped-repo-1"}]
+        )
 
     def test_storage_remove_deletes_one_selected_container_without_plan(self) -> None:
         from devcoordinator.broker import BrokerOperation
@@ -1073,9 +1127,6 @@ class AgentCliTests(unittest.TestCase):
             "ok": True,
             "operation_id": operation_id,
         }
-        missing = agent_cli.AgentCliError(
-            "target_not_found", "no observed target"
-        )
         namespace = agent_cli._parser().parse_args(
             [
                 "runtime",
@@ -1098,8 +1149,8 @@ class AgentCliTests(unittest.TestCase):
             mock.patch.object(
                 agent_cli,
                 "_runtime_target",
-                side_effect=[missing, {"id": "database-1", "kind": "database_stack"}],
-            ),
+                return_value={"id": "database-1", "kind": "database_stack"},
+            ) as runtime_target,
         ):
             result = agent_cli._runtime(
                 namespace,
@@ -1115,6 +1166,13 @@ class AgentCliTests(unittest.TestCase):
             operation=mock.ANY,
             arguments={},
             operation_id=child_operation_id,
+        )
+        runtime_target.assert_called_once_with(
+            profile=profile,
+            context=mock.ANY,
+            selector="postgres",
+            kind=None,
+            prefer_ready=True,
         )
         profile.runtime_ensure.assert_called_once_with(
             repository=repository,
@@ -1158,9 +1216,6 @@ class AgentCliTests(unittest.TestCase):
             "ok": True,
             "operation_id": operation_id,
         }
-        missing = agent_cli.AgentCliError(
-            "target_not_found", "no observed target"
-        )
         namespace = agent_cli._parser().parse_args(
             [
                 "runtime",
@@ -1181,10 +1236,7 @@ class AgentCliTests(unittest.TestCase):
             mock.patch.object(
                 agent_cli,
                 "_runtime_target",
-                side_effect=[
-                    missing,
-                    {"id": "database-1", "kind": "database_stack"},
-                ],
+                return_value={"id": "database-1", "kind": "database_stack"},
             ),
         ):
             result = agent_cli._runtime(

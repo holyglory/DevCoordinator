@@ -76,6 +76,20 @@ class AgentProjectionTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, "target_ambiguous")
         self.assertEqual(len(raised.exception.candidates), 2)
 
+    def test_compose_bootstrap_can_prefer_one_ready_duplicate(self) -> None:
+        value = inventory()
+        value["resources"]["servers"][1]["name"] = "web"
+
+        result = project_targets(
+            value,
+            effective_root="/repo",
+            selector="web",
+            prefer_ready=True,
+        )
+
+        self.assertEqual(result["selected"]["id"], "service-1")
+        self.assertTrue(result["selected"]["ready"])
+
     def test_missing_scope_or_resource_fails_closed(self) -> None:
         with self.assertRaises(AgentProjectionError):
             project_targets(inventory(), effective_root="/other")
@@ -110,6 +124,110 @@ class AgentProjectionTests(unittest.TestCase):
             projected, separators=(",", ":"), sort_keys=True
         ).encode()
         self.assertLessEqual(len(encoded), MAX_STATUS_RESULT_BYTES)
+
+    def test_runtime_projection_prefers_exact_supervisor_state_and_readiness(self) -> None:
+        projected = project_runtime_report(
+            {
+                "ok": True,
+                "action": "status",
+                "classification": "ready",
+                "ready": True,
+                "target": {"kind": "service", "id": "service-1"},
+                "result": {
+                    "operation_id": "00000000-0000-4000-8000-000000000001",
+                    "authority": "broker_service_supervisor",
+                    "state": "running",
+                    "ready": True,
+                    "supervision_ready": True,
+                    "endpoint_ready": True,
+                    "supervision": {
+                        "keep_alive": True,
+                        "desired_state": "running",
+                        "breaker_state": "armed",
+                        "supervisor_state": "running",
+                        "current_attempt_id": "attempt-1",
+                        "last_error_code": None,
+                        "private_field": "omitted",
+                    },
+                },
+                "resources": [
+                    {
+                        "kind": "service",
+                        "id": "service-1",
+                        "name": "web",
+                        "state": "stopped",
+                        "ready": False,
+                        "repo_id": "repo-1",
+                    }
+                ],
+            }
+        )
+
+        self.assertEqual(projected["resource"]["state"], "running")
+        self.assertTrue(projected["resource"]["ready"])
+        self.assertTrue(projected["supervision_ready"])
+        self.assertTrue(projected["endpoint_ready"])
+        self.assertEqual(projected["supervision"]["desired_state"], "running")
+        self.assertNotIn("private_field", projected["supervision"])
+
+    def test_runtime_projection_uses_action_result_readiness(self) -> None:
+        projected = project_runtime_report(
+            {
+                "ok": True,
+                "action": "restart",
+                "classification": "ready",
+                "target": {"kind": "service", "id": "service-1"},
+                "result": {
+                    "operation_id": "00000000-0000-4000-8000-000000000001",
+                    "authority": "broker_service_supervisor",
+                    "state": "running",
+                    "ready": True,
+                    "supervision_ready": True,
+                    "endpoint_ready": True,
+                },
+                "resources": [
+                    {
+                        "kind": "service",
+                        "id": "service-1",
+                        "state": "running",
+                        "ready": True,
+                        "repo_id": "repo-1",
+                    }
+                ],
+            }
+        )
+
+        self.assertTrue(projected["ready"])
+
+    def test_temporary_service_projection_prefers_exact_terminal_state(self) -> None:
+        projected = project_runtime_report(
+            {
+                "ok": True,
+                "action": "stop",
+                "classification": "stopped",
+                "ready": False,
+                "target": {"kind": "service", "id": "service-temporary"},
+                "result": {
+                    "operation_id": "00000000-0000-4000-8000-000000000001",
+                    "authority": "broker_temporary_service",
+                    "state": "stopped",
+                    "ready": False,
+                },
+                "resources": [
+                    {
+                        "kind": "service",
+                        "id": "service-temporary",
+                        "state": "running",
+                        "ready": True,
+                        "repo_id": "repo-1",
+                    }
+                ],
+            }
+        )
+
+        self.assertEqual(projected["state"], "stopped")
+        self.assertEqual(projected["resource"]["state"], "stopped")
+        self.assertFalse(projected["resource"]["ready"])
 
     def test_runtime_log_projection_returns_bounded_exact_tail(self) -> None:
         artifact_id = "11111111-1111-4111-8111-111111111111"

@@ -8,8 +8,8 @@
 <title>DevOps Console — vr.ae</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2016%2016'%3E%3Crect%20width='16'%20height='16'%20rx='3'%20fill='%230e1116'/%3E%3Ccircle%20cx='8'%20cy='8'%20r='4'%20fill='none'%20stroke='%234da3ff'%20stroke-width='2'/%3E%3Ccircle%20cx='8'%20cy='8'%20r='1.4'%20fill='%233fc97c'/%3E%3C/svg%3E">
 <!-- ?v= busts the 1h immutable asset cache on deploys; index.html itself is no-cache. -->
-<link rel="stylesheet" href="/app.css?v=01bd5f7746c4">
-<script src="/app.js?v=01bd5f7746c4" defer></script>
+  <link rel="stylesheet" href="/app.css?v=770af7f24586">
+  <script src="/app.js?v=770af7f24586" defer></script>
 </head>
 <body>
 
@@ -27,6 +27,7 @@
     <nav id="site-nav" class="site-nav" aria-label="Console sections">
       <a href="#/projects" data-nav="projects">Projects <span class="nav-count" id="nav-count-projects" hidden></span></a>
       <a href="#/tests" data-nav="tests">Tests <span class="nav-count" id="nav-count-tests" hidden></span></a>
+      <a href="#/efficiency" data-nav="efficiency" id="nav-efficiency" hidden>Efficiency <span class="nav-count" id="nav-count-efficiency" hidden></span></a>
       <a href="#/bugs" data-nav="bugs">Bugs <span class="nav-count" id="nav-count-bugs" hidden></span></a>
       <a href="#/servers" data-nav="servers">Servers <span class="nav-count" id="nav-count-servers" hidden></span></a>
       <a href="#/routes" data-nav="routes">Routes <span class="nav-count" id="nav-count-routes" hidden></span></a>
@@ -87,6 +88,17 @@
       <span id="tests-retained" hidden>Latest refresh failed — showing last available data</span>
     </div>
     <div id="tests-body" class="sec-body" aria-live="off">
+      <div class="skel" aria-hidden="true"></div>
+      <div class="skel" aria-hidden="true"></div>
+    </div>
+  </section>
+
+  <section id="sec-efficiency" class="card" data-page="efficiency" aria-labelledby="efficiency-h" hidden>
+    <div class="sec-head collection-head">
+      <h2 id="efficiency-h">Delivery efficiency <span class="count" id="efficiency-count" hidden></span></h2>
+      <button id="efficiency-refresh" class="btn" type="button">Refresh</button>
+    </div>
+    <div id="efficiency-body" class="sec-body" aria-live="off">
       <div class="skel" aria-hidden="true"></div>
       <div class="skel" aria-hidden="true"></div>
     </div>
@@ -248,6 +260,16 @@
   </section>
 
 </main>
+
+<dialog id="efficiency-detail-dialog" aria-labelledby="efficiency-detail-h">
+  <div class="efficiency-dialog-shell">
+    <div class="dialog-head">
+      <h2 id="efficiency-detail-h">Repository efficiency</h2>
+      <button id="efficiency-detail-close" class="iconbtn" type="button" aria-label="Close efficiency details" title="Close"></button>
+    </div>
+    <div id="efficiency-detail-body"></div>
+  </div>
+</dialog>
 
 <dialog id="bugs-export-dialog" aria-labelledby="bugs-export-h">
   <form id="bugs-export-form" method="dialog">

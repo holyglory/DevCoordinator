@@ -14,6 +14,13 @@ The repository also contains:
 - `DevOpsBoard`, the native macOS operations interface.
 - `DevOpsConsole`, the authenticated web interface and routing edge.
 
+When the independently installed delivery-efficiency recorder detects the
+advertised Coordinator capability, it may publish one bounded cumulative
+snapshot for the current account and configured repository. DevOps Console
+then exposes repository-first provider-token, phase-attribution, timing,
+account, and repeated-work statistics. The page is absent when the capability
+is not configured; recorder operation never depends on Coordinator.
+
 ## Architecture
 
 - One local broker and server-wide SQLite store own exact repository/resource

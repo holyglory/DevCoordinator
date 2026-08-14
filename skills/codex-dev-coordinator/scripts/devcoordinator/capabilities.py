@@ -121,6 +121,13 @@ def broker_capabilities(
             ],
         },
         "continuations": {"operation_follow": True, "run_follow": True},
+        "efficiency": {
+            "actions": ["ingest"],
+            "schema_version": 1,
+            "project_attribution": True,
+            "per_account": True,
+            "console_projection": True,
+        },
         "administration": {
             "systemd_unit": {
                 "cli": "devcoordinator-systemd-unit",

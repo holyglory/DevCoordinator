@@ -18,6 +18,7 @@ import math
 import os
 from pathlib import Path, PurePosixPath
 import pwd
+import shutil
 import socket
 import stat
 import struct
@@ -99,6 +100,24 @@ _CONTROL_PLANE_READ_OPERATIONS = frozenset(
         "plan",
     }
 )
+
+
+def _dependency_account_uids(
+    *, candidate_owner_uid: int, original_root: str
+) -> tuple[int, ...]:
+    """Return trusted-local cache candidates without using ownership as access."""
+
+    del original_root
+    developer_uids = sorted(
+        {
+            int(account.pw_uid)
+            for account in pwd.getpwall()
+            if int(account.pw_uid) > 0
+            and Path(account.pw_dir).parent == Path("/home")
+            and account.pw_shell not in {"/bin/false", "/usr/sbin/nologin"}
+        }
+    )
+    return tuple(dict.fromkeys((candidate_owner_uid, *developer_uids)))
 
 
 def _snapshot_preview_timeout(maximum_seconds: float) -> float:
@@ -1448,14 +1467,44 @@ class RootSnapshotService:
             return None, None, None
         ordered_uids = tuple(dict.fromkeys((owner_uid, *sorted(account_uids))))
         requested_sdk: str | None = None
-        global_json_paths = sorted(
-            (
-                PurePosixPath(path)
-                for path in dependency_locks
-                if PurePosixPath(path).name.lower() == "global.json"
-            ),
-            key=lambda path: (-len(path.parts), str(path)),
+        cwd_raw = launch.get("cwd")
+        cwd = (
+            PurePosixPath(".")
+            if cwd_raw == "."
+            else cls._dependency_relative(
+                cwd_raw, field="immutable .NET cwd"
+            )
         )
+        global_json_paths: list[PurePosixPath] = []
+        starts = [cwd]
+        for raw in argv[2:]:
+            if not isinstance(raw, str) or raw.startswith("-"):
+                continue
+            candidate = PurePosixPath(raw)
+            if candidate.suffix.lower() not in {
+                ".csproj",
+                ".fsproj",
+                ".sln",
+                ".slnx",
+                ".vbproj",
+            }:
+                continue
+            try:
+                project = cls._dependency_relative(
+                    raw, field="immutable .NET project"
+                )
+            except TestStoreConflict:
+                continue
+            starts.append(cwd / project.parent)
+        for start in starts:
+            directory = start
+            while True:
+                candidate = directory / "global.json"
+                if candidate not in global_json_paths:
+                    global_json_paths.append(candidate)
+                if directory == PurePosixPath("."):
+                    break
+                directory = directory.parent
         for global_json_path in global_json_paths:
             try:
                 payload, _metadata = cls._dependency_file_bytes(
@@ -1463,6 +1512,17 @@ class RootSnapshotService:
                     global_json_path,
                     field="immutable .NET SDK policy",
                 )
+                materialized_payload, _materialized_metadata = (
+                    cls._dependency_file_bytes(
+                        materialized_root,
+                        global_json_path,
+                        field="materialized immutable .NET SDK policy",
+                    )
+                )
+                if payload != materialized_payload:
+                    raise TestStoreConflict(
+                        "immutable .NET SDK policy differs from snapshot"
+                    )
                 document = json.loads(payload)
             except (TestStoreConflict, ValueError):
                 continue
@@ -1508,11 +1568,43 @@ class RootSnapshotService:
                         else:
                             exact_sdk = True
                     candidates.append((candidate, exact_sdk))
+        system_dotnet = shutil.which(
+            "dotnet", path="/usr/local/bin:/usr/bin:/bin"
+        )
+        if system_dotnet is not None:
+            try:
+                candidate = Path(system_dotnet).resolve(strict=True)
+                metadata = candidate.lstat()
+            except OSError:
+                pass
+            else:
+                if (
+                    stat.S_ISREG(metadata.st_mode)
+                    and not stat.S_ISLNK(metadata.st_mode)
+                    and os.access(candidate, os.X_OK)
+                ):
+                    exact_sdk = requested_sdk is None
+                    if requested_sdk is not None:
+                        try:
+                            cls._real_dependency_directory(
+                                candidate.parent / "sdk" / requested_sdk,
+                                field="requested system .NET SDK",
+                            )
+                        except TestStoreConflict:
+                            exact_sdk = False
+                        else:
+                            exact_sdk = True
+                    if all(path != candidate for path, _exact in candidates):
+                        candidates.append((candidate, exact_sdk))
         if candidates:
             candidate = next(
                 (path for path, exact in candidates if exact),
-                candidates[0][0],
+                candidates[0][0] if requested_sdk is None else None,
             )
+            if candidate is None:
+                raise TestStoreConflict(
+                    f"requested .NET SDK {requested_sdk} is unavailable"
+                )
             dotnet_executable = str(candidate)
             toolchain_root = candidate.parent
             toolchain_metadata = cls._real_dependency_directory(
@@ -1911,8 +2003,11 @@ class RootSnapshotService:
         python_executable: str | None = None
         dotnet_executable: str | None = None
         account_uids = (candidate.owner_uid,)
-        supplementary_gids = self._supplementary_developer_gids(account_uids)
         if plan.source.mode.value == "immutable":
+            account_uids = _dependency_account_uids(
+                candidate_owner_uid=candidate.owner_uid,
+                original_root=plan.source.original_root,
+            )
             (
                 dependency_bindings,
                 python_executable,
@@ -1926,6 +2021,7 @@ class RootSnapshotService:
                 owner_uid=candidate.owner_uid,
                 account_uids=account_uids,
             )
+        supplementary_gids = self._supplementary_developer_gids(account_uids)
         descriptor = TestAttemptDescriptor(
             attempt_id=lease.attempt_id,
             target_id=candidate.target_id,

@@ -218,6 +218,7 @@ def resolve_target(
     *,
     selector: str,
     kind: str | None = None,
+    prefer_ready: bool = False,
 ) -> dict[str, Any]:
     """Bind an ID or unique display selector to one immutable target."""
 
@@ -228,6 +229,10 @@ def resolve_target(
     ]
     exact = [item for item in eligible if item.get("id") == selector]
     matches = exact or [item for item in eligible if item.get("name") == selector]
+    if len(matches) > 1 and prefer_ready:
+        ready = [item for item in matches if item.get("ready") is True]
+        if len(ready) == 1:
+            matches = ready
     if len(matches) != 1:
         raise AgentProjectionError(
             "target_not_found" if not matches else "target_ambiguous",
@@ -248,6 +253,7 @@ def project_targets(
     selector: str | None = None,
     kind: str | None = None,
     limit: int = DEFAULT_TARGET_LIMIT,
+    prefer_ready: bool = False,
 ) -> dict[str, Any]:
     """Return a byte-bounded target lookup for one exact repository scope."""
 
@@ -257,7 +263,12 @@ def project_targets(
     selected = (
         None
         if selector is None
-        else resolve_target(targets, selector=selector, kind=kind)
+        else resolve_target(
+            targets,
+            selector=selector,
+            kind=kind,
+            prefer_ready=prefer_ready,
+        )
     )
     visible_source = [selected] if selected is not None else targets
     for visible_count in range(min(limit, len(visible_source)), -1, -1):
@@ -306,7 +317,57 @@ def project_runtime_report(report: Mapping[str, Any]) -> dict[str, Any]:
             for key in ("kind", "id", "name", "state", "ready", "repo_id")
             if key in raw
         }
+        supervised_state = result.get("state")
+        if (
+            target.get("kind") == "service"
+            and result.get("authority")
+            in {"broker_service_supervisor", "broker_worker_supervisor"}
+            and supervised_state
+            in {
+                "backoff",
+                "running",
+                "stopped",
+                "tripped",
+                "unconfigured",
+            }
+        ):
+            resource["state"] = supervised_state
+            if type(result.get("ready")) is bool:
+                resource["ready"] = result["ready"]
+        elif (
+            target.get("kind") == "service"
+            and result.get("authority") == "broker_temporary_service"
+            and supervised_state
+            in {"cleanup_pending", "expired", "running", "stopped"}
+        ):
+            # The complete snapshot may precede the just-finished native
+            # transition. The exact action/status result is the fresher
+            # authority for this retained temporary service.
+            resource["state"] = supervised_state
+            if type(result.get("ready")) is bool:
+                resource["ready"] = result["ready"]
     operation_id = result.get("operation_id") or report.get("operation_id")
+    raw_supervision = (
+        result.get("supervision")
+        if isinstance(result.get("supervision"), Mapping)
+        else None
+    )
+    supervision = (
+        {
+            key: raw_supervision[key]
+            for key in (
+                "keep_alive",
+                "desired_state",
+                "breaker_state",
+                "supervisor_state",
+                "current_attempt_id",
+                "last_error_code",
+            )
+            if key in raw_supervision
+        }
+        if raw_supervision is not None
+        else None
+    )
     document: dict[str, Any] = {
         "schema_version": 1,
         "ok": report.get("ok") is True,
@@ -315,9 +376,32 @@ def project_runtime_report(report: Mapping[str, Any]) -> dict[str, Any]:
             report.get("classification", "runtime_result_unproven"),
             maximum_bytes=96,
         ),
-        "ready": report.get("ready") if type(report.get("ready")) is bool else None,
+        "ready": (
+            report.get("ready")
+            if type(report.get("ready")) is bool
+            else result.get("ready")
+            if type(result.get("ready")) is bool
+            else None
+        ),
+        "supervision_ready": (
+            result.get("supervision_ready")
+            if type(result.get("supervision_ready")) is bool
+            else None
+        ),
+        "endpoint_ready": (
+            result.get("endpoint_ready")
+            if type(result.get("endpoint_ready")) is bool
+            else None
+        ),
+        "supervision": supervision,
         "target": dict(target),
         "resource": resource,
+        "state": (
+            result.get("state")
+            if result.get("state")
+            in {"cleanup_pending", "expired", "running", "stopped"}
+            else None
+        ),
         "operation_id": operation_id if isinstance(operation_id, str) else None,
         "mutation_performed": bool(
             report.get("action") not in {"status", "capture_logs"}

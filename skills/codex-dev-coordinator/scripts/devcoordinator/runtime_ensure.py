@@ -245,7 +245,23 @@ def build_runtime_ensure_result(
         ok = False
     elif mutation_performed and final_state != desired_state:
         classification = "attention_required"
-        reason = final_decision.reason or "desired_state_not_reached"
+        lifecycle = _lower(
+            terminal_observation.get("docker_lifecycle")
+            or terminal_observation.get("lifecycle")
+        )
+        if (
+            _lower(terminal_observation.get("resource_kind"))
+            == "database_stack"
+            and lifecycle == "running"
+            and terminal_observation.get("database_available") is False
+        ):
+            reason = "database_probe_unavailable"
+        elif final_state == "stopped":
+            reason = "target_stopped"
+        elif lifecycle == "starting":
+            reason = "target_starting"
+        else:
+            reason = final_decision.reason or "desired_state_not_reached"
         ok = False
     elif decision.attention_required:
         ok = False
@@ -264,6 +280,16 @@ def build_runtime_ensure_result(
     )
     if health:
         proof["health"] = _identifier(health)
+    lifecycle = _lower(
+        terminal_observation.get("docker_lifecycle")
+        or terminal_observation.get("lifecycle")
+    )
+    if lifecycle:
+        proof["lifecycle"] = _identifier(lifecycle)
+    if type(terminal_observation.get("database_available")) is bool:
+        proof["database_available"] = terminal_observation[
+            "database_available"
+        ]
     result: dict[str, Any] = {
         "schema_version": 1,
         "ok": ok,
@@ -323,6 +349,8 @@ def validate_runtime_ensure_result(
         "snapshot_id",
         "observed_state",
         "health",
+        "lifecycle",
+        "database_available",
     } or not {"certain", "source", "snapshot_id", "observed_state"} <= set(
         proof
     ):
@@ -341,6 +369,7 @@ def validate_runtime_ensure_result(
         raise ValueError("runtime ensure result identity is invalid")
     snapshot_id = proof.get("snapshot_id")
     health = proof.get("health")
+    lifecycle = proof.get("lifecycle")
     if snapshot_id is not None and (
         not isinstance(snapshot_id, str)
         or _IDENTIFIER.fullmatch(snapshot_id) is None
@@ -350,6 +379,16 @@ def validate_runtime_ensure_result(
         not isinstance(health, str) or _IDENTIFIER.fullmatch(health) is None
     ):
         raise ValueError("runtime ensure health proof is invalid")
+    if lifecycle is not None and (
+        not isinstance(lifecycle, str)
+        or _IDENTIFIER.fullmatch(lifecycle) is None
+    ):
+        raise ValueError("runtime ensure lifecycle proof is invalid")
+    if (
+        "database_available" in proof
+        and type(proof["database_available"]) is not bool
+    ):
+        raise ValueError("runtime ensure database proof is invalid")
     if (
         document.get("schema_version") != 1
         or type(document.get("ok")) is not bool

@@ -9,6 +9,7 @@ import time
 from types import SimpleNamespace
 import unittest
 from unittest import mock
+import uuid
 
 
 SCRIPTS_ROOT = Path(__file__).resolve().parents[2]
@@ -553,7 +554,9 @@ class BrokerRuntimeTests(unittest.TestCase):
             ),
         )
 
-    def _prepare_worker_replacement(self, *, execution_uid: int | None = None) -> Path:
+    def _prepare_worker_replacement(
+        self, *, execution_uid: int | None = None, role: str = "worker"
+    ) -> Path:
         repository = self.root / "worker-repository"
         repository.mkdir(mode=0o700, exist_ok=True)
         with CoordinatorStore.open(
@@ -567,10 +570,10 @@ class BrokerRuntimeTests(unittest.TestCase):
                 connection.execute(
                     """
                     UPDATE server_definitions
-                    SET role = 'worker', cwd = ?
+                    SET role = ?, cwd = ?
                     WHERE server_definition_id = ?
                     """,
-                    (str(repository), SERVER_ID),
+                    (role, str(repository), SERVER_ID),
                 )
                 self._seed_stopped_worker_observation(connection)
             WorkerSupervision(store).configure_policy(
@@ -1240,6 +1243,39 @@ class BrokerRuntimeTests(unittest.TestCase):
         )
         self.assertEqual(self.actions.calls, [])
 
+    def test_supervised_service_status_uses_live_worker_authority(self) -> None:
+        self._prepare_worker_replacement()
+
+        class FakeController:
+            def __init__(self, _store, **_kwargs):
+                pass
+
+            def status(self, **kwargs):
+                return {
+                    "ok": True,
+                    "id": kwargs["worker_id"],
+                    "name": kwargs["name"],
+                    "status": "running",
+                    "pid": 42_010,
+                    "process_start_time": "status-start-1",
+                    "health": {"ok": True},
+                    "supervision": {"supervisor_state": "running"},
+                }
+
+        with mock.patch.object(
+            broker_backend_module, "WorkerController", FakeController
+        ):
+            reply = self._reply(
+                action="status", target_kind="service", resource_id=SERVER_ID
+            )
+
+        self.assertTrue(reply["ok"], reply)
+        result = reply["result"]["result"]
+        self.assertEqual(result["authority"], "broker_worker_supervisor")
+        self.assertTrue(result["supervision_ready"])
+        self.assertTrue(result["endpoint_ready"])
+        self.assertTrue(result["ready"])
+
     def test_network_service_start_proves_listener_pid_identity_and_exact_cwd(
         self,
     ) -> None:
@@ -1300,6 +1336,9 @@ class BrokerRuntimeTests(unittest.TestCase):
 
         self.assertTrue(reply["ok"], reply)
         proof = reply["result"]["result"]["endpoint_proof"]
+        self.assertTrue(reply["result"]["result"]["supervision_ready"])
+        self.assertTrue(reply["result"]["result"]["endpoint_ready"])
+        self.assertTrue(reply["result"]["result"]["ready"])
         self.assertEqual(
             proof,
             {
@@ -1497,6 +1536,136 @@ class BrokerRuntimeTests(unittest.TestCase):
         self.assertEqual(
             raised.exception.code, "service_endpoint_identity_mismatch"
         )
+
+    def test_network_endpoint_proof_waits_for_a_delayed_listener(self) -> None:
+        class DelayedListener(type(self.actions)):
+            def __init__(self):
+                super().__init__()
+                self.probes = 0
+
+            def verify_owned_tcp_listener(self, *, port, canonical_root):
+                self.probes += 1
+                if self.probes < 3:
+                    raise BrokerError(
+                        "listener_identity_unavailable",
+                        "listener has not bound yet",
+                    )
+                return {
+                    "pid": 42_005,
+                    "process_identity": "linux:42005:listener-start-5",
+                    "cwd": "/repos/alpha",
+                    "canonical_root": canonical_root,
+                    "port": port,
+                    "protocol": "tcp",
+                }
+
+        actions = DelayedListener()
+        backend = StoreBackedMutationBackend(self.persistence, actions)
+        with mock.patch.object(
+            broker_backend_module, "_SERVICE_ENDPOINT_POLL_SECONDS", 0
+        ):
+            proof = backend._runtime_service_endpoint_proof(
+                endpoint_target=SimpleNamespace(
+                    listener_required=True,
+                    listener_port=3112,
+                    canonical_root="/repos/alpha",
+                    cwd="/repos/alpha",
+                ),
+                action="start",
+                controlled={
+                    "pid": 42_005,
+                    "process_start_time": "listener-start-5",
+                },
+                operation_id="runtime-delayed-listener",
+            )
+
+        self.assertEqual(actions.probes, 3)
+        self.assertTrue(proof["certain"])
+        self.assertEqual(proof["state"], "listening")
+
+    def test_service_log_target_falls_back_to_latest_supervisor_artifact(self) -> None:
+        self._prepare_worker_replacement()
+        artifact = self.root / "worker-attempt.log"
+        artifact.write_text("exact supervisor failure\n", encoding="utf-8")
+        attempt_id = str(uuid.uuid4())
+        now = utc_timestamp()
+        with CoordinatorStore.open(
+            self.persistence.database_path, expected_uid=os.geteuid()
+        ) as store:
+            with store.immediate_transaction() as connection:
+                policy = connection.execute(
+                    """
+                    SELECT generation FROM worker_policies
+                    WHERE server_definition_id = ?
+                    """,
+                    (SERVER_ID,),
+                ).fetchone()
+                supervisor = connection.execute(
+                    """
+                    SELECT supervisor_generation, supervisor_epoch
+                    FROM worker_supervisor_states
+                    WHERE server_definition_id = ?
+                    """,
+                    (SERVER_ID,),
+                ).fetchone()
+                connection.execute(
+                    """
+                    INSERT INTO worker_attempts(
+                        attempt_id, begin_request_id, server_definition_id,
+                        repo_id, definition_generation, policy_generation,
+                        supervisor_generation, supervisor_epoch, state,
+                        launch_report_id, exit_report_id, pid,
+                        process_start_time, process_fingerprint, reserved_at,
+                        launched_at, exited_at, exited_at_epoch, exit_kind,
+                        exit_code, exit_classification, expected_exit,
+                        counts_toward_breaker, log_artifact_id,
+                        log_artifact_path, log_artifact_sha256,
+                        exit_fingerprint, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, 0, ?, ?, ?, 'exited', ?, ?, 42006,
+                              'start-42006', 'process-42006', ?, ?, ?, 1.0,
+                              'exit_code', 1, 'crash', 0, 0, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        attempt_id,
+                        "begin-" + attempt_id,
+                        SERVER_ID,
+                        PROJECT_ID,
+                        int(policy["generation"]),
+                        int(supervisor["supervisor_generation"]),
+                        str(supervisor["supervisor_epoch"]),
+                        "launch-" + attempt_id,
+                        "exit-" + attempt_id,
+                        now,
+                        now,
+                        now,
+                        "artifact-" + attempt_id,
+                        str(artifact),
+                        "a" * 64,
+                        "sha256:" + "b" * 64,
+                        now,
+                        now,
+                    ),
+                )
+                connection.execute(
+                    """
+                    UPDATE worker_supervisor_states
+                    SET state = 'stopped', current_attempt_id = NULL,
+                        last_attempt_id = NULL
+                    WHERE server_definition_id = ?
+                    """,
+                    (SERVER_ID,),
+                )
+        request = self._request(
+            action="capture_logs",
+            target_kind="service",
+            resource_id=SERVER_ID,
+        )
+        accepted = self.persistence.accept(peer_for(), request)
+
+        target = self.persistence.runtime_service_log_target(accepted)
+
+        self.assertEqual(target.log_path, str(artifact))
+        self.assertEqual(target.owner_uid, os.geteuid())
 
     def test_network_stop_requires_listener_and_exact_process_absence(self) -> None:
         backend = StoreBackedMutationBackend(self.persistence, self.actions)
@@ -1714,7 +1883,7 @@ class BrokerRuntimeTests(unittest.TestCase):
         )
 
     def test_worker_replace_is_repo_anchored_cas_and_durably_replayed(self) -> None:
-        repository = self._prepare_worker_replacement()
+        repository = self._prepare_worker_replacement(role="api")
         calls: list[tuple[object, ...]] = []
 
         class FakeController:

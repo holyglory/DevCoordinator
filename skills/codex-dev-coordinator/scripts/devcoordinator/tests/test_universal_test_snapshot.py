@@ -21,6 +21,11 @@ from devcoordinator.universal_test_planner import (
     SourceIdentity,
     create_test_plan,
 )
+from devcoordinator.universal_test_repository_binding import (
+    IMMUTABLE_REPOSITORY_BINDING_NAME,
+    ImmutableRepositoryBindingError,
+    resolve_immutable_repository_binding,
+)
 from devcoordinator.universal_test_snapshot import (
     FilesystemSnapshotMaterializer,
     GitSnapshotSource,
@@ -38,6 +43,7 @@ from devcoordinator.universal_test_snapshot_service import (
     RootSnapshotService,
     UIDDelegatedSnapshotSource,
     UIDHelperRunner,
+    _dependency_account_uids,
 )
 from devcoordinator.universal_test_store import (
     TargetResources,
@@ -237,6 +243,29 @@ class LiveAuthority:
 
 
 class UniversalTestSnapshotTests(unittest.TestCase):
+    def test_dependency_cache_candidates_include_the_source_owner(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            source = Path(raw)
+            caller_uid = os.geteuid() + 100
+            accounts = [
+                mock.Mock(pw_uid=1002, pw_dir="/home/axel", pw_shell="/bin/bash"),
+                mock.Mock(pw_uid=1000, pw_dir="/home/holyglory", pw_shell="/bin/bash"),
+                mock.Mock(pw_uid=0, pw_dir="/root", pw_shell="/bin/bash"),
+                mock.Mock(pw_uid=985, pw_dir="/var/lib/testd", pw_shell="/bin/false"),
+            ]
+
+            with mock.patch(
+                "devcoordinator.universal_test_snapshot_service.pwd.getpwall",
+                return_value=accounts,
+            ):
+                self.assertEqual(
+                    _dependency_account_uids(
+                        candidate_owner_uid=caller_uid,
+                        original_root=str(source),
+                    ),
+                    (caller_uid, 1000, 1002),
+                )
+
     def test_read_only_uid_helper_runs_as_the_control_plane(
         self,
     ) -> None:
@@ -498,9 +527,89 @@ class UniversalTestSnapshotTests(unittest.TestCase):
             public["materialization_mode"], {"copy", "reflink", "mixed"}
         )
         self.assertEqual(public["schema_version"], 2)
+        binding = resolve_immutable_repository_binding(materialized / "tracked.txt")
+        self.assertIsNotNone(binding)
+        assert binding is not None
+        self.assertEqual(binding.repository_id, "repo-snapshot-tests")
+        self.assertEqual(binding.original_root, str(self.root))
+        self.assertEqual(binding.materialized_root, str(materialized))
+        self.assertEqual(binding.content_fingerprint, provenance.content_fingerprint)
+        self.assertEqual(
+            (materialized.parent / IMMUTABLE_REPOSITORY_BINDING_NAME).stat().st_mode
+            & 0o777,
+            0o444,
+        )
         self.assertEqual(
             materializer.materialize(self._request()), provenance
         )
+
+    def test_immutable_repository_binding_ignores_permissions_but_rejects_unrelated_context(self) -> None:
+        materializer = FilesystemSnapshotMaterializer(
+            self.store, allow_unprotected_test_store=True
+        )
+        provenance = materializer.materialize(self._request())
+        materialized = Path(provenance.materialized_root)
+        binding_path = materialized.parent / IMMUTABLE_REPOSITORY_BINDING_NAME
+        binding_path.chmod(0o644)
+
+        binding = resolve_immutable_repository_binding(materialized)
+        self.assertIsNotNone(binding)
+        assert binding is not None
+        self.assertEqual(binding.original_root, str(self.root))
+
+        self.assertIsNone(resolve_immutable_repository_binding(self.root))
+
+    def test_immutable_repository_binding_does_not_stat_an_inaccessible_route(self) -> None:
+        inaccessible = Path("/another-account/private/repository")
+        with (
+            mock.patch.object(Path, "resolve", return_value=inaccessible),
+            mock.patch.object(
+                Path,
+                "is_dir",
+                side_effect=PermissionError(13, "permission denied"),
+            ),
+        ):
+            self.assertIsNone(resolve_immutable_repository_binding(inaccessible))
+
+    def test_scan_retries_when_an_ephemeral_untracked_sidecar_disappears(self) -> None:
+        sidecar = self.root / ".test-tmp" / "events.sqlite3-shm"
+        sidecar.parent.mkdir()
+        sidecar.write_bytes(b"ephemeral")
+        original = GitSnapshotSource._read_file
+        removed = False
+
+        def racing_read(root: Path, relative: str, *, tracked: bool):
+            nonlocal removed
+            if relative == ".test-tmp/events.sqlite3-shm" and not removed:
+                removed = True
+                sidecar.unlink()
+            return original(root, relative, tracked=tracked)
+
+        with mock.patch.object(
+            GitSnapshotSource, "_read_file", side_effect=racing_read
+        ):
+            scan = GitSnapshotSource().scan(self._request())
+
+        self.assertTrue(removed)
+        self.assertNotIn(
+            ".test-tmp/events.sqlite3-shm",
+            {item.path for item in scan.files},
+        )
+
+    def test_manifest_contract_diagnostic_names_the_exact_safe_field(self) -> None:
+        invalid = manifest_document()
+        del invalid["targets"]["unit"]["argv"]
+        (self.root / ".codex" / "tests.json").write_text(
+            json.dumps(invalid), encoding="utf-8"
+        )
+
+        with self.assertRaises(SnapshotMaterializationError) as raised:
+            GitSnapshotSource().scan(self._request())
+
+        public = public_snapshot_source_diagnostic(raised.exception)
+        self.assertIn("$.targets.unit", public)
+        self.assertIn("missing required field 'argv'", public)
+        self.assertNotIn(str(self.root), public)
 
     def test_materialization_uses_one_aggregate_caller_deadline(self) -> None:
         materializer = FilesystemSnapshotMaterializer(
@@ -976,6 +1085,34 @@ class UniversalTestSnapshotTests(unittest.TestCase):
             planned["launch_catalog"]["unit"]["timeout_seconds"], 4_321
         )
 
+    def test_uid_helper_live_plan_preserves_manifest_contract_location(self) -> None:
+        manifest = manifest_document()
+        manifest["defaults"]["resources"] = {  # type: ignore[index]
+            "cpu_millis": 6000,
+            "memory_mib": 12288,
+            "pids": 2048,
+        }
+        (self.root / ".codex" / "tests.json").write_text(
+            json.dumps(manifest, sort_keys=True), encoding="utf-8"
+        )
+
+        with self.assertRaisesRegex(
+            SnapshotMaterializationError,
+            r"snapshot test manifest is invalid: \$\.defaults: unknown field",
+        ):
+            execute_uid_helper(
+                {
+                    "operation": "live_plan",
+                    "owner_uid": os.geteuid(),
+                    "arguments": {
+                        "repository_id": "repo-snapshot-tests",
+                        "original_root": str(self.root),
+                        "execution_root": str(self.root),
+                        "intent": "change",
+                    },
+                }
+            )
+
     def test_uid_helper_scan_accepts_the_typed_request_source_root(self) -> None:
         request = self._request()
         result = execute_uid_helper(
@@ -1321,6 +1458,39 @@ class UniversalTestSnapshotTests(unittest.TestCase):
         self.assertEqual(plan["source"]["mode"], "immutable")
         self.assertTrue(str(plan["source"]["snapshot_id"]).startswith("snapshot-"))
         self.assertEqual(set(document["target_resources"]), set(plan["selected_targets"]))
+
+    def test_uid_previewer_preserves_manifest_contract_location(self) -> None:
+        manifest = manifest_document()
+        manifest["defaults"]["resources"] = {  # type: ignore[index]
+            "cpu_millis": 6000,
+            "memory_mib": 12288,
+            "pids": 2048,
+        }
+        (self.root / ".codex" / "tests.json").write_text(
+            json.dumps(manifest, sort_keys=True), encoding="utf-8"
+        )
+        binding = SnapshotRepositoryBinding(
+            repository_id="repo-snapshot-tests",
+            canonical_root=str(self.root),
+            owner_uid=os.geteuid(),
+        )
+        previewer = ImmutableSnapshotPlanPreviewer(
+            FilesystemSnapshotMaterializer(
+                self.store, allow_unprotected_test_store=True
+            ),
+            ExactResolver(binding),
+        )
+
+        with self.assertRaisesRegex(
+            SnapshotMaterializationError,
+            r"snapshot test manifest is invalid: \$\.defaults: unknown field",
+        ):
+            previewer.preview_as_owner(
+                repository_id=binding.repository_id,
+                intent="release",
+                actor="broker:test",
+                owner_uid=binding.owner_uid,
+            )
 
     def test_uid_previewer_setup_includes_target_fixture_bindings(self) -> None:
         manifest = manifest_document()

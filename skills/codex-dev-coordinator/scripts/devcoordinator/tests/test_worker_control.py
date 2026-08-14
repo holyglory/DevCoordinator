@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 from devcoordinator.store import AccountStore, deterministic_id, utc_timestamp
 from devcoordinator.worker_control import (
@@ -24,6 +25,7 @@ class FakeNativeManager:
         self.stop_calls = 0
         self.remove_calls = 0
         self.fail_next_starts = 0
+        self.fail_next_removes = 0
         self.on_start_failure = None
         self.on_remove = None
 
@@ -97,6 +99,10 @@ class FakeNativeManager:
 
     def remove(self, *, worker_id: str) -> NativeWorkerState:
         self.remove_calls += 1
+        if self.fail_next_removes:
+            self.fail_next_removes -= 1
+            self.active = False
+            raise RuntimeError("injected lost native remove reply")
         if self.active:
             self.stop(worker_id=worker_id)
         if self.on_remove is not None:
@@ -279,6 +285,204 @@ class WorkerControllerTests(unittest.TestCase):
         self.assertEqual(stopped["status"], "stopped")
         self.assertEqual(self.manager.stop_calls, 1)
         self.assertFalse(self.supervision.attempt(str(self.manager.attempt["attempt_id"]))["counts_toward_breaker"])
+
+    def test_startup_reconciliation_retries_transient_native_registration(self) -> None:
+        self._start()
+        self.manager.fail_next_starts = 1
+
+        reconciled = self.controller.reconcile_startup(
+            supervisor_epoch="replacement-epoch"
+        )
+
+        self.assertTrue(reconciled["ok"])
+        self.assertEqual(reconciled["errors"], [])
+        self.assertEqual(len(reconciled["started"]), 1)
+        self.assertEqual(reconciled["started"][0]["startup_attempts"], 2)
+        self.assertEqual(self.manager.start_calls, 3)
+        self.assertEqual(self.manager.remove_calls, 2)
+        policy = self.supervision.policy(self.worker_id)
+        self.assertEqual(policy["supervisor_state"], "running")
+        self.assertEqual(policy["desired_state"], "running")
+        self.assertTrue(policy["keep_alive"])
+
+    def test_startup_normalizes_transient_stopped_label_after_native_absence(self) -> None:
+        self._start()
+
+        def settle_with_transient_stopped_label() -> None:
+            with self.store.immediate_transaction() as connection:
+                connection.execute(
+                    """
+                    UPDATE worker_supervisor_states
+                    SET state = 'stopped'
+                    WHERE server_definition_id = ?
+                    """,
+                    (self.worker_id,),
+                )
+
+        self.manager.on_remove = settle_with_transient_stopped_label
+        reconciled = self.controller.reconcile_startup(
+            supervisor_epoch="replacement-stopped-race"
+        )
+
+        self.assertTrue(reconciled["ok"])
+        self.assertEqual(len(reconciled["started"]), 1)
+        self.assertEqual(
+            self.supervision.policy(self.worker_id)["supervisor_state"],
+            "running",
+        )
+
+    def test_startup_recovers_lost_remove_reply_after_exact_absence_proof(self) -> None:
+        self._start()
+        self.manager.fail_next_removes = 1
+
+        reconciled = self.controller.reconcile_startup(
+            supervisor_epoch="replacement-remove-reply-lost"
+        )
+
+        self.assertTrue(reconciled["ok"])
+        self.assertEqual(len(reconciled["started"]), 1)
+        self.assertEqual(
+            self.supervision.policy(self.worker_id)["supervisor_state"],
+            "running",
+        )
+
+    def test_startup_convergence_retries_old_runner_still_exiting(self) -> None:
+        self._start()
+        real_remove = self.controller._native_remove
+        first_remove = True
+
+        def delayed_remove(*, worker_id: str, uid: int) -> NativeWorkerState:
+            nonlocal first_remove
+            if first_remove:
+                first_remove = False
+                raise RuntimeError("native runner is still exiting")
+            return real_remove(worker_id=worker_id, uid=uid)
+
+        with mock.patch.object(
+            self.controller, "_native_remove", side_effect=delayed_remove
+        ):
+            fenced = self.controller.fence_startup(
+                supervisor_epoch="replacement-delayed-native-exit"
+            )
+            self.assertFalse(fenced["ok"])
+            self.assertEqual(fenced["autostart_expected"], [self.worker_id])
+            autostarted = self.controller.autostart_fenced(
+                supervisor_epoch="replacement-delayed-native-exit",
+                expected_worker_ids=fenced["autostart_expected"],
+            )
+
+        self.assertTrue(autostarted["ok"])
+        self.assertEqual(len(autostarted["started"]), 1)
+        self.assertEqual(
+            self.supervision.policy(self.worker_id)["supervisor_state"],
+            "running",
+        )
+
+    def test_startup_converges_when_candidate_appears_after_first_read(self) -> None:
+        self._start()
+        fenced = self.controller.fence_startup(
+            supervisor_epoch="replacement-late-candidate"
+        )
+        real_candidates = self.supervision.startup_candidates(
+            supervisor_epoch="replacement-late-candidate"
+        )
+        with mock.patch.object(
+            self.supervision,
+            "startup_candidates",
+            side_effect=[[], real_candidates],
+        ):
+            autostarted = self.controller.autostart_fenced(
+                supervisor_epoch="replacement-late-candidate",
+                expected_worker_ids=fenced["autostart_expected"],
+            )
+
+        self.assertTrue(autostarted["ok"])
+        self.assertEqual(len(autostarted["started"]), 1)
+
+    def test_startup_waits_for_temporary_repository_fence_to_clear(self) -> None:
+        self._start()
+        with self.store.immediate_transaction() as connection:
+            connection.execute(
+                """
+                UPDATE repository_installations
+                SET startup_fenced = 1
+                WHERE repo_id = ?
+                """,
+                (self.repo_id,),
+            )
+        fenced = self.controller.fence_startup(
+            supervisor_epoch="replacement-repository-fence"
+        )
+        self.assertEqual(fenced["autostart_expected"], [self.worker_id])
+
+        cleared = False
+
+        def clear_temporary_fence(_seconds: float) -> None:
+            nonlocal cleared
+            if cleared:
+                return
+            cleared = True
+            with self.store.immediate_transaction() as connection:
+                connection.execute(
+                    """
+                    UPDATE repository_installations
+                    SET startup_fenced = 0
+                    WHERE repo_id = ?
+                    """,
+                    (self.repo_id,),
+                )
+
+        controller = WorkerController(
+            self.store,
+            coordinator_script=Path(__file__).parents[2] / "dev_coordinator.py",
+            manager_factory=lambda **_kwargs: self.manager,
+            process_observer=lambda _pid, _started: "alive",
+            sleeper=clear_temporary_fence,
+        )
+        autostarted = controller.autostart_fenced(
+            supervisor_epoch="replacement-repository-fence",
+            expected_worker_ids=fenced["autostart_expected"],
+        )
+
+        self.assertTrue(cleared)
+        self.assertTrue(autostarted["ok"])
+        self.assertEqual(len(autostarted["started"]), 1)
+        self.assertEqual(
+            self.supervision.policy(self.worker_id)["supervisor_state"],
+            "running",
+        )
+
+    def test_status_uses_fixed_runner_and_exact_process_when_attempt_pointer_lags(self) -> None:
+        self._start()
+        with self.store.immediate_transaction() as connection:
+            connection.execute(
+                """
+                UPDATE worker_supervisor_states
+                SET state = 'stopped', current_attempt_id = NULL
+                WHERE server_definition_id = ?
+                """,
+                (self.worker_id,),
+            )
+        controller = WorkerController(
+            self.store,
+            coordinator_script=Path(__file__).parents[2] / "dev_coordinator.py",
+            manager_factory=lambda **_kwargs: self.manager,
+            process_observer=lambda _pid, _started: "alive",
+            sleeper=lambda _seconds: None,
+        )
+
+        status = controller.status(
+            worker_id=self.worker_id,
+            canonical_repository=str(self.project),
+            name="queue-worker",
+        )
+
+        self.assertEqual(status["status"], "running")
+        self.assertTrue(status["health"]["ok"])
+        self.assertEqual(
+            status["health"]["process_source"], "fixed_runner_observation"
+        )
+        self.assertEqual(status["pid"], 31_001)
 
     def test_keep_alive_off_leaves_current_attempt_running_then_prevents_restart(self) -> None:
         self._start()
@@ -504,6 +708,24 @@ class WorkerControllerTests(unittest.TestCase):
         )
         self.assertTrue(str(definition["definition_fingerprint"]).startswith("sha256:"))
         self.assertFalse(self.supervision.policy(self.worker_id)["keep_alive"])
+
+    def test_replace_preserves_non_worker_service_role(self) -> None:
+        with self.store.immediate_transaction() as connection:
+            connection.execute(
+                "UPDATE server_definitions SET role = 'api' WHERE server_definition_id = ?",
+                (self.worker_id,),
+            )
+        self._start()
+
+        result = self._replace(
+            argv=["/usr/bin/python3", "api.py"],
+            environment={"ROLE": "api"},
+        )
+
+        self.assertTrue(result["ok"])
+        definition = self._definition()
+        self.assertEqual(definition["role"], "api")
+        self.assertEqual(definition["argv"], ["/usr/bin/python3", "api.py"])
 
     def test_replace_rejects_invalid_scope_argv_and_environment_before_stop(self) -> None:
         self._start()

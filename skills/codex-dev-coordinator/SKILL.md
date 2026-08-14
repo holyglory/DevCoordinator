@@ -24,6 +24,14 @@ devcoordinator runtime ensure web --kind service --desired ready
 devcoordinator storage inventory
 ```
 
+`capabilities.efficiency` is optional. When present, an installed
+delivery-efficiency recorder automatically publishes its current account's
+bounded cumulative repository snapshot after a terminal declaration. Agents do
+not copy raw ledgers, paths, prompts, or counters into Coordinator, and a
+missing or failed projection never changes the recorder outcome. The Console
+owns repository-level viewing; use `devcoordinator efficiency ingest` directly
+only for recorder integration tests or recovery diagnostics.
+
 Use command-scoped `--project /absolute/worktree` only when the process is not
 running inside the intended worktree. The intent client accepts no separate
 root-repository, temporary-repository, or attribution override; Python derives

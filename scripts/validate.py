@@ -30,10 +30,6 @@ DECISION_METADATA = re.compile(
     r"^ID: (DC-[A-Z0-9-]+) · Details: "
     r"\[supporting record\]\(DecisionDetails/(DC-[A-Z0-9-]+)\.md\)$"
 )
-MAX_DECISION_HISTORY_LINES = 160
-MAX_DECISION_ENTRIES = 12
-
-
 def validation_pyyaml_ready() -> bool:
     """Return whether this test interpreter has the pinned runtime contract."""
 
@@ -286,18 +282,13 @@ def check_duplicate_literal_dict_keys() -> None:
 def decision_history_contract_errors(history: str, detail_names: set[str]) -> list[str]:
     """Return dense-index contract violations without reading implementation evidence.
 
-    DecisionHistory is intentionally small enough for routine context. Detailed
-    evidence belongs in one matching DecisionDetails file, so the index format
-    is deliberately strict and mechanically checkable.
+    DecisionHistory is a concise routine-context index whose stable entries may
+    grow with the project's major decisions. Detailed evidence belongs in one
+    matching DecisionDetails file, so each entry remains deliberately strict
+    and mechanically checkable without an arbitrary whole-history ceiling.
     """
 
     errors: list[str] = []
-    line_count = len(history.splitlines())
-    if line_count > MAX_DECISION_HISTORY_LINES:
-        errors.append(
-            "history must stay within "
-            f"{MAX_DECISION_HISTORY_LINES} lines; consolidate durable direction"
-        )
     if history.count("# Decision History") != 1:
         errors.append("history must contain exactly one top-level Decision History heading")
     if history.count("## Direction") != 1:
@@ -307,12 +298,6 @@ def decision_history_contract_errors(history: str, detail_names: set[str]) -> li
     if not matches:
         errors.append("history must contain at least one stable decision entry")
         return errors
-    if len(matches) > MAX_DECISION_ENTRIES:
-        errors.append(
-            "history must stay within "
-            f"{MAX_DECISION_ENTRIES} decisions; merge overlapping direction"
-        )
-
     direction_offset = history.find("## Direction")
     direction_cited_ids: set[str] = set()
     if direction_offset < 0 or direction_offset > matches[0].start():
@@ -434,7 +419,7 @@ Why: Separate writable stores can disagree; one authority preserves identity.
 
     extra_blocks: list[str] = []
     extra_details = set(good_details)
-    for number in range(1, MAX_DECISION_ENTRIES + 1):
+    for number in range(1, 17):
         decision_id = f"DC-EXTRA-{number:02d}"
         extra_details.add(decision_id)
         extra_blocks.append(
@@ -444,28 +429,12 @@ ID: {decision_id} · Details: [supporting record](DecisionDetails/{decision_id}.
 
 Decision: Preserve durable boundary {number}.
 
-Why: This fixture proves excessive entries require consolidation.
+Why: This fixture proves distinct major decisions remain valid as the durable index grows.
 """
         )
-    too_many = good.rstrip() + "\n\n" + "\n".join(extra_blocks)
-    if not any(
-        "decisions; merge overlapping direction" in error
-        for error in decision_history_contract_errors(too_many, extra_details)
-    ):
-        raise SystemExit("DecisionHistory detector missed an excessive decision count")
-
-    oversized_direction = good.replace(
-        "Confirmed user intent keeps one authority;",
-        "\n".join(
-            "Confirmed user intent keeps one authority;"
-            for _ in range(MAX_DECISION_HISTORY_LINES + 1)
-        ),
-    )
-    if not any(
-        "lines; consolidate durable direction" in error
-        for error in decision_history_contract_errors(oversized_direction, good_details)
-    ):
-        raise SystemExit("DecisionHistory detector missed an oversized index")
+    many_valid = good.rstrip() + "\n\n" + "\n".join(extra_blocks)
+    if decision_history_contract_errors(many_valid, extra_details):
+        raise SystemExit("DecisionHistory detector rejected distinct valid major decisions")
 
     history_path = ROOT / "DecisionHistory.md"
     detail_dir = ROOT / "DecisionDetails"

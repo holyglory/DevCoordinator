@@ -186,8 +186,13 @@ from .universal_test_service import (
     TestPlanPreviewUnavailable,
     TestPlaneClient,
     decode_test_plan_document,
+    verified_text_artifact_content,
 )
-from .universal_test_transport import TestPlaneTransportError
+from .universal_test_transport import (
+    TEST_CATALOG_READ_TIMEOUT_SECONDS,
+    TEST_SETUP_READ_TIMEOUT_SECONDS,
+    TestPlaneTransportError,
+)
 from .universal_test_store import (
     TargetResources,
     TestStoreConflict,
@@ -284,6 +289,8 @@ _ASYNC_TEST_OPERATIONS = frozenset(
 )
 _LOGGER = logging.getLogger(__name__)
 _REPOSITORY_ADOPTION_MESSAGE_LIMIT = 512
+_SERVICE_ENDPOINT_STARTUP_TIMEOUT_SECONDS = 30.0
+_SERVICE_ENDPOINT_POLL_SECONDS = 0.1
 
 
 def _repository_adoption_message(
@@ -1001,7 +1008,10 @@ class StoreBackedMutationBackend:
                     str(row["repo_id"]) for row in authority_rows
                 )
                 retained = dict(
-                    plane.repository_catalog(repository_ids=repository_ids)
+                    plane.repository_catalog(
+                        repository_ids=repository_ids,
+                        timeout_seconds=TEST_CATALOG_READ_TIMEOUT_SECONDS,
+                    )
                 )
                 raw_rows = retained.get("repositories")
                 if not isinstance(raw_rows, list):
@@ -1064,6 +1074,7 @@ class StoreBackedMutationBackend:
                     plane.setup(
                         repository_id=request.project_id,
                         owner_uid=execution_context.execution_uid,
+                        timeout_seconds=TEST_SETUP_READ_TIMEOUT_SECONDS,
                     )
                 )
                 self._require_test_repository(result, request.project_id)
@@ -1173,6 +1184,20 @@ class StoreBackedMutationBackend:
                 ):
                     raise TestStoreContractError(
                         "testd returned a contradictory artifact identity"
+                    )
+                content = verified_text_artifact_content(artifact)
+                result["artifact_content"] = content
+                if content is not None and (
+                    not isinstance(content, Mapping)
+                    or content.get("artifact_id") != artifact_id
+                    or content.get("sha256") != artifact.get("sha256")
+                    or content.get("size_bytes") != artifact.get("size_bytes")
+                    or not isinstance(content.get("text"), str)
+                    or type(content.get("retained_bytes")) is not int
+                    or type(content.get("truncated")) is not bool
+                ):
+                    raise TestStoreContractError(
+                        "testd returned contradictory artifact content evidence"
                     )
                 return result
             if request.operation is BrokerOperation.TEST_RUN_CASES:
@@ -3564,31 +3589,49 @@ class StoreBackedMutationBackend:
                 operation_id=operation_id,
             )
         if action in {"start", "restart", "replace"}:
-            evidence = self._host_mutations.verify_owned_tcp_listener(
-                port=port,
-                canonical_root=endpoint_target.canonical_root,
-            )
             pid = controlled.get("pid")
             started = controlled.get("process_start_time")
-            observed_identity = evidence.get("process_identity")
             expected_identities = {
                 f"linux:{pid}:{started}",
                 f"process:{pid}:{started}",
             }
-            if (
-                type(pid) is not int
-                or pid <= 1
-                or not isinstance(started, str)
-                or not started
-                or evidence.get("pid") != pid
-                or evidence.get("cwd") != endpoint_target.cwd
-                or observed_identity not in expected_identities
-            ):
-                raise BrokerBackendError(
-                    "service_endpoint_identity_mismatch",
-                    "The observed listener does not match the exact supervised process and sealed cwd.",
-                    operation_id=operation_id,
-                )
+            deadline = time.monotonic() + _SERVICE_ENDPOINT_STARTUP_TIMEOUT_SECONDS
+            while True:
+                try:
+                    evidence = self._host_mutations.verify_owned_tcp_listener(
+                        port=port,
+                        canonical_root=endpoint_target.canonical_root,
+                    )
+                except Exception as error:
+                    available = self._host_mutations.select_available_port(
+                        candidates=(port,), protocol="tcp"
+                    )
+                    if available != port:
+                        raise
+                    if time.monotonic() >= deadline:
+                        raise BrokerBackendError(
+                            "service_endpoint_startup_timeout",
+                            "The supervised service did not bind its exact assigned listener before the startup deadline.",
+                            operation_id=operation_id,
+                        ) from error
+                    time.sleep(_SERVICE_ENDPOINT_POLL_SECONDS)
+                    continue
+                observed_identity = evidence.get("process_identity")
+                if (
+                    type(pid) is not int
+                    or pid <= 1
+                    or not isinstance(started, str)
+                    or not started
+                    or evidence.get("pid") != pid
+                    or evidence.get("cwd") != endpoint_target.cwd
+                    or observed_identity not in expected_identities
+                ):
+                    raise BrokerBackendError(
+                        "service_endpoint_identity_mismatch",
+                        "The observed listener does not match the exact supervised process and sealed cwd.",
+                        operation_id=operation_id,
+                    )
+                break
             return {
                 "certain": True,
                 "listener_required": True,
@@ -3597,6 +3640,54 @@ class StoreBackedMutationBackend:
                 "pid": pid,
                 "process_identity": observed_identity,
                 "cwd_binding": "exact",
+            }
+        if action == "status":
+            try:
+                evidence = self._host_mutations.verify_owned_tcp_listener(
+                    port=port,
+                    canonical_root=endpoint_target.canonical_root,
+                )
+            except Exception:
+                available = self._host_mutations.select_available_port(
+                    candidates=(port,), protocol="tcp"
+                )
+                return {
+                    "certain": available == port,
+                    "listener_required": True,
+                    "ready": False,
+                    "state": (
+                        "not_listening"
+                        if available == port
+                        else "identity_unproven"
+                    ),
+                    "port": port,
+                    "cwd_binding": "sealed_definition",
+                }
+            pid = controlled.get("pid")
+            started = controlled.get("process_start_time")
+            observed_identity = evidence.get("process_identity")
+            matches = bool(
+                type(pid) is int
+                and pid > 1
+                and isinstance(started, str)
+                and started
+                and evidence.get("pid") == pid
+                and evidence.get("cwd") == endpoint_target.cwd
+                and observed_identity
+                in {
+                    f"linux:{pid}:{started}",
+                    f"process:{pid}:{started}",
+                }
+            )
+            return {
+                "certain": True,
+                "listener_required": True,
+                "ready": matches,
+                "state": "listening" if matches else "identity_mismatch",
+                "port": port,
+                "pid": evidence.get("pid"),
+                "process_identity": observed_identity,
+                "cwd_binding": "exact" if matches else "mismatch",
             }
         if action == "stop":
             available = self._host_mutations.select_available_port(
@@ -4066,9 +4157,15 @@ class StoreBackedMutationBackend:
                             "main_pid": observed["main_pid"],
                         },
                     )
-            # Status is an authority-owned observation for every configured
-            # runtime kind.  Service-role supervision is a mutation boundary;
-            # it must not block this read-only path for ordinary web services.
+                if self._persistence.runtime_service_has_supervision(accepted):
+                    return self._execute_worker_runtime_request(
+                        accepted,
+                        service_role=self._persistence.runtime_service_role(
+                            accepted
+                        ),
+                    )
+            # Unsupervised service and container status remains an
+            # authority-owned committed host observation.
             observation = self._observe_committed_host(request.operation_id)
             return execute_broker_runtime_request(
                 accepted,
@@ -4090,12 +4187,6 @@ class StoreBackedMutationBackend:
                     )
                 return self._execute_temporary_service_runtime_request(
                     accepted, temporary=temporary
-                )
-            if action == "replace" and str(role or "").lower() != "worker":
-                raise BrokerBackendError(
-                    "runtime_supervisor_required",
-                    "Definition replacement remains available only for an installed worker-role service.",
-                    operation_id=request.operation_id,
                 )
             return self._execute_worker_runtime_request(
                 accepted, service_role=role
@@ -4834,6 +4925,9 @@ class StoreBackedMutationBackend:
                 arguments=request.arguments,
                 operation_id=request.operation_id,
             )
+        endpoint_target = self._persistence.runtime_service_endpoint_target(
+            accepted
+        )
 
         if action != "status":
             existing = self._persistence.existing_operation_disposition(accepted)
@@ -4851,9 +4945,6 @@ class StoreBackedMutationBackend:
                     "This exact worker control operation is pending; inspect status before issuing a new operation.",
                     operation_id=request.operation_id,
                 )
-            endpoint_target = self._persistence.runtime_service_endpoint_target(
-                accepted
-            )
             disposition = self._persistence.reserve_operation(accepted)
             if disposition.state == "completed":
                 return dict(disposition.result or {})
@@ -5053,6 +5144,30 @@ class StoreBackedMutationBackend:
             ),
             "operation_id": request.operation_id,
         }
+        if action == "status":
+            endpoint_proof = self._runtime_service_endpoint_proof(
+                endpoint_target=endpoint_target,
+                action="status",
+                controlled=controlled,
+                operation_id=request.operation_id,
+            )
+            endpoint_ready = bool(
+                endpoint_proof.get("ready") is True
+                or endpoint_proof.get("listener_required") is False
+            )
+            action_result.update(
+                {
+                    "supervision_ready": ready,
+                    "endpoint_ready": endpoint_ready,
+                    "endpoint_proof": endpoint_proof,
+                    "ready": ready and endpoint_ready,
+                    "classification": (
+                        "ready"
+                        if ready and endpoint_ready
+                        else "observed_not_ready"
+                    ),
+                }
+            )
         if action != "status":
             try:
                 if action == "replace":
@@ -5087,6 +5202,23 @@ class StoreBackedMutationBackend:
                         controlled=controlled,
                         operation_id=request.operation_id,
                     )
+                )
+                endpoint_proof = action_result["endpoint_proof"]
+                endpoint_ready = bool(
+                    endpoint_proof.get("listener_required") is False
+                    or endpoint_proof.get("state") == "listening"
+                )
+                action_result.update(
+                    {
+                        "supervision_ready": ready,
+                        "endpoint_ready": endpoint_ready,
+                        "ready": ready and endpoint_ready,
+                        "classification": (
+                            "ready"
+                            if ready and endpoint_ready
+                            else "observed_not_ready"
+                        ),
+                    }
                 )
             except Exception as endpoint_error:
                 rollback: Mapping[str, Any] | None = None
@@ -6432,6 +6564,12 @@ class StoreBackedBrokerRuntime:
     def reconcile_workers_on_startup(self) -> dict[str, Any]:
         """Fence prior worker authority and autostart each eligible worker once."""
 
+        fenced = self.fence_workers_on_startup()
+        return self.autostart_workers_after_admission(fenced=fenced)
+
+    def fence_workers_on_startup(self) -> dict[str, Any]:
+        """Fence old worker epochs before the server begins admission."""
+
         script = self.coordinator_script
         if script is None:
             script = Path(__file__).resolve().parent.parent / "dev_coordinator.py"
@@ -6444,7 +6582,45 @@ class StoreBackedBrokerRuntime:
             return WorkerController(
                 store,
                 coordinator_script=script,
-            ).reconcile_startup(supervisor_epoch=supervisor_epoch)
+            ).fence_startup(supervisor_epoch=supervisor_epoch)
+
+    def autostart_workers_after_admission(
+        self, *, fenced: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """Launch safe keep-alive workers only once broker calls can be served."""
+
+        supervisor_epoch = fenced.get("supervisor_epoch")
+        if not isinstance(supervisor_epoch, str) or not supervisor_epoch:
+            raise BrokerError(
+                "worker_reconciliation_invalid",
+                "Worker startup fencing omitted its supervisor epoch.",
+            )
+        script = self.coordinator_script
+        if script is None:
+            script = Path(__file__).resolve().parent.parent / "dev_coordinator.py"
+        with AccountStore.open(
+            self.persistence.database_path,
+            expected_uid=self.persistence.expected_uid,
+            busy_timeout_ms=self.persistence.busy_timeout_ms,
+        ) as store:
+            autostarted = WorkerController(
+                store,
+                coordinator_script=script,
+            ).autostart_fenced(
+                supervisor_epoch=supervisor_epoch,
+                expected_worker_ids=list(fenced.get("autostart_expected") or []),
+            )
+        errors = [
+            *list(fenced.get("errors") or []),
+            *list(autostarted.get("errors") or []),
+        ]
+        return {
+            "ok": not errors,
+            "supervisor_epoch": supervisor_epoch,
+            "fenced_old_runners": list(fenced.get("fenced_old_runners") or []),
+            "started": list(autostarted.get("started") or []),
+            "errors": errors,
+        }
 
     def begin_shutdown(self) -> int:
         """Fence mutation admission and request background stop without joining."""

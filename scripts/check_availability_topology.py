@@ -576,6 +576,14 @@ def validate_service(
             )
     if path.name == "devcoordinator-authority.service":
         command = one(unit, "Service", "ExecStart") or ""
+        if one(unit, "Service", "TimeoutStopSec") != "65min":
+            findings.append(
+                violation(
+                    "authority_backup_drain_timeout_invalid",
+                    path,
+                    "authority TimeoutStopSec must be exactly 65min so a bounded database backup can drain before replacement",
+                )
+            )
         for flag in ("--test-plane-socket",):
             if flag not in command:
                 findings.append(
@@ -1337,6 +1345,8 @@ def validate_tmpfiles(path: Path) -> list[Violation]:
         "/var/lib/devcoordinator-browser-lifecycle/browser-lifecycle.json.lock": ("z", "0644", "root", "root"),
         "/var/lib/devcoordinator-bugs": ("d", "0777", "root", "root"),
         "/var/lib/devcoordinator-bugs/open": ("d", "0777", "root", "root"),
+        "/var/lib/devcoordinator-efficiency": ("d", "0777", "root", "root"),
+        "/var/lib/devcoordinator-efficiency/accounts": ("d", "0777", "root", "root"),
         "/var/lib/devcoordinator-edge": ("d", "0700", "devcoordinator-edge", "devcoordinator-edge"),
         "/var/lib/devcoordinator-observer": ("d", "0755", "devcoordinator-observer", "devcoordinator-observer"),
         "/var/lib/devcoordinator-observer/inventory.publication": ("z", "0644", "devcoordinator-observer", "devcoordinator-observer"),

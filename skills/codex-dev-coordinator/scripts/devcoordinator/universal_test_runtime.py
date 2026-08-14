@@ -27,11 +27,14 @@ from typing import Callable, Mapping, Protocol, Sequence, runtime_checkable
 import uuid
 import zipfile
 
+from .universal_test_artifacts import package_directory
 from .universal_test_contract import (
     NON_AUTHORITATIVE_RESOURCES,
     deterministic_fingerprint,
 )
-from .universal_test_artifacts import package_directory
+from .universal_test_repository_binding import (
+    publish_immutable_repository_binding,
+)
 from .universal_test_snapshot import (
     nuget_locked_package_source_paths,
     nuget_locked_package_requirements,
@@ -81,6 +84,9 @@ _SYSTEMD_BIND_PATH = re.compile(r"^/[A-Za-z0-9_./@+\-]+$")
 _OPERATIONAL_CREDENTIAL_ALIAS = re.compile(r"^[a-z][a-z0-9_.-]{0,127}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _PYTHON_ENVIRONMENT_NAMES = frozenset({".venv-v2", ".venv", "venv"})
+_IMMUTABLE_PYTHON_TOOLCHAIN_MOUNT = Path(
+    "/tmp/devcoordinator-immutable-python-toolchain"
+)
 _DOTNET_PACKAGES_DESTINATION = ".devcoordinator-dependencies/nuget-source"
 _MAX_DEPENDENCY_IDENTITY_BYTES = 64 * 1024 * 1024
 _MAX_DEPENDENCY_IDENTITY_FILES = 8_192
@@ -2139,7 +2145,23 @@ class SystemdTestAttemptManager:
             raise TestStoreConflict(
                 "immutable test execution root is not the selected snapshot"
             )
-        destination = state / "root"
+        snapshot_directory = state / str(descriptor.snapshot_id)
+        try:
+            snapshot_directory.mkdir(mode=0o711)
+            # The authority service runs with a restrictive umask. This parent
+            # is a non-secret routing context and must remain traversable after
+            # systemd drops to the repository owner's UID; the attempt root
+            # itself remains owner-private below it.
+            snapshot_directory.chmod(0o711)
+        except FileExistsError as error:
+            raise TestStoreConflict(
+                "test attempt snapshot context already exists"
+            ) from error
+        except OSError as error:
+            raise TestStoreConflict(
+                "test attempt snapshot context is not traversable"
+            ) from error
+        destination = snapshot_directory / "root"
         try:
             destination.mkdir(mode=0o700)
         except FileExistsError as error:
@@ -2201,6 +2223,21 @@ class SystemdTestAttemptManager:
                 descriptor,
                 state=state,
                 execution_root=destination,
+            )
+            content_fingerprint = descriptor.source_provenance.get(
+                "content_fingerprint"
+            )
+            if not isinstance(content_fingerprint, str):
+                raise TestStoreConflict(
+                    "immutable test content identity is unavailable"
+                )
+            publish_immutable_repository_binding(
+                snapshot_directory,
+                snapshot_id=str(descriptor.snapshot_id),
+                repository_id=descriptor.repository_id,
+                original_root=descriptor.original_root,
+                materialized_root=str(destination),
+                content_fingerprint=content_fingerprint,
             )
             return destination
         except Exception:
@@ -3155,12 +3192,16 @@ class SystemdTestAttemptManager:
 
     @classmethod
     def _external_toolchain_bind(
-        cls, descriptor: TestAttemptDescriptor, *, execution_root: Path
-    ) -> str | None:
+        cls,
+        descriptor: TestAttemptDescriptor,
+        *,
+        execution_root: Path,
+        state_root: Path,
+    ) -> tuple[str, ...]:
         if descriptor.source_mode == "immutable":
             for toolchain in descriptor.toolchain_bindings:
                 source = cls._validate_standalone_toolchain(toolchain)
-                return _systemd_bind_path("immutable .NET toolchain", source)
+                return (_systemd_bind_path("immutable .NET toolchain", source),)
             for binding in descriptor.dependency_bindings:
                 toolchain = binding.get("toolchain")
                 if not isinstance(toolchain, Mapping):
@@ -3173,22 +3214,82 @@ class SystemdTestAttemptManager:
                 )
                 source = Path(str(toolchain["source_root"]))
                 if toolchain["installation_kind"] == "python-toolchain":
+                    # security-assumptions.md confirms one trusted local
+                    # developer across host accounts while requiring process
+                    # isolation and no public source exposure.  Mount the exact
+                    # fingerprinted toolchain into this unit's PrivateTmp view
+                    # so an absolute venv symlink never depends on traversing a
+                    # separately attributed account home.
+                    staged = state_root / "immutable-python-toolchain"
+                    try:
+                        shutil.copytree(
+                            source,
+                            staged,
+                            symlinks=True,
+                            copy_function=shutil.copy2,
+                        )
+                    except OSError as error:
+                        raise TestStoreConflict(
+                            "immutable Python toolchain could not be staged"
+                        ) from error
+                    try:
+                        identity = pwd.getpwuid(descriptor.owner_uid)
+                    except KeyError as error:
+                        raise TestStoreConflict(
+                            "test attempt owner has no local account"
+                        ) from error
+                    try:
+                        for directory, child_directories, files in os.walk(
+                            staged, followlinks=False
+                        ):
+                            os.chown(directory, identity.pw_uid, identity.pw_gid)
+                            for name in (*child_directories, *files):
+                                os.chown(
+                                    Path(directory) / name,
+                                    identity.pw_uid,
+                                    identity.pw_gid,
+                                    follow_symlinks=False,
+                                )
+                    except OSError as error:
+                        raise TestStoreConflict(
+                            "immutable Python toolchain ownership could not be staged"
+                        ) from error
+                    staged_identity = cls._installation_manifest_identity(
+                        staged, kind="python-toolchain"
+                    )
+                    if staged_identity != (
+                        toolchain["installation_sha256"],
+                        toolchain["installation_files"],
+                        toolchain["installation_bytes"],
+                    ):
+                        raise TestStoreConflict(
+                            "staged immutable Python toolchain identity differs"
+                        )
                     link_target = Path(str(toolchain["link_target"]))
-                    destination = (
+                    link_destination = (
                         link_target.parent.parent
                         if link_target.parent.name == "bin"
                         else link_target.parent
                     )
-                    return _systemd_bind_mapping(
-                        "immutable Python toolchain", source, destination
+                    return (
+                        _systemd_bind_mapping(
+                            "immutable Python toolchain",
+                            staged,
+                            _IMMUTABLE_PYTHON_TOOLCHAIN_MOUNT,
+                        ),
+                        _systemd_bind_mapping(
+                            "immutable Python environment link",
+                            staged,
+                            link_destination,
+                        ),
                     )
-                return _systemd_bind_path("immutable .NET toolchain", source)
-            return None
+                return (_systemd_bind_path("immutable .NET toolchain", source),)
+            return ()
         executable: Path | None = None
         if executable is None:
             raw = descriptor.argv[0]
             if "/" not in raw:
-                return None
+                return ()
             executable = Path(raw)
             if not executable.is_absolute():
                 executable = execution_root / descriptor.cwd / executable
@@ -3196,12 +3297,14 @@ class SystemdTestAttemptManager:
             executable, execution_root=execution_root
         )
         if roots is None:
-            return None
+            return ()
         source, destination = roots
         if source == destination:
-            return _systemd_bind_path("external test toolchain", source)
-        return _systemd_bind_mapping(
-            "external test toolchain", source, destination
+            return (_systemd_bind_path("external test toolchain", source),)
+        return (
+            _systemd_bind_mapping(
+                "external test toolchain", source, destination
+            ),
         )
 
     @classmethod
@@ -3257,10 +3360,12 @@ class SystemdTestAttemptManager:
                 "--property=SupplementaryGroups="
                 + " ".join(str(value) for value in descriptor.supplementary_gids)
             )
-        external_toolchain = cls._external_toolchain_bind(
-            descriptor, execution_root=execution_root
+        external_toolchains = cls._external_toolchain_bind(
+            descriptor,
+            execution_root=execution_root,
+            state_root=output_root.parent,
         )
-        if external_toolchain is not None:
+        for external_toolchain in external_toolchains:
             properties.append(
                 f"--property=BindReadOnlyPaths={external_toolchain}"
             )
@@ -3541,6 +3646,45 @@ class SystemdTestAttemptManager:
             started_at=started_at,
         )
 
+    def _collected_status(self, runtime_id: str) -> NativeTestAttemptState:
+        """Drain a durable result after systemd has collected its unit."""
+
+        result_document = self._read_runner_result(runtime_id)
+        if result_document is None:
+            self._cleanup_attempt_resources(
+                runtime_id,
+                reason="attempt_not_found_terminal",
+            )
+            return NativeTestAttemptState(
+                runtime_id, False, False, "not-found", None
+            )
+        returncode = result_document.get("returncode")
+        if type(returncode) is not int:
+            raise TestStoreConflict("retained test runner result is invalid")
+        peak_memory_bytes, cpu_seconds = _runner_resource_usage(result_document)
+        try:
+            self._collect_result_artifacts(runtime_id, result_document)
+        finally:
+            self._cleanup_attempt_resources(
+                runtime_id, reason="attempt_terminal"
+            )
+        return NativeTestAttemptState(
+            runtime_id=runtime_id,
+            loaded=False,
+            active=False,
+            state="collected",
+            exit_status=returncode,
+            started_at=self._started.get(runtime_id),
+            finished_at=float(self.clock()),
+            result_document=result_document,
+            systemd_result="success" if returncode == 0 else "exit-code",
+            exec_main_code=1,
+            termination_reason="success" if returncode == 0 else "exit_code",
+            oom_killed=False,
+            peak_memory_bytes=peak_memory_bytes,
+            cpu_seconds=cpu_seconds,
+        )
+
     def status(self, runtime_id: str) -> NativeTestAttemptState:
         unit = self._unit(runtime_id)
         completed = self._run(
@@ -3575,41 +3719,7 @@ class SystemdTestAttemptManager:
             # record and owner-private, generation-bound runner result remain
             # authoritative and must be drained rather than downgraded to an
             # infrastructure failure merely because the unit was collected.
-            result_document = self._read_runner_result(runtime_id)
-            if result_document is None:
-                self._cleanup_attempt_resources(
-                    runtime_id,
-                    reason="attempt_not_found_terminal",
-                )
-                return NativeTestAttemptState(
-                    runtime_id, False, False, "not-found", None
-                )
-            returncode = result_document.get("returncode")
-            if type(returncode) is not int:
-                raise TestStoreConflict("retained test runner result is invalid")
-            peak_memory_bytes, cpu_seconds = _runner_resource_usage(result_document)
-            try:
-                self._collect_result_artifacts(runtime_id, result_document)
-            finally:
-                self._cleanup_attempt_resources(
-                    runtime_id, reason="attempt_terminal"
-                )
-            return NativeTestAttemptState(
-                runtime_id=runtime_id,
-                loaded=False,
-                active=False,
-                state="collected",
-                exit_status=returncode,
-                started_at=self._started.get(runtime_id),
-                finished_at=float(self.clock()),
-                result_document=result_document,
-                systemd_result="success" if returncode == 0 else "exit-code",
-                exec_main_code=1,
-                termination_reason="success" if returncode == 0 else "exit_code",
-                oom_killed=False,
-                peak_memory_bytes=peak_memory_bytes,
-                cpu_seconds=cpu_seconds,
-            )
+            return self._collected_status(runtime_id)
         fields: dict[str, str] = {}
         for line in completed.stdout.splitlines():
             if "=" in line:
@@ -3622,6 +3732,13 @@ class SystemdTestAttemptManager:
                 "native test attempt observation is incomplete: missing "
                 + ", ".join(missing)
             )
+        # ``systemctl show`` can itself succeed after ``--collect`` has
+        # unloaded a transient unit. In that case it returns a synthetic
+        # not-found record whose success/zero exit fields are defaults, not
+        # terminal evidence. Drain the generation-bound durable result just as
+        # when the observation command fails.
+        if fields["LoadState"] == "not-found":
+            return self._collected_status(runtime_id)
         # ``deactivating`` is a transitional state, not terminal evidence.
         # systemd can expose Result=success/ExecMainCode=0 while the unit is
         # still draining and before the runner has atomically published its

@@ -31,6 +31,9 @@ SYSTEMD_SHOW_FIELDS = (
     "InvocationID",
     "UnitFileState",
 )
+SYSTEMD_REQUIRED_SHOW_FIELDS = frozenset(
+    {"LoadState", "ActiveState", "SubState", "UnitFileState"}
+)
 
 
 class SystemdCommissioningError(RuntimeError):
@@ -243,7 +246,7 @@ def _systemd_state(
         key, separator, value = line.partition("=")
         if separator and key in SYSTEMD_SHOW_FIELDS:
             fields[key] = value
-    if result.returncode != 0 or set(fields) != set(SYSTEMD_SHOW_FIELDS):
+    if result.returncode != 0 or not SYSTEMD_REQUIRED_SHOW_FIELDS <= set(fields):
         if allow_unobservable:
             return {
                 "name": name,
@@ -258,7 +261,7 @@ def _systemd_state(
         "name": name,
         "observable": True,
         "returncode": int(result.returncode),
-        **fields,
+        **{field: fields.get(field) for field in SYSTEMD_SHOW_FIELDS},
     }
 
 

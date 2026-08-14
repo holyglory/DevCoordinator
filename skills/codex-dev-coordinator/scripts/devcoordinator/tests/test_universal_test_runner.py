@@ -505,6 +505,46 @@ class UniversalTestRunnerTests(unittest.TestCase):
         )
         self.assertEqual(observed.cpu_seconds, expected["cpu_seconds"])
 
+    def test_successful_not_found_observation_drains_durable_result(self) -> None:
+        descriptor = self.descriptor(("/usr/bin/python3", "-c", "pass"))
+        result_path = self.output / "result.json"
+        self.assertEqual(run(descriptor, self.output, result_path), 0)
+        expected = json.loads(result_path.read_text(encoding="utf-8"))
+
+        runtime_id = "devcoordinator-test-collected-not-found"
+        attempt_root = Path(self.temporary.name) / "not-found-attempts"
+        state_root = attempt_root / runtime_id
+        state_root.mkdir(parents=True)
+        shutil.copytree(self.output, state_root / "output", copy_function=shutil.copy2)
+        (state_root / "launch.json").write_text(
+            json.dumps({"descriptor": descriptor.to_document()}),
+            encoding="utf-8",
+        )
+
+        def collected(_argv, **_kwargs):
+            stdout = "\n".join((
+                "LoadState=not-found",
+                "ActiveState=inactive",
+                "SubState=dead",
+                "Result=success",
+                "ExecMainCode=0",
+                "ExecMainStatus=0",
+                "OOMKilled=no",
+            ))
+            return subprocess.CompletedProcess(_argv, 0, stdout, "")
+
+        manager = SystemdTestAttemptManager(
+            attempt_root=attempt_root,
+            artifact_root=Path(self.temporary.name) / "not-found-artifacts",
+            runner=collected,
+        )
+        observed = manager.status(runtime_id)
+
+        self.assertEqual(observed.state, "collected")
+        self.assertEqual(observed.exit_status, expected["returncode"])
+        self.assertEqual(observed.result_document, expected)
+        self.assertEqual(observed.termination_reason, "success")
+
     def test_loaded_unit_prefers_cgroup_usage_over_runner_fallback(self) -> None:
         descriptor = self.descriptor(("/usr/bin/python3", "-c", "pass"))
         result_path = self.output / "result.json"
@@ -816,6 +856,22 @@ class UniversalTestRunnerTests(unittest.TestCase):
             dotnet_environment["DOTNET_CLI_WORKLOAD_UPDATE_NOTIFY_DISABLE"], "1"
         )
 
+        dotnet_build = replace(
+            base,
+            argv=("/usr/bin/dotnet", "build", "App.slnx", "--no-restore"),
+            driver="automation",
+            reporter="automation-events",
+        )
+        build_argv, build_environment, _, build_kind = adapt_driver_invocation(
+            dotnet_build, self.output
+        )
+        self.assertEqual(build_argv, dotnet_build.argv)
+        self.assertEqual(build_kind, "jsonl")
+        self.assertEqual(
+            build_environment["DOTNET_CLI_HOME"],
+            str(self.output / "dotnet-cli-home"),
+        )
+
     def test_dotnet_clean_attempt_home_is_ready_before_project_execution(self) -> None:
         observed = self.root / "dotnet-observed.json"
         executable = self.fake_dotnet(
@@ -987,6 +1043,7 @@ class UniversalTestRunnerTests(unittest.TestCase):
                 "--configuration",
                 "Release",
                 "App.Tests.csproj",
+                "--no-build",
                 "--",
                 "--filter",
                 "Smoke",
@@ -1007,6 +1064,7 @@ class UniversalTestRunnerTests(unittest.TestCase):
             [["--version"], ["restore", str(project.resolve())], ["test", "--configuration"]],
         )
         self.assertIn("--no-restore", evidence["calls"][2]["argv"])
+        self.assertNotIn("--no-build", evidence["calls"][2]["argv"])
         self.assertLess(
             evidence["calls"][2]["argv"].index("--no-restore"),
             evidence["calls"][2]["argv"].index("--"),
@@ -1032,6 +1090,81 @@ class UniversalTestRunnerTests(unittest.TestCase):
         )
         result = json.loads(result_path.read_text(encoding="utf-8"))
         self.assertFalse(result["incomplete_reporting"])
+        self.assertEqual(self.result_cases(result_path)[0]["status"], "passed")
+
+    def test_immutable_automation_dotnet_build_restores_before_execution(self) -> None:
+        project = self.root / "EngineeringRegistry.slnx"
+        project.write_text("<Solution />", encoding="utf-8")
+        observed = self.root / "dotnet-build-observed.json"
+        executable = self.fake_dotnet(
+            f"""\
+            import json
+            import os
+            from pathlib import Path
+            import sys
+
+            marker = Path({str(observed)!r})
+            payload = json.loads(marker.read_text()) if marker.exists() else {{"calls": []}}
+            payload["calls"].append(sys.argv[1:])
+            marker.write_text(json.dumps(payload, sort_keys=True))
+            args = sys.argv[1:]
+            if args == ["--version"]:
+                raise SystemExit(0)
+            if args and args[0] == "restore":
+                packages = Path(args[args.index("--packages") + 1])
+                restored = packages / "demo.package" / "1.0.0"
+                restored.mkdir(parents=True)
+                (restored / "restored.txt").write_text("restored")
+                raise SystemExit(0)
+            if not args or args[0] != "build" or "--no-restore" not in args:
+                raise SystemExit(76)
+            if not (Path(os.environ["NUGET_PACKAGES"]) / "demo.package" / "1.0.0" / "restored.txt").is_file():
+                raise SystemExit(82)
+            event = {{
+                "case_id": "dotnet-automation-build",
+                "name": "dotnet automation build",
+                "status": "passed",
+                "duration_seconds": 0.01,
+                "location": "EngineeringRegistry.slnx",
+            }}
+            Path(os.environ["DEVCOORDINATOR_TEST_EVENTS"]).write_text(
+                json.dumps(event, sort_keys=True) + "\\n"
+            )
+            """
+        )
+        dotnet_executable = self.root / "dotnet"
+        executable.rename(dotnet_executable)
+        executable = dotnet_executable
+        typed_descriptor = self.immutable_dotnet_descriptor(
+            (str(executable), "build", project.name, "--no-restore")
+        )
+        package_root = Path(typed_descriptor.dependency_bindings[0]["source_root"])
+        account = SimpleNamespace(
+            pw_uid=os.geteuid(),
+            pw_dir=str(package_root.parents[1]),
+        )
+        with mock.patch(
+            "devcoordinator.universal_test_runtime.pwd.getpwall",
+            return_value=[account],
+        ):
+            descriptor = replace(
+                typed_descriptor,
+                driver="automation",
+                reporter="automation-events",
+                target_name="dotnet-automation-build",
+            )
+        result_path = self.output / "dotnet-automation-build-result.json"
+
+        self.assertEqual(
+            run(descriptor, self.output, result_path),
+            0,
+            self.result_diagnostic(descriptor, result_path),
+        )
+        evidence = json.loads(observed.read_text(encoding="utf-8"))
+        self.assertEqual(
+            [call[0] for call in evidence["calls"]],
+            ["--version", "restore", "build"],
+        )
         self.assertEqual(self.result_cases(result_path)[0]["status"], "passed")
 
     def test_dotnet_locked_restore_requires_one_stable_snapshot_project(self) -> None:
@@ -1098,6 +1231,14 @@ class UniversalTestRunnerTests(unittest.TestCase):
                 )
             ),
             ("-p:Configuration=Release",),
+        )
+        self.assertEqual(
+            _dotnet_restore_project(
+                ("/usr/bin/dotnet", "build", second.name, "--no-restore"),
+                cwd=self.root,
+                execution_root=self.root,
+            ),
+            second,
         )
         with self.assertRaisesRegex(TestStoreContractError, "missing its value"):
             _dotnet_restore_semantic_options(

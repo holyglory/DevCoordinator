@@ -27,6 +27,7 @@ import { createRouteStore } from '../src/routes.mjs';
 import { createUpstreamAuthStore } from '../src/upstream-auth.mjs';
 import { createAccessStore } from '../src/access.mjs';
 import { createBugStore } from '../src/bugs.mjs';
+import { createEfficiencyStore } from '../src/efficiency.mjs';
 import { createConsoleApi } from '../src/api.mjs';
 import { createStaticServer } from '../src/static.mjs';
 import { createTelegramService } from '../src/telegram.mjs';
@@ -379,12 +380,15 @@ export async function start({ envFile, env, overrides = {}, listenPorts } = {}) 
     log,
     originServerId: config.consoleHost,
   });
+  const efficiencyStore = config.efficiencyEnabled
+    ? createEfficiencyStore({ root: config.efficiencyRoot, log }) : null;
   const edgePublication = buildEdgePublication({
     config, log, coordinator, routeStore, upstreamAuthStore, accessStore,
   });
   const consoleApi = createConsoleApi({
     config, log, coordinator, routeStore, upstreamAuthStore, accessStore, guard, certManager, metrics, prefs, telegram,
     bugStore,
+    efficiencyStore,
     edgePublication,
   });
   const staticServer = createStaticServer({ dir: path.join(APP_ROOT, 'src', 'ui'), log });
@@ -564,12 +568,15 @@ async function main() {
     log,
     originServerId: config.consoleHost,
   });
+  const efficiencyStore = config.efficiencyEnabled
+    ? createEfficiencyStore({ root: config.efficiencyRoot, log }) : null;
   const edgePublication = buildEdgePublication({
     config, log, coordinator, routeStore, upstreamAuthStore, accessStore,
   });
   const consoleApi = createConsoleApi({
     config, log, coordinator, routeStore, upstreamAuthStore, accessStore, guard, certManager, metrics, prefs, telegram,
     bugStore,
+    efficiencyStore,
     edgePublication,
   });
   const staticServer = createStaticServer({ dir: path.join(APP_ROOT, 'src', 'ui'), log });

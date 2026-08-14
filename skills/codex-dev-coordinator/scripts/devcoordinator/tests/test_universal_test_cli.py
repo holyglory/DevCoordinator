@@ -764,6 +764,53 @@ class UniversalTestCliTests(unittest.TestCase):
             },
         )
 
+    def test_wait_retries_transient_scheduler_replacement_failures(self) -> None:
+        now = [100.0]
+
+        class RecoveringProfile:
+            wait_test_run = BrokerClientProfile.wait_test_run
+
+            def __init__(self) -> None:
+                self.reads = 0
+
+            def test_run_status(
+                self,
+                *,
+                repository: str,
+                run_id: str,
+                transport_timeout_seconds: float | None = None,
+            ) -> dict[str, object]:
+                del repository, run_id, transport_timeout_seconds
+                self.reads += 1
+                if self.reads == 1:
+                    raise BrokerError(
+                        "test_scheduler_unavailable", "testd is restarting"
+                    )
+                if self.reads == 2:
+                    raise ConnectionResetError("authority is restarting")
+                return {"run_id": "run-preserved", "state": "succeeded"}
+
+        profile = RecoveringProfile()
+        with (
+            mock.patch.object(
+                broker_profile_module.time, "monotonic", side_effect=lambda: now[0]
+            ),
+            mock.patch.object(
+                broker_profile_module.time,
+                "sleep",
+                side_effect=lambda delay: now.__setitem__(0, now[0] + delay),
+            ),
+        ):
+            result = profile.wait_test_run(
+                repository=REPOSITORY_ID,
+                run_id="run-preserved",
+                timeout_seconds=3,
+            )
+
+        self.assertEqual(profile.reads, 3)
+        self.assertEqual(result["state"], "succeeded")
+        self.assertNotIn("wait_timed_out", result)
+
     def test_zero_wait_deadline_performs_no_status_read(self) -> None:
         profile = FailedWaitProfile()
 

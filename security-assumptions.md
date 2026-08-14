@@ -146,6 +146,13 @@ new gate.
   repository association or the account/agent that created it. The benefit is a
   substantially simpler, faster, and more reliable single-developer control
   plane without administrator provisioning or false cross-repository denials.
+- Delivery-efficiency repository projections are non-secret coordination and
+  accounting metadata under this same trust decision. They may be readable
+  across these local accounts only as strict bounded aggregates with opaque
+  source identity and explicit unknown-counter coverage; prompts, source
+  content, paths, credentials, personal data, and raw recorder events remain
+  outside Coordinator. Revisit this projection if local accounts become
+  mutually distrusting or the data boundary expands.
 - The developer explicitly accepts that any local agent can remove any selected
   Docker container on this server in one call, including a running, mounted,
   Compose-managed, database-bound, or differently attributed container. This

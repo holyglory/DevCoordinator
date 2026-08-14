@@ -17,7 +17,9 @@ import zipfile
 
 from devcoordinator import universal_test_snapshot
 from devcoordinator.universal_test_contract import parse_test_manifest
+from devcoordinator.universal_test_runner import _immutable_python_launch_executable
 from devcoordinator.universal_test_runtime import (
+    _IMMUTABLE_PYTHON_TOOLCHAIN_MOUNT,
     SystemdTestAttemptManager,
     TestAttemptDescriptor,
 )
@@ -368,8 +370,19 @@ class ImmutableDependencyBindingTests(unittest.TestCase):
             output_root=self.base / "python-output",
         )
         self.assertIn(
-            f"--property=BindReadOnlyPaths={toolchain}:{alias}",
+            "--property=BindReadOnlyPaths="
+            f"{self.base / 'immutable-python-toolchain'}:"
+            f"{_IMMUTABLE_PYTHON_TOOLCHAIN_MOUNT}",
             properties,
+        )
+        self.assertIn(
+            "--property=BindReadOnlyPaths="
+            f"{self.base / 'immutable-python-toolchain'}:{alias}",
+            properties,
+        )
+        self.assertEqual(
+            _immutable_python_launch_executable(descriptor),
+            str(_IMMUTABLE_PYTHON_TOOLCHAIN_MOUNT / "bin" / "python3.13"),
         )
         replacement_root = toolchain.parent / "replacement"
         replacement = replacement_root / "bin" / "python3.13"
@@ -869,6 +882,47 @@ class ImmutableDependencyBindingTests(unittest.TestCase):
         expected = alternate_home / ".dotnet" / "dotnet"
         self.assertEqual(executable, str(expected))
         self.assertEqual(toolchains[0]["source_root"], str(expected.parent))
+
+    def test_dotnet_target_uses_system_toolchain_for_requested_sdk(self) -> None:
+        owner_uid = 12003
+        owner_home = self.base / "incomplete-dotnet-home"
+        owner_executable = owner_home / ".dotnet" / "dotnet"
+        owner_executable.parent.mkdir(parents=True)
+        owner_executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        owner_executable.chmod(0o755)
+        system_root = self.base / "system-dotnet"
+        system_executable = system_root / "dotnet"
+        system_executable.parent.mkdir(parents=True)
+        system_executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        system_executable.chmod(0o755)
+        (system_root / "sdk" / "10.0.302").mkdir(parents=True)
+        global_json = self.original / "global.json"
+        global_json.write_text(
+            '{"sdk":{"version":"10.0.302","rollForward":"disable"}}\n',
+            encoding="utf-8",
+        )
+        (self.materialized / "global.json").write_bytes(global_json.read_bytes())
+        account = SimpleNamespace(pw_dir=str(owner_home))
+
+        with mock.patch(
+            "devcoordinator.universal_test_snapshot_service.pwd.getpwuid",
+            return_value=account,
+        ), mock.patch(
+            "devcoordinator.universal_test_snapshot_service.shutil.which",
+            return_value=str(system_executable),
+        ):
+            _bindings, _python, executable, toolchains = self.derive(
+                {
+                    "driver": "dotnet",
+                    "cwd": ".",
+                    "argv": ["{dotnet}", "test", "src/App.sln"],
+                },
+                account_uids=(),
+                full=True,
+            )
+
+        self.assertEqual(executable, str(system_executable))
+        self.assertEqual(toolchains[0]["source_root"], str(system_root))
 
 
 if __name__ == "__main__":

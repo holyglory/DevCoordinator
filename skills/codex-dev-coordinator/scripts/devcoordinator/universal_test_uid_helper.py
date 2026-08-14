@@ -44,6 +44,7 @@ if __package__ in {None, ""}:
 
 from devcoordinator.universal_test_contract import (  # type: ignore[import-not-found]
     MAX_MANIFEST_BYTES,
+    ManifestContractError,
     SourceMode,
     TestManifest,
     parse_test_manifest,
@@ -958,7 +959,22 @@ def _manifest(root: Path):
     raw = GitSnapshotSource._read_exact_regular(
         root, entry, maximum_bytes=MAX_MANIFEST_BYTES
     )
-    return parse_test_manifest(json.loads(raw.decode("utf-8")), repository_root=root)
+    try:
+        document = json.loads(raw.decode("utf-8"))
+        return parse_test_manifest(document, repository_root=root)
+    except ManifestContractError as error:
+        raise SnapshotMaterializationError(
+            f"snapshot test manifest is invalid: {error}"
+        ) from error
+    except json.JSONDecodeError as error:
+        raise SnapshotMaterializationError(
+            "snapshot test manifest is invalid: "
+            f"JSON {error.msg} at line {error.lineno}, column {error.colno}"
+        ) from error
+    except UnicodeError as error:
+        raise SnapshotMaterializationError(
+            "snapshot test manifest is invalid"
+        ) from error
 
 
 def _source(value: object) -> SourceIdentity:

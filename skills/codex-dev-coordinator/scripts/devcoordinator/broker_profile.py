@@ -51,6 +51,16 @@ REPOSITORY_PROFILE_FIELDS = frozenset(
 REPOSITORY_ENSURE_EVIDENCE_FIELDS = frozenset({"execution_uid"})
 HOST_OBSERVE_CLIENT_TIMEOUT_SECONDS = 11 * 60.0
 INVENTORY_READ_CLIENT_TIMEOUT_SECONDS = 60.0
+TEST_CATALOG_READ_CLIENT_TIMEOUT_SECONDS = 60.0
+TEST_SETUP_READ_CLIENT_TIMEOUT_SECONDS = 60.0
+_TRANSIENT_TEST_WAIT_CODES = frozenset(
+    {
+        "maintenance_in_progress",
+        "request_timeout",
+        "server_busy",
+        "test_scheduler_unavailable",
+    }
+)
 SYSTEM_PROFILE_PATH = Path(
     "/private/etc/devcoordinator/client-profiles.json"
     if sys.platform == "darwin"
@@ -1013,14 +1023,18 @@ class BrokerClientProfile:
                 }
                 status = self.test_run_status(**status_arguments)
             except BrokerError as error:
-                if error.code != "request_timeout":
+                if error.code not in _TRANSIENT_TEST_WAIT_CODES:
                     raise
-                if deadline - time.monotonic() <= 0:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
                     return timed_out()
+                time.sleep(min(0.25, remaining))
                 continue
-            except TimeoutError:
-                if deadline - time.monotonic() <= 0:
+            except OSError:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
                     return timed_out()
+                time.sleep(min(0.25, remaining))
                 continue
             if str(status.get("state") or status.get("status") or "") in terminal:
                 return status
@@ -1158,6 +1172,16 @@ def _broker_client_timeout_seconds(
         return HOST_OBSERVE_CLIENT_TIMEOUT_SECONDS
     if operation is BrokerOperation.INVENTORY_READ:
         return INVENTORY_READ_CLIENT_TIMEOUT_SECONDS
+    if operation is BrokerOperation.TEST_REPOSITORY_CATALOG:
+        return TEST_CATALOG_READ_CLIENT_TIMEOUT_SECONDS
+    if operation is BrokerOperation.TEST_REPOSITORY_SETUP:
+        return TEST_SETUP_READ_CLIENT_TIMEOUT_SECONDS
+    if operation is BrokerOperation.TEST_RUN_SUBMIT:
+        # Submission is logically short but can contend with post-restart
+        # snapshot/test-store recovery. Preserve its durable run handle rather
+        # than replacing a healthy delayed reply with the generic ten-second
+        # transport deadline.
+        return 60.0
     if operation in {
         BrokerOperation.EPHEMERAL_START,
         BrokerOperation.EPHEMERAL_IMAGE_PREFETCH,
@@ -1173,10 +1197,13 @@ def _broker_client_timeout_seconds(
         BrokerOperation.REPOSITORY_ENSURE,
         BrokerOperation.RESOURCE_ATTACH,
         BrokerOperation.RESOURCE_RETIRE,
-        BrokerOperation.RUNTIME_ENSURE,
-        BrokerOperation.RUNTIME_REQUEST,
     }:
         return 60.0
+    if operation is BrokerOperation.RUNTIME_ENSURE:
+        return 5 * 60.0
+    if operation is BrokerOperation.RUNTIME_REQUEST:
+        action = None if arguments is None else arguments.get("action")
+        return 60.0 if action in {"status", "capture_logs"} else 5 * 60.0
     return 10.0
 
 

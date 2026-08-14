@@ -463,7 +463,7 @@ def profile_inventory_readiness(
             "inventory_sha256": "e" * 64,
             "inventory_schema_version": 2,
             "inventory_scope": "server-wide",
-            "inventory_transport": "trusted-local-unix-socket",
+            "inventory_transport": "authenticated-unix-socket",
             "inventory_service_uid": 0,
             "inventory_database_generation": TARGET_AUTHORITY_GENERATION,
             "verified_at": "2026-07-28T00:05:30Z",
@@ -1901,7 +1901,7 @@ class CutoverTransitionTests(unittest.TestCase):
             finalizer["hard_gate"],
             {
                 "scope": "server-wide",
-                "transport": "trusted-local-unix-socket",
+                "transport": "authenticated-unix-socket",
                 "canonical_project": "<canonical-global-finance-project-root>",
                 "repository_id": "<global-finance-repository-id>",
                 "users": [

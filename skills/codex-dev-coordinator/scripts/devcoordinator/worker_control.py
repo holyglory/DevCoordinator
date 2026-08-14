@@ -36,6 +36,7 @@ from .worker_supervision import (
     WorkerNotConfigured,
     WorkerSupervision,
     WorkerSupervisionConflict,
+    WorkerSupervisionError,
 )
 
 
@@ -53,6 +54,10 @@ class WorkerReplaceError(WorkerControlError):
 
 ManagerFactory = Callable[..., Any]
 ProcessObserver = Callable[[int, str], str]
+STARTUP_AUTOSTART_ATTEMPTS = 3
+STARTUP_AUTOSTART_RETRY_SECONDS = 0.25
+STARTUP_CONVERGENCE_SECONDS = 60.0
+STARTUP_CONVERGENCE_POLL_SECONDS = 0.1
 
 
 class WorkerController:
@@ -620,11 +625,30 @@ class WorkerController:
     def reconcile_startup(self, *, supervisor_epoch: str) -> dict[str, Any]:
         """Fence the old authority generation, then start safe keep-alive workers."""
 
-        registrations: list[tuple[str, int, str | None]] = []
+        fenced = self.fence_startup(supervisor_epoch=supervisor_epoch)
+        autostarted = self.autostart_fenced(
+            supervisor_epoch=supervisor_epoch,
+            expected_worker_ids=fenced["autostart_expected"],
+        )
+        errors = [*fenced["errors"], *autostarted["errors"]]
+        return {
+            "ok": not errors,
+            "supervisor_epoch": supervisor_epoch,
+            "fenced_old_runners": fenced["fenced_old_runners"],
+            "started": autostarted["started"],
+            "errors": errors,
+        }
+
+    def fence_startup(self, *, supervisor_epoch: str) -> dict[str, Any]:
+        """Fence old runner generations before the new broker admits calls."""
+
+        registrations: list[tuple[str, int, str | None, bool]] = []
         with self.store.read_transaction() as connection:
             for row in connection.execute(
                 """
                 SELECT policy.server_definition_id, policy.execution_uid,
+                       policy.keep_alive, policy.desired_state,
+                       policy.breaker_state,
                        supervisor.current_attempt_id
                 FROM worker_policies policy
                 JOIN worker_supervisor_states supervisor
@@ -640,14 +664,34 @@ class WorkerController:
                             if row["current_attempt_id"] is None
                             else str(row["current_attempt_id"])
                         ),
+                        bool(
+                            row["keep_alive"]
+                            and str(row["desired_state"]) == "running"
+                            and str(row["breaker_state"]) == "armed"
+                        ),
                     )
                 )
         self.supervision.fence_startup(supervisor_epoch=supervisor_epoch)
         stopped_old: list[str] = []
+        autostart_expected: list[str] = []
         errors: list[dict[str, str]] = []
-        for worker_id, uid, attempt_id in registrations:
+        for worker_id, uid, attempt_id, should_autostart in registrations:
+            # Preserve the durable desired-running set independently from the
+            # first native cleanup observation. A runner can still be exiting
+            # when authority admission begins; bounded post-admission
+            # convergence must retain and recheck that exact worker instead of
+            # silently dropping it because one removal observation was early.
+            if should_autostart:
+                autostart_expected.append(worker_id)
             try:
-                removed = self._native_remove(worker_id=worker_id, uid=uid)
+                try:
+                    removed = self._native_remove(worker_id=worker_id, uid=uid)
+                except BaseException:
+                    # A transient native-manager reply may be lost after it
+                    # already removed the exact registration. Reobserve the
+                    # immutable unit before deciding whether startup fencing
+                    # actually failed.
+                    removed = self._native_status(worker_id=worker_id, uid=uid)
                 if removed.loaded or removed.active:
                     raise WorkerControlError(
                         "native worker registration remained after startup fencing"
@@ -656,6 +700,10 @@ class WorkerController:
                     self._settle_stopped_runner(
                         worker_id=worker_id, evidence_key=supervisor_epoch
                     )
+                self.supervision.normalize_startup_absence(
+                    server_definition_id=worker_id,
+                    supervisor_epoch=supervisor_epoch,
+                )
                 stopped_old.append(worker_id)
             except BaseException as error:
                 errors.append(
@@ -665,33 +713,184 @@ class WorkerController:
                         "error": f"{type(error).__name__}: {error}",
                     }
                 )
-        candidates = self.supervision.startup_candidates(
-            supervisor_epoch=supervisor_epoch
-        )
-        started: list[dict[str, Any]] = []
-        for candidate in candidates:
-            worker_id = str(candidate["server_definition_id"])
-            try:
-                user = pwd.getpwuid(int(candidate["execution_uid"]))
-                native = self._manager_instance().start(
-                    worker_id=worker_id,
-                    uid=int(candidate["execution_uid"]),
-                    gid=int(user.pw_gid),
-                    repository_id=str(candidate["repo_id"]),
-                )
-                started.append(native.to_dict())
-            except BaseException as error:
-                errors.append(
-                    {
-                        "worker_id": worker_id,
-                        "phase": "autostart",
-                        "error": f"{type(error).__name__}: {error}",
-                    }
-                )
         return {
             "ok": not errors,
             "supervisor_epoch": supervisor_epoch,
             "fenced_old_runners": stopped_old,
+            "autostart_expected": autostart_expected,
+            "started": [],
+            "errors": errors,
+        }
+
+    def autostart_fenced(
+        self,
+        *,
+        supervisor_epoch: str,
+        expected_worker_ids: list[str] | tuple[str, ...] | None = None,
+    ) -> dict[str, Any]:
+        """Start fenced keep-alive candidates after broker admission is live."""
+
+        remaining = (
+            None
+            if expected_worker_ids is None
+            else {str(worker_id) for worker_id in expected_worker_ids}
+        )
+        started: list[dict[str, Any]] = []
+        errors: list[dict[str, str]] = []
+        convergence_errors: dict[str, str] = {}
+        deadline = self.clock() + STARTUP_CONVERGENCE_SECONDS
+        while remaining is None or remaining:
+            if remaining is not None:
+                for worker_id in sorted(remaining):
+                    try:
+                        policy = self._require_policy(worker_id)
+                        uid = int(policy["execution_uid"])
+                        native = self._native_status(worker_id=worker_id, uid=uid)
+                        current_attempt_id = policy.get("current_attempt_id")
+                        current_attempt = (
+                            None
+                            if current_attempt_id is None
+                            else self.supervision.attempt(str(current_attempt_id))
+                        )
+                        if (
+                            native.active
+                            and current_attempt is not None
+                            and str(current_attempt.get("state") or "") == "running"
+                            and str(current_attempt.get("supervisor_epoch") or "")
+                            == supervisor_epoch
+                        ):
+                            started.append(
+                                {
+                                    **native.to_dict(),
+                                    "startup_attempts": 0,
+                                    "recovered_existing": True,
+                                }
+                            )
+                            remaining.discard(worker_id)
+                            convergence_errors.pop(worker_id, None)
+                            continue
+                        if native.loaded or native.active:
+                            removed = self._native_remove(
+                                worker_id=worker_id, uid=uid
+                            )
+                            if removed.loaded or removed.active:
+                                raise WorkerControlError(
+                                    "old native worker registration remained during startup convergence"
+                                )
+                        if current_attempt_id is not None:
+                            self._settle_stopped_runner(
+                                worker_id=worker_id,
+                                evidence_key=f"{supervisor_epoch}-convergence",
+                            )
+                        self.supervision.normalize_startup_absence(
+                            server_definition_id=worker_id,
+                            supervisor_epoch=supervisor_epoch,
+                        )
+                        convergence_errors.pop(worker_id, None)
+                    except BaseException as error:
+                        convergence_errors[worker_id] = (
+                            f"{type(error).__name__}: {error}"
+                        )[:4096]
+            candidates = self.supervision.startup_candidates(
+                supervisor_epoch=supervisor_epoch
+            )
+            if remaining is not None:
+                candidates = [
+                    candidate
+                    for candidate in candidates
+                    if str(candidate["server_definition_id"]) in remaining
+                ]
+            if remaining is None and not candidates:
+                break
+            for candidate in candidates:
+                worker_id = str(candidate["server_definition_id"])
+                uid = int(candidate["execution_uid"])
+                user = pwd.getpwuid(uid)
+                attempt_errors: list[str] = []
+                for attempt_number in range(1, STARTUP_AUTOSTART_ATTEMPTS + 1):
+                    try:
+                        native = self._manager_instance().start(
+                            worker_id=worker_id,
+                            uid=uid,
+                            gid=int(user.pw_gid),
+                            repository_id=str(candidate["repo_id"]),
+                        )
+                        started.append(
+                            {
+                                **native.to_dict(),
+                                "startup_attempts": attempt_number,
+                            }
+                        )
+                        break
+                    except BaseException as error:
+                        attempt_errors.append(f"{type(error).__name__}: {error}")
+                        if attempt_number >= STARTUP_AUTOSTART_ATTEMPTS:
+                            errors.append(
+                                {
+                                    "worker_id": worker_id,
+                                    "phase": "autostart",
+                                    "error": (
+                                        f"failed after {attempt_number} bounded attempts; "
+                                        + attempt_errors[-1]
+                                    )[:4096],
+                                }
+                            )
+                            break
+                        try:
+                            removed = self._native_remove(worker_id=worker_id, uid=uid)
+                            if removed.loaded or removed.active:
+                                raise WorkerControlError(
+                                    "native worker registration remained after failed autostart"
+                                )
+                            policy = self._policy_or_none(worker_id)
+                            if (
+                                policy is not None
+                                and policy.get("current_attempt_id") is not None
+                            ):
+                                self._settle_stopped_runner(
+                                    worker_id=worker_id,
+                                    evidence_key=(
+                                        f"{supervisor_epoch}-autostart-{attempt_number}"
+                                    ),
+                                )
+                        except BaseException as cleanup_error:
+                            errors.append(
+                                {
+                                    "worker_id": worker_id,
+                                    "phase": "autostart_cleanup",
+                                    "error": (
+                                        f"{type(cleanup_error).__name__}: {cleanup_error}"
+                                    )[:4096],
+                                }
+                            )
+                            break
+                        self.sleeper(
+                            STARTUP_AUTOSTART_RETRY_SECONDS * attempt_number
+                        )
+                if remaining is not None:
+                    remaining.discard(worker_id)
+            if remaining is None or not remaining:
+                break
+            if self.clock() >= deadline:
+                for worker_id in sorted(remaining):
+                    policy = self._policy_or_none(worker_id)
+                    errors.append(
+                        {
+                            "worker_id": worker_id,
+                            "phase": "autostart_convergence",
+                            "error": (
+                                "desired keep-alive worker did not become launchable; "
+                                f"supervisor_state={None if policy is None else policy.get('supervisor_state')}; "
+                                f"last_observation={convergence_errors.get(worker_id, 'none')}"
+                            )[:4096],
+                        }
+                    )
+                break
+            self.sleeper(STARTUP_CONVERGENCE_POLL_SECONDS)
+        return {
+            "ok": not errors,
+            "supervisor_epoch": supervisor_epoch,
+            "fenced_old_runners": [],
             "started": started,
             "errors": errors,
         }
@@ -770,7 +969,7 @@ class WorkerController:
         normalized_environment = dict(sorted(environment.items()))
         definition = {
             "name": str(context["name"]),
-            "role": "worker",
+            "role": str(context.get("role") or ""),
             "cwd": str(resolved_cwd),
             "argv": list(normalized_argv),
             "environment": normalized_environment,
@@ -859,7 +1058,7 @@ class WorkerController:
             if (
                 str(row["repo_id"]) != str(context["repo_id"])
                 or str(row["name"]) != str(context["name"])
-                or str(row["role"] or "").lower() != "worker"
+                or str(row["role"] or "") != str(context.get("role") or "")
             ):
                 raise WorkerControlError(
                     "worker immutable identity changed during replacement"
@@ -883,7 +1082,7 @@ class WorkerController:
                 SET cwd = ?, definition_fingerprint = ?,
                     generation = generation + 1, updated_at = ?
                 WHERE server_definition_id = ? AND repo_id = ?
-                  AND name = ? AND lower(role) = 'worker' AND generation = ?
+                  AND name = ? AND COALESCE(role, '') = ? AND generation = ?
                 """,
                 (
                     str(replacement["cwd"]),
@@ -892,6 +1091,7 @@ class WorkerController:
                     worker_id,
                     str(context["repo_id"]),
                     str(context["name"]),
+                    str(context.get("role") or ""),
                     expected_generation,
                 ),
             ).rowcount
@@ -1157,7 +1357,7 @@ class WorkerController:
                     definition_fingerprint = ?, generation = generation + 1,
                     updated_at = ?
                 WHERE server_definition_id = ? AND repo_id = ? AND name = ?
-                  AND lower(role) = 'worker' AND generation = ?
+                  AND COALESCE(role, '') = ? AND generation = ?
                 """,
                 (
                     snapshot["cwd"],
@@ -1168,6 +1368,7 @@ class WorkerController:
                     worker_id,
                     context["repo_id"],
                     context["name"],
+                    str(snapshot.get("role") or ""),
                     expected_generation,
                 ),
             ).rowcount
@@ -1500,7 +1701,9 @@ class WorkerController:
                        scope.family_id, scope.project_kind,
                        family.root_repo_id,
                        observation.lifecycle AS observed_lifecycle,
-                       observation.pid AS observed_pid
+                       observation.pid AS observed_pid,
+                       observation.process_start_time AS observed_process_start_time,
+                       observation.process_fingerprint AS observed_process_fingerprint
                 FROM server_definitions definition
                 JOIN repositories repository USING(repo_id)
                 JOIN repository_installations installation USING(repo_id)
@@ -1635,7 +1838,43 @@ class WorkerController:
         attempt = None
         if policy is not None and policy.get("current_attempt_id") is not None:
             attempt = self.supervision.attempt(str(policy["current_attempt_id"]))
-        running = state == "running" and attempt is not None
+        attempt_pid = None if attempt is None else attempt.get("pid")
+        attempt_start = (
+            None if attempt is None else attempt.get("process_start_time")
+        )
+        attempt_running = bool(
+            state == "running"
+            and attempt is not None
+            and attempt.get("state") == "running"
+            and type(attempt_pid) is int
+            and attempt_pid > 1
+            and isinstance(attempt_start, str)
+            and attempt_start
+        )
+        observed_pid = context.get("observed_pid")
+        observed_start = context.get("observed_process_start_time")
+        native_active = bool(
+            isinstance(native, Mapping) and native.get("active") is True
+        )
+        observed_running = bool(
+            policy is not None
+            and str(policy.get("desired_state") or "") == "running"
+            and native_active
+            and self._observed_process_active(context)
+            and type(observed_pid) is int
+            and observed_pid > 1
+            and isinstance(observed_start, str)
+            and observed_start
+            and self.process_observer(observed_pid, observed_start) == "alive"
+        )
+        running = attempt_running or observed_running
+        process_source = (
+            "active_attempt"
+            if attempt_running
+            else "fixed_runner_observation"
+            if observed_running
+            else None
+        )
         return {
             "ok": policy is not None and state in {"running", "stopped"},
             "id": str(context["server_definition_id"]),
@@ -1647,18 +1886,27 @@ class WorkerController:
             "project_kind": str(context["project_kind"]),
             "generation": int(context["generation"]),
             "status": "running" if running else "stopped" if state == "stopped" else state,
-            "pid": None if attempt is None else attempt.get("pid"),
+            "pid": attempt_pid if attempt_running else observed_pid if observed_running else None,
             "process_start_time": (
-                None if attempt is None else attempt.get("process_start_time")
+                attempt_start
+                if attempt_running
+                else observed_start
+                if observed_running
+                else None
             ),
             "process_fingerprint": (
-                None if attempt is None else attempt.get("process_fingerprint")
+                attempt.get("process_fingerprint")
+                if attempt_running
+                else context.get("observed_process_fingerprint")
+                if observed_running
+                else None
             ),
             "health": {
                 "ok": bool(running),
                 "classification": (
                     "supervised_process_running" if running else state
                 ),
+                "process_source": process_source,
             },
             "supervision": None if policy is None else dict(policy),
             "native_runner": None if native is None else dict(native),

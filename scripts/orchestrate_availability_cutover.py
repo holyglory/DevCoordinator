@@ -2284,7 +2284,7 @@ def _validate_routing_inventory(
         inventory.get("schema_version") != 2
         or not isinstance(authority, Mapping)
         or authority.get("scope") != "server-wide"
-        or authority.get("transport") != "trusted-local-unix-socket"
+        or authority.get("transport") != "authenticated-unix-socket"
         or authority.get("socket") != AUTHORITY_SOCKET_PATH
         or authority.get("service_uid") != authority_uid
         or authority.get("database_generation") != authority_generation
@@ -2427,7 +2427,7 @@ def verify_profile_inventory_readiness(
             "inventory_sha256": _digest(inventory),
             "inventory_schema_version": 2,
             "inventory_scope": "server-wide",
-            "inventory_transport": "trusted-local-unix-socket",
+            "inventory_transport": "authenticated-unix-socket",
             "inventory_service_uid": authority_uid,
             "inventory_database_generation": repair["authority_generation"],
             "verified_at": _now() if verified_at is None else verified_at,
@@ -10524,7 +10524,7 @@ def transition(
             or re.fullmatch(r"[0-9a-f]{64}", str(normalized["inventory_sha256"])) is None
             or normalized["inventory_schema_version"] != 2
             or normalized["inventory_scope"] != "server-wide"
-            or normalized["inventory_transport"] != "trusted-local-unix-socket"
+            or normalized["inventory_transport"] != "authenticated-unix-socket"
             or normalized["inventory_service_uid"] != current["authority_uid"]
             or normalized["inventory_database_generation"] != normalized["authority_generation"]
         ):

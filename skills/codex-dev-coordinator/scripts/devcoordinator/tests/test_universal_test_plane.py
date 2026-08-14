@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 from pathlib import Path
 import sqlite3
@@ -27,6 +28,7 @@ from devcoordinator.universal_test_scheduler import (
 from devcoordinator.universal_test_service import (
     RepositoryUIDPlanPreviewer,
     StoreTestPlaneAdapter,
+    verified_text_artifact_content,
     TestPlaneClient,
     TestPlanPreviewUnavailable,
     decode_test_plan_document,
@@ -640,7 +642,6 @@ class UniversalTestStoreTests(StoreFixture):
                 generation=grant.generation,
                 chunk=oversized,
             )
-
         self.store.terminalize_attempt(
             grant.attempt_id,
             generation=grant.generation,
@@ -655,6 +656,100 @@ class UniversalTestStoreTests(StoreFixture):
             chunk=chunk,
         )
         self.assertTrue(terminal_replay["replayed"])
+
+    def test_adapter_returns_integrity_verified_bounded_text_artifact_tail(self) -> None:
+        submitted = self.submit()
+        grant = self.lease_lint(submitted.run_id)
+        self.store.acknowledge_launch(
+            grant.attempt_id,
+            generation=grant.generation,
+            launch_ack_id="launch-artifact-tail",
+            operation_id=operation_id(),
+        )
+        payload = b"discarded-prefix\n" + b"x" * 5000 + b"\nexact-tail\n"
+        digest = hashlib.sha256(payload).hexdigest()
+        artifact_id = "artifact-" + uuid.uuid4().hex
+        artifact_root = Path(self.temporary.name) / "artifacts"
+        artifact_root.mkdir()
+        (artifact_root / f"{artifact_id}-{digest}.blob").write_bytes(payload)
+        self.store.append_result_chunk(
+            grant.attempt_id,
+            generation=grant.generation,
+            chunk=AttemptResultChunk(
+                chunk_id="artifact-tail",
+                chunk_index=0,
+                artifacts=(
+                    ArtifactMetadata(
+                        artifact_id,
+                        "log",
+                        f"test-artifact://{artifact_id}/{digest}",
+                        digest,
+                        len(payload),
+                    ),
+                ),
+                reporter_complete=True,
+            ),
+        )
+        adapter = StoreTestPlaneAdapter(self.store)
+
+        resolved = adapter.artifact(
+            run_id=submitted.run_id,
+            repository_id="repo-tests",
+            artifact_id=artifact_id,
+        )
+
+        self.assertTrue(resolved["ok"])
+        self.assertNotIn("artifact_content", resolved)
+        content = verified_text_artifact_content(
+            resolved["artifact"], artifact_root=artifact_root
+        )
+        self.assertEqual(content["artifact_id"], artifact_id)
+        self.assertEqual(content["sha256"], digest)
+        self.assertEqual(content["size_bytes"], len(payload))
+        self.assertTrue(content["truncated"])
+        self.assertTrue(content["text"].endswith("exact-tail\n"))
+        self.assertNotIn("discarded-prefix", content["text"])
+
+    def test_status_exposes_advancing_active_attempt_liveness(self) -> None:
+        submitted = self.submit()
+        grant = self.lease_lint(submitted.run_id, seconds=30)
+        self.store.acknowledge_launch(
+            grant.attempt_id,
+            generation=grant.generation,
+            launch_ack_id="launch-liveness",
+            operation_id=operation_id(),
+        )
+        adapter = StoreTestPlaneAdapter(self.store)
+        before = adapter.status(
+            run_id=submitted.run_id, repository_id="repo-tests"
+        )
+        self.clock.advance(5)
+        self.store.heartbeat_attempt(
+            grant.attempt_id,
+            generation=grant.generation,
+            lease_seconds=30,
+            operation_id=operation_id(),
+        )
+        after = adapter.status(
+            run_id=submitted.run_id, repository_id="repo-tests"
+        )
+        before_active = next(
+            item["active_attempt"]
+            for item in before["targets"]
+            if item["target_name"] == "lint"
+        )
+        after_active = next(
+            item["active_attempt"]
+            for item in after["targets"]
+            if item["target_name"] == "lint"
+        )
+        self.assertEqual(after_active["attempt_id"], grant.attempt_id)
+        self.assertGreater(
+            after_active["heartbeat_at"], before_active["heartbeat_at"]
+        )
+        self.assertGreater(
+            after_active["lease_expires_at"], before_active["lease_expires_at"]
+        )
 
     def test_incomplete_reporting_is_not_published_as_success(self) -> None:
         submitted = self.submit()

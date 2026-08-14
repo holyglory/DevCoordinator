@@ -171,6 +171,9 @@ from devcoordinator.repository_context import (
     resolve_effective_repository_context,
     resolve_repository_context,
 )
+from devcoordinator.universal_test_repository_binding import (
+    resolve_immutable_repository_binding,
+)
 from devcoordinator.runtime_api import (
     MAX_RUNTIME_TTL_SECONDS,
     RuntimeCallbacks,
@@ -2739,7 +2742,16 @@ def canonical_project(project: str, *, refresh: bool = False) -> str:
     marker is a file rather than a directory.
     """
 
-    raw = Path(project or os.getcwd()).expanduser().resolve()
+    expanded = Path(project or os.getcwd()).expanduser()
+    try:
+        raw = expanded.resolve()
+    except (OSError, RuntimeError):
+        if not expanded.is_absolute():
+            raise
+        # Broker-known absolute repository paths are opaque routing values on
+        # this single-developer host. A client does not need local traversal
+        # permission to address one.
+        raw = Path(os.path.abspath(os.fspath(expanded)))
     cache_key = str(raw)
     cached = _PROJECT_ROOT_CACHE.get(cache_key)
     if cached and not refresh:
@@ -2749,7 +2761,18 @@ def canonical_project(project: str, *, refresh: bool = False) -> str:
         # legacy in-process caller that did not do so gets the resolved path,
         # never a Git-marker walk from inside the critical section.
         return cached or cache_key
-    candidate = raw if raw.is_dir() else raw.parent
+    immutable = resolve_immutable_repository_binding(raw)
+    if immutable is not None:
+        _PROJECT_ROOT_CACHE[cache_key] = immutable.original_root
+        return immutable.original_root
+    try:
+        raw_is_directory = raw.is_dir()
+    except OSError:
+        # An explicit absolute broker route remains usable even when this
+        # attributed client cannot stat another account's repository.
+        _PROJECT_ROOT_CACHE[cache_key] = cache_key
+        return cache_key
+    candidate = raw if raw_is_directory else raw.parent
     for directory in (candidate, *candidate.parents):
         if (directory / ".git").exists():
             resolved = str(directory)
@@ -11147,6 +11170,33 @@ def coordinated_build_inventory(
     return result
 
 
+def legacy_cli_inventory(
+    *,
+    project: str | None = None,
+    include_docker: bool = True,
+    backup_dirs: list[str] | None = None,
+    stats_history_limit: int = DOCKER_STATS_HISTORY_LIMIT,
+) -> dict[str, Any]:
+    """Project the additive normalized graph through the stable v2 CLI envelope.
+
+    The authority store and broker protocol use schema v3.  The installed
+    lifecycle script remains the compatibility surface used by repository
+    automation written against normalized inventory v2; all v3 collections
+    are additive for those readers, so only the envelope version is projected.
+    """
+
+    result = coordinated_build_inventory(
+        project=project,
+        include_docker=include_docker,
+        backup_dirs=backup_dirs,
+        stats_history_limit=stats_history_limit,
+    )
+    if result.get("schema_version") != INVENTORY_SCHEMA_VERSION:
+        raise RuntimeError("normalized inventory omitted its current schema envelope")
+    result["schema_version"] = 2
+    return result
+
+
 def coordinated_retained_inventory() -> dict[str, Any]:
     """Read the bounded observer publication without authority sampling."""
 
@@ -11183,7 +11233,7 @@ def coordinated_list_events(
         result = profile.events(after=after, limit=limit)
         authority = {
             "scope": "server-wide",
-            "transport": "trusted-local-unix-socket",
+            "transport": "authenticated-unix-socket",
         }
     else:
         database_path = coordinator_home() / NORMALIZED_DATABASE_NAME
@@ -12270,7 +12320,7 @@ def coordinated_observe_host(options: dict[str, Any]) -> dict[str, Any]:
         response["max_age_seconds"] = max_age_seconds
         response["authority"] = {
             "scope": "server-wide",
-            "transport": "trusted-local-unix-socket",
+            "transport": "authenticated-unix-socket",
         }
         return response
     with AccountStore.open_default(coordinator_home()) as store:
@@ -13867,7 +13917,7 @@ def coordinated_broker_project_runtime_action(
         },
         "authority": {
             "scope": "server-wide",
-            "transport": "trusted-local-unix-socket",
+            "transport": "authenticated-unix-socket",
         },
     }
 
@@ -16088,7 +16138,7 @@ def broker_authority_inventory(
     result = filter_normalized_inventory_project(result, project)
     result["authority"] = {
         "scope": "server-wide",
-        "transport": "trusted-local-unix-socket",
+        "transport": "authenticated-unix-socket",
         "socket": str(profile.service.socket_path),
         "database_generation": profile.service.database_generation,
     }
@@ -20184,7 +20234,7 @@ def handle_cli(args: argparse.Namespace) -> Any:
     if args.group == "project" and args.action == "stop":
         return coordinated_project_runtime_stop(namespace_to_options(args))
     if args.group == "inventory":
-        return coordinated_build_inventory(
+        return legacy_cli_inventory(
             project=args.project,
             include_docker=not args.no_docker,
             backup_dirs=args.backup_dir,

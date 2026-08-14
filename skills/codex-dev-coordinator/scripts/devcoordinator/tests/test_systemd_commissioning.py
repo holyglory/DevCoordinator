@@ -47,12 +47,17 @@ class FakeSystemd:
                 "LoadState": "loaded",
                 "ActiveState": active,
                 "SubState": "waiting" if active == "active" else "dead",
-                "Result": "success",
-                "ExecMainCode": "1",
-                "ExecMainStatus": "0",
-                "InvocationID": self.invocation if not is_timer else "timer",
                 "UnitFileState": "enabled" if self.timer_active else "disabled",
             }
+            if not is_timer:
+                output.update(
+                    {
+                        "Result": "success",
+                        "ExecMainCode": "1",
+                        "ExecMainStatus": "0",
+                        "InvocationID": self.invocation,
+                    }
+                )
             return subprocess.CompletedProcess(
                 argv,
                 0,

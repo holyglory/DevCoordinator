@@ -208,6 +208,38 @@ class AgentTestTests(unittest.TestCase):
             "exact_worktree_busy",
         )
 
+    def test_follow_exposes_bounded_active_attempt_heartbeats(self) -> None:
+        status = {
+            "run_id": "run-1",
+            "state": "running",
+            "targets": [
+                {
+                    "target_name": f"target-{index}",
+                    "active_attempt": {
+                        "attempt_id": f"attempt-{index}",
+                        "state": "running",
+                        "started_at": 100.0,
+                        "heartbeat_at": 200.0 + index,
+                        "lease_expires_at": 230.0 + index,
+                    },
+                }
+                for index in range(6)
+            ],
+        }
+
+        result = project_test_follow(status, run_id="run-1")
+
+        self.assertEqual(len(result["active_attempts"]), 4)
+        self.assertTrue(result["active_attempts_truncated"])
+        self.assertEqual(
+            result["active_attempts"][0]["attempt_id"], "attempt-0"
+        )
+        self.assertEqual(result["active_attempts"][0]["heartbeat_at"], 200.0)
+        self.assertLessEqual(
+            len(json.dumps(result, separators=(",", ":"), sort_keys=True).encode()),
+            MAX_TEST_RESULT_BYTES,
+        )
+
     def test_follow_distinguishes_failed_cases_from_retained_records(self) -> None:
         status = {"run_id": "run-1", "state": "failed"}
         summary = {

@@ -173,7 +173,7 @@ def _require_broker_stopped_baseline(
         reject("normalized authority envelope is missing")
     if (
         authority.get("scope") != "server-wide"
-        or authority.get("transport") != "trusted-local-unix-socket"
+        or authority.get("transport") != "authenticated-unix-socket"
         or not isinstance(authority.get("socket"), str)
         or not Path(authority["socket"]).is_absolute()
         or _integer(authority.get("service_uid")) is None

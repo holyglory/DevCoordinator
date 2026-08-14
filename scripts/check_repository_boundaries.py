@@ -53,8 +53,8 @@ CROSS_DEPENDENCY_PATTERNS = (
     re.compile(r"(?:\.\./)+holyskills(?:/|\b)", re.IGNORECASE),
 )
 
-# Commits ab5141d, 8ad3312, 360718b, and c21e2d0 were published on main with current
-# canonical image/sidecar bytes but changed renderer inputs without refreshing
+# Several published main commits, most recently a507505, retained canonical
+# image/sidecar bytes but changed renderer inputs without refreshing
 # their source bindings. Public history is immutable, so accept only the exact
 # tree, image, sidecar, and mismatch-detail tuples below. Current-tip provenance
 # remains mandatory and repaired successors replace the stale bindings.
@@ -151,6 +151,48 @@ KNOWN_HISTORICAL_SOURCE_DRIFT = frozenset(
                 "apps/DevOpsConsole/Artifacts/Canonical/projects-mobile.png",
                 "b8df5ab7fd431b4040001524fb4226fedb698fcc",
                 "635827bbff999a2719488b0cde77097018bb7c2d",
+            ),
+        )
+    }
+) | frozenset(
+    {
+        (
+            "0925a647bd3584cca08af15087cadcd4c89c713d",
+            image_path,
+            image_blob,
+            sidecar_blob,
+            detail,
+        )
+        for image_path, image_blob, sidecar_blob, detail in (
+            (
+                "apps/DevOpsConsole/Artifacts/Canonical/login-desktop.png",
+                "c923e6e0cd1db244774c982484d336d4cb7d1489",
+                "f155b9b10dae16288cc8e5971cb5cc84ef343d2b",
+                "source hash mismatch: apps/DevOpsConsole/Tools/canonical-api-fixtures.mjs",
+            ),
+            (
+                "apps/DevOpsConsole/Artifacts/Canonical/login-mobile.png",
+                "c94c0b78c7fe25d57589234a7f9731e449eefe97",
+                "45fdf040df738ee44efdeaed36c60b44b8c9fad1",
+                "source hash mismatch: apps/DevOpsConsole/Tools/canonical-api-fixtures.mjs",
+            ),
+            (
+                "apps/DevOpsConsole/Artifacts/Canonical/projects-desktop.png",
+                "5fefcb7009ef21deee13f4d319864171ee9b00b3",
+                "b6d5d17ab60e6c2e8d56a8b9e8fbc689dd396d20",
+                "source hash mismatch: apps/DevOpsConsole/Tools/canonical-api-fixtures.mjs",
+            ),
+            (
+                "apps/DevOpsConsole/Artifacts/Canonical/projects-mobile.png",
+                "ffe502891dc31ffe13ff6f18af41812d1120082b",
+                "ca9110a3b60aabffceca3d8281b0615dae83e930",
+                "source hash mismatch: apps/DevOpsConsole/Tools/canonical-api-fixtures.mjs",
+            ),
+            (
+                "apps/DevOpsConsole/Artifacts/Canonical/tests-detail-desktop.png",
+                "fd9359b7f24278abd4baa233736765be453fd2d3",
+                "0c0c7e7aa8c9208ab9c6ac5110ef7d8d58cf5570",
+                "source hash mismatch: apps/DevOpsConsole/src/ui/app.js",
             ),
         )
     }

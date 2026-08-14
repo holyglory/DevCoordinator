@@ -58,6 +58,16 @@ class CapabilityContractTests(unittest.TestCase):
         self.assertEqual(
             document["storage"]["plan_apply_target_kinds"], ["volume"]
         )
+        self.assertEqual(
+            document["efficiency"],
+            {
+                "actions": ["ingest"],
+                "schema_version": 1,
+                "project_attribution": True,
+                "per_account": True,
+                "console_projection": True,
+            },
+        )
         self.assertNotIn("approval_classes", document)
         self.assertNotIn("remove", document["runtime"]["actions"])
         encoded = json.dumps(

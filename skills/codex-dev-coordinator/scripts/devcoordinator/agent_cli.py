@@ -126,6 +126,13 @@ def _parser() -> argparse.ArgumentParser:
     targets.add_argument("--limit", type=int, default=4)
     _add_scoped_project(targets)
 
+    efficiency = commands.add_parser(
+        "efficiency",
+        help="publish one privacy-safe repository efficiency snapshot",
+    )
+    efficiency.add_argument("action", choices=("ingest",))
+    _add_scoped_project(efficiency)
+
     storage = commands.add_parser(
         "storage",
         help="read Docker storage, remove one selected container, or plan/apply volume deletion",
@@ -346,10 +353,27 @@ def _parser() -> argparse.ArgumentParser:
 
 def _repository_context(namespace: argparse.Namespace) -> Any:
     from .repository_context import resolve_effective_repository_context
-
-    context = resolve_effective_repository_context(
-        project=getattr(namespace, "project", None) or os.getcwd()
+    from .universal_test_repository_binding import (
+        immutable_repository_route_context,
+        repository_route_context,
+        resolve_immutable_repository_binding,
     )
+
+    explicit_project = getattr(namespace, "project", None)
+    project = explicit_project or os.getcwd()
+    binding = resolve_immutable_repository_binding(project)
+    if binding is not None:
+        context = immutable_repository_route_context(binding)
+    elif explicit_project is not None and Path(explicit_project).expanduser().is_absolute():
+        # Explicit absolute repository roots are broker routing identities, not
+        # filesystem-access challenges. This server has one trusted developer
+        # across local accounts, so another account's traversal permissions
+        # cannot block or authorize a Coordinator command.
+        context = repository_route_context(
+            os.path.abspath(os.fspath(Path(explicit_project).expanduser()))
+        )
+    else:
+        context = resolve_effective_repository_context(project=project)
     # Preserve the resolved canonical scope for any failure/continuation
     # emitted after discovery.  The resulting command can be followed from a
     # different working directory without silently selecting another repo.
@@ -414,6 +438,7 @@ def _target_projection(
     selector: str | None,
     kind: str | None,
     limit: int,
+    prefer_ready: bool = False,
 ) -> dict[str, Any]:
     from .agent_projection import project_targets
 
@@ -451,6 +476,7 @@ def _target_projection(
         selector=selector,
         kind=kind,
         limit=limit,
+        prefer_ready=prefer_ready,
     )
 
 
@@ -460,6 +486,7 @@ def _runtime_target(
     context: Any,
     selector: str,
     kind: str | None,
+    prefer_ready: bool = False,
 ) -> dict[str, Any]:
     """Resolve an exact configured ID locally, otherwise use fresh inventory.
 
@@ -509,6 +536,7 @@ def _runtime_target(
         selector=selector,
         kind=kind,
         limit=4,
+        prefer_ready=prefer_ready,
     )
     selected = projection.get("selected")
     if not isinstance(selected, Mapping):
@@ -930,6 +958,7 @@ def _runtime(
         operation_id = _canonical_operation_id(namespace.operation_id, mutate=True)
         namespace.operation_id = operation_id
         assert operation_id is not None
+        compose_bootstrapped = False
         if namespace.desired == "ready":
             scopes = [(context.root, "primary")]
             if context.temporary is not None:
@@ -947,12 +976,23 @@ def _runtime(
                     agent=_attribution(),
                     operation_id=catalog_operation_id,
                 )
+            if _declared_compose_selector(
+                context.effective.canonical_root, namespace.selector
+            ):
+                _bootstrap_declared_compose_target(
+                    profile=profile,
+                    context=context,
+                    selector=namespace.selector,
+                    operation_id=operation_id,
+                )
+                compose_bootstrapped = True
         try:
             target = _runtime_target(
                 profile=profile,
                 context=context,
                 selector=namespace.selector,
                 kind=namespace.kind,
+                prefer_ready=compose_bootstrapped,
             )
         except BaseException as error:
             if (
@@ -966,11 +1006,13 @@ def _runtime(
                 selector=namespace.selector,
                 operation_id=operation_id,
             )
+            compose_bootstrapped = True
             target = _runtime_target(
                 profile=profile,
                 context=context,
                 selector=namespace.selector,
                 kind=namespace.kind,
+                prefer_ready=compose_bootstrapped,
             )
         root = _require_resolved_repository(
             profile, context.root.canonical_root
@@ -1461,6 +1503,15 @@ def _storage(
             if isinstance(row, Mapping)
             and repository.repo_id in (row.get("project_ids") or [])
         ]
+        stopped_container_ids = sorted(
+            str(row.get("docker_resource_id"))
+            for row in storage.get("containers") or []
+            if isinstance(row, Mapping)
+            and row.get("running") is False
+            and repository.repo_id in (row.get("project_ids") or [])
+            and isinstance(row.get("docker_resource_id"), str)
+            and row.get("docker_resource_id")
+        )
         return require_agent_result(
             {
                 "schema_version": 1,
@@ -1482,11 +1533,15 @@ def _storage(
                 "accounting": storage.get("accounting"),
                 "cleanup_plans": project_plans[:16],
                 "cleanup_plan_count": len(project_plans),
+                "stopped_containers": [
+                    {"id": resource_id} for resource_id in stopped_container_ids
+                ],
+                "stopped_container_count": len(stopped_container_ids),
                 "truncated": len(project_plans) > 16,
                 "evidence_fingerprint": storage.get("evidence_fingerprint"),
             },
             surface="project Docker storage",
-            maximum_bytes=4 * 1024,
+            maximum_bytes=8 * 1024,
         )
     if namespace.target_kind is None or namespace.target_id is None:
         raise AgentCliError(
@@ -1731,6 +1786,33 @@ def _execute(
     profile, capabilities = _profile_and_capabilities(
         context, execution_state=execution_state
     )
+    if namespace.command == "efficiency":
+        capability = capabilities.get("efficiency")
+        if (
+            not isinstance(capability, Mapping)
+            or "ingest" not in capability.get("actions", [])
+            or capability.get("schema_version") != 1
+        ):
+            raise AgentCliError(
+                "efficiency_capability_unavailable",
+                "the active Coordinator does not advertise efficiency ingestion",
+                classification="incompatible_authority",
+            )
+        repository = profile.resolve_repository(context.effective.canonical_root)
+        if repository is None:
+            raise AgentCliError(
+                "repository_unconfigured",
+                "efficiency ingestion requires a configured Coordinator repository",
+                classification="unavailable",
+            )
+        from .efficiency_registry import MAX_INPUT_BYTES, parse_submission, publish
+
+        raw = sys.stdin.buffer.read(MAX_INPUT_BYTES + 1)
+        summary = parse_submission(raw)
+        return require_agent_result(
+            publish(repository_id=repository.repo_id, summary=summary),
+            surface="delivery efficiency ingest",
+        )
     if namespace.command == "capabilities":
         repository = profile.resolve_repository(
             context.effective.canonical_root
@@ -1806,7 +1888,7 @@ def _command_mutates(namespace: argparse.Namespace | None) -> bool:
     # Bug reports mutate only the independent local open-file registry.  They
     # never submit a broker mutation and therefore must not manufacture an
     # uncertain broker operation/continuation when the registry is unavailable.
-    if namespace.command == "bug":
+    if namespace.command in {"bug", "efficiency"}:
         return False
     if namespace.command == "runtime":
         return namespace.action not in {"status", "capture_logs"}

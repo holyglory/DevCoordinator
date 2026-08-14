@@ -229,7 +229,8 @@ class WorkerBrokerStartupTests(unittest.TestCase):
         store = mock.MagicMock()
         store.__enter__.return_value = store
         store.__exit__.return_value = None
-        epochs: list[str] = []
+        fenced_epochs: list[str] = []
+        autostart_epochs: list[str] = []
         testcase = self
 
         class FakeController:
@@ -239,12 +240,26 @@ class WorkerBrokerStartupTests(unittest.TestCase):
                     Path(kwargs["coordinator_script"]).is_absolute()
                 )
 
-            def reconcile_startup(self, *, supervisor_epoch: str):
-                epochs.append(supervisor_epoch)
+            def fence_startup(self, *, supervisor_epoch: str):
+                fenced_epochs.append(supervisor_epoch)
+                return {
+                    "ok": True,
+                    "supervisor_epoch": supervisor_epoch,
+                    "fenced_old_runners": [SERVER_ID],
+                    "autostart_expected": [SERVER_ID],
+                    "started": [],
+                    "errors": [],
+                }
+
+            def autostart_fenced(
+                self, *, supervisor_epoch: str, expected_worker_ids: list[str]
+            ):
+                autostart_epochs.append(supervisor_epoch)
+                testcase.assertEqual(expected_worker_ids, [SERVER_ID])
                 return {
                     "ok": False,
                     "supervisor_epoch": supervisor_epoch,
-                    "fenced_old_runners": [SERVER_ID],
+                    "fenced_old_runners": [],
                     "started": [],
                     "errors": [
                         {
@@ -275,12 +290,23 @@ class WorkerBrokerStartupTests(unittest.TestCase):
             result = runtime.reconcile_workers_on_startup()
 
         self.assertFalse(result["ok"])
-        self.assertEqual(len(epochs), 1)
-        self.assertEqual(str(uuid.UUID(epochs[0])), epochs[0])
-        opened.assert_called_once_with(
-            persistence.database_path,
-            expected_uid=persistence.expected_uid,
-            busy_timeout_ms=persistence.busy_timeout_ms,
+        self.assertEqual(len(fenced_epochs), 1)
+        self.assertEqual(fenced_epochs, autostart_epochs)
+        self.assertEqual(str(uuid.UUID(fenced_epochs[0])), fenced_epochs[0])
+        self.assertEqual(
+            opened.call_args_list,
+            [
+                mock.call(
+                    persistence.database_path,
+                    expected_uid=persistence.expected_uid,
+                    busy_timeout_ms=persistence.busy_timeout_ms,
+                ),
+                mock.call(
+                    persistence.database_path,
+                    expected_uid=persistence.expected_uid,
+                    busy_timeout_ms=persistence.busy_timeout_ms,
+                ),
+            ],
         )
 
 

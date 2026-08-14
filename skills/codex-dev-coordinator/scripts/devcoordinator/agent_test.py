@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+import math
 from typing import Any
 import uuid
 
@@ -345,6 +346,38 @@ def project_test_follow(
         else declared_failure_records
     )
     source_failure_count = max(declared_failure_records, len(failures))
+    active_attempts: list[dict[str, Any]] = []
+    raw_targets = status.get("targets")
+    if isinstance(raw_targets, list):
+        for raw_target in raw_targets:
+            if not isinstance(raw_target, Mapping):
+                continue
+            raw_attempt = raw_target.get("active_attempt")
+            if not isinstance(raw_attempt, Mapping):
+                continue
+            attempt_id = raw_attempt.get("attempt_id")
+            attempt_state = raw_attempt.get("state")
+            target_name = raw_target.get("target_name")
+            if not all(
+                isinstance(value, str) and value
+                for value in (attempt_id, attempt_state, target_name)
+            ):
+                continue
+            active = {
+                "attempt_id": bounded_text(attempt_id, maximum_bytes=128),
+                "target": bounded_text(target_name, maximum_bytes=128),
+                "state": bounded_text(attempt_state, maximum_bytes=64),
+            }
+            for key in ("started_at", "heartbeat_at", "lease_expires_at"):
+                value = raw_attempt.get(key)
+                if (
+                    not isinstance(value, bool)
+                    and isinstance(value, (int, float))
+                    and math.isfinite(float(value))
+                    and float(value) >= 0
+                ):
+                    active[key] = float(value)
+            active_attempts.append(active)
     document: dict[str, Any] = {
         "schema_version": 1,
         "ok": True,
@@ -361,6 +394,8 @@ def project_test_follow(
         "counts": counts,
         "timing": _small_mapping(source.get("timing"), limit=12),
         "scheduler_wait": _scheduler_wait_projection(status),
+        "active_attempts": active_attempts[:4],
+        "active_attempts_truncated": len(active_attempts) > 4,
         "failures": failures,
         # ``counts.failed`` counts failed test cases, while the summary's
         # ``failure_count`` counts independently retained failure records.

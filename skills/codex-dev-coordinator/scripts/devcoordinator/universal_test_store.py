@@ -4602,7 +4602,8 @@ class UniversalTestStore:
             result = dict(row)
             attempt_rows = connection.execute(
                 """
-                SELECT target_id, peak_memory_bytes, cpu_seconds
+                SELECT attempt_id, target_id, state, started_at, heartbeat_at,
+                       lease_expires_at, peak_memory_bytes, cpu_seconds
                 FROM test_target_attempts
                 WHERE run_id = ?
                 ORDER BY created_at, attempt_id
@@ -4610,10 +4611,12 @@ class UniversalTestStore:
                 (run_id,),
             ).fetchall()
             attempts_by_target: dict[str, list[sqlite3.Row]] = {}
+            attempts_by_id: dict[str, sqlite3.Row] = {}
             for attempt in attempt_rows:
                 attempts_by_target.setdefault(str(attempt["target_id"]), []).append(
                     attempt
                 )
+                attempts_by_id[str(attempt["attempt_id"])] = attempt
             targets: list[dict[str, object]] = []
             for target_row in connection.execute(
                 """
@@ -4652,6 +4655,30 @@ class UniversalTestStore:
                     }
                 )
                 attempts = attempts_by_target.get(str(target["target_id"]), [])
+                current_attempt_id = target.get("current_attempt_id")
+                active_attempt = (
+                    None
+                    if current_attempt_id is None
+                    else attempts_by_id.get(str(current_attempt_id))
+                )
+                target["active_attempt"] = (
+                    None
+                    if active_attempt is None
+                    or str(active_attempt["state"]) not in {"leased", "running"}
+                    else {
+                        "attempt_id": str(active_attempt["attempt_id"]),
+                        "state": str(active_attempt["state"]),
+                        "started_at": (
+                            None
+                            if active_attempt["started_at"] is None
+                            else float(active_attempt["started_at"])
+                        ),
+                        "heartbeat_at": float(active_attempt["heartbeat_at"]),
+                        "lease_expires_at": float(
+                            active_attempt["lease_expires_at"]
+                        ),
+                    }
+                )
                 measured_peaks = [
                     int(attempt["peak_memory_bytes"])
                     for attempt in attempts

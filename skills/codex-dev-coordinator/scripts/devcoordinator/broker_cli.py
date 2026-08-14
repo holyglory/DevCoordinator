@@ -627,55 +627,83 @@ def serve_broker(
                     "Broker stale socket could not be removed.",
                 ) from None
 
-        worker_reconciliation = runtime.reconcile_workers_on_startup()
-        print(
-            json.dumps(
-                {
-                    "event": "worker.startup_reconciled",
-                    "ok": worker_reconciliation.get("ok") is True,
-                    "supervisor_epoch": worker_reconciliation.get(
-                        "supervisor_epoch"
-                    ),
-                    "fenced_old_runners": worker_reconciliation.get(
-                        "fenced_old_runners", []
-                    ),
-                    "started": worker_reconciliation.get("started", []),
-                    "failure_count": len(worker_reconciliation.get("errors", [])),
-                },
-                sort_keys=True,
-            ),
-            file=(
-                sys.stdout
-                if worker_reconciliation.get("ok") is True
-                else sys.stderr
-            ),
-            flush=True,
-        )
-        for failure in worker_reconciliation.get("errors", []):
-            worker_id = str(failure.get("worker_id") or "unknown")[:128]
-            phase = str(failure.get("phase") or "unknown")[:128]
-            detail = str(failure.get("error") or "inspect broker logs")[:4096]
+        worker_fencing = runtime.fence_workers_on_startup()
+        stop = threading.Event()
+        previous: dict[int, Any] = {}
+        shutdown_requested = False
+        worker_autostart_thread: threading.Thread | None = None
+
+        def report_worker_reconciliation(
+            worker_reconciliation: dict[str, Any],
+        ) -> None:
             print(
                 json.dumps(
                     {
-                        "event": "worker.startup_failed",
-                        "worker_id": worker_id,
-                        "phase": phase,
-                        "error": detail,
-                        "action_required": (
-                            "Inspect this worker's retained attempt/native-runner logs, "
-                            "fix its installed definition or host service state, then "
-                            "explicitly start it again."
+                        "event": "worker.startup_reconciled",
+                        "ok": worker_reconciliation.get("ok") is True,
+                        "supervisor_epoch": worker_reconciliation.get(
+                            "supervisor_epoch"
+                        ),
+                        "fenced_old_runners": worker_reconciliation.get(
+                            "fenced_old_runners", []
+                        ),
+                        "started": worker_reconciliation.get("started", []),
+                        "failure_count": len(
+                            worker_reconciliation.get("errors", [])
                         ),
                     },
                     sort_keys=True,
                 ),
-                file=sys.stderr,
+                file=(
+                    sys.stdout
+                    if worker_reconciliation.get("ok") is True
+                    else sys.stderr
+                ),
                 flush=True,
             )
-        stop = threading.Event()
-        previous: dict[int, Any] = {}
-        shutdown_requested = False
+            for failure in worker_reconciliation.get("errors", []):
+                worker_id = str(failure.get("worker_id") or "unknown")[:128]
+                phase = str(failure.get("phase") or "unknown")[:128]
+                detail = str(failure.get("error") or "inspect broker logs")[:4096]
+                print(
+                    json.dumps(
+                        {
+                            "event": "worker.startup_failed",
+                            "worker_id": worker_id,
+                            "phase": phase,
+                            "error": detail,
+                            "action_required": (
+                                "Inspect this worker's retained attempt/native-runner logs, "
+                                "fix its installed definition or host service state, then "
+                                "explicitly start it again."
+                            ),
+                        },
+                        sort_keys=True,
+                    ),
+                    file=sys.stderr,
+                    flush=True,
+                )
+
+        def reconcile_workers_after_admission() -> None:
+            try:
+                worker_reconciliation = runtime.autostart_workers_after_admission(
+                    fenced=worker_fencing
+                )
+            except BaseException as error:
+                worker_reconciliation = {
+                    **worker_fencing,
+                    "ok": False,
+                    "started": [],
+                    "errors": [
+                        *list(worker_fencing.get("errors") or []),
+                        {
+                            "worker_id": "unknown",
+                            "phase": "autostart_reconciliation",
+                            "error": f"{type(error).__name__}: {error}"[:4096],
+                        },
+                    ],
+                }
+            report_worker_reconciliation(worker_reconciliation)
 
         def request_stop(_signum: int, _frame: Any) -> None:
             nonlocal shutdown_requested
@@ -701,6 +729,25 @@ def serve_broker(
                 runtime.server.start()
             else:
                 runtime.server.start(listener=inherited_listener)
+            if shutdown_requested:
+                report_worker_reconciliation(
+                    {
+                        **worker_fencing,
+                        "ok": worker_fencing.get("ok") is True,
+                        "started": [],
+                    }
+                )
+            else:
+                # Repository startup remains fenced until the release manager
+                # observes this broker as ready. Reconcile in the background so
+                # admission can become observable first, then converge every
+                # expected keep-alive worker once that temporary fence clears.
+                worker_autostart_thread = threading.Thread(
+                    target=reconcile_workers_after_admission,
+                    name="devcoordinator-worker-startup",
+                    daemon=True,
+                )
+                worker_autostart_thread.start()
             print(
                 json.dumps(
                     {
@@ -719,6 +766,8 @@ def serve_broker(
                 pass
         finally:
             try:
+                if worker_autostart_thread is not None:
+                    worker_autostart_thread.join(timeout=1.0)
                 runtime.close()
             finally:
                 for signum, handler in previous.items():

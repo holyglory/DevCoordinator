@@ -118,6 +118,43 @@ class InMemoryUnixListener:
 
 
 class UniversalTestTransportIsolationTests(unittest.TestCase):
+    def test_catalog_forwards_explicit_nested_read_deadline(self) -> None:
+        client = UnixTestPlaneClient(self.root / "testd.sock")
+        with mock.patch.object(
+            client,
+            "_call",
+            return_value={"schema_version": 1, "repositories": []},
+        ) as call:
+            client.repository_catalog(
+                repository_ids=("repo-ready",),
+                timeout_seconds=transport.TEST_CATALOG_READ_TIMEOUT_SECONDS,
+            )
+
+        call.assert_called_once_with(
+            transport.TEST_REPOSITORY_CATALOG,
+            {"repository_ids": ("repo-ready",)},
+            timeout_seconds=transport.TEST_CATALOG_READ_TIMEOUT_SECONDS,
+        )
+
+    def test_setup_forwards_explicit_nested_read_deadline(self) -> None:
+        client = UnixTestPlaneClient(self.root / "testd.sock")
+        with mock.patch.object(
+            client,
+            "_call",
+            return_value={"repository_id": "repo-ready", "status": "ready"},
+        ) as call:
+            client.setup(
+                repository_id="repo-ready",
+                owner_uid=os.geteuid(),
+                timeout_seconds=transport.TEST_SETUP_READ_TIMEOUT_SECONDS,
+            )
+
+        call.assert_called_once_with(
+            transport.TEST_REPOSITORY_SETUP,
+            {"repository_id": "repo-ready", "owner_uid": os.geteuid()},
+            timeout_seconds=transport.TEST_SETUP_READ_TIMEOUT_SECONDS,
+        )
+
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)

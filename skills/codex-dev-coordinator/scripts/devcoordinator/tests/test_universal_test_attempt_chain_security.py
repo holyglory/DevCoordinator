@@ -25,6 +25,9 @@ from devcoordinator.universal_test_planner import (
     SourceIdentity,
     create_test_plan,
 )
+from devcoordinator.universal_test_repository_binding import (
+    resolve_immutable_repository_binding,
+)
 from devcoordinator.universal_test_runtime import (
     BrokerTestAttemptCoordinator,
     NativeTestAttemptState,
@@ -1099,20 +1102,38 @@ class UniversalTestAttemptChainSecurityTests(unittest.TestCase):
             source_mode="immutable",
             snapshot_id=snapshot_id,
             execution_root=str(source),
+            source_provenance={
+                "complete": True,
+                "content_fingerprint": "b" * 64,
+                "manifest_fingerprint": "c" * 64,
+                "dependency_locks": {},
+                "toolchain": {},
+            },
         )
         state = manager._prepare_attempt_state(manager._runtime_id(descriptor))
 
-        destination = manager._prepare_attempt_root(
-            descriptor,
-            state=state,
-            owner_gid=os.getegid(),
-        )
+        previous_umask = os.umask(0o077)
+        try:
+            destination = manager._prepare_attempt_root(
+                descriptor,
+                state=state,
+                owner_gid=os.getegid(),
+            )
+        finally:
+            os.umask(previous_umask)
 
         self.assertEqual(commands[0][1:3], ["--archive", "--reflink=auto"])
+        self.assertEqual(stat.S_IMODE(destination.parent.stat().st_mode), 0o711)
+        self.assertTrue(destination.parent.stat().st_mode & stat.S_IXOTH)
         self.assertEqual(
             (destination / "payload.txt").read_text(encoding="utf-8"),
             "immutable source\n",
         )
+        binding = resolve_immutable_repository_binding(destination)
+        self.assertIsNotNone(binding)
+        assert binding is not None
+        self.assertEqual(binding.repository_id, descriptor.repository_id)
+        self.assertEqual(binding.original_root, descriptor.original_root)
         (destination / "payload.txt").write_text("attempt copy\n", encoding="utf-8")
         self.assertEqual(
             (source / "payload.txt").read_text(encoding="utf-8"),

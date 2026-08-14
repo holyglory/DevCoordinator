@@ -9503,6 +9503,29 @@ class BrokerPersistence:
             return int(accepted.peer.uid)
         return int(row["execution_uid"])
 
+    def runtime_service_has_supervision(
+        self, accepted: AcceptedBrokerRequest
+    ) -> bool:
+        """Return whether one exact service has a persisted supervisor policy."""
+
+        request = accepted.request
+        with self._store() as store:
+            with store.read_transaction() as connection:
+                _validate_connection_request(
+                    connection, peer=accepted.peer, request=request
+                )
+                row = connection.execute(
+                    """
+                    SELECT COUNT(*) AS policy_count
+                    FROM server_definitions definition
+                    JOIN worker_policies policy USING(server_definition_id)
+                    WHERE definition.repo_id = ?
+                      AND definition.server_definition_id = ?
+                    """,
+                    (request.project_id, request.resource_id),
+                ).fetchone()
+        return row is not None and int(row["policy_count"]) == 1
+
     def worker_execution_uid_for_resource(
         self,
         *,
@@ -9858,9 +9881,27 @@ class BrokerPersistence:
                     """
                     SELECT definition.server_definition_id,
                            definition.repo_id, definition.role,
-                           definition.log_path,
-                           definition.definition_fingerprint
+                           COALESCE(
+                               definition.log_path,
+                               attempt.log_artifact_path
+                           ) AS authoritative_log_path,
+                           definition.definition_fingerprint,
+                           policy.execution_uid
                     FROM server_definitions definition
+                    LEFT JOIN worker_policies policy
+                      USING(server_definition_id)
+                    LEFT JOIN worker_attempts attempt
+                      ON attempt.attempt_id = (
+                          SELECT candidate.attempt_id
+                          FROM worker_attempts candidate
+                          WHERE candidate.server_definition_id =
+                                definition.server_definition_id
+                            AND candidate.log_artifact_path IS NOT NULL
+                          ORDER BY candidate.exited_at_epoch DESC,
+                                   candidate.updated_at DESC,
+                                   candidate.attempt_id DESC
+                          LIMIT 1
+                      )
                     WHERE definition.repo_id = ?
                       AND definition.server_definition_id = ?
                     """,
@@ -9868,8 +9909,8 @@ class BrokerPersistence:
                 ).fetchone()
                 if (
                     row is None
-                    or not isinstance(row["log_path"], str)
-                    or not str(row["log_path"])
+                    or not isinstance(row["authoritative_log_path"], str)
+                    or not str(row["authoritative_log_path"])
                 ):
                     raise BrokerError(
                         "service_log_unavailable",
@@ -9880,9 +9921,13 @@ class BrokerPersistence:
                     server_definition_id=str(row["server_definition_id"]),
                     repo_id=str(row["repo_id"]),
                     role=None if row["role"] is None else str(row["role"]),
-                    log_path=str(row["log_path"]),
+                    log_path=str(row["authoritative_log_path"]),
                     definition_fingerprint=str(row["definition_fingerprint"]),
-                    owner_uid=accepted.attribution_uid,
+                    owner_uid=(
+                        accepted.attribution_uid
+                        if row["execution_uid"] is None
+                        else int(row["execution_uid"])
+                    ),
                 )
 
     def events(self, accepted: AcceptedBrokerRequest) -> dict[str, Any]:

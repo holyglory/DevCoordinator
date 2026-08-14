@@ -1083,7 +1083,7 @@ def _verify_broker_client_readiness(names: list[str]) -> list[dict[str, Any]]:
             or inventory.get("schema_version") != 3
             or not isinstance(authority, dict)
             or authority.get("scope") != "server-wide"
-            or authority.get("transport") != "trusted-local-unix-socket"
+            or authority.get("transport") != "authenticated-unix-socket"
             or authority.get("socket") != os.fspath(BROKER_SOCKET)
             or authority.get("service_uid") != SYSTEM_OWNER_UID
             or authority.get("database_generation") != generation

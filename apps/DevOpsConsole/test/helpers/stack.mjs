@@ -746,6 +746,8 @@ async function stopProcess(proc) {
  *   to be available in the committed normalized observation.
  * @param {string[]} [options.repositoryRoots] E2E fixture repositories to catalog
  *   repository roots needed by pre-existing observed resources.
+ * @param {boolean} [options.enableEfficiency] configure the optional retained
+ *   delivery-efficiency projection for this isolated Console.
  */
 export async function startStack({
   domain = 'vr.ae',
@@ -755,6 +757,7 @@ export async function startStack({
   coordinatorEnv = {},
   expectDocker = false,
   repositoryRoots = [],
+  enableEfficiency = false,
 } = {}) {
   ensureDevCert(); // fresh clones (CI) generate the throwaway TLS fixture
   const cleanups = []; // LIFO
@@ -773,6 +776,8 @@ export async function startStack({
     cleanups.push(() => fsp.rm(stateDir, { recursive: true, force: true }));
     const coordHome = await canonicalTempDir('devops-console-e2e-coord-');
     cleanups.push(() => fsp.rm(coordHome, { recursive: true, force: true }));
+    const efficiencyRoot = path.join(stateDir, 'efficiency');
+    if (enableEfficiency) await fsp.mkdir(efficiencyRoot, { recursive: true });
 
     const issuer = await startIssuer({ clientId: 'test-client', clientSecret: 'test-secret', claims });
     cleanups.push(() => issuer.close());
@@ -842,6 +847,7 @@ export async function startStack({
         'COORDINATOR_AUTOSTART=0',
         `CODEX_AGENT_COORDINATOR_HOME=${coordHome}`,
         `STATE_DIR=${stateDir}`,
+        ...(enableEfficiency ? [`DEVCOORDINATOR_EFFICIENCY_ROOT=${efficiencyRoot}`] : []),
         'LOG_LEVEL=error',
         '',
       ].join('\n'),

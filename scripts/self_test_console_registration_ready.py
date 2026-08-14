@@ -367,7 +367,7 @@ def broker_published_stopped_fixture(
         "schema_version": 2,
         "authority": {
             "scope": "server-wide",
-            "transport": "trusted-local-unix-socket",
+            "transport": "authenticated-unix-socket",
             "socket": "/run/devcoordinator-authority.sock",
             "service_uid": 992,
             "database_generation": database_generation,

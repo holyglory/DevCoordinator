@@ -203,6 +203,43 @@ class RuntimeEnsureContractTests(unittest.TestCase):
         self.assertEqual(decision.action, "start")
         self.assertEqual(decision.classification, "mutation_required")
 
+    def test_database_terminal_mismatch_preserves_probe_and_lifecycle_cause(self) -> None:
+        before = {
+            "exact": True,
+            "resource_kind": "database_stack",
+            "lifecycle": "stopped",
+            "docker_lifecycle": "stopped",
+            "database_available": False,
+        }
+        decision = decide_runtime_ensure(
+            before, desired_state="ready", family_classified=True
+        )
+        terminal = {
+            **before,
+            "lifecycle": "running",
+            "docker_lifecycle": "running",
+        }
+
+        result = build_runtime_ensure_result(
+            operation_id="35353535-3535-4353-8353-353535353535",
+            repository_id=PROJECT_ID,
+            repository_generation=0,
+            resource_kind="database_stack",
+            resource_id=DATABASE_ID,
+            desired_state="ready",
+            decision=decision,
+            mutation_performed=True,
+            terminal_observation=terminal,
+            snapshot_id="45454545-4545-4454-8454-454545454545",
+            proof_source="broker_host_observation",
+        )
+
+        self.assertEqual(
+            result["attention_reason"], "database_probe_unavailable"
+        )
+        self.assertEqual(result["terminal_proof"]["lifecycle"], "running")
+        self.assertFalse(result["terminal_proof"]["database_available"])
+
 
 class RuntimeEnsureBackendTests(unittest.TestCase):
     def setUp(self) -> None:

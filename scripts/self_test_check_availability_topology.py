@@ -65,6 +65,18 @@ def main() -> int:
         expect(cli.returncode == 0, f"validator CLI failed: {cli.stderr}")
         expect('"ok": true' in cli.stdout, "validator CLI omitted success evidence")
 
+        short_backup_drain = Path(raw) / "short-backup-drain"
+        shutil.copytree(clean, short_backup_drain)
+        replace(
+            short_backup_drain / "devcoordinator-authority.service",
+            "TimeoutStopSec=65min",
+            "TimeoutStopSec=2min",
+        )
+        expect(
+            "authority_backup_drain_timeout_invalid" in codes(short_backup_drain),
+            "authority replacement could force-kill a bounded database backup",
+        )
+
         mutable = Path(raw) / "mutable"
         shutil.copytree(clean, mutable)
         replace(

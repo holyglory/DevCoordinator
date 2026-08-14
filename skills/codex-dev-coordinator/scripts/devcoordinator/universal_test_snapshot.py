@@ -32,11 +32,15 @@ from typing import Callable, Mapping, Protocol, Sequence, runtime_checkable
 
 from .universal_test_contract import (
     MAX_MANIFEST_BYTES,
+    ManifestContractError,
     SourceMode,
     deterministic_fingerprint,
     is_sha256,
     parse_test_manifest,
     safe_history_shard_ceiling,
+)
+from .universal_test_repository_binding import (
+    publish_immutable_repository_binding,
 )
 from .universal_test_planner import (
     ChangeStatus,
@@ -360,6 +364,14 @@ def public_snapshot_source_diagnostic(value: object) -> str:
     """Map internal snapshot failures to bounded, allowlisted client detail."""
 
     message = " ".join(str(value).split())
+    manifest_prefix = "snapshot test manifest is invalid: "
+    if message.startswith(manifest_prefix):
+        detail = message[len(manifest_prefix) :]
+        if detail.startswith("$") and len(detail) <= 384:
+            return f"Test manifest contract is invalid at {detail}."
+        if detail.startswith("JSON ") and len(detail) <= 192:
+            return f"Test manifest is invalid: {detail}."
+        return "The test manifest is invalid; correct its JSON or field contract."
     unreadable_prefixes = {
         "snapshot file could not be opened safely: ": "unreadable",
         "snapshot file is unavailable: ": "unavailable",
@@ -1657,7 +1669,30 @@ class GitSnapshotSource:
             )
         return state
 
+    @staticmethod
+    def _retryable_scan_churn(error: SnapshotMaterializationError) -> bool:
+        message = str(error)
+        return message.startswith(
+            (
+                "snapshot file is unavailable: ",
+                "snapshot file could not be opened safely: ",
+                "snapshot file changed while read: ",
+                "snapshot file changed type while opened: ",
+            )
+        )
+
     def scan(self, request: SnapshotMaterializationRequest) -> SnapshotScan:
+        """Capture one stable tree, retrying one complete scan on live churn."""
+
+        for attempt in range(2):
+            try:
+                return self._scan_once(request)
+            except SnapshotMaterializationError as error:
+                if attempt or not self._retryable_scan_churn(error):
+                    raise
+        raise AssertionError("bounded snapshot scan retry did not terminate")
+
+    def _scan_once(self, request: SnapshotMaterializationRequest) -> SnapshotScan:
         _check_snapshot_deadline()
         root = self._require_owner(request)
         root_metadata = root.lstat()
@@ -1703,8 +1738,19 @@ class GitSnapshotSource:
             )
             manifest_document = json.loads(manifest_bytes.decode("utf-8"))
             manifest = parse_test_manifest(manifest_document, repository_root=root)
-        except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as error:
-            raise SnapshotMaterializationError("snapshot test manifest is invalid") from error
+        except ManifestContractError as error:
+            raise SnapshotMaterializationError(
+                f"snapshot test manifest is invalid: {error}"
+            ) from error
+        except json.JSONDecodeError as error:
+            raise SnapshotMaterializationError(
+                "snapshot test manifest is invalid: "
+                f"JSON {error.msg} at line {error.lineno}, column {error.colno}"
+            ) from error
+        except (OSError, UnicodeError, ValueError) as error:
+            raise SnapshotMaterializationError(
+                "snapshot test manifest is invalid"
+            ) from error
         if manifest.fingerprint != request.manifest_fingerprint:
             raise SnapshotMaterializationError(
                 "snapshot manifest changed after the plan request was validated"
@@ -2296,6 +2342,14 @@ class FilesystemSnapshotMaterializer:
             )
             if existing != expected:
                 raise SnapshotMaterializationError("snapshot identity collides with different provenance")
+            publish_immutable_repository_binding(
+                final,
+                snapshot_id=existing.snapshot_id,
+                repository_id=existing.repository_id,
+                original_root=existing.original_root,
+                materialized_root=existing.materialized_root,
+                content_fingerprint=existing.content_fingerprint,
+            )
             self._verify_tree(final / "root", before.files)
             return existing
         stage = Path(tempfile.mkdtemp(prefix=".snapshot-", dir=self._root))
@@ -2360,6 +2414,14 @@ class FilesystemSnapshotMaterializer:
                 os.fsync(descriptor)
             finally:
                 os.close(descriptor)
+            publish_immutable_repository_binding(
+                stage,
+                snapshot_id=provenance.snapshot_id,
+                repository_id=provenance.repository_id,
+                original_root=provenance.original_root,
+                materialized_root=provenance.materialized_root,
+                content_fingerprint=provenance.content_fingerprint,
+            )
             self._seal(materialized_root)
             _check_snapshot_deadline()
             # Repository owners and transient runners need read/execute access
@@ -2561,8 +2623,19 @@ class ImmutableSnapshotPlanPreviewer:
             return parse_test_manifest(
                 json.loads(raw.decode("utf-8")), repository_root=root
             )
-        except (UnicodeError, json.JSONDecodeError, ValueError) as error:
-            raise SnapshotMaterializationError("snapshot test manifest is invalid") from error
+        except ManifestContractError as error:
+            raise SnapshotMaterializationError(
+                f"snapshot test manifest is invalid: {error}"
+            ) from error
+        except json.JSONDecodeError as error:
+            raise SnapshotMaterializationError(
+                "snapshot test manifest is invalid: "
+                f"JSON {error.msg} at line {error.lineno}, column {error.colno}"
+            ) from error
+        except (OSError, UnicodeError, ValueError) as error:
+            raise SnapshotMaterializationError(
+                "snapshot test manifest is invalid"
+            ) from error
 
     @staticmethod
     def _setup_status(repository_id: str, status: str) -> Mapping[str, object]:

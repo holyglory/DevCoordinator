@@ -10,9 +10,13 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from dataclasses import replace
+import hashlib
 import json
 import math
+import os
+from pathlib import Path
 import re
+import stat
 from threading import RLock
 from types import MappingProxyType
 from typing import Mapping, Protocol, Sequence, runtime_checkable
@@ -55,8 +59,90 @@ from .universal_test_summary import (
 MAX_TEST_PLANE_RESPONSE_BYTES = 256 * 1024
 MAX_TEST_PLANE_PAGE_SIZE = 50
 MAX_TEST_PLANE_STATS_PAGE_SIZE = 500
+MAX_TEST_ARTIFACT_TEXT_TAIL_BYTES = 4 * 1024
+_TEXT_ARTIFACT_KINDS = frozenset({"jsonl", "junit", "log", "trx"})
 _SAFE_REPOSITORY_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:@/-]{0,255}$")
 _TEST_INTENTS = frozenset({"change", "checkpoint", "handoff", "release", "manual"})
+
+
+def verified_text_artifact_content(
+    artifact: Mapping[str, object],
+    *,
+    artifact_root: Path = Path("/var/lib/devcoordinator-test-artifacts"),
+) -> Mapping[str, object] | None:
+    """Read one root-private textual blob with exact immutable verification."""
+
+    if str(artifact.get("kind") or "") not in _TEXT_ARTIFACT_KINDS:
+        return None
+    artifact_id = artifact.get("artifact_id")
+    digest = artifact.get("sha256")
+    size_bytes = artifact.get("size_bytes")
+    if (
+        not isinstance(artifact_id, str)
+        or re.fullmatch(r"artifact-[0-9a-f]{32}", artifact_id) is None
+        or not isinstance(digest, str)
+        or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+        or type(size_bytes) is not int
+        or not 0 <= size_bytes <= 32 * 1024 * 1024
+        or artifact.get("verified") not in {1, True}
+    ):
+        raise TestStoreContractError(
+            "test artifact metadata cannot authorize content retrieval"
+        )
+    root = Path(artifact_root).absolute()
+    try:
+        root_metadata = root.lstat()
+    except OSError as error:
+        raise TestStoreConflict("test artifact store is unavailable") from error
+    if not stat.S_ISDIR(root_metadata.st_mode) or stat.S_ISLNK(root_metadata.st_mode):
+        raise TestStoreConflict("test artifact store is unsafe")
+    path = root / f"{artifact_id}-{digest}.blob"
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise TestStoreConflict("test artifact content is unavailable") from error
+    observed = hashlib.sha256()
+    tail = bytearray()
+    total = 0
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode) or before.st_size != size_bytes:
+            raise TestStoreConflict("test artifact content identity is invalid")
+        while True:
+            chunk = os.read(descriptor, 64 * 1024)
+            if not chunk:
+                break
+            total += len(chunk)
+            observed.update(chunk)
+            tail.extend(chunk)
+            if len(tail) > MAX_TEST_ARTIFACT_TEXT_TAIL_BYTES:
+                del tail[:-MAX_TEST_ARTIFACT_TEXT_TAIL_BYTES]
+        after = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    try:
+        path_after = path.lstat()
+    except OSError as error:
+        raise TestStoreConflict("test artifact content changed during read") from error
+    identity = (before.st_dev, before.st_ino, before.st_size)
+    if (
+        identity != (after.st_dev, after.st_ino, after.st_size)
+        or identity != (path_after.st_dev, path_after.st_ino, path_after.st_size)
+        or total != size_bytes
+        or observed.hexdigest() != digest
+    ):
+        raise TestStoreConflict("test artifact content failed integrity verification")
+    retained = bytes(tail)
+    return {
+        "artifact_id": artifact_id,
+        "sha256": digest,
+        "encoding": "utf-8",
+        "text": retained.decode("utf-8", errors="replace"),
+        "size_bytes": size_bytes,
+        "retained_bytes": len(retained),
+        "truncated": len(retained) < size_bytes,
+    }
 
 _PLAN_FIELDS = frozenset(
     {
@@ -1026,10 +1112,14 @@ class TestPlaneClient(Protocol):
         *,
         repository_id: str,
         owner_uid: int,
+        timeout_seconds: float | None = None,
     ) -> Mapping[str, object]: ...
 
     def repository_catalog(
-        self, *, repository_ids: Sequence[str]
+        self,
+        *,
+        repository_ids: Sequence[str],
+        timeout_seconds: float | None = None,
     ) -> Mapping[str, object]: ...
 
     def dashboard_stats(
@@ -1256,7 +1346,9 @@ class StoreTestPlaneAdapter:
         *,
         repository_id: str,
         owner_uid: int,
+        timeout_seconds: float | None = None,
     ) -> Mapping[str, object]:
+        del timeout_seconds
         if (
             not isinstance(repository_id, str)
             or _SAFE_REPOSITORY_ID.fullmatch(repository_id) is None
@@ -1279,8 +1371,12 @@ class StoreTestPlaneAdapter:
         return self._bounded(document)
 
     def repository_catalog(
-        self, *, repository_ids: Sequence[str]
+        self,
+        *,
+        repository_ids: Sequence[str],
+        timeout_seconds: float | None = None,
     ) -> Mapping[str, object]:
+        del timeout_seconds
         rows = self._store.repository_setup_catalog(repository_ids)
         return self._bounded(
             {
@@ -2318,14 +2414,16 @@ class StoreTestPlaneAdapter:
         self, *, run_id: str, repository_id: str, artifact_id: str
     ) -> Mapping[str, object]:
         self._store.get_run(run_id, repository_id=repository_id)
+        artifact = self._store.artifact(
+            run_id=run_id, artifact_id=artifact_id
+        )
         return self._bounded(
             {
                 "schema_version": 1,
+                "ok": True,
                 "repository_id": repository_id,
                 "run_id": run_id,
-                "artifact": self._store.artifact(
-                    run_id=run_id, artifact_id=artifact_id
-                ),
+                "artifact": artifact,
             }
         )
 
@@ -2557,6 +2655,7 @@ class StoreTestPlaneAdapter:
                     "shard_count": target["shard_count"],
                     "state": target["state"],
                     "wait": target.get("wait"),
+                    "active_attempt": target.get("active_attempt"),
                     "usage": target.get("usage"),
                 }
                 for target in targets

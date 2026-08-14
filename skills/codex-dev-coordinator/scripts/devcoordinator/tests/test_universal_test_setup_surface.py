@@ -670,6 +670,7 @@ class RepositorySetupSurfaceTests(unittest.TestCase):
         client._call.assert_called_once_with(
             TEST_REPOSITORY_SETUP,
             {"repository_id": "repo-setup", "owner_uid": self.owner_uid},
+            timeout_seconds=None,
         )
 
     def test_setup_decoder_rejects_contradictory_repository_identity(self) -> None:

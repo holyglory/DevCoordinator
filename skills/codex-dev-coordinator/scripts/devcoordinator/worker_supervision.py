@@ -504,6 +504,56 @@ class WorkerSupervision:
         with self.store.read_transaction() as connection:
             return self._startup_candidates(connection, epoch)
 
+    def normalize_startup_absence(
+        self, *, server_definition_id: str, supervisor_epoch: str
+    ) -> bool:
+        """Make a desired keep-alive worker launchable after proven native absence.
+
+        The caller owns the native-manager proof. This transaction only repairs
+        a transient resting label after every old attempt has durably exited;
+        it never clears an active attempt, circuit breaker, or lifecycle fence.
+        """
+
+        server_id = _text("server_definition_id", server_definition_id)
+        epoch = _text("supervisor_epoch", supervisor_epoch)
+        _, timestamp = self._now()
+        with self.store.immediate_transaction() as connection:
+            context, policy = self._context_and_policy(connection, server_id)
+            state = connection.execute(
+                "SELECT * FROM worker_supervisor_states WHERE server_definition_id = ?",
+                (server_id,),
+            ).fetchone()
+            if state is None or str(state["supervisor_epoch"] or "") != epoch:
+                raise WorkerSupervisionConflict(
+                    "startup absence proof used the wrong supervisor epoch"
+                )
+            if state["current_attempt_id"] is not None or self._active_attempt(
+                connection, server_id
+            ) is not None:
+                raise WorkerSupervisionConflict(
+                    "startup absence cannot clear an active worker attempt"
+                )
+            eligible = bool(
+                policy["keep_alive"]
+                and str(policy["desired_state"]) == "running"
+                and str(policy["breaker_state"]) == "armed"
+                and self._fence_reason(connection, context) is None
+            )
+            if not eligible:
+                return False
+            connection.execute(
+                """
+                UPDATE worker_supervisor_states
+                SET state = 'idle', next_restart_at = NULL,
+                    last_error_code = NULL, last_error_message = NULL,
+                    updated_at = ?
+                WHERE server_definition_id = ? AND supervisor_epoch = ?
+                  AND current_attempt_id IS NULL
+                """,
+                (timestamp, server_id, epoch),
+            )
+            return True
+
     def launch_candidate(
         self, *, server_definition_id: str, supervisor_epoch: str
     ) -> dict[str, Any]:

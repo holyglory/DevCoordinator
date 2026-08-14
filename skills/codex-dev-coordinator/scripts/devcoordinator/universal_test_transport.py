@@ -44,6 +44,8 @@ from .universal_test_store import (
 TEST_PLANE_TRANSPORT_SCHEMA_VERSION = 1
 MAX_TEST_PLANE_FRAME_BYTES = 768 * 1024
 DEFAULT_TEST_PLANE_TIMEOUT_SECONDS = 10.0
+TEST_CATALOG_READ_TIMEOUT_SECONDS = 60.0
+TEST_SETUP_READ_TIMEOUT_SECONDS = 60.0
 DEFAULT_TEST_PLAN_PREVIEW_TIMEOUT_SECONDS = 180.0
 DEFAULT_TEST_PLANE_CONCURRENCY = 8
 LOGGER = logging.getLogger(__name__)
@@ -1322,14 +1324,24 @@ class UnixTestPlaneClient:
         )
         return result
 
-    def setup(self, **arguments):
-        return self._call(TEST_REPOSITORY_SETUP, arguments)
+    def setup(self, *, timeout_seconds: float | None = None, **arguments):
+        return self._call(
+            TEST_REPOSITORY_SETUP,
+            arguments,
+            timeout_seconds=timeout_seconds,
+        )
 
     def health(self):
         return self._call(TEST_HEALTH, {})
 
-    def repository_catalog(self, **arguments):
-        return self._call(TEST_REPOSITORY_CATALOG, arguments)
+    def repository_catalog(
+        self, *, timeout_seconds: float | None = None, **arguments
+    ):
+        return self._call(
+            TEST_REPOSITORY_CATALOG,
+            arguments,
+            timeout_seconds=timeout_seconds,
+        )
 
     def dashboard_stats(self, **arguments):
         return self._call(TEST_DASHBOARD_STATS, arguments)

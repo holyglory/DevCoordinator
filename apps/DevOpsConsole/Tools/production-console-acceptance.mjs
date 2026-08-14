@@ -763,7 +763,7 @@ async function exerciseLogs(page, route, journeys) {
   }
 }
 
-async function exerciseEmptyBugRegistry(page, journeys) {
+async function exerciseBugRegistry(page, journeys) {
   try {
     const api = await page.evaluate(async () => {
       const response = await fetch('/api/bugs', {
@@ -783,25 +783,31 @@ async function exerciseEmptyBugRegistry(page, journeys) {
         bugCount: Array.isArray(payload?.bugs) ? payload.bugs.length : null,
       };
     });
-    if (api.status !== 200 || api.schemaVersion !== 1 || api.bugCount !== 0) {
-      fail(`authenticated /api/bugs is not empty (status ${api.status}, count ${api.bugCount})`);
+    if (api.status !== 200 || api.schemaVersion !== 1 || !Number.isInteger(api.bugCount) || api.bugCount < 0) {
+      fail(`authenticated /api/bugs is invalid (status ${api.status}, count ${api.bugCount})`);
     }
     const empty = page.locator('#bugs-body .bugs-empty p').filter({ visible: true });
-    if (await empty.count() !== 1) fail('rendered Bugs page lacks its unique empty state');
-    if ((await empty.first().innerText()).trim() !== 'No open Coordinator bugs.') {
-      fail('rendered Bugs page empty-state copy is not exact');
-    }
-    if (await page.locator('#bugs-body .bug-card').filter({ visible: true }).count() !== 0) {
-      fail('rendered Bugs page still contains an open report card');
+    const cardCount = await page.locator('#bugs-body .bug-card').filter({ visible: true }).count();
+    if (api.bugCount === 0) {
+      if (await empty.count() !== 1) fail('rendered Bugs page lacks its unique empty state');
+      if ((await empty.first().innerText()).trim() !== 'No open Coordinator bugs.') {
+        fail('rendered Bugs page empty-state copy is not exact');
+      }
+      if (cardCount !== 0) fail('rendered Bugs page still contains an open report card');
+    } else {
+      if (await empty.count() !== 0) fail('rendered Bugs page shows an empty state for open reports');
+      if (cardCount !== api.bugCount) {
+        fail(`rendered Bugs page/API count mismatch (${cardCount}/${api.bugCount})`);
+      }
     }
     journeys.push({
-      name: 'open bug registry empty',
+      name: 'open bug registry parity',
       status: 'passed',
-      detail: 'authenticated API and rendered page both contain zero open reports',
+      detail: `authenticated API and rendered page agree on ${api.bugCount} open report${api.bugCount === 1 ? '' : 's'}`,
     });
   } catch (error) {
     journeys.push({
-      name: 'open bug registry empty',
+      name: 'open bug registry parity',
       status: 'failed',
       detail: text(error.message),
     });
@@ -849,7 +855,7 @@ async function exerciseJourneys(page, route) {
       cancel: '#test-run-cancel',
     }, journeys);
   }
-  if (route === 'bugs') await exerciseEmptyBugRegistry(page, journeys);
+  if (route === 'bugs') await exerciseBugRegistry(page, journeys);
   const dialogs = {
     routes: { name: 'create-route dialog open/cancel', trigger: '#route-add', dialog: '#route-dialog', cancel: '#route-cancel' },
     ports: { name: 'lease-port dialog open/cancel', trigger: '#lease-add', dialog: '#lease-dialog', cancel: '#lease-cancel' },

@@ -334,6 +334,10 @@ export function loadConfig({ envFile, env = process.env, initializeRuntimePaths 
   const bugReportDir = resolveConfiguredPath(
     get('DEVCOORDINATOR_BUG_DIR') || path.join(stateDir, 'bugs', 'open'),
   );
+  const efficiencyRoot = resolveConfiguredPath(
+    get('DEVCOORDINATOR_EFFICIENCY_ROOT') || path.join(stateDir, 'efficiency', 'accounts'),
+  );
+  const efficiencyEnabled = Boolean(get('DEVCOORDINATOR_EFFICIENCY_ROOT'));
 
   // Webroot the plain-HTTP listener serves ACME HTTP-01 challenges from, so a
   // Let's Encrypt client (certbot --webroot) can validate + auto-renew certs
@@ -427,6 +431,8 @@ export function loadConfig({ envFile, env = process.env, initializeRuntimePaths 
     lifecycleEnabled,
     stateDir,
     bugReportDir,
+    efficiencyRoot,
+    efficiencyEnabled,
     acmeWebroot,
     logLevel,
     devInsecureHttp,

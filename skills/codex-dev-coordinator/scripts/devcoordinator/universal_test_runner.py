@@ -28,6 +28,7 @@ if __package__ in {None, ""}:
 
 from devcoordinator.universal_test_runtime import (  # type: ignore[import-not-found]
     TestAttemptDescriptor,
+    _IMMUTABLE_PYTHON_TOOLCHAIN_MOUNT,
     _safe_id,
 )
 from devcoordinator.universal_test_artifacts import package_directory  # type: ignore[import-not-found]
@@ -983,6 +984,19 @@ def adapt_driver_invocation(
         }
     )
     argv = tuple(descriptor.argv)
+    is_dotnet_invocation = _is_dotnet_project_invocation(descriptor)
+    if is_dotnet_invocation:
+        # Apply the same trusted, attempt-local CLI state to a typed dotnet
+        # test and to an automation target whose exact executable is dotnet.
+        environment.update(
+            {
+                "DOTNET_CLI_HOME": str(output / "dotnet-cli-home"),
+                "DOTNET_CLI_TELEMETRY_OPTOUT": "1",
+                "DOTNET_NOLOGO": "1",
+                "DOTNET_SKIP_FIRST_TIME_EXPERIENCE": "1",
+                "DOTNET_CLI_WORKLOAD_UPDATE_NOTIFY_DISABLE": "1",
+            }
+        )
     if descriptor.driver == "pytest":
         reporter = output / "reporter.junit.xml"
         if descriptor.shard_count > 1:
@@ -1000,21 +1014,30 @@ def adapt_driver_invocation(
         # first-use/workload-maintenance operation.  Keep all mutable CLI state
         # inside the attempt output and make the non-test SDK behavior fixed by
         # the trusted adapter rather than repository-controlled environment.
-        environment.update(
-            {
-                "DOTNET_CLI_HOME": str(output / "dotnet-cli-home"),
-                "DOTNET_CLI_TELEMETRY_OPTOUT": "1",
-                "DOTNET_NOLOGO": "1",
-                "DOTNET_SKIP_FIRST_TIME_EXPERIENCE": "1",
-                "DOTNET_CLI_WORKLOAD_UPDATE_NOTIFY_DISABLE": "1",
-            }
-        )
         dotnet_arguments = argv[2:]
         passthrough = (
             dotnet_arguments.index("--")
             if "--" in dotnet_arguments
             else len(dotnet_arguments)
         )
+        if (
+            _dotnet_locked_restore_required(descriptor)
+            and "--no-build" in dotnet_arguments[:passthrough]
+        ):
+            # Dependency targets run in separate immutable attempts; their
+            # writable build output is deliberately not shared.  Let this
+            # test attempt build from its already sealed offline restore.
+            before_passthrough = tuple(
+                argument
+                for argument in dotnet_arguments[:passthrough]
+                if argument != "--no-build"
+            )
+            dotnet_arguments = (
+                *before_passthrough,
+                *dotnet_arguments[passthrough:],
+            )
+            argv = (*argv[:2], *dotnet_arguments)
+            passthrough = len(before_passthrough)
         trusted_options: tuple[str, ...] = ()
         if (
             _dotnet_locked_restore_required(descriptor)
@@ -1077,6 +1100,17 @@ class DotnetProbeResult(NamedTuple):
     timed_out: bool
 
 
+def _is_dotnet_project_invocation(descriptor: TestAttemptDescriptor) -> bool:
+    return (
+        len(descriptor.argv) >= 2
+        and (
+            descriptor.driver == "dotnet"
+            or Path(descriptor.argv[0]).name == "dotnet"
+        )
+        and descriptor.argv[1] in {"build", "test"}
+    )
+
+
 def _dotnet_locked_restore_required(descriptor: TestAttemptDescriptor) -> bool:
     return descriptor.source_mode == "immutable" and any(
         binding.get("kind") == "dotnet-packages"
@@ -1084,14 +1118,49 @@ def _dotnet_locked_restore_required(descriptor: TestAttemptDescriptor) -> bool:
     )
 
 
+def _immutable_python_launch_executable(
+    descriptor: TestAttemptDescriptor,
+) -> str | None:
+    """Return the private mount executable for an external venv toolchain.
+
+    ``argv[0]`` intentionally remains the environment executable so CPython
+    discovers the mounted venv and its ``pyvenv.cfg``.  ``Popen.executable``
+    selects the same fingerprinted interpreter through the unit-private mount,
+    avoiding traversal through an absolute symlink into another local home.
+    """
+
+    if descriptor.source_mode != "immutable":
+        return None
+    for binding in descriptor.dependency_bindings:
+        toolchain = binding.get("toolchain")
+        if not isinstance(toolchain, Mapping):
+            continue
+        if toolchain.get("installation_kind") != "python-toolchain":
+            continue
+        source = Path(str(toolchain["source_root"]))
+        resolved = Path(str(toolchain["resolved_executable"]))
+        try:
+            relative = resolved.relative_to(source)
+        except ValueError as error:
+            raise TestStoreContractError(
+                "immutable Python toolchain executable escapes its root"
+            ) from error
+        if not relative.parts or any(part in {".", ".."} for part in relative.parts):
+            raise TestStoreContractError(
+                "immutable Python toolchain executable is invalid"
+            )
+        return str(_IMMUTABLE_PYTHON_TOOLCHAIN_MOUNT / relative)
+    return None
+
+
 def _dotnet_restore_project(
     argv: Sequence[str], *, cwd: Path, execution_root: Path
 ) -> Path:
     """Resolve the one typed project operand without leaving the snapshot."""
 
-    if len(argv) < 2 or argv[1] != "test":
+    if len(argv) < 2 or argv[1] not in {"build", "test"}:
         raise TestStoreContractError(
-            "locked dotnet bootstrap requires a dotnet test invocation"
+            "locked dotnet bootstrap requires a dotnet build or test invocation"
         )
     candidates: list[str] = []
     for raw in argv[2:]:
@@ -1908,6 +1977,9 @@ def run(
     # native sandbox. Linux attempts receive a unit-private /tmp namespace;
     # test-created directories remain 0700 on other platforms.
     environment["DEVCOORDINATOR_TEST_TMP_ROOT"] = "/tmp"
+    python_launch_executable = _immutable_python_launch_executable(descriptor)
+    if python_launch_executable is not None:
+        environment["PYTHONHOME"] = str(_IMMUTABLE_PYTHON_TOOLCHAIN_MOUNT)
     credential_directory = os.environ.get("CREDENTIALS_DIRECTORY")
     if descriptor.fixtures:
         if not credential_directory or not Path(credential_directory).is_absolute():
@@ -1924,7 +1996,8 @@ def run(
             )
         environment["CREDENTIALS_DIRECTORY"] = credential_directory
     Path(environment["HOME"]).mkdir(mode=0o700, exist_ok=True)
-    if descriptor.driver == "dotnet":
+    is_dotnet_invocation = _is_dotnet_project_invocation(descriptor)
+    if is_dotnet_invocation:
         Path(environment["DOTNET_CLI_HOME"]).mkdir(mode=0o700, exist_ok=True)
     started = time.monotonic()
     deadline = started + descriptor.ttl_seconds
@@ -1947,7 +2020,7 @@ def run(
                 output=output,
                 deadline=deadline,
             )
-            if descriptor.driver == "dotnet"
+            if is_dotnet_invocation
             else None
         )
         if readiness_failure is not None:
@@ -1957,6 +2030,7 @@ def run(
         else:
             process = subprocess.Popen(
                 list(adapted_argv),
+                executable=python_launch_executable,
                 cwd=cwd,
                 env=environment,
                 stdin=subprocess.DEVNULL,
