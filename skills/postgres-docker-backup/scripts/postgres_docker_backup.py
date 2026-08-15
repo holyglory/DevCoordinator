@@ -491,11 +491,32 @@ def backup_command(container: str, user: str, database: str | None, auth: list[s
     if backup_format == "custom":
         if not database:
             raise RuntimeError("database-scope backup requires a database")
-        return [*prefix, "pg_dump", "-Fc", "--no-owner", "-U", user, "-d", database]
+        return [
+            *prefix,
+            "pg_dump",
+            "-Fc",
+            "--no-owner",
+            "--no-acl",
+            "-U",
+            user,
+            "-d",
+            database,
+        ]
     if backup_format == "plain":
         if not database:
             raise RuntimeError("database-scope backup requires a database")
-        return [*prefix, "pg_dump", "--no-owner", "--clean", "--if-exists", "-U", user, "-d", database]
+        return [
+            *prefix,
+            "pg_dump",
+            "--no-owner",
+            "--no-acl",
+            "--clean",
+            "--if-exists",
+            "-U",
+            user,
+            "-d",
+            database,
+        ]
     if backup_format == "all":
         return [*prefix, "pg_dumpall", "--clean", "--if-exists", "-U", user]
     raise RuntimeError(f"unsupported backup format: {backup_format}")
@@ -510,6 +531,7 @@ def restore_command(container: str, user: str, database: str, auth: list[str], b
             "--clean",
             "--if-exists",
             "--no-owner",
+            "--no-acl",
             "--exit-on-error",
             "--single-transaction",
             "-U",
@@ -907,10 +929,90 @@ def drop_scratch_db_command(container: str, user: str, auth: list[str], scratch_
     return ["exec", container, *auth, "dropdb", "--if-exists", "--force", "-U", user, scratch_db]
 
 
+STALE_SCRATCH_DATABASE = re.compile(r"^codex_verify_[0-9a-f]{12}$")
+MAX_STALE_SCRATCH_DATABASES = 32
+
+
+def cleanup_stale_verification_scratch(
+    container: str,
+    user: str,
+    auth: list[str],
+    *,
+    secrets: tuple[str, ...],
+) -> list[str]:
+    """Remove only inactive scratch databases left by terminated verifiers.
+
+    Broker callers serialize this helper by immutable container ID.  The
+    catalog query additionally excludes any database with another active
+    backend so a non-broker or still-running verifier is never selected.
+    """
+
+    query = (
+        "SELECT d.datname FROM pg_database AS d "
+        "WHERE d.datname ~ '^codex_verify_[0-9a-f]{12}$' "
+        "AND NOT EXISTS (SELECT 1 FROM pg_stat_activity AS a "
+        "WHERE a.datid = d.oid AND a.pid <> pg_backend_pid()) "
+        "ORDER BY d.datname LIMIT 33"
+    )
+    listed = docker(
+        [
+            "exec",
+            container,
+            *auth,
+            "psql",
+            "-X",
+            "-A",
+            "-t",
+            "-v",
+            "ON_ERROR_STOP=1",
+            "-U",
+            user,
+            "-d",
+            "postgres",
+            "-c",
+            query,
+        ],
+        capture=True,
+        secrets=secrets,
+    )
+    names = [line.strip() for line in listed.stdout.splitlines() if line.strip()]
+    if (
+        len(names) > MAX_STALE_SCRATCH_DATABASES
+        or len(set(names)) != len(names)
+        or any(STALE_SCRATCH_DATABASE.fullmatch(name) is None for name in names)
+    ):
+        raise RuntimeError("stale verification scratch inventory is invalid or excessive")
+    removed: list[str] = []
+    for name in names:
+        cleanup = docker(
+            drop_scratch_db_command(container, user, auth, name),
+            capture=True,
+            check=False,
+            secrets=secrets,
+        )
+        if cleanup.returncode != 0:
+            raise RuntimeError(
+                "failed to remove stale verification scratch database "
+                f"{name}: {redact_text(cleanup.stderr, secrets).strip()}"
+            )
+        removed.append(name)
+    return removed
+
+
 def restore_into_scratch_command(container: str, user: str, auth: list[str], scratch_db: str, backup_format: str) -> list[str]:
     prefix = ["exec", "-i", container, *auth]
     if backup_format == "custom":
-        return [*prefix, "pg_restore", "--no-owner", "--exit-on-error", "-U", user, "-d", scratch_db]
+        return [
+            *prefix,
+            "pg_restore",
+            "--no-owner",
+            "--no-acl",
+            "--exit-on-error",
+            "-U",
+            user,
+            "-d",
+            scratch_db,
+        ]
     if backup_format == "plain":
         return [*prefix, "psql", "-X", "-v", "ON_ERROR_STOP=1", "-U", user, "-d", scratch_db]
     raise RuntimeError("database scratch restore accepts only custom or plain database dumps")
@@ -926,6 +1028,7 @@ def deep_verify_database(
     *,
     expected_container_id: str | None,
     phase: str,
+    cleanup_stale_scratch: bool = False,
 ) -> dict[str, Any]:
     if backup_scope(backup_format) != DATABASE_SCOPE:
         raise RuntimeError("database verification cannot accept a cluster-scope dump")
@@ -946,6 +1049,16 @@ def deep_verify_database(
     )
     immutable_target = identity_preflight["actual_id"]
     with postgres_auth(immutable_target, password) as auth:
+        stale_scratch_removed = (
+            cleanup_stale_verification_scratch(
+                immutable_target,
+                user,
+                auth,
+                secrets=secrets,
+            )
+            if cleanup_stale_scratch
+            else []
+        )
         create = create_scratch_db_command(immutable_target, user, auth, scratch)
         restore = restore_into_scratch_command(immutable_target, user, auth, scratch, backup_format)
         drop = drop_scratch_db_command(immutable_target, user, auth, scratch)
@@ -986,6 +1099,7 @@ def deep_verify_database(
         "restore_returncode": restore_returncode,
         "catalog_signature": signature,
         "table_count": (signature or {}).get("tables"),
+        "stale_scratch_removed": stale_scratch_removed,
         "container_identity_preflight": identity_preflight,
     }
 
@@ -1298,6 +1412,15 @@ def do_verify(args: argparse.Namespace) -> dict[str, Any]:
         user, database, password, _password_source = postgres_identity(args, env, database_default=database_default)
         secrets = (password,) if password else ()
         if test_restore:
+            cleanup_stale_scratch = bool(
+                getattr(args, "cleanup_stale_verification_scratch", False)
+            )
+            if cleanup_stale_scratch and os.environ.get(
+                "DEVCOORDINATOR_BROKER_INTERNAL"
+            ) != "1":
+                raise RuntimeError(
+                    "stale verification scratch cleanup is broker-internal only"
+                )
             result = deep_verify_database(
                 path,
                 container,
@@ -1307,6 +1430,7 @@ def do_verify(args: argparse.Namespace) -> dict[str, Any]:
                 manifest_database_signature(manifest),
                 expected_container_id=immutable_target,
                 phase="database strong verification",
+                cleanup_stale_scratch=cleanup_stale_scratch,
             )
             result.update({"ok": True, "format": backup_format, "scope": scope, "sha256": checksum, "target_database": database})
         elif backup_format == "custom":
@@ -1735,6 +1859,11 @@ def build_parser() -> argparse.ArgumentParser:
     verify.add_argument("--scope", choices=[DATABASE_SCOPE, CLUSTER_SCOPE])
     verify.add_argument("--allow-unmanifested", action="store_true")
     verify.add_argument("--test-restore", action="store_true")
+    verify.add_argument(
+        "--cleanup-stale-verification-scratch",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
     verify.add_argument("--verification-image", help="override the disposable cluster image for a cluster-scope test restore")
     verify.add_argument("--verification-timeout", type=float, default=60.0)
 

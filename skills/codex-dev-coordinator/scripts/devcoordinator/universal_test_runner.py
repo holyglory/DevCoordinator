@@ -22,6 +22,7 @@ import threading
 import time
 from typing import Mapping, NamedTuple, Sequence
 import uuid
+import xml.parsers.expat as expat
 import xml.etree.ElementTree as ET
 
 if __package__ in {None, ""}:
@@ -42,6 +43,9 @@ MAX_RESULT_CHUNK_BYTES = 240 * 1024
 MAX_RESULT_CHUNKS = 4_096
 MAX_CAPTURE_BYTES = 4 * 1024 * 1024
 MAX_REPORT_BYTES = 32 * 1024 * 1024
+MAX_TRX_INPUT_BYTES = 512 * 1024 * 1024
+MAX_TRX_DETAIL_CHARACTERS = 16 * 1024
+MAX_TRX_XML_DEPTH = 128
 MAX_CASES = 100_000
 MAX_FAILURES = 64
 MAX_ARTIFACTS = 64
@@ -1133,7 +1137,7 @@ def adapt_driver_invocation(
             trusted_options += ("--no-restore",)
         trusted_options += (
             "--logger",
-            f"trx;LogFileName={reporter.name}",
+            "trx;LogFilePrefix=reporter",
             "--results-directory",
             str(output),
         )
@@ -1776,7 +1780,264 @@ def _jsonl_cases(path: Path) -> tuple[list[dict[str, object]], list[dict[str, ob
     return cases, failures
 
 
-def _trx_cases(path: Path) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+def _redact_trx_text(descriptor: TestAttemptDescriptor, value: str) -> str:
+    replacements: dict[str, str] = {}
+    for private_root, replacement in (
+        (descriptor.original_root, "<repository>"),
+        (descriptor.execution_root, "<execution-root>"),
+        (descriptor.worktree_key, "<worktree>"),
+    ):
+        replacements.setdefault(str(Path(private_root)), replacement)
+    if descriptor.temporary_root is not None:
+        replacements.setdefault(
+            str(Path(descriptor.temporary_root)), "<temporary-repository>"
+        )
+    for private_root, replacement in sorted(
+        replacements.items(), key=lambda item: len(item[0]), reverse=True
+    ):
+        value = value.replace(private_root, replacement)
+    return value
+
+
+def _streaming_trx_cases(
+    descriptor: TestAttemptDescriptor,
+    path: Path,
+    *,
+    artifact_id: str | None = None,
+    case_namespace: str | None = None,
+) -> tuple[list[dict[str, object]], list[dict[str, object]], str, int]:
+    """Parse one oversized TRX without retaining its unbounded XML tree."""
+
+    file_descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    cases: list[dict[str, object]] = []
+    failures: list[dict[str, object]] = []
+    current: dict[str, object] | None = None
+    capture_kind: str | None = None
+    depth = 0
+
+    def local_name(value: str) -> str:
+        return value.rsplit("}", 1)[-1]
+
+    def attribute(attributes: Mapping[str, str], name: str) -> str | None:
+        return next(
+            (
+                str(value)
+                for key, value in attributes.items()
+                if local_name(str(key)) == name
+            ),
+            None,
+        )
+
+    def reject_xml_declaration(*_args: object) -> None:
+        raise TestStoreContractError("TRX reporter contains a prohibited XML declaration")
+
+    def start_element(name: str, attributes: Mapping[str, str]) -> None:
+        nonlocal current, capture_kind, depth
+        depth += 1
+        if depth > MAX_TRX_XML_DEPTH:
+            raise TestStoreContractError("TRX reporter XML depth exceeds its bound")
+        kind = local_name(name)
+        if kind == "UnitTestResult":
+            if current is not None or len(cases) >= MAX_CASES:
+                raise TestStoreContractError("TRX reporter output is excessive")
+            outcome = str(attribute(attributes, "outcome") or "").lower()
+            status = {
+                "passed": "passed",
+                "failed": "failed",
+                "notexecuted": "skipped",
+                "inconclusive": "skipped",
+                "error": "error",
+            }.get(outcome, "error")
+            raw_case_id = str(
+                attribute(attributes, "testId") or f"trx-{len(cases)}"
+            )[:1024]
+            case_id = (
+                raw_case_id
+                if case_namespace is None
+                else f"{case_namespace}:{raw_case_id}"[:1024]
+            )
+            display = str(attribute(attributes, "testName") or case_id)[:4096]
+            duration_text = str(attribute(attributes, "duration") or "")
+            duration = 0.0
+            if duration_text:
+                try:
+                    hours, minutes, seconds = duration_text.split(":", 2)
+                    duration = (
+                        float(hours) * 3600 + float(minutes) * 60 + float(seconds)
+                    )
+                except (TypeError, ValueError):
+                    duration = 0.0
+            cases.append(
+                {
+                    "case_id": case_id,
+                    "display_name": display,
+                    "status": status,
+                    "duration_seconds": max(0.0, duration),
+                    "location": None,
+                }
+            )
+            current = {
+                "case_id": case_id,
+                "display": display,
+                "status": status,
+                "details": {"Message": "", "StackTrace": "", "StdOut": ""},
+            }
+            return
+        if current is not None and kind in {"Message", "StackTrace", "StdOut"}:
+            capture_kind = kind
+
+    def character_data(value: str) -> None:
+        if current is None or capture_kind is None or not value:
+            return
+        details = current["details"]
+        if not isinstance(details, dict):
+            raise TestStoreContractError("TRX reporter detail state is invalid")
+        existing = str(details[capture_kind])
+        if capture_kind == "StdOut":
+            details[capture_kind] = (existing + value)[-MAX_TRX_DETAIL_CHARACTERS:]
+        elif len(existing) < MAX_TRX_DETAIL_CHARACTERS:
+            details[capture_kind] = (existing + value)[:MAX_TRX_DETAIL_CHARACTERS]
+
+    def end_element(name: str) -> None:
+        nonlocal current, capture_kind, depth
+        kind = local_name(name)
+        if kind in {"Message", "StackTrace", "StdOut"}:
+            capture_kind = None
+        if kind == "UnitTestResult" and current is not None:
+            if (
+                current["status"] in {"failed", "error"}
+                and len(failures) < MAX_FAILURES
+            ):
+                details = current["details"]
+                if not isinstance(details, dict):
+                    raise TestStoreContractError("TRX reporter detail state is invalid")
+                selected: list[str] = []
+                location: str | None = None
+                for detail_kind in ("Message", "StackTrace", "StdOut"):
+                    detail = "\n".join(
+                        line.rstrip()
+                        for line in str(details[detail_kind]).splitlines()
+                        if line.strip()
+                    ).strip()
+                    if not detail:
+                        continue
+                    detail = _redact_trx_text(descriptor, detail)
+                    if detail_kind == "StackTrace" and location is None:
+                        location = next(
+                            (
+                                line.strip()
+                                for line in detail.splitlines()
+                                if line.strip()
+                            ),
+                            None,
+                        )
+                    selected.append(detail)
+                message = "\n".join(selected).strip() or str(current["display"])
+                case_id = str(current["case_id"])
+                failures.append(
+                    {
+                        "failure_id": "failure-"
+                        + hashlib.sha256(case_id.encode()).hexdigest()[:32],
+                        "classification": "test_failure",
+                        "message": message[:8192],
+                        "case_id": case_id,
+                        "location": None if location is None else location[:4096],
+                        "artifact_id": artifact_id,
+                    }
+                )
+            current = None
+        depth -= 1
+        if depth < 0:
+            raise TestStoreContractError("TRX reporter XML structure is invalid")
+
+    parser = expat.ParserCreate(namespace_separator="}")
+    parser.buffer_text = True
+    parser.StartElementHandler = start_element
+    parser.CharacterDataHandler = character_data
+    parser.EndElementHandler = end_element
+    parser.StartDoctypeDeclHandler = reject_xml_declaration
+    parser.EntityDeclHandler = reject_xml_declaration
+    parser.ExternalEntityRefHandler = reject_xml_declaration
+    parser.SetParamEntityParsing(expat.XML_PARAM_ENTITY_PARSING_NEVER)
+    try:
+        before = os.fstat(file_descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_size <= MAX_REPORT_BYTES
+            or before.st_size > MAX_TRX_INPUT_BYTES
+        ):
+            raise TestStoreContractError("oversized TRX reporter is unsafe")
+        digest = hashlib.sha256()
+        observed = 0
+        secret_tail = b""
+        while True:
+            chunk = os.read(file_descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            observed += len(chunk)
+            if observed > MAX_TRX_INPUT_BYTES:
+                raise TestStoreContractError("oversized TRX reporter exceeds its bound")
+            digest.update(chunk)
+            secret_probe = secret_tail + chunk
+            if _suspected_secret(secret_probe):
+                raise TestStoreContractError(
+                    "oversized TRX reporter contains suspected secret material"
+                )
+            secret_tail = secret_probe[-4096:]
+            parser.Parse(chunk, False)
+        parser.Parse(b"", True)
+        after = os.fstat(file_descriptor)
+        path_after = path.lstat()
+        if (
+            depth != 0
+            or current is not None
+            or _stable_file_identity(before) != _stable_file_identity(after)
+            or _stable_file_identity(after) != _stable_file_identity(path_after)
+        ):
+            raise TestStoreContractError("oversized TRX reporter changed during read")
+        return cases, failures, digest.hexdigest(), observed
+    finally:
+        os.close(file_descriptor)
+
+
+def _write_trx_projection(
+    *,
+    output: Path,
+    index: int,
+    source_digest: str,
+    source_size: int,
+    cases: Sequence[Mapping[str, object]],
+    failures: Sequence[Mapping[str, object]],
+) -> Path:
+    counts = {name: 0 for name in ("passed", "failed", "error", "skipped")}
+    for case in cases:
+        status = str(case.get("status"))
+        if status in counts:
+            counts[status] += 1
+    document = {
+        "schema_version": 1,
+        "classification": "bounded_trx_projection",
+        "source_sha256": source_digest,
+        "source_size_bytes": source_size,
+        "counts": counts,
+        "failures": [dict(failure) for failure in failures],
+    }
+    path = output / f"reporter-{index + 1}-bounded.json"
+    path.write_bytes(
+        json.dumps(document, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        + b"\n"
+    )
+    if path.stat().st_size > MAX_REPORT_BYTES:
+        raise TestStoreContractError("bounded TRX projection exceeds its bound")
+    return path
+
+
+def _trx_cases(
+    path: Path,
+    *,
+    artifact_id: str | None = None,
+    case_namespace: str | None = None,
+) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
     if path.stat().st_size > MAX_REPORT_BYTES:
         raise TestStoreContractError("TRX reporter output exceeds its bound")
     root = ET.parse(path).getroot()
@@ -1792,7 +2053,14 @@ def _trx_cases(path: Path) -> tuple[list[dict[str, object]], list[dict[str, obje
             "passed": "passed", "failed": "failed", "notexecuted": "skipped",
             "inconclusive": "skipped", "error": "error",
         }.get(outcome, "error")
-        case_id = str(element.attrib.get("testId") or f"trx-{len(cases)}")[:1024]
+        raw_case_id = str(
+            element.attrib.get("testId") or f"trx-{len(cases)}"
+        )[:1024]
+        case_id = (
+            raw_case_id
+            if case_namespace is None
+            else f"{case_namespace}:{raw_case_id}"[:1024]
+        )
         display = str(element.attrib.get("testName") or case_id)[:4096]
         duration_text = str(element.attrib.get("duration") or "")
         duration = 0.0
@@ -1818,17 +2086,48 @@ def _trx_cases(path: Path) -> tuple[list[dict[str, object]], list[dict[str, obje
             }
         )
         if status in {"failed", "error"}:
+            detail_parts: list[str] = []
+            location: str | None = None
+            for descendant in element.iter():
+                kind = descendant.tag.rsplit("}", 1)[-1]
+                if kind not in {"Message", "StackTrace", "StdOut"}:
+                    continue
+                detail = "\n".join(
+                    line.rstrip()
+                    for line in str(descendant.text or "").splitlines()
+                    if line.strip()
+                ).strip()
+                if not detail:
+                    continue
+                if kind == "StackTrace" and location is None:
+                    location = next(
+                        (line.strip() for line in detail.splitlines() if line.strip()),
+                        None,
+                    )
+                detail_parts.append(detail)
+            message = "\n".join(detail_parts).strip() or display
             failures.append(
                 {
                     "failure_id": "failure-" + hashlib.sha256(case_id.encode()).hexdigest()[:32],
                     "classification": "test_failure",
-                    "message": display,
+                    "message": message[:8192],
                     "case_id": case_id,
-                    "location": None,
-                    "artifact_id": None,
+                    "location": None if location is None else location[:4096],
+                    "artifact_id": artifact_id,
                 }
             )
     return cases, failures
+
+
+def _generated_reporter_paths(
+    generated_reporter: Path, generated_kind: str
+) -> tuple[Path, ...]:
+    if generated_kind != "trx":
+        return (generated_reporter,) if generated_reporter.exists() else ()
+    candidates = sorted(generated_reporter.parent.glob("reporter*.trx"))
+    if len(candidates) > 64:
+        raise TestStoreContractError("TRX reporter file count exceeds its bound")
+    return tuple(candidates)
 
 
 def _junit_cases(path: Path) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
@@ -2211,6 +2510,14 @@ def run(
     )
     artifacts: list[Mapping[str, object]] = [stdout_artifact, stderr_artifact]
     reporter_path: Path | None = None
+    generated_reporter_artifacts: list[
+        tuple[
+            Path,
+            Mapping[str, object],
+            list[dict[str, object]] | None,
+            list[dict[str, object]] | None,
+        ]
+    ] = []
     # A trusted readiness/bootstrap result is itself complete evidence.  It did
     # not start the project reporter, so it must not be mislabeled as an
     # incomplete test report.
@@ -2438,29 +2745,99 @@ def run(
     if len(artifacts) > MAX_ARTIFACTS:
         incomplete = True
         artifacts = artifacts[:MAX_ARTIFACTS]
-    if generated_reporter.exists():
-        try:
-            generated = _generated_artifact(
-                descriptor,
-                generated_reporter,
-                kind=generated_kind,
-                name="coordinator-reporter",
+    try:
+        generated_reporters = _generated_reporter_paths(
+            generated_reporter, generated_kind
+        )
+        if len(artifacts) + len(generated_reporters) > MAX_ARTIFACTS:
+            raise TestStoreContractError(
+                "generated reporter artifacts exceed their bound"
             )
-            artifacts.append(generated)
-            reporter_path = generated_reporter
-        except TestStoreContractError as error:
-            incomplete = True
-            failures.append(
-                {
-                    "failure_id": "failure-" + uuid.uuid4().hex,
-                    "classification": "incomplete_reporting",
-                    "message": str(error)[:8192],
-                    "case_id": None,
-                    "location": None,
-                    "artifact_id": None,
-                }
-            )
-    elif (
+        multi = len(generated_reporters) > 1
+        for index, generated_path in enumerate(generated_reporters):
+            try:
+                metadata = generated_path.lstat()
+                if not stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+                    raise TestStoreContractError("TRX reporter path is unsafe")
+                namespace = (
+                    hashlib.sha256(generated_path.name.encode("utf-8")).hexdigest()[:12]
+                    if multi
+                    else None
+                )
+                projected_cases: list[dict[str, object]] | None = None
+                projected_failures: list[dict[str, object]] | None = None
+                if generated_kind == "trx" and metadata.st_size > MAX_REPORT_BYTES:
+                    (
+                        projected_cases,
+                        projected_failures,
+                        source_digest,
+                        source_size,
+                    ) = _streaming_trx_cases(
+                        descriptor,
+                        generated_path,
+                        case_namespace=namespace,
+                    )
+                    projection = _write_trx_projection(
+                        output=output,
+                        index=index,
+                        source_digest=source_digest,
+                        source_size=source_size,
+                        cases=projected_cases,
+                        failures=projected_failures,
+                    )
+                    generated = _generated_artifact(
+                        descriptor,
+                        projection,
+                        kind="trace",
+                        name=f"coordinator-reporter-projection-{index + 1}",
+                    )
+                    for failure in projected_failures:
+                        failure["artifact_id"] = str(generated["artifact_id"])
+                else:
+                    generated = _generated_artifact(
+                        descriptor,
+                        generated_path,
+                        kind=generated_kind,
+                        name=(
+                            "coordinator-reporter"
+                            if len(generated_reporters) == 1
+                            else f"coordinator-reporter-{index + 1}"
+                        ),
+                    )
+                artifacts.append(generated)
+                generated_reporter_artifacts.append(
+                    (generated_path, generated, projected_cases, projected_failures)
+                )
+            except (OSError, TestStoreContractError) as error:
+                incomplete = True
+                failures.append(
+                    {
+                        "failure_id": "failure-" + uuid.uuid4().hex,
+                        "classification": "incomplete_reporting",
+                        "message": str(error)[:8192],
+                        "case_id": None,
+                        "location": None,
+                        "artifact_id": None,
+                    }
+                )
+        if (
+            len(generated_reporter_artifacts) == 1
+            and generated_reporter_artifacts[0][2] is None
+        ):
+            reporter_path = generated_reporter_artifacts[0][0]
+    except TestStoreContractError as error:
+        incomplete = True
+        failures.append(
+            {
+                "failure_id": "failure-" + uuid.uuid4().hex,
+                "classification": "incomplete_reporting",
+                "message": str(error)[:8192],
+                "case_id": None,
+                "location": None,
+                "artifact_id": None,
+            }
+        )
+    if not generated_reporter_artifacts and reporter_path is None and (
         descriptor.driver == "automation"
         and launch_error is None
         and not project_timed_out
@@ -2479,7 +2856,7 @@ def run(
                 "location": None,
             }
         ]
-    elif (
+    elif not generated_reporter_artifacts and reporter_path is None and (
         launch_error is None
         and readiness_failure is None
         and not project_timed_out
@@ -2495,7 +2872,45 @@ def run(
                 "artifact_id": None,
             }
         )
-    if reporter_path is not None:
+    if generated_reporter_artifacts and generated_kind == "trx":
+        multi = len(generated_reporter_artifacts) > 1
+        for (
+            generated_path,
+            generated_artifact,
+            projected_cases,
+            projected_failures,
+        ) in generated_reporter_artifacts:
+            try:
+                if projected_cases is not None and projected_failures is not None:
+                    cases.extend(projected_cases)
+                    failures.extend(projected_failures)
+                    continue
+                artifact_id = str(generated_artifact["artifact_id"])
+                namespace = (
+                    hashlib.sha256(generated_path.name.encode("utf-8")).hexdigest()[:12]
+                    if multi
+                    else None
+                )
+                reporter_cases, reporter_failures = _trx_cases(
+                    generated_path,
+                    artifact_id=artifact_id,
+                    case_namespace=namespace,
+                )
+                cases.extend(reporter_cases)
+                failures.extend(reporter_failures)
+            except Exception as error:
+                incomplete = True
+                failures.append(
+                    {
+                        "failure_id": "failure-" + uuid.uuid4().hex,
+                        "classification": "incomplete_reporting",
+                        "message": f"reporter output is invalid: {type(error).__name__}",
+                        "case_id": None,
+                        "location": None,
+                        "artifact_id": None,
+                    }
+                )
+    elif reporter_path is not None:
         try:
             if generated_kind == "trx" or descriptor.reporter == "trx":
                 cases, reporter_failures = _trx_cases(reporter_path)

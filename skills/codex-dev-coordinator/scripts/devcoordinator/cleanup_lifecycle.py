@@ -459,10 +459,11 @@ class CleanupLifecycle:
                 )
                 kind = str(row["target_kind"])
                 repo_id = str(row["repo_id"]) if row["repo_id"] is not None else None
-                # A removed managed worker no longer belongs in the routine
-                # archive collection.  Its immutable tombstone and lifecycle
-                # history remain available to explicit audit readers.
-                if kind == "server":
+                # Removed managed workers and exact storage objects no longer
+                # belong in the interactive lifecycle collection. Their
+                # immutable tombstones and operation history remain available
+                # to explicit audit and storage readers.
+                if kind in {"server", "volume"}:
                     continue
                 current_project_removed = False
                 if kind == "project":

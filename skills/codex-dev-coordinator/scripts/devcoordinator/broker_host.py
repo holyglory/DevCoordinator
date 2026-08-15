@@ -296,6 +296,34 @@ def _require_service_output_root(value: str) -> Path:
     return root
 
 
+@contextlib.contextmanager
+def _postgres_container_operation_lock(
+    root: Path, full_container_id: str
+) -> Iterator[None]:
+    """Serialize broker-owned database helpers for one immutable container.
+
+    The strong verifier is allowed to remove only its private scratch-database
+    namespace.  Serializing by full container identity prevents a second
+    broker operation from being mistaken for stale work between restore and
+    catalog inspection, including when two database bindings share a cluster.
+    """
+
+    lock_path = root / f".container-{full_container_id}.lock"
+    descriptor = os.open(
+        lock_path,
+        os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+    )
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
+
+
 class LocalBrokerHostMutations:
     """Bounded host implementation for the broker's typed mutation protocol."""
 
@@ -339,9 +367,9 @@ class LocalBrokerHostMutations:
         self._compose_model_renderer = compose_model_renderer
         self._port_probe = port_probe or _port_available
         self._listener_verifier = listener_verifier or _verify_owned_tcp_listener
-        if postgres_timeout_seconds <= 0 or postgres_timeout_seconds > 3_600:
+        if postgres_timeout_seconds <= 0 or postgres_timeout_seconds > 24 * 60 * 60:
             raise ValueError(
-                "postgres_timeout_seconds must be greater than 0 and at most 3600"
+                "postgres_timeout_seconds must be greater than 0 and at most 86400"
             )
         self._postgres_timeout_seconds = float(postgres_timeout_seconds)
         self._postgres_runner = postgres_runner or self._run_postgres_tool
@@ -1647,49 +1675,51 @@ class LocalBrokerHostMutations:
             sys.executable,
             str(_postgres_backup_tool()),
         )
-        backup = self._postgres_command(
-            (
-                *base,
-                "backup",
-                "--container",
-                full_id,
-                "--expect-container-id",
-                full_id,
-                "--database",
-                target.database_name,
-                "--format",
-                "custom",
-                "--scope",
-                "database",
-                "--out-dir",
-                str(root),
-            ),
-            failure_code="database_backup_failed",
-            failure_label="PostgreSQL backup",
-        )
-        artifact = backup.get("backup")
-        manifest = backup.get("manifest")
-        if not isinstance(artifact, str) or not isinstance(manifest, str):
-            raise RuntimeError(
-                "PostgreSQL backup tool omitted published artifact evidence"
+        with _postgres_container_operation_lock(root, full_id):
+            backup = self._postgres_command(
+                (
+                    *base,
+                    "backup",
+                    "--container",
+                    full_id,
+                    "--expect-container-id",
+                    full_id,
+                    "--database",
+                    target.database_name,
+                    "--format",
+                    "custom",
+                    "--scope",
+                    "database",
+                    "--out-dir",
+                    str(root),
+                ),
+                failure_code="database_backup_failed",
+                failure_label="PostgreSQL backup",
             )
-        verification = self._postgres_command(
-            (
-                *base,
-                "verify",
-                "--container",
-                full_id,
-                "--expect-container-id",
-                full_id,
-                "--database",
-                target.database_name,
-                "--file",
-                artifact,
-                "--test-restore",
-            ),
-            failure_code="database_backup_verification_failed",
-            failure_label="PostgreSQL backup verification",
-        )
+            artifact = backup.get("backup")
+            manifest = backup.get("manifest")
+            if not isinstance(artifact, str) or not isinstance(manifest, str):
+                raise RuntimeError(
+                    "PostgreSQL backup tool omitted published artifact evidence"
+                )
+            verification = self._postgres_command(
+                (
+                    *base,
+                    "verify",
+                    "--container",
+                    full_id,
+                    "--expect-container-id",
+                    full_id,
+                    "--database",
+                    target.database_name,
+                    "--file",
+                    artifact,
+                    "--test-restore",
+                    "--cleanup-stale-verification-scratch",
+                ),
+                failure_code="database_backup_verification_failed",
+                failure_label="PostgreSQL backup verification",
+            )
         if verification.get("ok") is not True or not verification.get("test_restore"):
             raise RuntimeError("PostgreSQL backup strong verification did not complete")
         return {
@@ -1710,26 +1740,27 @@ class LocalBrokerHostMutations:
         if backup.database_binding_id != target.database_binding_id:
             raise ValueError("registered backup belongs to another database binding")
         safety_root = _require_service_output_root(safety_output_root)
-        return self._postgres_command(
-            (
-                sys.executable,
-                str(_postgres_backup_tool()),
-                "restore",
-                "--container",
-                full_id,
-                "--expect-container-id",
-                full_id,
-                "--database",
-                target.database_name,
-                "--file",
-                backup.artifact_path,
-                "--confirm-restore",
-                "--safety-out-dir",
-                str(safety_root),
-            ),
-            failure_code="database_restore_failed",
-            failure_label="PostgreSQL restore",
-        )
+        with _postgres_container_operation_lock(safety_root.parent, full_id):
+            return self._postgres_command(
+                (
+                    sys.executable,
+                    str(_postgres_backup_tool()),
+                    "restore",
+                    "--container",
+                    full_id,
+                    "--expect-container-id",
+                    full_id,
+                    "--database",
+                    target.database_name,
+                    "--file",
+                    backup.artifact_path,
+                    "--confirm-restore",
+                    "--safety-out-dir",
+                    str(safety_root),
+                ),
+                failure_code="database_restore_failed",
+                failure_label="PostgreSQL restore",
+            )
 
     def postgres_reconcile_restore(
         self,
@@ -1744,29 +1775,30 @@ class LocalBrokerHostMutations:
         if backup.database_binding_id != target.database_binding_id:
             raise ValueError("registered backup belongs to another database binding")
         safety_root = _require_service_output_root(safety_output_root)
-        result = self._postgres_command(
-            (
-                sys.executable,
-                str(_postgres_backup_tool()),
-                "reconcile-restore",
-                "--container",
-                full_id,
-                "--expect-container-id",
-                full_id,
-                "--database",
-                target.database_name,
-                "--file",
-                backup.artifact_path,
-                "--format",
-                "custom",
-                "--scope",
-                "database",
-                "--safety-out-dir",
-                str(safety_root),
-            ),
-            failure_code="database_restore_reconciliation_failed",
-            failure_label="PostgreSQL restore reconciliation",
-        )
+        with _postgres_container_operation_lock(safety_root.parent, full_id):
+            result = self._postgres_command(
+                (
+                    sys.executable,
+                    str(_postgres_backup_tool()),
+                    "reconcile-restore",
+                    "--container",
+                    full_id,
+                    "--expect-container-id",
+                    full_id,
+                    "--database",
+                    target.database_name,
+                    "--file",
+                    backup.artifact_path,
+                    "--format",
+                    "custom",
+                    "--scope",
+                    "database",
+                    "--safety-out-dir",
+                    str(safety_root),
+                ),
+                failure_code="database_restore_reconciliation_failed",
+                failure_label="PostgreSQL restore reconciliation",
+            )
         if result.get("matched") is not True:
             return None
         return result

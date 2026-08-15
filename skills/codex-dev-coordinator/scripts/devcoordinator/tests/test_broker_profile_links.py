@@ -3610,6 +3610,57 @@ class BrokerLinkStoreTests(unittest.TestCase):
         self.assertEqual(replacement.broker_resource_id, "broker-lease-replacement")
         self.assertEqual(result["lease_id"], "broker-lease-replacement")
 
+    def test_saved_lease_release_uses_current_broker_route_after_migration(self) -> None:
+        saved = self._reserve_lease()
+        migrated = replace(
+            self.profile,
+            service=BrokerServiceProfile(
+                socket_path=Path("/run/devcoordinator-current.sock"),
+                database_generation="generation-current",
+            ),
+        )
+        calls: list[dict[str, object]] = []
+
+        def release(**arguments):
+            calls.append(arguments)
+            return (
+                str(arguments["operation_id"]),
+                {
+                    "lease_id": saved.broker_resource_id,
+                    "port": saved.port,
+                    "protocol": "tcp",
+                    "status": "released",
+                },
+            )
+
+        with mock.patch.object(
+            dev_coordinator, "coordinator_home", return_value=self.root / "account-store"
+        ), mock.patch.object(
+            dev_coordinator, "configured_broker_profile", return_value=migrated
+        ), mock.patch.object(
+            dev_coordinator, "call_broker", side_effect=release
+        ):
+            result = dev_coordinator.release_broker_lease_link(
+                saved, rollback=False
+            )
+
+        self.assertEqual(result["status"], "released")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(
+            calls[0]["service"].socket_path,
+            Path("/run/devcoordinator-current.sock"),
+        )
+        self.assertEqual(
+            calls[0]["service"].database_generation, "generation-current"
+        )
+        self.assertEqual(calls[0]["resource_id"], saved.broker_resource_id)
+        with self.store.read_transaction() as connection:
+            status = connection.execute(
+                "SELECT status FROM broker_lease_links WHERE link_id = ?",
+                (saved.link_id,),
+            ).fetchone()[0]
+        self.assertEqual(status, "released")
+
     def test_renewed_broker_lease_rebinds_exact_stale_local_process_lease(self) -> None:
         reserved = self._reserve_lease()
         now = utc_timestamp()

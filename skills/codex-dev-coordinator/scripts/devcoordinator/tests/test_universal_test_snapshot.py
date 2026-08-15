@@ -49,6 +49,7 @@ from devcoordinator.universal_test_store import (
     TargetResources,
     TestStoreContractError,
     UniversalTestStore,
+    _retry_plan_projection,
 )
 from devcoordinator.universal_test_uid_helper import execute as execute_uid_helper
 
@@ -372,6 +373,76 @@ class UniversalTestSnapshotTests(unittest.TestCase):
         self._git("config", "user.name", "Snapshot Tests")
         self._git("add", ".")
         self._git("commit", "--quiet", "-m", "initial")
+
+    def test_immutable_retry_derives_exact_catalog_from_source_plan(self) -> None:
+        document = manifest_document()
+        document["targets"] = {
+            "build": {
+                **document["targets"]["unit"],
+                "depends_on": [],
+            },
+            "tests": {
+                **document["targets"]["unit"],
+                "depends_on": ["build"],
+            },
+        }
+        manifest = parse_test_manifest(document, repository_root=self.root)
+        source = SourceIdentity(
+            mode=SourceMode.IMMUTABLE,
+            repository_id="repo-snapshot-tests",
+            content_fingerprint="b" * 64,
+            original_root=str(self.root),
+            temporary_root=None,
+            snapshot_id="snapshot-" + "a" * 32,
+        )
+        original = create_test_plan(
+            manifest,
+            intent="manual",
+            source=source,
+            requested_targets=("tests",),
+        )
+        _, _, _, retry_json = _retry_plan_projection(
+            json.dumps(original.to_document(), sort_keys=True),
+            selected_targets=("tests",),
+        )
+        retry_document = json.loads(retry_json)
+        service = object.__new__(RootSnapshotService)
+        service.catalog_root = Path(self.temporary.name) / "catalog"
+        service.catalog_root.mkdir()
+        original_catalog = {
+            "schema_version": 1,
+            "plan": original.to_document(),
+            "repository_generation": 7,
+            "owner_uid": os.geteuid(),
+            "launch_catalog": {
+                target: {"argv": ["./scripts/test"], "target": target}
+                for target in original.selected_targets
+            },
+            "target_resources": {
+                target: {"shard_count": 1, "worktree_key": str(self.root)}
+                for target in original.selected_targets
+            },
+            "source_provenance": {
+                "complete": True,
+                "content_fingerprint": source.content_fingerprint,
+            },
+        }
+        service._publish_catalog(
+            plan_id=original.plan_id,
+            snapshot_id=source.snapshot_id,
+            value=original_catalog,
+        )
+
+        derived = service._load_catalog(retry_document)
+        replay = service._load_catalog(retry_document)
+
+        self.assertEqual(derived, replay)
+        self.assertEqual(derived["plan"], retry_document)
+        self.assertEqual(set(derived["launch_catalog"]), {"tests"})
+        self.assertEqual(set(derived["target_resources"]), {"tests"})
+        self.assertTrue(
+            (service.catalog_root / source.snapshot_id / f"{retry_document['plan_id']}.json").is_file()
+        )
 
     def test_control_plane_identity_is_read_only_in_the_fixed_helper(self) -> None:
         request = {

@@ -17,8 +17,10 @@ from devcoordinator.universal_test_runtime import (
     TestAttemptDescriptor,
 )
 from devcoordinator.universal_test_store import TestStoreConflict
+from devcoordinator.store import CoordinatorStore, utc_timestamp
 from devcoordinator.tests.test_ephemeral_containers import (
     EphemeralFixture,
+    IMAGE,
     MultiEphemeralHost,
     TEMPLATE,
 )
@@ -139,6 +141,163 @@ class UniversalTestFixtureProviderTests(unittest.TestCase):
             runtime_id=runtime_id,
             descriptor_fingerprint=lease.descriptor_fingerprint,
             reason="idempotent",
+        )
+
+    def test_sealed_fixture_template_is_available_to_another_repository(self) -> None:
+        consumer_root = self.fixture.root / "consumer"
+        consumer_root.mkdir()
+        now = utc_timestamp()
+        with CoordinatorStore.open(
+            self.fixture.database, expected_uid=os.geteuid()
+        ) as store:
+            with store.immediate_transaction() as connection:
+                connection.execute(
+                    """
+                    INSERT INTO repositories(
+                        repo_id, host_id, canonical_root, display_name, state,
+                        generation, created_at, updated_at
+                    ) VALUES (
+                        'repo-consumer', 'host-ephemeral', ?, 'Consumer',
+                        'active', 0, ?, ?
+                    )
+                    """,
+                    (str(consumer_root), now, now),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO repository_installations(
+                        repo_id, status, startup_fenced, generation, actor,
+                        updated_at
+                    ) VALUES (
+                        'repo-consumer', 'installed', 0, 0, 'fixture', ?
+                    )
+                    """,
+                    (now,),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO repositories(
+                        repo_id, host_id, canonical_root, display_name, state,
+                        generation, created_at, updated_at
+                    ) VALUES (
+                        'repo-template-copy', 'host-ephemeral', ?, 'Template copy',
+                        'active', 0, ?, ?
+                    )
+                    """,
+                    (str(self.fixture.root / "template-copy"), now, now),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO repository_installations(
+                        repo_id, status, startup_fenced, generation, actor,
+                        updated_at
+                    ) VALUES (
+                        'repo-template-copy', 'installed', 0, 0, 'fixture', ?
+                    )
+                    """,
+                    (now,),
+                )
+        self.fixture.persistence.provision_ephemeral_template(
+            template_id="ephemeral-template-copy-postgres",
+            repo_id="repo-template-copy",
+            name="artifact-postgres",
+            image_ref=IMAGE,
+            command=("postgres", "-c", "fsync=off"),
+            environment={"POSTGRES_HOST_AUTH_METHOD": "trust"},
+            default_ttl_seconds=600,
+            max_ttl_seconds=3600,
+            container_tcp_port=5432,
+            host_port_start=55400,
+            host_port_end=55410,
+            memory_bytes=256 * 1024 * 1024,
+            cpu_millis=750,
+        )
+        descriptor = replace(
+            self.descriptor(),
+            repository_id="repo-consumer",
+            original_root=str(consumer_root),
+            execution_root=str(consumer_root),
+            worktree_key=str(consumer_root),
+        )
+        runtime_id = "devcoordinator-test-" + "5" * 32
+        provider = self.provider()
+
+        lease = provider.provision(descriptor, runtime_id=runtime_id)
+
+        self.assertEqual(lease.fixtures, ("postgres",))
+        self.assertEqual(lease.provenance[0]["template_id"], TEMPLATE)
+        provider.cleanup(
+            runtime_id=runtime_id,
+            descriptor_fingerprint=lease.descriptor_fingerprint,
+            reason="terminal",
+        )
+        self.assertEqual(self.host.containers, {})
+        self.assertFalse((self.credential_root / runtime_id).exists())
+
+    def test_duplicate_global_name_uses_repository_association_only_as_routing(self) -> None:
+        consumer_root = self.fixture.root / "consumer-routing"
+        consumer_root.mkdir()
+        now = utc_timestamp()
+        with CoordinatorStore.open(
+            self.fixture.database, expected_uid=os.geteuid()
+        ) as store:
+            with store.immediate_transaction() as connection:
+                connection.execute(
+                    """
+                    INSERT INTO repositories(
+                        repo_id, host_id, canonical_root, display_name, state,
+                        generation, created_at, updated_at
+                    ) VALUES (
+                        'repo-consumer', 'host-ephemeral', ?, 'Consumer',
+                        'active', 0, ?, ?
+                    )
+                    """,
+                    (str(consumer_root), now, now),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO repository_installations(
+                        repo_id, status, startup_fenced, generation, actor,
+                        updated_at
+                    ) VALUES (
+                        'repo-consumer', 'installed', 0, 0, 'fixture', ?
+                    )
+                    """,
+                    (now,),
+                )
+        consumer_template = "ephemeral-template-consumer-postgres"
+        self.fixture.persistence.provision_ephemeral_template(
+            template_id=consumer_template,
+            repo_id="repo-consumer",
+            name="artifact-postgres",
+            image_ref="postgres@sha256:" + "b" * 64,
+            command=("postgres", "-c", "fsync=off"),
+            environment={},
+            default_ttl_seconds=600,
+            max_ttl_seconds=3600,
+            container_tcp_port=5432,
+            host_port_start=55500,
+            host_port_end=55510,
+            memory_bytes=256 * 1024 * 1024,
+            cpu_millis=750,
+        )
+        descriptor = replace(
+            self.descriptor(),
+            repository_id="repo-consumer",
+            original_root=str(consumer_root),
+            execution_root=str(consumer_root),
+            worktree_key=str(consumer_root),
+        )
+        runtime_id = "devcoordinator-test-" + "6" * 32
+        provider = self.provider()
+
+        lease = provider.provision(descriptor, runtime_id=runtime_id)
+
+        self.assertEqual(lease.provenance[0]["template_id"], consumer_template)
+        provider.cleanup(
+            runtime_id=runtime_id,
+            descriptor_fingerprint=lease.descriptor_fingerprint,
+            reason="terminal",
         )
 
     def test_secret_is_loadcredential_file_only_and_never_journaled(self) -> None:

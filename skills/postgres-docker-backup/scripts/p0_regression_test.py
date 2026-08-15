@@ -167,10 +167,85 @@ def test_partial_publication_rollback(root: Path) -> None:
     check(not output.exists(), "successful publication rollback left a final backup")
 
 
+def test_stale_verification_cleanup_is_exact_and_inactive_only() -> None:
+    module = load_production_module()
+    calls: list[list[str]] = []
+    original_docker = module.docker
+
+    def fake_docker(args, *, capture=False, check=True, secrets=()):
+        del capture, check, secrets
+        calls.append(list(args))
+        if "psql" in args:
+            sql = args[args.index("-c") + 1]
+            check_sql = "pg_stat_activity" in sql and "a.pid <> pg_backend_pid()" in sql
+            if not check_sql:
+                raise AssertionError("stale cleanup did not exclude active backends")
+            return subprocess.CompletedProcess(
+                args,
+                0,
+                stdout="codex_verify_012345abcdef\ncodex_verify_fedcba543210\n",
+                stderr="",
+            )
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    module.docker = fake_docker
+    try:
+        removed = module.cleanup_stale_verification_scratch(
+            "1" * 64, "app", [], secrets=()
+        )
+    finally:
+        module.docker = original_docker
+    check(
+        removed == ["codex_verify_012345abcdef", "codex_verify_fedcba543210"],
+        "stale cleanup returned contradictory database identities",
+    )
+    dropped = [call[-1] for call in calls if "dropdb" in call]
+    check(dropped == removed, "stale cleanup did not drop only exact selected names")
+
+    def forged_docker(args, *, capture=False, check=True, secrets=()):
+        del capture, check, secrets
+        return subprocess.CompletedProcess(
+            args, 0, stdout="codex_verify_not-a-digest\n", stderr=""
+        )
+
+    module.docker = forged_docker
+    try:
+        try:
+            module.cleanup_stale_verification_scratch(
+                "1" * 64, "app", [], secrets=()
+            )
+        except RuntimeError as error:
+            check("inventory is invalid" in str(error), "forged scratch name was not rejected")
+        else:
+            raise AssertionError("forged scratch database name was accepted")
+    finally:
+        module.docker = original_docker
+
+
+def test_database_dump_and_restore_are_role_neutral() -> None:
+    module = load_production_module()
+    custom_dump = module.backup_command("container", "app", "appdb", [], "custom")
+    plain_dump = module.backup_command("container", "app", "appdb", [], "plain")
+    restore = module.restore_command("container", "app", "appdb", [], "custom")
+    scratch_restore = module.restore_into_scratch_command(
+        "container", "app", [], "codex_verify_012345abcdef", "custom"
+    )
+    for label, command in (
+        ("custom dump", custom_dump),
+        ("plain dump", plain_dump),
+        ("ordinary restore", restore),
+        ("scratch restore", scratch_restore),
+    ):
+        check("--no-owner" in command, f"{label} must not replay source ownership")
+        check("--no-acl" in command, f"{label} must not replay source ACL grants")
+
+
 def main() -> int:
     tmp = Path(tempfile.mkdtemp(prefix="postgres-backup-p0-regression-")).resolve(strict=True)
     try:
         test_partial_publication_rollback(tmp / "publication-rollback")
+        test_stale_verification_cleanup_is_exact_and_inactive_only()
+        test_database_dump_and_restore_are_role_neutral()
         fake_bin = tmp / "bin"
         fake_bin.mkdir()
         make_fake_docker(fake_bin / "docker")

@@ -246,6 +246,47 @@ class UniversalTestRunnerTests(unittest.TestCase):
         self.assertEqual(loaded_output, state / "output")
         self.assertEqual(loaded_result, expected_result_path)
 
+    def test_fixture_launch_preserves_typed_provider_cause_without_raw_secrets(
+        self,
+    ) -> None:
+        class TypedFailure(RuntimeError):
+            code = "fixture_image_unavailable"
+            message = "sealed fixture image is not cached"
+
+        class Provider:
+            def provision(self, _descriptor, *, runtime_id):
+                del runtime_id
+                raise TypedFailure("credential=must-not-leak")
+
+            def cleanup(self, *, runtime_id, descriptor_fingerprint, reason):
+                del runtime_id, descriptor_fingerprint, reason
+
+        descriptor = replace(
+            self.descriptor(("/usr/bin/python3", "-c", "pass")),
+            fixtures=("postgres",),
+            fixture_bindings=(
+                {
+                    "name": "postgres",
+                    "template": "artifact-postgres",
+                    "network": "loopback",
+                },
+            ),
+        )
+        manager = SystemdTestAttemptManager(
+            attempt_root=Path(self.temporary.name) / "fixture-attempts",
+            artifact_root=Path(self.temporary.name) / "fixture-artifacts",
+            fixture_provider=Provider(),
+        )
+
+        with self.assertRaisesRegex(
+            TestStoreConflict,
+            "fixture_image_unavailable: sealed fixture image is not cached",
+        ) as raised:
+            manager._provision_fixture_descriptor(
+                descriptor, runtime_id="devcoordinator-test-fixture-cause"
+            )
+        self.assertNotIn("must-not-leak", str(raised.exception))
+
     def test_runner_load_accepts_legacy_launch_and_rejects_invalid_ticket_shape(self) -> None:
         descriptor = self.descriptor(("/usr/bin/python3", "-c", "pass"))
         attempt_root = Path(self.temporary.name) / "legacy-attempts"
@@ -1737,6 +1778,163 @@ class UniversalTestRunnerTests(unittest.TestCase):
         self.assertEqual(failures[0]["case_id"], "real-failure")
         self.assertEqual(self.result_cases(result_path)[0]["status"], "failed")
         self.assertTrue(self.result_chunks(result_path)[-1]["reporter_complete"])
+
+    def test_dotnet_solution_retains_every_trx_and_assertion_cause(self) -> None:
+        executable = self.fake_dotnet(
+            """\
+            from pathlib import Path
+            import sys
+
+            if sys.argv[1:] in (["--version"], ["workload", "list"]):
+                raise SystemExit(0)
+            args = sys.argv[1:]
+            results = Path(args[args.index("--results-directory") + 1])
+            results.joinpath("reporter_alpha.trx").write_text(
+                '<TestRun xmlns="http://microsoft.com/schemas/VisualStudio/TeamTest/2010">'
+                '<Results><UnitTestResult testId="shared" testName="alpha failure" '
+                'outcome="Failed" duration="00:00:00.0200000"><Output><ErrorInfo>'
+                '<Message>Expected 2 but found 1</Message>'
+                '<StackTrace>at Alpha.Tests.Case() in Alpha.cs:line 42</StackTrace>'
+                '</ErrorInfo></Output></UnitTestResult></Results></TestRun>'
+            )
+            results.joinpath("reporter_beta.trx").write_text(
+                '<TestRun xmlns="http://microsoft.com/schemas/VisualStudio/TeamTest/2010">'
+                '<Results><UnitTestResult testId="shared" testName="beta passes" '
+                'outcome="Passed" duration="00:00:00.0100000" /></Results></TestRun>'
+            )
+            raise SystemExit(1)
+            """
+        )
+        descriptor = replace(
+            self.descriptor((str(executable), "test", "AllTests.sln")),
+            driver="dotnet",
+            reporter="trx",
+            target_name="dotnet-solution-failure",
+        )
+        result_path = self.output / "dotnet-solution-failure-result.json"
+
+        self.assertEqual(run(descriptor, self.output, result_path), 1)
+
+        cases = self.result_cases(result_path)
+        failures = self.result_failures(result_path)
+        self.assertEqual(len(cases), 2)
+        self.assertEqual(len({case["case_id"] for case in cases}), 2)
+        self.assertEqual(len(failures), 1)
+        self.assertIn("Expected 2 but found 1", failures[0]["message"])
+        self.assertIn("Alpha.cs:line 42", failures[0]["location"])
+        self.assertIsInstance(failures[0]["artifact_id"], str)
+        result = json.loads(result_path.read_text(encoding="utf-8"))
+        reporter_artifacts = [
+            artifact
+            for artifact in result["artifact_sources"]
+            if artifact["kind"] == "trx"
+        ]
+        self.assertEqual(len(reporter_artifacts), 2)
+
+    def test_dotnet_oversized_trx_streams_bounded_failure_projection(self) -> None:
+        executable = self.fake_dotnet(
+            """\
+            from pathlib import Path
+            import sys
+
+            if sys.argv[1:] in (["--version"], ["workload", "list"]):
+                raise SystemExit(0)
+            args = sys.argv[1:]
+            results = Path(args[args.index("--results-directory") + 1])
+            oversized = (
+                '<TestRun xmlns="http://microsoft.com/schemas/VisualStudio/TeamTest/2010">'
+                '<Results><UnitTestResult testId="large-failure" '
+                'testName="oversized assertion" outcome="Failed" '
+                'duration="00:00:00.0200000"><Output><ErrorInfo>'
+                '<Message>Expected durable cause</Message>'
+                '<StackTrace>at Large.Tests.Case() in /private/source/Large.cs:line 9</StackTrace>'
+                '</ErrorInfo><StdOut>'
+                + ("bounded diagnostic filler\\n" * 1_400_000)
+                + '</StdOut></Output></UnitTestResult></Results></TestRun>'
+            )
+            results.joinpath("reporter_alpha.trx").write_text(oversized)
+            results.joinpath("reporter_beta.trx").write_text(
+                '<TestRun xmlns="http://microsoft.com/schemas/VisualStudio/TeamTest/2010">'
+                '<Results><UnitTestResult testId="small-pass" testName="small pass" '
+                'outcome="Passed" duration="00:00:00.0100000" /></Results></TestRun>'
+            )
+            raise SystemExit(1)
+            """
+        )
+        descriptor = replace(
+            self.descriptor((str(executable), "test", "AllTests.sln")),
+            driver="dotnet",
+            reporter="trx",
+            target_name="dotnet-oversized-trx",
+        )
+        result_path = self.output / "dotnet-oversized-trx-result.json"
+
+        self.assertEqual(run(descriptor, self.output, result_path), 1)
+
+        result = json.loads(result_path.read_text(encoding="utf-8"))
+        self.assertFalse(result["incomplete_reporting"])
+        cases = self.result_cases(result_path)
+        failures = self.result_failures(result_path)
+        self.assertEqual({case["status"] for case in cases}, {"failed", "passed"})
+        self.assertEqual(len(failures), 1)
+        self.assertIn("Expected durable cause", failures[0]["message"])
+        self.assertIn("Large.cs:line 9", failures[0]["location"])
+        self.assertIsInstance(failures[0]["artifact_id"], str)
+        reporter_artifacts = [
+            artifact
+            for artifact in result["artifact_sources"]
+            if artifact["kind"] in {"trace", "trx"}
+            and "reporter" in artifact["relative_path"]
+        ]
+        self.assertEqual({artifact["kind"] for artifact in reporter_artifacts}, {"trace", "trx"})
+        self.assertFalse(
+            any(
+                artifact["relative_path"].endswith("reporter_alpha.trx")
+                for artifact in reporter_artifacts
+            )
+        )
+
+    def test_dotnet_invalid_trx_does_not_suppress_independent_report(self) -> None:
+        executable = self.fake_dotnet(
+            """\
+            from pathlib import Path
+            import sys
+
+            if sys.argv[1:] in (["--version"], ["workload", "list"]):
+                raise SystemExit(0)
+            args = sys.argv[1:]
+            results = Path(args[args.index("--results-directory") + 1])
+            results.joinpath("reporter_alpha.trx").write_text("<invalid")
+            results.joinpath("reporter_beta.trx").write_text(
+                '<TestRun xmlns="http://microsoft.com/schemas/VisualStudio/TeamTest/2010">'
+                '<Results><UnitTestResult testId="safe-pass" testName="safe pass" '
+                'outcome="Passed" duration="00:00:00.0100000" /></Results></TestRun>'
+            )
+            raise SystemExit(0)
+            """
+        )
+        descriptor = replace(
+            self.descriptor((str(executable), "test", "AllTests.sln")),
+            driver="dotnet",
+            reporter="trx",
+            target_name="dotnet-invalid-trx",
+        )
+        result_path = self.output / "dotnet-invalid-trx-result.json"
+
+        self.assertEqual(run(descriptor, self.output, result_path), 1)
+
+        result = json.loads(result_path.read_text(encoding="utf-8"))
+        self.assertTrue(result["incomplete_reporting"])
+        self.assertEqual(
+            [case["display_name"] for case in self.result_cases(result_path)],
+            ["safe pass"],
+        )
+        self.assertTrue(
+            any(
+                failure["classification"] == "incomplete_reporting"
+                for failure in self.result_failures(result_path)
+            )
+        )
 
     def test_python_unittest_executes_through_trusted_jsonl_reporter(self) -> None:
         script = self.root / "python_framework_suite.py"

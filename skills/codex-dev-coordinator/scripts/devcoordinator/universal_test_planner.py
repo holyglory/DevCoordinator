@@ -199,13 +199,15 @@ class TestPlan:
     eligible_targets: tuple[str, ...]
     selected_targets: tuple[str, ...]
     dependency_waves: tuple[tuple[str, ...], ...]
+    dependencies: Mapping[str, tuple[str, ...]]
     selection: Mapping[str, TargetSelection]
     complete_intent_fallback: bool
     reusable: bool
     evidence_policies: Mapping[str, EvidencePolicy]
+    dependency_schema_version: int = 3
 
     def to_document(self) -> dict[str, object]:
-        return {
+        document: dict[str, object] = {
             "plan_id": self.plan_id,
             "fingerprint": self.fingerprint,
             "execution_fingerprint": self.execution_fingerprint,
@@ -242,6 +244,12 @@ class TestPlan:
                 for name, policy in self.evidence_policies.items()
             },
         }
+        if self.dependency_schema_version >= 3:
+            document["dependencies"] = {
+                target: list(values)
+                for target, values in self.dependencies.items()
+            }
+        return document
 
 
 def _normalized_changes(changes: Sequence[ChangedPath]) -> tuple[ChangedPath, ...]:
@@ -472,11 +480,12 @@ def _selection_document(
     eligible: tuple[str, ...],
     selected: tuple[str, ...],
     waves: tuple[tuple[str, ...], ...],
+    dependencies: Mapping[str, tuple[str, ...]],
     reasons: Mapping[str, TargetSelection],
     fallback: bool,
 ) -> dict[str, object]:
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "manifest_fingerprint": manifest.fingerprint,
         "repository_id": source.repository_id,
         "intent": intent,
@@ -493,6 +502,9 @@ def _selection_document(
         "eligible_targets": list(eligible),
         "selected_targets": list(selected),
         "dependency_waves": [list(wave) for wave in waves],
+        "dependencies": {
+            name: list(values) for name, values in dependencies.items()
+        },
         "selection": {
             name: list(item.reasons) for name, item in reasons.items()
         },
@@ -619,6 +631,12 @@ def create_test_plan(
     selected_set = _bidirectional_closure(manifest, initial, reasons)
     selected = tuple(sorted(selected_set))
     waves = _dependency_waves(manifest, selected_set) if selected_set else ()
+    dependencies = MappingProxyType(
+        {
+            name: tuple(manifest.targets[name].depends_on)
+            for name in selected
+        }
+    )
     selection = MappingProxyType(
         {
             name: TargetSelection(
@@ -637,13 +655,14 @@ def create_test_plan(
         eligible=eligible,
         selected=selected,
         waves=waves,
+        dependencies=dependencies,
         reasons=selection,
         fallback=fallback,
     )
     fingerprint = deterministic_fingerprint(fingerprint_document)
     execution_fingerprint = deterministic_fingerprint(
         {
-            "schema_version": 2,
+            "schema_version": 3,
             "manifest_fingerprint": manifest.fingerprint,
             "repository_id": source.repository_id,
             "source_mode": source.mode.value,
@@ -653,6 +672,9 @@ def create_test_plan(
             "eligible_targets": list(eligible),
             "selected_targets": list(selected),
             "dependency_waves": [list(wave) for wave in waves],
+            "dependencies": {
+                name: list(values) for name, values in dependencies.items()
+            },
         }
     )
     evidence_policies = MappingProxyType(
@@ -675,6 +697,7 @@ def create_test_plan(
         eligible_targets=eligible,
         selected_targets=selected,
         dependency_waves=waves,
+        dependencies=dependencies,
         selection=selection,
         complete_intent_fallback=fallback,
         reusable=bool(fingerprint_document["reusable"]),

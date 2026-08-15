@@ -555,6 +555,12 @@ class UniversalTestHarnessTests(unittest.TestCase):
         self.assertEqual(len(valid_plane.registered), 1)
         self.assertEqual(valid_plane.preview_calls[0]["access_uid"], preview.peer.uid)
         self.assertEqual(valid_plane.preview_calls[0]["owner_uid"], os.geteuid())
+        replay = backend.execute(
+            self.persistence.accept(preview.peer, preview.request)
+        )
+        self.assertEqual(replay["classification"], "test_plan_preview_completed")
+        self.assertEqual(replay["plan_id"], valid_plane.selected_plan.plan_id)
+        self.assertEqual(len(valid_plane.preview_calls), 1)
 
         invalid_plane = PreviewTestPlane(selected(self.root / "not-authorized"))
         invalid_backend = StoreBackedMutationBackend(
@@ -562,17 +568,23 @@ class UniversalTestHarnessTests(unittest.TestCase):
             object(),  # type: ignore[arg-type]
             test_plane=invalid_plane,  # type: ignore[arg-type]
         )
+        invalid_preview = self.request(
+            BrokerOperation.TEST_PLAN_PREVIEW,
+            self.preview_arguments("release"),
+        )
         with self.assertLogs("devcoordinator.broker_backend", level="WARNING") as logs:
             with self.assertRaises(BrokerBackendError) as rejected:
                 invalid_backend.execute(
-                    self.persistence.accept(preview.peer, preview.request)
+                    self.persistence.accept(
+                        invalid_preview.peer, invalid_preview.request
+                    )
                 )
         self.assertEqual(rejected.exception.code, "test_contract_invalid")
         self.assertIn(
             "plan source is not the exact accepted root repository",
             str(rejected.exception),
         )
-        self.assertIn(preview.request.operation_id, "\n".join(logs.output))
+        self.assertIn(invalid_preview.request.operation_id, "\n".join(logs.output))
         self.assertIn(
             "plan source is not the exact accepted root repository",
             "\n".join(logs.output),
@@ -664,9 +676,10 @@ class UniversalTestHarnessTests(unittest.TestCase):
         preview = self.request(
             BrokerOperation.TEST_PLAN_PREVIEW, self.preview_arguments("manual")
         )
+        accepted = self.persistence.accept(preview.peer, preview.request)
 
         with self.assertRaises(BrokerBackendError) as raised:
-            backend.execute(self.persistence.accept(preview.peer, preview.request))
+            backend.execute(accepted)
 
         self.assertEqual(raised.exception.code, "test_plan_source_invalid")
         self.assertEqual(
@@ -675,9 +688,16 @@ class UniversalTestHarnessTests(unittest.TestCase):
             "deploy/ceph-vault-probe/temporal_scope_probe.py.",
         )
         self.assertNotIn("Errno", raised.exception.message)
+        persisted = self.persistence.existing_operation_disposition(accepted)
+        self.assertIsNotNone(persisted)
+        self.assertEqual(persisted.state, "failed")
+        self.assertEqual(persisted.error_code, "test_plan_source_invalid")
 
         plane.preview_error = TestPlaneTransportError(
             "test_plan_source_invalid", "unexpected secret at /outside/path"
+        )
+        preview = self.request(
+            BrokerOperation.TEST_PLAN_PREVIEW, self.preview_arguments("manual")
         )
         with self.assertRaises(BrokerBackendError) as opaque:
             backend.execute(self.persistence.accept(preview.peer, preview.request))
@@ -687,6 +707,9 @@ class UniversalTestHarnessTests(unittest.TestCase):
             "snapshot_materialization_failed",
             "snapshot file is unavailable: tests.json: "
             "[Errno 2] No such file or directory: 'tests.json'",
+        )
+        preview = self.request(
+            BrokerOperation.TEST_PLAN_PREVIEW, self.preview_arguments("manual")
         )
         with self.assertRaises(BrokerBackendError) as missing:
             backend.execute(self.persistence.accept(preview.peer, preview.request))

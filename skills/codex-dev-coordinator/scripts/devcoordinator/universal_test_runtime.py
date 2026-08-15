@@ -94,6 +94,25 @@ _MAX_NUGET_SOURCE_IDENTITY_BYTES = (1 << 63) - 1
 _DEPENDENCY_BINDING_KINDS = frozenset(
     {"python-venv", "node-modules", "dotnet-packages"}
 )
+
+
+def _safe_fixture_provider_failure(error: BaseException) -> str:
+    """Project one trusted typed host failure without exposing raw exceptions."""
+
+    code = getattr(error, "code", None)
+    message = getattr(error, "message", None)
+    if (
+        isinstance(code, str)
+        and _SAFE_ID.fullmatch(code) is not None
+        and isinstance(message, str)
+        and message
+        and len(message.encode("utf-8")) <= 1024
+        and not any(character in message for character in "\x00\r\n")
+    ):
+        return f"{code}: {message}"
+    return type(error).__name__
+
+
 _INSTALLATION_MANIFEST_KINDS = frozenset(
     {
         "python-dist-info",
@@ -1381,7 +1400,11 @@ class SystemdTestAttemptManager:
         except TestStoreConflict:
             raise
         except Exception as error:
-            raise TestStoreConflict("test fixture provisioning failed") from error
+            raise TestStoreConflict(
+                "test fixture provisioning failed ("
+                + _safe_fixture_provider_failure(error)
+                + ")"
+            ) from error
         if not isinstance(lease, TestFixtureLease):
             raise TestStoreConflict("test fixture lease identity is invalid")
         if (

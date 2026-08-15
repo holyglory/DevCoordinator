@@ -158,6 +158,7 @@ _PLAN_FIELDS = frozenset(
         "eligible_targets",
         "selected_targets",
         "dependency_waves",
+        "dependencies",
         "selection",
         "complete_intent_fallback",
         "reusable",
@@ -842,7 +843,12 @@ def decode_test_plan_document(value: Mapping[str, object]) -> TestPlan:
     """Revalidate the complete deterministic planner wire document."""
 
     raw = _mapping("plan", value)
-    _exact_fields("plan", raw, _PLAN_FIELDS)
+    has_dependencies = "dependencies" in raw
+    _exact_fields(
+        "plan",
+        raw,
+        _PLAN_FIELDS if has_dependencies else _PLAN_FIELDS - {"dependencies"},
+    )
     source_raw = _mapping("plan.source", raw["source"])
     _exact_fields("plan.source", source_raw, _SOURCE_FIELDS)
     try:
@@ -956,6 +962,48 @@ def decode_test_plan_document(value: Mapping[str, object]) -> TestPlan:
     )
     if any(not item.reasons for item in selection.values()):
         raise TestStoreContractError("every selected target requires a selection reason")
+    if has_dependencies:
+        dependencies_raw = _mapping("plan.dependencies", raw["dependencies"])
+        if set(dependencies_raw) != set(selected):
+            raise TestStoreContractError(
+                "plan dependencies must cover every selected target exactly once"
+            )
+        dependencies = MappingProxyType(
+            {
+                target: _text_sequence(
+                    f"plan.dependencies.{target}",
+                    dependencies_raw[target],
+                    maximum_items=256,
+                )
+                for target in selected
+            }
+        )
+    else:
+        # Schema-2 retained plans predate the exact dependency field. Their
+        # deterministic closure reasons preserve direct prerequisite names.
+        dependencies = MappingProxyType(
+            {
+                target: tuple(
+                    sorted(
+                        reason.split(":", 1)[1]
+                        for reason in selection[target].reasons
+                        if reason.startswith("dependent-of:")
+                    )
+                )
+                for target in selected
+            }
+        )
+    wave_by_target = {
+        target: index for index, wave in enumerate(waves) for target in wave
+    }
+    for target, required in dependencies.items():
+        if (
+            tuple(sorted(set(required))) != required
+            or target in required
+            or not set(required).issubset(selected)
+            or any(wave_by_target[name] >= wave_by_target[target] for name in required)
+        ):
+            raise TestStoreContractError("plan exact dependencies are invalid")
     fallback = raw["complete_intent_fallback"]
     reusable = raw["reusable"]
     if type(fallback) is not bool or type(reusable) is not bool:
@@ -1039,7 +1087,7 @@ def decode_test_plan_document(value: Mapping[str, object]) -> TestPlan:
             )
         policies[name] = policy
     fingerprint_document = {
-        "schema_version": 2,
+        "schema_version": 3 if has_dependencies else 2,
         "manifest_fingerprint": manifest_fingerprint,
         "repository_id": repository_id,
         "intent": intent,
@@ -1056,6 +1104,16 @@ def decode_test_plan_document(value: Mapping[str, object]) -> TestPlan:
         "eligible_targets": list(eligible),
         "selected_targets": list(selected),
         "dependency_waves": [list(wave) for wave in waves],
+        **(
+            {
+                "dependencies": {
+                    target: list(values)
+                    for target, values in dependencies.items()
+                }
+            }
+            if has_dependencies
+            else {}
+        ),
         "selection": {
             target: list(item.reasons) for target, item in selection.items()
         },
@@ -1065,7 +1123,7 @@ def decode_test_plan_document(value: Mapping[str, object]) -> TestPlan:
     fingerprint = deterministic_fingerprint(fingerprint_document)
     execution_fingerprint = deterministic_fingerprint(
         {
-            "schema_version": 2,
+            "schema_version": 3 if has_dependencies else 2,
             "manifest_fingerprint": manifest_fingerprint,
             "repository_id": repository_id,
             "source_mode": source.mode.value,
@@ -1075,6 +1133,16 @@ def decode_test_plan_document(value: Mapping[str, object]) -> TestPlan:
             "eligible_targets": list(eligible),
             "selected_targets": list(selected),
             "dependency_waves": [list(wave) for wave in waves],
+            **(
+                {
+                    "dependencies": {
+                        target: list(values)
+                        for target, values in dependencies.items()
+                    }
+                }
+                if has_dependencies
+                else {}
+            ),
         }
     )
     if (
@@ -1096,10 +1164,12 @@ def decode_test_plan_document(value: Mapping[str, object]) -> TestPlan:
         eligible_targets=eligible,
         selected_targets=selected,
         dependency_waves=waves,
+        dependencies=dependencies,
         selection=selection,
         complete_intent_fallback=fallback,
         reusable=reusable,
         evidence_policies=MappingProxyType(policies),
+        dependency_schema_version=3 if has_dependencies else 2,
     )
 
 

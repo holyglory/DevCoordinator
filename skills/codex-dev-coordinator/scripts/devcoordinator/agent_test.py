@@ -136,38 +136,51 @@ def enqueue_test(
         raise AgentTestError(
             "test_reply_invalid", "test preview contradicted its operation identity"
         )
-    plan_document = preview.get("plan")
-    if not isinstance(plan_document, Mapping):
-        raise AgentTestError("test_reply_invalid", "test preview omitted its plan")
-
-    # The producer-owned decoder verifies the complete plan, including source,
-    # manifest, selection, timeouts, and fingerprints.  Only its compact
-    # projection crosses the caller boundary.
-    from .universal_test_service import decode_test_plan_document
-
-    plan = decode_test_plan_document(plan_document)
-    if (
-        plan.repository_id != repository.repo_id
-        or plan.intent != intent
-        or plan.timeouts.execution_seconds != execution_timeout_seconds
-        or plan.timeouts.launch_seconds != launch_timeout_seconds
-        or plan.source.original_root != repository.canonical_root
-        or plan.source.temporary_root
-        != (
-            temporary_repository.canonical_root
-            if temporary_repository is not None
-            else None
-        )
-    ):
-        raise AgentTestError(
-            "test_reply_invalid", "test preview contradicted repository, intent, or timeout"
-        )
     plan_id = _opaque(preview.get("plan_id"), field="plan_id")
-    if plan_id != plan.plan_id:
-        raise AgentTestError(
-            "test_reply_invalid", "registered plan identity is contradictory"
-        )
-    plan_projection = _compact_plan(plan)
+    plan_document = preview.get("plan")
+    if isinstance(plan_document, Mapping):
+        # The producer-owned decoder verifies the complete plan, including
+        # source, manifest, selection, timeouts, and fingerprints. Only its
+        # compact projection crosses the caller boundary.
+        from .universal_test_service import decode_test_plan_document
+
+        plan = decode_test_plan_document(plan_document)
+        if (
+            plan.repository_id != repository.repo_id
+            or plan.intent != intent
+            or plan.timeouts.execution_seconds != execution_timeout_seconds
+            or plan.timeouts.launch_seconds != launch_timeout_seconds
+            or plan.source.original_root != repository.canonical_root
+            or plan.source.temporary_root
+            != (
+                temporary_repository.canonical_root
+                if temporary_repository is not None
+                else None
+            )
+            or plan_id != plan.plan_id
+        ):
+            raise AgentTestError(
+                "test_reply_invalid",
+                "test preview contradicted repository, intent, or timeout",
+            )
+        plan_projection = _compact_plan(plan)
+    elif preview.get("classification") == "test_plan_preview_completed":
+        if (
+            preview.get("repository_id") != repository.repo_id
+            or preview.get("intent") != intent
+            or preview.get("operation_id") != operation_id
+        ):
+            raise AgentTestError(
+                "test_reply_invalid", "durable test preview replay is contradictory"
+            )
+        plan_projection = {
+            "id": plan_id,
+            "intent": intent,
+            "source": {"snapshot_id": preview.get("snapshot_id")},
+            "replayed": True,
+        }
+    else:
+        raise AgentTestError("test_reply_invalid", "test preview omitted its plan")
 
     submit_operation_id = child_operation_id(operation_id, "submit")
     submitted = profile.submit_test_plan(
@@ -282,6 +295,29 @@ def project_queue_status(
                 "target_count": item.get("target_count"),
             }
             for item in status.get("blockers", [])[:16]
+            if isinstance(item, Mapping)
+        ],
+        "representative_targets": [
+            {
+                "run_id": _opaque(item.get("run_id"), field="run_id"),
+                "target_name": _opaque(
+                    item.get("target_name"), field="target_name"
+                ),
+                "state": bounded_text(
+                    item.get("state", "unknown"), maximum_bytes=64
+                ),
+                "attempt_id": (
+                    None
+                    if item.get("attempt_id") is None
+                    else _opaque(item.get("attempt_id"), field="attempt_id")
+                ),
+                "wait_code": (
+                    None
+                    if item.get("wait_code") is None
+                    else bounded_text(item.get("wait_code"), maximum_bytes=64)
+                ),
+            }
+            for item in status.get("representative_targets", [])[:16]
             if isinstance(item, Mapping)
         ],
         "worker_capacity": {

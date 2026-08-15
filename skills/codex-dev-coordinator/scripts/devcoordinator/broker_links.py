@@ -15,7 +15,11 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Optional
 
 from .broker import BrokerClient, BrokerOperation, BrokerRequest
-from .broker_profile import BrokerClientProfile, BrokerRepositoryProfile
+from .broker_profile import (
+    BrokerClientProfile,
+    BrokerRepositoryProfile,
+    load_broker_profile,
+)
 from .repository_lifecycle import ResourceKind
 from .sqlite_lifecycle import SQLiteLifecyclePersistence
 from .store import (
@@ -80,11 +84,18 @@ class BrokerLinkStore:
                 connection.execute(
                     """
                     UPDATE broker_lease_links
-                    SET expires_at = ?, updated_at = ?
+                    SET broker_socket = ?, broker_database_generation = ?,
+                        expires_at = ?, updated_at = ?
                     WHERE broker_lease_id = ?
                       AND status IN ('reserved','active')
                     """,
-                    (expires_at, timestamp, broker_lease_id),
+                    (
+                        str(profile.service.socket_path),
+                        profile.service.database_generation,
+                        expires_at,
+                        timestamp,
+                        broker_lease_id,
+                    ),
                 )
                 refreshed = connection.execute(
                     "SELECT * FROM broker_lease_links WHERE broker_lease_id = ?",
@@ -1875,9 +1886,6 @@ def _require_same_lease(
         or str(row["protocol"]) != protocol
         or str(row["status"]) not in {"reserved", "active"}
         or str(row["account_id"]) != "local"
-        or str(row["broker_socket"]) != str(profile.service.socket_path)
-        or str(row["broker_database_generation"])
-        != profile.service.database_generation
     ):
         raise RuntimeError("broker lease identity was reused with conflicting linkage")
 
@@ -1885,7 +1893,20 @@ def _require_same_lease(
 def _call_saved_broker(
     link: BrokerLink, request: BrokerRequest
 ) -> Mapping[str, Any]:
-    return BrokerClient(Path(link.broker_socket)).call(request)
+    profile = load_broker_profile(required=False)
+    if profile is None:
+        return BrokerClient(Path(link.broker_socket)).call(request)
+    current = BrokerRequest.create(
+        account_id=request.account_id,
+        project_id=request.project_id,
+        repository_generation=request.repository_generation,
+        resource_id=request.resource_id,
+        operation=request.operation,
+        arguments=request.arguments,
+        operation_id=request.operation_id,
+        authority_generation=profile.service.database_generation,
+    )
+    return BrokerClient(profile.service.socket_path).call(current)
 
 
 def _require_same_assignment(

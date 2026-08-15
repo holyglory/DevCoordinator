@@ -103,6 +103,15 @@ class AgentTestTests(unittest.TestCase):
                 "approximate_first_position": 3,
                 "position_population_truncated": False,
                 "blockers": [{"code": "host_memory", "target_count": 1}],
+                "representative_targets": [
+                    {
+                        "run_id": "run-1",
+                        "target_name": "server-tests",
+                        "state": "queued",
+                        "attempt_id": None,
+                        "wait_code": "exact_dependency_pending",
+                    }
+                ],
                 "worker_capacity": {
                     "model": "dynamic_memory_admission",
                     "limit": None,
@@ -115,6 +124,39 @@ class AgentTestTests(unittest.TestCase):
         self.assertEqual(result["classification"], "test_queue_status")
         self.assertEqual(result["approximate_first_position"], 3)
         self.assertNotIn("run_id", result)
+        self.assertEqual(
+            result["representative_targets"][0]["target_name"], "server-tests"
+        )
+
+    def test_enqueue_replays_completed_durable_preview_and_submits(self) -> None:
+        profile = Profile()
+        profile.preview_test_plan = mock.Mock(
+            return_value={
+                "schema_version": 1,
+                "ok": True,
+                "classification": "test_plan_preview_completed",
+                "operation_id": ROOT_OPERATION,
+                "repository_id": "repo-1",
+                "intent": "change",
+                "plan_id": "plan-1",
+                "snapshot_id": "snapshot-1",
+                "registered": True,
+            }
+        )
+        result = enqueue_test(
+            profile=profile,
+            repository=SimpleNamespace(repo_id="repo-1", canonical_root="/repo"),
+            temporary_repository=None,
+            intent="change",
+            requested_targets=(),
+            execution_timeout_seconds=None,
+            launch_timeout_seconds=300,
+            actor="codex:thread-1",
+            operation_id=ROOT_OPERATION,
+        )
+        self.assertEqual(result["plan"]["id"], "plan-1")
+        self.assertTrue(result["plan"]["replayed"])
+        self.assertEqual(len(profile.submit_calls), 1)
 
     def _enqueue(
         self, *, intent: str = "change", account_id: str = "account-tests"

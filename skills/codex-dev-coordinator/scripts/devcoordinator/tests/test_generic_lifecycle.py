@@ -479,6 +479,13 @@ class GenericLifecycleBrokerTests(unittest.TestCase):
                 ).fetchone()
                 self.assertIsNotNone(tombstone)
                 self.assertEqual(tombstone["immutable_fingerprint"], plan.target_fingerprint)
+                self.assertFalse(
+                    any(
+                        item["target_kind"] == "volume"
+                        for item in lifecycle.list_archives(actor="fixture")["archives"]
+                    ),
+                    "storage tombstones must not become interactive lifecycle controls",
+                )
 
     def test_exact_compose_volume_revalidates_zero_references_before_apply(self) -> None:
         volume_name = "alpha_data"

@@ -73,7 +73,10 @@ MAX_EPHEMERAL_SECRET_BYTES = 512
 # Repository lifecycle plans can also exceed this budget; their recovery
 # contract is durable per-target phase checkpoints plus idempotent
 # re-observation, rather than completion inside this timeout.
-DEFAULT_POSTGRES_COMMAND_TIMEOUT_SECONDS = 60 * 60.0
+# Large production databases can legitimately need several hours for a
+# complete dump or a single-threaded scratch restore.  This is a semantic
+# database-operation bound, not the ordinary broker transport slice.
+DEFAULT_POSTGRES_COMMAND_TIMEOUT_SECONDS = 6 * 60 * 60.0
 DATABASE_BACKUP_CUMULATIVE_TIMEOUT_SECONDS = (
     2 * DEFAULT_POSTGRES_COMMAND_TIMEOUT_SECONDS
 )

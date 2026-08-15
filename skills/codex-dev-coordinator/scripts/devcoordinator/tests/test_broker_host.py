@@ -222,6 +222,12 @@ class BrokerHostMutationTests(unittest.TestCase):
         )
         self.assertIn("no space left on device", str(raised.exception))
         self.assertEqual([command[2] for command in calls], ["backup", "verify"])
+        self.assertIn("--cleanup-stale-verification-scratch", calls[1])
+        self.assertEqual(host._postgres_timeout_seconds, 6 * 60 * 60)
+
+        LocalBrokerHostMutations(postgres_timeout_seconds=24 * 60 * 60)
+        with self.assertRaisesRegex(ValueError, "at most 86400"):
+            LocalBrokerHostMutations(postgres_timeout_seconds=24 * 60 * 60 + 1)
 
     @unittest.skipUnless(sys.platform.startswith("linux"), "Linux procfs observer")
     def test_linux_listener_proof_does_not_depend_on_lsof(self) -> None:

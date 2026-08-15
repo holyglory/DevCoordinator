@@ -699,6 +699,172 @@ def _canonical_json(value: object) -> str:
     )
 
 
+def _stored_plan_dependencies(plan_json: object) -> dict[str, tuple[str, ...]]:
+    """Read exact dependencies from a validated retained plan document."""
+
+    try:
+        raw = json.loads(str(plan_json))
+    except (TypeError, ValueError, json.JSONDecodeError) as error:
+        raise TestStoreContractError("stored test plan JSON is invalid") from error
+    if not isinstance(raw, Mapping):
+        raise TestStoreContractError("stored test plan is invalid")
+    selected_raw = raw.get("selected_targets")
+    selection_raw = raw.get("selection")
+    if (
+        not isinstance(selected_raw, list)
+        or not isinstance(selection_raw, Mapping)
+        or any(not isinstance(name, str) for name in selected_raw)
+    ):
+        raise TestStoreContractError("stored test plan selection is invalid")
+    selected = tuple(str(name) for name in selected_raw)
+    dependencies_raw = raw.get("dependencies")
+    if dependencies_raw is None:
+        dependencies: dict[str, tuple[str, ...]] = {}
+        for target in selected:
+            reasons = selection_raw.get(target)
+            if not isinstance(reasons, list):
+                raise TestStoreContractError(
+                    "stored legacy test plan selection is invalid"
+                )
+            dependencies[target] = tuple(
+                sorted(
+                    str(reason).split(":", 1)[1]
+                    for reason in reasons
+                    if isinstance(reason, str)
+                    and reason.startswith("dependent-of:")
+                )
+            )
+    else:
+        if not isinstance(dependencies_raw, Mapping) or set(
+            dependencies_raw
+        ) != set(selected):
+            raise TestStoreContractError("stored test plan dependencies are invalid")
+        dependencies = {}
+        for target in selected:
+            values = dependencies_raw[target]
+            if not isinstance(values, list) or any(
+                not isinstance(value, str) for value in values
+            ):
+                raise TestStoreContractError(
+                    "stored test plan dependency list is invalid"
+                )
+            dependencies[target] = tuple(str(value) for value in values)
+    for target, values in dependencies.items():
+        if (
+            tuple(sorted(set(values))) != values
+            or target in values
+            or not set(values).issubset(selected)
+        ):
+            raise TestStoreContractError("stored test plan dependencies are invalid")
+    return dependencies
+
+
+def _target_dependencies_succeeded(
+    *,
+    target_name: str,
+    dependencies: Mapping[str, tuple[str, ...]],
+    states: Mapping[str, Sequence[str]],
+) -> bool:
+    return all(
+        states.get(dependency)
+        and all(state == "succeeded" for state in states[dependency])
+        for dependency in dependencies.get(target_name, ())
+    )
+
+
+def _retry_plan_projection(
+    plan_json: object,
+    *,
+    selected_targets: Sequence[str],
+) -> tuple[str, str, str, str]:
+    """Derive one dense exact-dependency plan for a retained-run retry."""
+
+    try:
+        source = json.loads(str(plan_json))
+    except (TypeError, ValueError, json.JSONDecodeError) as error:
+        raise TestStoreContractError("stored retry source plan is invalid") from error
+    if not isinstance(source, dict):
+        raise TestStoreContractError("stored retry source plan is invalid")
+    selected = tuple(sorted(set(selected_targets)))
+    if not selected:
+        raise TestStoreContractError("retry plan requires selected targets")
+    dependencies = _stored_plan_dependencies(plan_json)
+    if not set(selected).issubset(dependencies):
+        raise TestStoreContractError("retry targets exceed the stored plan")
+    selected_set = set(selected)
+    projected_dependencies = {
+        target: tuple(
+            dependency
+            for dependency in dependencies[target]
+            if dependency in selected_set
+        )
+        for target in selected
+    }
+    unresolved = set(selected)
+    resolved: set[str] = set()
+    waves: list[list[str]] = []
+    while unresolved:
+        wave = sorted(
+            target
+            for target in unresolved
+            if set(projected_dependencies[target]).issubset(resolved)
+        )
+        if not wave:
+            raise TestStoreContractError("retry plan dependencies contain a cycle")
+        waves.append(wave)
+        unresolved.difference_update(wave)
+        resolved.update(wave)
+    selection = source.get("selection")
+    if not isinstance(selection, dict) or not selected_set.issubset(selection):
+        raise TestStoreContractError("stored retry plan selection is invalid")
+    document = dict(source)
+    document["selected_targets"] = list(selected)
+    document["dependency_waves"] = waves
+    document["dependencies"] = {
+        target: list(projected_dependencies[target]) for target in selected
+    }
+    document["selection"] = {target: selection[target] for target in selected}
+    try:
+        fingerprint_document = {
+            "schema_version": 3,
+            "manifest_fingerprint": document["manifest_fingerprint"],
+            "repository_id": document["repository_id"],
+            "intent": document["intent"],
+            "timeouts": document["timeouts"],
+            "source": document["source"],
+            "changes": document["changes"],
+            "eligible_targets": document["eligible_targets"],
+            "selected_targets": document["selected_targets"],
+            "dependency_waves": document["dependency_waves"],
+            "dependencies": document["dependencies"],
+            "selection": document["selection"],
+            "complete_intent_fallback": document["complete_intent_fallback"],
+            "reusable": document["reusable"],
+        }
+        execution_document = {
+            "schema_version": 3,
+            "manifest_fingerprint": document["manifest_fingerprint"],
+            "repository_id": document["repository_id"],
+            "source_mode": document["source"]["mode"],
+            "content_fingerprint": document["source"]["content_fingerprint"],
+            "intent": document["intent"],
+            "timeouts": document["timeouts"],
+            "eligible_targets": document["eligible_targets"],
+            "selected_targets": document["selected_targets"],
+            "dependency_waves": document["dependency_waves"],
+            "dependencies": document["dependencies"],
+        }
+    except (KeyError, TypeError) as error:
+        raise TestStoreContractError("stored retry source plan is invalid") from error
+    fingerprint = deterministic_fingerprint(fingerprint_document)
+    execution_fingerprint = deterministic_fingerprint(execution_document)
+    plan_id = "plan-" + fingerprint[:32]
+    document["plan_id"] = plan_id
+    document["fingerprint"] = fingerprint
+    document["execution_fingerprint"] = execution_fingerprint
+    return plan_id, fingerprint, execution_fingerprint, _canonical_json(document)
+
+
 def _bounded_text(
     field: str,
     value: object,
@@ -1466,27 +1632,52 @@ class UniversalTestStore:
                 """
                 SELECT target.*, run.repository_id, run.owner_uid, run.priority,
                        run.state AS run_state, run.source_mode,
+                       plan.plan_json,
                        profile.sample_count AS memory_sample_count,
                        profile.recent_peak_memory_bytes
                 FROM test_run_targets AS target
                 JOIN test_runs AS run ON run.run_id = target.run_id
+                JOIN test_plans AS plan ON plan.plan_id = run.plan_id
                 LEFT JOIN test_target_resource_profiles AS profile
                   ON profile.repository_id = run.repository_id
                  AND profile.target_name = target.target_name
                 WHERE target.state = 'queued'
                   AND run.state IN ('queued', 'running')
-                  AND NOT EXISTS (
-                    SELECT 1 FROM test_run_targets AS prior
-                    WHERE prior.run_id = target.run_id
-                      AND prior.wave_index < target.wave_index
-                      AND prior.state != 'succeeded'
-                  )
                 ORDER BY run.priority DESC, target.queued_at, target.target_id
-                LIMIT ?
+                LIMIT 10000
                 """,
-                (limit,),
             ).fetchall()
-            return tuple(self._runnable_target(row) for row in rows)
+            dependencies_by_run: dict[str, dict[str, tuple[str, ...]]] = {}
+            states_by_run: dict[str, dict[str, list[str]]] = {}
+            for row in rows:
+                run_id = str(row["run_id"])
+                if run_id in dependencies_by_run:
+                    continue
+                dependencies_by_run[run_id] = _stored_plan_dependencies(
+                    row["plan_json"]
+                )
+                states: dict[str, list[str]] = {}
+                for state_row in connection.execute(
+                    """
+                    SELECT target_name, state FROM test_run_targets
+                    WHERE run_id = ? ORDER BY target_name, shard_index
+                    """,
+                    (run_id,),
+                ):
+                    states.setdefault(str(state_row["target_name"]), []).append(
+                        str(state_row["state"])
+                    )
+                states_by_run[run_id] = states
+            runnable = [
+                self._runnable_target(row)
+                for row in rows
+                if _target_dependencies_succeeded(
+                    target_name=str(row["target_name"]),
+                    dependencies=dependencies_by_run[str(row["run_id"])],
+                    states=states_by_run[str(row["run_id"])],
+                )
+            ]
+            return tuple(runnable[:limit])
         finally:
             connection.close()
 
@@ -1601,6 +1792,35 @@ class UniversalTestStore:
                     (repository_id,),
                 ).fetchall()
             ]
+            representative_targets = [
+                {
+                    "run_id": str(row["run_id"]),
+                    "target_name": str(row["target_name"]),
+                    "state": str(row["state"]),
+                    "attempt_id": (
+                        None
+                        if row["current_attempt_id"] is None
+                        else str(row["current_attempt_id"])
+                    ),
+                    "wait_code": (
+                        None if row["wait_code"] is None else str(row["wait_code"])
+                    ),
+                }
+                for row in connection.execute(
+                    """
+                    SELECT target.run_id, target.target_name, target.state,
+                           target.current_attempt_id, target.wait_code
+                    FROM test_run_targets AS target
+                    JOIN test_runs AS run ON run.run_id = target.run_id
+                    WHERE run.repository_id = ?
+                      AND target.state IN ('queued', 'leased', 'running')
+                      AND run.state IN ('queued', 'running', 'cancelling', 'superseding')
+                    ORDER BY target.queued_at, target.target_id
+                    LIMIT 16
+                    """,
+                    (repository_id,),
+                ).fetchall()
+            ]
         finally:
             connection.close()
 
@@ -1637,6 +1857,7 @@ class UniversalTestStore:
             ),
             "position_population_truncated": len(runnable) == 10_000,
             "blockers": blockers[:16],
+            "representative_targets": representative_targets,
             # Admission is dynamic and memory-based; there is deliberately no
             # invented fixed worker count or unobserved available capacity.
             "worker_capacity": {
@@ -1762,9 +1983,10 @@ class UniversalTestStore:
             target = connection.execute(
                 """
                 SELECT target.*, run.repository_id, run.owner_uid,
-                       run.state AS run_state
+                       run.state AS run_state, plan.plan_json
                 FROM test_run_targets AS target
                 JOIN test_runs AS run ON run.run_id = target.run_id
+                JOIN test_plans AS plan ON plan.plan_id = run.plan_id
                 WHERE target.target_id = ?
                 """,
                 (target_id,),
@@ -1776,16 +1998,24 @@ class UniversalTestStore:
                 "running",
             }:
                 raise TestStoreConflict("test target is not runnable")
-            blocked = connection.execute(
+            dependencies = _stored_plan_dependencies(target["plan_json"])
+            states: dict[str, list[str]] = {}
+            for state_row in connection.execute(
                 """
-                SELECT 1 FROM test_run_targets
-                WHERE run_id = ? AND wave_index < ? AND state != 'succeeded'
-                LIMIT 1
+                SELECT target_name, state FROM test_run_targets
+                WHERE run_id = ? ORDER BY target_name, shard_index
                 """,
-                (target["run_id"], target["wave_index"]),
-            ).fetchone()
-            if blocked is not None:
-                raise TestStoreConflict("test target dependency wave is incomplete")
+                (target["run_id"],),
+            ):
+                states.setdefault(str(state_row["target_name"]), []).append(
+                    str(state_row["state"])
+                )
+            if not _target_dependencies_succeeded(
+                target_name=str(target["target_name"]),
+                dependencies=dependencies,
+                states=states,
+            ):
+                raise TestStoreConflict("test target exact dependencies are incomplete")
             attempt_number = int(
                 connection.execute(
                     "SELECT COUNT(*) FROM test_target_attempts WHERE target_id = ?",
@@ -2629,6 +2859,43 @@ class UniversalTestStore:
                 raise TestStoreNotFound("test run does not exist")
             if str(source_run["state"]) in _ACTIVE_RUN_STATES:
                 raise TestStoreConflict("an active run cannot be retried")
+            source_plan = connection.execute(
+                "SELECT * FROM test_plans WHERE plan_id = ?",
+                (source_run["plan_id"],),
+            ).fetchone()
+            if source_plan is None:
+                raise TestStoreContractError("retry source plan does not exist")
+            source_targets = connection.execute(
+                """
+                SELECT * FROM test_run_targets
+                WHERE run_id = ? ORDER BY wave_index, target_name, shard_index
+                """,
+                (run_id,),
+            ).fetchall()
+            selected = [
+                row
+                for row in source_targets
+                if not failed_only or str(row["state"]) != "succeeded"
+            ]
+            if not selected:
+                raise TestStoreConflict("the run has no failed targets to retry")
+            (
+                retry_plan_id,
+                retry_plan_fingerprint,
+                retry_execution_fingerprint,
+                retry_plan_json,
+            ) = _retry_plan_projection(
+                source_plan["plan_json"],
+                selected_targets=[str(row["target_name"]) for row in selected],
+            )
+            retry_plan_document = json.loads(retry_plan_json)
+            retry_wave_by_target = {
+                str(target): wave_index
+                for wave_index, wave in enumerate(
+                    retry_plan_document["dependency_waves"]
+                )
+                for target in wave
+            }
             active = None
             if str(source_run["source_mode"]) == SourceMode.IMMUTABLE.value:
                 active = connection.execute(
@@ -2638,7 +2905,7 @@ class UniversalTestStore:
                       AND state IN ({','.join('?' for _ in _ACTIVE_RUN_STATES)})
                     ORDER BY created_at, run_id LIMIT 1
                     """,
-                    (source_run["execution_fingerprint"], *_ACTIVE_RUN_STATES),
+                    (retry_execution_fingerprint, *_ACTIVE_RUN_STATES),
                 ).fetchone()
             if active is not None:
                 result = SubmissionResult(
@@ -2657,20 +2924,40 @@ class UniversalTestStore:
                     created_at=timestamp,
                 )
                 return result
-            source_targets = connection.execute(
-                """
-                SELECT * FROM test_run_targets
-                WHERE run_id = ? ORDER BY wave_index, target_name, shard_index
-                """,
-                (run_id,),
-            ).fetchall()
-            selected = [
-                row
-                for row in source_targets
-                if not failed_only or str(row["state"]) != "succeeded"
-            ]
-            if not selected:
-                raise TestStoreConflict("the run has no failed targets to retry")
+            existing_retry_plan = connection.execute(
+                "SELECT fingerprint, plan_json FROM test_plans WHERE plan_id = ?",
+                (retry_plan_id,),
+            ).fetchone()
+            if existing_retry_plan is None:
+                connection.execute(
+                    """
+                    INSERT INTO test_plans(
+                        plan_id, fingerprint, execution_fingerprint,
+                        manifest_fingerprint, repository_id, intent, snapshot_id,
+                        source_mode, source_fingerprint, reusable, plan_json,
+                        created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        retry_plan_id,
+                        retry_plan_fingerprint,
+                        retry_execution_fingerprint,
+                        source_plan["manifest_fingerprint"],
+                        source_plan["repository_id"],
+                        source_plan["intent"],
+                        source_plan["snapshot_id"],
+                        source_plan["source_mode"],
+                        source_plan["source_fingerprint"],
+                        source_plan["reusable"],
+                        retry_plan_json,
+                        timestamp,
+                    ),
+                )
+            elif (
+                str(existing_retry_plan["fingerprint"]) != retry_plan_fingerprint
+                or str(existing_retry_plan["plan_json"]) != retry_plan_json
+            ):
+                raise TestStoreConflict("retry plan identity is already bound")
             retry_id = "run-" + hashlib.sha256(
                 f"retry\0{operation_id}\0{request_fingerprint}".encode("utf-8")
             ).hexdigest()[:32]
@@ -2685,14 +2972,14 @@ class UniversalTestStore:
                 """,
                 (
                     retry_id,
-                    source_run["plan_id"],
+                    retry_plan_id,
                     source_run["repository_id"],
                     source_run["owner_uid"],
                     actor,
                     source_run["intent"],
                     source_run["source_mode"],
                     source_run["source_fingerprint"],
-                    source_run["execution_fingerprint"],
+                    retry_execution_fingerprint,
                     source_run["eligible_target_count"],
                     len({str(row["target_name"]) for row in selected}),
                     source_run["priority"],
@@ -2720,7 +3007,7 @@ class UniversalTestStore:
                         target_id,
                         retry_id,
                         row["target_name"],
-                        row["wave_index"],
+                        retry_wave_by_target[str(row["target_name"])],
                         row["shard_index"],
                         row["shard_count"],
                         row["cpu_millis"],
@@ -3650,7 +3937,13 @@ class UniversalTestStore:
         self, connection: sqlite3.Connection, run_id: str, timestamp: float
     ) -> None:
         run = connection.execute(
-            "SELECT * FROM test_runs WHERE run_id = ?", (run_id,)
+            """
+            SELECT run.*, plan.plan_json
+            FROM test_runs AS run
+            JOIN test_plans AS plan ON plan.plan_id = run.plan_id
+            WHERE run.run_id = ?
+            """,
+            (run_id,),
         ).fetchone()
         if run is None:
             raise TestStoreNotFound("test run does not exist")
@@ -3685,21 +3978,44 @@ class UniversalTestStore:
             and str(row["state"]) != "succeeded"
         ]
         if failed:
-            first_wave = min(int(row["wave_index"]) for row in failed)
+            dependencies = _stored_plan_dependencies(run["plan_json"])
+            unavailable_names = {
+                str(row["target_name"]) for row in failed
+            }
+            cancelled_dependents: set[str] = set()
+            changed = True
+            while changed:
+                changed = False
+                for target_name, required in dependencies.items():
+                    if target_name in unavailable_names | cancelled_dependents:
+                        continue
+                    if any(
+                        dependency in unavailable_names | cancelled_dependents
+                        for dependency in required
+                    ):
+                        cancelled_dependents.add(target_name)
+                        changed = True
+            cancelled_target_ids: set[str] = set()
+            for row in targets:
+                if (
+                    str(row["state"]) == "queued"
+                    and str(row["target_name"]) in cancelled_dependents
+                ):
+                    connection.execute(
+                        """
+                        UPDATE test_run_targets
+                        SET state = 'cancelled', finished_at = ?
+                        WHERE target_id = ? AND state = 'queued'
+                        """,
+                        (timestamp, str(row["target_id"])),
+                    )
+                    cancelled_target_ids.add(str(row["target_id"]))
             if any(
                 str(row["state"]) in {"queued", "leased", "running"}
-                and int(row["wave_index"]) <= first_wave
+                and str(row["target_id"]) not in cancelled_target_ids
                 for row in targets
             ):
                 return
-            connection.execute(
-                """
-                UPDATE test_run_targets
-                SET state = 'cancelled', finished_at = ?
-                WHERE run_id = ? AND state = 'queued' AND wave_index > ?
-                """,
-                (timestamp, run_id, first_wave),
-            )
             states = {str(row["state"]) for row in failed}
             run_terminal, classification = self._dominant_failure(states)
             connection.execute(

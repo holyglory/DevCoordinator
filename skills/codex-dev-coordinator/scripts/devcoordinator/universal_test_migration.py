@@ -620,7 +620,7 @@ def _legacy_plan(run: Mapping[str, object]) -> TestPlan:
     )
     timeouts = TestPlanTimeouts()
     document = {
-        "schema_version": 2,
+        "schema_version": 3,
         "manifest_fingerprint": manifest_fingerprint,
         "repository_id": repository_id,
         "intent": "manual",
@@ -630,6 +630,7 @@ def _legacy_plan(run: Mapping[str, object]) -> TestPlan:
         "eligible_targets": [target],
         "selected_targets": [target],
         "dependency_waves": [[target]],
+        "dependencies": {target: []},
         "selection": {target: ["historical-legacy-journal"]},
         "complete_intent_fallback": False,
         "reusable": False,
@@ -637,7 +638,7 @@ def _legacy_plan(run: Mapping[str, object]) -> TestPlan:
     fingerprint = deterministic_fingerprint(document)
     execution_fingerprint = deterministic_fingerprint(
         {
-            "schema_version": 2,
+            "schema_version": 3,
             "manifest_fingerprint": manifest_fingerprint,
             "repository_id": repository_id,
             "source_mode": source.mode.value,
@@ -647,6 +648,7 @@ def _legacy_plan(run: Mapping[str, object]) -> TestPlan:
             "eligible_targets": [target],
             "selected_targets": [target],
             "dependency_waves": [[target]],
+            "dependencies": {target: []},
         }
     )
     return TestPlan(
@@ -662,6 +664,7 @@ def _legacy_plan(run: Mapping[str, object]) -> TestPlan:
         eligible_targets=(target,),
         selected_targets=(target,),
         dependency_waves=((target,),),
+        dependencies=MappingProxyType({target: ()}),
         selection=selection,
         complete_intent_fallback=False,
         reusable=False,

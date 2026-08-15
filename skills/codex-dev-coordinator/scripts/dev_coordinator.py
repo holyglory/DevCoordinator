@@ -16467,9 +16467,14 @@ def release_broker_lease_link(link: BrokerLink, *, rollback: bool) -> dict[str, 
         links = BrokerLinkStore(store)
         pending = links.begin_lease_release(link.link_id, release_operation_id)
         release_operation_id = str(pending.release_operation_id or release_operation_id)
-    service = BrokerServiceProfile(
-        socket_path=Path(link.broker_socket),
-        database_generation=link.broker_database_generation,
+    current_profile = configured_broker_profile()
+    service = (
+        current_profile.service
+        if current_profile is not None
+        else BrokerServiceProfile(
+            socket_path=Path(link.broker_socket),
+            database_generation=link.broker_database_generation,
+        )
     )
     try:
         _operation_id, result = call_broker(
@@ -16580,9 +16585,14 @@ def release_broker_assignment_link(
         links = BrokerLinkStore(store)
         pending = links.begin_assignment_release(link.link_id, release_operation_id)
         release_operation_id = str(pending.release_operation_id or release_operation_id)
-    service = BrokerServiceProfile(
-        socket_path=Path(link.broker_socket),
-        database_generation=link.broker_database_generation,
+    current_profile = configured_broker_profile()
+    service = (
+        current_profile.service
+        if current_profile is not None
+        else BrokerServiceProfile(
+            socket_path=Path(link.broker_socket),
+            database_generation=link.broker_database_generation,
+        )
     )
     try:
         _operation_id, result = call_broker(

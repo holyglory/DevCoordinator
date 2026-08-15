@@ -533,6 +533,57 @@ class UniversalTestStoreTests(StoreFixture):
             [item.target_name for item in self.store.runnable_targets()], ["unit"]
         )
 
+    def test_failed_independent_branch_does_not_suppress_ready_dependency_branch(
+        self,
+    ) -> None:
+        document = manifest_document()
+        targets = document["targets"]
+        assert isinstance(targets, dict)
+        targets["fixture-check"] = {
+            "driver": "automation",
+            "reporter": "automation-events",
+            "argv": ["./scripts/check-fixture"],
+            "cwd": ".",
+            "inputs": ["fixtures/**"],
+            "depends_on": [],
+            "intents": ["release"],
+            "retry": {"max_attempts": 1, "retry_on": []},
+        }
+        manifest = parse_test_manifest(document)
+        selected_plan = create_test_plan(
+            manifest,
+            intent="release",
+            source=SourceIdentity(
+                mode=SourceMode.IMMUTABLE,
+                repository_id="repo-tests",
+                content_fingerprint="d" * 64,
+                original_root="/home/example/repo",
+                snapshot_id="snapshot-independent-branch",
+            ),
+        )
+        submitted = self.submit(selected_plan=selected_plan)
+        first_wave = {
+            item.target_name: item for item in self.store.runnable_targets()
+        }
+        self.assertEqual(set(first_wave), {"fixture-check", "lint"})
+
+        fixture = self.store.lease_target(
+            first_wave["fixture-check"].target_id,
+            lease_owner="testd",
+            operation_id=operation_id(),
+        )
+        self.complete(fixture, conclusion=AttemptConclusion.INFRASTRUCTURE_FAILED)
+        self.assertEqual(
+            [item.target_name for item in self.store.runnable_targets()], ["lint"]
+        )
+
+        lint = self.lease_lint(submitted.run_id)
+        self.complete(lint)
+        self.assertEqual(
+            [item.target_name for item in self.store.runnable_targets()], ["unit"]
+        )
+        self.assertEqual(self.store.get_run(submitted.run_id)["state"], "running")
+
     def test_terminalization_is_idempotent_after_lease_closes(self) -> None:
         submitted = self.submit()
         grant = self.lease_lint(submitted.run_id)
@@ -1100,6 +1151,51 @@ class UniversalTestStoreTests(StoreFixture):
         )
         self.assertTrue(deduplicated.deduplicated)
         self.assertEqual(deduplicated.run_id, retry.run_id)
+
+    def test_failed_only_retry_densifies_wave_after_succeeded_dependency(self) -> None:
+        submitted = self.submit()
+        lint = self.lease_lint(submitted.run_id)
+        self.complete(lint)
+        unit_target = next(
+            target
+            for target in self.store.runnable_targets()
+            if target.run_id == submitted.run_id and target.target_name == "unit"
+        )
+        unit = self.store.lease_target(
+            unit_target.target_id,
+            lease_owner="testd",
+            operation_id=operation_id(),
+        )
+        self.complete(unit, conclusion=AttemptConclusion.TEST_FAILED)
+
+        retry = self.store.retry_run(
+            submitted.run_id,
+            actor="codex:retry-downstream",
+            failed_only=True,
+            operation_id=operation_id(),
+        )
+
+        retried = self.store.get_run(retry.run_id)
+        self.assertEqual(
+            [
+                (target["target_name"], target["wave_index"], target["state"])
+                for target in retried["targets"]
+            ],
+            [("unit", 0, "queued")],
+        )
+        runnable = [
+            target
+            for target in self.store.runnable_targets()
+            if target.run_id == retry.run_id
+        ]
+        self.assertEqual(
+            [(target.target_name, target.wave_index) for target in runnable],
+            [("unit", 0)],
+        )
+        queue = self.store.queue_status(repository_id="repo-tests")
+        self.assertFalse(
+            any(blocker["code"] == "dependency_wave" for blocker in queue["blockers"])
+        )
 
     def test_evidence_policy_is_exact_snapshot_bounded_and_expiring(self) -> None:
         selected = plan()

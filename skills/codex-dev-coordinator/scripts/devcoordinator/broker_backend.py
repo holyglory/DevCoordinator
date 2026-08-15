@@ -673,6 +673,24 @@ class StoreBackedMutationBackend:
             )
         actor = _test_run_actor(accepted)
         resolving_run_id: str | None = None
+        preview_operation_reserved = False
+
+        def finish_preview_failure(code: str, message: str) -> None:
+            if not preview_operation_reserved:
+                return
+            try:
+                self._persistence.finish_operation(
+                    request.operation_id,
+                    error_code=code,
+                    error_message=message,
+                )
+            except Exception:
+                _LOGGER.exception(
+                    "test preview failure could not be persisted operation_id=%s code=%s",
+                    request.operation_id,
+                    code,
+                )
+
         try:
             if request.operation is BrokerOperation.TEST_HEALTH:
                 result = dict(plane.health())
@@ -761,6 +779,24 @@ class StoreBackedMutationBackend:
                 return result
 
             if request.operation is BrokerOperation.TEST_PLAN_PREVIEW:
+                disposition = self._persistence.reserve_operation(accepted)
+                if disposition.state == "completed":
+                    return dict(disposition.result or {})
+                if disposition.state == "failed":
+                    raise BrokerBackendError(
+                        disposition.error_code or "test_plan_preview_failed",
+                        disposition.error_message
+                        or "The durable test-plan preview failed.",
+                        operation_id=request.operation_id,
+                    )
+                if disposition.state != "execute":
+                    raise BrokerBackendError(
+                        "operation_in_progress",
+                        "The durable test-plan preview is still running; follow its exact operation handle.",
+                        operation_id=request.operation_id,
+                        retry_after_seconds=2,
+                    )
+                preview_operation_reserved = True
                 execution_context = (
                     self._persistence.test_repository_execution_context(
                         repo_id=request.project_id,
@@ -858,6 +894,20 @@ class StoreBackedMutationBackend:
                 result["plan_id"] = preview_plan.plan_id
                 result["snapshot_id"] = preview_plan.source.snapshot_id
                 result["registered"] = bool(registration.get("registered"))
+                self._persistence.finish_operation(
+                    request.operation_id,
+                    result={
+                        "schema_version": 1,
+                        "ok": True,
+                        "classification": "test_plan_preview_completed",
+                        "operation_id": request.operation_id,
+                        "repository_id": request.project_id,
+                        "intent": preview_plan.intent,
+                        "plan_id": preview_plan.plan_id,
+                        "snapshot_id": preview_plan.source.snapshot_id,
+                        "registered": bool(registration.get("registered")),
+                    },
+                )
                 return result
 
             if request.operation is BrokerOperation.TEST_PLAN_REGISTER:
@@ -1328,13 +1378,15 @@ class StoreBackedMutationBackend:
                 return result
         except TestPlanPreviewUnavailable as error:
             unavailable_code = getattr(error, "code", "test_plan_preview_unavailable")
+            unavailable_message = (
+                "Repository-owned test setup inspection is not connected; retry after testd is healthy."
+                if unavailable_code == "test_repository_setup_unavailable"
+                else "Repository-owned test planning is not connected; retry after testd is healthy."
+            )
+            finish_preview_failure(unavailable_code, unavailable_message)
             raise BrokerBackendError(
                 unavailable_code,
-                (
-                    "Repository-owned test setup inspection is not connected; retry after testd is healthy."
-                    if unavailable_code == "test_repository_setup_unavailable"
-                    else "Repository-owned test planning is not connected; retry after testd is healthy."
-                ),
+                unavailable_message,
                 operation_id=request.operation_id,
                 retry_after_seconds=2,
             ) from error
@@ -1385,8 +1437,7 @@ class StoreBackedMutationBackend:
                 if preview_unavailable
                 else "test_scheduler_unavailable"
             )
-            raise BrokerBackendError(
-                public_code,
+            public_message = (
                 (
                     "Repository-owned test setup inspection is not connected; retry after testd is healthy."
                     if error.code == "test_repository_setup_unavailable"
@@ -1397,7 +1448,12 @@ class StoreBackedMutationBackend:
                     else "Repository-owned test planning is not connected; retry after testd is healthy."
                 )
                 if preview_unavailable
-                else "The asynchronous test scheduler is unavailable; retry shortly.",
+                else "The asynchronous test scheduler is unavailable; retry shortly."
+            )
+            finish_preview_failure(public_code, public_message)
+            raise BrokerBackendError(
+                public_code,
+                public_message,
                 operation_id=request.operation_id,
                 retry_after_seconds=None
                 if public_code == "test_plan_source_invalid"
@@ -1412,23 +1468,38 @@ class StoreBackedMutationBackend:
                 type(error).__name__,
                 detail,
             )
+            contract_message = "The test manifest or plan contract is invalid: " + detail
+            finish_preview_failure("test_contract_invalid", contract_message)
             raise BrokerBackendError(
                 "test_contract_invalid",
-                "The test manifest or plan contract is invalid: " + detail,
+                contract_message,
                 operation_id=request.operation_id,
             ) from error
         except TestStoreNotFound as error:
+            finish_preview_failure(
+                "test_run_not_found", "The exact test run does not exist."
+            )
             raise BrokerBackendError(
                 "test_run_not_found",
                 "The exact test run does not exist.",
                 operation_id=request.operation_id,
             ) from error
         except TestStoreConflict as error:
+            finish_preview_failure(
+                "test_state_conflict",
+                "The test request conflicts with current scheduler state.",
+            )
             raise BrokerBackendError(
                 "test_state_conflict",
                 "The test request conflicts with current scheduler state.",
                 operation_id=request.operation_id,
             ) from error
+        except Exception:
+            finish_preview_failure(
+                "test_plan_preview_failed",
+                "The durable test-plan preview failed unexpectedly.",
+            )
+            raise
         raise BrokerBackendError(
             "unsupported_operation",
             "The asynchronous test operation is not supported.",

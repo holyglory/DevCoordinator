@@ -1053,7 +1053,12 @@ class RootSnapshotService:
     def _load_catalog(self, plan_document: Mapping[str, object]) -> Mapping[str, object]:
         plan = decode_test_plan_document(plan_document)
         path = self._catalog_path(self._source_catalog_id(plan), plan.plan_id)
-        metadata = path.lstat()
+        try:
+            metadata = path.lstat()
+        except FileNotFoundError:
+            if plan.source.mode.value != "immutable":
+                raise
+            return self._derive_retry_catalog(plan)
         if (
             not stat.S_ISREG(metadata.st_mode)
             or metadata.st_size > MAX_CATALOG_BYTES
@@ -1063,6 +1068,92 @@ class RootSnapshotService:
         if not isinstance(value, Mapping) or value.get("plan") != plan.to_document():
             raise TestStoreContractError("snapshot launch catalog is contradictory")
         return value
+
+    def _derive_retry_catalog(self, plan) -> Mapping[str, object]:
+        """Project a missing retry catalog from one equivalent immutable source."""
+
+        snapshot_id = self._source_catalog_id(plan)
+        directory = self._catalog_path(snapshot_id, plan.plan_id).parent
+        candidates: dict[bytes, Mapping[str, object]] = {}
+        examined = 0
+        for path in sorted(directory.iterdir(), key=lambda item: item.name):
+            name = path.name
+            identity = name[5:-5] if name.startswith("plan-") and name.endswith(".json") else ""
+            if (
+                len(identity) != 32
+                or any(character not in "0123456789abcdef" for character in identity)
+                or name == f"{plan.plan_id}.json"
+            ):
+                continue
+            examined += 1
+            if examined > 64:
+                raise TestStoreContractError(
+                    "retry snapshot launch catalog candidates exceed their bound"
+                )
+            metadata = path.lstat()
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or stat.S_ISLNK(metadata.st_mode)
+                or metadata.st_size > MAX_CATALOG_BYTES
+            ):
+                raise TestStoreContractError(
+                    "retry snapshot launch catalog candidate is unsafe"
+                )
+            try:
+                value = json.loads(path.read_bytes())
+            except (OSError, UnicodeError, json.JSONDecodeError) as error:
+                raise TestStoreContractError(
+                    "retry snapshot launch catalog candidate is invalid"
+                ) from error
+            if not isinstance(value, Mapping) or not isinstance(value.get("plan"), Mapping):
+                raise TestStoreContractError(
+                    "retry snapshot launch catalog candidate is invalid"
+                )
+            source_plan = decode_test_plan_document(value["plan"])
+            if (
+                source_plan.repository_id != plan.repository_id
+                or source_plan.manifest_fingerprint != plan.manifest_fingerprint
+                or source_plan.source.to_document() != plan.source.to_document()
+            ):
+                continue
+            launch_catalog = value.get("launch_catalog")
+            target_resources = value.get("target_resources")
+            if not isinstance(launch_catalog, Mapping) or not isinstance(
+                target_resources, Mapping
+            ):
+                raise TestStoreContractError(
+                    "retry snapshot launch catalog candidate is incomplete"
+                )
+            required = set(plan.selected_targets)
+            if not required.issubset(launch_catalog) or not required.issubset(
+                target_resources
+            ):
+                continue
+            projection = dict(value)
+            projection["plan"] = plan.to_document()
+            projection["launch_catalog"] = {
+                target: launch_catalog[target] for target in plan.selected_targets
+            }
+            projection["target_resources"] = {
+                target: target_resources[target] for target in plan.selected_targets
+            }
+            encoded = _json(projection, maximum=MAX_CATALOG_BYTES)
+            candidates[encoded] = projection
+        if not candidates:
+            raise TestStoreContractError(
+                "immutable retry snapshot launch catalog is unavailable"
+            )
+        if len(candidates) != 1:
+            raise TestStoreContractError(
+                "immutable retry snapshot launch catalog is ambiguous"
+            )
+        projection = next(iter(candidates.values()))
+        self._publish_catalog(
+            plan_id=plan.plan_id,
+            snapshot_id=snapshot_id,
+            value=projection,
+        )
+        return projection
 
     @staticmethod
     def _dependency_relative(value: object, *, field: str) -> PurePosixPath:

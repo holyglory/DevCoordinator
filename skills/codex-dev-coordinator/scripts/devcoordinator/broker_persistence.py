@@ -4419,12 +4419,72 @@ class BrokerPersistence:
                 rows = connection.execute(
                     """
                     SELECT * FROM ephemeral_container_templates
-                    WHERE repo_id = ? AND enabled = 1
-                      AND (template_id = ? OR name = ?)
+                    WHERE enabled = 1 AND template_id = ?
                     ORDER BY template_id
                     """,
-                    (repo_id, template, template),
+                    (template,),
                 ).fetchall()
+                if not rows:
+                    rows = connection.execute(
+                        """
+                        SELECT * FROM ephemeral_container_templates
+                        WHERE enabled = 1 AND name = ?
+                        ORDER BY template_id
+                        """,
+                        (template,),
+                    ).fetchall()
+                    if len(rows) > 1:
+                        routed = [
+                            row for row in rows if str(row["repo_id"]) == repo_id
+                        ]
+                        if len(routed) == 1:
+                            rows = routed
+                    if len(rows) > 1:
+                        def routing_signature(candidate: sqlite3.Row) -> tuple[Any, ...]:
+                            candidate_id = str(candidate["template_id"])
+                            candidate_arguments = tuple(
+                                str(item[0])
+                                for item in connection.execute(
+                                    """
+                                    SELECT argument FROM ephemeral_template_arguments
+                                    WHERE template_id = ? ORDER BY ordinal
+                                    """,
+                                    (candidate_id,),
+                                )
+                            )
+                            candidate_environment = tuple(
+                                (str(item[0]), str(item[1]))
+                                for item in connection.execute(
+                                    """
+                                    SELECT name, value FROM ephemeral_template_environment
+                                    WHERE template_id = ? ORDER BY name
+                                    """,
+                                    (candidate_id,),
+                                )
+                            )
+                            return (
+                                str(candidate["name"]),
+                                str(candidate["image_ref"]),
+                                candidate["secret_policy_kind"],
+                                int(candidate["default_ttl_seconds"]),
+                                int(candidate["max_ttl_seconds"]),
+                                candidate["container_tcp_port"],
+                                candidate["host_port_start"],
+                                candidate["host_port_end"],
+                                candidate["memory_bytes"],
+                                candidate["cpu_millis"],
+                                candidate["max_concurrent_runs"],
+                                candidate["max_concurrent_runs_per_uid"],
+                                candidate["repo_max_active_runs"],
+                                candidate["repo_memory_budget_bytes"],
+                                candidate["repo_cpu_budget_millis"],
+                                candidate_arguments,
+                                candidate_environment,
+                            )
+
+                        signatures = {routing_signature(row) for row in rows}
+                        if len(signatures) == 1:
+                            rows = [rows[0]]
                 if len(rows) != 1:
                     raise BrokerError(
                         "test_fixture_template_unavailable",
@@ -14962,6 +15022,8 @@ def _operation_follow_projection_size(projection: Mapping[str, Any]) -> int:
 
 
 def _target_kind(operation: BrokerOperation) -> str:
+    if operation is BrokerOperation.TEST_PLAN_PREVIEW:
+        return "test_plan"
     if operation in _REPOSITORY_BOOTSTRAP_OPERATIONS:
         return "repository"
     if operation in _REPOSITORY_LIFECYCLE_OPERATIONS:
