@@ -1323,12 +1323,70 @@ class LifecycleParserContractTests(unittest.TestCase):
         self.assertEqual(result["schema_version"], 2)
         self.assertEqual(result["repositories"], [{"repo_id": "repo-alpha"}])
         self.assertEqual(result["v1_compatibility"], {"servers": []})
+        self.assertEqual(result["memberships"], [])
+        self.assertNotIn("memberships", current)
         inventory.assert_called_once_with(
             project="/repository",
             include_docker=True,
             backup_dirs=None,
             stats_history_limit=dev_coordinator.DOCKER_STATS_HISTORY_LIMIT,
         )
+
+    def test_legacy_inventory_projects_immutable_effective_route_without_membership_state(
+        self,
+    ) -> None:
+        current = {
+            "schema_version": dev_coordinator.INVENTORY_SCHEMA_VERSION,
+            "project": "/source/repository",
+            "repositories": [
+                {
+                    "canonical_root": "/source/repository",
+                    "repo_id": "repo-alpha",
+                }
+            ],
+            "v1_compatibility": {"project": "/source/repository"},
+        }
+        binding = mock.Mock(
+            materialized_root="/snapshots/snapshot-one/root",
+            original_root="/source/repository",
+            repository_id="repo-alpha",
+        )
+        with (
+            mock.patch.object(
+                dev_coordinator,
+                "coordinated_build_inventory",
+                return_value=current,
+            ),
+            mock.patch.object(
+                dev_coordinator,
+                "resolve_immutable_repository_binding",
+                return_value=binding,
+            ),
+        ):
+            result = dev_coordinator.legacy_cli_inventory(
+                project="/snapshots/snapshot-one/root",
+            )
+
+        self.assertEqual(result["schema_version"], 2)
+        self.assertEqual(result["memberships"], [])
+        self.assertEqual(result["project"], binding.materialized_root)
+        self.assertEqual(
+            result["v1_compatibility"]["project"], binding.materialized_root
+        )
+        self.assertEqual(
+            result["repositories"],
+            [
+                {
+                    "authority_canonical_root": binding.original_root,
+                    "canonical_root": binding.materialized_root,
+                    "repo_id": binding.repository_id,
+                }
+            ],
+        )
+        self.assertEqual(
+            current["schema_version"], dev_coordinator.INVENTORY_SCHEMA_VERSION
+        )
+        self.assertNotIn("memberships", current)
 
     def test_production_cli_registers_lifecycle_and_broker_dispatch_groups(
         self,
@@ -1943,6 +2001,20 @@ class LifecycleParserContractTests(unittest.TestCase):
                 )
             )
             self.assertNotIn("retry_after_seconds", invalid_payload)
+
+    def test_systemd_plan_contract_failure_is_typed_repository_configuration(self) -> None:
+        payload = dev_coordinator.coordinator_exception_payload(
+            dev_coordinator.SystemdCommissioningError(
+                "commissioned service requires UMask=0077"
+            )
+        )
+
+        self.assertEqual(payload["code"], "systemd_unit_contract_invalid")
+        self.assertEqual(
+            payload["classification"], "repository_configuration_invalid"
+        )
+        self.assertFalse(payload["mutation_performed"])
+        self.assertIn("repository-declared unit", payload["action_required"])
 
     def test_active_maintenance_masks_transient_profile_contract_skew(self) -> None:
         maintenance = mock.Mock(

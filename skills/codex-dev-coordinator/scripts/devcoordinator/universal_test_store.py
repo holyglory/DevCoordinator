@@ -25,6 +25,7 @@ import secrets
 import sqlite3
 import stat
 import time
+from types import MappingProxyType
 from typing import Any, Callable, Generator, Iterable, Mapping, Sequence
 import uuid
 
@@ -699,15 +700,30 @@ def _canonical_json(value: object) -> str:
     )
 
 
-def _stored_plan_dependencies(plan_json: object) -> dict[str, tuple[str, ...]]:
-    """Read exact dependencies from a validated retained plan document."""
+_STORED_PLAN_RESOURCES_FIELD = "_coordinator_target_resources"
+
+
+def _stored_plan_parts(
+    plan_json: object,
+) -> tuple[dict[str, object], Mapping[str, object] | None]:
+    """Decode one retained plan plus its same-schema durable launch resources."""
 
     try:
         raw = json.loads(str(plan_json))
     except (TypeError, ValueError, json.JSONDecodeError) as error:
         raise TestStoreContractError("stored test plan JSON is invalid") from error
-    if not isinstance(raw, Mapping):
+    if not isinstance(raw, dict):
         raise TestStoreContractError("stored test plan is invalid")
+    resources = raw.pop(_STORED_PLAN_RESOURCES_FIELD, None)
+    if resources is not None and not isinstance(resources, Mapping):
+        raise TestStoreContractError("stored test plan resources are invalid")
+    return raw, resources
+
+
+def _stored_plan_dependencies(plan_json: object) -> dict[str, tuple[str, ...]]:
+    """Read exact dependencies from a validated retained plan document."""
+
+    raw, _resources = _stored_plan_parts(plan_json)
     selected_raw = raw.get("selected_targets")
     selection_raw = raw.get("selection")
     if (
@@ -780,11 +796,9 @@ def _retry_plan_projection(
     """Derive one dense exact-dependency plan for a retained-run retry."""
 
     try:
-        source = json.loads(str(plan_json))
-    except (TypeError, ValueError, json.JSONDecodeError) as error:
+        source, _resources = _stored_plan_parts(plan_json)
+    except TestStoreContractError as error:
         raise TestStoreContractError("stored retry source plan is invalid") from error
-    if not isinstance(source, dict):
-        raise TestStoreContractError("stored retry source plan is invalid")
     selected = tuple(sorted(set(selected_targets)))
     if not selected:
         raise TestStoreContractError("retry plan requires selected targets")
@@ -1308,7 +1322,12 @@ class UniversalTestStore:
             )
             if replay is not None:
                 return SubmissionResult(**replay)
-            self._upsert_snapshot_and_plan(connection, plan=plan, created_at=timestamp)
+            self._upsert_snapshot_and_plan(
+                connection,
+                plan=plan,
+                created_at=timestamp,
+                target_resources=resources,
+            )
             existing = None
             if plan.source.mode is SourceMode.IMMUTABLE:
                 existing = connection.execute(
@@ -1448,11 +1467,21 @@ class UniversalTestStore:
                 )
             return result
 
-    def register_plan(self, plan: TestPlan) -> dict[str, object]:
+    def register_plan(
+        self,
+        plan: TestPlan,
+        *,
+        target_resources: Mapping[str, TargetResources] | None = None,
+    ) -> dict[str, object]:
         """Durably register a validated plan before asynchronous submission."""
 
         if not isinstance(plan, TestPlan):
             raise TestStoreContractError("plan must be a validated TestPlan")
+        resources = (
+            None
+            if target_resources is None
+            else self._normalize_resources(plan, target_resources)
+        )
         timestamp = _now(self._clock)
         with self._transaction() as connection:
             existing = connection.execute(
@@ -1460,7 +1489,10 @@ class UniversalTestStore:
                 (plan.plan_id,),
             ).fetchone()
             self._upsert_snapshot_and_plan(
-                connection, plan=plan, created_at=timestamp
+                connection,
+                plan=plan,
+                created_at=timestamp,
+                target_resources=resources,
             )
             return {
                 "plan_id": plan.plan_id,
@@ -1537,6 +1569,7 @@ class UniversalTestStore:
         *,
         plan: TestPlan,
         created_at: float,
+        target_resources: Mapping[str, TargetResources] | None = None,
     ) -> None:
         source = plan.source
         snapshot_id = source.snapshot_id or (
@@ -1589,7 +1622,14 @@ class UniversalTestStore:
             )
             if actual != expected_snapshot:
                 raise TestStoreConflict("snapshot_id is bound to different provenance")
-        plan_json = _canonical_json(plan.to_document())
+        plan_document = plan.to_document()
+        stored_document = dict(plan_document)
+        if target_resources is not None:
+            stored_document[_STORED_PLAN_RESOURCES_FIELD] = {
+                name: self._resource_document(resource)
+                for name, resource in sorted(target_resources.items())
+            }
+        plan_json = _canonical_json(stored_document)
         existing_plan = connection.execute(
             "SELECT * FROM test_plans WHERE plan_id = ?", (plan.plan_id,)
         ).fetchone()
@@ -1618,11 +1658,26 @@ class UniversalTestStore:
                     created_at,
                 ),
             )
-        elif (
-            str(existing_plan["fingerprint"]) != plan.fingerprint
-            or str(existing_plan["plan_json"]) != plan_json
-        ):
-            raise TestStoreConflict("plan_id is bound to a different plan")
+        else:
+            existing_document, existing_resources = _stored_plan_parts(
+                existing_plan["plan_json"]
+            )
+            if (
+                str(existing_plan["fingerprint"]) != plan.fingerprint
+                or existing_document != plan_document
+            ):
+                raise TestStoreConflict("plan_id is bound to a different plan")
+            requested_resources = stored_document.get(_STORED_PLAN_RESOURCES_FIELD)
+            if requested_resources is not None:
+                if existing_resources is None:
+                    connection.execute(
+                        "UPDATE test_plans SET plan_json = ? WHERE plan_id = ?",
+                        (plan_json, plan.plan_id),
+                    )
+                elif existing_resources != requested_resources:
+                    raise TestStoreConflict(
+                        "plan_id is bound to different target resources"
+                    )
 
     def runnable_targets(self, *, limit: int = 1_000) -> tuple[RunnableTarget, ...]:
         limit = _positive_int("limit", limit, maximum=10_000)
@@ -2953,11 +3008,16 @@ class UniversalTestStore:
                         timestamp,
                     ),
                 )
-            elif (
-                str(existing_retry_plan["fingerprint"]) != retry_plan_fingerprint
-                or str(existing_retry_plan["plan_json"]) != retry_plan_json
-            ):
-                raise TestStoreConflict("retry plan identity is already bound")
+            else:
+                existing_retry_document, _resources = _stored_plan_parts(
+                    existing_retry_plan["plan_json"]
+                )
+                if (
+                    str(existing_retry_plan["fingerprint"])
+                    != retry_plan_fingerprint
+                    or existing_retry_document != retry_plan_document
+                ):
+                    raise TestStoreConflict("retry plan identity is already bound")
             retry_id = "run-" + hashlib.sha256(
                 f"retry\0{operation_id}\0{request_fingerprint}".encode("utf-8")
             ).hexdigest()[:32]
@@ -5425,12 +5485,93 @@ class UniversalTestStore:
             ).fetchone()
             if row is None:
                 raise TestStoreNotFound("test plan does not exist")
-            document = json.loads(str(row["plan_json"]))
-            if not isinstance(document, dict):
-                raise TestStoreConflict("stored test plan is malformed")
+            document, _resources = _stored_plan_parts(row["plan_json"])
             return document
         finally:
             connection.close()
+
+    def get_plan_target_resources(
+        self, plan_id: str
+    ) -> Mapping[str, TargetResources] | None:
+        """Restore the exact normalized registration resources after replacement."""
+
+        plan_id = _safe_id("plan_id", plan_id)
+        connection = self._connect(readonly=True)
+        try:
+            row = connection.execute(
+                "SELECT plan_json FROM test_plans WHERE plan_id = ?", (plan_id,)
+            ).fetchone()
+            if row is None:
+                raise TestStoreNotFound("test plan does not exist")
+            plan_document, raw_resources = _stored_plan_parts(row["plan_json"])
+        finally:
+            connection.close()
+        if raw_resources is None:
+            return None
+        selected = plan_document.get("selected_targets")
+        if not isinstance(selected, list) or any(
+            not isinstance(name, str) for name in selected
+        ):
+            raise TestStoreContractError("stored test plan selection is invalid")
+        expected = set(TargetResources.__dataclass_fields__)
+        decoded: dict[str, TargetResources] = {}
+        if set(raw_resources) != set(selected):
+            raise TestStoreContractError(
+                "stored test plan target resources are incomplete"
+            )
+        for name, value in raw_resources.items():
+            if not isinstance(name, str) or not isinstance(value, Mapping):
+                raise TestStoreContractError(
+                    "stored test plan target resources are invalid"
+                )
+            if set(value) != expected:
+                raise TestStoreContractError(
+                    "stored test plan target resource fields are invalid"
+                )
+            estimated = _finite_nonnegative(
+                "estimated_seconds", value["estimated_seconds"]
+            )
+            if estimated <= 0 or estimated > 31_536_000:
+                raise TestStoreContractError(
+                    "stored estimated_seconds is outside its bound"
+                )
+            shard_count = _positive_int(
+                "shard_count", value["shard_count"], maximum=256
+            )
+            max_attempts = _positive_int(
+                "max_attempts", value["max_attempts"], maximum=16
+            )
+            worktree = value["worktree_key"]
+            if worktree is not None:
+                worktree = _single_line("worktree_key", worktree, maximum=4096)
+            exclusive_value = value["exclusive_resources"]
+            if not isinstance(exclusive_value, list):
+                raise TestStoreContractError(
+                    "stored exclusive resources are invalid"
+                )
+            exclusive = tuple(
+                _safe_id("exclusive_resource", item)
+                for item in exclusive_value
+            )
+            if tuple(sorted(set(exclusive))) != exclusive:
+                raise TestStoreContractError(
+                    "stored exclusive resources are invalid"
+                )
+            decoded[name] = TargetResources(
+                cpu_millis=_positive_int(
+                    "cpu_millis", value["cpu_millis"], maximum=1_000_000
+                ),
+                memory_mib=_positive_int(
+                    "memory_mib", value["memory_mib"], maximum=16_777_216
+                ),
+                pids=_positive_int("pids", value["pids"], maximum=1_000_000),
+                estimated_seconds=estimated,
+                shard_count=shard_count,
+                max_attempts=max_attempts,
+                worktree_key=worktree,
+                exclusive_resources=exclusive,
+            )
+        return MappingProxyType(decoded)
 
     def run_metrics(self, run_id: str) -> dict[str, object]:
         run_id = _safe_id("run_id", run_id)

@@ -100,6 +100,31 @@ def _scope_test_result(
     return document
 
 
+def _bounded_test_failure_page(result: Mapping[str, Any]) -> dict[str, Any]:
+    """Keep the largest ordered failure prefix that fits the agent contract."""
+
+    document = dict(result)
+    document.setdefault("ok", True)
+    raw_failures = document.get("failures")
+    if not isinstance(raw_failures, list):
+        return require_agent_result(document, surface="test failures")
+    failures = list(raw_failures)
+    document["failures"] = failures
+    while True:
+        try:
+            return require_agent_result(document, surface="test failures")
+        except AgentContractError:
+            if len(failures) <= 1:
+                raise
+            failures.pop()
+            cursor = failures[-1].get("failure_id")
+            if not isinstance(cursor, str) or not cursor:
+                raise AgentContractError(
+                    "test failure page cannot publish a safe continuation cursor"
+                )
+            document["next_cursor"] = cursor
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = _Parser(
         prog="devcoordinator",
@@ -183,6 +208,16 @@ def _parser() -> argparse.ArgumentParser:
     compose.add_argument("--wait-timeout-seconds", type=int, default=120)
     compose.add_argument("--operation-id")
     _add_scoped_project(compose)
+
+    ephemeral = commands.add_parser(
+        "ephemeral", help="inspect or prefetch one sealed ephemeral image"
+    )
+    ephemeral.add_argument(
+        "action", choices=("image-status", "image-prefetch")
+    )
+    ephemeral.add_argument("template", help="exact declared ephemeral template name")
+    ephemeral.add_argument("--operation-id")
+    _add_scoped_project(ephemeral)
 
     runtime = commands.add_parser(
         "runtime", help="execute one exact configured runtime lifecycle action"
@@ -1730,11 +1765,23 @@ def _compose(
             "compose_wait_timeout_invalid",
             "--wait-timeout-seconds must be from 10 through 600",
         )
+    operation_id = _canonical_operation_id(namespace.operation_id, mutate=True)
+    namespace.operation_id = operation_id
+    assert operation_id is not None
+    profile.ensure_repository_with_outcome(
+        canonical_root=context.effective.canonical_root,
+        project_kind=context.project_kind,
+        agent=_attribution(),
+        operation_id=str(
+            uuid.uuid5(
+                uuid.UUID(operation_id),
+                "repository.catalog:" + context.effective.canonical_root,
+            )
+        ),
+    )
     repository = _require_resolved_repository(
         profile, context.effective.canonical_root
     )
-    operation_id = _canonical_operation_id(namespace.operation_id, mutate=True)
-    namespace.operation_id = operation_id
     returned_operation_id, result = profile.call(
         repository=repository,
         resource_id=repository.compose_id(),
@@ -1765,6 +1812,74 @@ def _compose(
         },
         surface="Compose service recreate",
         maximum_bytes=6 * 1024,
+    )
+
+
+def _ephemeral(
+    namespace: argparse.Namespace,
+    *,
+    profile: Any,
+    capabilities: Mapping[str, Any],
+    context: Any,
+) -> dict[str, Any]:
+    from .broker import BrokerOperation
+
+    advertised = capabilities.get("ephemeral_image")
+    advertised_action = namespace.action.removeprefix("image-")
+    if (
+        not isinstance(advertised, list)
+        or advertised_action not in advertised
+    ):
+        raise AgentCliError(
+            "capability_unavailable",
+            "active authority does not advertise sealed ephemeral image operations",
+            classification="unsupported_capability",
+            phase="handshake",
+        )
+    repository = _require_resolved_repository(
+        profile, context.effective.canonical_root
+    )
+    template_id = repository.ephemeral_image_prefetch_template_id(
+        namespace.template
+    )
+    mutates = namespace.action == "image-prefetch"
+    operation_id = _canonical_operation_id(
+        namespace.operation_id, mutate=mutates
+    )
+    namespace.operation_id = operation_id
+    returned_operation_id, result = profile.call(
+        repository=repository,
+        resource_id=template_id,
+        operation=(
+            BrokerOperation.EPHEMERAL_IMAGE_PREFETCH
+            if mutates
+            else BrokerOperation.EPHEMERAL_IMAGE_STATUS
+        ),
+        arguments={"agent": _attribution()} if mutates else {},
+        operation_id=operation_id,
+    )
+    if not isinstance(result, Mapping) or (
+        mutates and returned_operation_id != operation_id
+    ):
+        raise AgentCliError(
+            "ephemeral_image_reply_invalid",
+            "ephemeral image reply contradicted its exact operation identity",
+            classification="invalid_reply",
+            phase="transport",
+        )
+    document = {
+        "schema_version": 1,
+        "ok": True,
+        "classification": "ephemeral_image_prefetch" if mutates else "ephemeral_image_status",
+        "template": namespace.template,
+        "result": dict(result),
+    }
+    if mutates:
+        assert operation_id is not None
+        document["operation_id"] = operation_id
+        document["continuation"] = continuation_handle("operation", operation_id)
+    return require_agent_result(
+        document, surface="ephemeral image", maximum_bytes=4 * 1024
     )
 
 
@@ -1889,7 +2004,7 @@ def _test(
             after=namespace.after,
             limit=namespace.limit,
         )
-        return require_agent_result(result, surface="test failures")
+        return _bounded_test_failure_page(result)
     if action == "artifact":
         run_id = _handle_identity(namespace.run, expected_kind="run")
         artifact_id = _handle_identity(namespace.artifact, expected_kind="artifact")
@@ -1927,6 +2042,7 @@ def _test(
                 actor=_attribution(),
             )
         document = dict(result)
+        document.setdefault("ok", True)
         document["operation_id"] = operation_id
         document["continuation"] = continuation_handle(
             "operation", operation_id
@@ -2033,6 +2149,13 @@ def _execute(
             capabilities=capabilities,
             context=context,
         )
+    if namespace.command == "ephemeral":
+        return _ephemeral(
+            namespace,
+            profile=profile,
+            capabilities=capabilities,
+            context=context,
+        )
     if namespace.command == "runtime":
         return _runtime(
             namespace,
@@ -2072,6 +2195,8 @@ def _command_mutates(namespace: argparse.Namespace | None) -> bool:
         return namespace.action in {"remove", "plan", "apply"}
     if namespace.command in {"database", "compose"}:
         return True
+    if namespace.command == "ephemeral":
+        return namespace.action == "image-prefetch"
     return namespace.command == "test" and namespace.test_action in {
         "cancel",
         "enqueue",
@@ -2628,6 +2753,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif namespace.command in {"database", "compose"}:
             namespace.operation_id = _canonical_operation_id(
                 namespace.operation_id, mutate=True
+            )
+        elif namespace.command == "ephemeral":
+            namespace.operation_id = _canonical_operation_id(
+                namespace.operation_id,
+                mutate=namespace.action == "image-prefetch",
             )
         elif namespace.command == "test" and namespace.test_action in {
             "cancel",

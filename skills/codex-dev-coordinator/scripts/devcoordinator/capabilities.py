@@ -105,6 +105,7 @@ def broker_capabilities(
         "compose": {
             "actions": ["recreate-service"],
         },
+        "ephemeral_image": ["prefetch", "status"],
         "image_publication": {
             "actions": ["status", "plan", "build", "apply", "rollback"],
             "cli": "devcoordinator-image",

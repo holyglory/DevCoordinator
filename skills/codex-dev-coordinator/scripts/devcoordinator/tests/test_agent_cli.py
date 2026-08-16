@@ -143,6 +143,7 @@ class AgentCliTests(unittest.TestCase):
             ["capabilities", "--project", "/repo"],
             ["targets", "--project", "/repo"],
             ["storage", "inventory", "--project", "/repo"],
+            ["ephemeral", "image-status", "postgres", "--project", "/repo"],
             ["runtime", "status", "service-1", "--project", "/repo"],
             [
                 "runtime",
@@ -253,6 +254,86 @@ class AgentCliTests(unittest.TestCase):
         self.assertEqual(result["repository"]["state"], "configured")
         self.assertEqual(result["repository"]["id"], "repo-1")
         self.assertNotIn("root", result["repository"])
+
+    def test_ephemeral_image_prefetch_uses_only_the_sealed_template(self) -> None:
+        operation_id = "00000000-0000-4000-8000-000000000001"
+        repository = mock.Mock(repo_id="repo-1")
+        repository.ephemeral_image_prefetch_template_id.return_value = "template-1"
+        profile = mock.Mock()
+        profile.resolve_repository.return_value = repository
+        profile.call.return_value = (
+            operation_id,
+            {"cached": True, "cache_changed": True},
+        )
+        namespace = agent_cli._parser().parse_args(
+            [
+                "ephemeral",
+                "image-prefetch",
+                "postgres",
+                "--operation-id",
+                operation_id,
+            ]
+        )
+
+        with mock.patch.object(
+            agent_cli, "_attribution", return_value="codex:thread"
+        ):
+            result = agent_cli._ephemeral(
+                namespace,
+                profile=profile,
+                capabilities={"ephemeral_image": ["prefetch", "status"]},
+                context=_Context(),
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["operation_id"], operation_id)
+        repository.ephemeral_image_prefetch_template_id.assert_called_once_with(
+            "postgres"
+        )
+        profile.call.assert_called_once()
+        call = profile.call.call_args.kwargs
+        self.assertEqual(call["resource_id"], "template-1")
+        self.assertEqual(call["arguments"], {"agent": "codex:thread"})
+
+    def test_compose_recreate_reseals_the_current_repository_first(self) -> None:
+        operation_id = "00000000-0000-4000-8000-000000000001"
+        repository = mock.Mock(repo_id="repo-1")
+        repository.compose_id.return_value = "compose-1"
+        profile = mock.Mock()
+        profile.resolve_repository.return_value = repository
+        profile.call.return_value = (operation_id, {"ok": True})
+        namespace = agent_cli._parser().parse_args(
+            [
+                "compose",
+                "recreate-service",
+                "worker",
+                "--operation-id",
+                operation_id,
+            ]
+        )
+
+        with mock.patch.object(
+            agent_cli, "_attribution", return_value="codex:thread"
+        ):
+            result = agent_cli._compose(
+                namespace,
+                profile=profile,
+                capabilities={"compose": {"actions": ["recreate-service"]}},
+                context=_Context(),
+            )
+
+        self.assertTrue(result["ok"])
+        profile.ensure_repository_with_outcome.assert_called_once_with(
+            canonical_root="/repo",
+            project_kind="primary",
+            agent="codex:thread",
+            operation_id=str(
+                uuid.uuid5(
+                    uuid.UUID(operation_id), "repository.catalog:/repo"
+                )
+            ),
+        )
+        self.assertEqual(profile.call.call_args.kwargs["resource_id"], "compose-1")
 
     def test_unconfigured_capabilities_are_pure_and_advertise_bootstrap(self) -> None:
         profile = mock.Mock()
@@ -881,6 +962,71 @@ class AgentCliTests(unittest.TestCase):
             namespace.operation_id, mutate=True
         )
         self.assertEqual(str(__import__("uuid").UUID(namespace.operation_id)), namespace.operation_id)
+
+    def test_failure_page_preserves_a_cursor_while_enforcing_agent_bound(self) -> None:
+        result = {
+            "schema_version": 1,
+            "repository_id": "repo-1",
+            "run_id": "run-1",
+            "failures": [
+                {
+                    "failure_id": f"failure-{index}",
+                    "message": "x" * 2048,
+                    "location": "y" * 2048,
+                }
+                for index in range(10)
+            ],
+            "next_cursor": None,
+        }
+
+        bounded = agent_cli._bounded_test_failure_page(result)
+
+        self.assertTrue(bounded["ok"])
+        self.assertGreaterEqual(len(bounded["failures"]), 1)
+        self.assertLess(len(bounded["failures"]), 10)
+        self.assertEqual(
+            bounded["next_cursor"], bounded["failures"][-1]["failure_id"]
+        )
+        self.assertLessEqual(
+            len(agent_cli.canonical_json_bytes(bounded)), 8 * 1024
+        )
+        self.assertEqual(result["next_cursor"], None)
+        self.assertEqual(len(result["failures"]), 10)
+
+    def test_successful_retry_without_broker_ok_still_exits_successfully(self) -> None:
+        operation_id = "00000000-0000-4000-8000-000000000001"
+        repository = mock.Mock(repo_id="repo-1")
+        profile = mock.Mock()
+        profile.resolve_repository.return_value = repository
+        profile.retry_test_run.return_value = {
+            "schema_version": 1,
+            "repository_id": "repo-1",
+            "run_id": "run-2",
+            "state": "queued",
+        }
+        namespace = agent_cli._parser().parse_args(
+            [
+                "test",
+                "retry",
+                "run-1",
+                "--failed-only",
+                "--operation-id",
+                operation_id,
+            ]
+        )
+
+        with mock.patch.object(
+            agent_cli, "_attribution", return_value="codex:thread"
+        ):
+            result = agent_cli._test(
+                namespace,
+                profile=profile,
+                capabilities={"tests": {}},
+                context=_Context(),
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["operation_id"], operation_id)
 
     def test_test_parser_exposes_every_advertised_agent_action(self) -> None:
         test_parser = agent_cli._parser()._subparsers._group_actions[0].choices["test"]

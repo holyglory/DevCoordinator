@@ -1949,6 +1949,53 @@ volumes:
                 project_name="alpha-stack",
                 host_access_approved=True,
             )
+            retained = self.fixture.persistence.provision_compose_definition(
+                repo_id=REPO_ALPHA,
+                compose_definition_id=COMPOSE_ALPHA,
+                cwd=self.fixture.alpha_root,
+                files=(self.fixture.compose_one,),
+                services=("web",),
+                project_name="alpha-stack",
+                host_access_approved=None,
+            )
+        self.assertEqual(
+            retained["definition_fingerprint"], approved["definition_fingerprint"]
+        )
+
+        expanded = json.dumps(
+            {
+                "services": {
+                    "web": {
+                        "image": "example.invalid/web:test",
+                        "privileged": True,
+                        "network_mode": "host",
+                        "cap_add": ["SYS_PTRACE"],
+                        "volumes": [
+                            {
+                                "type": "bind",
+                                "source": "/var/run/docker.sock",
+                                "target": "/var/run/docker.sock",
+                            }
+                        ],
+                    }
+                }
+            }
+        ).encode()
+        self.fixture.persistence.compose_model_renderer = (
+            lambda **_arguments: expanded
+        )
+        with self.assertRaisesRegex(
+            PermissionError, "adds administrator-approved host access: added_capabilities"
+        ):
+            self.fixture.persistence.provision_compose_definition(
+                repo_id=REPO_ALPHA,
+                compose_definition_id=COMPOSE_ALPHA,
+                cwd=self.fixture.alpha_root,
+                files=(self.fixture.compose_one,),
+                services=("web",),
+                project_name="alpha-stack",
+                host_access_approved=None,
+            )
         with CoordinatorStore.open(
             self.fixture.persistence.database_path,
             expected_uid=os.geteuid(),

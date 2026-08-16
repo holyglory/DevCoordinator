@@ -93,6 +93,7 @@ from devcoordinator.image_publication import (
 )
 from devcoordinator.systemd_commissioning import (
     DESIRED_STATES as SYSTEMD_COMMISSIONING_STATES,
+    SystemdCommissioningError,
     apply_commissioning as apply_systemd_commissioning,
     commissioning_status as systemd_commissioning_status,
     plan_commissioning as plan_systemd_commissioning,
@@ -502,6 +503,17 @@ def coordinator_exception_payload(exc: BaseException) -> dict[str, Any]:
             "code": "broker_profile_invalid",
             "classification": "broker_configuration_required",
             "action_required": "Rerun Coordinator skill installation as the host administrator.",
+        }
+    if isinstance(exc, SystemdCommissioningError):
+        return {
+            "error": str(exc),
+            "code": "systemd_unit_contract_invalid",
+            "classification": "repository_configuration_invalid",
+            "mutation_performed": False,
+            "action_required": (
+                "Correct the exact repository-declared unit safety contract, then "
+                "rerun systemd-unit plan."
+            ),
         }
     return {
         "error": str(exc),
@@ -11186,15 +11198,48 @@ def legacy_cli_inventory(
     are additive for those readers, so only the envelope version is projected.
     """
 
-    result = coordinated_build_inventory(
-        project=project,
-        include_docker=include_docker,
-        backup_dirs=backup_dirs,
-        stats_history_limit=stats_history_limit,
+    result = dict(
+        coordinated_build_inventory(
+            project=project,
+            include_docker=include_docker,
+            backup_dirs=backup_dirs,
+            stats_history_limit=stats_history_limit,
+        )
     )
     if result.get("schema_version") != INVENTORY_SCHEMA_VERSION:
         raise RuntimeError("normalized inventory omitted its current schema envelope")
     result["schema_version"] = 2
+    # Normalized schema v3 removed repository membership state entirely on the
+    # confirmed single-developer host.  The stable v2 lifecycle envelope still
+    # defined this collection as a list, and older automation validates that
+    # shape before using current resource rows' direct ``repo_id`` association.
+    # Publish no records and perform no membership lookup: this is wire-shape
+    # compatibility only, not a restored permission or association mechanism.
+    result["memberships"] = []
+    immutable = None if project is None else resolve_immutable_repository_binding(project)
+    if immutable is not None:
+        repositories = list(result.get("repositories") or [])
+        matches = [
+            index
+            for index, row in enumerate(repositories)
+            if isinstance(row, dict)
+            and row.get("repo_id") == immutable.repository_id
+            and row.get("canonical_root") == immutable.original_root
+        ]
+        if len(matches) != 1:
+            raise RuntimeError(
+                "normalized inventory omitted the immutable route's authority repository"
+            )
+        index = matches[0]
+        routed = dict(repositories[index])
+        routed["authority_canonical_root"] = immutable.original_root
+        routed["canonical_root"] = immutable.materialized_root
+        repositories[index] = routed
+        result["repositories"] = repositories
+        result["project"] = immutable.materialized_root
+        compatibility = dict(result.get("v1_compatibility") or {})
+        compatibility["project"] = immutable.materialized_root
+        result["v1_compatibility"] = compatibility
     return result
 
 

@@ -2342,7 +2342,7 @@ class BrokerPersistence:
         run_once_services: Iterable[Mapping[str, Any]] = (),
         project_name: Optional[str] = None,
         observation_snapshot_id: Optional[str] = None,
-        host_access_approved: bool = False,
+        host_access_approved: bool | None = False,
         enabled: bool = True,
     ) -> dict[str, Any]:
         """Persist one trusted Compose definition outside the client protocol.
@@ -2366,9 +2366,9 @@ class BrokerPersistence:
             raise ValueError(
                 "run_once_services must be an iterable of sealed service policies"
             )
-        if type(host_access_approved) is not bool:
-            raise TypeError("host_access_approved must be a boolean")
-        if host_access_approved and _service_administrator_uid() != 0:
+        if host_access_approved is not None and type(host_access_approved) is not bool:
+            raise TypeError("host_access_approved must be boolean or null")
+        if host_access_approved is True and _service_administrator_uid() != 0:
             raise PermissionError(
                 "Compose host-access approval requires the root service administrator"
             )
@@ -2402,12 +2402,41 @@ class BrokerPersistence:
         if not 1 <= len(supplied_files) <= 16:
             raise ValueError("compose_files must contain from one through 16 paths")
 
+        previous_host_access_approved = False
+        previous_host_access_risks: tuple[str, ...] = ()
         with self._store() as store:
             with store.read_transaction() as connection:
                 repo = connection.execute(
                     "SELECT canonical_root FROM repositories WHERE repo_id = ?",
                     (repo_id,),
                 ).fetchone()
+                previous_evidence = connection.execute(
+                    """
+                    SELECT effective.host_access_approved,
+                           effective.host_access_risks_json
+                    FROM broker_compose_effective_model_evidence effective
+                    JOIN broker_compose_definitions definition
+                      USING(compose_definition_id)
+                    WHERE effective.compose_definition_id = ?
+                      AND definition.repo_id = ?
+                    """,
+                    (compose_definition_id, repo_id),
+                ).fetchone()
+        if previous_evidence is not None:
+            previous_host_access_approved = bool(
+                previous_evidence["host_access_approved"]
+            )
+            previous_risks_raw = json.loads(
+                str(previous_evidence["host_access_risks_json"])
+            )
+            if not isinstance(previous_risks_raw, list) or any(
+                not isinstance(item, str) for item in previous_risks_raw
+            ):
+                raise BrokerError(
+                    "compose_definition_invalid",
+                    "Retained Compose host-access evidence is invalid.",
+                )
+            previous_host_access_risks = tuple(previous_risks_raw)
         if repo is None:
             raise BrokerError(
                 "repository_unavailable",
@@ -2490,6 +2519,7 @@ class BrokerPersistence:
             file_evidence = tuple(file_evidence_list)
             env_file_evidence = tuple(env_file_evidence_list)
             effective_evidence: EffectiveComposeEvidence | None = None
+            effective_host_access_approved = host_access_approved is True
             if enabled:
                 if self.compose_model_renderer is None:
                     raise RuntimeError(
@@ -2508,8 +2538,23 @@ class BrokerPersistence:
                     declared_services=model_services,
                     declared_profiles=normalized_profiles,
                     project_name=normalized_project_name,
-                    host_access_approved=host_access_approved,
+                    host_access_approved=(
+                        previous_host_access_approved
+                        if host_access_approved is None
+                        else host_access_approved
+                    ),
                 )
+                if host_access_approved is None and previous_host_access_approved:
+                    added_risks = sorted(
+                        set(effective_evidence.host_access_risks)
+                        - set(previous_host_access_risks)
+                    )
+                    if added_risks:
+                        raise PermissionError(
+                            "effective Compose model adds administrator-approved "
+                            "host access: " + ", ".join(added_risks)
+                        )
+                    effective_host_access_approved = True
         finally:
             if cwd_descriptor >= 0:
                 os.close(cwd_descriptor)
@@ -2734,7 +2779,8 @@ class BrokerPersistence:
                     )
                 else:
                     approved = bool(
-                        effective_evidence.host_access_risks and host_access_approved
+                        effective_evidence.host_access_risks
+                        and effective_host_access_approved
                     )
                     connection.execute(
                         """

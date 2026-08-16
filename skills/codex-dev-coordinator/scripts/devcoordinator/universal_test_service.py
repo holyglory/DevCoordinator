@@ -2235,7 +2235,9 @@ class StoreTestPlaneAdapter:
                     for name, resource in target_resources.items()
                 }
             )
-        durable = self._store.register_plan(plan)
+        durable = self._store.register_plan(
+            plan, target_resources=target_resources
+        )
         with self._lock:
             existing = self._plans.get(plan.plan_id)
             if existing is not None and existing.fingerprint != plan.fingerprint:
@@ -2280,6 +2282,8 @@ class StoreTestPlaneAdapter:
         if target_resources is None:
             with self._lock:
                 target_resources = self._preview_resources.get(plan.plan_id)
+        if target_resources is None:
+            target_resources = self._store.get_plan_target_resources(plan.plan_id)
         result = self._store.submit_plan(
             plan,
             operation_id=operation_id,

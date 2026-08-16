@@ -1715,7 +1715,7 @@ def _provision_compose(
     root: Path,
     compose: Mapping[str, Any] | None,
     observation_snapshot_id: str | None = None,
-    host_access_approved: bool = False,
+    host_access_approved: bool | None = False,
 ) -> str | None:
     if not compose or not compose.get("declared"):
         persistence.disable_repository_compose(repo_id=repo_id)
@@ -1817,7 +1817,7 @@ def reconcile_declared_compose_first_use(
             root=root,
             compose=compose,
             observation_snapshot_id=None,
-            host_access_approved=False,
+            host_access_approved=None,
         )
     except (BrokerError, OSError, RuntimeError, TypeError, ValueError) as error:
         raise DeclaredComposeConfigurationError(str(error)) from error

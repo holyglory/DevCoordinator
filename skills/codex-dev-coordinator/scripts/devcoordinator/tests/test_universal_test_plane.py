@@ -8,6 +8,7 @@ import sqlite3
 import tempfile
 import unittest
 import uuid
+from unittest import mock
 
 from devcoordinator.universal_test_contract import (
     SourceMode,
@@ -1773,7 +1774,29 @@ class TestPlaneServiceBoundaryTests(StoreFixture):
     def test_registered_plan_survives_testd_adapter_replacement(self) -> None:
         selected = plan()
         first = StoreTestPlaneAdapter(self.store)
-        first.register_plan(selected.to_document())
+        with mock.patch.object(
+            self.store,
+            "recommend_shard_count",
+            side_effect=lambda *, repository_id, target_name, ceiling: ceiling,
+        ):
+            first.register_plan(
+                selected.to_document(),
+                target_resources={
+                    "lint": TargetResources(
+                        estimated_seconds=17,
+                        max_attempts=2,
+                        worktree_key="/var/lib/devcoordinator-snapshots/exact",
+                        exclusive_resources=("shared-cache",),
+                    ),
+                    "unit": TargetResources(
+                        estimated_seconds=33,
+                        shard_count=2,
+                        max_attempts=3,
+                        worktree_key="/var/lib/devcoordinator-snapshots/exact",
+                        exclusive_resources=("database", "shared-cache"),
+                    ),
+                },
+            )
 
         replacement = StoreTestPlaneAdapter(self.store)
         self.assertEqual(
@@ -1791,6 +1814,25 @@ class TestPlaneServiceBoundaryTests(StoreFixture):
             owner_uid=1001,
         )
         self.assertEqual(submitted["state"], "queued")
+        targets = self.store.get_run(str(submitted["run_id"]))["targets"]
+        self.assertEqual(len(targets), 3)
+        self.assertEqual(
+            {str(target["worktree_key"]) for target in targets},
+            {"/var/lib/devcoordinator-snapshots/exact"},
+        )
+        unit_targets = [
+            target for target in targets if target["target_name"] == "unit"
+        ]
+        self.assertEqual([target["shard_count"] for target in unit_targets], [2, 2])
+        self.assertEqual(
+            [target["max_attempts"] for target in unit_targets], [3, 3]
+        )
+        restored = self.store.get_plan_target_resources(selected.plan_id)
+        self.assertIsNotNone(restored)
+        self.assertEqual(
+            restored["unit"].exclusive_resources,
+            ("database", "shared-cache"),
+        )
 
     def test_manual_preview_requires_broker_registration_after_authority_check(self) -> None:
         selected = plan()
