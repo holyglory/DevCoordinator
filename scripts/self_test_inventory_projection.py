@@ -742,6 +742,16 @@ def main() -> int:
                 bounded["retained_generations"] == 3,
                 "inventory generation retention exceeded its configured cap",
             )
+            INVENTORY_STORE.MAX_RETAINED_GENERATIONS = 2
+            repaired = verify_inventory_store(
+                database,
+                publication,
+                expected_owner_uid=os.geteuid(),
+            )
+            expect(
+                repaired["retained_generations"] == 2,
+                "startup verification did not repair excessive retained generations",
+            )
         finally:
             INVENTORY_STORE.MAX_RETAINED_GENERATIONS = original_limit
 

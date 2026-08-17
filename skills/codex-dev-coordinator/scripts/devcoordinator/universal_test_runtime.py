@@ -3451,6 +3451,7 @@ class SystemdTestAttemptManager:
             "--property=CPUAccounting=yes",
             "--property=MemoryAccounting=yes",
             "--property=KillMode=control-group",
+            "--property=TimeoutStopSec=30s",
             "--property=NoNewPrivileges=yes",
             "--property=PrivateTmp=yes",
             "--property=PrivateDevices=yes",
@@ -3918,7 +3919,7 @@ class SystemdTestAttemptManager:
             else:
                 termination_reason = "systemd_failure"
         started = self._started.get(runtime_id)
-        result_document = None
+        result_document = self._read_runner_result(runtime_id) if active else None
         if not active:
             try:
                 result_document = self._read_runner_result(runtime_id)
@@ -3958,8 +3959,27 @@ class SystemdTestAttemptManager:
         )
 
     def cancel(self, runtime_id: str) -> NativeTestAttemptState:
-        self._run([self.systemctl, "stop", self._unit(runtime_id)], allow_failure=True)
-        return self.status(runtime_id)
+        unit = self._unit(runtime_id)
+        self._run([self.systemctl, "stop", unit], allow_failure=True)
+        state = self.status(runtime_id)
+        if state.active:
+            # A runner can leave a descendant or obsolete release process in
+            # its exact transient cgroup after the main result is complete.
+            # Cancellation owns this deterministic unit, so escalate only its
+            # control group and then require one fresh observation.
+            self._run(
+                [
+                    self.systemctl,
+                    "kill",
+                    "--kill-whom=all",
+                    "--signal=KILL",
+                    unit,
+                ],
+                allow_failure=True,
+            )
+            self._run([self.systemctl, "stop", unit], allow_failure=True)
+            state = self.status(runtime_id)
+        return state
 
     def collect(self, runtime_id: str) -> None:
         state = self.status(runtime_id)
@@ -4288,7 +4308,7 @@ class BrokerTestAttemptCoordinator:
         descriptor = self.runtime_descriptor(runtime_id)
         result_summary: dict[str, object] | None = None
         result_chunk: Mapping[str, object] | None = None
-        if not state.active and state.result_document is not None:
+        if state.result_document is not None:
             result = state.result_document
             if not isinstance(result, Mapping) or set(result) != {
                 "schema_version",
@@ -4352,13 +4372,34 @@ class BrokerTestAttemptCoordinator:
         current_memory_bytes = _validated_peak_memory_bytes(
             state.current_memory_bytes
         )
-        if not state.active and result_summary is not None:
+        terminal_from_result = result_summary is not None
+        if terminal_from_result and state.active:
+            # The owner publishes result.json atomically only after every
+            # digest-bound chunk. That exact evidence is terminal even when a
+            # descendant or obsolete release keeps the native cgroup active.
+            # Stop only this deterministic runtime; do not renew its lease.
+            self.manager.cancel(runtime_id)
+        effective_active = state.active and not terminal_from_result
+        if terminal_from_result:
             runner_peak_memory, runner_cpu_seconds = _runner_resource_usage(result)
             if peak_memory_bytes is None and runner_peak_memory is not None:
                 peak_memory_bytes = runner_peak_memory
             if cpu_seconds is None and runner_cpu_seconds is not None:
                 cpu_seconds = runner_cpu_seconds
-        if not state.active and termination_reason is None:
+            exit_status = int(result["returncode"])
+            terminal_outcome = str(result["terminal_outcome"])
+            termination_reason = (
+                "success"
+                if terminal_outcome == "succeeded"
+                else "timeout"
+                if terminal_outcome == "timed_out"
+                else "exit_code"
+            )
+            systemd_result = "success" if exit_status == 0 else "exit-code"
+            exec_main_code = 1
+        else:
+            exit_status = state.exit_status
+        if not effective_active and termination_reason is None:
             # Protocol fakes and alternate native managers may not expose the
             # richer systemd fields. Preserve the old interface without
             # silently claiming OOM/timeout evidence that was not observed.
@@ -4376,17 +4417,21 @@ class BrokerTestAttemptCoordinator:
             "attempt_id": descriptor.attempt_id,
             "repository_id": descriptor.repository_id,
             "repository_generation": descriptor.repository_generation,
-            "state": "running" if state.active else "exited",
-            "exit_status": state.exit_status,
+            "state": "running" if effective_active else "exited",
+            "exit_status": exit_status,
             "started_at": state.started_at,
-            "finished_at": state.finished_at,
+            "finished_at": (
+                float(self.clock())
+                if terminal_from_result and state.finished_at is None
+                else state.finished_at
+            ),
             "result": result_summary,
             "result_chunk": (
                 None if result_chunk is None else dict(result_chunk)
             ),
             "termination": (
                 None
-                if state.active
+                if effective_active
                 else {
                     "reason": termination_reason,
                     "systemd_result": systemd_result,
@@ -4396,7 +4441,7 @@ class BrokerTestAttemptCoordinator:
             ),
             "resource_usage": (
                 {"current_memory_bytes": current_memory_bytes}
-                if state.active
+                if effective_active
                 else {
                     "peak_memory_bytes": peak_memory_bytes,
                     "cpu_seconds": cpu_seconds,

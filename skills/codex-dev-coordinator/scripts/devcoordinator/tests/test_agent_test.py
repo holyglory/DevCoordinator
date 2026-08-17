@@ -203,11 +203,18 @@ class AgentTestTests(unittest.TestCase):
             MAX_TEST_RESULT_BYTES,
         )
 
-    def test_handoff_submits_without_a_permission_review(self) -> None:
-        profile, result = self._enqueue(intent="handoff")
-        self.assertEqual(len(profile.submit_calls), 1)
-        self.assertTrue(result["submission_performed"])
-        self.assertEqual(result["continuation"], "dc1:run:run-1")
+    def test_handoff_and_release_stop_for_explicit_plan_review(self) -> None:
+        for intent in ("handoff", "release"):
+            with self.subTest(intent=intent):
+                profile, result = self._enqueue(intent=intent)
+                self.assertEqual(profile.submit_calls, [])
+                self.assertFalse(result["submission_performed"])
+                self.assertEqual(result["classification"], "test_plan_ready")
+                self.assertEqual(result["continuation"], f"dc1:plan:{profile.plan.plan_id}")
+                self.assertEqual(
+                    result["next_command"],
+                    f"devcoordinator test submit dc1:plan:{profile.plan.plan_id}",
+                )
 
     def test_routine_enqueue_codex_actor_survives_api_account_routing(self) -> None:
         profile, result = self._enqueue(account_id="devcoordinator-api")

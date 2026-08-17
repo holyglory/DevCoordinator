@@ -194,9 +194,11 @@ def _parser() -> argparse.ArgumentParser:
     database = commands.add_parser(
         "database", help="run one sealed database-stack operation"
     )
-    database.add_argument("action", choices=("backup",))
+    database.add_argument("action", choices=("backup", "retire"))
     database.add_argument("selector", help="exact database-stack ID or unique name")
     database.add_argument("--database-name", required=True)
+    database.add_argument("--database-backup-id")
+    database.add_argument("--confirm-backup-id")
     database.add_argument("--operation-id")
     _add_scoped_project(database)
 
@@ -1690,12 +1692,12 @@ def _database(
 
     advertised = capabilities.get("database")
     if (
-        not isinstance(advertised, Mapping)
-        or namespace.action not in advertised.get("actions", [])
+        not isinstance(advertised, list)
+        or namespace.action not in advertised
     ):
         raise AgentCliError(
             "capability_unavailable",
-            "active authority does not advertise database backup",
+            "active authority does not advertise the requested database action",
             classification="unsupported_capability",
             phase="handshake",
         )
@@ -1710,19 +1712,68 @@ def _database(
     )
     operation_id = _canonical_operation_id(namespace.operation_id, mutate=True)
     namespace.operation_id = operation_id
+    if namespace.action == "backup" and (
+        namespace.database_backup_id is not None
+        or namespace.confirm_backup_id is not None
+    ):
+        raise AgentCliError(
+            "database_backup_option_forbidden",
+            "database backup does not accept retirement selectors",
+        )
+    if namespace.action == "retire" and (
+        not namespace.database_backup_id
+        or not namespace.confirm_backup_id
+    ):
+        raise AgentCliError(
+            "database_backup_retirement_incomplete",
+            "database retire requires --database-backup-id and the same exact "
+            "--confirm-backup-id",
+        )
+    broker_operation = (
+        BrokerOperation.DATABASE_BACKUP
+        if namespace.action == "backup"
+        else BrokerOperation.DATABASE_BACKUP_RETIRE
+    )
+    arguments = (
+        {"database_name": namespace.database_name}
+        if namespace.action == "backup"
+        else {
+            "database_name": namespace.database_name,
+            "database_backup_id": namespace.database_backup_id,
+            "confirm_backup_id": namespace.confirm_backup_id,
+        }
+    )
     returned_operation_id, result = profile.call(
         repository=repository,
         resource_id=str(target["id"]),
-        operation=BrokerOperation.DATABASE_BACKUP,
-        arguments={"database_name": namespace.database_name},
+        operation=broker_operation,
+        arguments=arguments,
         operation_id=operation_id,
     )
     if returned_operation_id != operation_id or not isinstance(result, Mapping):
         raise AgentCliError(
-            "database_backup_reply_invalid",
-            "database backup reply contradicted its durable operation identity",
+            "database_reply_invalid",
+            "database operation reply contradicted its durable operation identity",
             classification="invalid_reply",
             phase="transport",
+        )
+    if namespace.action == "retire":
+        return require_agent_result(
+            {
+                "schema_version": 1,
+                "ok": result.get("status") == "retired",
+                "classification": "database_backup_retired",
+                "operation_id": operation_id,
+                "continuation": continuation_handle("operation", operation_id),
+                "database_backup_id": result.get("database_backup_id"),
+                "database_binding_id": result.get("database_binding_id"),
+                "database_name": result.get("database_name"),
+                "status": result.get("status"),
+                "removed": result.get("removed"),
+                "already_absent": result.get("already_absent"),
+                "reclaimed_bytes": result.get("reclaimed_bytes"),
+            },
+            surface="database backup retirement",
         )
     document = {
         "schema_version": 1,
@@ -2247,6 +2298,11 @@ def _error_classification(error: BaseException, code: str) -> str:
         "temporary_service_readiness_timeout",
     }:
         return "infrastructure_failure"
+    if code in {
+        "repository_runtime_contract_invalid",
+        "compose_definition_invalid",
+    }:
+        return "repository_configuration_invalid"
     if code.startswith("maintenance_"):
         return "maintenance"
     if code in {"server_busy", "broker_busy", "request_timeout"}:
@@ -2338,6 +2394,15 @@ def _next_action_for_failure(
             "Repository adoption reached the broker but failed unexpectedly before launch. "
             "Do not retry blindly or bypass Coordinator; report the returned operation ID "
             "and error code to the Coordinator task."
+        )
+    if code in {
+        "repository_runtime_contract_invalid",
+        "compose_definition_invalid",
+    }:
+        return (
+            "Correct the exact repository-declared runtime condition named in "
+            "the message, then retry the same service action. Coordinator did "
+            "not classify this as a broker outage or bypass the host-access gate."
         )
     if code == "invalid_arguments":
         return (

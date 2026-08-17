@@ -182,6 +182,24 @@ def enqueue_test(
     else:
         raise AgentTestError("test_reply_invalid", "test preview omitted its plan")
 
+    if intent in {"handoff", "release"}:
+        plan_handle = continuation_handle("plan", plan_id)
+        return require_agent_result(
+            {
+                "schema_version": 1,
+                "ok": True,
+                "classification": "test_plan_ready",
+                "repository_id": repository.repo_id,
+                "operation_id": operation_id,
+                "continuation": plan_handle,
+                "plan": plan_projection,
+                "submission_performed": False,
+                "next_command": f"devcoordinator test submit {plan_handle}",
+            },
+            surface="test enqueue",
+            maximum_bytes=MAX_TEST_RESULT_BYTES,
+        )
+
     submit_operation_id = child_operation_id(operation_id, "submit")
     submitted = profile.submit_test_plan(
         repository=repository.repo_id,

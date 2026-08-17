@@ -689,6 +689,48 @@ class UniversalTestRunnerTests(unittest.TestCase):
         self.assertEqual(state.cpu_seconds, 3.5)
         self.assertIsNone(state.current_memory_bytes)
 
+    def test_active_unit_exposes_atomic_runner_result_for_terminal_convergence(self) -> None:
+        descriptor = self.descriptor(("/usr/bin/python3", "-c", "pass"))
+        result_path = self.output / "result.json"
+        self.assertEqual(run(descriptor, self.output, result_path), 0)
+        expected = json.loads(result_path.read_text(encoding="utf-8"))
+        runtime_id = "devcoordinator-test-active-result"
+        attempt_root = Path(self.temporary.name) / "active-result-attempts"
+        state_root = attempt_root / runtime_id
+        state_root.mkdir(parents=True)
+        shutil.copytree(self.output, state_root / "output", copy_function=shutil.copy2)
+        (state_root / "launch.json").write_text(
+            json.dumps({"descriptor": descriptor.to_document()}),
+            encoding="utf-8",
+        )
+
+        def active(_argv, **_kwargs):
+            stdout = "\n".join((
+                "LoadState=loaded",
+                "ActiveState=deactivating",
+                "SubState=stop-sigterm",
+                "Result=success",
+                "ExecMainCode=0",
+                "ExecMainStatus=0",
+                "OOMKilled=no",
+                "CPUUsageNSec=3500000000",
+                "MemoryPeak=234881024",
+                "MemoryCurrent=1048576",
+            ))
+            return subprocess.CompletedProcess(_argv, 0, stdout, "")
+
+        manager = SystemdTestAttemptManager(
+            attempt_root=attempt_root,
+            artifact_root=Path(self.temporary.name) / "active-result-artifacts",
+            runner=active,
+        )
+
+        observed = manager.status(runtime_id)
+
+        self.assertTrue(observed.active)
+        self.assertEqual(observed.result_document, expected)
+        self.assertEqual(observed.current_memory_bytes, 1024 * 1024)
+
     def test_source_toolchain_and_fixture_provenance_are_exact_and_nonsecret(self) -> None:
         credentials = Path(self.temporary.name) / "credentials"
         credentials.mkdir(mode=0o700)

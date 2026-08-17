@@ -1068,6 +1068,114 @@ class AgentCliTests(unittest.TestCase):
         self.assertEqual(result["code"], "mutation_failed")
         self.assertFalse(result["ok"])
 
+    def test_successful_test_follow_always_emits_one_decision_document(self) -> None:
+        stream = mock.Mock()
+        stream.buffer = io.BytesIO()
+        stream.flush = mock.Mock()
+        decision = {
+            "schema_version": 1,
+            "ok": True,
+            "classification": "test_pending",
+            "continuation": "dc1:run:run-follow-output",
+            "run": {
+                "id": "run-follow-output",
+                "state": "running",
+                "terminal": False,
+                "conclusion": None,
+                "wait_timed_out": True,
+            },
+        }
+        with (
+            mock.patch.object(agent_cli.sys, "stdout", stream),
+            mock.patch(
+                "devcoordinator.call_journal.configured_call_journal",
+                return_value=None,
+            ),
+            mock.patch.object(agent_cli, "_execute", return_value=decision),
+        ):
+            returncode = agent_cli.main(
+                ["test", "follow", "run-follow-output", "--wait-seconds", "1"]
+            )
+
+        self.assertEqual(returncode, 0)
+        lines = stream.buffer.getvalue().splitlines()
+        self.assertEqual(len(lines), 1)
+        self.assertEqual(json.loads(lines[0]), decision)
+
+    def test_database_retire_uses_only_exact_registered_identity_and_confirmation(self) -> None:
+        operation_id = "00000000-0000-4000-8000-000000000321"
+        namespace = mock.Mock(
+            action="retire",
+            selector="postgres",
+            database_name="appdb",
+            database_backup_id="backup-exact",
+            confirm_backup_id="backup-exact",
+            operation_id=operation_id,
+        )
+        profile = mock.Mock()
+        repository = mock.Mock(repo_id="repo-1")
+        profile.call.return_value = (
+            operation_id,
+            {
+                "status": "retired",
+                "database_backup_id": "backup-exact",
+                "database_binding_id": "database-1",
+                "database_name": "appdb",
+                "removed": ["artifact", "manifest"],
+                "already_absent": [],
+                "reclaimed_bytes": 123,
+            },
+        )
+        with (
+            mock.patch.object(
+                agent_cli,
+                "_runtime_target",
+                return_value={"id": "database-1", "kind": "database_stack"},
+            ),
+            mock.patch.object(
+                agent_cli, "_require_resolved_repository", return_value=repository
+            ),
+        ):
+            result = agent_cli._database(
+                namespace,
+                profile=profile,
+                capabilities={"database": ["backup", "retire"]},
+                context=_Context(),
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["classification"], "database_backup_retired")
+        profile.call.assert_called_once()
+        self.assertEqual(
+            profile.call.call_args.kwargs["arguments"],
+            {
+                "database_name": "appdb",
+                "database_backup_id": "backup-exact",
+                "confirm_backup_id": "backup-exact",
+            },
+        )
+
+    def test_declared_compose_contract_failure_is_not_a_broker_outage(self) -> None:
+        error = BrokerError(
+            "repository_runtime_contract_invalid",
+            "effective Compose model adds administrator-approved host access: "
+            "volume_driver_bind",
+        )
+
+        result = agent_cli._failure(
+            error,
+            mutation_attempted=True,
+            broker_contacted=True,
+            observed_mutation=False,
+        )
+
+        self.assertEqual(
+            result["classification"], "repository_configuration_invalid"
+        )
+        self.assertEqual(result["phase"], "authority")
+        self.assertIn("host-access gate", result["next_action"])
+        self.assertFalse(result["mutation_performed"])
+
     def test_operation_follow_uses_the_exact_handle_and_bounded_projection(self) -> None:
         operation_id = "00000000-0000-4000-8000-000000000001"
         profile = mock.Mock()

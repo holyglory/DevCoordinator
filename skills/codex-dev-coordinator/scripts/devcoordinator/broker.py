@@ -176,6 +176,7 @@ class BrokerOperation(str, Enum):
     DOCKER_STOP = "docker.stop"
     DOCKER_RESTART = "docker.restart"
     DATABASE_BACKUP = "database.backup"
+    DATABASE_BACKUP_RETIRE = "database.backup_retire"
     DATABASE_RESTORE = "database.restore"
     COMPOSE_UP = "compose.up"
     COMPOSE_STOP = "compose.stop"
@@ -3969,6 +3970,40 @@ def _validate_arguments(
             "database_name": _database_name_argument(
                 value["database_name"], operation_id
             )
+        }
+
+    if operation == BrokerOperation.DATABASE_BACKUP_RETIRE:
+        if set(value) != {
+            "database_name",
+            "database_backup_id",
+            "confirm_backup_id",
+        }:
+            raise BrokerError(
+                "invalid_arguments",
+                "Database backup retirement requires one database name, one "
+                "registered backup ID, and its exact confirmation ID; service "
+                "paths and commands are forbidden.",
+                operation_id=operation_id,
+            )
+        backup_id = _opaque_argument(
+            value["database_backup_id"], "database_backup_id", operation_id
+        )
+        confirmation = _opaque_argument(
+            value["confirm_backup_id"], "confirm_backup_id", operation_id
+        )
+        if confirmation != backup_id:
+            raise BrokerError(
+                "database_backup_confirmation_invalid",
+                "Backup retirement confirmation must exactly match the selected "
+                "database backup ID.",
+                operation_id=operation_id,
+            )
+        return {
+            "database_name": _database_name_argument(
+                value["database_name"], operation_id
+            ),
+            "database_backup_id": backup_id,
+            "confirm_backup_id": confirmation,
         }
 
     if operation == BrokerOperation.DATABASE_RESTORE:

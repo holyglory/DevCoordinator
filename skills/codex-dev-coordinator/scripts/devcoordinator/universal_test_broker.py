@@ -1233,12 +1233,12 @@ class CoordinatorRuntimeRequestSubmitter(RuntimeRequestSubmitter):
                 }
             if chunk is not None or context.next_chunk_index != chunk_count:
                 raise TestStoreConflict("broker result chunk stream is contradictory")
-            if context.cancelled:
-                conclusion = AttemptConclusion.CANCELLED
-            else:
-                conclusion = AttemptConclusion(
-                    str(runner_result["terminal_outcome"])
-                )
+            # An atomic runner result may win the race with cancellation. Its
+            # measured outcome remains authoritative; cancellation is used
+            # only when no terminal runner evidence exists.
+            conclusion = AttemptConclusion(
+                str(runner_result["terminal_outcome"])
+            )
         envelope = AttemptExitEnvelope(
             envelope_id="exit-" + hashlib.sha256(
                 (

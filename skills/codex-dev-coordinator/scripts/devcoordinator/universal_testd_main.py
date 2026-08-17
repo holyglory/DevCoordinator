@@ -107,18 +107,25 @@ def run(
     call_journal: RollingCallJournal | None = None,
 ) -> int:
     store = UniversalTestStore.open(Path(database))
+    service = StoreTestPlaneAdapter(
+        store,
+        previewer=previewer,
+        canceller=(
+            None if engine_loop is None else engine_loop.engine.cancel_run
+        ),
+    )
     inherited = inherited_systemd_listener(expected_address=socket_path)
     if inherited is None:
         server = UnixTestPlaneServer.bind(
             Path(socket_path),
-            StoreTestPlaneAdapter(store, previewer=previewer),
+            service,
             socket_mode=0o600,
             call_journal=call_journal,
         )
     else:
         server = UnixTestPlaneServer(
             inherited,
-            StoreTestPlaneAdapter(store, previewer=previewer),
+            service,
             call_journal=call_journal,
         )
 

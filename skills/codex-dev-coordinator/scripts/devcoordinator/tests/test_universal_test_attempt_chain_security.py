@@ -101,6 +101,7 @@ def _plan(repository_id: str, root: Path, fingerprint: str):
 class _FakeNativeManager:
     def __init__(self) -> None:
         self.started: list[TestAttemptDescriptor] = []
+        self.cancelled: list[str] = []
         self.states: dict[str, NativeTestAttemptState] = {}
         self.chunks: dict[tuple[str, int], dict[str, object]] = {}
         self.launch_tickets: dict[str, str] = {}
@@ -137,6 +138,10 @@ class _FakeNativeManager:
         return self.chunks.get((runtime_id, chunk_index))
 
     def cancel(self, runtime_id: str) -> NativeTestAttemptState:
+        self.cancelled.append(runtime_id)
+        self.states[runtime_id] = replace(
+            self.states[runtime_id], active=False, state="exited", exit_status=1
+        )
         return self.states[runtime_id]
 
     def collect(self, runtime_id: str) -> None:
@@ -464,6 +469,44 @@ class UniversalTestAttemptChainSecurityTests(unittest.TestCase):
             terminal["resource_usage"],
             {"peak_memory_bytes": 64 * 1024 * 1024, "cpu_seconds": 1.5},
         )
+
+    def test_atomic_runner_result_terminalizes_and_stops_lingering_native_unit(self) -> None:
+        candidate, lease = self._submit_and_lease(
+            "repo-lingering-result", self.repo_a, os.geteuid()
+        )
+        descriptor = self._descriptor(candidate, lease, self.repo_a)
+        native = _FakeNativeManager()
+        coordinator = BrokerTestAttemptCoordinator(native, clock=lambda: 9.0)
+        ticket = coordinator.issue(descriptor)
+        launch = coordinator.launch(
+            ticket_id=ticket["ticket_id"],
+            attempt_id=descriptor.attempt_id,
+            generation=descriptor.generation,
+        )
+        runtime_id = launch["runtime_id"]
+        chunk = {
+            "chunk_id": "chunk-lingering-result-0",
+            "chunk_index": 0,
+            "cases": [],
+            "failures": [],
+            "artifacts": [],
+            "reporter_complete": True,
+        }
+        native.finish(runtime_id, descriptor, chunk)
+        native.states[runtime_id] = replace(
+            native.states[runtime_id],
+            active=True,
+            state="deactivating",
+            exit_status=None,
+            finished_at=None,
+        )
+
+        observed = coordinator.observe(runtime_id)
+
+        self.assertEqual(observed["state"], "exited")
+        self.assertEqual(observed["result_chunk"], chunk)
+        self.assertEqual(observed["exit_status"], 0)
+        self.assertEqual(native.cancelled, [runtime_id])
 
     def test_launch_ticket_outlives_caller_launch_deadline(self) -> None:
         candidate, lease = self._submit_and_lease(
@@ -1631,6 +1674,75 @@ class UniversalTestAttemptChainSecurityTests(unittest.TestCase):
                 )
             },
         )
+
+    def test_published_runner_outcome_wins_cancellation_race(self) -> None:
+        attempt_id = "attempt-cancel-result-race"
+        runtime_id = "devcoordinator-test-" + hashlib.sha256(
+            attempt_id.encode("utf-8")
+        ).hexdigest()[:32]
+        submitter = CoordinatorRuntimeRequestSubmitter(
+            BrokerConnection(Path("/tmp/devcoordinator-unused.sock"), "authority-1"),
+            clock=lambda: 10.0,
+        )
+        submitter.recover(
+            runtime_id,
+            context=RunnerRecoveryContext(
+                repository_id="repo-cancel-result-race",
+                repository_generation=1,
+                attempt_id=attempt_id,
+                generation=1,
+                started_at=1.0,
+            ),
+        )
+        submitter._runtimes[runtime_id].cancelled = True
+
+        class Calls:
+            def call(self, *, arguments, **_kwargs):
+                index = int(arguments["result_chunk_index"])
+                return {
+                    "state": "exited",
+                    "exit_status": 1,
+                    "result": {
+                        "schema_version": 3,
+                        "attempt_id": attempt_id,
+                        "generation": 1,
+                        "returncode": 1,
+                        "duration_seconds": 2.0,
+                        "incomplete_reporting": False,
+                        "terminal_outcome": "test_failed",
+                        "captures": {},
+                        "chunk_count": 1,
+                    },
+                    "result_chunk": (
+                        {
+                            "chunk_id": "chunk-cancel-result-race",
+                            "chunk_index": 0,
+                            "cases": [],
+                            "failures": [],
+                            "artifacts": [],
+                            "reporter_complete": True,
+                        }
+                        if index == 0
+                        else None
+                    ),
+                    "termination": {
+                        "reason": "exit_code",
+                        "systemd_result": "exit-code",
+                        "exec_main_code": 1,
+                        "oom_killed": False,
+                    },
+                    "resource_usage": {
+                        "peak_memory_bytes": 1024,
+                        "cpu_seconds": 0.5,
+                    },
+                }
+
+        submitter.calls = Calls()
+
+        self.assertEqual(submitter.observe(runtime_id)["state"], "result")
+        terminal = submitter.observe(runtime_id)
+        self.assertEqual(terminal["state"], "exited")
+        self.assertEqual(terminal["exit_envelope"]["conclusion"], "test_failed")
 
     def test_native_exit_without_result_streams_bounded_failure_then_exact_exit(self) -> None:
         runtime_id = "devcoordinator-test-" + hashlib.sha256(

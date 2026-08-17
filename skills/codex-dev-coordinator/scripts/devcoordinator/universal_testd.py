@@ -1439,24 +1439,36 @@ class TestdEngine:
                                 "stage": "source_observation",
                             }
                         )
+                observation: RunnerObservation | None = None
                 if state in {"cancelling", "superseding"}:
-                    reason = "run cancellation requested" if state == "cancelling" else "run superseded"
-                    if self.launcher.cancel(active.handle, reason=reason):
-                        conclusion = (
-                            AttemptConclusion.CANCELLED
+                    # A result can publish immediately before cancellation or
+                    # during release recovery. Observe first so measured
+                    # terminal evidence wins; cancel only a genuinely running
+                    # runtime with no published result.
+                    observation = self.launcher.observe(active.handle)
+                    if observation.state == "running":
+                        reason = (
+                            "run cancellation requested"
                             if state == "cancelling"
-                            else AttemptConclusion.SUPERSEDED
+                            else "run superseded"
                         )
-                        if self._spool_terminal(active, conclusion):
-                            completed.append(attempt_id)
-                        else:
-                            failed.append({
-                                "attempt_id": attempt_id,
-                                "error_type": "TestStoreConflict",
-                                "stage": "terminal_replay",
-                            })
-                        continue
-                observation = self.launcher.observe(active.handle)
+                        if self.launcher.cancel(active.handle, reason=reason):
+                            conclusion = (
+                                AttemptConclusion.CANCELLED
+                                if state == "cancelling"
+                                else AttemptConclusion.SUPERSEDED
+                            )
+                            if self._spool_terminal(active, conclusion):
+                                completed.append(attempt_id)
+                            else:
+                                failed.append({
+                                    "attempt_id": attempt_id,
+                                    "error_type": "TestStoreConflict",
+                                    "stage": "terminal_replay",
+                                })
+                            continue
+                if observation is None:
+                    observation = self.launcher.observe(active.handle)
                 if observation.launch_confirmed and not active.handle.launch_confirmed:
                     active.handle = replace(active.handle, launch_confirmed=True)
                     self._retain_active(active)
@@ -1605,6 +1617,24 @@ class TestdEngine:
         # state so cancellation never strands an attempt that has in fact
         # finished and no longer has an in-memory worker binding.
         self.replay_spool()
+        # Drain an already-published bounded chunk stream before changing run
+        # state. A running attempt with no result makes no progress and exits
+        # this loop after one observation; a complete result needs at most its
+        # 4096 chunks plus one terminal observation.
+        for _ in range(4_097):
+            before = {
+                attempt_id: len(active.result_chunk_ids)
+                for attempt_id, active in self._active.items()
+            }
+            self.heartbeat()
+            if not any(
+                attempt_id in self._active
+                and len(self._active[attempt_id].result_chunk_ids) > count
+                for attempt_id, count in before.items()
+            ):
+                break
+        else:  # pragma: no cover - the result contract caps chunks at 4096.
+            raise TestStoreConflict("runner result stream exceeded its drain bound")
         self.reap()
         result = self.store.request_cancel(
             run_id, actor=actor, reason=reason, operation_id=operation_id
@@ -1795,6 +1825,27 @@ class TestdEngineLoop:
         # Reconcile launched work before admitting more, then reap only after
         # current leases have had a chance to heartbeat.
         heartbeat = self.engine.heartbeat()
+        heartbeat_failures = heartbeat.get("failures")
+        if isinstance(heartbeat_failures, list) and heartbeat_failures:
+            # A retiring testd can briefly lose the matching authority release
+            # while its native attempts and durable spool remain valid. Never
+            # let that failed supervision turn into lease abandonment or new
+            # launches. The replacement recovers the exact spool binding and
+            # performs the next clean heartbeat before reaping.
+            return {
+                "heartbeat": heartbeat,
+                # Scheduling remains independently fail-closed at ticket and
+                # launch boundaries. Let unrelated repositories make progress
+                # while one active attempt needs supervision recovery; only
+                # lease destruction is unsafe without a clean heartbeat.
+                "schedule": self.engine.schedule(
+                    launch_batch=self.launch_batch
+                ),
+                "reaped": {
+                    "skipped": True,
+                    "reason": "heartbeat_failures",
+                },
+            }
         schedule = self.engine.schedule(launch_batch=self.launch_batch)
         reaped = self.engine.reap()
         return {"heartbeat": heartbeat, "schedule": schedule, "reaped": reaped}

@@ -19,7 +19,7 @@ import re
 import stat
 from threading import RLock
 from types import MappingProxyType
-from typing import Mapping, Protocol, Sequence, runtime_checkable
+from typing import Callable, Mapping, Protocol, Sequence, runtime_checkable
 
 from .universal_test_contract import (
     EvidencePolicy,
@@ -1364,6 +1364,7 @@ class StoreTestPlaneAdapter:
         store: UniversalTestStore,
         *,
         previewer: RepositoryUIDPlanPreviewer | None = None,
+        canceller: Callable[..., Mapping[str, object]] | None = None,
     ) -> None:
         if not isinstance(store, UniversalTestStore):
             raise TestStoreContractError("store must be UniversalTestStore")
@@ -1373,6 +1374,9 @@ class StoreTestPlaneAdapter:
         ):
             raise TestStoreContractError("repository plan previewer is invalid")
         self._previewer = previewer
+        if canceller is not None and not callable(canceller):
+            raise TestStoreContractError("test run canceller is invalid")
+        self._canceller = canceller
         self._plans: dict[str, TestPlan] = {}
         self._preview_resources: dict[str, Mapping[str, TargetResources]] = {}
         self._lock = RLock()
@@ -2322,11 +2326,12 @@ class StoreTestPlaneAdapter:
     def status(
         self, *, run_id: str, repository_id: str
     ) -> Mapping[str, object]:
-        return self._bounded(
-            self._status_document(
-                self._store.get_run(run_id, repository_id=repository_id)
-            )
+        document = self._status_document(
+            self._store.get_run(run_id, repository_id=repository_id)
         )
+        metrics = self._store.run_metrics(run_id)
+        document["failure_count"] = int(metrics["failure_record_count"])
+        return self._bounded(document)
 
     def queue_status(self, *, repository_id: str) -> Mapping[str, object]:
         return self._bounded(
@@ -2574,13 +2579,24 @@ class StoreTestPlaneAdapter:
         operation_id: str,
     ) -> Mapping[str, object]:
         self._store.get_run(run_id, repository_id=repository_id)
+        cancel = self._canceller
+        result = (
+            self._store.request_cancel(
+                run_id, actor=actor, reason=reason, operation_id=operation_id
+            )
+            if cancel is None
+            else cancel(
+                run_id=run_id,
+                actor=actor,
+                reason=reason,
+                operation_id=operation_id,
+            )
+        )
         return self._bounded(
             {
                 "schema_version": 1,
                 "repository_id": repository_id,
-                **self._store.request_cancel(
-                    run_id, actor=actor, reason=reason, operation_id=operation_id
-                ),
+                **result,
             }
         )
 

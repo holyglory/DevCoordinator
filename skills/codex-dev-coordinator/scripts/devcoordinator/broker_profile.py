@@ -1172,7 +1172,10 @@ def _broker_client_timeout_seconds(
                 "Compose run-once call requires a valid timeout_seconds argument"
             )
         return float(requested + 120)
-    if operation is BrokerOperation.DATABASE_BACKUP:
+    if operation in {
+        BrokerOperation.DATABASE_BACKUP,
+        BrokerOperation.DATABASE_BACKUP_RETIRE,
+    }:
         return DATABASE_BACKUP_CLIENT_TIMEOUT_SECONDS
     if operation is BrokerOperation.DATABASE_RESTORE:
         return DATABASE_RESTORE_CLIENT_TIMEOUT_SECONDS

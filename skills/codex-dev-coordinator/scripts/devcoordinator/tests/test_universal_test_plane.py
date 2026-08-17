@@ -684,6 +684,12 @@ class UniversalTestStoreTests(StoreFixture):
         self.assertFalse(first["replayed"])
         self.assertTrue(replay["replayed"])
         self.assertEqual(self.store.failures(run_id=submitted.run_id)[0]["failure_id"], "failure-1")
+        live_status = StoreTestPlaneAdapter(self.store).status(
+            run_id=submitted.run_id,
+            repository_id="repo-tests",
+        )
+        self.assertEqual(live_status["state"], "running")
+        self.assertEqual(live_status["failure_count"], 1)
         self.assertEqual(self.store.artifacts(run_id=submitted.run_id)[0]["artifact_id"], "artifact-1")
         resolved = self.store.artifact(
             run_id=submitted.run_id, artifact_id="artifact-1"
@@ -1618,6 +1624,42 @@ class TestPlaneServiceBoundaryTests(StoreFixture):
         def setup_as_owner(self, **values):
             self.setup_calls.append(dict(values))
             return setup_document(str(values["repository_id"]))
+
+    def test_adapter_routes_cancellation_through_injected_testd_engine(self) -> None:
+        submitted = self.submit()
+        calls: list[dict[str, object]] = []
+
+        def cancel(**arguments):
+            calls.append(dict(arguments))
+            return {
+                "run_id": submitted.run_id,
+                "state": "cancelled",
+                "active_attempt_ids": [],
+                "cancelled_attempt_ids": ["attempt-exact"],
+                "unresolved_attempt_ids": [],
+            }
+
+        adapter = StoreTestPlaneAdapter(self.store, canceller=cancel)
+        operation = operation_id()
+        result = adapter.cancel(
+            run_id=submitted.run_id,
+            repository_id="repo-tests",
+            actor="codex:adapter",
+            reason="stop exact run",
+            operation_id=operation,
+        )
+
+        self.assertEqual(
+            calls,
+            [{
+                "run_id": submitted.run_id,
+                "actor": "codex:adapter",
+                "reason": "stop exact run",
+                "operation_id": operation,
+            }],
+        )
+        self.assertEqual(result["state"], "cancelled")
+        self.assertEqual(result["cancelled_attempt_ids"], ["attempt-exact"])
 
     def test_plan_wire_codec_round_trips_and_rejects_tampering(self) -> None:
         selected = plan()

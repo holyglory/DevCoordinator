@@ -963,38 +963,48 @@ def _activate_inventory_generation(
             "UPDATE inventory_store_metadata SET active_generation = ?, updated_at = ? WHERE singleton = 1",
             (validated["generation"], validated["published_at"]),
         )
-        # Keep the newest generations by both count and aggregate logical
-        # bytes.  The new active row is never eligible for pruning.
-        connection.execute(
-            """
-            DELETE FROM inventory_publications
-            WHERE generation IN (
-                SELECT generation FROM inventory_publications
-                WHERE generation != ?
-                ORDER BY generation DESC
-                LIMIT -1 OFFSET ?
-            )
-            """,
-            (validated["generation"], MAX_RETAINED_GENERATIONS - 1),
+        _prune_inventory_generations(
+            connection, active_generation=validated["generation"]
         )
-        while int(
-            connection.execute(
-                "SELECT COALESCE(SUM(logical_bytes), 0) FROM inventory_publications"
-            ).fetchone()[0]
-        ) > MAX_INVENTORY_STORE_LOGICAL_BYTES:
-            removed = connection.execute(
-                "DELETE FROM inventory_publications WHERE generation = ("
-                "SELECT MIN(generation) FROM inventory_publications WHERE generation != ?)",
-                (validated["generation"],),
-            ).rowcount
-            if removed != 1:
-                raise InventoryProjectionError("one inventory generation exceeds the store budget")
         connection.commit()
     except BaseException:
         connection.rollback()
         raise
     finally:
         connection.close()
+
+
+def _prune_inventory_generations(
+    connection: sqlite3.Connection, *, active_generation: int
+) -> None:
+    """Retain the exact active row plus the newest bounded history."""
+
+    connection.execute(
+        """
+        DELETE FROM inventory_publications
+        WHERE generation IN (
+            SELECT generation FROM inventory_publications
+            WHERE generation != ?
+            ORDER BY generation DESC
+            LIMIT -1 OFFSET ?
+        )
+        """,
+        (active_generation, MAX_RETAINED_GENERATIONS - 1),
+    )
+    while int(
+        connection.execute(
+            "SELECT COALESCE(SUM(logical_bytes), 0) FROM inventory_publications"
+        ).fetchone()[0]
+    ) > MAX_INVENTORY_STORE_LOGICAL_BYTES:
+        removed = connection.execute(
+            "DELETE FROM inventory_publications WHERE generation = ("
+            "SELECT MIN(generation) FROM inventory_publications WHERE generation != ?)",
+            (active_generation,),
+        ).rowcount
+        if removed != 1:
+            raise InventoryProjectionError(
+                "one inventory generation exceeds the store budget"
+            )
 
 
 def publish_retained_inventory(
@@ -1076,6 +1086,13 @@ def verify_inventory_store(
         connection.execute(
             "DELETE FROM inventory_publications WHERE state = 'pending' AND generation != ?",
             (public["generation"],),
+        )
+        # Older releases and a crash after pointer recovery could leave more
+        # retained rows than the current bound. Once the exact public active
+        # generation is proven above, pruning only older history is a safe,
+        # idempotent startup repair rather than a reason to brick the observer.
+        _prune_inventory_generations(
+            connection, active_generation=int(public["generation"])
         )
         connection.commit()
     except BaseException:

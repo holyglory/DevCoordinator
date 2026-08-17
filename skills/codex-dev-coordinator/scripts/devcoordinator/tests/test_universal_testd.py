@@ -39,6 +39,7 @@ from devcoordinator.universal_testd import (
     RunnerHandle,
     RunnerObservation,
     TestdEngine,
+    TestdEngineLoop,
     TestdLaunchAdapter,
 )
 from devcoordinator.universal_test_broker import (
@@ -197,6 +198,45 @@ class EngineFixture(unittest.TestCase):
 
 
 class TestdEngineTests(EngineFixture):
+    def test_supervision_failure_never_reaps_but_still_schedules_unrelated_work(self) -> None:
+        submitted = self.submit_live()
+        self.engine.schedule(launch_batch=1)
+        attempt_id = self.launcher.requests[0].ticket.attempt_id
+        self.clock.advance(60)
+        failed_heartbeat = {
+            "running_attempt_ids": [],
+            "completed_attempt_ids": [],
+            "failures": [
+                {
+                    "attempt_id": attempt_id,
+                    "error_type": "BrokerProfileError",
+                    "stage": "authority_release",
+                }
+            ],
+        }
+        loop = TestdEngineLoop(self.engine)
+        with (
+            mock.patch.object(
+                self.engine, "heartbeat", return_value=failed_heartbeat
+            ),
+            mock.patch.object(
+                self.engine,
+                "schedule",
+                return_value={"launched_target_ids": ["target-unrelated"]},
+            ) as schedule,
+            mock.patch.object(self.engine, "reap") as reap,
+        ):
+            result = loop.run_once()
+
+        schedule.assert_called_once_with(launch_batch=64)
+        reap.assert_not_called()
+        self.assertEqual(
+            result["schedule"]["launched_target_ids"], ["target-unrelated"]
+        )
+        self.assertEqual(result["reaped"]["reason"], "heartbeat_failures")
+        self.assertEqual(self.store.get_attempt(attempt_id)["state"], "running")
+        self.assertEqual(self.store.get_run(submitted.run_id)["state"], "running")
+
     def test_reporter_failure_identity_is_scoped_to_one_attempt(self) -> None:
         raw = {
             "chunk_id": "chunk-repeated-failure",
@@ -843,6 +883,51 @@ class TestdEngineTests(EngineFixture):
         self.assertEqual(cancelled["active_attempt_ids"], [])
         self.assertEqual(cancelled["unresolved_attempt_ids"], [])
         self.assertEqual(self.store.get_run(submitted.run_id)["state"], "failed")
+
+    def test_cancel_drains_published_runner_result_before_changing_run_state(self) -> None:
+        submitted = self.submit_live()
+        self.engine.schedule(launch_batch=1)
+        request = self.launcher.requests[0]
+        runtime_id = "runtime-" + request.ticket.attempt_id
+        chunk_id = "chunk-immediately-before-cancel"
+        self.launcher.observations[runtime_id] = [
+            RunnerObservation(
+                "result",
+                result_chunk={
+                    "chunk_id": chunk_id,
+                    "chunk_index": 0,
+                    "cases": [],
+                    "failures": [],
+                    "artifacts": [],
+                    "reporter_complete": True,
+                },
+            ),
+            RunnerObservation(
+                "exited",
+                AttemptExitEnvelope(
+                    envelope_id="exit-immediately-before-cancel-result",
+                    attempt_id=request.ticket.attempt_id,
+                    generation=request.ticket.generation,
+                    operation_id=operation_id(),
+                    conclusion=AttemptConclusion.TEST_FAILED,
+                    duration_seconds=1.0,
+                    result_chunk_ids=(chunk_id,),
+                ),
+            ),
+        ]
+
+        cancelled = self.engine.cancel_run(
+            run_id=submitted.run_id,
+            actor="user@example.com",
+            reason="late cancellation",
+            operation_id=operation_id(),
+        )
+
+        self.assertEqual(cancelled["active_attempt_ids"], [])
+        self.assertEqual(cancelled["cancelled_attempt_ids"], [])
+        self.assertEqual(cancelled["unresolved_attempt_ids"], [])
+        self.assertEqual(self.store.get_run(submitted.run_id)["state"], "failed")
+        self.assertEqual(self.launcher.cancelled, [])
 
     def test_durable_exit_replays_after_testd_crash(self) -> None:
         submitted = self.submit_live()

@@ -430,7 +430,11 @@ def request_for(
         resolved_resource_id = (
             DATABASE_ID
             if operation
-            in {BrokerOperation.DATABASE_BACKUP, BrokerOperation.DATABASE_RESTORE}
+            in {
+                BrokerOperation.DATABASE_BACKUP,
+                BrokerOperation.DATABASE_BACKUP_RETIRE,
+                BrokerOperation.DATABASE_RESTORE,
+            }
             else CONTAINER_ID
         )
     return BrokerRequest.create(
@@ -2595,11 +2599,12 @@ class StoreBackedBrokerTests(unittest.TestCase):
                 ) as store:
                     with store.read_transaction() as connection:
                         running = connection.execute(
-                            "SELECT status FROM operations WHERE operation_id = ?",
+                            "SELECT status, phase FROM operations WHERE operation_id = ?",
                             (first_request.operation_id,),
                         ).fetchone()
                 self.assertIsNotNone(running)
                 self.assertEqual(running["status"], "running")
+                self.assertEqual(running["phase"], "host_backup")
 
                 close_failures: list[BaseException] = []
 
@@ -3352,6 +3357,84 @@ class StoreBackedBrokerTests(unittest.TestCase):
                     "a" * 64,
                     DATABASE_NAME,
                 ),
+            )
+
+    def test_postgres_backup_retirement_is_exact_confirmed_and_replay_safe(self) -> None:
+        with CanonicalTemporaryDirectory() as root:
+            persistence, _unused = seed_store_backed_broker(root)
+            seed_postgres_database(persistence)
+            actions = RecordingPostgresHostActions()
+            service = store_backed_service(persistence, actions)
+            backup_request = request_for(
+                BrokerOperation.DATABASE_BACKUP,
+                arguments={"database_name": DATABASE_NAME},
+            )
+            backup = service.reply_for_document(
+                peer_for(), backup_request.to_wire()
+            )
+            self.assertTrue(backup["ok"], backup)
+            backup_id = str(backup["result"]["database_backup_id"])
+            with CoordinatorStore.open(
+                persistence.database_path, expected_uid=os.geteuid()
+            ) as store:
+                with store.read_transaction() as connection:
+                    row = connection.execute(
+                        """
+                        SELECT artifact_path, manifest_path FROM database_backups
+                        WHERE database_backup_id = ?
+                        """,
+                        (backup_id,),
+                    ).fetchone()
+            artifact = Path(str(row["artifact_path"]))
+            manifest = Path(str(row["manifest_path"]))
+            self.assertTrue(artifact.is_file())
+            self.assertTrue(manifest.is_file())
+            retire_request = request_for(
+                BrokerOperation.DATABASE_BACKUP_RETIRE,
+                arguments={
+                    "database_name": DATABASE_NAME,
+                    "database_backup_id": backup_id,
+                    "confirm_backup_id": backup_id,
+                },
+            )
+
+            retired = service.reply_for_document(
+                peer_for(), retire_request.to_wire()
+            )
+            replay = service.reply_for_document(
+                peer_for(), retire_request.to_wire()
+            )
+
+            self.assertTrue(retired["ok"], retired)
+            self.assertEqual(retired, replay)
+            self.assertEqual(retired["result"]["status"], "retired")
+            self.assertEqual(
+                set(retired["result"]["removed"]), {"artifact", "manifest"}
+            )
+            self.assertFalse(artifact.exists())
+            self.assertFalse(manifest.exists())
+            with CoordinatorStore.open(
+                persistence.database_path, expected_uid=os.geteuid()
+            ) as store:
+                with store.read_transaction() as connection:
+                    status = connection.execute(
+                        "SELECT status FROM database_backups WHERE database_backup_id = ?",
+                        (backup_id,),
+                    ).fetchone()["status"]
+            self.assertEqual(status, "retired")
+
+            with self.assertRaises(BrokerError) as rejected:
+                request_for(
+                    BrokerOperation.DATABASE_BACKUP_RETIRE,
+                    arguments={
+                        "database_name": DATABASE_NAME,
+                        "database_backup_id": backup_id,
+                        "confirm_backup_id": "backup-wrong",
+                    },
+                )
+            self.assertEqual(
+                rejected.exception.code,
+                "database_backup_confirmation_invalid",
             )
 
     def test_postgres_target_mismatches_fail_before_runner(self) -> None:

@@ -308,6 +308,54 @@ class UniversalTestFaultContainmentTests(unittest.TestCase):
             self.assertEqual(state.current_memory_bytes, 96 * 1024 * 1024)
             self.assertTrue(marker.is_file())
 
+    def test_cancellation_force_kills_only_the_exact_still_active_unit(self) -> None:
+        calls: list[list[str]] = []
+        observations = iter(("active", "inactive"))
+
+        def runner(argv, **_kwargs):
+            calls.append(list(argv))
+            if "show" not in argv:
+                return subprocess.CompletedProcess(argv, 0, "", "")
+            active = next(observations)
+            stdout = "\n".join((
+                "LoadState=loaded",
+                f"ActiveState={active}",
+                "SubState=running" if active == "active" else "SubState=dead",
+                "Result=" if active == "active" else "Result=signal",
+                "ExecMainCode=" if active == "active" else "ExecMainCode=2",
+                "ExecMainStatus=" if active == "active" else "ExecMainStatus=9",
+                "OOMKilled=no",
+                "CPUUsageNSec=1000000",
+                "MemoryPeak=1048576",
+                "MemoryCurrent=0",
+            ))
+            return subprocess.CompletedProcess(argv, 0, stdout, "")
+
+        with tempfile.TemporaryDirectory(prefix="test-systemd-force-cancel-") as raw:
+            manager = SystemdTestAttemptManager(
+                attempt_root=Path(raw) / "attempts",
+                runner=runner,
+            )
+            state = manager.cancel("devcoordinator-test-deadbeef")
+
+        self.assertFalse(state.active)
+        self.assertEqual(
+            [call for call in calls if "kill" in call],
+            [[
+                manager.systemctl,
+                "kill",
+                "--kill-whom=all",
+                "--signal=KILL",
+                "devcoordinator-test-deadbeef.service",
+            ]],
+        )
+        self.assertTrue(
+            all(
+                "devcoordinator-test-deadbeef.service" in call
+                for call in calls
+            )
+        )
+
     def test_test_crash_loop_has_no_dependency_path_into_control_plane(self) -> None:
         deploy = self.fault_containment_deploy()
         edge = _directives(deploy / "devcoordinator-edge.service", "Service")

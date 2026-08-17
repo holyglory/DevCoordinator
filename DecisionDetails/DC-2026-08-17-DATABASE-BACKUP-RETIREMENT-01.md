@@ -1,0 +1,7 @@
+# DC-2026-08-17-DATABASE-BACKUP-RETIREMENT-01
+
+The stable database surface supports retirement of one service-owned backup by its current database selector/name, opaque backup ID, and an exact confirmation equal to that ID. The broker derives both file paths from the normalized registry, proves they remain regular fingerprint-matching files below the service-owned backup root, removes only the artifact and manifest, fsyncs their directories, and marks the retained row `retired`. Restore history and the row remain; a retired backup cannot be restored.
+
+Direct filesystem deletion, silent retention forever, generic storage cleanup, and exact broker retirement were considered. Direct deletion bypasses registry identity and replay; permanent retention caused a concrete disk-capacity defect; generic storage cleanup does not understand backup manifests or restore history. Exact confirmed retirement matches the single-developer trust model while preserving the project-database value assumption and preventing stale or path-directed deletion.
+
+Verification covers matching confirmation, database binding/name, artifact and manifest digests, root containment, regular-file identity, partial absence, idempotent operation replay, retained history, restore rejection, and isolation from another backup. The deployed capability is advertised as `database ["backup", "retire"]` and uses no caller-supplied path or command.

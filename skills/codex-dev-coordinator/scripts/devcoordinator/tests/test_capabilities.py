@@ -48,7 +48,7 @@ class CapabilityContractTests(unittest.TestCase):
             ["change", "checkpoint", "handoff", "release", "manual"],
         )
         self.assertIn("queue-status", document["tests"]["actions"])
-        self.assertEqual(document["database"]["actions"], ["backup"])
+        self.assertEqual(document["database"], ["backup", "retire"])
         self.assertEqual(document["compose"]["actions"], ["recreate-service"])
         self.assertEqual(document["ephemeral_image"], ["prefetch", "status"])
         self.assertEqual(

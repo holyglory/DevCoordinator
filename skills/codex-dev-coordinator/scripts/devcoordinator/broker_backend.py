@@ -17,6 +17,7 @@ import os
 from pathlib import Path
 import re
 import sqlite3
+import stat
 import threading
 import time
 from typing import Any, Callable, Mapping, NoReturn, Optional, Protocol
@@ -614,6 +615,98 @@ class StoreBackedMutationBackend:
             expected_uid=persistence.expected_uid,
             busy_timeout_ms=persistence.busy_timeout_ms,
         )
+
+    def _retire_database_backup_files(
+        self, backup: RegisteredDatabaseBackup
+    ) -> dict[str, Any]:
+        """Unlink only the exact registry-bound artifact and manifest."""
+
+        root = self._postgres_backup_root.resolve(strict=True)
+        paths = (
+            (
+                "artifact",
+                Path(backup.artifact_path),
+                backup.artifact_sha256,
+                backup.artifact_size_bytes,
+            ),
+            ("manifest", Path(backup.manifest_path), backup.manifest_sha256, None),
+        )
+        if paths[0][1] == paths[1][1]:
+            raise BrokerBackendError(
+                "database_backup_evidence_invalid",
+                "Registered backup artifact and manifest paths are identical.",
+            )
+        removed: list[str] = []
+        already_absent: list[str] = []
+        reclaimed_bytes = 0
+        directories: set[Path] = set()
+        for label, path, expected_sha256, expected_size in paths:
+            if not path.is_absolute():
+                raise BrokerBackendError(
+                    "database_backup_evidence_invalid",
+                    "Registered backup path is not absolute.",
+                )
+            try:
+                parent = path.parent.resolve(strict=True)
+            except OSError as error:
+                raise BrokerBackendError(
+                    "database_backup_evidence_invalid",
+                    "Registered backup parent is unavailable.",
+                ) from error
+            if parent != root and root not in parent.parents:
+                raise BrokerBackendError(
+                    "database_backup_evidence_invalid",
+                    "Registered backup path escapes the service-owned backup root.",
+                )
+            directories.add(parent)
+            try:
+                metadata = path.lstat()
+            except FileNotFoundError:
+                already_absent.append(label)
+                continue
+            if not stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+                raise BrokerBackendError(
+                    "database_backup_evidence_invalid",
+                    "Registered backup evidence is not a regular file.",
+                )
+            if expected_size is not None and metadata.st_size != expected_size:
+                raise BrokerBackendError(
+                    "database_backup_evidence_changed",
+                    "Registered backup artifact size changed before retirement.",
+                )
+            digest = hashlib.sha256()
+            size = 0
+            with path.open("rb", buffering=0) as stream:
+                while True:
+                    chunk = stream.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    size += len(chunk)
+                    if size > metadata.st_size:
+                        raise BrokerBackendError(
+                            "database_backup_evidence_changed",
+                            "Registered backup evidence grew during retirement.",
+                        )
+                    digest.update(chunk)
+            if size != metadata.st_size or digest.hexdigest() != expected_sha256:
+                raise BrokerBackendError(
+                    "database_backup_evidence_changed",
+                    "Registered backup evidence changed before retirement.",
+                )
+            reclaimed_bytes += int(metadata.st_size)
+            path.unlink()
+            removed.append(label)
+        for directory in directories:
+            descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+        return {
+            "removed": removed,
+            "already_absent": already_absent,
+            "reclaimed_bytes": reclaimed_bytes,
+        }
 
     def _execute_test_admission_admin(
         self, accepted: AcceptedBrokerRequest
@@ -1411,6 +1504,18 @@ class StoreBackedMutationBackend:
                 "test_plan_source_invalid",
             } or snapshot_transport_failure or snapshot_source_failure
             if error.code == "not_found":
+                if request.operation is BrokerOperation.TEST_PLAN_PREVIEW:
+                    public_code = "test_plan_source_invalid"
+                    public_message = (
+                        "Repository source state disappeared during immutable "
+                        "planning; retry after repository writes stop."
+                    )
+                    finish_preview_failure(public_code, public_message)
+                    raise BrokerBackendError(
+                        public_code,
+                        public_message,
+                        operation_id=request.operation_id,
+                    ) from error
                 if resolving_run_id is not None:
                     raise BrokerBackendError(
                         "test_run_not_found",
@@ -2180,6 +2285,7 @@ class StoreBackedMutationBackend:
                 compose_preflight=compose_preflight,
             )
         replay_database_result: Mapping[str, Any] | None = None
+        replay_database_retirement = False
         if disposition.state == "completed":
             return dict(disposition.result or {})
         if disposition.state == "failed":
@@ -2189,6 +2295,9 @@ class StoreBackedMutationBackend:
                 operation_id=request.operation_id,
             )
         if disposition.state == "pending":
+            replay_database_retirement = (
+                request.operation is BrokerOperation.DATABASE_BACKUP_RETIRE
+            )
             if request.operation in {
                 BrokerOperation.DATABASE_BACKUP,
                 BrokerOperation.DATABASE_RESTORE,
@@ -2212,7 +2321,7 @@ class StoreBackedMutationBackend:
                 raise BrokerBackendError(
                     code, message, operation_id=request.operation_id
                 )
-            if replay_database_result is None:
+            if replay_database_result is None and not replay_database_retirement:
                 raise BrokerBackendError(
                     "operation_in_progress",
                     "This durable operation is already running or requires reconciliation; it was not executed again.",
@@ -2641,6 +2750,8 @@ class StoreBackedMutationBackend:
                 BrokerOperation.DATABASE_RESTORE,
             }:
                 target = self._persistence.database_target(accepted)
+                if replay_database_result is None:
+                    self._persistence.mark_database_host_execution(accepted)
                 if request.operation == BrokerOperation.DATABASE_BACKUP:
                     if replay_database_result is None:
                         try:
@@ -2720,6 +2831,21 @@ class StoreBackedMutationBackend:
                             "PostgreSQL restore completed but its durable registry commit failed; service reconciliation is required.",
                             operation_id=request.operation_id,
                         ) from exc
+            elif request.operation is BrokerOperation.DATABASE_BACKUP_RETIRE:
+                target = self._persistence.database_target(accepted)
+                backup = self._persistence.database_backup_for_retirement(
+                    accepted, target
+                )
+                removed = self._retire_database_backup_files(backup)
+                retired = self._persistence.retire_database_backup_result(
+                    accepted, backup
+                )
+                result = {
+                    **retired,
+                    **removed,
+                    "database_name": target.database_name,
+                    "replayed_cleanup": replay_database_retirement,
+                }
             elif request.operation not in _LIFECYCLE_OPERATIONS:
                 # Re-read the current catalog identity, immutable container ID,
                 # and observation revision after reservation and immediately

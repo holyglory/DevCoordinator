@@ -720,6 +720,18 @@ class UniversalTestHarnessTests(unittest.TestCase):
         )
         self.assertIsNone(missing.exception.retry_after_seconds)
 
+        plane.preview_error = TestPlaneTransportError(
+            "not_found", "snapshot source vanished during preview"
+        )
+        preview = self.request(
+            BrokerOperation.TEST_PLAN_PREVIEW, self.preview_arguments("manual")
+        )
+        with self.assertRaises(BrokerBackendError) as vanished:
+            backend.execute(self.persistence.accept(preview.peer, preview.request))
+        self.assertEqual(vanished.exception.code, "test_plan_source_invalid")
+        self.assertIn("writes stop", vanished.exception.message)
+        self.assertNotEqual(vanished.exception.code, "test_scheduler_unavailable")
+
     def test_async_preview_is_exactly_repository_authorized_and_bounded(self) -> None:
         preview = self.request(
             BrokerOperation.TEST_PLAN_PREVIEW, self.preview_arguments("manual")

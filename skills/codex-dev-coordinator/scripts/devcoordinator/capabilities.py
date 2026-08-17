@@ -99,9 +99,7 @@ def broker_capabilities(
             "exact_reclaim_plans": True,
             "durable_confirmation_bound_apply": True,
         },
-        "database": {
-            "actions": ["backup"],
-        },
+        "database": ["backup", "retire"],
         "compose": {
             "actions": ["recreate-service"],
         },

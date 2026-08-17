@@ -699,6 +699,41 @@ class UniversalTestSnapshotTests(unittest.TestCase):
                 self._request(), timeout_seconds=1.0
             )
 
+    def test_materialization_retries_one_complete_before_after_source_change(self) -> None:
+        source = GitSnapshotSource(clone_regular_file=self._emulate_reflink)
+        original_scan = source.scan
+        scans = 0
+
+        def racing_scan(request):
+            nonlocal scans
+            scans += 1
+            if scans == 2:
+                (self.root / "tracked.txt").write_text(
+                    "stable after churn\n", encoding="utf-8"
+                )
+            return original_scan(request)
+
+        source.scan = racing_scan  # type: ignore[method-assign]
+        materializer = FilesystemSnapshotMaterializer(
+            self.store,
+            source=source,
+            allow_unprotected_test_store=True,
+        )
+
+        provenance = materializer.materialize(self._request())
+
+        self.assertEqual(scans, 4)
+        self.assertEqual(
+            (Path(provenance.materialized_root) / "tracked.txt").read_text(
+                encoding="utf-8"
+            ),
+            "stable after churn\n",
+        )
+        self.assertEqual(
+            [path.name for path in self.store.iterdir() if path.name.startswith(".snapshot-")],
+            [],
+        )
+
     def test_prefers_reflink_and_records_exact_materialization_mode(self) -> None:
         calls: list[tuple[int, int]] = []
 
@@ -802,6 +837,12 @@ class UniversalTestSnapshotTests(unittest.TestCase):
         self.assertNotIn(
             "/outside/path",
             public_snapshot_source_diagnostic("unexpected failure at /outside/path"),
+        )
+        self.assertEqual(
+            public_snapshot_source_diagnostic(
+                "snapshot source changed during materialization; retry from a fresh plan"
+            ),
+            "Snapshot source changed during capture; retry after writes stop.",
         )
 
     def test_uid_delegated_copy_never_invokes_git_as_root(self) -> None:

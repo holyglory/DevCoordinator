@@ -138,7 +138,11 @@ _LIFECYCLE_PLAN_OPERATIONS_FOR_PERSISTENCE = frozenset(
     }
 )
 _DATABASE_OPERATIONS = frozenset(
-    {BrokerOperation.DATABASE_BACKUP, BrokerOperation.DATABASE_RESTORE}
+    {
+        BrokerOperation.DATABASE_BACKUP,
+        BrokerOperation.DATABASE_BACKUP_RETIRE,
+        BrokerOperation.DATABASE_RESTORE,
+    }
 )
 _DOCKER_OPERATIONS = frozenset(
     {
@@ -1072,6 +1076,9 @@ class RegisteredDatabaseBackup:
     artifact_path: str
     manifest_path: str
     artifact_sha256: str
+    manifest_sha256: str
+    artifact_size_bytes: int
+    status: str
 
 
 @dataclass(frozen=True)
@@ -6538,6 +6545,9 @@ class BrokerPersistence:
                         artifact_path=str(descriptor["artifact_path"]),
                         manifest_path=str(descriptor["manifest_path"]),
                         artifact_sha256=str(descriptor["artifact_sha256"]),
+                        manifest_sha256=str(descriptor["manifest_sha256"]),
+                        artifact_size_bytes=int(descriptor["artifact_size_bytes"]),
+                        status=str(backup_row["status"]),
                     ),
                     saved_result,
                 )
@@ -7559,6 +7569,52 @@ class BrokerPersistence:
                     control_generation=int(row["control_generation"]),
                 )
 
+    def mark_database_host_execution(
+        self, accepted: AcceptedBrokerRequest
+    ) -> str:
+        """Publish that the exact protected database helper has started."""
+
+        request = accepted.request
+        if request.operation not in _DATABASE_OPERATIONS:
+            raise ValueError("request is not a database operation")
+        phase = (
+            "host_backup"
+            if request.operation is BrokerOperation.DATABASE_BACKUP
+            else "host_restore"
+        )
+        now = utc_timestamp()
+        with self._store() as store:
+            with store.immediate_transaction() as connection:
+                _validate_connection_request(
+                    connection, peer=accepted.peer, request=request
+                )
+                operation = connection.execute(
+                    """
+                    UPDATE operations
+                    SET phase = ?, updated_at = ?, generation = generation + 1
+                    WHERE operation_id = ? AND status = 'running'
+                      AND phase = 'reserved'
+                    """,
+                    (phase, now, request.operation_id),
+                )
+                target = connection.execute(
+                    """
+                    UPDATE operation_targets
+                    SET phase = ?
+                    WHERE operation_id = ? AND ordinal = 0
+                      AND target_kind = 'database' AND status = 'running'
+                      AND phase = 'reserved'
+                    """,
+                    (phase, request.operation_id),
+                )
+                if operation.rowcount != 1 or target.rowcount != 1:
+                    raise BrokerError(
+                        "operation_state_conflict",
+                        "Database operation lost its reserved host-execution fence.",
+                        operation_id=request.operation_id,
+                    )
+        return phase
+
     def save_database_host_result(
         self,
         accepted: AcceptedBrokerRequest,
@@ -7918,7 +7974,7 @@ class BrokerPersistence:
                     """
                     SELECT database_backup_id, database_binding_id,
                            artifact_path, manifest_path, artifact_sha256,
-                           source_container_id, source_database_name,
+                           manifest_sha256, source_container_id, source_database_name,
                            status, verification_status, scope
                     FROM database_backups WHERE database_backup_id = ?
                     """,
@@ -7961,7 +8017,101 @@ class BrokerPersistence:
                     artifact_path=str(descriptor["artifact_path"]),
                     manifest_path=str(descriptor["manifest_path"]),
                     artifact_sha256=str(descriptor["artifact_sha256"]),
+                    manifest_sha256=str(descriptor["manifest_sha256"]),
+                    artifact_size_bytes=int(descriptor["artifact_size_bytes"]),
+                    status=str(row["status"]),
                 )
+
+    def database_backup_for_retirement(
+        self,
+        accepted: AcceptedBrokerRequest,
+        target: DatabaseMutationTarget,
+    ) -> RegisteredDatabaseBackup:
+        """Resolve one exact registered backup without accepting caller paths."""
+
+        request = accepted.request
+        if request.operation is not BrokerOperation.DATABASE_BACKUP_RETIRE:
+            raise ValueError("request is not a database backup retirement")
+        with self._store() as store:
+            with store.read_transaction() as connection:
+                _validate_connection_request(
+                    connection, peer=accepted.peer, request=request
+                )
+                row = connection.execute(
+                    """
+                    SELECT database_backup_id, database_binding_id,
+                           artifact_path, manifest_path, artifact_sha256, manifest_sha256,
+                           artifact_size_bytes, source_container_id,
+                           source_database_name, status
+                    FROM database_backups WHERE database_backup_id = ?
+                    """,
+                    (request.arguments["database_backup_id"],),
+                ).fetchone()
+        if (
+            row is None
+            or row["database_binding_id"] != target.database_binding_id
+            or str(row["source_container_id"]).lower()
+            != target.full_container_id
+            or row["source_database_name"] != target.database_name
+            or row["status"] not in {"available", "missing", "retired"}
+        ):
+            raise BrokerError(
+                "database_backup_unavailable",
+                "The exact registered backup does not belong to the selected database.",
+                operation_id=request.operation_id,
+            )
+        return RegisteredDatabaseBackup(
+            database_backup_id=str(row["database_backup_id"]),
+            database_binding_id=str(row["database_binding_id"]),
+            artifact_path=str(row["artifact_path"]),
+            manifest_path=str(row["manifest_path"]),
+            artifact_sha256=str(row["artifact_sha256"]),
+            manifest_sha256=str(row["manifest_sha256"]),
+            artifact_size_bytes=int(row["artifact_size_bytes"]),
+            status=str(row["status"]),
+        )
+
+    def retire_database_backup_result(
+        self,
+        accepted: AcceptedBrokerRequest,
+        backup: RegisteredDatabaseBackup,
+    ) -> dict[str, Any]:
+        request = accepted.request
+        if request.operation is not BrokerOperation.DATABASE_BACKUP_RETIRE:
+            raise ValueError("request is not a database backup retirement")
+        now = utc_timestamp()
+        with self._store() as store:
+            with store.immediate_transaction() as connection:
+                _validate_connection_request(
+                    connection, peer=accepted.peer, request=request
+                )
+                row = connection.execute(
+                    "SELECT status FROM database_backups WHERE database_backup_id = ?",
+                    (backup.database_backup_id,),
+                ).fetchone()
+                if row is None or row["status"] not in {
+                    "available",
+                    "missing",
+                    "retired",
+                }:
+                    raise BrokerError(
+                        "database_backup_unavailable",
+                        "The exact registered backup is unavailable for retirement.",
+                        operation_id=request.operation_id,
+                    )
+                connection.execute(
+                    """
+                    UPDATE database_backups SET status = 'retired', updated_at = ?
+                    WHERE database_backup_id = ?
+                    """,
+                    (now, backup.database_backup_id),
+                )
+        return {
+            "ok": True,
+            "status": "retired",
+            "database_backup_id": backup.database_backup_id,
+            "database_binding_id": backup.database_binding_id,
+        }
 
     def register_database_backup_result(
         self,

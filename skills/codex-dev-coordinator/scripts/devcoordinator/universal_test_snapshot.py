@@ -439,6 +439,10 @@ def public_snapshot_source_diagnostic(value: object) -> str:
     }
     if message in exact_failures:
         return exact_failures[message]
+    if message == (
+        "snapshot source changed during materialization; retry from a fresh plan"
+    ):
+        return "Snapshot source changed during capture; retry after writes stop."
     if message.startswith("Git snapshot inspection failed:"):
         return "Git metadata inspection failed for the configured repository."
     if message.startswith("gitlink worktree") or message.startswith(
@@ -2318,6 +2322,21 @@ class FilesystemSnapshotMaterializer:
             _SNAPSHOT_DEADLINE.reset(token)
 
     def materialize(self, request: SnapshotMaterializationRequest) -> SnapshotProvenance:
+        """Materialize one stable tree, retrying one complete source-churn pass."""
+
+        for attempt in range(2):
+            try:
+                return self._materialize_once(request)
+            except SnapshotMaterializationError as error:
+                if attempt or str(error) != (
+                    "snapshot source changed during materialization; retry from a fresh plan"
+                ):
+                    raise
+        raise AssertionError("bounded snapshot materialization retry did not terminate")
+
+    def _materialize_once(
+        self, request: SnapshotMaterializationRequest
+    ) -> SnapshotProvenance:
         _check_snapshot_deadline()
         if not isinstance(request, SnapshotMaterializationRequest):
             raise SnapshotMaterializationError("snapshot request must be typed")
