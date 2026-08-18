@@ -677,6 +677,35 @@ class TestPlannerTests(unittest.TestCase):
         self.assertIn("dependent-of:unit", plan.selection["integration"].reasons)
         self.assertFalse(plan.complete_intent_fallback)
 
+    def test_dependency_declaration_order_has_one_canonical_plan_identity(self) -> None:
+        first = valid_manifest()
+        first["targets"]["integration"]["depends_on"] = ["unit", "lint"]  # type: ignore[index]
+        second = copy.deepcopy(first)
+        second["targets"]["integration"]["depends_on"] = ["lint", "unit"]  # type: ignore[index]
+        first_contract = parse_test_manifest(first)
+        second_contract = parse_test_manifest(second)
+
+        first_plan = create_test_plan(
+            first_contract,
+            intent="manual",
+            source=source(SourceMode.IMMUTABLE),
+            requested_targets=("integration",),
+        )
+        second_plan = create_test_plan(
+            second_contract,
+            intent="manual",
+            source=source(SourceMode.IMMUTABLE),
+            requested_targets=("integration",),
+        )
+
+        self.assertEqual(first_contract.fingerprint, second_contract.fingerprint)
+        self.assertEqual(first_plan.to_document(), second_plan.to_document())
+        self.assertEqual(first_plan.dependencies["integration"], ("lint", "unit"))
+        self.assertEqual(
+            decode_test_plan_document(first_plan.to_document()),
+            first_plan,
+        )
+
     def test_unmapped_change_fails_toward_complete_intent(self) -> None:
         plan = create_test_plan(
             self.contract,

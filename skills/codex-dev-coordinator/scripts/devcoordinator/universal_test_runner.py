@@ -623,12 +623,48 @@ def _load(path: Path) -> tuple[TestAttemptDescriptor, Path, Path]:
     return descriptor, output_root, result_path
 
 
+def _publish_capture_progress(
+    destination: Path,
+    *,
+    observed_bytes: int,
+    retained_bytes: int,
+    truncated: bool,
+    last_output_at: float | None,
+) -> None:
+    progress = destination.with_name(destination.name + ".progress.json")
+    temporary = progress.with_name(progress.name + f".{os.getpid()}.tmp")
+    payload = json.dumps(
+        {
+            "schema_version": 1,
+            "observed_bytes": observed_bytes,
+            "retained_bytes": retained_bytes,
+            "truncated": truncated,
+            "last_output_at": last_output_at,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    descriptor = os.open(
+        temporary,
+        os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+    )
+    try:
+        _write_all(descriptor, payload)
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    os.replace(temporary, progress)
+
+
 def _capture(stream, destination: Path, state: dict[str, object]) -> None:
     observed_digest = hashlib.sha256()
     retained_digest = hashlib.sha256()
     retained = 0
     total = 0
     truncated = False
+    last_output_at: float | None = None
+    last_progress_at: float | None = None
     descriptor = os.open(
         destination,
         os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
@@ -643,6 +679,7 @@ def _capture(stream, destination: Path, state: dict[str, object]) -> None:
             if not chunk:
                 break
             total += len(chunk)
+            last_output_at = time.time()
             observed_digest.update(chunk)
             if retained < MAX_CAPTURE_BYTES:
                 keep = chunk[: MAX_CAPTURE_BYTES - retained]
@@ -651,7 +688,24 @@ def _capture(stream, destination: Path, state: dict[str, object]) -> None:
                 retained += len(keep)
             if total > MAX_CAPTURE_BYTES:
                 truncated = True
+            now = time.monotonic()
+            if last_progress_at is None or now - last_progress_at >= 1.0:
+                _publish_capture_progress(
+                    destination,
+                    observed_bytes=total,
+                    retained_bytes=retained,
+                    truncated=truncated,
+                    last_output_at=last_output_at,
+                )
+                last_progress_at = now
         os.fsync(descriptor)
+    _publish_capture_progress(
+        destination,
+        observed_bytes=total,
+        retained_bytes=retained,
+        truncated=truncated,
+        last_output_at=last_output_at,
+    )
     identity = os.fstat(descriptor)
     state.update(
         {
@@ -683,6 +737,7 @@ def _redact_capture_if_needed(path: Path, state: dict[str, object]) -> None:
     os.lseek(descriptor, 0, os.SEEK_SET)
     _write_all(descriptor, replacement)
     os.fsync(descriptor)
+    path.with_name(path.name + ".progress.json").unlink(missing_ok=True)
     state.update(
         {
             "retained_sha256": hashlib.sha256(replacement).hexdigest(),

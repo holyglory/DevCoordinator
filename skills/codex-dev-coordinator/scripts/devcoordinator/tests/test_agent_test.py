@@ -287,6 +287,7 @@ class AgentTestTests(unittest.TestCase):
         status = {
             "run_id": "run-1",
             "state": "running",
+            "sampled_at": 260.0,
             "targets": [
                 {
                     "target_name": f"target-{index}",
@@ -296,6 +297,17 @@ class AgentTestTests(unittest.TestCase):
                         "started_at": 100.0,
                         "heartbeat_at": 200.0 + index,
                         "lease_expires_at": 230.0 + index,
+                        "output_progress": {
+                            "stdout_bytes": 5 * 1024 * 1024 + index,
+                            "stderr_bytes": 128,
+                            "stdout_retained_bytes": 4 * 1024 * 1024,
+                            "stderr_retained_bytes": 128,
+                            "stdout_truncated": True,
+                            "stderr_truncated": False,
+                            "current_memory_bytes": 8 * 1024 * 1024,
+                            "last_output_at": 250.0,
+                            "observed_at": 255.0,
+                        },
                     },
                 }
                 for index in range(6)
@@ -310,6 +322,30 @@ class AgentTestTests(unittest.TestCase):
             result["active_attempts"][0]["attempt_id"], "attempt-0"
         )
         self.assertEqual(result["active_attempts"][0]["heartbeat_at"], 200.0)
+        self.assertEqual(result["active_attempts"][0]["phase"], "executing")
+        self.assertEqual(result["active_attempts"][0]["elapsed_seconds"], 160.0)
+        self.assertEqual(
+            result["active_attempts"][0]["output_progress"]["stdout_bytes"],
+            5 * 1024 * 1024,
+        )
+        self.assertEqual(
+            result["active_attempts"][0]["output_progress"][
+                "stdout_retained_bytes"
+            ],
+            4 * 1024 * 1024,
+        )
+        self.assertTrue(
+            result["active_attempts"][0]["output_progress"][
+                "stdout_truncated"
+            ]
+        )
+        self.assertEqual(
+            result["active_attempts"][0]["output_progress"][
+                "current_memory_bytes"
+            ],
+            8 * 1024 * 1024,
+        )
+        self.assertNotIn("progress\n", json.dumps(result))
         self.assertLessEqual(
             len(json.dumps(result, separators=(",", ":"), sort_keys=True).encode()),
             MAX_TEST_RESULT_BYTES,

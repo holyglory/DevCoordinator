@@ -54,6 +54,7 @@ from devcoordinator.universal_test_store import (
     TestStoreContractError,
     TestStoreNotFound,
     UniversalTestStore,
+    _attempt_progress_document,
     prepare_test_store_schema_v5,
 )
 
@@ -283,6 +284,27 @@ class StoreFixture(unittest.TestCase):
 
 
 class UniversalTestStoreTests(StoreFixture):
+    def test_legacy_attempt_progress_is_readable_after_schema_expansion(self) -> None:
+        legacy = {
+            "stdout_bytes": 4 * 1024 * 1024,
+            "stderr_bytes": 64,
+            "current_memory_bytes": 512 * 1024 * 1024,
+            "last_output_at": 100.0,
+            "observed_at": 101.0,
+        }
+
+        normalized = _attempt_progress_document(legacy)
+
+        self.assertEqual(normalized["stdout_retained_bytes"], 4 * 1024 * 1024)
+        self.assertEqual(normalized["stderr_retained_bytes"], 64)
+        self.assertFalse(normalized["stdout_truncated"])
+        self.assertFalse(normalized["stderr_truncated"])
+        with self.assertRaisesRegex(
+            TestStoreContractError,
+            "retained attempt output progress is invalid",
+        ):
+            _attempt_progress_document({**legacy, "unexpected": True})
+
     def test_queue_status_needs_no_run_handle_and_reports_typed_blockers(self) -> None:
         submitted = self.submit()
 
@@ -813,6 +835,19 @@ class UniversalTestStoreTests(StoreFixture):
             run_id=submitted.run_id, repository_id="repo-tests"
         )
         self.clock.advance(5)
+        self.store.record_attempt_progress(
+            grant.attempt_id,
+            generation=grant.generation,
+            stdout_bytes=5 * 1024 * 1024,
+            stderr_bytes=64,
+            stdout_retained_bytes=4 * 1024 * 1024,
+            stderr_retained_bytes=64,
+            stdout_truncated=True,
+            stderr_truncated=False,
+            current_memory_bytes=8 * 1024 * 1024,
+            last_output_at=self.clock(),
+            observed_at=self.clock(),
+        )
         self.store.heartbeat_attempt(
             grant.attempt_id,
             generation=grant.generation,
@@ -839,6 +874,21 @@ class UniversalTestStoreTests(StoreFixture):
         self.assertGreater(
             after_active["lease_expires_at"], before_active["lease_expires_at"]
         )
+        self.assertEqual(
+            after_active["output_progress"]["stdout_bytes"],
+            5 * 1024 * 1024,
+        )
+        self.assertEqual(
+            after_active["output_progress"]["stdout_retained_bytes"],
+            4 * 1024 * 1024,
+        )
+        self.assertTrue(after_active["output_progress"]["stdout_truncated"])
+        self.assertEqual(after_active["output_progress"]["stderr_bytes"], 64)
+        self.assertEqual(
+            after_active["output_progress"]["current_memory_bytes"],
+            8 * 1024 * 1024,
+        )
+        self.assertGreater(after["sampled_at"], before["sampled_at"])
 
     def test_incomplete_reporting_is_not_published_as_success(self) -> None:
         submitted = self.submit()

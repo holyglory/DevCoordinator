@@ -2330,6 +2330,7 @@ class StoreTestPlaneAdapter:
             self._store.get_run(run_id, repository_id=repository_id)
         )
         metrics = self._store.run_metrics(run_id)
+        document["sampled_at"] = self._store.current_time()
         document["failure_count"] = int(metrics["failure_record_count"])
         document["counts"] = {
             "attempts": int(metrics["attempt_count"]),

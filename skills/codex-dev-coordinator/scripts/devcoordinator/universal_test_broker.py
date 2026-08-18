@@ -77,6 +77,72 @@ def _current_memory_usage(value: object) -> int | None:
     return current_memory_bytes
 
 
+def _output_progress(value: object) -> Mapping[str, object] | None:
+    if value is None:
+        return None
+    if not isinstance(value, Mapping) or set(value) != {
+        "stdout_bytes",
+        "stderr_bytes",
+        "stdout_retained_bytes",
+        "stderr_retained_bytes",
+        "stdout_truncated",
+        "stderr_truncated",
+        "last_output_at",
+        "observed_at",
+    }:
+        raise TestStoreContractError("broker runtime output progress is invalid")
+    stdout_bytes = value["stdout_bytes"]
+    stderr_bytes = value["stderr_bytes"]
+    stdout_retained_bytes = value["stdout_retained_bytes"]
+    stderr_retained_bytes = value["stderr_retained_bytes"]
+    stdout_truncated = value["stdout_truncated"]
+    stderr_truncated = value["stderr_truncated"]
+    last_output_at = value["last_output_at"]
+    observed_at = value["observed_at"]
+    if (
+        type(stdout_bytes) is not int
+        or type(stderr_bytes) is not int
+        or not 0 <= stdout_bytes <= (1 << 63) - 1
+        or not 0 <= stderr_bytes <= (1 << 63) - 1
+        or type(stdout_retained_bytes) is not int
+        or type(stderr_retained_bytes) is not int
+        or not 0 <= stdout_retained_bytes <= 4 * 1024 * 1024
+        or not 0 <= stderr_retained_bytes <= 4 * 1024 * 1024
+        or type(stdout_truncated) is not bool
+        or type(stderr_truncated) is not bool
+        or stdout_retained_bytes > stdout_bytes
+        or stderr_retained_bytes > stderr_bytes
+        or stdout_truncated != (stdout_bytes > stdout_retained_bytes)
+        or stderr_truncated != (stderr_bytes > stderr_retained_bytes)
+        or isinstance(observed_at, bool)
+        or not isinstance(observed_at, (int, float))
+        or not math.isfinite(float(observed_at))
+        or float(observed_at) < 0
+        or (
+            last_output_at is not None
+            and (
+                isinstance(last_output_at, bool)
+                or not isinstance(last_output_at, (int, float))
+                or not math.isfinite(float(last_output_at))
+                or float(last_output_at) < 0
+            )
+        )
+    ):
+        raise TestStoreContractError("broker runtime output progress is invalid")
+    return {
+        "stdout_bytes": stdout_bytes,
+        "stderr_bytes": stderr_bytes,
+        "stdout_retained_bytes": stdout_retained_bytes,
+        "stderr_retained_bytes": stderr_retained_bytes,
+        "stdout_truncated": stdout_truncated,
+        "stderr_truncated": stderr_truncated,
+        "last_output_at": (
+            None if last_output_at is None else float(last_output_at)
+        ),
+        "observed_at": float(observed_at),
+    }
+
+
 @runtime_checkable
 class RepositoryLaunchDescriptorResolver(Protocol):
     """Resolve one selected manifest target through the repository-UID helper."""
@@ -1131,11 +1197,13 @@ class CoordinatorRuntimeRequestSubmitter(RuntimeRequestSubmitter):
             current_memory_bytes = _current_memory_usage(
                 result.get("resource_usage")
             )
+            output_progress = _output_progress(result.get("progress"))
             return {
                 "state": "running",
                 "exit_envelope": None,
                 "result_chunk": None,
                 "current_memory_bytes": current_memory_bytes,
+                "output_progress": output_progress,
                 "launch_confirmed": True,
             }
         if result.get("state") != "exited" or type(result.get("exit_status")) is not int:
@@ -1277,6 +1345,7 @@ class CoordinatorRuntimeRequestSubmitter(RuntimeRequestSubmitter):
             "exit_envelope": envelope.to_document(),
             "result_chunk": chunk,
             "current_memory_bytes": None,
+            "output_progress": None,
             "launch_confirmed": True,
         }
 

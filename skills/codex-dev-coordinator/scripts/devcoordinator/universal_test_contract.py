@@ -865,12 +865,14 @@ def _parse_targets(
                 path=f"{path}.inputs[{index}]",
             )
         dependencies = tuple(
-            _name(item, path=f"{path}.depends_on[{index}]")
-            for index, item in enumerate(
-                _string_list(
-                    definition.get("depends_on", []),
-                    path=f"{path}.depends_on",
-                    allow_empty=True,
+            sorted(
+                _name(item, path=f"{path}.depends_on[{index}]")
+                for index, item in enumerate(
+                    _string_list(
+                        definition.get("depends_on", []),
+                        path=f"{path}.depends_on",
+                        allow_empty=True,
+                    )
                 )
             )
         )

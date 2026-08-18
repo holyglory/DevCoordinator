@@ -435,7 +435,18 @@ class UniversalTestAttemptChainSecurityTests(unittest.TestCase):
         )
         runtime_id = launch["runtime_id"]
         native.states[runtime_id] = replace(
-            native.states[runtime_id], current_memory_bytes=48 * 1024 * 1024
+            native.states[runtime_id],
+            current_memory_bytes=48 * 1024 * 1024,
+            output_progress={
+                "stdout_bytes": 5 * 1024 * 1024,
+                "stderr_bytes": 256,
+                "stdout_retained_bytes": 4 * 1024 * 1024,
+                "stderr_retained_bytes": 256,
+                "stdout_truncated": True,
+                "stderr_truncated": False,
+                "last_output_at": 8.0,
+                "observed_at": 9.0,
+            },
         )
 
         active = coordinator.observe(runtime_id)
@@ -443,6 +454,12 @@ class UniversalTestAttemptChainSecurityTests(unittest.TestCase):
             active["resource_usage"],
             {"current_memory_bytes": 48 * 1024 * 1024},
         )
+        self.assertEqual(active["progress"]["stdout_bytes"], 5 * 1024 * 1024)
+        self.assertEqual(
+            active["progress"]["stdout_retained_bytes"], 4 * 1024 * 1024
+        )
+        self.assertTrue(active["progress"]["stdout_truncated"])
+        self.assertEqual(active["progress"]["stderr_bytes"], 256)
 
         native.finish(
             runtime_id,
@@ -469,6 +486,7 @@ class UniversalTestAttemptChainSecurityTests(unittest.TestCase):
             terminal["resource_usage"],
             {"peak_memory_bytes": 64 * 1024 * 1024, "cpu_seconds": 1.5},
         )
+        self.assertIsNone(terminal["progress"])
 
     def test_atomic_runner_result_terminalizes_and_stops_lingering_native_unit(self) -> None:
         candidate, lease = self._submit_and_lease(

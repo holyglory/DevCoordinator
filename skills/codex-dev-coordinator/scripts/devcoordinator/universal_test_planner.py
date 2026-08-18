@@ -633,7 +633,7 @@ def create_test_plan(
     waves = _dependency_waves(manifest, selected_set) if selected_set else ()
     dependencies = MappingProxyType(
         {
-            name: tuple(manifest.targets[name].depends_on)
+            name: tuple(sorted(manifest.targets[name].depends_on))
             for name in selected
         }
     )

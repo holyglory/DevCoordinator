@@ -709,6 +709,93 @@ def _canonical_json(value: object) -> str:
 _STORED_PLAN_RESOURCES_FIELD = "_coordinator_target_resources"
 
 
+def _attempt_progress_document(value: object) -> dict[str, object]:
+    """Normalize retained progress across the initial and expanded schemas."""
+
+    if not isinstance(value, Mapping):
+        raise TestStoreContractError("retained attempt output progress is invalid")
+    legacy_fields = {
+        "stdout_bytes",
+        "stderr_bytes",
+        "current_memory_bytes",
+        "last_output_at",
+        "observed_at",
+    }
+    current_fields = legacy_fields | {
+        "stdout_retained_bytes",
+        "stderr_retained_bytes",
+        "stdout_truncated",
+        "stderr_truncated",
+    }
+    if set(value) == legacy_fields:
+        stdout_bytes = value["stdout_bytes"]
+        stderr_bytes = value["stderr_bytes"]
+        if type(stdout_bytes) is not int or type(stderr_bytes) is not int:
+            raise TestStoreContractError(
+                "retained attempt output progress is invalid"
+            )
+        normalized = {
+            **dict(value),
+            "stdout_retained_bytes": min(stdout_bytes, 4 * 1024 * 1024),
+            "stderr_retained_bytes": min(stderr_bytes, 4 * 1024 * 1024),
+            # The initial schema measured retained files only, so reaching the
+            # cap did not prove whether additional bytes were observed.
+            "stdout_truncated": False,
+            "stderr_truncated": False,
+        }
+    elif set(value) == current_fields:
+        normalized = dict(value)
+    else:
+        raise TestStoreContractError("retained attempt output progress is invalid")
+    stdout_bytes = normalized["stdout_bytes"]
+    stderr_bytes = normalized["stderr_bytes"]
+    stdout_retained = normalized["stdout_retained_bytes"]
+    stderr_retained = normalized["stderr_retained_bytes"]
+    stdout_truncated = normalized["stdout_truncated"]
+    stderr_truncated = normalized["stderr_truncated"]
+    current_memory = normalized["current_memory_bytes"]
+    last_output_at = normalized["last_output_at"]
+    observed_at = normalized["observed_at"]
+    if (
+        type(stdout_bytes) is not int
+        or type(stderr_bytes) is not int
+        or not 0 <= stdout_bytes <= (1 << 63) - 1
+        or not 0 <= stderr_bytes <= (1 << 63) - 1
+        or type(stdout_retained) is not int
+        or type(stderr_retained) is not int
+        or not 0 <= stdout_retained <= 4 * 1024 * 1024
+        or not 0 <= stderr_retained <= 4 * 1024 * 1024
+        or stdout_retained > stdout_bytes
+        or stderr_retained > stderr_bytes
+        or type(stdout_truncated) is not bool
+        or type(stderr_truncated) is not bool
+        or stdout_truncated != (stdout_bytes > stdout_retained)
+        or stderr_truncated != (stderr_bytes > stderr_retained)
+        or (
+            current_memory is not None
+            and (
+                type(current_memory) is not int
+                or not 0 <= current_memory <= (1 << 63) - 1
+            )
+        )
+        or isinstance(observed_at, bool)
+        or not isinstance(observed_at, (int, float))
+        or not math.isfinite(float(observed_at))
+        or float(observed_at) < 0
+        or (
+            last_output_at is not None
+            and (
+                isinstance(last_output_at, bool)
+                or not isinstance(last_output_at, (int, float))
+                or not math.isfinite(float(last_output_at))
+                or float(last_output_at) < 0
+            )
+        )
+    ):
+        raise TestStoreContractError("retained attempt output progress is invalid")
+    return normalized
+
+
 def _stored_plan_parts(
     plan_json: object,
 ) -> tuple[dict[str, object], Mapping[str, object] | None]:
@@ -2302,6 +2389,129 @@ class UniversalTestStore:
                 created_at=timestamp,
             )
             return result
+
+    def record_attempt_progress(
+        self,
+        attempt_id: str,
+        *,
+        generation: int,
+        stdout_bytes: int,
+        stderr_bytes: int,
+        stdout_retained_bytes: int,
+        stderr_retained_bytes: int,
+        stdout_truncated: bool,
+        stderr_truncated: bool,
+        current_memory_bytes: int | None,
+        last_output_at: float | None,
+        observed_at: float,
+    ) -> dict[str, object]:
+        """Retain bounded output growth without storing captured output content."""
+
+        attempt_id = _safe_id("attempt_id", attempt_id)
+        if (
+            type(stdout_bytes) is not int
+            or type(stderr_bytes) is not int
+            or not 0 <= stdout_bytes <= (1 << 63) - 1
+            or not 0 <= stderr_bytes <= (1 << 63) - 1
+            or type(stdout_retained_bytes) is not int
+            or type(stderr_retained_bytes) is not int
+            or not 0 <= stdout_retained_bytes <= 4 * 1024 * 1024
+            or not 0 <= stderr_retained_bytes <= 4 * 1024 * 1024
+            or type(stdout_truncated) is not bool
+            or type(stderr_truncated) is not bool
+            or stdout_retained_bytes > stdout_bytes
+            or stderr_retained_bytes > stderr_bytes
+            or stdout_truncated != (stdout_bytes > stdout_retained_bytes)
+            or stderr_truncated != (stderr_bytes > stderr_retained_bytes)
+        ):
+            raise TestStoreContractError("attempt output progress bytes are invalid")
+        if current_memory_bytes is not None and (
+            type(current_memory_bytes) is not int
+            or not 0 <= current_memory_bytes <= (1 << 63) - 1
+        ):
+            raise TestStoreContractError("attempt current memory is invalid")
+        observed = _finite_nonnegative("observed_at", observed_at)
+        last_output = (
+            None
+            if last_output_at is None
+            else _finite_nonnegative("last_output_at", last_output_at)
+        )
+        with self._transaction() as connection:
+            attempt = self._attempt(connection, attempt_id)
+            self._require_lease(attempt, generation=generation)
+            latest = connection.execute(
+                """
+                SELECT detail_json FROM test_events
+                WHERE attempt_id = ? AND event_type = 'test.attempt.progress'
+                ORDER BY event_id DESC LIMIT 1
+                """,
+                (attempt_id,),
+            ).fetchone()
+            previous: Mapping[str, object] | None = None
+            if latest is not None:
+                try:
+                    decoded = json.loads(str(latest["detail_json"]))
+                except (TypeError, ValueError, json.JSONDecodeError) as error:
+                    raise TestStoreContractError(
+                        "retained attempt output progress is invalid"
+                    ) from error
+                previous = _attempt_progress_document(decoded)
+            if previous is not None:
+                prior_stdout = previous.get("stdout_bytes")
+                prior_stderr = previous.get("stderr_bytes")
+                prior_memory = previous.get("current_memory_bytes")
+                if (
+                    type(prior_stdout) is not int
+                    or type(prior_stderr) is not int
+                    or stdout_bytes < prior_stdout
+                    or stderr_bytes < prior_stderr
+                    or (
+                        prior_memory is not None
+                        and type(prior_memory) is not int
+                    )
+                ):
+                    raise TestStoreConflict("attempt output progress regressed")
+                if (
+                    stdout_bytes == prior_stdout
+                    and stderr_bytes == prior_stderr
+                    and current_memory_bytes == prior_memory
+                    and stdout_retained_bytes
+                    == previous.get("stdout_retained_bytes")
+                    and stderr_retained_bytes
+                    == previous.get("stderr_retained_bytes")
+                    and stdout_truncated == previous.get("stdout_truncated")
+                    and stderr_truncated == previous.get("stderr_truncated")
+                ):
+                    return dict(previous)
+            detail = {
+                "stdout_bytes": stdout_bytes,
+                "stderr_bytes": stderr_bytes,
+                "stdout_retained_bytes": stdout_retained_bytes,
+                "stderr_retained_bytes": stderr_retained_bytes,
+                "stdout_truncated": stdout_truncated,
+                "stderr_truncated": stderr_truncated,
+                "current_memory_bytes": current_memory_bytes,
+                "last_output_at": last_output,
+                "observed_at": observed,
+            }
+            run = connection.execute(
+                "SELECT repository_id FROM test_runs WHERE run_id = ?",
+                (attempt["run_id"],),
+            ).fetchone()
+            if run is None:
+                raise TestStoreContractError(
+                    "attempt output progress lost its run identity"
+                )
+            self._event(
+                connection,
+                event_type="test.attempt.progress",
+                repository_id=str(run["repository_id"]),
+                run_id=str(attempt["run_id"]),
+                attempt_id=attempt_id,
+                detail=detail,
+                created_at=_now(self._clock),
+            )
+            return detail
 
     def recover_attempt_lease(
         self,
@@ -5090,6 +5300,25 @@ class UniversalTestStore:
                     attempt
                 )
                 attempts_by_id[str(attempt["attempt_id"])] = attempt
+            progress_by_attempt: dict[str, dict[str, object]] = {}
+            for progress_row in connection.execute(
+                """
+                SELECT attempt_id, detail_json FROM test_events
+                WHERE run_id = ? AND event_type = 'test.attempt.progress'
+                ORDER BY event_id
+                """,
+                (run_id,),
+            ).fetchall():
+                progress_attempt_id = str(progress_row["attempt_id"])
+                try:
+                    progress = json.loads(str(progress_row["detail_json"]))
+                except (TypeError, ValueError, json.JSONDecodeError) as error:
+                    raise TestStoreContractError(
+                        "retained attempt output progress is invalid"
+                    ) from error
+                progress_by_attempt[progress_attempt_id] = (
+                    _attempt_progress_document(progress)
+                )
             targets: list[dict[str, object]] = []
             for target_row in connection.execute(
                 """
@@ -5149,6 +5378,9 @@ class UniversalTestStore:
                         "heartbeat_at": float(active_attempt["heartbeat_at"]),
                         "lease_expires_at": float(
                             active_attempt["lease_expires_at"]
+                        ),
+                        "output_progress": progress_by_attempt.get(
+                            str(active_attempt["attempt_id"])
                         ),
                     }
                 )

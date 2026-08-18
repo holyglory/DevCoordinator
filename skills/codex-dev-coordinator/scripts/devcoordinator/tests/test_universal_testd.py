@@ -756,8 +756,30 @@ class TestdEngineTests(EngineFixture):
     def test_heartbeat_and_cancel_use_injected_launcher(self) -> None:
         submitted = self.submit_live()
         self.engine.schedule(launch_batch=1)
+        request = self.launcher.requests[0]
+        runtime_id = "runtime-" + request.ticket.attempt_id
+        self.launcher.observations[runtime_id] = RunnerObservation(
+            "running",
+            output_progress={
+                "stdout_bytes": 4096,
+                "stderr_bytes": 128,
+                "stdout_retained_bytes": 4096,
+                "stderr_retained_bytes": 128,
+                "stdout_truncated": False,
+                "stderr_truncated": False,
+                "last_output_at": self.clock(),
+                "observed_at": self.clock(),
+            },
+        )
         heartbeat = self.engine.heartbeat()
         self.assertEqual(len(heartbeat["running_attempt_ids"]), 1)
+        active = next(
+            target["active_attempt"]
+            for target in self.store.get_run(submitted.run_id)["targets"]
+            if target["active_attempt"] is not None
+        )
+        self.assertEqual(active["output_progress"]["stdout_bytes"], 4096)
+        self.assertEqual(active["output_progress"]["stderr_bytes"], 128)
         cancelled = self.engine.cancel_run(
             run_id=submitted.run_id,
             actor="user@example.com",
@@ -1321,6 +1343,16 @@ class FakeSubmitter:
             "exit_envelope": None,
             "result_chunk": None,
             "current_memory_bytes": 96 * 1024 * 1024,
+            "output_progress": {
+                "stdout_bytes": 4096,
+                "stderr_bytes": 64,
+                "stdout_retained_bytes": 4096,
+                "stderr_retained_bytes": 64,
+                "stdout_truncated": False,
+                "stderr_truncated": False,
+                "last_output_at": 100.0,
+                "observed_at": 101.0,
+            },
         }
 
     def recover(self, runtime_id, *, context):
@@ -1456,6 +1488,8 @@ class TestdLaunchAdapterTests(EngineFixture):
 
         self.assertEqual(observation.state, "running")
         self.assertEqual(observation.current_memory_bytes, 96 * 1024 * 1024)
+        self.assertEqual(observation.output_progress["stdout_bytes"], 4096)
+        self.assertEqual(observation.output_progress["stderr_bytes"], 64)
 
 
 class UnixTransportTests(unittest.TestCase):

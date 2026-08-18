@@ -19,6 +19,7 @@ from unittest import mock
 
 from devcoordinator.universal_test_runner import (
     DotnetProbeResult,
+    _capture,
     _dotnet_readiness,
     _dotnet_restore_project,
     _dotnet_restore_semantic_options,
@@ -430,6 +431,29 @@ class UniversalTestRunnerTests(unittest.TestCase):
         with self.assertRaisesRegex(TestStoreConflict, "identity"):
             second_manager._collect_result_artifacts(runtime_id, escaped)
 
+    def test_capture_progress_advances_after_retained_artifact_cap(self) -> None:
+        destination = self.output / "bounded.log"
+        state: dict[str, object] = {}
+        payload = b"x" * 192
+
+        with mock.patch(
+            "devcoordinator.universal_test_runner.MAX_CAPTURE_BYTES", 64
+        ):
+            _capture(io.BytesIO(payload), destination, state)
+
+        progress = json.loads(
+            destination.with_name(destination.name + ".progress.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(destination.stat().st_size, 64)
+        self.assertEqual(progress["observed_bytes"], len(payload))
+        self.assertEqual(progress["retained_bytes"], 64)
+        self.assertTrue(progress["truncated"])
+        self.assertIsInstance(progress["last_output_at"], float)
+        self.assertEqual(state["observed_bytes"], len(payload))
+        self.assertTrue(state["truncated"])
+
     def test_failed_automation_links_declared_directory_text_diagnostic(self) -> None:
         descriptor = replace(
             self.descriptor(
@@ -730,6 +754,69 @@ class UniversalTestRunnerTests(unittest.TestCase):
         self.assertTrue(observed.active)
         self.assertEqual(observed.result_document, expected)
         self.assertEqual(observed.current_memory_bytes, 1024 * 1024)
+
+    def test_active_unit_exposes_bounded_output_growth_without_content(self) -> None:
+        descriptor = self.descriptor(("/usr/bin/python3", "-c", "pass"))
+        runtime_id = "devcoordinator-test-active-progress"
+        attempt_root = Path(self.temporary.name) / "active-progress-attempts"
+        state_root = attempt_root / runtime_id
+        output = state_root / "output"
+        output.mkdir(parents=True)
+        (state_root / "launch.json").write_text(
+            json.dumps({"descriptor": descriptor.to_document()}),
+            encoding="utf-8",
+        )
+        (output / f"{descriptor.attempt_id}-stdout.log").write_bytes(b"progress\n")
+        (output / f"{descriptor.attempt_id}-stderr.log").write_bytes(b"warn\n")
+
+        def active(_argv, **_kwargs):
+            stdout = "\n".join((
+                "LoadState=loaded",
+                "ActiveState=active",
+                "SubState=running",
+                "Result=",
+                "ExecMainCode=0",
+                "ExecMainStatus=0",
+                "OOMKilled=no",
+                "CPUUsageNSec=1000000",
+                "MemoryPeak=1048576",
+                "MemoryCurrent=524288",
+            ))
+            return subprocess.CompletedProcess(_argv, 0, stdout, "")
+
+        manager = SystemdTestAttemptManager(
+            attempt_root=attempt_root,
+            artifact_root=Path(self.temporary.name) / "active-progress-artifacts",
+            runner=active,
+        )
+
+        observed = manager.status(runtime_id)
+
+        self.assertEqual(observed.output_progress["stdout_bytes"], 9)
+        self.assertEqual(observed.output_progress["stderr_bytes"], 5)
+        self.assertEqual(observed.output_progress["stdout_retained_bytes"], 9)
+        self.assertFalse(observed.output_progress["stdout_truncated"])
+        self.assertNotIn("progress", json.dumps(observed.output_progress))
+
+        stdout_progress = output / (
+            f"{descriptor.attempt_id}-stdout.log.progress.json"
+        )
+        stdout_progress.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "observed_bytes": 5 * 1024 * 1024,
+                    "retained_bytes": 9,
+                    "truncated": True,
+                    "last_output_at": time.time(),
+                }
+            ),
+            encoding="utf-8",
+        )
+        capped = manager.status(runtime_id)
+        self.assertEqual(capped.output_progress["stdout_bytes"], 5 * 1024 * 1024)
+        self.assertEqual(capped.output_progress["stdout_retained_bytes"], 9)
+        self.assertTrue(capped.output_progress["stdout_truncated"])
 
     def test_source_toolchain_and_fixture_provenance_are_exact_and_nonsecret(self) -> None:
         credentials = Path(self.temporary.name) / "credentials"
@@ -2326,6 +2413,12 @@ class UniversalTestRunnerTests(unittest.TestCase):
         self.assertNotIn(secret, payload)
         self.assertNotIn(secret, capture)
         self.assertIn("redacted", capture)
+        self.assertFalse(
+            (
+                self.output
+                / f"{descriptor.attempt_id}-stdout.log.progress.json"
+            ).exists()
+        )
         result = json.loads(payload)
         self.assertTrue(result["captures"]["stdout"]["secret_redacted"])
         self.assertTrue(result["incomplete_reporting"])

@@ -482,6 +482,7 @@ def project_test_follow(
                 "attempt_id": bounded_text(attempt_id, maximum_bytes=128),
                 "target": bounded_text(target_name, maximum_bytes=128),
                 "state": bounded_text(attempt_state, maximum_bytes=64),
+                "phase": "executing",
             }
             for key in ("started_at", "heartbeat_at", "lease_expires_at"):
                 value = raw_attempt.get(key)
@@ -492,6 +493,68 @@ def project_test_follow(
                     and float(value) >= 0
                 ):
                     active[key] = float(value)
+            sampled_at = status.get("sampled_at")
+            started_at = raw_attempt.get("started_at")
+            if (
+                not isinstance(sampled_at, bool)
+                and isinstance(sampled_at, (int, float))
+                and not isinstance(started_at, bool)
+                and isinstance(started_at, (int, float))
+            ):
+                active["elapsed_seconds"] = max(
+                    0.0, float(sampled_at) - float(started_at)
+                )
+            raw_progress = raw_attempt.get("output_progress")
+            if isinstance(raw_progress, Mapping):
+                stdout_bytes = raw_progress.get("stdout_bytes")
+                stderr_bytes = raw_progress.get("stderr_bytes")
+                stdout_retained_bytes = raw_progress.get(
+                    "stdout_retained_bytes"
+                )
+                stderr_retained_bytes = raw_progress.get(
+                    "stderr_retained_bytes"
+                )
+                stdout_truncated = raw_progress.get("stdout_truncated")
+                stderr_truncated = raw_progress.get("stderr_truncated")
+                current_memory_bytes = raw_progress.get("current_memory_bytes")
+                observed_at = raw_progress.get("observed_at")
+                last_output_at = raw_progress.get("last_output_at")
+                if (
+                    type(stdout_bytes) is int
+                    and type(stderr_bytes) is int
+                    and type(stdout_retained_bytes) is int
+                    and type(stderr_retained_bytes) is int
+                    and type(stdout_truncated) is bool
+                    and type(stderr_truncated) is bool
+                    and (
+                        current_memory_bytes is None
+                        or type(current_memory_bytes) is int
+                    )
+                    and not isinstance(observed_at, bool)
+                    and isinstance(observed_at, (int, float))
+                    and (
+                        last_output_at is None
+                        or (
+                            not isinstance(last_output_at, bool)
+                            and isinstance(last_output_at, (int, float))
+                        )
+                    )
+                ):
+                    active["output_progress"] = {
+                        "stdout_bytes": stdout_bytes,
+                        "stderr_bytes": stderr_bytes,
+                        "stdout_retained_bytes": stdout_retained_bytes,
+                        "stderr_retained_bytes": stderr_retained_bytes,
+                        "stdout_truncated": stdout_truncated,
+                        "stderr_truncated": stderr_truncated,
+                        "current_memory_bytes": current_memory_bytes,
+                        "last_output_at": (
+                            None
+                            if last_output_at is None
+                            else float(last_output_at)
+                        ),
+                        "observed_at": float(observed_at),
+                    }
             active_attempts.append(active)
     document: dict[str, Any] = {
         "schema_version": 1,

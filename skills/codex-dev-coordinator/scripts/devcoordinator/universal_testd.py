@@ -389,6 +389,7 @@ class RunnerObservation:
     exit_envelope: AttemptExitEnvelope | None = None
     result_chunk: Mapping[str, object] | None = None
     current_memory_bytes: int | None = None
+    output_progress: Mapping[str, object] | None = None
     launch_confirmed: bool = True
 
 
@@ -563,6 +564,8 @@ class TestdLaunchAdapter:
         if not isinstance(reply, Mapping) or set(reply) not in {
             frozenset(base_fields),
             frozenset(base_fields | {"launch_confirmed"}),
+            frozenset(base_fields | {"output_progress"}),
+            frozenset(base_fields | {"launch_confirmed", "output_progress"}),
         }:
             raise TestStoreContractError("runtime observation fields are invalid")
         state = str(reply["state"])
@@ -574,6 +577,69 @@ class TestdLaunchAdapter:
             type(current_memory_bytes) is not int or current_memory_bytes < 0
         ):
             raise TestStoreContractError("runtime current memory is invalid")
+        output_progress = reply.get("output_progress")
+        if output_progress is not None:
+            if not isinstance(output_progress, Mapping) or set(output_progress) != {
+                "stdout_bytes",
+                "stderr_bytes",
+                "stdout_retained_bytes",
+                "stderr_retained_bytes",
+                "stdout_truncated",
+                "stderr_truncated",
+                "last_output_at",
+                "observed_at",
+            }:
+                raise TestStoreContractError("runtime output progress is invalid")
+            stdout_bytes = output_progress["stdout_bytes"]
+            stderr_bytes = output_progress["stderr_bytes"]
+            stdout_retained_bytes = output_progress["stdout_retained_bytes"]
+            stderr_retained_bytes = output_progress["stderr_retained_bytes"]
+            stdout_truncated = output_progress["stdout_truncated"]
+            stderr_truncated = output_progress["stderr_truncated"]
+            last_output_at = output_progress["last_output_at"]
+            observed_at = output_progress["observed_at"]
+            if (
+                type(stdout_bytes) is not int
+                or type(stderr_bytes) is not int
+                or not 0 <= stdout_bytes <= (1 << 63) - 1
+                or not 0 <= stderr_bytes <= (1 << 63) - 1
+                or type(stdout_retained_bytes) is not int
+                or type(stderr_retained_bytes) is not int
+                or not 0 <= stdout_retained_bytes <= 4 * 1024 * 1024
+                or not 0 <= stderr_retained_bytes <= 4 * 1024 * 1024
+                or type(stdout_truncated) is not bool
+                or type(stderr_truncated) is not bool
+                or stdout_retained_bytes > stdout_bytes
+                or stderr_retained_bytes > stderr_bytes
+                or stdout_truncated != (stdout_bytes > stdout_retained_bytes)
+                or stderr_truncated != (stderr_bytes > stderr_retained_bytes)
+                or isinstance(observed_at, bool)
+                or not isinstance(observed_at, (int, float))
+                or not math.isfinite(float(observed_at))
+                or float(observed_at) < 0
+                or (
+                    last_output_at is not None
+                    and (
+                        isinstance(last_output_at, bool)
+                        or not isinstance(last_output_at, (int, float))
+                        or not math.isfinite(float(last_output_at))
+                        or float(last_output_at) < 0
+                    )
+                )
+            ):
+                raise TestStoreContractError("runtime output progress is invalid")
+            output_progress = {
+                "stdout_bytes": stdout_bytes,
+                "stderr_bytes": stderr_bytes,
+                "stdout_retained_bytes": stdout_retained_bytes,
+                "stderr_retained_bytes": stderr_retained_bytes,
+                "stdout_truncated": stdout_truncated,
+                "stderr_truncated": stderr_truncated,
+                "last_output_at": (
+                    None if last_output_at is None else float(last_output_at)
+                ),
+                "observed_at": float(observed_at),
+            }
         if (
             state == "running"
             and reply["exit_envelope"] is None
@@ -582,6 +648,7 @@ class TestdLaunchAdapter:
             return RunnerObservation(
                 state="running",
                 current_memory_bytes=current_memory_bytes,
+                output_progress=output_progress,
                 launch_confirmed=launch_confirmed,
             )
         if (
@@ -1547,6 +1614,40 @@ class TestdEngine:
                 if observation.state == "running":
                     active.current_memory_bytes = observation.current_memory_bytes
                     active.runtime_active = True
+                    if observation.output_progress is not None:
+                        self.store.record_attempt_progress(
+                            attempt_id,
+                            generation=active.lease.generation,
+                            stdout_bytes=int(
+                                observation.output_progress["stdout_bytes"]
+                            ),
+                            stderr_bytes=int(
+                                observation.output_progress["stderr_bytes"]
+                            ),
+                            stdout_retained_bytes=int(
+                                observation.output_progress[
+                                    "stdout_retained_bytes"
+                                ]
+                            ),
+                            stderr_retained_bytes=int(
+                                observation.output_progress[
+                                    "stderr_retained_bytes"
+                                ]
+                            ),
+                            stdout_truncated=bool(
+                                observation.output_progress["stdout_truncated"]
+                            ),
+                            stderr_truncated=bool(
+                                observation.output_progress["stderr_truncated"]
+                            ),
+                            current_memory_bytes=observation.current_memory_bytes,
+                            last_output_at=observation.output_progress[
+                                "last_output_at"
+                            ],  # type: ignore[arg-type]
+                            observed_at=float(
+                                observation.output_progress["observed_at"]
+                            ),
+                        )
                     self.store.heartbeat_attempt(
                         attempt_id,
                         generation=active.lease.generation,

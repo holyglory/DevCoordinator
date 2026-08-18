@@ -167,6 +167,74 @@ def _validated_cpu_seconds(value: object) -> float | None:
     return float(value)
 
 
+def _validated_output_progress(
+    value: object,
+) -> Mapping[str, object] | None:
+    if value is None:
+        return None
+    if not isinstance(value, Mapping) or set(value) != {
+        "stdout_bytes",
+        "stderr_bytes",
+        "stdout_retained_bytes",
+        "stderr_retained_bytes",
+        "stdout_truncated",
+        "stderr_truncated",
+        "last_output_at",
+        "observed_at",
+    }:
+        raise TestStoreContractError("test output progress fields are invalid")
+    stdout_bytes = value["stdout_bytes"]
+    stderr_bytes = value["stderr_bytes"]
+    stdout_retained_bytes = value["stdout_retained_bytes"]
+    stderr_retained_bytes = value["stderr_retained_bytes"]
+    stdout_truncated = value["stdout_truncated"]
+    stderr_truncated = value["stderr_truncated"]
+    last_output_at = value["last_output_at"]
+    observed_at = value["observed_at"]
+    if (
+        type(stdout_bytes) is not int
+        or type(stderr_bytes) is not int
+        or not 0 <= stdout_bytes <= (1 << 63) - 1
+        or not 0 <= stderr_bytes <= (1 << 63) - 1
+        or type(stdout_retained_bytes) is not int
+        or type(stderr_retained_bytes) is not int
+        or not 0 <= stdout_retained_bytes <= 4 * 1024 * 1024
+        or not 0 <= stderr_retained_bytes <= 4 * 1024 * 1024
+        or type(stdout_truncated) is not bool
+        or type(stderr_truncated) is not bool
+        or stdout_retained_bytes > stdout_bytes
+        or stderr_retained_bytes > stderr_bytes
+        or stdout_truncated != (stdout_bytes > stdout_retained_bytes)
+        or stderr_truncated != (stderr_bytes > stderr_retained_bytes)
+        or isinstance(observed_at, bool)
+        or not isinstance(observed_at, (int, float))
+        or not math.isfinite(float(observed_at))
+        or float(observed_at) < 0
+        or (
+            last_output_at is not None
+            and (
+                isinstance(last_output_at, bool)
+                or not isinstance(last_output_at, (int, float))
+                or not math.isfinite(float(last_output_at))
+                or float(last_output_at) < 0
+            )
+        )
+    ):
+        raise TestStoreContractError("test output progress is invalid")
+    return {
+        "stdout_bytes": stdout_bytes,
+        "stderr_bytes": stderr_bytes,
+        "stdout_retained_bytes": stdout_retained_bytes,
+        "stderr_retained_bytes": stderr_retained_bytes,
+        "stdout_truncated": stdout_truncated,
+        "stderr_truncated": stderr_truncated,
+        "last_output_at": (
+            None if last_output_at is None else float(last_output_at)
+        ),
+        "observed_at": float(observed_at),
+    }
+
+
 def _systemd_counter(value: str | None, *, field: str) -> int | None:
     if value in {None, "", "[not set]", "n/a", "infinity"}:
         return None
@@ -1316,6 +1384,7 @@ class NativeTestAttemptState:
     peak_memory_bytes: int | None = None
     cpu_seconds: float | None = None
     current_memory_bytes: int | None = None
+    output_progress: Mapping[str, object] | None = None
 
 
 @runtime_checkable
@@ -2802,6 +2871,130 @@ class SystemdTestAttemptManager:
             raise TestStoreConflict("test runner result evidence is invalid")
         return dict(value)
 
+    def _runner_output_progress(
+        self, runtime_id: str
+    ) -> Mapping[str, object] | None:
+        """Observe bounded capture growth without reading repository output text."""
+
+        launch_path = self.attempt_root / runtime_id / "launch.json"
+        try:
+            launch_metadata = launch_path.lstat()
+        except FileNotFoundError:
+            return None
+        except OSError as error:
+            raise TestStoreConflict("test runner launch evidence is invalid") from error
+        try:
+            if (
+                not stat.S_ISREG(launch_metadata.st_mode)
+                or stat.S_ISLNK(launch_metadata.st_mode)
+                or launch_metadata.st_size > 256 * 1024
+            ):
+                raise ValueError("unsafe launch evidence")
+            launch = json.loads(launch_path.read_bytes())
+            if not isinstance(launch, Mapping):
+                raise ValueError("invalid launch evidence")
+            descriptor = TestAttemptDescriptor.from_document(launch["descriptor"])
+        except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+            raise TestStoreConflict("test runner launch evidence is invalid") from error
+        output = self.attempt_root / runtime_id / "output"
+        progress: dict[str, object] = {}
+        latest_output_at: float | None = None
+        for stream in ("stdout", "stderr"):
+            path = output / f"{descriptor.attempt_id}-{stream}.log"
+            try:
+                metadata = path.lstat()
+            except FileNotFoundError:
+                retained_bytes = 0
+                capture_mtime = None
+            except OSError as error:
+                raise TestStoreConflict(
+                    "test runner output progress is unavailable"
+                ) from error
+            else:
+                if (
+                    not stat.S_ISREG(metadata.st_mode)
+                    or stat.S_ISLNK(metadata.st_mode)
+                    or metadata.st_size < 0
+                    or metadata.st_size > 4 * 1024 * 1024
+                ):
+                    raise TestStoreConflict("test runner output progress is unsafe")
+                retained_bytes = int(metadata.st_size)
+                capture_mtime = float(metadata.st_mtime)
+            progress_path = path.with_name(path.name + ".progress.json")
+            try:
+                progress_metadata = progress_path.lstat()
+            except FileNotFoundError:
+                observed_bytes = retained_bytes
+                truncated = False
+                stream_last_output_at = (
+                    capture_mtime if retained_bytes else None
+                )
+            except OSError as error:
+                raise TestStoreConflict(
+                    "test runner output progress is unavailable"
+                ) from error
+            else:
+                if (
+                    not stat.S_ISREG(progress_metadata.st_mode)
+                    or stat.S_ISLNK(progress_metadata.st_mode)
+                    or not 1 <= progress_metadata.st_size <= 4_096
+                ):
+                    raise TestStoreConflict("test runner output progress is unsafe")
+                try:
+                    raw_progress = json.loads(progress_path.read_bytes())
+                except (OSError, ValueError, json.JSONDecodeError) as error:
+                    raise TestStoreConflict(
+                        "test runner output progress is invalid"
+                    ) from error
+                if not isinstance(raw_progress, Mapping) or set(raw_progress) != {
+                    "schema_version",
+                    "observed_bytes",
+                    "retained_bytes",
+                    "truncated",
+                    "last_output_at",
+                }:
+                    raise TestStoreConflict("test runner output progress is invalid")
+                observed_bytes = raw_progress["observed_bytes"]
+                published_retained = raw_progress["retained_bytes"]
+                truncated = raw_progress["truncated"]
+                stream_last_output_at = raw_progress["last_output_at"]
+                if (
+                    raw_progress["schema_version"] != 1
+                    or type(observed_bytes) is not int
+                    or not 0 <= observed_bytes <= (1 << 63) - 1
+                    or type(published_retained) is not int
+                    or published_retained != retained_bytes
+                    or type(truncated) is not bool
+                    or truncated != (observed_bytes > retained_bytes)
+                    or (
+                        stream_last_output_at is None
+                        and observed_bytes > 0
+                    )
+                    or (
+                        stream_last_output_at is not None
+                        and (
+                            isinstance(stream_last_output_at, bool)
+                            or not isinstance(stream_last_output_at, (int, float))
+                            or not math.isfinite(float(stream_last_output_at))
+                            or float(stream_last_output_at) < 0
+                        )
+                    )
+                ):
+                    raise TestStoreConflict("test runner output progress is invalid")
+            progress[f"{stream}_bytes"] = observed_bytes
+            progress[f"{stream}_retained_bytes"] = retained_bytes
+            progress[f"{stream}_truncated"] = truncated
+            if stream_last_output_at is not None:
+                latest_output_at = max(
+                    latest_output_at or float(stream_last_output_at),
+                    float(stream_last_output_at),
+                )
+        return {
+            **progress,
+            "last_output_at": latest_output_at,
+            "observed_at": float(self.clock()),
+        }
+
     def read_result_chunk(
         self, runtime_id: str, chunk_index: int
     ) -> Mapping[str, object] | None:
@@ -3929,6 +4122,7 @@ class SystemdTestAttemptManager:
             else:
                 termination_reason = "systemd_failure"
         started = self._started.get(runtime_id)
+        output_progress = self._runner_output_progress(runtime_id) if active else None
         result_document = self._read_runner_result(runtime_id) if active else None
         if not active:
             try:
@@ -3966,6 +4160,7 @@ class SystemdTestAttemptManager:
             peak_memory_bytes=peak_memory_bytes,
             cpu_seconds=cpu_seconds,
             current_memory_bytes=(current_memory_bytes if active else None),
+            output_progress=output_progress,
         )
 
     def cancel(self, runtime_id: str) -> NativeTestAttemptState:
@@ -4390,6 +4585,11 @@ class BrokerTestAttemptCoordinator:
             # Stop only this deterministic runtime; do not renew its lease.
             self.manager.cancel(runtime_id)
         effective_active = state.active and not terminal_from_result
+        output_progress = (
+            _validated_output_progress(state.output_progress)
+            if effective_active
+            else None
+        )
         if terminal_from_result:
             runner_peak_memory, runner_cpu_seconds = _runner_resource_usage(result)
             if peak_memory_bytes is None and runner_peak_memory is not None:
@@ -4457,6 +4657,7 @@ class BrokerTestAttemptCoordinator:
                     "cpu_seconds": cpu_seconds,
                 }
             ),
+            "progress": output_progress,
         }
 
     def cancel(
