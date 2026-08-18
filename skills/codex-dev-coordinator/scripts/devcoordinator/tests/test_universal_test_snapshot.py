@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from dataclasses import asdict
 import errno
 import json
@@ -427,16 +428,40 @@ class UniversalTestSnapshotTests(unittest.TestCase):
                 "content_fingerprint": source.content_fingerprint,
             },
         }
+        legacy_path = service._catalog_path(source.snapshot_id, original.plan_id)
+        legacy_path.write_text(
+            json.dumps(
+                original_catalog,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+            encoding="utf-8",
+        )
+        second_account_catalog = copy.deepcopy(original_catalog)
+        second_account_catalog["owner_uid"] = os.geteuid() + 1
         service._publish_catalog(
             plan_id=original.plan_id,
             snapshot_id=source.snapshot_id,
-            value=original_catalog,
+            value=second_account_catalog,
         )
+        owner_neutral = service._load_catalog(original.to_document())
+        self.assertNotIn("owner_uid", owner_neutral)
+        conflicting_catalog = copy.deepcopy(second_account_catalog)
+        conflicting_catalog["launch_catalog"]["tests"]["argv"] = [
+            "./scripts/different-test"
+        ]
+        with self.assertRaisesRegex(TestStoreContractError, "identity collided"):
+            service._publish_catalog(
+                plan_id=original.plan_id,
+                snapshot_id=source.snapshot_id,
+                value=conflicting_catalog,
+            )
 
         derived = service._load_catalog(retry_document)
         replay = service._load_catalog(retry_document)
 
         self.assertEqual(derived, replay)
+        self.assertNotIn("owner_uid", derived)
         self.assertEqual(derived["plan"], retry_document)
         self.assertEqual(set(derived["launch_catalog"]), {"tests"})
         self.assertEqual(set(derived["target_resources"]), {"tests"})

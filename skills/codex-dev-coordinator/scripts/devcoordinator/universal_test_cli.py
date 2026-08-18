@@ -82,6 +82,19 @@ _OPAQUE_ID_CHARS = frozenset(
 class UniversalTestCliError(ValueError):
     """One local CLI request cannot be represented safely."""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str = "test_request_invalid",
+        classification: str = "invalid_request",
+        action_required: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.classification = classification
+        self.action_required = action_required
+
 
 def _encoded_size(value: Mapping[str, object]) -> int:
     return len(
@@ -283,7 +296,7 @@ def add_universal_test_cli_parser(subparsers: Any) -> argparse.ArgumentParser:
         default=[],
         metavar="STATUS:PATH",
         help=(
-            "override Git discovery; repeat modified:path, added:path, deleted:path, "
+            "declare the exact current Git changes; repeat modified:path, added:path, deleted:path, "
             "untracked:path, or renamed:old-path:new-path"
         ),
     )
@@ -1204,9 +1217,10 @@ def build_local_plan(
         raise UniversalTestCliError(
             "explicit test targets are supported only for manual intent"
         )
-    # Explicit --change values intentionally keep their documented local
-    # override semantics because the broker preview contract owns Git
-    # discovery and does not accept caller-supplied paths.
+    # Broker preview owns Git discovery and accepts no caller-supplied paths.
+    # The legacy explicit surface remains local, but it must describe the exact
+    # current change set so selection can never omit dirty source that is still
+    # included in the live content fingerprint.
     broker_preview = None
     if not raw_changes:
         broker_preview = _broker_plan_preview(
@@ -1256,11 +1270,34 @@ def build_local_plan(
         raise TestPlanError(f"manifest does not declare intent {intent!r}")
     if intent_contract.source_mode is SourceMode.IMMUTABLE:
         raise TestPlanError("immutable intents must use broker snapshot preview")
-    changes = (
-        tuple(_parse_explicit_change(item) for item in raw_changes)
-        if raw_changes
-        else discover_changes(effective)
-    )
+    discovered_changes = discover_changes(effective)
+    if raw_changes:
+        changes = tuple(_parse_explicit_change(item) for item in raw_changes)
+        explicit_keys = tuple(
+            sorted(
+                (item.path, item.status.value, item.previous_path or "")
+                for item in changes
+            )
+        )
+        discovered_keys = tuple(
+            sorted(
+                (item.path, item.status.value, item.previous_path or "")
+                for item in discovered_changes
+            )
+        )
+        if explicit_keys != discovered_keys:
+            raise UniversalTestCliError(
+                "explicit changes must exactly match current Git changes; "
+                "omit --change to use protected discovery",
+                code="test_plan_changes_mismatch",
+                classification="repository_source_invalid",
+                action_required=(
+                    "Omit --change and rerun planning so protected Git discovery "
+                    "selects the complete current source."
+                ),
+            )
+    else:
+        changes = discovered_changes
     repository_id, configured = _repository_id(root, broker_profile)
     content_fingerprint = _live_source_fingerprint(
         effective,

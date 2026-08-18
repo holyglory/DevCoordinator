@@ -287,6 +287,18 @@ class AgentCliTests(unittest.TestCase):
 
         self.assertTrue(result["ok"])
         self.assertEqual(result["operation_id"], operation_id)
+        profile.ensure_repository_with_outcome.assert_called_once_with(
+            canonical_root="/repo",
+            project_kind="primary",
+            agent="codex:thread",
+            operation_id=str(
+                uuid.uuid5(
+                    uuid.UUID(operation_id),
+                    "repository.catalog:/repo",
+                )
+            ),
+            reconcile_scope="test",
+        )
         repository.ephemeral_image_prefetch_template_id.assert_called_once_with(
             "postgres"
         )
@@ -963,6 +975,55 @@ class AgentCliTests(unittest.TestCase):
         )
         self.assertEqual(str(__import__("uuid").UUID(namespace.operation_id)), namespace.operation_id)
 
+    def test_enqueue_reconciles_current_repository_catalog_before_preview(self) -> None:
+        operation_id = "00000000-0000-4000-8000-000000000041"
+        namespace = agent_cli._parser().parse_args(
+            ["test", "enqueue", "--operation-id", operation_id]
+        )
+        repository = mock.Mock(repo_id="repo-1", canonical_root="/repo")
+        profile = mock.Mock()
+        profile.resolve_repository.return_value = repository
+        profile.ensure_repository_with_outcome.return_value = (repository, True)
+
+        with (
+            mock.patch.object(agent_cli, "_attribution", return_value="codex:thread"),
+            mock.patch(
+                "devcoordinator.agent_test.enqueue_test",
+                return_value={"schema_version": 1, "ok": True},
+            ) as enqueue,
+        ):
+            result = agent_cli._test(
+                namespace,
+                profile=profile,
+                capabilities={
+                    "tests": {
+                        "enqueue_intents": [
+                            "change",
+                            "checkpoint",
+                            "handoff",
+                            "release",
+                            "manual",
+                        ]
+                    }
+                },
+                context=_Context(),
+            )
+
+        profile.ensure_repository_with_outcome.assert_called_once_with(
+            canonical_root="/repo",
+            project_kind="primary",
+            agent="codex:thread",
+            operation_id=str(
+                uuid.uuid5(
+                    uuid.UUID(operation_id),
+                    "repository.catalog:/repo",
+                )
+            ),
+            reconcile_scope="test",
+        )
+        enqueue.assert_called_once()
+        self.assertTrue(result["ok"])
+
     def test_failure_page_preserves_a_cursor_while_enforcing_agent_bound(self) -> None:
         result = {
             "schema_version": 1,
@@ -1047,6 +1108,39 @@ class AgentCliTests(unittest.TestCase):
                 "wait",
             },
         )
+
+    def test_only_read_only_test_continuations_allow_compatible_release(self) -> None:
+        allowed = (
+            ["test", "artifact", "run-1", "artifact-1"],
+            ["test", "failures", "run-1"],
+            ["test", "follow", "run-1"],
+            ["test", "queue-status"],
+            ["test", "status", "run-1"],
+            ["test", "summary", "run-1"],
+            ["test", "wait", "run-1", "--timeout-seconds", "1"],
+        )
+        strict = (
+            ["test", "cancel", "run-1", "--reason", "stop"],
+            ["test", "enqueue"],
+            ["test", "retry", "run-1", "--failed-only"],
+            ["test", "submit", "plan-1"],
+            ["runtime", "status", "service-1"],
+            ["capabilities"],
+        )
+        for argv in allowed:
+            with self.subTest(argv=argv):
+                self.assertTrue(
+                    agent_cli._allows_compatible_release(
+                        agent_cli._parser().parse_args(argv)
+                    )
+                )
+        for argv in strict:
+            with self.subTest(argv=argv):
+                self.assertFalse(
+                    agent_cli._allows_compatible_release(
+                        agent_cli._parser().parse_args(argv)
+                    )
+                )
 
     def test_test_mutation_failure_always_emits_structured_stdout(self) -> None:
         stream = mock.Mock()
@@ -1175,6 +1269,20 @@ class AgentCliTests(unittest.TestCase):
         self.assertEqual(result["phase"], "authority")
         self.assertIn("host-access gate", result["next_action"])
         self.assertFalse(result["mutation_performed"])
+
+    def test_plan_source_failure_is_not_a_broker_outage(self) -> None:
+        result = agent_cli._failure(
+            BrokerError(
+                "test_plan_source_invalid",
+                "snapshot launch catalog identity collided",
+            ),
+            broker_contacted=True,
+            observed_mutation=False,
+        )
+
+        self.assertEqual(result["classification"], "repository_source_invalid")
+        self.assertEqual(result["phase"], "authority")
+        self.assertIn("scheduler and broker remain available", result["next_action"])
 
     def test_operation_follow_uses_the_exact_handle_and_bounded_projection(self) -> None:
         operation_id = "00000000-0000-4000-8000-000000000001"

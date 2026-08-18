@@ -473,6 +473,7 @@ class BrokerClientProfile:
         agent: str,
         operation_id: str,
         transport_timeout_seconds: float | None = None,
+        reconcile_scope: str = "runtime",
     ) -> tuple[BrokerRepositoryProfile, bool]:
         """Adopt a proven Git root through one existing transport anchor.
 
@@ -495,6 +496,7 @@ class BrokerClientProfile:
                 "agent": agent,
                 "canonical_root": canonical_root,
                 "project_kind": project_kind,
+                "reconcile_scope": reconcile_scope,
             },
             operation_id=operation_id,
             transport_timeout_seconds=transport_timeout_seconds,

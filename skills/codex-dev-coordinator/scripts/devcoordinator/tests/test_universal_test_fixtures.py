@@ -7,6 +7,7 @@ from pathlib import Path
 import stat
 import unittest
 
+from devcoordinator.broker import BrokerError
 from devcoordinator.ephemeral_secrets import (
     POSTGRES_INITDB_PASSWORD_FILE_V1,
     VolatileRunSecretManager,
@@ -201,16 +202,21 @@ class UniversalTestFixtureProviderTests(unittest.TestCase):
             template_id="ephemeral-template-copy-postgres",
             repo_id="repo-template-copy",
             name="artifact-postgres",
-            image_ref=IMAGE,
+            image_ref="postgres@sha256:" + "b" * 64,
             command=("postgres", "-c", "fsync=off"),
             environment={"POSTGRES_HOST_AUTH_METHOD": "trust"},
-            default_ttl_seconds=600,
-            max_ttl_seconds=3600,
+            default_ttl_seconds=1200,
+            max_ttl_seconds=7200,
             container_tcp_port=5432,
-            host_port_start=55400,
-            host_port_end=55410,
-            memory_bytes=256 * 1024 * 1024,
-            cpu_millis=750,
+            host_port_start=56000,
+            host_port_end=56020,
+            memory_bytes=512 * 1024 * 1024,
+            cpu_millis=1500,
+            max_concurrent_runs=9,
+            max_concurrent_runs_per_uid=7,
+            repo_max_active_runs=11,
+            repo_memory_budget_bytes=12 * 1024 * 1024 * 1024,
+            repo_cpu_budget_millis=24_000,
         )
         descriptor = replace(
             self.descriptor(),
@@ -233,6 +239,193 @@ class UniversalTestFixtureProviderTests(unittest.TestCase):
         )
         self.assertEqual(self.host.containers, {})
         self.assertFalse((self.credential_root / runtime_id).exists())
+
+    def test_equivalent_noncanonical_legacy_templates_ignore_quota_metadata(self) -> None:
+        now = utc_timestamp()
+        with CoordinatorStore.open(
+            self.fixture.database, expected_uid=os.geteuid()
+        ) as store:
+            with store.immediate_transaction() as connection:
+                for repo_id in (
+                    "repo-legacy-a",
+                    "repo-legacy-b",
+                    "repo-legacy-consumer",
+                ):
+                    root = self.fixture.root / repo_id
+                    root.mkdir()
+                    connection.execute(
+                        """
+                        INSERT INTO repositories(
+                            repo_id, host_id, canonical_root, display_name,
+                            state, generation, created_at, updated_at
+                        ) VALUES (?, 'host-ephemeral', ?, ?, 'active', 0, ?, ?)
+                        """,
+                        (repo_id, str(root), repo_id, now, now),
+                    )
+                    connection.execute(
+                        """
+                        INSERT INTO repository_installations(
+                            repo_id, status, startup_fenced, generation,
+                            actor, updated_at
+                        ) VALUES (?, 'installed', 0, 0, 'fixture', ?)
+                        """,
+                        (repo_id, now),
+                    )
+        for suffix, default_ttl, maximum_ttl, memory, cpu in (
+            ("a", 300, 1800, 128 * 1024 * 1024, 500),
+            ("b", 1200, 7200, 512 * 1024 * 1024, 1500),
+        ):
+            self.fixture.persistence.provision_ephemeral_template(
+                template_id=f"legacy-template-{suffix}",
+                repo_id=f"repo-legacy-{suffix}",
+                name="legacy-postgres",
+                image_ref=IMAGE,
+                command=("postgres", "-c", "fsync=off"),
+                environment={"POSTGRES_HOST_AUTH_METHOD": "trust"},
+                default_ttl_seconds=default_ttl,
+                max_ttl_seconds=maximum_ttl,
+                container_tcp_port=5432,
+                host_port_start=56100 if suffix == "a" else 56200,
+                host_port_end=56110 if suffix == "a" else 56210,
+                memory_bytes=memory,
+                cpu_millis=cpu,
+                max_concurrent_runs=2 if suffix == "a" else 8,
+                max_concurrent_runs_per_uid=1 if suffix == "a" else 6,
+                repo_max_active_runs=4 if suffix == "a" else 12,
+                repo_memory_budget_bytes=4 * 1024 * 1024 * 1024,
+                repo_cpu_budget_millis=8_000,
+            )
+        descriptor = replace(
+            self.descriptor(),
+            repository_id="repo-legacy-consumer",
+            original_root=str(self.fixture.root / "repo-legacy-consumer"),
+            execution_root=str(self.fixture.root / "repo-legacy-consumer"),
+            worktree_key=str(self.fixture.root / "repo-legacy-consumer"),
+            fixture_bindings=(
+                {
+                    "name": "postgres",
+                    "template": "legacy-postgres",
+                    "network": "loopback",
+                },
+            ),
+        )
+        provider = self.provider()
+        runtime_id = "devcoordinator-test-" + "7" * 32
+
+        lease = provider.provision(descriptor, runtime_id=runtime_id)
+
+        self.assertEqual(
+            lease.provenance[0]["template_id"], "legacy-template-a"
+        )
+        provider.cleanup(
+            runtime_id=runtime_id,
+            descriptor_fingerprint=lease.descriptor_fingerprint,
+            reason="terminal",
+        )
+
+    def test_materially_different_fixture_name_reports_bounded_candidate_ids(self) -> None:
+        other_root = self.fixture.root / "materially-different-repo"
+        other_root.mkdir()
+        now = utc_timestamp()
+        with CoordinatorStore.open(
+            self.fixture.database, expected_uid=os.geteuid()
+        ) as store:
+            with store.immediate_transaction() as connection:
+                connection.execute(
+                    """
+                    INSERT INTO repositories(
+                        repo_id, host_id, canonical_root, display_name, state,
+                        generation, created_at, updated_at
+                    ) VALUES (
+                        'repo-materially-different', 'host-ephemeral', ?,
+                        'Materially different', 'active', 0, ?, ?
+                    )
+                    """,
+                    (str(other_root), now, now),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO repository_installations(
+                        repo_id, status, startup_fenced, generation, actor,
+                        updated_at
+                    ) VALUES (
+                        'repo-materially-different', 'installed', 0, 0,
+                        'fixture', ?
+                    )
+                    """,
+                    (now,),
+                )
+        consumer_root = self.fixture.root / "materially-different-consumer"
+        consumer_root.mkdir()
+        with CoordinatorStore.open(
+            self.fixture.database, expected_uid=os.geteuid()
+        ) as store:
+            with store.immediate_transaction() as connection:
+                connection.execute(
+                    """
+                    INSERT INTO repositories(
+                        repo_id, host_id, canonical_root, display_name, state,
+                        generation, created_at, updated_at
+                    ) VALUES (
+                        'repo-materially-consumer', 'host-ephemeral', ?,
+                        'Materially different consumer', 'active', 0, ?, ?
+                    )
+                    """,
+                    (str(consumer_root), now, now),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO repository_installations(
+                        repo_id, status, startup_fenced, generation, actor,
+                        updated_at
+                    ) VALUES (
+                        'repo-materially-consumer', 'installed', 0, 0,
+                        'fixture', ?
+                    )
+                    """,
+                    (now,),
+                )
+        for template_id, image, repo_id in (
+            ("materially-different-postgres", IMAGE, "repo-ephemeral"),
+            (
+                "materially-different-postgres-v2",
+                "postgres@sha256:" + "b" * 64,
+                "repo-materially-different",
+            ),
+        ):
+            self.fixture.persistence.provision_ephemeral_template(
+                template_id=template_id,
+                repo_id=repo_id,
+                name="ambiguous-postgres",
+                image_ref=image,
+                default_ttl_seconds=600,
+                max_ttl_seconds=3600,
+                memory_bytes=128 * 1024 * 1024,
+                cpu_millis=500,
+            )
+        descriptor = replace(
+            self.descriptor(),
+            repository_id="repo-materially-consumer",
+            original_root=str(consumer_root),
+            execution_root=str(consumer_root),
+            worktree_key=str(consumer_root),
+            fixture_bindings=(
+                {
+                    "name": "postgres",
+                    "template": "ambiguous-postgres",
+                    "network": "loopback",
+                },
+            ),
+        )
+
+        with self.assertRaisesRegex(
+            BrokerError,
+            "materially-different-postgres,materially-different-postgres-v2",
+        ):
+            self.provider().provision(
+                descriptor,
+                runtime_id="devcoordinator-test-" + "8" * 32,
+            )
 
     def test_duplicate_global_name_uses_repository_association_only_as_routing(self) -> None:
         consumer_root = self.fixture.root / "consumer-routing"

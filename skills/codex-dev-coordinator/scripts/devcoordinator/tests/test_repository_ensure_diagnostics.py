@@ -8,7 +8,7 @@ import unittest
 import uuid
 from unittest import mock
 
-from devcoordinator import agent_cli, broker_configuration
+from devcoordinator import agent_cli, broker_backend, broker_configuration
 from devcoordinator.broker import (
     AcceptedBrokerRequest,
     BrokerError,
@@ -132,6 +132,7 @@ class RepositoryEnsureDiagnosticsTests(unittest.TestCase):
                 "agent": "codex:task:repository-adoption",
                 "canonical_root": "/workspace/new-repository",
                 "project_kind": "primary",
+                "reconcile_scope": "runtime",
             },
         )
 
@@ -321,12 +322,21 @@ class RepositoryEnsureDiagnosticsTests(unittest.TestCase):
             )
             request = self._request()
 
-            result = backend._reconcile_repository_runtime_contract(
-                request=request,
-                repo_id="repo-1",
-                root=str(root),
-                execution_uid=1000,
-            )
+            with mock.patch.object(
+                broker_backend,
+                "reconcile_declared_ephemeral_templates_first_use",
+                return_value={
+                    "changed": False,
+                    "ephemeral_templates": {},
+                    "ephemeral_secret_policies": {},
+                },
+            ):
+                result = backend._reconcile_repository_runtime_contract(
+                    request=request,
+                    repo_id="repo-1",
+                    root=str(root),
+                    execution_uid=1000,
+                )
 
         self.assertEqual(
             persistence.reconciliations,
@@ -338,6 +348,49 @@ class RepositoryEnsureDiagnosticsTests(unittest.TestCase):
             request.operation_id,
             project_id="repo-1",
         )
+
+    def test_test_scope_reconciles_fixtures_without_runtime_catalogs(self) -> None:
+        persistence = mock.Mock()
+        backend = object.__new__(StoreBackedMutationBackend)
+        backend._persistence = persistence  # type: ignore[attr-defined]
+        ephemeral = {
+            "changed": True,
+            "ephemeral_templates": {"artifact-postgres": "template-1"},
+            "ephemeral_secret_policies": {},
+        }
+        with (
+            mock.patch.object(
+                broker_backend,
+                "reconcile_declared_compose_first_use",
+            ) as compose,
+            mock.patch.object(
+                broker_backend,
+                "reconcile_declared_servers_first_use",
+            ) as servers,
+            mock.patch.object(
+                broker_backend,
+                "reconcile_declared_ephemeral_templates_first_use",
+                return_value=ephemeral,
+            ) as fixtures,
+        ):
+            result = backend._reconcile_repository_runtime_contract(
+                request=self._request(),
+                repo_id="repo-1",
+                root="/repository",
+                execution_uid=1000,
+                reconcile_scope="test",
+            )
+
+        persistence.configured_compose_definition_id.assert_not_called()
+        compose.assert_not_called()
+        servers.assert_not_called()
+        fixtures.assert_called_once_with(
+            persistence,
+            repo_id="repo-1",
+            root=Path("/repository"),
+        )
+        self.assertEqual(result["ephemeral_templates"], {"artifact-postgres": "template-1"})
+        self.assertTrue(result["changed"])
 
     def test_first_use_catalogs_declared_persistent_services_without_offline_setup(
         self,
@@ -417,6 +470,19 @@ class RepositoryEnsureDiagnosticsTests(unittest.TestCase):
                     root=root,
                     execution_uid=1000,
                 )
+                manifest = root / ".codex" / "dev-runtime.json"
+                manifest.write_text(
+                    manifest.read_text(encoding="utf-8").replace(
+                        '"port": 4185', '"port": 4186'
+                    ),
+                    encoding="utf-8",
+                )
+                third = broker_configuration.reconcile_declared_servers_first_use(
+                    persistence,
+                    repo_id="repo-1",
+                    root=root,
+                    execution_uid=1000,
+                )
             with CoordinatorStore.open(
                 persistence.database_path,
                 expected_uid=Path(root).stat().st_uid,
@@ -453,18 +519,145 @@ class RepositoryEnsureDiagnosticsTests(unittest.TestCase):
                         SELECT start_port, end_port, enabled
                         FROM broker_port_ranges
                         WHERE repo_id = 'repo-1' AND server_definition_id = ?
+                          AND start_port = 4185 AND end_port = 4185
                         """,
                         (definition["server_definition_id"],),
                     ).fetchone()
+                    active_port_ranges = [
+                        tuple(row)
+                        for row in connection.execute(
+                            """
+                            SELECT start_port, end_port
+                            FROM broker_port_ranges
+                            WHERE repo_id = 'repo-1'
+                              AND server_definition_id = ? AND enabled = 1
+                            ORDER BY start_port, end_port
+                            """,
+                            (definition["server_definition_id"],),
+                        )
+                    ]
 
         self.assertTrue(first["changed"])
         self.assertFalse(second["changed"])
+        self.assertTrue(third["changed"])
         self.assertEqual(first["servers"], second["servers"])
         self.assertEqual(definition["cwd"], str(root / "web"))
         self.assertEqual(definition["generation"], 0)
         self.assertEqual(arguments[-2:], ["--port", "{port}"])
         self.assertEqual(environment, {"NODE_ENV": "development"})
-        self.assertEqual(tuple(port_range), (4185, 4185, 1))
+        self.assertEqual(tuple(port_range), (4185, 4185, 0))
+        self.assertEqual(active_port_ranges, [(4186, 4186)])
+
+    def test_first_use_catalogs_declared_ephemeral_fixture_without_offline_setup(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="repository-first-use-fixtures-"
+        ) as temporary:
+            root = Path(temporary).resolve()
+            (root / ".codex").mkdir()
+            (root / ".codex" / "dev-runtime.json").write_text(
+                """{
+                  "ephemeral_containers": [{
+                    "name": "artifact-postgres",
+                    "image_ref": "postgres@sha256:57c72fd2a128e416c7fcc499958864df5301e940bca0a56f58fddf30ffc07777",
+                    "argv": ["postgres", "-c", "fsync=off"],
+                    "env": {"POSTGRES_INITDB_ARGS": "--auth-host=scram-sha-256"},
+                    "secret_policy": "postgres_initdb_password_file_v1",
+                    "default_ttl_seconds": 600,
+                    "max_ttl_seconds": 3600,
+                    "container_tcp_port": 5432,
+                    "host_port_start": 55600,
+                    "host_port_end": 55631,
+                    "memory_bytes": 536870912,
+                    "cpu_millis": 1000,
+                    "max_concurrent_runs": 2,
+                    "max_concurrent_runs_per_uid": 1,
+                    "repo_max_active_runs": 4,
+                    "repo_memory_budget_bytes": 2147483648,
+                    "repo_cpu_budget_millis": 4000
+                  }]
+                }""",
+                encoding="utf-8",
+            )
+            persistence = BrokerPersistence(
+                root / "coordinator.sqlite3",
+                expected_uid=Path(root).stat().st_uid,
+            )
+            now = utc_timestamp()
+            with CoordinatorStore.open(
+                persistence.database_path,
+                expected_uid=Path(root).stat().st_uid,
+            ) as store:
+                with store.immediate_transaction() as connection:
+                    connection.execute(
+                        """
+                        INSERT INTO hosts(
+                            host_id, machine_fingerprint, platform, hostname,
+                            created_at, updated_at
+                        ) VALUES ('host-1', 'machine-1', 'test', 'test', ?, ?)
+                        """,
+                        (now, now),
+                    )
+                    connection.execute(
+                        """
+                        INSERT INTO repositories(
+                            repo_id, host_id, canonical_root, display_name,
+                            state, generation, created_at, updated_at
+                        ) VALUES ('repo-1', 'host-1', ?, 'Example',
+                                  'active', 0, ?, ?)
+                        """,
+                        (str(root), now, now),
+                    )
+                    connection.execute(
+                        """
+                        INSERT INTO repository_installations(
+                            repo_id, status, startup_fenced, generation,
+                            actor, updated_at
+                        ) VALUES ('repo-1', 'installed', 0, 0, 'fixture', ?)
+                        """,
+                        (now,),
+                    )
+
+            first = (
+                broker_configuration.reconcile_declared_ephemeral_templates_first_use(
+                    persistence,
+                    repo_id="repo-1",
+                    root=root,
+                )
+            )
+            second = (
+                broker_configuration.reconcile_declared_ephemeral_templates_first_use(
+                    persistence,
+                    repo_id="repo-1",
+                    root=root,
+                )
+            )
+            template_id = first["ephemeral_templates"]["artifact-postgres"]
+            with CoordinatorStore.open(
+                persistence.database_path,
+                expected_uid=Path(root).stat().st_uid,
+            ) as store:
+                with store.read_transaction() as connection:
+                    sealed = connection.execute(
+                        """
+                        SELECT template_id, image_ref, container_tcp_port, enabled
+                        FROM ephemeral_container_templates
+                        WHERE repo_id = 'repo-1' AND name = 'artifact-postgres'
+                        """
+                    ).fetchone()
+
+        self.assertTrue(first["changed"])
+        self.assertFalse(second["changed"])
+        self.assertEqual(first["ephemeral_templates"], second["ephemeral_templates"])
+        self.assertEqual(sealed["template_id"], template_id)
+        self.assertEqual(sealed["image_ref"].split("@", 1)[0], "postgres")
+        self.assertEqual(sealed["container_tcp_port"], 5432)
+        self.assertTrue(sealed["enabled"])
+        self.assertEqual(
+            first["ephemeral_secret_policies"]["artifact-postgres"]["policy"],
+            "postgres_initdb_password_file_v1",
+        )
 
 
 if __name__ == "__main__":

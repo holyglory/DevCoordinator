@@ -2125,10 +2125,11 @@ def _validate_arguments(
             "agent",
             "canonical_root",
             "project_kind",
+            "reconcile_scope",
         }:
             raise BrokerError(
                 "invalid_arguments",
-                "Repository ensure requires one canonical root, project kind, and agent attribution.",
+                "Repository ensure requires one canonical root, project kind, reconciliation scope, and agent attribution.",
                 operation_id=operation_id,
             )
         canonical_root = value["canonical_root"]
@@ -2151,10 +2152,18 @@ def _validate_arguments(
                 "project_kind must be primary or temporary.",
                 operation_id=operation_id,
             )
+        reconcile_scope = value["reconcile_scope"]
+        if reconcile_scope not in {"runtime", "test"}:
+            raise BrokerError(
+                "invalid_arguments",
+                "reconcile_scope must be runtime or test.",
+                operation_id=operation_id,
+            )
         return {
             "agent": _bounded_agent(value["agent"], operation_id),
             "canonical_root": canonical_root,
             "project_kind": project_kind,
+            "reconcile_scope": reconcile_scope,
         }
 
     if operation == BrokerOperation.REPOSITORY_RESOLVE:

@@ -219,6 +219,17 @@ def declared_servers_from_runtime_manifest(root: Path) -> tuple[dict[str, Any], 
     return tuple(servers)
 
 
+def declared_ephemeral_templates_from_runtime_manifest(
+    root: Path,
+) -> tuple[dict[str, Any], ...]:
+    """Return the sealed ephemeral templates declared by one repository."""
+
+    document = _runtime_manifest_document(root)
+    if document is None:
+        return ()
+    return _normalize_ephemeral_templates(document.get("ephemeral_containers", ()))
+
+
 def _runtime_manifest_strings(
     value: Any,
     *,
@@ -1868,6 +1879,7 @@ def reconcile_declared_servers_first_use(
         return {"changed": False, "servers": {}}
     provision_worker_log_directory(execution_uid)
     before: dict[str, tuple[str, int]] = {}
+    before_ranges: tuple[tuple[str, str, int, int, bool], ...] = ()
     with persistence._store() as store:
         with store.read_transaction() as connection:
             before = {
@@ -1884,6 +1896,23 @@ def reconcile_declared_servers_first_use(
                     (repo_id,),
                 )
             }
+            before_ranges = tuple(
+                (
+                    str(row["server_definition_id"]),
+                    str(row["protocol"]),
+                    int(row["start_port"]),
+                    int(row["end_port"]),
+                    bool(row["enabled"]),
+                )
+                for row in connection.execute(
+                    """
+                    SELECT server_definition_id, protocol, start_port, end_port, enabled
+                    FROM broker_port_ranges WHERE repo_id = ?
+                    ORDER BY server_definition_id, protocol, start_port, end_port
+                    """,
+                    (repo_id,),
+                )
+            )
         with store.immediate_transaction() as connection:
             server_ids = _synchronize_server_definitions(
                 connection,
@@ -1906,6 +1935,7 @@ def reconcile_declared_servers_first_use(
             start_port=start_port,
             end_port=end_port,
             max_ttl_seconds=7 * 24 * 60 * 60,
+            replace_existing=True,
         )
     with persistence._store() as store:
         with store.read_transaction() as connection:
@@ -1923,9 +1953,78 @@ def reconcile_declared_servers_first_use(
                     (repo_id,),
                 )
             }
+            after_ranges = tuple(
+                (
+                    str(row["server_definition_id"]),
+                    str(row["protocol"]),
+                    int(row["start_port"]),
+                    int(row["end_port"]),
+                    bool(row["enabled"]),
+                )
+                for row in connection.execute(
+                    """
+                    SELECT server_definition_id, protocol, start_port, end_port, enabled
+                    FROM broker_port_ranges WHERE repo_id = ?
+                    ORDER BY server_definition_id, protocol, start_port, end_port
+                    """,
+                    (repo_id,),
+                )
+            )
     return {
-        "changed": before != after,
+        "changed": before != after or before_ranges != after_ranges,
         "servers": dict(server_ids),
+    }
+
+
+def reconcile_declared_ephemeral_templates_first_use(
+    persistence: BrokerPersistence,
+    *,
+    repo_id: str,
+    root: Path,
+) -> Mapping[str, Any]:
+    """Seal declared test/runtime fixtures during ordinary repository use."""
+
+    try:
+        templates = declared_ephemeral_templates_from_runtime_manifest(root)
+    except (OSError, RuntimeError, TypeError, ValueError) as error:
+        if isinstance(error, DeclaredRuntimeConfigurationError):
+            raise
+        raise DeclaredRuntimeConfigurationError(str(error)) from error
+
+    def catalog() -> dict[str, tuple[str, int, bool]]:
+        with persistence._store() as store:
+            with store.read_transaction() as connection:
+                return {
+                    str(row["template_id"]): (
+                        str(row["definition_fingerprint"]),
+                        int(row["generation"]),
+                        bool(row["enabled"]),
+                    )
+                    for row in connection.execute(
+                        """
+                        SELECT template_id, definition_fingerprint, generation, enabled
+                        FROM ephemeral_container_templates
+                        WHERE repo_id = ? ORDER BY template_id
+                        """,
+                        (repo_id,),
+                    )
+                }
+
+    before = catalog()
+    template_ids = _provision_ephemeral_templates(
+        persistence,
+        repo_id=repo_id,
+        templates=templates,
+    )
+    secret_policies = _ephemeral_secret_policy_profiles(
+        repo_id=repo_id,
+        template_ids=template_ids,
+        templates=templates,
+    )
+    return {
+        "changed": before != catalog(),
+        "ephemeral_templates": template_ids,
+        "ephemeral_secret_policies": secret_policies,
     }
 
 

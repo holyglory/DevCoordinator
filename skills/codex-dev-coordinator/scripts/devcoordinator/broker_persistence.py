@@ -1460,6 +1460,22 @@ class BrokerPersistence:
                     "repository reconciliation returned invalid run-once services"
                 )
             repository_document["compose_run_once_services"] = dict(run_once_services)
+            ephemeral_templates = reconciliation.get("ephemeral_templates", {})
+            if not isinstance(ephemeral_templates, Mapping):
+                raise RuntimeError(
+                    "repository reconciliation returned invalid ephemeral templates"
+                )
+            repository_document["ephemeral_templates"] = dict(ephemeral_templates)
+            ephemeral_secret_policies = reconciliation.get(
+                "ephemeral_secret_policies", {}
+            )
+            if not isinstance(ephemeral_secret_policies, Mapping):
+                raise RuntimeError(
+                    "repository reconciliation returned invalid ephemeral secret policies"
+                )
+            repository_document["ephemeral_secret_policies"] = dict(
+                ephemeral_secret_policies
+            )
             reconcile_changed = reconciliation.get("changed", False)
             if type(reconcile_changed) is not bool:
                 raise RuntimeError(
@@ -4176,6 +4192,7 @@ class BrokerPersistence:
         protocol: str = "tcp",
         max_ttl_seconds: int = 3_600,
         enabled: bool = True,
+        replace_existing: bool = False,
     ) -> None:
         """Set one target server's allocation range for every local caller."""
 
@@ -4189,6 +4206,8 @@ class BrokerPersistence:
             raise ValueError("protocol must be tcp or udp")
         if type(max_ttl_seconds) is not int or not 1 <= max_ttl_seconds <= 604_800:
             raise ValueError("max_ttl_seconds must be from one second to seven days")
+        if type(replace_existing) is not bool:
+            raise TypeError("replace_existing must be boolean")
         with self._store() as store:
             with store.immediate_transaction() as connection:
                 server = connection.execute(
@@ -4203,7 +4222,7 @@ class BrokerPersistence:
                         "resource_identity_mismatch",
                         "Port range target is not a current server definition.",
                     )
-                conflict = connection.execute(
+                conflict = None if replace_existing else connection.execute(
                     """
                     SELECT start_port, end_port FROM broker_port_ranges
                     WHERE repo_id = ? AND server_definition_id = ?
@@ -4226,6 +4245,24 @@ class BrokerPersistence:
                     raise BrokerError(
                         "overlapping_port_range",
                         "Port ranges for one server must not overlap.",
+                    )
+                if replace_existing:
+                    connection.execute(
+                        """
+                        UPDATE broker_port_ranges
+                        SET enabled = 0, updated_at = ?
+                        WHERE repo_id = ? AND server_definition_id = ?
+                          AND protocol = ?
+                          AND NOT(start_port = ? AND end_port = ?)
+                        """,
+                        (
+                            utc_timestamp(),
+                            repo_id,
+                            server_definition_id,
+                            protocol,
+                            start_port,
+                            end_port,
+                        ),
                     )
                 connection.execute(
                     """
@@ -4493,6 +4530,15 @@ class BrokerPersistence:
                         if len(routed) == 1:
                             rows = routed
                     if len(rows) > 1:
+                        canonical_id = "ephemeral-template-" + template
+                        canonical = [
+                            row
+                            for row in rows
+                            if str(row["template_id"]) == canonical_id
+                        ]
+                        if len(canonical) == 1:
+                            rows = canonical
+                    if len(rows) > 1:
                         def routing_signature(candidate: sqlite3.Row) -> tuple[Any, ...]:
                             candidate_id = str(candidate["template_id"])
                             candidate_arguments = tuple(
@@ -4519,18 +4565,8 @@ class BrokerPersistence:
                                 str(candidate["name"]),
                                 str(candidate["image_ref"]),
                                 candidate["secret_policy_kind"],
-                                int(candidate["default_ttl_seconds"]),
-                                int(candidate["max_ttl_seconds"]),
+                                candidate["secret_binding_id"],
                                 candidate["container_tcp_port"],
-                                candidate["host_port_start"],
-                                candidate["host_port_end"],
-                                candidate["memory_bytes"],
-                                candidate["cpu_millis"],
-                                candidate["max_concurrent_runs"],
-                                candidate["max_concurrent_runs_per_uid"],
-                                candidate["repo_max_active_runs"],
-                                candidate["repo_memory_budget_bytes"],
-                                candidate["repo_cpu_budget_millis"],
                                 candidate_arguments,
                                 candidate_environment,
                             )
@@ -4539,9 +4575,21 @@ class BrokerPersistence:
                         if len(signatures) == 1:
                             rows = [rows[0]]
                 if len(rows) != 1:
+                    candidate_ids = [
+                        str(row["template_id"])
+                        for row in rows[:8]
+                    ]
+                    candidate_suffix = (
+                        "; candidates=" + ",".join(candidate_ids)
+                        if candidate_ids
+                        else ""
+                    )
                     raise BrokerError(
                         "test_fixture_template_unavailable",
-                        "The administrator-sealed fixture template is unavailable or ambiguous.",
+                        "The administrator-sealed fixture template is unavailable "
+                        "or ambiguous"
+                        + candidate_suffix
+                        + ".",
                         operation_id=operation_id,
                     )
                 row = rows[0]

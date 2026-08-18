@@ -443,7 +443,10 @@ def _repository_context(namespace: argparse.Namespace) -> Any:
 
 
 def _profile_and_capabilities(
-    context: Any, *, execution_state: dict[str, bool | None] | None = None
+    context: Any,
+    *,
+    execution_state: dict[str, bool | None] | None = None,
+    allow_compatible_release: bool = False,
 ) -> tuple[Any, dict[str, Any]]:
     from .broker_profile import load_broker_profile
     from .capabilities import (
@@ -475,9 +478,27 @@ def _profile_and_capabilities(
     validated = validate_client_capabilities(
         capabilities,
         expected_authority_generation=profile.service.database_generation,
-        client_release_digest=release_digest(Path(__file__)),
+        client_release_digest=(
+            None
+            if allow_compatible_release
+            else release_digest(Path(__file__))
+        ),
     )
     return profile, validated
+
+
+def _allows_compatible_release(namespace: argparse.Namespace) -> bool:
+    """Scope same-schema release compatibility to read-only test continuations."""
+
+    return namespace.command == "test" and namespace.test_action in {
+        "artifact",
+        "failures",
+        "follow",
+        "queue-status",
+        "status",
+        "summary",
+        "wait",
+    }
 
 
 def _attribution() -> str:
@@ -1887,17 +1908,31 @@ def _ephemeral(
             classification="unsupported_capability",
             phase="handshake",
         )
+    mutates = namespace.action == "image-prefetch"
+    operation_id = _canonical_operation_id(
+        namespace.operation_id, mutate=mutates
+    )
+    namespace.operation_id = operation_id
+    if mutates:
+        assert operation_id is not None
+        profile.ensure_repository_with_outcome(
+            canonical_root=context.effective.canonical_root,
+            project_kind=context.project_kind,
+            agent=_attribution(),
+            operation_id=str(
+                uuid.uuid5(
+                    uuid.UUID(operation_id),
+                    "repository.catalog:" + context.effective.canonical_root,
+                )
+            ),
+            reconcile_scope="test",
+        )
     repository = _require_resolved_repository(
         profile, context.effective.canonical_root
     )
     template_id = repository.ephemeral_image_prefetch_template_id(
         namespace.template
     )
-    mutates = namespace.action == "image-prefetch"
-    operation_id = _canonical_operation_id(
-        namespace.operation_id, mutate=mutates
-    )
-    namespace.operation_id = operation_id
     returned_operation_id, result = profile.call(
         repository=repository,
         resource_id=template_id,
@@ -1956,10 +1991,6 @@ def _test(
             classification="unsupported_capability",
             phase="handshake",
         )
-    root = _require_resolved_repository(profile, context.root.canonical_root)
-    effective = _require_resolved_repository(
-        profile, context.effective.canonical_root
-    )
     action = namespace.test_action
     if action == "enqueue":
         allowed = test_caps.get("enqueue_intents")
@@ -1970,6 +2001,32 @@ def _test(
                 classification="unsupported_capability",
                 phase="handshake",
             )
+        operation_root = uuid.UUID(namespace.operation_id)
+        repository_roots = [context.root.canonical_root]
+        if context.effective.canonical_root != context.root.canonical_root:
+            repository_roots.append(context.effective.canonical_root)
+        for canonical_root in repository_roots:
+            profile.ensure_repository_with_outcome(
+                canonical_root=canonical_root,
+                project_kind=(
+                    context.project_kind
+                    if canonical_root == context.effective.canonical_root
+                    else "primary"
+                ),
+                agent=_attribution(),
+                operation_id=str(
+                    uuid.uuid5(
+                        operation_root,
+                        "repository.catalog:" + canonical_root,
+                    )
+                ),
+                reconcile_scope="test",
+            )
+    root = _require_resolved_repository(profile, context.root.canonical_root)
+    effective = _require_resolved_repository(
+        profile, context.effective.canonical_root
+    )
+    if action == "enqueue":
         return _scope_test_result(enqueue_test(
             profile=profile,
             repository=root,
@@ -2113,7 +2170,9 @@ def _execute(
         return execute_namespace(namespace)
     context = _repository_context(namespace)
     profile, capabilities = _profile_and_capabilities(
-        context, execution_state=execution_state
+        context,
+        execution_state=execution_state,
+        allow_compatible_release=_allows_compatible_release(namespace),
     )
     if namespace.command == "efficiency":
         capability = capabilities.get("efficiency")
@@ -2303,6 +2362,8 @@ def _error_classification(error: BaseException, code: str) -> str:
         "compose_definition_invalid",
     }:
         return "repository_configuration_invalid"
+    if code in {"test_plan_source_invalid", "live_retry_replan_required"}:
+        return "repository_source_invalid"
     if code.startswith("maintenance_"):
         return "maintenance"
     if code in {"server_busy", "broker_busy", "request_timeout"}:
@@ -2403,6 +2464,17 @@ def _next_action_for_failure(
             "Correct the exact repository-declared runtime condition named in "
             "the message, then retry the same service action. Coordinator did "
             "not classify this as a broker outage or bypass the host-access gate."
+        )
+    if code == "test_plan_source_invalid":
+        return (
+            "Correct the exact repository source or immutable catalog condition "
+            "named in the message, then retry planning. The scheduler and broker "
+            "remain available."
+        )
+    if code == "live_retry_replan_required":
+        return (
+            "Create a fresh current-source plan with `devcoordinator test enqueue`; "
+            "the retained live plan was not replayed and no retry run was created."
         )
     if code == "invalid_arguments":
         return (

@@ -37,7 +37,10 @@ from .call_journal import (
 from .store import CoordinatorStore
 from .schema import SCHEMA_VERSION
 from .universal_test_broker import RepositoryLaunchDescriptorResolver
-from .universal_test_runtime import TestAttemptDescriptor
+from .universal_test_runtime import (
+    _SYSTEM_PYTHON_TOOLCHAIN_ROOTS,
+    TestAttemptDescriptor,
+)
 from .universal_test_planner import TestPlanError, TestPlanTimeouts
 from .universal_testd import LiveSourceChanged
 from .universal_test_service import (
@@ -1029,11 +1032,38 @@ class RootSnapshotService:
             raise TestStoreContractError("snapshot catalog directory is not real")
         return directory / f"{plan_id}.json"
 
+    @staticmethod
+    def _owner_neutral_catalog(
+        value: Mapping[str, object]
+    ) -> dict[str, object]:
+        """Drop the legacy planning UID from immutable catalog identity."""
+
+        projection = dict(value)
+        plan = projection.get("plan")
+        source = plan.get("source") if isinstance(plan, Mapping) else None
+        if isinstance(source, Mapping) and source.get("mode") == "immutable":
+            projection.pop("owner_uid", None)
+        return projection
+
     def _publish_catalog(self, *, plan_id: str, snapshot_id: str, value: Mapping[str, object]) -> None:
-        payload = _json(value, maximum=MAX_CATALOG_BYTES)
+        projection = self._owner_neutral_catalog(value)
+        payload = _json(projection, maximum=MAX_CATALOG_BYTES)
         destination = self._catalog_path(snapshot_id, plan_id)
         if destination.exists():
-            if destination.read_bytes() != payload:
+            try:
+                existing = json.loads(destination.read_bytes())
+            except (OSError, UnicodeError, json.JSONDecodeError) as error:
+                raise TestStoreContractError(
+                    "snapshot launch catalog is invalid"
+                ) from error
+            if (
+                not isinstance(existing, Mapping)
+                or _json(
+                    self._owner_neutral_catalog(existing),
+                    maximum=MAX_CATALOG_BYTES,
+                )
+                != payload
+            ):
                 raise TestStoreContractError("snapshot launch catalog identity collided")
             return
         descriptor, name = tempfile.mkstemp(prefix=".catalog-", dir=destination.parent)
@@ -1067,7 +1097,7 @@ class RootSnapshotService:
         value = json.loads(path.read_bytes())
         if not isinstance(value, Mapping) or value.get("plan") != plan.to_document():
             raise TestStoreContractError("snapshot launch catalog is contradictory")
-        return value
+        return self._owner_neutral_catalog(value)
 
     def _derive_retry_catalog(self, plan) -> Mapping[str, object]:
         """Project a missing retry catalog from one equivalent immutable source."""
@@ -1109,6 +1139,7 @@ class RootSnapshotService:
                 raise TestStoreContractError(
                     "retry snapshot launch catalog candidate is invalid"
                 )
+            value = self._owner_neutral_catalog(value)
             source_plan = decode_test_plan_document(value["plan"])
             if (
                 source_plan.repository_id != plan.repository_id
@@ -1497,6 +1528,7 @@ class RootSnapshotService:
             direct_target = Path(link_target)
             try:
                 target_metadata = direct_target.lstat()
+                resolved_target = direct_target.resolve(strict=True)
             except OSError as error:
                 raise TestStoreConflict(
                     "immutable Python toolchain target is unavailable"
@@ -1507,20 +1539,42 @@ class RootSnapshotService:
                     allowed_homes.append(Path(pwd.getpwuid(uid).pw_dir))
                 except KeyError:
                     continue
-            if (
-                not direct_target.is_absolute()
-                or stat.S_ISLNK(target_metadata.st_mode)
-                or not stat.S_ISREG(target_metadata.st_mode)
-                or not any(
-                    home in direct_target.parents and home in resolved_executable.parents
+            system_root = next(
+                (
+                    root
+                    for root in sorted(_SYSTEM_PYTHON_TOOLCHAIN_ROOTS, key=str)
+                    if root in direct_target.parents
+                    and root in resolved_executable.parents
+                ),
+                None,
+            )
+            account_toolchain = (
+                not stat.S_ISLNK(target_metadata.st_mode)
+                and stat.S_ISREG(target_metadata.st_mode)
+                and any(
+                    home in direct_target.parents
+                    and home in resolved_executable.parents
                     for home in allowed_homes
                 )
+            )
+            system_toolchain = (
+                system_root is not None
+                and (
+                    stat.S_ISREG(target_metadata.st_mode)
+                    or stat.S_ISLNK(target_metadata.st_mode)
+                )
+                and resolved_target == resolved_executable
+            )
+            if not direct_target.is_absolute() or not (
+                account_toolchain or system_toolchain
             ):
                 raise TestStoreConflict(
                     "immutable Python toolchain target is unsafe"
                 )
             toolchain_root = (
-                resolved_executable.parent.parent
+                system_root
+                if system_toolchain
+                else resolved_executable.parent.parent
                 if resolved_executable.parent.name == "bin"
                 else resolved_executable.parent
             )
@@ -2147,7 +2201,10 @@ class RootSnapshotService:
             raise TestStoreContractError("test plan source authority changed")
         if catalog is not None and (
             authority["generation"] != catalog["repository_generation"]
-            or candidate.owner_uid != catalog["owner_uid"]
+            or (
+                plan.source.mode.value == "live"
+                and candidate.owner_uid != catalog["owner_uid"]
+            )
         ):
             raise TestStoreContractError("snapshot repository authority changed")
         launch_source = catalog

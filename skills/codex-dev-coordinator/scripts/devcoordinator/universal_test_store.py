@@ -100,6 +100,12 @@ class TestStoreConflict(TestStoreError):
     """A request conflicts with immutable or generation-fenced state."""
 
 
+class LiveRetryReplanRequired(TestStoreConflict):
+    """A live-source run cannot be replayed as an exact retained-plan retry."""
+
+    code = "live_retry_replan_required"
+
+
 class TestStoreSecurityError(TestStoreConflict):
     """The test store path or filesystem object shape is unsafe."""
 
@@ -2920,6 +2926,11 @@ class UniversalTestStore:
             ).fetchone()
             if source_plan is None:
                 raise TestStoreContractError("retry source plan does not exist")
+            if str(source_run["source_mode"]) == SourceMode.LIVE.value:
+                raise LiveRetryReplanRequired(
+                    "Live-source retries require a fresh current-source plan; "
+                    "no retry run was created."
+                )
             source_targets = connection.execute(
                 """
                 SELECT * FROM test_run_targets
@@ -5976,6 +5987,7 @@ __all__ = [
     "FailureClassification",
     "FailureRecord",
     "LeaseGrant",
+    "LiveRetryReplanRequired",
     "RunnableTarget",
     "SubmissionResult",
     "TargetResources",

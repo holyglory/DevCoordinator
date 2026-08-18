@@ -2331,6 +2331,18 @@ class StoreTestPlaneAdapter:
         )
         metrics = self._store.run_metrics(run_id)
         document["failure_count"] = int(metrics["failure_record_count"])
+        document["counts"] = {
+            "attempts": int(metrics["attempt_count"]),
+            "passed": int(metrics["passed_count"]),
+            "failed": int(metrics["failed_count"]),
+            "skipped": int(metrics["skipped_count"]),
+            "errors": int(metrics["error_count"]),
+        }
+        document["timing"] = {
+            "queue_seconds": metrics["queue_seconds"],
+            "wall_seconds": metrics["wall_seconds"],
+            "aggregate_test_seconds": metrics["aggregate_test_seconds"],
+        }
         return self._bounded(document)
 
     def queue_status(self, *, repository_id: str) -> Mapping[str, object]:

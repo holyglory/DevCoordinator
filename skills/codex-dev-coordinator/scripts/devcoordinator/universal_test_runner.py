@@ -31,6 +31,7 @@ if __package__ in {None, ""}:
 from devcoordinator.universal_test_runtime import (  # type: ignore[import-not-found]
     TestAttemptDescriptor,
     _IMMUTABLE_PYTHON_TOOLCHAIN_MOUNT,
+    _SYSTEM_PYTHON_TOOLCHAIN_ROOTS,
     _safe_id,
 )
 from devcoordinator.universal_test_artifacts import package_directory  # type: ignore[import-not-found]
@@ -1237,6 +1238,8 @@ def _immutable_python_launch_executable(
             raise TestStoreContractError(
                 "immutable Python toolchain executable is invalid"
             )
+        if source in _SYSTEM_PYTHON_TOOLCHAIN_ROOTS:
+            return str(resolved)
         return str(_IMMUTABLE_PYTHON_TOOLCHAIN_MOUNT / relative)
     return None
 
@@ -2361,7 +2364,10 @@ def run(
     # test-created directories remain 0700 on other platforms.
     environment["DEVCOORDINATOR_TEST_TMP_ROOT"] = "/tmp"
     python_launch_executable = _immutable_python_launch_executable(descriptor)
-    if python_launch_executable is not None:
+    if python_launch_executable is not None and not any(
+        root in Path(python_launch_executable).parents
+        for root in _SYSTEM_PYTHON_TOOLCHAIN_ROOTS
+    ):
         environment["PYTHONHOME"] = str(_IMMUTABLE_PYTHON_TOOLCHAIN_MOUNT)
     credential_directory = os.environ.get("CREDENTIALS_DIRECTORY")
     if descriptor.fixtures:

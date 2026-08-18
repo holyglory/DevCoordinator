@@ -11,7 +11,7 @@ from devcoordinator.universal_test_store import AttemptConclusion
 
 class UniversalTestFaultRecoveryTests(EngineFixture):
     def test_late_spool_after_lost_heartbeat_cannot_corrupt_retry(self) -> None:
-        submitted = self.submit_live()
+        submitted = self.submit_immutable()
         self.engine.schedule(launch_batch=1)
         stale = self.launcher.requests[0]
 

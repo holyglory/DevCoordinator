@@ -431,6 +431,84 @@ class ImmutableDependencyBindingTests(unittest.TestCase):
                 output_root=self.base / "python-output",
             )
 
+    def test_system_python_alias_is_validated_without_copying_system_root(self) -> None:
+        system_root = self.base / "system-python"
+        executable = system_root / "bin" / "python3.13"
+        executable.parent.mkdir(parents=True)
+        executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        executable.chmod(0o755)
+        alias = system_root / "bin" / "python3"
+        alias.symlink_to(executable.name)
+        standard_library = system_root / "lib" / "python3.13"
+        standard_library.mkdir(parents=True)
+        for name in ("os.py", "site.py", "sysconfig.py"):
+            (standard_library / name).write_text(f"# {name}\n", encoding="utf-8")
+        environment_python = self.original / ".venv-v2" / "bin" / "python"
+        environment_python.unlink()
+        environment_python.symlink_to(alias)
+        roots = frozenset({system_root})
+
+        with (
+            mock.patch(
+                "devcoordinator.universal_test_snapshot_service."
+                "_SYSTEM_PYTHON_TOOLCHAIN_ROOTS",
+                roots,
+            ),
+            mock.patch(
+                "devcoordinator.universal_test_runtime."
+                "_SYSTEM_PYTHON_TOOLCHAIN_ROOTS",
+                roots,
+            ),
+            mock.patch(
+                "devcoordinator.universal_test_runner."
+                "_SYSTEM_PYTHON_TOOLCHAIN_ROOTS",
+                roots,
+            ),
+        ):
+            bindings, _python, _dotnet = self.derive(
+                {
+                    "driver": "automation",
+                    "cwd": ".",
+                    "argv": ["{python}", "harness.py", "node-suite"],
+                }
+            )
+            binding = bindings[0]
+            self.assertEqual(binding["toolchain"]["source_root"], str(system_root))
+            self.assertEqual(
+                binding["toolchain"]["resolved_executable"], str(executable)
+            )
+            descriptor = self.descriptor(*self.staged(*bindings))
+            SystemdTestAttemptManager._prepare_dependency_mountpoints(
+                descriptor,
+                execution_root=self.materialized,
+                owner_gid=os.getegid(),
+            )
+            properties = SystemdTestAttemptManager._systemd_properties(
+                descriptor,
+                execution_root=self.materialized,
+                output_root=self.base / "system-python-output",
+            )
+            self.assertFalse(
+                any(
+                    str(_IMMUTABLE_PYTHON_TOOLCHAIN_MOUNT) in property_value
+                    for property_value in properties
+                )
+            )
+            self.assertEqual(
+                _immutable_python_launch_executable(descriptor), str(executable)
+            )
+            replacement = system_root / "bin" / "python3.14"
+            replacement.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            replacement.chmod(0o755)
+            alias.unlink()
+            alias.symlink_to(replacement.name)
+            with self.assertRaisesRegex(TestStoreConflict, "toolchain link changed"):
+                SystemdTestAttemptManager._systemd_properties(
+                    descriptor,
+                    execution_root=self.materialized,
+                    output_root=self.base / "system-python-output",
+                )
+
     def test_runtime_creates_only_empty_read_only_dependency_mount_destinations(self) -> None:
         python_bindings, _python, _dotnet = self.derive(
             {

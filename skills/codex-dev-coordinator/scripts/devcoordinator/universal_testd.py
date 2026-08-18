@@ -82,6 +82,7 @@ _FORBIDDEN_EXECUTABLES = frozenset(
     }
 )
 _LOGGER = logging.getLogger(__name__)
+MAX_RESULT_CHUNKS_PER_HEARTBEAT = 64
 
 
 class LiveSourceChanged(TestStoreConflict):
@@ -1390,6 +1391,44 @@ class TestdEngine:
             launch_timeout_seconds=launch_timeout_seconds,
         )
 
+    def _retain_result_observation(
+        self,
+        active: _ActiveAttempt,
+        observation: RunnerObservation,
+    ) -> None:
+        """Persist one exact runner chunk while retaining active ownership."""
+
+        if observation.state != "result" or observation.result_chunk is None:
+            raise TestStoreContractError("runner result observation is incomplete")
+        attempt_id = active.lease.attempt_id
+        active.current_memory_bytes = None
+        active.runtime_active = False
+        chunk = _attempt_result_chunk(observation.result_chunk)
+        if chunk.chunk_id in active.result_chunk_ids:
+            raise TestStoreConflict("runner result chunk is duplicated")
+        self.spool.append_result_chunk(
+            AttemptResultChunkEnvelope(
+                envelope_id=(
+                    f"result-{chunk.chunk_index:06d}-"
+                    + hashlib.sha256(
+                        (
+                            attempt_id
+                            + "\0"
+                            + str(active.lease.generation)
+                            + "\0"
+                            + chunk.chunk_id
+                        ).encode("utf-8")
+                    ).hexdigest()[:32]
+                ),
+                attempt_id=attempt_id,
+                generation=active.lease.generation,
+                chunk=dict(observation.result_chunk),
+            )
+        )
+        active.result_chunk_ids.append(chunk.chunk_id)
+        self._retain_active(active)
+        self.replay_result_spool()
+
     def heartbeat(self) -> dict[str, object]:
         running: list[str] = []
         completed: list[str] = []
@@ -1477,44 +1516,37 @@ class TestdEngine:
                     raise TestStoreConflict(
                         "confirmed runtime regressed to an uncertain launch"
                     )
+                drained_chunks = 0
+                while (
+                    observation.state == "result"
+                    and observation.result_chunk is not None
+                    and drained_chunks < MAX_RESULT_CHUNKS_PER_HEARTBEAT
+                ):
+                    self._retain_result_observation(active, observation)
+                    drained_chunks += 1
+                    if drained_chunks == MAX_RESULT_CHUNKS_PER_HEARTBEAT:
+                        self.store.heartbeat_attempt(
+                            attempt_id,
+                            generation=active.lease.generation,
+                            lease_seconds=self.lease_seconds,
+                            operation_id=str(uuid.uuid4()),
+                        )
+                        running.append(attempt_id)
+                        observation = None
+                        break
+                    observation = self.launcher.observe(active.handle)
+                    if (
+                        observation.launch_confirmed
+                        != active.handle.launch_confirmed
+                    ):
+                        raise TestStoreConflict(
+                            "runner launch confirmation changed while draining results"
+                        )
+                if observation is None:
+                    continue
                 if observation.state == "running":
                     active.current_memory_bytes = observation.current_memory_bytes
                     active.runtime_active = True
-                    self.store.heartbeat_attempt(
-                        attempt_id,
-                        generation=active.lease.generation,
-                        lease_seconds=self.lease_seconds,
-                        operation_id=str(uuid.uuid4()),
-                    )
-                    running.append(attempt_id)
-                elif observation.state == "result" and observation.result_chunk is not None:
-                    active.current_memory_bytes = None
-                    active.runtime_active = False
-                    chunk = _attempt_result_chunk(observation.result_chunk)
-                    if chunk.chunk_id in active.result_chunk_ids:
-                        raise TestStoreConflict("runner result chunk is duplicated")
-                    self.spool.append_result_chunk(
-                        AttemptResultChunkEnvelope(
-                            envelope_id=(
-                                f"result-{chunk.chunk_index:06d}-"
-                                + hashlib.sha256(
-                                (
-                                    attempt_id
-                                    + "\0"
-                                    + str(active.lease.generation)
-                                    + "\0"
-                                    + chunk.chunk_id
-                                ).encode("utf-8")
-                                ).hexdigest()[:32]
-                            ),
-                            attempt_id=attempt_id,
-                            generation=active.lease.generation,
-                            chunk=dict(observation.result_chunk),
-                        )
-                    )
-                    active.result_chunk_ids.append(chunk.chunk_id)
-                    self._retain_active(active)
-                    self.replay_result_spool()
                     self.store.heartbeat_attempt(
                         attempt_id,
                         generation=active.lease.generation,

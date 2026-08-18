@@ -196,6 +196,28 @@ class EngineFixture(unittest.TestCase):
             },
         )
 
+    def submit_immutable(self, *, launch_timeout_seconds: int = 300):
+        selected = plan(
+            mode=SourceMode.IMMUTABLE,
+            fingerprint=uuid.uuid4().hex * 2,
+            launch_timeout_seconds=launch_timeout_seconds,
+        )
+        return self.store.submit_plan(
+            selected,
+            operation_id=operation_id(),
+            actor="codex:testd",
+            owner_uid=1001,
+            target_resources={
+                name: TargetResources(
+                    cpu_millis=1_000,
+                    memory_mib=1_024,
+                    pids=128,
+                    worktree_key=selected.source.original_root,
+                )
+                for name in selected.selected_targets
+            },
+        )
+
 
 class TestdEngineTests(EngineFixture):
     def test_supervision_failure_never_reaps_but_still_schedules_unrelated_work(self) -> None:
@@ -1123,8 +1145,8 @@ class TestdEngineTests(EngineFixture):
         terminal_operation_id = terminal["terminal_operation_id"]
         third = replacement.heartbeat()
 
-        self.assertEqual(first["running_attempt_ids"], [request.ticket.attempt_id])
-        self.assertEqual(second["completed_attempt_ids"], [request.ticket.attempt_id])
+        self.assertEqual(first["completed_attempt_ids"], [request.ticket.attempt_id])
+        self.assertEqual(second["completed_attempt_ids"], [])
         self.assertEqual(third["completed_attempt_ids"], [])
         self.assertEqual(terminal["state"], "succeeded")
         self.assertEqual(terminal["passed_count"], 1)
@@ -1135,6 +1157,55 @@ class TestdEngineTests(EngineFixture):
         self.assertEqual(replacement.spool.active_envelopes(), ())
         self.assertEqual(replacement.spool.pending_result_chunks(), ())
         self.assertEqual(replacement.spool.pending_envelopes(), ())
+
+    def test_result_chunk_stream_drains_in_bounded_batches(self) -> None:
+        submitted = self.submit_immutable()
+        self.engine.schedule(launch_batch=1)
+        request = self.launcher.requests[0]
+        runtime_id = "runtime-" + request.ticket.attempt_id
+        chunk_ids = tuple(f"chunk-batch-{index:03d}" for index in range(65))
+        chunks = [
+            RunnerObservation(
+                "result",
+                result_chunk={
+                    "chunk_id": chunk_id,
+                    "chunk_index": index,
+                    "cases": [],
+                    "failures": [],
+                    "artifacts": [],
+                    "reporter_complete": index == 64,
+                },
+            )
+            for index, chunk_id in enumerate(chunk_ids)
+        ]
+        self.launcher.observations[runtime_id] = [
+            *chunks,
+            RunnerObservation(
+                "exited",
+                AttemptExitEnvelope(
+                    envelope_id="exit-batched-results",
+                    attempt_id=request.ticket.attempt_id,
+                    generation=request.ticket.generation,
+                    operation_id=operation_id(),
+                    conclusion=AttemptConclusion.SUCCEEDED,
+                    duration_seconds=1.0,
+                    result_chunk_ids=chunk_ids,
+                ),
+            ),
+        ]
+
+        first = self.engine.heartbeat()
+        second = self.engine.heartbeat()
+
+        self.assertEqual(first["running_attempt_ids"], [request.ticket.attempt_id])
+        self.assertEqual(
+            second["completed_attempt_ids"],
+            [request.ticket.attempt_id],
+        )
+        self.assertEqual(
+            self.store.get_attempt(request.ticket.attempt_id)["state"],
+            "succeeded",
+        )
 
     def test_running_runtime_survives_replacement_after_ordinary_lease_expiry(
         self,

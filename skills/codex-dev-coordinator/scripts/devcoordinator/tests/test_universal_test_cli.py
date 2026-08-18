@@ -855,6 +855,7 @@ class UniversalTestCliTests(unittest.TestCase):
 
     def test_broker_profile_exception_text_is_not_exposed(self) -> None:
         self._committed_repository()
+        (self.root / "source.py").write_text("VALUE = 2\n", encoding="utf-8")
 
         def broken_profile() -> object:
             raise RuntimeError("credential=do-not-print\x00\n" + ("z" * 20_000))
@@ -977,6 +978,7 @@ class UniversalTestCliTests(unittest.TestCase):
 
     def test_caller_timeouts_are_persisted_in_live_plan(self) -> None:
         self._committed_repository()
+        (self.root / "source.py").write_text("VALUE = 2\n", encoding="utf-8")
         planned = build_local_plan(
             root=self.root,
             temporary=None,
@@ -997,6 +999,7 @@ class UniversalTestCliTests(unittest.TestCase):
 
     def test_broker_registration_makes_live_plan_submittable_not_attestable(self) -> None:
         self._committed_repository()
+        (self.root / "source.py").write_text("VALUE = 2\n", encoding="utf-8")
         profile = FakeSchedulerProfile()
         planned = build_local_plan(
             root=self.root,
@@ -1012,6 +1015,26 @@ class UniversalTestCliTests(unittest.TestCase):
         self.assertTrue(planned["submission"]["available"])
         self.assertFalse(planned["attestable"])
         self.assertEqual(profile.registered_plan_id, planned["plan"]["plan_id"])
+
+    def test_explicit_live_changes_must_cover_current_dirty_source(self) -> None:
+        self._committed_repository()
+        (self.root / "source.py").write_text("VALUE = 2\n", encoding="utf-8")
+        (self.root / "omitted.py").write_text("VALUE = 3\n", encoding="utf-8")
+
+        with self.assertRaisesRegex(
+            UniversalTestCliError,
+            "must exactly match current Git changes",
+        ):
+            build_local_plan(
+                root=self.root,
+                temporary=None,
+                agent="codex",
+                intent="change",
+                raw_changes=("modified:source.py",),
+                requested_targets=(),
+                broker_profile=FakeSchedulerProfile(),
+                operation_id=PLAN_OPERATION_ID,
+            )
 
     def test_submit_returns_real_queued_run_from_broker(self) -> None:
         operation_id = "00000000-0000-4000-8000-000000000002"
@@ -1244,13 +1267,19 @@ class UniversalTestCliTests(unittest.TestCase):
 
     def test_default_plan_envelope_is_bounded_and_marks_truncation(self) -> None:
         self._committed_repository()
+        generated = self.root / "generated"
+        generated.mkdir()
+        for index in range(200):
+            (generated / f"path-{index:04d}.py").write_text(
+                f"VALUE = {index}\n", encoding="utf-8"
+            )
         planned = build_local_plan(
             root=self.root,
             temporary=None,
             agent="codex",
             intent="change",
             raw_changes=tuple(
-                f"modified:generated/path-{index:04d}.py" for index in range(200)
+                f"untracked:generated/path-{index:04d}.py" for index in range(200)
             ),
             requested_targets=(),
             broker_profile=None,

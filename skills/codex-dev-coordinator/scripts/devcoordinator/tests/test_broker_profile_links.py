@@ -351,6 +351,7 @@ class BrokerProfileTrustTests(unittest.TestCase):
                         "agent": "codex:task:first-use",
                         "canonical_root": str(new_root),
                         "project_kind": "primary",
+                        "reconcile_scope": "runtime",
                     },
                     operation_id=operation_id,
                 ),

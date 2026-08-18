@@ -31,6 +31,21 @@ def parser() -> argparse.ArgumentParser:
 
 
 class LifecycleParserContractTests(unittest.TestCase):
+    def test_universal_test_planning_error_is_not_process_health_failure(self) -> None:
+        error = dev_coordinator.UniversalTestCliError(
+            "explicit changes are incomplete",
+            code="test_plan_changes_mismatch",
+            classification="repository_source_invalid",
+            action_required="Omit --change and replan.",
+        )
+
+        payload = dev_coordinator.coordinator_exception_payload(error)
+
+        self.assertEqual(payload["code"], "test_plan_changes_mismatch")
+        self.assertEqual(payload["classification"], "repository_source_invalid")
+        self.assertFalse(payload["mutation_performed"])
+        self.assertEqual(payload["action_required"], "Omit --change and replan.")
+
     def test_legacy_absolute_project_route_does_not_require_local_stat(self) -> None:
         route = Path("/another-account/private/repository")
         dev_coordinator._PROJECT_ROOT_CACHE.pop(str(route), None)

@@ -34,6 +34,7 @@ from .universal_test_service import (
     TestPlanPreviewUnavailable,
 )
 from .universal_test_store import (
+    LiveRetryReplanRequired,
     TargetResources,
     TestStoreConflict,
     TestStoreContractError,
@@ -565,6 +566,8 @@ class TestPlaneDispatcher:
                 code, message = str(getattr(error, "code")), str(error)
             elif isinstance(error, TestStoreNotFound):
                 code, message = "not_found", str(error)
+            elif isinstance(error, LiveRetryReplanRequired):
+                code, message = error.code, str(error)
             elif isinstance(error, TestStoreConflict):
                 code, message = "conflict", str(error)
             elif isinstance(error, TestStoreContractError):

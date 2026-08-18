@@ -45,6 +45,7 @@ from devcoordinator.universal_test_store import (
     CaseResult,
     FailureClassification,
     FailureRecord,
+    LiveRetryReplanRequired,
     MAX_EXPIRED_ATTEMPTS_PER_REAP,
     RunnableTarget,
     TargetResources,
@@ -690,6 +691,9 @@ class UniversalTestStoreTests(StoreFixture):
         )
         self.assertEqual(live_status["state"], "running")
         self.assertEqual(live_status["failure_count"], 1)
+        self.assertEqual(live_status["counts"]["attempts"], 1)
+        self.assertEqual(live_status["counts"]["failed"], 1)
+        self.assertIn("aggregate_test_seconds", live_status["timing"])
         self.assertEqual(self.store.artifacts(run_id=submitted.run_id)[0]["artifact_id"], "artifact-1")
         resolved = self.store.artifact(
             run_id=submitted.run_id, artifact_id="artifact-1"
@@ -1158,6 +1162,32 @@ class UniversalTestStoreTests(StoreFixture):
         )
         self.assertTrue(deduplicated.deduplicated)
         self.assertEqual(deduplicated.run_id, retry.run_id)
+
+    def test_live_failed_only_retry_requires_fresh_plan_without_new_run(self) -> None:
+        submitted = self.submit(selected_plan=plan(mode=SourceMode.LIVE))
+        grant = self.lease_lint(submitted.run_id)
+        self.complete(grant, conclusion=AttemptConclusion.TEST_FAILED)
+        before = tuple(
+            item["run_id"]
+            for item in self.store.runs(repository_id="repo-tests", limit=50)
+        )
+
+        with self.assertRaisesRegex(
+            LiveRetryReplanRequired,
+            "fresh current-source plan",
+        ):
+            self.store.retry_run(
+                submitted.run_id,
+                actor="codex:retry-live",
+                failed_only=True,
+                operation_id=operation_id(),
+            )
+
+        after = tuple(
+            item["run_id"]
+            for item in self.store.runs(repository_id="repo-tests", limit=50)
+        )
+        self.assertEqual(after, before)
 
     def test_failed_only_retry_densifies_wave_after_succeeded_dependency(self) -> None:
         submitted = self.submit()

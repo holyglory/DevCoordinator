@@ -157,6 +157,7 @@ from devcoordinator.test_runner import (
     test_statistics,
 )
 from devcoordinator.universal_test_cli import (
+    UniversalTestCliError,
     add_universal_test_cli_parser,
     handle_universal_test_cli,
 )
@@ -392,6 +393,16 @@ class PrivateStateWriteCleanupError(RuntimeError):
 def coordinator_exception_payload(exc: BaseException) -> dict[str, Any]:
     if isinstance(exc, StructuredCoordinatorError):
         return copy.deepcopy(exc.payload)
+    if isinstance(exc, UniversalTestCliError):
+        payload: dict[str, Any] = {
+            "error": str(exc),
+            "code": exc.code,
+            "classification": exc.classification,
+            "mutation_performed": False,
+        }
+        if exc.action_required is not None:
+            payload["action_required"] = exc.action_required
+        return payload
     if isinstance(exc, FencedRetirementResumeError):
         payload = coordinator_exception_payload(exc.original_error)
         original_action = str(payload.get("action_required") or "").strip()

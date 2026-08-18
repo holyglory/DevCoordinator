@@ -74,6 +74,7 @@ from .broker_configuration import (
     DeclaredComposeConfigurationError,
     DeclaredRuntimeConfigurationError,
     reconcile_declared_compose_first_use,
+    reconcile_declared_ephemeral_templates_first_use,
     reconcile_declared_servers_first_use,
     revoke_repository_from_protected_profile,
     revoke_server_from_protected_profile,
@@ -1490,6 +1491,14 @@ class StoreBackedMutationBackend:
                 error.code,
                 " ".join(str(error.message).split())[:1024],
             )
+            if error.code == "live_retry_replan_required":
+                raise BrokerBackendError(
+                    error.code,
+                    "The retained run used live source and cannot be retried "
+                    "after source changes. Create a fresh current-source plan; "
+                    "no retry run was created.",
+                    operation_id=request.operation_id,
+                ) from error
             snapshot_transport_failure = error.code in {
                 "snapshot_transport_unavailable",
                 "snapshot_transport_timeout",
@@ -1959,13 +1968,24 @@ class StoreBackedMutationBackend:
         repo_id: str,
         root: str,
         execution_uid: int,
+        reconcile_scope: str = "runtime",
     ) -> Mapping[str, Any]:
-        """Reconcile an older uncertain Compose result before resealing it."""
+        """Reconcile only the catalog family required by the start-like intent."""
 
-        compose_definition_id = self._persistence.configured_compose_definition_id(
-            repo_id=repo_id
+        if reconcile_scope not in {"runtime", "test"}:
+            raise TestStoreContractError("repository reconciliation scope is invalid")
+        compose: Mapping[str, Any] = {
+            "changed": False,
+            "compose_definition_id": None,
+            "compose_run_once_services": {},
+        }
+        servers: Mapping[str, Any] = {"changed": False, "servers": {}}
+        compose_definition_id = (
+            self._persistence.configured_compose_definition_id(repo_id=repo_id)
+            if reconcile_scope == "runtime"
+            else None
         )
-        if compose_definition_id is not None:
+        if reconcile_scope == "runtime" and compose_definition_id is not None:
             prior_operation_id = (
                 self._persistence.reconcilable_compose_operation_for_definition(
                     repo_id=repo_id,
@@ -1994,20 +2014,31 @@ class StoreBackedMutationBackend:
                     prior_operation_id,
                     evidence=evidence,
                 )
-        compose = reconcile_declared_compose_first_use(
+        if reconcile_scope == "runtime":
+            compose = reconcile_declared_compose_first_use(
+                self._persistence,
+                repo_id=repo_id,
+                root=Path(root),
+            )
+            servers = reconcile_declared_servers_first_use(
+                self._persistence,
+                repo_id=repo_id,
+                root=Path(root),
+                execution_uid=execution_uid,
+            )
+        ephemeral = reconcile_declared_ephemeral_templates_first_use(
             self._persistence,
             repo_id=repo_id,
             root=Path(root),
-        )
-        servers = reconcile_declared_servers_first_use(
-            self._persistence,
-            repo_id=repo_id,
-            root=Path(root),
-            execution_uid=execution_uid,
         )
         return {
             **dict(compose),
-            "changed": bool(compose.get("changed") or servers.get("changed")),
+            **dict(ephemeral),
+            "changed": bool(
+                compose.get("changed")
+                or servers.get("changed")
+                or ephemeral.get("changed")
+            ),
             "servers": dict(servers.get("servers") or {}),
         }
 
@@ -2050,6 +2081,7 @@ class StoreBackedMutationBackend:
                         repo_id=repo_id,
                         root=root,
                         execution_uid=execution_uid,
+                        reconcile_scope=str(request.arguments["reconcile_scope"]),
                     )
                 ),
             )

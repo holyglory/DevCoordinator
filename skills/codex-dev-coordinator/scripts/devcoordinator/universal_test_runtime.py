@@ -87,6 +87,7 @@ _PYTHON_ENVIRONMENT_NAMES = frozenset({".venv-v2", ".venv", "venv"})
 _IMMUTABLE_PYTHON_TOOLCHAIN_MOUNT = Path(
     "/tmp/devcoordinator-immutable-python-toolchain"
 )
+_SYSTEM_PYTHON_TOOLCHAIN_ROOTS = frozenset({Path("/usr"), Path("/usr/local")})
 _DOTNET_PACKAGES_DESTINATION = ".devcoordinator-dependencies/nuget-source"
 _MAX_DEPENDENCY_IDENTITY_BYTES = 64 * 1024 * 1024
 _MAX_DEPENDENCY_IDENTITY_FILES = 8_192
@@ -2082,7 +2083,10 @@ class SystemdTestAttemptManager:
                 if (
                     current_link_target != toolchain["link_target"]
                     or not Path(current_link_target).is_absolute()
-                    or Path(current_link_target).is_symlink()
+                    or (
+                        Path(current_link_target).is_symlink()
+                        and toolchain_root not in _SYSTEM_PYTHON_TOOLCHAIN_ROOTS
+                    )
                     or lexical.resolve(strict=True) != resolved_executable
                 ):
                     raise TestStoreConflict(
@@ -3338,6 +3342,12 @@ class SystemdTestAttemptManager:
                 )
                 source = Path(str(toolchain["source_root"]))
                 if toolchain["installation_kind"] == "python-toolchain":
+                    if source in _SYSTEM_PYTHON_TOOLCHAIN_ROOTS:
+                        # The service-owned system toolchain is already visible
+                        # inside the isolated unit. Its exact link, inode and
+                        # bounded installation identity were revalidated above;
+                        # copying all of /usr would be wasteful and less faithful.
+                        return ()
                     # security-assumptions.md confirms one trusted local
                     # developer across host accounts while requiring process
                     # isolation and no public source exposure.  Mount the exact
