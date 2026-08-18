@@ -4578,11 +4578,18 @@ class BrokerTestAttemptCoordinator:
             state.current_memory_bytes
         )
         terminal_from_result = result_summary is not None
-        if terminal_from_result and state.active:
+        result_stream_complete = (
+            terminal_from_result
+            and result_chunk_index >= int(result_summary["chunk_count"])
+        )
+        if terminal_from_result and state.active and result_stream_complete:
             # The owner publishes result.json atomically only after every
             # digest-bound chunk. That exact evidence is terminal even when a
             # descendant or obsolete release keeps the native cgroup active.
-            # Stop only this deterministic runtime; do not renew its lease.
+            # Preserve the result directory until the caller has drained the
+            # complete declared stream: the native stop path collects and
+            # removes those files. Stop only on the manifest-complete
+            # observation, then let the caller commit its terminal envelope.
             self.manager.cancel(runtime_id)
         effective_active = state.active and not terminal_from_result
         output_progress = (

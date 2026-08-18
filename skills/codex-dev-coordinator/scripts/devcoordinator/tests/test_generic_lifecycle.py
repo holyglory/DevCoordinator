@@ -110,7 +110,7 @@ class BrokerCleanupProjectionTests(unittest.TestCase):
         self.assertEqual(profile.repository.call_count, 4)
         profile.inventory.assert_called_once_with(canonical_root="/repos/shared")
 
-    def test_cleanup_plan_resolves_current_inventory_not_stale_profile_ids(self) -> None:
+    def test_cleanup_plan_uses_server_wide_anchor_without_repository_membership(self) -> None:
         repository_a = mock.Mock(canonical_root="/repos/a", repo_id="repo-a")
         repository_b = mock.Mock(canonical_root="/repos/b", repo_id="repo-b")
         profile = mock.Mock()
@@ -194,14 +194,12 @@ class BrokerCleanupProjectionTests(unittest.TestCase):
 
         self.assertEqual(result["status"], "planned")
         self.assertIs(
-            profile.call.call_args.kwargs["repository"], repository_b
+            profile.call.call_args.kwargs["repository"], repository_a
         )
         self.assertEqual(
             profile.call.call_args.kwargs["resource_id"], "docker-current"
         )
-        profile.inventory.assert_called_once_with(
-            canonical_root=repository_a.canonical_root
-        )
+        profile.inventory.assert_not_called()
 
 
 def _service(

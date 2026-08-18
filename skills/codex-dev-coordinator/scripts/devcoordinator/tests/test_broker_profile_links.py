@@ -2510,6 +2510,14 @@ class BrokerProfileTrustTests(unittest.TestCase):
                 broker_profile_module.HOST_OBSERVE_CLIENT_TIMEOUT_SECONDS,
             ),
             (
+                BrokerOperation.CLEANUP_PLAN,
+                broker_profile_module.HOST_OBSERVE_CLIENT_TIMEOUT_SECONDS,
+            ),
+            (
+                BrokerOperation.CLEANUP_APPLY,
+                broker_profile_module.HOST_OBSERVE_CLIENT_TIMEOUT_SECONDS,
+            ),
+            (
                 BrokerOperation.DATABASE_BACKUP,
                 broker_profile_module.DATABASE_BACKUP_CLIENT_TIMEOUT_SECONDS,
             ),
@@ -2533,12 +2541,27 @@ class BrokerProfileTrustTests(unittest.TestCase):
                             in {
                                 BrokerOperation.REPOSITORY_REMOVE,
                                 BrokerOperation.HOST_OBSERVE,
+                                BrokerOperation.CLEANUP_PLAN,
+                                BrokerOperation.CLEANUP_APPLY,
                             }
                             else "container-postgres"
                         ),
                         operation=operation,
                         arguments=(
                             {
+                                "action": "purge",
+                                "target_kind": "project",
+                                "target_id": REPO_ID,
+                                "reason": "remove archived fixture",
+                            }
+                            if operation == BrokerOperation.CLEANUP_PLAN
+                            else {
+                                "plan_id": str(uuid.uuid4()),
+                                "plan_fingerprint": "sha256:" + "6" * 64,
+                                "confirmation_phrase": "PURGE PROJECT fixture",
+                            }
+                            if operation == BrokerOperation.CLEANUP_APPLY
+                            else {
                                 "plan_id": "plan-" + "a" * 32,
                                 "expected_repository_id": REPO_ID,
                                 "actor": "timeout-test",

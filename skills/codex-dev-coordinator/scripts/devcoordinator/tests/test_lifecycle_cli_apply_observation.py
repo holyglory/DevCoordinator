@@ -341,6 +341,37 @@ class LifecycleApplyObservationTests(unittest.TestCase):
             [("disable", self.A), ("stop", self.A)],
         )
 
+    def test_identical_observation_revision_between_refresh_and_fence_is_not_drift(self) -> None:
+        plan = self._plan_repository()
+        sample = self._sample(
+            self._container(self.A, project=self.repo_a),
+            self._container(self.B, project=self.repo_b),
+        )
+        self.adapter.add_container(self.A)
+        original = SQLiteLifecyclePersistence.bind_lifecycle_plan_successor
+
+        def bind_then_observe(persistence, predecessor, successor):
+            original(persistence, predecessor, successor)
+            self._commit_observation(sample)
+
+        with mock.patch.object(
+            SQLiteLifecyclePersistence,
+            "bind_lifecycle_plan_successor",
+            autospec=True,
+            side_effect=bind_then_observe,
+        ):
+            result = self._handle(
+                self._repository_remove_args(plan),
+                observe_before_apply=self._callback(sample),
+            )
+
+        self.assertEqual(result["status"], "succeeded")
+        self.assertTrue(result["hidden"])
+        self.assertEqual(
+            self.adapter.effects,
+            [("disable", self.A), ("stop", self.A)],
+        )
+
     def test_resume_revalidates_replacement_drift_before_further_host_effects(self) -> None:
         plan = self._plan_repository()
         unchanged = self._sample(

@@ -488,7 +488,7 @@ class UniversalTestAttemptChainSecurityTests(unittest.TestCase):
         )
         self.assertIsNone(terminal["progress"])
 
-    def test_atomic_runner_result_terminalizes_and_stops_lingering_native_unit(self) -> None:
+    def test_atomic_runner_result_drains_before_stopping_lingering_native_unit(self) -> None:
         candidate, lease = self._submit_and_lease(
             "repo-lingering-result", self.repo_a, os.geteuid()
         )
@@ -511,18 +511,38 @@ class UniversalTestAttemptChainSecurityTests(unittest.TestCase):
             "reporter_complete": True,
         }
         native.finish(runtime_id, descriptor, chunk)
+        second_chunk = {
+            **chunk,
+            "chunk_id": "chunk-lingering-result-1",
+            "chunk_index": 1,
+        }
+        native.chunks[(runtime_id, 1)] = second_chunk
         native.states[runtime_id] = replace(
             native.states[runtime_id],
             active=True,
             state="deactivating",
             exit_status=None,
             finished_at=None,
+            result_document={
+                **(native.states[runtime_id].result_document or {}),
+                "chunk_manifest": [
+                    {"chunk_index": 0},
+                    {"chunk_index": 1},
+                ],
+            },
         )
 
-        observed = coordinator.observe(runtime_id)
+        first = coordinator.observe(runtime_id, result_chunk_index=0)
+        second = coordinator.observe(runtime_id, result_chunk_index=1)
+
+        self.assertEqual(first["result_chunk"], chunk)
+        self.assertEqual(second["result_chunk"], second_chunk)
+        self.assertEqual(native.cancelled, [])
+
+        observed = coordinator.observe(runtime_id, result_chunk_index=2)
 
         self.assertEqual(observed["state"], "exited")
-        self.assertEqual(observed["result_chunk"], chunk)
+        self.assertIsNone(observed["result_chunk"])
         self.assertEqual(observed["exit_status"], 0)
         self.assertEqual(native.cancelled, [runtime_id])
 

@@ -1183,6 +1183,15 @@ def _broker_client_timeout_seconds(
         return DATABASE_RESTORE_CLIENT_TIMEOUT_SECONDS
     if operation is BrokerOperation.HOST_OBSERVE:
         return HOST_OBSERVE_CLIENT_TIMEOUT_SECONDS
+    if operation in {
+        BrokerOperation.CLEANUP_PLAN,
+        BrokerOperation.CLEANUP_APPLY,
+    }:
+        # Both operations may include the same mandatory fresh full-host
+        # observation as HOST_OBSERVE before they can safely plan or apply.
+        # The generic ten-second transport deadline abandons normal protected
+        # work and loses its useful result.
+        return HOST_OBSERVE_CLIENT_TIMEOUT_SECONDS
     if operation is BrokerOperation.INVENTORY_READ:
         return INVENTORY_READ_CLIENT_TIMEOUT_SECONDS
     if operation is BrokerOperation.TEST_REPOSITORY_CATALOG:

@@ -9,7 +9,6 @@ from typing import Any, Callable, Mapping, TypeVar
 from .broker import BrokerOperation
 from .broker_links import BrokerLinkStore
 from .broker_profile import BrokerClientProfile, BrokerRepositoryProfile, load_broker_profile
-from .agent_projection import AgentProjectionError, project_targets
 from .cleanup_lifecycle import CleanupLifecycle
 from .host_lifecycle import CoordinatorHostLifecycleAdapter
 from .repository_lifecycle import ExactResourceRef, RepositoryLifecycle, ResourceKind
@@ -987,22 +986,27 @@ def _handle_broker_cleanup(
         raise RuntimeError("cleanup requires at least one configured broker repository")
     if args.group == "archives":
         archives: dict[tuple[str, str], dict[str, Any]] = {}
-        for repository in repositories:
-            _operation_id, result = profile.call(
-                repository=repository,
-                resource_id=repository.repo_id,
-                operation=BrokerOperation.ARCHIVES_READ,
-                arguments={},
-            )
-            rows = result.get("archives")
-            if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
-                raise RuntimeError("host broker returned an invalid archive listing")
-            for row in rows:
-                project_id = str(row.get("project_id") or row.get("target_id") or "")
-                if project_id != repository.repo_id:
-                    raise RuntimeError("host broker returned an archive outside configured authority")
-                key = (str(row.get("target_kind") or ""), str(row.get("target_id") or ""))
-                archives[key] = dict(row)
+        # Archive inventory is server-wide. A configured repository supplies
+        # only the transport anchor; it is not an authorization boundary and
+        # must not filter archives from other repositories.
+        repository = min(repositories, key=lambda item: item.canonical_root)
+        _operation_id, result = profile.call(
+            repository=repository,
+            resource_id=repository.repo_id,
+            operation=BrokerOperation.ARCHIVES_READ,
+            arguments={},
+        )
+        rows = result.get("archives")
+        if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+            raise RuntimeError("host broker returned an invalid archive listing")
+        for row in rows:
+            key = (str(row.get("target_kind") or ""), str(row.get("target_id") or ""))
+            if not all(key):
+                raise RuntimeError("host broker returned an invalid archive identity")
+            existing = archives.get(key)
+            if existing is not None and existing != row:
+                raise RuntimeError("host broker returned conflicting duplicate archives")
+            archives[key] = dict(row)
         return {
             "archives": sorted(
                 archives.values(),
@@ -1017,37 +1021,11 @@ def _handle_broker_cleanup(
     if args.action == "plan":
         kind = "project" if str(args.target_kind) == "repository" else str(args.target_kind)
         target_id = str(args.target_id)
-        matches: list[BrokerRepositoryProfile] = []
-        inventory = profile.inventory(canonical_root=repositories[0].canonical_root)
-        projection_kind = {"server": "service", "container": "docker"}.get(kind)
-        for repository in repositories:
-            if kind in {"project", "worktree"} and repository.repo_id == target_id:
-                matches.append(repository)
-                continue
-            if projection_kind is None:
-                continue
-            try:
-                projection = project_targets(
-                    inventory,
-                    effective_root=repository.canonical_root,
-                    selector=target_id,
-                    kind=projection_kind,
-                    limit=1,
-                )
-            except AgentProjectionError as error:
-                if error.code == "target_not_found":
-                    continue
-                raise RuntimeError(
-                    f"host broker inventory could not resolve cleanup target: {error}"
-                ) from error
-            selected = projection.get("selected")
-            if isinstance(selected, Mapping) and selected.get("id") == target_id:
-                matches.append(repository)
-        if len(matches) != 1:
-            raise RuntimeError(
-                "cleanup target is not exactly one current authority-configured resource"
-            )
-        repository = matches[0]
+        # The exact cleanup target may intentionally be absent from the active
+        # profile because it is already archived. Any current repository is a
+        # transport anchor; broker-side exact identity, blockers, plan
+        # fingerprint, and confirmation own the lifecycle decision.
+        repository = min(repositories, key=lambda item: item.canonical_root)
         operation = BrokerOperation.CLEANUP_PLAN
         arguments = {
             "action": str(args.lifecycle_action),
@@ -1057,10 +1035,9 @@ def _handle_broker_cleanup(
         }
         resource_id = target_id
     else:
-        # The service resolves the durable plan to its exact repository and
-        # rechecks that repository's live cleanup grant.  The anchor only
-        # authenticates the installed profile; no client DB lookup is used.
-        repository = repositories[0]
+        # The service resolves the durable plan to its exact global target.
+        # The repository is only a current transport anchor.
+        repository = min(repositories, key=lambda item: item.canonical_root)
         operation = BrokerOperation.CLEANUP_APPLY
         arguments = {
             "plan_id": str(args.plan_id),

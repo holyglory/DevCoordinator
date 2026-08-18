@@ -2152,9 +2152,14 @@ def _test(
         document = dict(result)
         document.setdefault("ok", True)
         document["operation_id"] = operation_id
-        document["continuation"] = continuation_handle(
-            "operation", operation_id
-        )
+        # Test mutations are retained by testd's run store, not the broker's
+        # generic runtime-operation journal. The operation ID is an exact
+        # idempotent replay identity, but it is not a followable operation.
+        returned_run_id = str(document.get("run_id") or run_id)
+        run_handle = continuation_handle("run", returned_run_id)
+        document.pop("continuation", None)
+        document["run"] = run_handle
+        document["next_command"] = f"devcoordinator test follow {run_handle}"
         return require_agent_result(document, surface=f"test {action}")
     raise AgentCliError("command_unsupported", "test action is unsupported")
 
@@ -2587,6 +2592,7 @@ def _failure(
     *,
     mutation_attempted: bool = False,
     operation_id_hint: str | None = None,
+    operation_follow_supported: bool = True,
     broker_contacted: bool | None = False,
     observed_mutation: bool | None = False,
     project_hint: str | None = None,
@@ -2664,7 +2670,7 @@ def _failure(
             except AgentContractError:
                 operation_id = None
     continuation = None
-    if operation_id is not None and (
+    if operation_follow_supported and operation_id is not None and (
         outcome != "certain"
         or (phase == "repository_adoption" and broker_contacted is True)
     ):
@@ -2960,6 +2966,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                         getattr(namespace, "operation_id", None)
                         if namespace is not None
                         else None
+                    ),
+                    operation_follow_supported=not (
+                        namespace is not None
+                        and getattr(namespace, "command", None) == "test"
+                        and getattr(namespace, "test_action", None)
+                        in {"cancel", "retry"}
                     ),
                     broker_contacted=execution_state["broker_contacted"],
                     observed_mutation=execution_state["mutation_performed"],

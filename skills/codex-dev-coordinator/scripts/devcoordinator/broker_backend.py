@@ -76,7 +76,6 @@ from .broker_configuration import (
     reconcile_declared_compose_first_use,
     reconcile_declared_ephemeral_templates_first_use,
     reconcile_declared_servers_first_use,
-    revoke_repository_from_protected_profile,
     revoke_server_from_protected_profile,
 )
 from .broker_profile import configured_profile_path
@@ -6787,21 +6786,14 @@ class StoreBackedMutationBackend:
                     cleanup_operation_id=str(plan.plan_id),
                 )
             )
-            profile_revocation = revoke_repository_from_protected_profile(
-                profile_path=configured_profile_path(),
-                repo_id=repo_id,
-                repository_generation=repository_generation,
-                cleanup_operation_id=str(plan.plan_id),
-                expected_database_generation=(
-                    self._persistence.database_generation()
-                ),
-            )
+            # security-assumptions.md, “Explicitly unnecessary gates”:
+            # repository association is routing/context, never membership or
+            # permission. Permanent cleanup therefore updates canonical
+            # service state and exact worker projections only; it must not
+            # mutate a root-owned client routing profile as an access revoke.
             return {
                 "status": "project_generation_revoked",
-                "repository_revocation": {
-                    "service": service_revocation,
-                    "protected_profile": profile_revocation,
-                },
+                "repository_revocation": {"service": service_revocation},
                 "workers": worker_evidence["workers"],
                 "server_projections": removed_servers,
             }

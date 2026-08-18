@@ -2273,54 +2273,6 @@ def revoke_server_from_protected_profile(
     }
 
 
-def revoke_repository_from_protected_profile(
-    *,
-    profile_path: Path,
-    repo_id: str,
-    repository_generation: int,
-    cleanup_operation_id: str,
-    expected_database_generation: str,
-) -> dict[str, Any]:
-    """Remove one permanently revoked repository generation from all clients."""
-
-    path = profile_path.expanduser()
-    if not path.is_absolute() or ".." in path.parts:
-        raise ValueError("broker profile path must be absolute without traversal")
-    for value, label in (
-        (repo_id, "repo_id"),
-        (cleanup_operation_id, "cleanup_operation_id"),
-        (expected_database_generation, "database_generation"),
-    ):
-        if not isinstance(value, str) or not value:
-            raise ValueError(f"{label} must be a non-empty string")
-    if type(repository_generation) is not int or repository_generation < 0:
-        raise ValueError("repository_generation must be a non-negative integer")
-    initial = _read_protected_profile_for_revocation(
-        path, expected_database_generation=expected_database_generation
-    )
-    del initial
-    _ensure_root_profile_parent(path.parent)
-    with _locked_root_profile(path):
-        document = _read_protected_profile_for_revocation(
-            path, expected_database_generation=expected_database_generation
-        )
-        affected = _revoke_repository_from_profile_document(
-            document,
-            repo_id=repo_id,
-            repository_generation=repository_generation,
-        )
-        if affected:
-            _atomic_write_root_json(path, document)
-    return {
-        "status": "revoked" if affected else "already_revoked",
-        "repo_id": repo_id,
-        "repository_generation": repository_generation,
-        "cleanup_operation_id": cleanup_operation_id,
-        "affected_routes": affected,
-        "profile_path": str(path),
-    }
-
-
 def _read_protected_profile_for_revocation(
     path: Path, *, expected_database_generation: str
 ) -> dict[str, Any]:
@@ -2381,36 +2333,6 @@ def _revoke_server_from_profile_document(
         if aliases:
             del servers[server_name]
             affected.append(str(repository.get("canonical_root") or ""))
-    return sorted(affected)
-
-
-def _revoke_repository_from_profile_document(
-    document: dict[str, Any],
-    *,
-    repo_id: str,
-    repository_generation: int,
-) -> list[str]:
-    """Remove only the exact revoked repository incarnation from each client."""
-
-    repositories = document.get("repositories")
-    if not isinstance(repositories, list):
-        raise RuntimeError("protected broker routing catalog is invalid")
-    affected = [
-        str(repository.get("canonical_root") or "")
-        for repository in repositories
-        if isinstance(repository, dict)
-        and str(repository.get("repo_id") or "") == repo_id
-        and repository.get("generation") == repository_generation
-    ]
-    document["repositories"] = [
-        repository
-        for repository in repositories
-        if not (
-            isinstance(repository, dict)
-            and str(repository.get("repo_id") or "") == repo_id
-            and repository.get("generation") == repository_generation
-        )
-    ]
     return sorted(affected)
 
 

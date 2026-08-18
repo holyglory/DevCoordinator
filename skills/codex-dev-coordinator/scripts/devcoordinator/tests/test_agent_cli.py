@@ -1431,6 +1431,57 @@ class AgentCliTests(unittest.TestCase):
         )
         profile.test_run_summary.assert_not_called()
 
+    def test_test_cancel_returns_run_follow_not_unresolvable_operation_follow(self) -> None:
+        operation_id = "00000000-0000-4000-8000-000000000141"
+        profile = mock.Mock()
+        repository = mock.Mock(repo_id="repo-1")
+        profile.resolve_repository.return_value = repository
+        profile.cancel_test_run.return_value = {
+            "schema_version": 1,
+            "ok": True,
+            "run_id": "run-cancelled",
+            "state": "cancelling",
+        }
+        namespace = agent_cli._parser().parse_args(
+            [
+                "test",
+                "cancel",
+                "dc1:run:run-cancelled",
+                "--reason",
+                "reported attempt did not converge",
+                "--operation-id",
+                operation_id,
+            ]
+        )
+
+        result = agent_cli._test(
+            namespace,
+            profile=profile,
+            capabilities={"tests": {}},
+            context=_Context(),
+        )
+
+        self.assertEqual(result["operation_id"], operation_id)
+        self.assertEqual(result["run"], "dc1:run:run-cancelled")
+        self.assertEqual(
+            result["next_command"],
+            "devcoordinator test follow dc1:run:run-cancelled",
+        )
+        self.assertNotIn("continuation", result)
+
+    def test_test_mutation_failure_never_offers_generic_operation_follow(self) -> None:
+        operation_id = "00000000-0000-4000-8000-000000000142"
+        result = agent_cli._failure(
+            OSError("socket disappeared"),
+            mutation_attempted=True,
+            operation_id_hint=operation_id,
+            operation_follow_supported=False,
+        )
+
+        self.assertEqual(result["operation_id"], operation_id)
+        self.assertNotIn("continuation", result)
+        self.assertNotEqual(result.get("action"), "follow_operation")
+
     def test_mutation_transport_failure_preserves_recovery_identity(self) -> None:
         operation_id = "00000000-0000-4000-8000-000000000001"
         result = agent_cli._failure(

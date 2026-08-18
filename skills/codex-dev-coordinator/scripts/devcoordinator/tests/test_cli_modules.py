@@ -17,7 +17,7 @@ import devcoordinator.broker_cli as broker_cli_module
 from devcoordinator import broker_configuration
 from devcoordinator.broker import BrokerError, BrokerOperation, UnixBrokerServer
 from devcoordinator.broker_cli import add_broker_parser, handle_broker_cli, serve_broker
-from devcoordinator.lifecycle_cli import add_lifecycle_parsers
+from devcoordinator.lifecycle_cli import _handle_broker_cleanup, add_lifecycle_parsers
 from devcoordinator.store import CoordinatorStore, utc_timestamp
 from devcoordinator.tests.test_broker import CanonicalTemporaryDirectory
 
@@ -31,6 +31,118 @@ def parser() -> argparse.ArgumentParser:
 
 
 class LifecycleParserContractTests(unittest.TestCase):
+    def test_archive_listing_is_server_wide_through_one_transport_anchor(self) -> None:
+        first = mock.Mock(repo_id="repo-a", canonical_root="/a")
+        second = mock.Mock(repo_id="repo-b", canonical_root="/b")
+        profile = mock.Mock()
+        profile.repositories = {"b": second, "a": first}
+        profile.repository.side_effect = lambda root: {
+            "/a": first,
+            "/b": second,
+        }[root]
+        profile.call.return_value = (
+            "archive-read-operation",
+            {
+                "archives": [
+                    {
+                        "target_kind": "project",
+                        "target_id": "repo-b",
+                        "project_id": "repo-b",
+                        "display_name": "Project B",
+                        "archived_at": "2026-08-18T02:00:00Z",
+                    },
+                    {
+                        "target_kind": "project",
+                        "target_id": "repo-a",
+                        "project_id": "repo-a",
+                        "display_name": "Project A",
+                        "archived_at": "2026-08-18T01:00:00Z",
+                    },
+                ]
+            },
+        )
+
+        result = _handle_broker_cleanup(
+            argparse.Namespace(group="archives"), profile=profile
+        )
+
+        self.assertEqual(
+            [item["target_id"] for item in result["archives"]],
+            ["repo-b", "repo-a"],
+        )
+        profile.call.assert_called_once_with(
+            repository=first,
+            resource_id="repo-a",
+            operation=BrokerOperation.ARCHIVES_READ,
+            arguments={},
+        )
+
+    def test_archive_listing_rejects_conflicting_duplicate_identity(self) -> None:
+        repository = mock.Mock(repo_id="repo-a", canonical_root="/a")
+        profile = mock.Mock()
+        profile.repositories = {"a": repository}
+        profile.repository.return_value = repository
+        profile.call.return_value = (
+            "archive-read-operation",
+            {
+                "archives": [
+                    {"target_kind": "project", "target_id": "repo-a"},
+                    {
+                        "target_kind": "project",
+                        "target_id": "repo-a",
+                        "status": "removed",
+                    },
+                ]
+            },
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "conflicting duplicate"):
+            _handle_broker_cleanup(
+                argparse.Namespace(group="archives"), profile=profile
+            )
+
+    def test_cleanup_plan_uses_anchor_for_target_absent_from_active_profile(self) -> None:
+        anchor = mock.Mock(repo_id="repo-active", canonical_root="/active")
+        profile = mock.Mock()
+        profile.repositories = {"active": anchor}
+        profile.repository.return_value = anchor
+        profile.call.return_value = (
+            "cleanup-plan-operation",
+            {
+                "status": "planned",
+                "target": {
+                    "target_kind": "project",
+                    "target_id": "repo-archived",
+                },
+            },
+        )
+
+        result = _handle_broker_cleanup(
+            argparse.Namespace(
+                group="cleanup",
+                action="plan",
+                lifecycle_action="purge",
+                target_kind="project",
+                target_id="repo-archived",
+                reason="remove archived fixture",
+            ),
+            profile=profile,
+        )
+
+        self.assertEqual(result["status"], "planned")
+        profile.inventory.assert_not_called()
+        profile.call.assert_called_once_with(
+            repository=anchor,
+            resource_id="repo-archived",
+            operation=BrokerOperation.CLEANUP_PLAN,
+            arguments={
+                "action": "purge",
+                "target_kind": "project",
+                "target_id": "repo-archived",
+                "reason": "remove archived fixture",
+            },
+        )
+
     def test_universal_test_planning_error_is_not_process_health_failure(self) -> None:
         error = dev_coordinator.UniversalTestCliError(
             "explicit changes are incomplete",

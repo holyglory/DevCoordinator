@@ -2179,16 +2179,19 @@ def _deduplicate_blockers(values: Sequence[Mapping[str, Any]]) -> list[dict[str,
 
 
 def _run_git(root: Path, *arguments: str) -> str:
-    owner = root.stat()
-    result = subprocess.run(
-        [_resolve_executable("git"), "-C", str(root), *arguments],
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=15.0,
-        env=_sanitized_env(),
-        preexec_fn=_owner_preexec(int(owner.st_uid), int(owner.st_gid)),
-    )
+    try:
+        owner = root.stat()
+        result = subprocess.run(
+            [_resolve_executable("git"), "-C", str(root), *arguments],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=15.0,
+            env=_sanitized_env(),
+            preexec_fn=_owner_preexec(int(owner.st_uid), int(owner.st_gid)),
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise CleanupError("Git could not inspect the retained worktree boundary") from error
     if result.returncode != 0:
         raise CleanupError("Git could not prove the linked worktree boundary")
     return result.stdout
@@ -2203,6 +2206,13 @@ def _inspect_linked_worktree(root: Path) -> tuple[dict[str, Any], list[dict[str,
         root_stat = canonical_root.lstat()
     except FileNotFoundError as error:
         raise CleanupError("worktree path is absent") from error
+    except OSError as error:
+        # Archive listing is an inventory read, not a requirement that the
+        # broker account can traverse every retained developer path. Convert
+        # an inaccessible/unobservable checkout into one exact worktree
+        # blocker so a valid project archive or tombstone cannot take the
+        # entire lifecycle collection down.
+        raise CleanupError("worktree path cannot be inspected") from error
     if stat.S_ISLNK(root_stat.st_mode) or not stat.S_ISDIR(root_stat.st_mode):
         blockers.append(_blocker("unsafe_root", "worktree root is a symlink or not a directory"))
     current = Path(canonical_root.anchor)

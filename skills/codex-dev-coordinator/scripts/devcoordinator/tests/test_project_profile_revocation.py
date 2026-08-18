@@ -1,4 +1,4 @@
-"""Project-incarnation revocation and stale protected-profile regressions."""
+"""Project-incarnation cleanup and stale-generation regressions."""
 
 from __future__ import annotations
 
@@ -67,37 +67,7 @@ def client_profile(repository: BrokerRepositoryProfile) -> BrokerClientProfile:
     )
 
 
-def profile_document(root: Path) -> dict[str, object]:
-    repository = {
-        "canonical_root": str(root),
-        "repo_id": "repo-project",
-        "generation": 7,
-        "servers": {"worker": "worker-old"},
-        "containers": {"postgres": "container-old"},
-        "compose_definition_id": None,
-        "compose_container_ids": [],
-        "compose_run_once_services": {},
-        "ephemeral_templates": {},
-        "ephemeral_secret_policies": {},
-    }
-    return {
-        "version": 2,
-        "service": {
-            "socket": "/run/devcoordinator-authority.sock",
-            "database_generation": "database-generation",
-        },
-        "repositories": [
-            repository,
-            {
-                **repository,
-                "canonical_root": str(root.parent / "other"),
-                "repo_id": "repo-other",
-            },
-        ],
-    }
-
-
-class ProjectProfileRevocationTests(unittest.TestCase):
+class ProjectCleanupGenerationTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = CanonicalTemporaryDirectory()
         self.root = self.temporary.path / "repository"
@@ -107,26 +77,6 @@ class ProjectProfileRevocationTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.temporary.cleanup()
-
-    def test_routing_catalog_removes_only_the_exact_repository_generation(
-        self,
-    ) -> None:
-        document = profile_document(self.root)
-        affected = broker_configuration._revoke_repository_from_profile_document(
-            document,
-            repo_id="repo-project",
-            repository_generation=7,
-        )
-        self.assertEqual(affected, [str(self.root)])
-        self.assertEqual(len(document["repositories"]), 1)
-        self.assertEqual(document["repositories"][0]["repo_id"], "repo-other")
-
-        replay = broker_configuration._revoke_repository_from_profile_document(
-            document,
-            repo_id="repo-project",
-            repository_generation=7,
-        )
-        self.assertEqual(replay, [])
 
     def test_profile_call_binds_repository_generation_to_broker_request(self) -> None:
         repository = repository_profile(self.root, generation=7)
@@ -221,7 +171,7 @@ class ProjectProfileRevocationTests(unittest.TestCase):
             self.assertNotIn("assert ", text)
             self.assertNotIn("__debug__", text)
 
-    def test_project_cleanup_prepares_service_profile_and_account_evidence(
+    def test_project_cleanup_prepares_service_and_account_evidence(
         self,
     ) -> None:
         calls: list[str] = []
@@ -259,21 +209,6 @@ class ProjectProfileRevocationTests(unittest.TestCase):
                 side_effect=lambda *_args, **_kwargs: calls.append("workers")
                 or {"workers": []},
             ),
-            mock.patch.object(
-                broker_backend_module,
-                "configured_profile_path",
-                return_value=Path("/protected/profile.json"),
-            ),
-            mock.patch.object(
-                broker_backend_module,
-                "revoke_repository_from_protected_profile",
-                side_effect=lambda **_kwargs: calls.append("profile")
-                or {
-                    "repo_id": "repo-project",
-                    "repository_generation": 7,
-                    "cleanup_operation_id": "cleanup-project",
-                },
-            ),
         ):
             result = backend._prepare_worker_lifecycle_apply(
                 authorized,
@@ -282,7 +217,7 @@ class ProjectProfileRevocationTests(unittest.TestCase):
                 actor="test-actor",
             )
 
-        self.assertEqual(calls, ["service", "workers", "projections", "profile"])
+        self.assertEqual(calls, ["service", "workers", "projections"])
         self.assertEqual(
             result["repository_revocation"]["service"]["repository_generation"],
             7,

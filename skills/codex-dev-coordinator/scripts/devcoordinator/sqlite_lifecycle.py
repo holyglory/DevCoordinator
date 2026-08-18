@@ -554,8 +554,8 @@ class SQLiteLifecyclePersistence:
                 if (
                     current.repository_fingerprint != plan.repository_fingerprint
                     or current.installation_generation != plan.installation_generation
-                    or tuple(sorted(current.targets, key=lambda item: item.ledger_key))
-                    != plan.targets
+                    or _repository_target_contracts(current.targets)
+                    != _repository_target_contracts(plan.targets)
                     or tuple(
                         sorted(
                             current.repository_allocations,
@@ -2335,7 +2335,15 @@ class SQLiteLifecyclePersistence:
             if binding is None:
                 conflicts.append(f"{key[0]}:{key[1]} is missing from the catalog")
                 continue
-            association_rows.append(binding)
+            association_rows.append(
+                {
+                    "resource_kind": binding["resource_kind"],
+                    "resource_id": binding["resource_id"],
+                    "stable_identity_fingerprint": (
+                        _stable_identity_fingerprint(binding)
+                    ),
+                }
+            )
             target_policies = tuple(policies.get(key, ()))
             policy_rows.extend(item.to_dict() for item in target_policies)
             native_identity, native_conflict = self._native_identity(
@@ -2423,8 +2431,29 @@ class SQLiteLifecyclePersistence:
             )
         repository_fingerprint = _sha(
             {
-                "repository": dict(repository),
-                "installation": dict(installation),
+                "repository": {
+                    field: repository[field]
+                    for field in (
+                        "repo_id",
+                        "host_id",
+                        "canonical_root",
+                        "display_name",
+                        "state",
+                        "generation",
+                    )
+                },
+                "installation": {
+                    field: installation[field]
+                    for field in (
+                        "repo_id",
+                        "status",
+                        "startup_fenced",
+                        "generation",
+                        "operation_id",
+                        "reason",
+                        "actor",
+                    )
+                },
                 "associations": association_rows,
                 "policies": policy_rows,
                 "allocations": allocation_rows,
@@ -3260,6 +3289,46 @@ def _stable_identity_fingerprint(row: Mapping[str, Any]) -> str:
             "capability": row["capability"],
             "provenance": row["provenance"],
         }
+    )
+
+
+def _repository_target_contracts(
+    targets: Sequence[ExactResourceRef],
+) -> tuple[tuple[Any, ...], ...]:
+    """Actionable target identity without global observation-revision churn."""
+
+    return tuple(
+        sorted(
+            (
+                target.kind.value,
+                target.resource_id,
+                target.immutable_fingerprint,
+                target.stable_identity_fingerprint,
+                tuple(
+                    sorted(
+                        (
+                            policy.policy_id,
+                            policy.kind.value,
+                            policy.immutable_fingerprint,
+                            policy.disabled_value,
+                        )
+                        for policy in target.policies
+                    )
+                ),
+                tuple(
+                    sorted(
+                        (
+                            allocation.kind.value,
+                            allocation.allocation_id,
+                            allocation.immutable_fingerprint,
+                        )
+                        for allocation in target.allocations
+                    )
+                ),
+                tuple(sorted(target.native_identity)),
+            )
+            for target in targets
+        )
     )
 
 

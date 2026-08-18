@@ -561,18 +561,12 @@ def _lifecycle(
     *,
     adapter: ExactStoppedAdapter | None = None,
     docker: FakeDockerBackend | None = None,
-    calls: list[tuple[str, str, str, str]] | None = None,
     prepare_apply: Callable[[Any, str], Mapping[str, Any] | None] | None = None,
 ) -> CleanupLifecycle:
-    def authorize(capability: str, kind: str, target: str, actor: str) -> None:
-        if calls is not None:
-            calls.append((capability, kind, target, actor))
-
     return CleanupLifecycle(
         store,
         lifecycle_adapter=adapter or ExactStoppedAdapter(),
         docker_backend=docker or FakeDockerBackend(),
-        authorize=authorize,
         prepare_apply=prepare_apply,
     )
 
@@ -963,8 +957,7 @@ class CleanupLifecycleTests(unittest.TestCase):
             store = _open_store(root)
             self.addCleanup(store.close)
             _seed_project(store, project, archived=True)
-            authorization: list[tuple[str, str, str, str]] = []
-            service = _lifecycle(store, calls=authorization)
+            service = _lifecycle(store)
 
             first = service.plan(
                 target_kind="repository",
@@ -1015,7 +1008,6 @@ class CleanupLifecycleTests(unittest.TestCase):
             self.assertEqual(operation["actor"], "planner-one")
             self.assertEqual(json.loads(apply_evidence["evidence_json"])["applier"], "separate-applier")
             self.assertEqual(json.loads(tombstone["evidence_json"])["applied_by"], "separate-applier")
-            self.assertIn(("cleanup.apply", "project", REPO_ID, "separate-applier"), authorization)
 
             archives = service.list_archives(actor="reader")["archives"]
             removed = [
@@ -1371,6 +1363,68 @@ class CleanupLifecycleTests(unittest.TestCase):
                 if item["target_kind"] == "server" and item["target_id"] == SERVER_ID
             ]
             self.assertEqual(removed, [])
+
+    def test_removed_project_archive_survives_unobservable_retained_worktree(self) -> None:
+        with _temporary_root(".cleanup-unobservable-project-") as root:
+            project = root / "fixture"
+            project.mkdir()
+            store = _open_store(root)
+            self.addCleanup(store.close)
+            _seed_project(store, project, archived=True)
+            service = _lifecycle(store)
+            plan = service.plan(
+                target_kind="project",
+                target_id=REPO_ID,
+                actor="planner",
+                reason="catalog only",
+            )
+            self.assertTrue(_apply(service, plan)["ok"])
+
+            with mock.patch.object(
+                cleanup.Path,
+                "lstat",
+                side_effect=PermissionError("retained developer path is private"),
+            ):
+                archives = service.list_archives(actor="reader")["archives"]
+
+            with mock.patch.object(
+                cleanup.subprocess,
+                "run",
+                side_effect=subprocess.SubprocessError(
+                    "owner-switch preexec failed"
+                ),
+            ):
+                git_failure_archives = service.list_archives(actor="reader")[
+                    "archives"
+                ]
+
+            removed = [
+                item
+                for item in archives
+                if item["target_kind"] == "project"
+                and item["target_id"] == REPO_ID
+            ]
+            self.assertEqual(len(removed), 1)
+            self.assertEqual(removed[0]["status"], "removed")
+            worktree = [
+                item
+                for item in archives
+                if item["target_kind"] == "worktree"
+                and item["target_id"] == REPO_ID
+            ]
+            self.assertEqual(len(worktree), 1)
+            self.assertIn(
+                "not_removable_worktree",
+                {str(item.get("code")) for item in worktree[0]["blockers"]},
+            )
+            self.assertTrue(
+                any(
+                    item["target_kind"] == "project"
+                    and item["target_id"] == REPO_ID
+                    and item["status"] == "removed"
+                    for item in git_failure_archives
+                )
+            )
 
     def test_project_purge_retains_secondary_worktree_until_exact_removal(self) -> None:
         with _temporary_root(".cleanup-worktree-") as root:
