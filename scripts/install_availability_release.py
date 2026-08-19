@@ -1602,7 +1602,7 @@ def verify_release(
             "device", "inode", "mode", "owner_gid", "owner_uid", "path"
         }
         or not isinstance(source_identity.get("path"), str)
-        or not re.fullmatch(r"0[0-7]{3}", str(source_identity.get("mode")))
+        or not re.fullmatch(r"[0-7]{4}", str(source_identity.get("mode")))
         or any(
             type(source_identity.get(field)) is not int
             or int(source_identity[field]) < 0

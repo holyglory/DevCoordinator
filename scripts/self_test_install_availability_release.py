@@ -192,6 +192,27 @@ def main() -> int:
         manifest.chmod(0o444)
         expect(manifest.read_bytes() == original, "manifest check changed release bytes")
 
+        # Repository worktrees commonly inherit a setgid group-sharing mode.
+        # Source identity records the complete four-octal-digit mode; this is
+        # evidence, not a requirement that the first digit be zero.
+        source_document = json.loads(original)
+        source_document["source_identity"]["mode"] = "2775"
+        manifest.chmod(0o644)
+        manifest.write_text(
+            json.dumps(source_document, sort_keys=True, separators=(",", ":"))
+            + "\n",
+            encoding="utf-8",
+        )
+        manifest.chmod(0o444)
+        INSTALLER.verify_release(
+            release,
+            owner_uid=os.geteuid(),
+            owner_gid=os.getegid(),
+        )
+        manifest.chmod(0o644)
+        manifest.write_bytes(original)
+        manifest.chmod(0o444)
+
         reservations, digest = write_port_reservations(root, release.name)
         rendered = root / "rendered"
         INSTALLER.render_units(
