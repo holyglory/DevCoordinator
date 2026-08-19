@@ -1022,16 +1022,6 @@ class TestdEngine:
                 active.handle.launch_ack_id,
             ),
         )
-        # A pending launch starts with a lease covering its full semantic
-        # deadline.  Once the exact launch is confirmed, return immediately to
-        # the short ordinary heartbeat lease so abandoned work is reaped
-        # promptly after a testd crash.
-        self.store.heartbeat_attempt(
-            active.lease.attempt_id,
-            generation=active.lease.generation,
-            lease_seconds=self.lease_seconds,
-            operation_id=str(uuid.uuid4()),
-        )
 
     def _pending_launch_lease_seconds(self, active: _ActiveAttempt) -> int:
         deadline = (
@@ -1238,6 +1228,18 @@ class TestdEngine:
                 self._retain_active(active)
                 self._active[lease.attempt_id] = active
             self._acknowledge_active(active)
+            if active.handle.launch_confirmed:
+                # A pending launch begins with a lease covering its semantic
+                # launch deadline. The first confirmed launch shortens that
+                # lease immediately. Later supervision renews only after a
+                # successful native observation, so a missing/overdue runtime
+                # cannot be blindly heartbeated before its deadline check.
+                self.store.heartbeat_attempt(
+                    active.lease.attempt_id,
+                    generation=active.lease.generation,
+                    lease_seconds=self.lease_seconds,
+                    operation_id=str(uuid.uuid4()),
+                )
         except LiveSourceChanged as error:
             self.store.mark_superseded(
                 candidate.run_id,

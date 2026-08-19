@@ -755,6 +755,26 @@ class UniversalTestRunnerTests(unittest.TestCase):
         self.assertEqual(observed.result_document, expected)
         self.assertEqual(observed.current_memory_bytes, 1024 * 1024)
 
+    def test_active_unit_recovers_nonextending_start_from_legacy_launch_time(self) -> None:
+        descriptor = self.descriptor(("/usr/bin/python3", "-c", "pass"))
+        runtime_id = "devcoordinator-test-recovered-start"
+        attempt_root = Path(self.temporary.name) / "recovered-start-attempts"
+        state_root = attempt_root / runtime_id
+        state_root.mkdir(parents=True)
+        launch_path = state_root / "launch.json"
+        launch_path.write_text(
+            json.dumps({"descriptor": descriptor.to_document()}),
+            encoding="utf-8",
+        )
+        os.utime(launch_path, (12.5, 12.5))
+        manager = SystemdTestAttemptManager(
+            attempt_root=attempt_root,
+            artifact_root=Path(self.temporary.name) / "recovered-start-artifacts",
+        )
+
+        self.assertEqual(manager._attempt_started_at(runtime_id), 12.5)
+        self.assertEqual(manager._started[runtime_id], 12.5)
+
     def test_active_unit_exposes_bounded_output_growth_without_content(self) -> None:
         descriptor = self.descriptor(("/usr/bin/python3", "-c", "pass"))
         runtime_id = "devcoordinator-test-active-progress"

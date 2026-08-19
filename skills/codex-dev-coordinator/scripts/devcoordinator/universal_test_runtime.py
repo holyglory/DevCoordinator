@@ -4002,7 +4002,7 @@ class SystemdTestAttemptManager:
             active=False,
             state="collected",
             exit_status=returncode,
-            started_at=self._started.get(runtime_id),
+            started_at=self._attempt_started_at(runtime_id),
             finished_at=float(self.clock()),
             result_document=result_document,
             systemd_result="success" if returncode == 0 else "exit-code",
@@ -4121,7 +4121,7 @@ class SystemdTestAttemptManager:
                 termination_reason = "protocol_failure"
             else:
                 termination_reason = "systemd_failure"
-        started = self._started.get(runtime_id)
+        started = self._attempt_started_at(runtime_id)
         output_progress = self._runner_output_progress(runtime_id) if active else None
         result_document = self._read_runner_result(runtime_id) if active else None
         if not active:
@@ -4162,6 +4162,35 @@ class SystemdTestAttemptManager:
             current_memory_bytes=(current_memory_bytes if active else None),
             output_progress=output_progress,
         )
+
+    def _attempt_started_at(self, runtime_id: str) -> float | None:
+        retained = self._started.get(runtime_id)
+        if retained is not None:
+            return retained
+        launch_path = self.attempt_root / runtime_id / "launch.json"
+        try:
+            metadata = launch_path.lstat()
+        except FileNotFoundError:
+            return None
+        except OSError as error:
+            raise TestStoreConflict(
+                "test attempt launch time is unavailable"
+            ) from error
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or stat.S_ISLNK(metadata.st_mode)
+            or metadata.st_size > 256 * 1024
+            or not math.isfinite(float(metadata.st_mtime))
+            or float(metadata.st_mtime) <= 0
+        ):
+            raise TestStoreConflict("test attempt launch time is invalid")
+        # Legacy launch records predate an explicit start-time field. Their
+        # root-owned creation time precedes native start, so using it as the
+        # recovered origin can only shorten the deadline; it never grants an
+        # overdue runner more execution time after authority replacement.
+        recovered = float(metadata.st_mtime)
+        self._started[runtime_id] = recovered
+        return recovered
 
     def cancel(self, runtime_id: str) -> NativeTestAttemptState:
         unit = self._unit(runtime_id)
@@ -4511,6 +4540,46 @@ class BrokerTestAttemptCoordinator:
             raise TestStoreContractError("test result chunk index is invalid")
         state = self.manager.status(runtime_id)
         descriptor = self.runtime_descriptor(runtime_id)
+        if state.active and state.result_document is None:
+            if state.started_at is None:
+                # Without a durable origin there is no truthful way to decide
+                # whether another heartbeat would extend an overdue attempt.
+                # Fail observation so testd cannot renew the lease blindly.
+                raise TestStoreConflict(
+                    "active test attempt execution deadline is unavailable"
+                )
+            execution_deadline = (
+                float(state.started_at) + descriptor.ttl_seconds
+            )
+            if float(self.clock()) >= execution_deadline:
+                expired = self._require_exact_native_state(
+                    runtime_id, self.manager.cancel(runtime_id)
+                )
+                if expired.active:
+                    raise TestStoreConflict(
+                        "expired test attempt remained active after exact cancellation"
+                    )
+                if expired.result_document is None:
+                    state = replace(
+                        expired,
+                        exit_status=124,
+                        finished_at=(
+                            float(self.clock())
+                            if expired.finished_at is None
+                            else expired.finished_at
+                        ),
+                        termination_reason="timeout",
+                        systemd_result="timeout",
+                        exec_main_code=1,
+                        oom_killed=False,
+                        current_memory_bytes=None,
+                        output_progress=None,
+                    )
+                else:
+                    # A complete atomic result published between the first
+                    # observation and deadline cancellation remains the
+                    # measured terminal truth and is drained normally below.
+                    state = expired
         result_summary: dict[str, object] | None = None
         result_chunk: Mapping[str, object] | None = None
         if state.result_document is not None:

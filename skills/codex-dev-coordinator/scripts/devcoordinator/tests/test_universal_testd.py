@@ -519,6 +519,30 @@ class TestdEngineTests(EngineFixture):
         self.assertEqual(confirmed["state"], "running")
         self.assertEqual(confirmed["lease_expires_at"], self.clock() + 30)
 
+    def test_failed_native_observation_does_not_preemptively_renew_lease(self) -> None:
+        class FailingObservationLauncher(FakeLauncher):
+            def observe(self, handle):
+                del handle
+                raise RuntimeError("native deadline observation unavailable")
+
+        self.launcher = FailingObservationLauncher()
+        self.engine.launcher = self.launcher
+        self.submit_live()
+        self.engine.schedule(launch_batch=1)
+        attempt_id = self.launcher.requests[0].ticket.attempt_id
+        initial_expiry = self.store.get_attempt(attempt_id)["lease_expires_at"]
+        self.clock.advance(5)
+
+        heartbeat = self.engine.heartbeat()
+
+        self.assertEqual(
+            heartbeat["failures"][0]["error_type"], "RuntimeError"
+        )
+        self.assertEqual(
+            self.store.get_attempt(attempt_id)["lease_expires_at"],
+            initial_expiry,
+        )
+
     def test_declared_ticket_resources_do_not_gate_or_throttle_launch(self) -> None:
         submitted = self.submit_live()
         self.issuer.mutate = lambda values: values.update(
@@ -1598,9 +1622,22 @@ class UnixTransportTests(unittest.TestCase):
         self.assertNotIn("secret repository detail", journal)
 
     def test_daemon_check_verifies_writability_and_listener_env_fails_closed(self) -> None:
-        with mock.patch.object(
-            UniversalTestStore, "verify_writable", autospec=True
-        ) as verify_writable:
+        with (
+            mock.patch.object(
+                UniversalTestStore,
+                "verify",
+                autospec=True,
+                side_effect=AssertionError(
+                    "service startup must not run full integrity verification"
+                ),
+            ) as verify,
+            mock.patch.object(
+                UniversalTestStore, "health", autospec=True, return_value={}
+            ) as health,
+            mock.patch.object(
+                UniversalTestStore, "verify_writable", autospec=True
+            ) as verify_writable,
+        ):
             self.assertEqual(main(["--database", str(self.store.path), "--check"]), 0)
             fresh_spool = Path(self.temporary.name) / "check-spool"
             fresh_spool.mkdir(mode=0o700)
@@ -1617,6 +1654,8 @@ class UnixTransportTests(unittest.TestCase):
                 0,
             )
         self.assertEqual(verify_writable.call_count, 2)
+        self.assertEqual(health.call_count, 2)
+        verify.assert_not_called()
         self.assertTrue((fresh_spool / "pending").is_dir())
         self.assertIsNone(
             inherited_systemd_listener({"LISTEN_PID": "0", "LISTEN_FDS": "0"})

@@ -1148,14 +1148,25 @@ class UniversalTestStore:
         expected_uid: int | None = None,
         clock: Callable[[], float] | None = None,
         busy_timeout_ms: int = DEFAULT_BUSY_TIMEOUT_MS,
+        verify_integrity: bool = True,
     ) -> "UniversalTestStore":
+        if type(verify_integrity) is not bool:
+            raise TestStoreContractError("verify_integrity must be boolean")
         store = cls(
             path,
             expected_uid=expected_uid,
             clock=clock,
             busy_timeout_ms=busy_timeout_ms,
         )
-        store.verify()
+        if verify_integrity:
+            store.verify()
+        else:
+            # Service startup must be bounded independently of retained test
+            # history size. Health proves the exact schema/read boundary;
+            # verify_writable separately proves the rolled-back write path.
+            # Full PRAGMA quick_check remains the default for explicit opens,
+            # migrations, backup/restore, and diagnostic verification.
+            store.health()
         return store
 
     def _connect(self, *, readonly: bool = False) -> sqlite3.Connection:

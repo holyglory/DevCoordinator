@@ -9,6 +9,7 @@ import unittest
 from unittest import mock
 
 from devcoordinator.universal_test_store import (
+    TestStoreContractError,
     TestStoreConflict,
     TestStoreSecurityError,
     UniversalTestStore,
@@ -81,6 +82,14 @@ class UniversalTestStoreSecurityTests(unittest.TestCase):
         )
 
         self.assertEqual(reopened.expected_uid, os.geteuid())
+
+    def test_open_rejects_nonboolean_integrity_mode(self) -> None:
+        with self.assertRaisesRegex(
+            TestStoreContractError, "verify_integrity must be boolean"
+        ):
+            UniversalTestStore.open(
+                self.database, verify_integrity=1  # type: ignore[arg-type]
+            )
 
     def test_verify_writable_begins_and_rolls_back_without_committing(self) -> None:
         connection = mock.Mock()

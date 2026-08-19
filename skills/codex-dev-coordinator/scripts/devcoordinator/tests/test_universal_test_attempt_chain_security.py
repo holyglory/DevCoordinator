@@ -320,7 +320,7 @@ class UniversalTestAttemptChainSecurityTests(unittest.TestCase):
         artifact, resolver = self._collect_verified_artifact(descriptor_a)
 
         native = _FakeNativeManager()
-        coordinator = BrokerTestAttemptCoordinator(native)
+        coordinator = BrokerTestAttemptCoordinator(native, clock=lambda: 9.0)
         ticket_a = coordinator.issue(descriptor_a)
         ticket_b = coordinator.issue(descriptor_b)
 
@@ -426,7 +426,7 @@ class UniversalTestAttemptChainSecurityTests(unittest.TestCase):
         )
         descriptor = self._descriptor(candidate, lease, self.repo_a)
         native = _FakeNativeManager()
-        coordinator = BrokerTestAttemptCoordinator(native)
+        coordinator = BrokerTestAttemptCoordinator(native, clock=lambda: 9.0)
         ticket = coordinator.issue(descriptor)
         launch = coordinator.launch(
             ticket_id=ticket["ticket_id"],
@@ -545,6 +545,97 @@ class UniversalTestAttemptChainSecurityTests(unittest.TestCase):
         self.assertIsNone(observed["result_chunk"])
         self.assertEqual(observed["exit_status"], 0)
         self.assertEqual(native.cancelled, [runtime_id])
+
+    def test_active_attempt_is_cancelled_at_inclusive_execution_deadline(self) -> None:
+        candidate, lease = self._submit_and_lease(
+            "repo-execution-deadline", self.repo_a, os.geteuid()
+        )
+        descriptor = self._descriptor(candidate, lease, self.repo_a)
+        native = _FakeNativeManager()
+        now = [60.999]
+        coordinator = BrokerTestAttemptCoordinator(
+            native, clock=lambda: now[0]
+        )
+        ticket = coordinator.issue(descriptor)
+        launch = coordinator.launch(
+            ticket_id=ticket["ticket_id"],
+            attempt_id=descriptor.attempt_id,
+            generation=descriptor.generation,
+        )
+        runtime_id = launch["runtime_id"]
+
+        before = coordinator.observe(runtime_id)
+        self.assertEqual(before["state"], "running")
+        self.assertEqual(native.cancelled, [])
+
+        now[0] = 61.0
+        expired = coordinator.observe(runtime_id)
+
+        self.assertEqual(expired["state"], "exited")
+        self.assertEqual(expired["exit_status"], 124)
+        self.assertEqual(expired["termination"]["reason"], "timeout")
+        self.assertEqual(native.cancelled, [runtime_id])
+
+    def test_atomic_result_published_during_deadline_cancel_wins_timeout(self) -> None:
+        candidate, lease = self._submit_and_lease(
+            "repo-deadline-result-race", self.repo_a, os.geteuid()
+        )
+        descriptor = self._descriptor(candidate, lease, self.repo_a)
+        native = _FakeNativeManager()
+        coordinator = BrokerTestAttemptCoordinator(native, clock=lambda: 61.0)
+        ticket = coordinator.issue(descriptor)
+        launch = coordinator.launch(
+            ticket_id=ticket["ticket_id"],
+            attempt_id=descriptor.attempt_id,
+            generation=descriptor.generation,
+        )
+        runtime_id = launch["runtime_id"]
+        chunk = {
+            "chunk_id": "chunk-deadline-result-race-0",
+            "chunk_index": 0,
+            "cases": [],
+            "failures": [],
+            "artifacts": [],
+            "reporter_complete": True,
+        }
+
+        def publish_then_cancel(selected_runtime_id: str):
+            native.cancelled.append(selected_runtime_id)
+            native.finish(selected_runtime_id, descriptor, chunk)
+            return native.states[selected_runtime_id]
+
+        native.cancel = publish_then_cancel  # type: ignore[method-assign]
+
+        observed = coordinator.observe(runtime_id)
+
+        self.assertEqual(observed["state"], "exited")
+        self.assertEqual(observed["result_chunk"], chunk)
+        self.assertEqual(observed["termination"]["reason"], "success")
+        self.assertEqual(native.cancelled, [runtime_id])
+
+    def test_active_attempt_without_durable_start_cannot_be_heartbeated(self) -> None:
+        candidate, lease = self._submit_and_lease(
+            "repo-missing-execution-origin", self.repo_a, os.geteuid()
+        )
+        descriptor = self._descriptor(candidate, lease, self.repo_a)
+        native = _FakeNativeManager()
+        coordinator = BrokerTestAttemptCoordinator(native, clock=lambda: 2.0)
+        ticket = coordinator.issue(descriptor)
+        launch = coordinator.launch(
+            ticket_id=ticket["ticket_id"],
+            attempt_id=descriptor.attempt_id,
+            generation=descriptor.generation,
+        )
+        runtime_id = launch["runtime_id"]
+        native.states[runtime_id] = replace(
+            native.states[runtime_id], started_at=None
+        )
+
+        with self.assertRaisesRegex(
+            TestStoreConflict, "execution deadline is unavailable"
+        ):
+            coordinator.observe(runtime_id)
+        self.assertEqual(native.cancelled, [])
 
     def test_launch_ticket_outlives_caller_launch_deadline(self) -> None:
         candidate, lease = self._submit_and_lease(
@@ -1387,7 +1478,7 @@ class UniversalTestAttemptChainSecurityTests(unittest.TestCase):
         )
         descriptor = self._descriptor(candidate, lease, self.repo_a)
         native = _FakeNativeManager()
-        original = BrokerTestAttemptCoordinator(native)
+        original = BrokerTestAttemptCoordinator(native, clock=lambda: 9.0)
         ticket = original.issue(descriptor)
         launch = original.launch(
             ticket_id=ticket["ticket_id"],
@@ -1395,7 +1486,7 @@ class UniversalTestAttemptChainSecurityTests(unittest.TestCase):
             generation=descriptor.generation,
         )
 
-        replacement = BrokerTestAttemptCoordinator(native)
+        replacement = BrokerTestAttemptCoordinator(native, clock=lambda: 9.0)
 
         self.assertEqual(
             replacement.runtime_descriptor(launch["runtime_id"]), descriptor

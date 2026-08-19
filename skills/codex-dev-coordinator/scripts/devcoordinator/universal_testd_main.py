@@ -148,7 +148,9 @@ def run(
 def main(argv: Sequence[str] | None = None) -> int:
     arguments = build_parser().parse_args(argv)
     if arguments.check:
-        store = UniversalTestStore.open(arguments.database)
+        store = UniversalTestStore.open(
+            arguments.database, verify_integrity=False
+        )
         store.verify_writable()
         if arguments.spool is not None:
             DurableAttemptSpool.open(arguments.spool)
