@@ -171,9 +171,6 @@ class SetupCatalogProfile:
             "network_requirements": [],
             "isolation": {
                 "network": "none",
-                "cpu_millis": 0,
-                "memory_mib": 0,
-                "pids": 0,
                 "private_scratch": True,
                 "kill_after_run": True,
             },
@@ -197,7 +194,6 @@ class ReadySetupCatalogProfile(SetupCatalogProfile):
             "fixtures": [],
             "credentials": [],
             "depends_on": [],
-            "resources": {"cpu_millis": 1000, "memory_mib": 512, "pids": 64},
         }
         return {
             "repository_id": repository,
@@ -218,9 +214,6 @@ class ReadySetupCatalogProfile(SetupCatalogProfile):
             "network_requirements": [],
             "isolation": {
                 "network": "none",
-                "cpu_millis": 1000,
-                "memory_mib": 512,
-                "pids": 64,
                 "private_scratch": True,
                 "kill_after_run": True,
             },
@@ -256,11 +249,6 @@ class OversizedCatalogProfile:
                     "fixtures": [],
                     "credentials": [],
                     "depends_on": [],
-                    "resources": {
-                        "cpu_millis": 1000,
-                        "memory_mib": 512,
-                        "pids": 64,
-                    },
                 }
                 for item in range(40)
             ],

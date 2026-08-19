@@ -196,7 +196,7 @@ def candidate_state(release: Path) -> dict[str, object]:
         }
         | {
             "preparation": preparation,
-            "migration_seal_sha256": state["evidence"]["migration-seal"][
+            "migration_seal_sha256": state["evidence"]["test-history-discard"][
                 "document_sha256"
             ]
         },
@@ -743,17 +743,19 @@ class ActivationTests(unittest.TestCase):
             completion["document_sha256"],
             discarded["evidence"]["test-history-discard"]["document_sha256"],
         )
-        migrated, _authority_backup, _test_backup = fixtures.through_seal()
-        self.assertEqual(
-            activation._first_adoption_test_store_completion(migrated)["mode"],
-            "history-migrated",
-        )
+        invalid = {
+            key: value
+            for key, value in discarded.items()
+            if key not in {"schema_version", "kind", "document_sha256"}
+        }
+        invalid["evidence"] = dict(discarded["evidence"])
+        invalid["evidence"].pop("test-history-discard")
         with self.assertRaisesRegex(
             activation.ActivationError,
-            "migrated or discarded Test Store",
+            "fresh disposable Test Store",
         ):
             activation._first_adoption_test_store_completion(
-                fixtures.sealed_state()
+                cutover.seal(cutover.STATE_KIND, invalid)
             )
 
     def setUp(self) -> None:

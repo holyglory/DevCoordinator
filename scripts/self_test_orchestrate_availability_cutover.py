@@ -963,87 +963,14 @@ class CutoverTransitionTests(unittest.TestCase):
         with self.assertRaisesRegex(cutover.CutoverError, "SLO"):
             cutover._continuity_probe(failed)
 
-    def test_supported_drain_executor_binds_generation_proof(self) -> None:
-        state = sealed_state()
-        state = cutover.seal(
-            cutover.STATE_KIND,
-            {
-                key: value
-                for key, value in state.items()
-                if key not in {"schema_version", "kind", "document_sha256"}
-            }
-            | {"drain_proof": f"/tmp/drain-{uuid.uuid4()}.json"},
-        )
-        state = cutover.transition(
-            state, evidence_kind="authority-backup", evidence=backup("authority")
-        )
-        state = cutover.transition(
-            state, evidence_kind="testd-backup", evidence=backup("testd")
-        )
-        state = cutover.transition(
-            state,
-            evidence_kind="initial-import",
-            evidence=imported("initial", migration_id=str(uuid.uuid4())),
-        )
-        proof = dict(
-            build_legacy_test_admission_drain_proof(
-                drain_id=str(uuid.uuid4()),
-                authority_generation=AUTHORITY_GENERATION,
-                activated_at_epoch=100,
-                activated_by_uid=0,
-                drained_at_epoch=101,
-                broker_instance_id="broker-instance",
-            )
-        )
-        observed = {}
-
-        def broker_call(request):
-            observed["operation"] = request.operation
-            observed["generation"] = request.authority_generation
-            return {"ok": True, "result": {"proof": proof}}
-
-        with mock.patch.object(cutover.os, "geteuid", return_value=0), mock.patch.object(
-            cutover, "load_state", return_value=state
-        ), mock.patch.object(
-            cutover, "_authority_generation", return_value=AUTHORITY_GENERATION
-        ), mock.patch.object(
-            cutover,
-            "verify_legacy_test_admission_drain_proof",
-            side_effect=lambda _path, value, expected_uid: value,
-        ), mock.patch.object(
-            cutover, "_publish_evidence"
-        ), mock.patch.object(
-            cutover,
-            "record_evidence",
-            return_value={"phase": "admission_drained", "replayed": False},
-        ):
-            result = cutover.execute_admission_drain(
-                state_path=Path("/var/lib/devcoordinator/cutover-state.json"),
-                proof_output=Path(state["drain_proof"]),
-                broker_socket=Path(cutover.AUTHORITY_SOCKET_PATH),
-                authority_uid=0,
-                expected_broker_uid=0,
-                broker_call=broker_call,
-            )
-        self.assertEqual(observed["generation"], AUTHORITY_GENERATION)
-        self.assertEqual(result["proof"], proof)
-        self.assertEqual(result["phase"], "admission_drained")
-
     def test_supported_rehearsal_and_retention_producers_converge(self) -> None:
-        state, authority_backup, test_backup, activation = through_activation()
+        state, authority_backup, _test_backup, activation = through_activation()
         activation_state = state
         restore_values = {
             "authority": {
                 "source": authority_backup["backup"],
                 "source_sha256": authority_backup["backup_sha256"],
                 "restored_sha256": "5" * 64,
-                "quick_check": "ok",
-                "foreign_key_violations": 0,
-            },
-            "testd": {
-                "source": test_backup["backup"],
-                "source_sha256": test_backup["backup_sha256"],
-                "restored_sha256": "6" * 64,
                 "quick_check": "ok",
                 "foreign_key_violations": 0,
             },
@@ -1163,12 +1090,8 @@ class CutoverTransitionTests(unittest.TestCase):
                     ]
                 }
 
-            def digest(path):
-                return (
-                    authority_backup["backup_sha256"]
-                    if "authority" in str(path)
-                    else test_backup["backup_sha256"]
-                )
+            def digest(_path):
+                return authority_backup["backup_sha256"]
 
             with mock.patch.object(cutover.os, "geteuid", return_value=0), mock.patch.object(
                 cutover, "_private_parent"
@@ -1189,7 +1112,7 @@ class CutoverTransitionTests(unittest.TestCase):
                 ),
             ), mock.patch.object(
                 cutover,
-                "reverify_post_v13_profile_inventory_readiness",
+                "reverify_profile_inventory_readiness",
                 return_value=refreshed_profile_inventory_readiness(state),
             ), mock.patch.object(
                 cutover, "_database_identity", return_value={"device": 1, "inode": 2, "size": 3}
@@ -1232,7 +1155,7 @@ class CutoverTransitionTests(unittest.TestCase):
                 final,
             )
             forged = dict(retained["attestation"])
-            forged["test_backup_sha256"] = "f" * 64
+            forged["authority_backup_sha256"] = "f" * 64
             with self.assertRaisesRegex(cutover.CutoverError, "digest"):
                 cutover.transition(
                     state,
@@ -1327,7 +1250,7 @@ class CutoverTransitionTests(unittest.TestCase):
         )
 
     def test_complete_evidence_chain_and_exact_replay(self) -> None:
-        state, authority_backup, test_backup = through_seal()
+        state, authority_backup, _test_backup = through_seal()
         state = cutover.transition(
             state,
             evidence_kind="profile-inventory-readiness",
@@ -1342,7 +1265,7 @@ class CutoverTransitionTests(unittest.TestCase):
                 if key not in {"schema_version", "kind", "document_sha256"}
             }
             | {
-                "migration_seal_sha256": state["evidence"]["migration-seal"][
+                "migration_seal_sha256": state["evidence"]["test-history-discard"][
                     "document_sha256"
                 ]
             },
@@ -1424,19 +1347,11 @@ class CutoverTransitionTests(unittest.TestCase):
                 "activation_sha256": activation["document_sha256"],
                 "executor_release": f"/opt/devcoordinator/releases/{RELEASE}",
                 "authority_backup_sha256": authority_backup["backup_sha256"],
-                "test_backup_sha256": test_backup["backup_sha256"],
                 "restores": {
                     "authority": {
                         "source": authority_backup["backup"],
                         "source_sha256": authority_backup["backup_sha256"],
                         "restored_sha256": "5" * 64,
-                        "quick_check": "ok",
-                        "foreign_key_violations": 0,
-                    },
-                    "testd": {
-                        "source": test_backup["backup"],
-                        "source_sha256": test_backup["backup_sha256"],
-                        "restored_sha256": "6" * 64,
                         "quick_check": "ok",
                         "foreign_key_violations": 0,
                     },
@@ -1465,7 +1380,6 @@ class CutoverTransitionTests(unittest.TestCase):
             cutover.RETENTION_KIND,
             {
                 "authority_backup_sha256": authority_backup["backup_sha256"],
-                "test_backup_sha256": test_backup["backup_sha256"],
                 "legacy_source_retained": True,
                 "retain_until": state["retain_until"],
                 "rollback_rehearsal_sha256": rehearsal["document_sha256"],
@@ -1500,58 +1414,6 @@ class CutoverTransitionTests(unittest.TestCase):
             state,
         )
 
-    def test_migration_seal_requires_migrator_fingerprint_of_whole_proof(self) -> None:
-        state = sealed_state()
-        state = cutover.transition(
-            state, evidence_kind="authority-backup", evidence=backup("authority")
-        )
-        state = cutover.transition(
-            state, evidence_kind="testd-backup", evidence=backup("testd")
-        )
-        migration_id = str(uuid.uuid4())
-        initial = imported("initial", migration_id=migration_id)
-        final = imported("final", migration_id=migration_id)
-        state = cutover.transition(
-            state, evidence_kind="initial-import", evidence=initial
-        )
-        drain = dict(
-            build_legacy_test_admission_drain_proof(
-                drain_id=str(uuid.uuid4()),
-                authority_generation=AUTHORITY_GENERATION,
-                activated_at_epoch=100,
-                activated_by_uid=0,
-                drained_at_epoch=101,
-                broker_instance_id="broker-instance",
-            )
-        )
-        state = cutover.transition(
-            state, evidence_kind="admission-drain", evidence=drain
-        )
-        state = cutover.transition(
-            state, evidence_kind="final-import", evidence=final
-        )
-        wrong = cutover.seal(
-            cutover.SEAL_KIND,
-            {
-                "migration_id": migration_id,
-                "authority_database": LEGACY_AUTHORITY_DATABASE,
-                "authority_generation": AUTHORITY_GENERATION,
-                "test_database": TEST_DATABASE,
-                "test_store_generation": TEST_GENERATION,
-                "drain_proof_fingerprint": drain["proof_sha256"],
-                "final_export_fingerprint": final["export_fingerprint"],
-                "final_watermark_fingerprint": final["watermark_fingerprint"],
-                "destination_attestation_fingerprint": final["document_sha256"],
-                "legacy_source_retained": True,
-                "activation_ready": True,
-                "rollback": {"safe": True},
-            },
-        )
-        with self.assertRaisesRegex(cutover.CutoverError, "migration seal"):
-            cutover.transition(
-                state, evidence_kind="migration-seal", evidence=wrong
-            )
-
     def test_candidate_requires_distinct_service_identities_and_exact_slices(self) -> None:
         state, _, _ = through_seal()
         state = cutover.transition(
@@ -1565,7 +1427,7 @@ class CutoverTransitionTests(unittest.TestCase):
             for key, value in invalid.items()
             if key not in {"schema_version", "kind", "document_sha256"}
         }
-        unsigned["migration_seal_sha256"] = state["evidence"]["migration-seal"][
+        unsigned["migration_seal_sha256"] = state["evidence"]["test-history-discard"][
             "document_sha256"
         ]
         unsigned["service_uids"] = dict(unsigned["service_uids"])
@@ -1573,7 +1435,9 @@ class CutoverTransitionTests(unittest.TestCase):
             "service_uids"
         ]["devcoordinator-edge.service"]
         invalid = cutover.seal(cutover.CANDIDATE_KIND, unsigned)
-        with self.assertRaisesRegex(cutover.CutoverError, "service UIDs"):
+        with self.assertRaisesRegex(
+            cutover.CutoverError, "share an operating-system UID"
+        ):
             cutover.transition(state, evidence_kind="candidate", evidence=invalid)
 
     def test_candidate_state_machine_rejects_pending_project_isolation(self) -> None:
@@ -1589,7 +1453,7 @@ class CutoverTransitionTests(unittest.TestCase):
             for key, value in invalid.items()
             if key not in {"schema_version", "kind", "document_sha256"}
         }
-        unsigned["migration_seal_sha256"] = state["evidence"]["migration-seal"][
+        unsigned["migration_seal_sha256"] = state["evidence"]["test-history-discard"][
             "document_sha256"
         ]
         preparation = unsigned["preparation"]
@@ -1640,7 +1504,7 @@ class CutoverTransitionTests(unittest.TestCase):
                         if key not in {"schema_version", "kind", "document_sha256"}
                     }
                     unsigned["migration_seal_sha256"] = state["evidence"][
-                        "migration-seal"
+                        "test-history-discard"
                     ]["document_sha256"]
                     preparation_unsigned = {
                         key: value
@@ -1854,48 +1718,6 @@ class CutoverTransitionTests(unittest.TestCase):
                             f"next action bypasses an immutable release wrapper: {argv[0]}",
                         )
 
-        planned = sealed_state()
-        assert_release_commands(planned)
-        backed_up = cutover.transition(
-            planned,
-            evidence_kind="authority-backup",
-            evidence=backup("authority"),
-        )
-        backed_up = cutover.transition(
-            backed_up,
-            evidence_kind="testd-backup",
-            evidence=backup("testd"),
-        )
-        assert_release_commands(backed_up)
-        migration_id = str(uuid.uuid4())
-        initial_migrated = cutover.transition(
-            backed_up,
-            evidence_kind="initial-import",
-            evidence=imported("initial", migration_id=migration_id),
-        )
-        assert_release_commands(initial_migrated)
-        drain = dict(
-            build_legacy_test_admission_drain_proof(
-                drain_id=str(uuid.uuid4()),
-                authority_generation=AUTHORITY_GENERATION,
-                activated_at_epoch=100,
-                activated_by_uid=0,
-                drained_at_epoch=101,
-                broker_instance_id="broker-instance",
-            )
-        )
-        admission_drained = cutover.transition(
-            initial_migrated,
-            evidence_kind="admission-drain",
-            evidence=drain,
-        )
-        assert_release_commands(admission_drained)
-        tail_migrated = cutover.transition(
-            admission_drained,
-            evidence_kind="final-import",
-            evidence=imported("final", migration_id=migration_id),
-        )
-        assert_release_commands(tail_migrated)
         sealed, _authority, _testd = through_seal()
         assert_release_commands(sealed)
         activated, _authority, _testd, activation = through_activation()
@@ -2416,10 +2238,6 @@ class CutoverPersistenceTests(unittest.TestCase):
                 test_database=Path(TEST_DATABASE),
                 inventory_canary_project=Path(INVENTORY_PROJECT),
                 authority_backup_directory=Path("/var/backups/devcoordinator"),
-                test_backup_directory=Path("/var/backups/devcoordinator-testd"),
-                migration_state=Path("/var/lib/devcoordinator/cutover.json"),
-                drain_proof=Path("/var/lib/devcoordinator/drain.json"),
-                cutover_seal=Path("/var/lib/devcoordinator/seal.json"),
                 first_deployment_bootstrap=Path(BOOTSTRAP_ATTESTATION),
                 authority_readiness=Path(AUTHORITY_READINESS_ATTESTATION),
                 first_adoption_port_reservations=Path(
@@ -2439,7 +2257,6 @@ class CutoverPersistenceTests(unittest.TestCase):
         self.assertTrue(result["actions"])
         self.assertFalse(result["capacity"]["authority"]["required"])
         self.assertEqual(result["capacity"]["authority"]["required_free_bytes"], 0)
-        self.assertEqual(result["capacity"]["testd"]["estimated_backup_bytes"], 10)
 
 
 class AuthorityReadinessRebindDescendantTests(unittest.TestCase):
@@ -2650,7 +2467,7 @@ class InitializationPortRevisionWindowTests(unittest.TestCase):
         state_loader: mock.Mock | None = None,
         state_write_observer: mock.Mock | None = None,
         reattest_reference_verifier: mock.Mock | None = None,
-        discard_test_history: bool = False,
+        discard_test_history: bool = True,
         fresh_store_evidence: Mapping[str, object] | None = None,
         fresh_store_digest: str | None = None,
     ):
@@ -2776,12 +2593,6 @@ class InitializationPortRevisionWindowTests(unittest.TestCase):
                 test_database=Path(TEST_DATABASE),
                 inventory_canary_project=Path(INVENTORY_PROJECT),
                 authority_backup_directory=Path("/var/backups/devcoordinator"),
-                test_backup_directory=Path(
-                    "/var/backups/devcoordinator-testd"
-                ),
-                migration_state=Path("/var/lib/devcoordinator/cutover.json"),
-                drain_proof=Path("/var/lib/devcoordinator/drain.json"),
-                cutover_seal=Path("/var/lib/devcoordinator/seal.json"),
                 first_deployment_bootstrap=Path(BOOTSTRAP_ATTESTATION),
                 authority_readiness=Path(AUTHORITY_READINESS_ATTESTATION),
                 first_adoption_port_reservations=Path(
@@ -2790,23 +2601,11 @@ class InitializationPortRevisionWindowTests(unittest.TestCase):
                 first_adoption_port_reservations_sha256=(
                     supplied_digest or str(reservations["document_sha256"])
                 ),
-                discard_test_history=(
-                    cutover.DISCARD_TEST_HISTORY_CONFIRMATION
-                    if discard_test_history
-                    else None
-                ),
-                fresh_test_store_attestation=(
-                    Path(FRESH_SCHEMA_ATTESTATION)
-                    if discard_test_history
-                    else None
-                ),
+                discard_test_history=cutover.DISCARD_TEST_HISTORY_CONFIRMATION,
+                fresh_test_store_attestation=Path(FRESH_SCHEMA_ATTESTATION),
                 fresh_test_store_attestation_sha256=(
                     fresh_store_digest
-                    or (
-                        str(fresh_schema["document_sha256"])
-                        if discard_test_history
-                        else None
-                    )
+                    or str(fresh_schema["document_sha256"])
                 ),
                 authority_uid=0,
                 testd_uid=TESTD_UID,
@@ -2855,8 +2654,6 @@ class InitializationPortRevisionWindowTests(unittest.TestCase):
             state_path=state_path,
         )
         self.assertEqual(result["phase"], "sealed")
-        self.assertFalse(result["capacity"]["testd"]["required"])
-        self.assertEqual(result["capacity"]["testd"]["required_free_bytes"], 0)
         self.assertEqual(state["phase"], "sealed")
         self.assertEqual(
             state["evidence"]["test-history-discard"], schema_readiness()

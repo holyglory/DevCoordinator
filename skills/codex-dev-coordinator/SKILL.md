@@ -376,8 +376,10 @@ next command. Do not paste raw logs or large case lists into model context.
 
 ## Deliver DevCoordinator changes
 
-For this repository, run the repository-owned workflow once after the complete
-edit batch:
+The installed Coordinator runtime/test surfaces are not a self-hosting path.
+When changing DevCoordinator itself, do not invoke this skill's installed
+`devcoordinator test`, runtime, or installation commands for verification or
+delivery. Run the repository-owned workflow once after the complete edit batch:
 
 ```bash
 python3 scripts/software_owned_delivery.py run --help

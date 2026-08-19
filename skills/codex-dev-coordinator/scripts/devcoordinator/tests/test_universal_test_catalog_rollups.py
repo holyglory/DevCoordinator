@@ -248,12 +248,12 @@ class RetainedCatalogAndRollupTests(unittest.TestCase):
                         """
                         INSERT INTO test_run_targets(
                             target_id, run_id, target_name, wave_index,
-                            shard_index, shard_count, state, cpu_millis,
-                            memory_mib, pids, estimated_seconds, max_attempts,
+                            shard_index, shard_count, state,
+                            estimated_seconds, max_attempts,
                             worktree_key, exclusive_resources_json,
                             current_attempt_id, queued_at, started_at, finished_at
                         ) VALUES (
-                            ?, ?, ?, 0, 0, 1, ?, 1000, 1024, 64, 1.0, 1,
+                            ?, ?, ?, 0, 0, 1, ?, 1.0, 1,
                             ?, '[]', ?, ?, ?, ?
                         )
                         """,

@@ -67,6 +67,11 @@ These rules apply to every agent working in this repository.
   cycle once. DevCoordinator delivery uses
   `scripts/software_owned_delivery.py`; do not reconstruct its test, package,
   deploy, and browser workflow manually.
+- Never use the installed DevCoordinator skill, `devcoordinator test`, runtime
+  orchestration, or installation surfaces to test or install DevCoordinator
+  itself. That creates a circular self-hosting dependency on the product under
+  repair. The repository-owned `scripts/software_owned_delivery.py` workflow is
+  the sole complete verification and delivery authority for this repository.
 - Before readiness, the accumulated cycle must include repository boundaries
   and the applicable repository validation. Report unresolved ledger items as
   incomplete; never describe partial or unverified behavior as ready.
