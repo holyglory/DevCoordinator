@@ -363,9 +363,6 @@ def _target_resources(value: object) -> Mapping[str, TargetResources] | None:
         if not isinstance(raw, Mapping) or set(raw) != fields:
             raise TestStoreContractError("target resource fields are invalid")
         result[name] = TargetResources(
-            cpu_millis=raw["cpu_millis"],
-            memory_mib=raw["memory_mib"],
-            pids=raw["pids"],
             estimated_seconds=raw["estimated_seconds"],
             shard_count=raw["shard_count"],
             max_attempts=raw["max_attempts"],
@@ -382,9 +379,6 @@ def _resource_documents(
         return None
     return {
         name: {
-            "cpu_millis": value.cpu_millis,
-            "memory_mib": value.memory_mib,
-            "pids": value.pids,
             "estimated_seconds": value.estimated_seconds,
             "shard_count": value.shard_count,
             "max_attempts": value.max_attempts,

@@ -317,9 +317,6 @@ def add_broker_parser(subparsers: Any) -> None:
     call.add_argument("--database-name")
     call.add_argument("--database-backup-id")
     call.add_argument("--explicit", action="store_true")
-    call.add_argument("--drain-purpose")
-    call.add_argument("--drain-id")
-    call.add_argument("--proof-sha256")
 
 
 def handle_broker_cli(args: argparse.Namespace) -> Any:
@@ -795,32 +792,6 @@ def _octal_mode(raw: str) -> int:
 def _request_arguments(
     args: argparse.Namespace, operation: BrokerOperation
 ) -> dict[str, Any]:
-    drain_purpose = getattr(args, "drain_purpose", None)
-    drain_id = getattr(args, "drain_id", None)
-    proof_sha256 = getattr(args, "proof_sha256", None)
-    if operation is BrokerOperation.TEST_ADMISSION_DRAIN_BEGIN:
-        if drain_id or proof_sha256:
-            raise ValueError("test admission drain begin does not accept clear evidence")
-        return {
-            "purpose": str(
-                drain_purpose or "legacy-test-history-cutover"
-            )
-        }
-    if operation is BrokerOperation.TEST_ADMISSION_DRAIN_STATUS:
-        if drain_purpose or drain_id or proof_sha256:
-            raise ValueError("test admission drain status accepts no arguments")
-        return {}
-    if operation is BrokerOperation.TEST_ADMISSION_DRAIN_CLEAR:
-        if drain_purpose or not drain_id or not proof_sha256:
-            raise ValueError(
-                "test admission drain clear requires --drain-id and --proof-sha256"
-            )
-        return {
-            "drain_id": str(drain_id),
-            "proof_sha256": str(proof_sha256),
-        }
-    if drain_purpose or drain_id or proof_sha256:
-        raise ValueError("drain evidence is valid only for test admission administration")
     if operation is BrokerOperation.EPHEMERAL_SECRET_FD:
         raise ValueError(
             "ephemeral.secret_fd is in-process descriptor transport only; "

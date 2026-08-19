@@ -1,4 +1,4 @@
-# Server-wide administration and migration
+# Server-wide administration
 
 Read only the relevant section when the task changes the Coordinator host,
 authority, installation, or fleet policy. Ordinary coding, runtime actions,
@@ -78,7 +78,7 @@ retain them. Prefer a fresh test store during a harness cutover while
 preserving Console/user settings and project runtimes.
 
 Use the immutable release's
-`devcoordinator-test-history testd-initialize-fresh` operation through the
+`devcoordinator-test-store initialize-fresh` operation through the
 delivery workflow. It requires
 the fixed discard confirmation, exact testd identity, operation UUID, and
 readiness output. It must not open or change authority, profile, inventory, or

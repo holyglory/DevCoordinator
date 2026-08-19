@@ -119,7 +119,8 @@ STABLE_LAUNCHERS = {
     ),
     IMAGE_LAUNCHER_RENDERED: (IMAGE_LAUNCHER, "devcoordinator-image"),
 }
-TEST_HISTORY_WRAPPER = "devcoordinator-test-history"
+TEST_HISTORY_WRAPPER = "devcoordinator-test-store"
+PREVIOUS_TEST_HISTORY_WRAPPER = "devcoordinator-test-history"
 TESTD_USER = "devcoordinator-testd"
 TESTD_SERVICE = "devcoordinator-testd.service"
 TESTD_SOCKET = "devcoordinator-testd.socket"
@@ -1455,6 +1456,8 @@ def unit_enabled(runner: Runner, unit: str) -> bool:
 
 def test_history_wrapper(release: Path) -> Path:
     wrapper = release / "bin" / TEST_HISTORY_WRAPPER
+    if not wrapper.exists():
+        wrapper = release / "bin" / PREVIOUS_TEST_HISTORY_WRAPPER
     if not wrapper.is_file() or wrapper.is_symlink() or not os.access(wrapper, os.X_OK):
         raise SwitchError(
             f"immutable release lacks the test-history wrapper: {release}"
@@ -1656,7 +1659,7 @@ def reset_test_history_for_release(
         runner,
         release,
         [
-            "testd-initialize-fresh",
+            "initialize-fresh",
             "--test-database",
             str(TEST_DATABASE),
             "--operation-id",
@@ -1668,25 +1671,25 @@ def reset_test_history_for_release(
             "--confirm-discard-test-history",
             "discard-test-history",
         ],
-        label="initialize fresh schema-5 test history",
+        label="initialize fresh current Test Store",
     )
     fingerprint = result.get("attestation_fingerprint")
     if (
-        result.get("action") != "testd-initialize-fresh"
-        or result.get("branch") != "attested-fresh-v5"
+        result.get("action") != "test-store-initialize-fresh"
+        or result.get("branch") != "attested-fresh"
         or result.get("attestation") != reset["attestation"]
         or not isinstance(fingerprint, str)
         or RELEASE_RE.fullmatch(fingerprint) is None
         or not isinstance(result.get("store_generation"), str)
     ):
-        raise SwitchError("fresh schema-5 test-history evidence is invalid")
+        raise SwitchError("fresh Test Store evidence is invalid")
     reset.update(
         {
             "status": "complete",
             "completed_at": now(),
             "forward_evidence": {
                 "action": result["action"],
-                "schema_version": 5,
+                "schema_version": result["schema_version"],
                 "branch": result["branch"],
                 "attestation": result["attestation"],
                 "attestation_fingerprint": fingerprint,
@@ -2707,7 +2710,7 @@ def parser() -> argparse.ArgumentParser:
             action="store_true",
             help=(
                 "discard only the isolated test-history store and attempt spool, "
-                "then initialize an empty schema-5 test plane while testd is stopped"
+                "then initialize an empty current-schema test plane while testd is stopped"
             ),
         )
         if name == "verify":

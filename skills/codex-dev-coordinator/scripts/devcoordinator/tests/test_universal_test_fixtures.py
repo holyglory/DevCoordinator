@@ -101,9 +101,6 @@ class UniversalTestFixtureProviderTests(unittest.TestCase):
             ),
             network="loopback",
             ttl_seconds=300,
-            cpu_millis=1000,
-            memory_mib=128,
-            pids=32,
         )
 
     def test_sealed_fixture_lease_recovers_and_cleanup_is_exact(self) -> None:

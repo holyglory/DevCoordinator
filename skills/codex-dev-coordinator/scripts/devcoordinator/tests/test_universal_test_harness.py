@@ -45,7 +45,7 @@ class PreviewTestPlane:
         return {
             "schema_version": 1,
             "status": "ok",
-            "test_store_schema_version": 5,
+            "test_store_schema_version": 6,
             "store_generation": "generation-tests",
         }
 
@@ -605,7 +605,7 @@ class UniversalTestHarnessTests(unittest.TestCase):
             self.persistence.accept(health_request.peer, health_request.request)
         )
         self.assertEqual(health["status"], "ok")
-        self.assertEqual(health["test_store_schema_version"], 5)
+        self.assertEqual(health["test_store_schema_version"], 6)
         self.assertEqual(health["store_generation"], "generation-tests")
         self.assertEqual(health["repository_id"], self.repo_id)
 

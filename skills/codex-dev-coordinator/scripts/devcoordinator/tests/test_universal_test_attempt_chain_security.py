@@ -102,6 +102,7 @@ class _FakeNativeManager:
     def __init__(self) -> None:
         self.started: list[TestAttemptDescriptor] = []
         self.cancelled: list[str] = []
+        self.collected: list[str] = []
         self.states: dict[str, NativeTestAttemptState] = {}
         self.chunks: dict[tuple[str, int], dict[str, object]] = {}
         self.launch_tickets: dict[str, str] = {}
@@ -145,7 +146,7 @@ class _FakeNativeManager:
         return self.states[runtime_id]
 
     def collect(self, runtime_id: str) -> None:
-        del runtime_id
+        self.collected.append(runtime_id)
 
     def recover_descriptor(self, runtime_id: str) -> TestAttemptDescriptor:
         for descriptor in self.started:
@@ -251,9 +252,6 @@ class UniversalTestAttemptChainSecurityTests(unittest.TestCase):
             fixtures=(),
             network="none",
             ttl_seconds=60,
-            cpu_millis=candidate.cpu_millis,
-            memory_mib=candidate.memory_mib,
-            pids=candidate.pids,
         )
 
     def _collect_verified_artifact(
@@ -544,7 +542,18 @@ class UniversalTestAttemptChainSecurityTests(unittest.TestCase):
         self.assertEqual(observed["state"], "exited")
         self.assertIsNone(observed["result_chunk"])
         self.assertEqual(observed["exit_status"], 0)
+        self.assertEqual(native.cancelled, [])
+
+        collected = coordinator.collect(
+            runtime_id,
+            expected_attempt_id=descriptor.attempt_id,
+            expected_repository_id=descriptor.repository_id,
+            expected_repository_generation=descriptor.repository_generation,
+        )
+
+        self.assertTrue(collected["collected"])
         self.assertEqual(native.cancelled, [runtime_id])
+        self.assertEqual(native.collected, [runtime_id])
 
     def test_active_attempt_is_cancelled_at_inclusive_execution_deadline(self) -> None:
         candidate, lease = self._submit_and_lease(

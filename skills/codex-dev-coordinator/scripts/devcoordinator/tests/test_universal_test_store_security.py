@@ -40,7 +40,7 @@ class UniversalTestStoreSecurityTests(unittest.TestCase):
 
         reopened = UniversalTestStore.open(self.database)
 
-        self.assertEqual(reopened.verify()["schema_version"], 5)
+        self.assertEqual(reopened.verify()["schema_version"], 6)
 
     def test_open_rejects_symlink_database(self) -> None:
         real = self.root / "real.sqlite3"
@@ -74,7 +74,7 @@ class UniversalTestStoreSecurityTests(unittest.TestCase):
 
         reopened = UniversalTestStore.open(self.database)
 
-        self.assertEqual(reopened.verify()["schema_version"], 5)
+        self.assertEqual(reopened.verify()["schema_version"], 6)
 
     def test_expected_uid_is_compatibility_only(self) -> None:
         reopened = UniversalTestStore.open(

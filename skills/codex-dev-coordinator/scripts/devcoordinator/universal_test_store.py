@@ -39,7 +39,7 @@ from .universal_test_planner import TestPlan
 from .store import refuse_symlink_components
 
 
-TEST_STORE_SCHEMA_VERSION = 5
+TEST_STORE_SCHEMA_VERSION = 6
 DEFAULT_BUSY_TIMEOUT_MS = 5_000
 DEFAULT_LEASE_SECONDS = 30
 # Pending launch reconciliation may use the caller's full one-hour launch
@@ -260,9 +260,6 @@ def _validate_new_test_store_sidecars(presence: Mapping[Path, bool]) -> None:
 
 @dataclass(frozen=True)
 class TargetResources:
-    cpu_millis: int = 1_000
-    memory_mib: int = 1_024
-    pids: int = 256
     estimated_seconds: float = 1.0
     shard_count: int = 1
     max_attempts: int = 2
@@ -343,9 +340,6 @@ class RunnableTarget:
     wave_index: int
     shard_index: int
     shard_count: int
-    cpu_millis: int
-    memory_mib: int
-    pids: int
     estimated_seconds: float
     worktree_key: str
     source_mode: str
@@ -439,9 +433,6 @@ CREATE TABLE test_run_targets (
       'infrastructure_failed', 'timed_out', 'cancelled', 'incomplete',
       'abandoned', 'superseded'
     )),
-    cpu_millis INTEGER NOT NULL CHECK(cpu_millis > 0),
-    memory_mib INTEGER NOT NULL CHECK(memory_mib > 0),
-    pids INTEGER NOT NULL CHECK(pids > 0),
     estimated_seconds REAL NOT NULL CHECK(estimated_seconds > 0),
     max_attempts INTEGER NOT NULL CHECK(max_attempts > 0),
     worktree_key TEXT NOT NULL,
@@ -1216,7 +1207,7 @@ class UniversalTestStore:
             ).fetchone()
             if row is None or int(row["schema_version"]) != TEST_STORE_SCHEMA_VERSION:
                 raise TestStoreConflict(
-                    "test store schema is unsupported; initialize a fresh schema-5 store"
+                    "test store schema is unsupported; initialize a fresh current store"
                 )
             expected_schema = hashlib.sha256(_SCHEMA.encode("utf-8")).hexdigest()
             if not hmac.compare_digest(str(row["schema_fingerprint"]), expected_schema):
@@ -1280,7 +1271,7 @@ class UniversalTestStore:
                 )
             ):
                 raise TestStoreConflict(
-                    "test store schema is unsupported; initialize a fresh schema-5 store"
+                    "test store schema is unsupported; initialize a fresh current store"
                 )
             return {
                 "schema_version": int(row["schema_version"]),
@@ -1513,10 +1504,10 @@ class UniversalTestStore:
                         """
                         INSERT INTO test_run_targets(
                             target_id, run_id, target_name, wave_index,
-                            shard_index, shard_count, state, cpu_millis,
-                            memory_mib, pids, estimated_seconds, max_attempts,
+                            shard_index, shard_count, state,
+                            estimated_seconds, max_attempts,
                             worktree_key, exclusive_resources_json, queued_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?)
+                        ) VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?)
                         """,
                         (
                             target_id,
@@ -1525,9 +1516,6 @@ class UniversalTestStore:
                             wave_by_target[target_name],
                             shard_index,
                             resource.shard_count,
-                            resource.cpu_millis,
-                            resource.memory_mib,
-                            resource.pids,
                             resource.estimated_seconds,
                             resource.max_attempts,
                             resource.worktree_key or plan.source.temporary_root or plan.source.original_root,
@@ -1639,13 +1627,6 @@ class UniversalTestStore:
                 )
             )
             result[name] = TargetResources(
-                # Retain stable positive compatibility values while the
-                # manifest/transport schema is simplified. Repository-declared
-                # CPU, memory, and PID values are intentionally discarded and
-                # cannot become admission limits or cgroup quotas.
-                cpu_millis=TargetResources.cpu_millis,
-                memory_mib=TargetResources.memory_mib,
-                pids=TargetResources.pids,
                 estimated_seconds=estimated,
                 shard_count=resource.shard_count,
                 max_attempts=resource.max_attempts,
@@ -1657,9 +1638,6 @@ class UniversalTestStore:
     @staticmethod
     def _resource_document(resource: TargetResources) -> dict[str, object]:
         return {
-            "cpu_millis": resource.cpu_millis,
-            "memory_mib": resource.memory_mib,
-            "pids": resource.pids,
             "estimated_seconds": resource.estimated_seconds,
             "shard_count": resource.shard_count,
             "max_attempts": resource.max_attempts,
@@ -1855,9 +1833,6 @@ class UniversalTestStore:
             wave_index=int(row["wave_index"]),
             shard_index=int(row["shard_index"]),
             shard_count=int(row["shard_count"]),
-            cpu_millis=int(row["cpu_millis"]),
-            memory_mib=int(row["memory_mib"]),
-            pids=int(row["pids"]),
             estimated_seconds=float(row["estimated_seconds"]),
             worktree_key=str(row["worktree_key"]),
             exclusive_resources=tuple(json.loads(row["exclusive_resources_json"])),
@@ -1898,9 +1873,6 @@ class UniversalTestStore:
                     "worktree_key": str(row["worktree_key"]),
                     "source_mode": str(row["source_mode"]),
                     "memory_commitment_mib": int(row["memory_commitment_mib"]),
-                    "cpu_millis": int(row["cpu_millis"]),
-                    "memory_mib": int(row["memory_mib"]),
-                    "pids": int(row["pids"]),
                     "exclusive_resources": tuple(
                         json.loads(row["exclusive_resources_json"])
                     ),
@@ -3290,10 +3262,10 @@ class UniversalTestStore:
                     """
                     INSERT INTO test_run_targets(
                         target_id, run_id, target_name, wave_index,
-                        shard_index, shard_count, state, cpu_millis,
-                        memory_mib, pids, estimated_seconds, max_attempts,
+                        shard_index, shard_count, state,
+                        estimated_seconds, max_attempts,
                         worktree_key, exclusive_resources_json, queued_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?)
                     """,
                     (
                         target_id,
@@ -3302,9 +3274,6 @@ class UniversalTestStore:
                         retry_wave_by_target[str(row["target_name"])],
                         row["shard_index"],
                         row["shard_count"],
-                        row["cpu_millis"],
-                        row["memory_mib"],
-                        row["pids"],
                         row["estimated_seconds"],
                         row["max_attempts"],
                         row["worktree_key"],
@@ -5812,13 +5781,6 @@ class UniversalTestStore:
                     "stored exclusive resources are invalid"
                 )
             decoded[name] = TargetResources(
-                cpu_millis=_positive_int(
-                    "cpu_millis", value["cpu_millis"], maximum=1_000_000
-                ),
-                memory_mib=_positive_int(
-                    "memory_mib", value["memory_mib"], maximum=16_777_216
-                ),
-                pids=_positive_int("pids", value["pids"], maximum=1_000_000),
                 estimated_seconds=estimated,
                 shard_count=shard_count,
                 max_attempts=max_attempts,
@@ -6082,7 +6044,7 @@ class UniversalTestStore:
             connection.close()
 
 
-def prepare_test_store_schema_v5(
+def prepare_test_store_schema(
     path: Path,
     *,
     operation_id: str,
@@ -6090,7 +6052,7 @@ def prepare_test_store_schema_v5(
     busy_timeout_ms: int = DEFAULT_BUSY_TIMEOUT_MS,
     checkpoint: Callable[[str], None] | None = None,
 ) -> dict[str, object]:
-    """Attest one exact fresh schema-5 Test Store.
+    """Attest one exact fresh current-schema Test Store.
 
     Test history is disposable on this single-developer server.  Older stores
     are intentionally not migrated: the administrator workflow replaces the
@@ -6104,7 +6066,7 @@ def prepare_test_store_schema_v5(
         expected_uid=expected_uid,
         busy_timeout_ms=busy_timeout_ms,
     )
-    expected_v5 = hashlib.sha256(_SCHEMA.encode("utf-8")).hexdigest()
+    expected_schema = hashlib.sha256(_SCHEMA.encode("utf-8")).hexdigest()
     connection = store._connect()
     try:
         metadata = connection.execute(
@@ -6115,10 +6077,10 @@ def prepare_test_store_schema_v5(
         version = int(metadata["schema_version"])
         schema_fingerprint = str(metadata["schema_fingerprint"])
         if version != TEST_STORE_SCHEMA_VERSION or not hmac.compare_digest(
-            schema_fingerprint, expected_v5
+            schema_fingerprint, expected_schema
         ):
             raise TestStoreConflict(
-                "test store schema is unsupported; initialize a fresh schema-5 store"
+                "test store schema is unsupported; initialize a fresh current store"
             )
 
         replay = connection.execute(
@@ -6130,7 +6092,7 @@ def prepare_test_store_schema_v5(
         ).fetchone()
         if replay is not None:
             operation_kind = str(replay["operation_kind"])
-            if operation_kind != "schema_readiness_v5":
+            if operation_kind != "schema_readiness":
                 raise TestStoreConflict(
                     "test-store schema operation identity is already used"
                 )
@@ -6147,7 +6109,7 @@ def prepare_test_store_schema_v5(
             return {
                 "schema_version": 1,
                 "operation_id": operation_id,
-                "action": "attested-fresh-v5",
+                "action": "attested-fresh",
                 "journal_kind": operation_kind,
                 "journal": result,
                 "store": verified,
@@ -6163,7 +6125,7 @@ def prepare_test_store_schema_v5(
             {
                 "operation_id": operation_id,
                 "schema_version": TEST_STORE_SCHEMA_VERSION,
-                "schema_fingerprint": expected_v5,
+                "schema_fingerprint": expected_schema,
                 "store_generation": store_generation,
             }
         )
@@ -6173,7 +6135,7 @@ def prepare_test_store_schema_v5(
             "from_schema_version": TEST_STORE_SCHEMA_VERSION,
             "to_schema_version": TEST_STORE_SCHEMA_VERSION,
             "store_generation": store_generation,
-            "schema_fingerprint": expected_v5,
+            "schema_fingerprint": expected_schema,
             "quick_check": "ok",
             "status": "succeeded",
         }
@@ -6186,7 +6148,7 @@ def prepare_test_store_schema_v5(
                 INSERT INTO test_mutation_journal(
                     operation_id, operation_kind, request_fingerprint,
                     result_json, created_at
-                ) VALUES (?, 'schema_readiness_v5', ?, ?, ?)
+                ) VALUES (?, 'schema_readiness', ?, ?, ?)
                 """,
                 (
                     operation_id,
@@ -6215,8 +6177,8 @@ def prepare_test_store_schema_v5(
     return {
         "schema_version": 1,
         "operation_id": operation_id,
-        "action": "attested-fresh-v5",
-        "journal_kind": "schema_readiness_v5",
+        "action": "attested-fresh",
+        "journal_kind": "schema_readiness",
         "journal": result,
         "store": verified,
     }
@@ -6240,5 +6202,5 @@ __all__ = [
     "TestStoreNotFound",
     "TestStoreSecurityError",
     "UniversalTestStore",
-    "prepare_test_store_schema_v5",
+    "prepare_test_store_schema",
 ]

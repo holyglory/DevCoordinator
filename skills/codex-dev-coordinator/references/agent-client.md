@@ -361,10 +361,16 @@ The lower-level Python CLI and `devcoordinator-test` are separate current
 interfaces for capabilities intentionally outside the routine parser/tool
 catalog: a new definition, generation-checked replacement, bounded `run`,
 staged removal, manifest init/validate/doctor, exact failure/artifact
-drill-down, or an administrator migration/recovery transaction. The authority
+drill-down, or an administrator fresh-store/recovery transaction. The authority
 capability document may advertise these operations without projecting them into
 the routine client. A release/generation/broker-protocol mismatch must not be
 bypassed through another interface.
+
+The routine test parser intentionally has no separate `status`, `summary`, or
+`wait` aliases. `test follow` owns immediate reads and bounded waiting and
+automatically includes the terminal summary. Failure, artifact, and retry
+commands are diagnostic continuations returned by that one decision surface;
+the advanced CLI retains its detailed status/summary/wait operations.
 
 For advanced tests, `test plan` derives the enrolled repository from its
 explicit root/temporary-repository context. Every submit, status, summary,

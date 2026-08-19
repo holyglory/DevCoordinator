@@ -2680,9 +2680,6 @@ class ImmutableSnapshotPlanPreviewer:
             "network_requirements": [],
             "isolation": {
                 "network": "none",
-                "cpu_millis": 0,
-                "memory_mib": 0,
-                "pids": 0,
                 "private_scratch": True,
                 "kill_after_run": True,
             },
@@ -2756,11 +2753,6 @@ class ImmutableSnapshotPlanPreviewer:
                     "network": target.network,
                     "fixtures": sorted(target.fixtures),
                     "depends_on": sorted(target.depends_on),
-                    "resources": {
-                        "cpu_millis": target.resources.cpu_millis,
-                        "memory_mib": target.resources.memory_mib,
-                        "pids": target.resources.pids,
-                    },
                 }
                 for name, target in sorted(manifest.targets.items())
             ],
@@ -2784,15 +2776,6 @@ class ImmutableSnapshotPlanPreviewer:
             "network_requirements": networks,
             "isolation": {
                 "network": max(networks, key=network_rank.__getitem__),
-                "cpu_millis": max(
-                    target.resources.cpu_millis for target in manifest.targets.values()
-                ),
-                "memory_mib": max(
-                    target.resources.memory_mib for target in manifest.targets.values()
-                ),
-                "pids": max(
-                    target.resources.pids for target in manifest.targets.values()
-                ),
                 "private_scratch": True,
                 "kill_after_run": True,
             },
@@ -2899,9 +2882,6 @@ class ImmutableSnapshotPlanPreviewer:
             "plan": plan.to_document(),
             "target_resources": {
                 name: {
-                    "cpu_millis": manifest.targets[name].resources.cpu_millis,
-                    "memory_mib": manifest.targets[name].resources.memory_mib,
-                    "pids": manifest.targets[name].resources.pids,
                     "estimated_seconds": float(
                         manifest.targets[name].timeout_seconds
                         if plan.timeouts.execution_seconds is None

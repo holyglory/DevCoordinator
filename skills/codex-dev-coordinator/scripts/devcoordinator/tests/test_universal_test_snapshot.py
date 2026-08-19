@@ -12,11 +12,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from devcoordinator.universal_test_contract import (
-    NON_AUTHORITATIVE_RESOURCES,
-    SourceMode,
-    parse_test_manifest,
-)
+from devcoordinator.universal_test_contract import SourceMode, parse_test_manifest
 from devcoordinator.universal_test_planner import (
     ChangeStatus,
     SourceIdentity,
@@ -188,9 +184,6 @@ class OwnerPreviewHelper(InProcessUIDHelper):
         for name in selected.selected_targets:
             target = manifest.targets[name]
             resources[name] = {
-                "cpu_millis": target.resources.cpu_millis,
-                "memory_mib": target.resources.memory_mib,
-                "pids": target.resources.pids,
                 "estimated_seconds": float(target.timeout_seconds),
                 "shard_count": 1,
                 "max_attempts": 2,
@@ -205,11 +198,6 @@ class OwnerPreviewHelper(InProcessUIDHelper):
                 "environment": dict(target.environment),
                 "network": target.network,
                 "timeout_seconds": target.timeout_seconds,
-                "resources": {
-                    "cpu_millis": target.resources.cpu_millis,
-                    "memory_mib": target.resources.memory_mib,
-                    "pids": target.resources.pids,
-                },
                 "fixtures": list(target.fixtures),
                 "artifacts": [],
             }
@@ -1398,9 +1386,6 @@ class UniversalTestSnapshotTests(unittest.TestCase):
         )
         resources = {
             name: TargetResources(
-                cpu_millis=value["cpu_millis"],
-                memory_mib=value["memory_mib"],
-                pids=value["pids"],
                 estimated_seconds=value["estimated_seconds"],
                 shard_count=value["shard_count"],
                 max_attempts=value["max_attempts"],
@@ -1457,15 +1442,9 @@ class UniversalTestSnapshotTests(unittest.TestCase):
                     "plan": planned["plan"],
                 }
             )
-        advisory_resources = asdict(candidate)
-        advisory_resources.update(
-            cpu_millis=64_000,
-            memory_mib=262_144,
-            pids=32_768,
-        )
         descriptor = service.resolve(
             {
-                "candidate": advisory_resources,
+                "candidate": asdict(candidate),
                 "lease": asdict(lease),
                 "plan": planned["plan"],
             }
@@ -1475,13 +1454,7 @@ class UniversalTestSnapshotTests(unittest.TestCase):
         self.assertEqual(descriptor["temporary_root"], str(temporary_root))
         self.assertEqual(descriptor["execution_root"], str(temporary_root))
         self.assertEqual(descriptor["argv"], ["./scripts/test"])
-        self.assertEqual(
-            descriptor["cpu_millis"], NON_AUTHORITATIVE_RESOURCES.cpu_millis
-        )
-        self.assertEqual(
-            descriptor["memory_mib"], NON_AUTHORITATIVE_RESOURCES.memory_mib
-        )
-        self.assertEqual(descriptor["pids"], NON_AUTHORITATIVE_RESOURCES.pids)
+        self.assertFalse({"cpu_millis", "memory_mib", "pids"} & set(descriptor))
         self.assertEqual(len(published), 1)
         published_value = published[0]["value"]
         self.assertEqual(published_value["owner_uid"], owner_uid)

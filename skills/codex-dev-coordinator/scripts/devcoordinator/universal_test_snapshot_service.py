@@ -37,6 +37,7 @@ from .call_journal import (
 from .store import CoordinatorStore
 from .schema import SCHEMA_VERSION
 from .universal_test_broker import RepositoryLaunchDescriptorResolver
+from .universal_test_dependency_drivers import DependencyDrivers
 from .universal_test_runtime import (
     _SYSTEM_PYTHON_TOOLCHAIN_ROOTS,
     TestAttemptDescriptor,
@@ -2079,40 +2080,35 @@ class RootSnapshotService:
         cls._real_dependency_directory(
             materialized, field="immutable dependency materialization"
         )
-        bindings: list[Mapping[str, object]] = []
-        python, python_executable = cls._python_dependency(
-            launch=launch,
-            original_root=original,
-            materialized_root=materialized,
-            dependency_locks=dependency_locks,
-            account_uids=account_uids,
+        resolved = DependencyDrivers(
+            python=lambda: cls._python_dependency(
+                launch=launch,
+                original_root=original,
+                materialized_root=materialized,
+                dependency_locks=dependency_locks,
+                account_uids=account_uids,
+            ),
+            node=lambda: cls._node_dependency(
+                launch=launch,
+                original_root=original,
+                materialized_root=materialized,
+                dependency_locks=dependency_locks,
+            ),
+            dotnet=lambda: cls._dotnet_dependency(
+                launch=launch,
+                original_root=original,
+                materialized_root=materialized,
+                dependency_locks=dependency_locks,
+                owner_uid=owner_uid,
+                account_uids=account_uids,
+            ),
+        ).resolve()
+        return (
+            resolved.bindings,
+            resolved.python_executable,
+            resolved.dotnet_executable,
+            resolved.toolchains,
         )
-        if python is not None:
-            bindings.append(python)
-        node = cls._node_dependency(
-            launch=launch,
-            original_root=original,
-            materialized_root=materialized,
-            dependency_locks=dependency_locks,
-        )
-        if node is not None:
-            bindings.append(node)
-        dotnet, dotnet_executable, standalone_dotnet_toolchain = cls._dotnet_dependency(
-            launch=launch,
-            original_root=original,
-            materialized_root=materialized,
-            dependency_locks=dependency_locks,
-            owner_uid=owner_uid,
-            account_uids=account_uids,
-        )
-        if dotnet is not None:
-            bindings.append(dotnet)
-        toolchains = (
-            ()
-            if standalone_dotnet_toolchain is None
-            else (standalone_dotnet_toolchain,)
-        )
-        return tuple(bindings), python_executable, dotnet_executable, toolchains
 
     @staticmethod
     def _supplementary_developer_gids(
@@ -2352,9 +2348,6 @@ class RootSnapshotService:
             fixture_bindings=tuple(launch.get("fixture_bindings", ())),  # type: ignore[arg-type]
             network=launch["network"],  # type: ignore[arg-type]
             ttl_seconds=launch["timeout_seconds"],  # type: ignore[arg-type]
-            cpu_millis=candidate.cpu_millis,
-            memory_mib=candidate.memory_mib,
-            pids=candidate.pids,
             source_provenance=source_provenance,
             dependency_bindings=dependency_bindings,
             toolchain_bindings=toolchain_bindings,

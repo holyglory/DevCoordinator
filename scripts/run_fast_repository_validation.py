@@ -4,9 +4,9 @@
 The five ordinary harness targets own Console and Coordinator behavioral tests.
 This command owns only cheap repository-wide release checks: diff cleanliness,
 immutable-release syntax, the test manifest/partition contract, skill metadata,
-availability topology, and repository boundaries.  Compatibility, provenance,
-legacy migration, and destructive recovery suites remain explicit manual or
-nightly validation and are intentionally absent here.
+availability topology, testing-simplification boundaries, and repository
+boundaries. Provenance and destructive recovery suites remain explicit manual
+or nightly validation and are intentionally absent here.
 """
 
 from __future__ import annotations
@@ -164,10 +164,6 @@ def manifest_contract() -> str:
     partition_errors = coordinator_partitions.partition_contract_errors()
     if partition_errors:
         raise RuntimeError("; ".join(partition_errors))
-    if coordinator_partitions.non_gate_compatibility_modules() != (
-        "test_universal_test_migration",
-    ):
-        raise RuntimeError("legacy test-history migration is not isolated from normal gates")
     return "manifest, six evidence targets, and manual runner probe ok"
 
 
@@ -197,6 +193,51 @@ def skill_contract() -> str:
             raise RuntimeError(f"{name} skill has no executable scripts")
         checked.append(name)
     return "canonical skill metadata ok: " + ", ".join(checked)
+
+
+def test_simplification_contract() -> str:
+    package = ROOT / "skills/codex-dev-coordinator/scripts/devcoordinator"
+    required = {
+        ROOT / "scripts/manage_test_store.py",
+        package / "universal_test_drivers.py",
+        package / "universal_test_dependency_drivers.py",
+        package / "universal_test_reporters.py",
+    }
+    missing = sorted(str(path.relative_to(ROOT)) for path in required if not path.is_file())
+    if missing:
+        raise RuntimeError("missing testing simplification source: " + ", ".join(missing))
+    retired = {
+        ROOT / "scripts/migrate_universal_test_history.py",
+        package / "universal_test_admission.py",
+        package / "universal_test_migration.py",
+    }
+    retained = sorted(str(path.relative_to(ROOT)) for path in retired if path.exists())
+    if retained:
+        raise RuntimeError("retired testing compatibility source remains: " + ", ".join(retained))
+    core = {
+        "store": (package / "universal_test_store.py").read_text(encoding="utf-8"),
+        "runtime": (package / "universal_test_runtime.py").read_text(encoding="utf-8"),
+        "service": (package / "universal_test_service.py").read_text(encoding="utf-8"),
+        "agent": (package / "agent_cli.py").read_text(encoding="utf-8"),
+        "runner": (package / "universal_test_runner.py").read_text(encoding="utf-8"),
+    }
+    for field in ("cpu_millis", "memory_mib", "pids"):
+        token = f'"{field}"'
+        if token in core["store"] or token in core["runtime"] or token in core["service"]:
+            raise RuntimeError(f"compatibility-only target field remains: {field}")
+    if "def adapt_driver_invocation" in core["runner"]:
+        raise RuntimeError("framework invocation adaptation remains in runner core")
+    if "ReporterDrivers" not in core["runner"]:
+        raise RuntimeError("runner does not use the reporter driver boundary")
+    snapshot_service = (
+        package / "universal_test_snapshot_service.py"
+    ).read_text(encoding="utf-8")
+    if "DependencyDrivers" not in snapshot_service:
+        raise RuntimeError("snapshot service does not use dependency drivers")
+    for alias in ('add_parser("status"', 'add_parser("summary"', 'add_parser("wait"'):
+        if alias in core["agent"]:
+            raise RuntimeError("redundant routine test alias remains: " + alias)
+    return "fresh store, single-state, driver, and routine API boundaries ok"
 
 
 def emit_cases(results: Sequence[Result]) -> None:
@@ -241,6 +282,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         ("release-syntax", lambda: internal("release-syntax", release_syntax)),
         ("test-manifest", lambda: internal("test-manifest", manifest_contract)),
         ("skill-contract", lambda: internal("skill-contract", skill_contract)),
+        (
+            "test-simplification",
+            lambda: internal("test-simplification", test_simplification_contract),
+        ),
         (
             "availability-topology",
             lambda: external(

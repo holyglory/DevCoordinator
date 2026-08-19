@@ -3,7 +3,7 @@
 The acceptance plane deliberately reuses the broker-owned universal-test
 transient launcher.  Repository-controlled commands, shell wrappers, Docker
 operations, and direct service lifecycle calls are not part of this module.
-Each fixed scenario is generation-fenced, resource-clamped, TTL bounded, and
+Each fixed scenario is generation-fenced, TTL bounded, and
 collected before a root-private attestation can be published.
 """
 
@@ -64,49 +64,31 @@ SCENARIO_POLICIES: Mapping[str, Mapping[str, object]] = {
     "bounded_fork_pressure": {
         "unit_scope": "test",
         "ttl_seconds": 20,
-        "cpu_millis": 500,
-        "memory_mib": 96,
-        "pids": 24,
         "expected_terminal": "success",
     },
     "cgroup_oom": {
         "unit_scope": "test",
         "ttl_seconds": 20,
-        "cpu_millis": 500,
-        "memory_mib": 96,
-        "pids": 16,
         "expected_terminal": "oom_kill",
     },
     "crash_loop_breaker": {
         "unit_scope": "test",
         "ttl_seconds": 20,
-        "cpu_millis": 500,
-        "memory_mib": 96,
-        "pids": 16,
         "expected_terminal": "success",
     },
     "malformed_runner_output": {
         "unit_scope": "test",
         "ttl_seconds": 20,
-        "cpu_millis": 500,
-        "memory_mib": 96,
-        "pids": 16,
         "expected_terminal": "incomplete_reporting",
     },
     "slow_project_upstream": {
         "unit_scope": "project",
         "ttl_seconds": 20,
-        "cpu_millis": 500,
-        "memory_mib": 96,
-        "pids": 24,
         "expected_terminal": "success",
     },
     "bounded_request_burst": {
         "unit_scope": "test",
         "ttl_seconds": 20,
-        "cpu_millis": 750,
-        "memory_mib": 128,
-        "pids": 24,
         "expected_terminal": "success",
     },
 }
@@ -296,11 +278,6 @@ def build_request(
                 "unit_scope": policy["unit_scope"],
                 "ttl_seconds": policy["ttl_seconds"],
                 "kill_after_run": True,
-                "resources": {
-                    "cpu_millis": policy["cpu_millis"],
-                    "memory_mib": policy["memory_mib"],
-                    "pids": policy["pids"],
-                },
                 "expected_terminal": policy["expected_terminal"],
             }
         )
@@ -492,7 +469,6 @@ def validate_request(value: object, *, now: datetime | None = None) -> dict[str,
             "unit_scope",
             "ttl_seconds",
             "kill_after_run",
-            "resources",
             "expected_terminal",
         }:
             raise FaultAcceptanceError("fault scenario fields are invalid")
@@ -507,23 +483,10 @@ def validate_request(value: object, *, now: datetime | None = None) -> dict[str,
         if raw["resource_generation"] != repository["generation"]:
             raise FaultAcceptanceError("scenario resource generation is stale")
         policy = SCENARIO_POLICIES[scenario_id]
-        resources = raw["resources"]
-        if not isinstance(resources, Mapping) or set(resources) != {
-            "cpu_millis",
-            "memory_mib",
-            "pids",
-        }:
-            raise FaultAcceptanceError("scenario resource clamp fields are invalid")
         if (
             raw["unit_scope"] != policy["unit_scope"]
             or raw["ttl_seconds"] != policy["ttl_seconds"]
             or raw["kill_after_run"] is not True
-            or dict(resources)
-            != {
-                "cpu_millis": policy["cpu_millis"],
-                "memory_mib": policy["memory_mib"],
-                "pids": policy["pids"],
-            }
             or raw["expected_terminal"] != policy["expected_terminal"]
         ):
             raise FaultAcceptanceError("scenario safety policy was weakened or changed")
@@ -590,9 +553,6 @@ class NativeFaultRuntime:
             raise FaultAcceptanceError("fault runtime request binding is invalid")
         scenario_id = str(scenario["scenario_id"])
         operation = str(scenario["operation_id"])
-        limits = scenario["resources"]
-        if not isinstance(limits, Mapping):
-            raise FaultAcceptanceError("fault runtime resource clamps are invalid")
         return TestAttemptDescriptor(
             attempt_id="fault-attempt-" + operation.replace("-", ""),
             target_id=str(scenario["resource_id"]),
@@ -628,9 +588,6 @@ class NativeFaultRuntime:
             fixtures=(),
             network="loopback",
             ttl_seconds=int(scenario["ttl_seconds"]),
-            cpu_millis=int(limits["cpu_millis"]),
-            memory_mib=int(limits["memory_mib"]),
-            pids=int(limits["pids"]),
         )
 
     def launch(self, scenario: Mapping[str, object]) -> Mapping[str, object]:
@@ -656,7 +613,6 @@ class NativeFaultRuntime:
             "unit_scope": scenario["unit_scope"],
             "ttl_seconds": scenario["ttl_seconds"],
             "kill_after_run": True,
-            "resources": dict(scenario["resources"]),
         }
 
     def status(self, handle: Mapping[str, object]) -> Mapping[str, object]:
@@ -786,7 +742,6 @@ def _validate_runtime_result(
         "unit_scope",
         "ttl_seconds",
         "kill_after_run",
-        "resources",
     }:
         raise FaultAcceptanceError("fault runtime launch evidence is invalid")
     launch = dict(launch)
@@ -805,8 +760,6 @@ def _validate_runtime_result(
     ):
         if launch[field] != scenario[field]:
             raise FaultAcceptanceError("fault runtime launch changed scenario identity")
-    if launch["resources"] != scenario["resources"]:
-        raise FaultAcceptanceError("fault runtime launch changed resource clamps")
 
     if not isinstance(result, Mapping) or set(result) != {
         "scenario_id",
@@ -957,7 +910,6 @@ def validate_attestation(
             "unit_scope",
             "ttl_seconds",
             "kill_after_run",
-            "resources",
             "expected_terminal",
             "launch",
             "result",
@@ -975,7 +927,6 @@ def validate_attestation(
             "unit_scope",
             "ttl_seconds",
             "kill_after_run",
-            "resources",
             "expected_terminal",
         ):
             if evidence[field] != expected[field]:
@@ -1094,7 +1045,6 @@ def run_acceptance(
                     "unit_scope",
                     "ttl_seconds",
                     "kill_after_run",
-                    "resources",
                     "expected_terminal",
                 )},
                 "launch": launch,

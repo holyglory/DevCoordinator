@@ -217,9 +217,6 @@ class BrokerLaunchTicket:
     network: str = "none"
     ttl_seconds: int = 0
     kill_after_run: bool = True
-    cpu_millis: int = 0
-    memory_mib: int = 0
-    pids: int = 0
     worktree_key: str = ""
     issued_at: float = 0.0
     expires_at: float = 0.0
@@ -242,9 +239,6 @@ class BrokerLaunchTicket:
         environment: Mapping[str, str],
         network: str,
         ttl_seconds: int,
-        cpu_millis: int,
-        memory_mib: int,
-        pids: int,
         worktree_key: str,
         issued_at: float,
         expires_at: float,
@@ -281,9 +275,6 @@ class BrokerLaunchTicket:
             network=network,
             ttl_seconds=ttl_seconds,
             kill_after_run=True,
-            cpu_millis=cpu_millis,
-            memory_mib=memory_mib,
-            pids=pids,
             worktree_key=worktree_key,
             issued_at=float(issued_at),
             expires_at=float(expires_at),
@@ -313,11 +304,6 @@ class BrokerLaunchTicket:
             "network": self.network,
             "ttl_seconds": self.ttl_seconds,
             "kill_after_run": self.kill_after_run,
-            "resources": {
-                "cpu_millis": self.cpu_millis,
-                "memory_mib": self.memory_mib,
-                "pids": self.pids,
-            },
             "worktree_key": self.worktree_key,
             "issued_at": self.issued_at,
             "expires_at": self.expires_at,
@@ -353,9 +339,6 @@ class TransientRunnerRequest:
             "isolation": {
                 "owner_uid": ticket.owner_uid,
                 "worktree_key": ticket.worktree_key,
-                "cpu_millis": ticket.cpu_millis,
-                "memory_mib": ticket.memory_mib,
-                "pids": ticket.pids,
                 "network": ticket.network,
                 "clean_environment": True,
             },
@@ -426,6 +409,8 @@ class RuntimeRequestSubmitter(Protocol):
 
     def cancel(self, runtime_id: str, *, reason: str) -> Mapping[str, object]: ...
 
+    def collect(self, runtime_id: str) -> Mapping[str, object]: ...
+
 
 @runtime_checkable
 class RunnerLauncher(Protocol):
@@ -438,6 +423,8 @@ class RunnerLauncher(Protocol):
     ) -> None: ...
 
     def cancel(self, handle: RunnerHandle, *, reason: str) -> bool: ...
+
+    def collect(self, handle: RunnerHandle) -> bool: ...
 
 
 @runtime_checkable
@@ -698,6 +685,14 @@ class TestdLaunchAdapter:
         if type(reply["cancelled"]) is not bool:
             raise TestStoreContractError("runtime cancellation result is invalid")
         return bool(reply["cancelled"])
+
+    def collect(self, handle: RunnerHandle) -> bool:
+        reply = self._submitter.collect(handle.runtime_id)
+        if not isinstance(reply, Mapping) or set(reply) != {"collected"}:
+            raise TestStoreContractError("runtime collection reply fields are invalid")
+        if type(reply["collected"]) is not bool:
+            raise TestStoreContractError("runtime collection result is invalid")
+        return bool(reply["collected"])
 
 
 def _attempt_result_chunk(value: Mapping[str, object]) -> AttemptResultChunk:
@@ -1039,6 +1034,12 @@ class TestdEngine:
         for envelope in self.spool.active_envelopes():
             state = str(self.store.get_attempt(envelope.attempt_id)["state"])
             if state not in {"leased", "running"}:
+                active = self._active.get(envelope.attempt_id)
+                if active is not None and active.result_chunk_ids:
+                    if not self.launcher.collect(active.handle):
+                        raise TestStoreConflict(
+                            "terminal test attempt runtime was not collected"
+                        )
                 self.spool.discard_active(envelope.attempt_id)
                 self._active.pop(envelope.attempt_id, None)
 

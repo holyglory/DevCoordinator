@@ -182,7 +182,6 @@ AUTHORITY_TABLES = frozenset(
         "broker_runtime_replacements",
         "broker_port_ranges",
         "broker_operation_requests",
-        "broker_test_admission_fences",
         *CURRENT_OBSERVATION_TABLES,
         *SPECIAL_AUTHORITY_TABLES,
     }

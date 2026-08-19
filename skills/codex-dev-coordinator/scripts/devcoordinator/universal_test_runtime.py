@@ -28,10 +28,7 @@ import uuid
 import zipfile
 
 from .universal_test_artifacts import package_directory
-from .universal_test_contract import (
-    NON_AUTHORITATIVE_RESOURCES,
-    deterministic_fingerprint,
-)
+from .universal_test_contract import deterministic_fingerprint
 from .universal_test_repository_binding import (
     publish_immutable_repository_binding,
 )
@@ -450,9 +447,6 @@ class TestAttemptDescriptor:
     fixtures: tuple[str, ...]
     network: str
     ttl_seconds: int
-    cpu_millis: int
-    memory_mib: int
-    pids: int
     source_provenance: Mapping[str, object] = field(default_factory=dict)
     dependency_bindings: tuple[Mapping[str, object], ...] = ()
     toolchain_bindings: tuple[Mapping[str, object], ...] = ()
@@ -599,15 +593,6 @@ class TestAttemptDescriptor:
                 "host-loopback requires manual intent without fixtures"
             )
         object.__setattr__(self, "ttl_seconds", _positive_integer("ttl_seconds", self.ttl_seconds, maximum=MAX_TEST_ATTEMPT_TTL_SECONDS))
-        # These fields remain only for schema compatibility. Never validate or
-        # retain repository declarations as though they were executable limits.
-        object.__setattr__(
-            self, "cpu_millis", NON_AUTHORITATIVE_RESOURCES.cpu_millis
-        )
-        object.__setattr__(
-            self, "memory_mib", NON_AUTHORITATIVE_RESOURCES.memory_mib
-        )
-        object.__setattr__(self, "pids", NON_AUTHORITATIVE_RESOURCES.pids)
         raw_provenance = self.source_provenance
         if not isinstance(raw_provenance, Mapping):
             raise TestStoreContractError("test attempt source provenance is invalid")
@@ -1144,9 +1129,6 @@ class TestAttemptDescriptor:
             "fixtures": list(self.fixtures),
             "network": self.network,
             "ttl_seconds": self.ttl_seconds,
-            "cpu_millis": self.cpu_millis,
-            "memory_mib": self.memory_mib,
-            "pids": self.pids,
             "source_provenance": dict(self.source_provenance),
             "dependency_bindings": [dict(item) for item in self.dependency_bindings],
             "toolchain_bindings": [dict(item) for item in self.toolchain_bindings],
@@ -4300,9 +4282,6 @@ class BrokerTestAttemptCoordinator:
             "ttl_seconds": descriptor.ttl_seconds,
             "kill_after_run": True,
             "resources": {
-                "cpu_millis": descriptor.cpu_millis,
-                "memory_mib": descriptor.memory_mib,
-                "pids": descriptor.pids,
             },
             "worktree_key": descriptor.worktree_key,
             "issued_at": now,
@@ -4647,19 +4626,6 @@ class BrokerTestAttemptCoordinator:
             state.current_memory_bytes
         )
         terminal_from_result = result_summary is not None
-        result_stream_complete = (
-            terminal_from_result
-            and result_chunk_index >= int(result_summary["chunk_count"])
-        )
-        if terminal_from_result and state.active and result_stream_complete:
-            # The owner publishes result.json atomically only after every
-            # digest-bound chunk. That exact evidence is terminal even when a
-            # descendant or obsolete release keeps the native cgroup active.
-            # Preserve the result directory until the caller has drained the
-            # complete declared stream: the native stop path collects and
-            # removes those files. Stop only on the manifest-complete
-            # observation, then let the caller commit its terminal envelope.
-            self.manager.cancel(runtime_id)
         effective_active = state.active and not terminal_from_result
         output_progress = (
             _validated_output_progress(state.output_progress)
@@ -4735,6 +4701,45 @@ class BrokerTestAttemptCoordinator:
             ),
             "progress": output_progress,
         }
+
+    def collect(
+        self,
+        runtime_id: str,
+        *,
+        expected_attempt_id: str,
+        expected_repository_id: str,
+        expected_repository_generation: int,
+    ) -> dict[str, object]:
+        """Stop and remove one measured runtime after testd commits terminal state."""
+
+        runtime_id = _safe_id("runtime_id", runtime_id)
+        descriptor = self.runtime_descriptor(runtime_id)
+        if (
+            descriptor.attempt_id != _safe_id("expected_attempt_id", expected_attempt_id)
+            or descriptor.repository_id
+            != _safe_id("expected_repository_id", expected_repository_id)
+            or descriptor.repository_generation != expected_repository_generation
+        ):
+            raise TestStoreConflict("test attempt collection identity is contradictory")
+        state = self._require_exact_native_state(
+            runtime_id, self.manager.status(runtime_id)
+        )
+        if state.result_document is None:
+            raise TestStoreConflict(
+                "test attempt cannot be collected before measured result publication"
+            )
+        if state.active:
+            state = self._require_exact_native_state(
+                runtime_id, self.manager.cancel(runtime_id)
+            )
+        if state.active:
+            raise TestStoreConflict("test attempt remained active during collection")
+        self.manager.collect(runtime_id)
+        ticket_id = self._runtimes.pop(runtime_id, None)
+        if ticket_id is not None:
+            self._tickets.pop(ticket_id, None)
+        self._recovered_runtimes.pop(runtime_id, None)
+        return {"runtime_id": runtime_id, "collected": True}
 
     def cancel(
         self,

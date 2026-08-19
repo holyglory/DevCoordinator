@@ -190,87 +190,6 @@ class AuthoritySchemaCutoverRequired(InstallError):
         )
 
 
-def install_test_admission_fence_schema(
-    *,
-    database_path: Path = AUTHORITY_DATABASE_PATH,
-) -> dict[str, Any]:
-    """Install the additive drain table only while the authority is offline.
-
-    Broker startup deliberately does not perform this migration.  The
-    service-lifetime flock proves that the installer cannot race a running
-    authority writer, and SQLite keeps the DDL plus validation in one
-    transaction.
-    """
-
-    if not path_lexists(database_path):
-        return {
-            "status": "deferred",
-            "reason": "authority_database_missing",
-            "database": os.fspath(database_path),
-        }
-    metadata = _protected_regular_metadata(
-        database_path, label="service authority database"
-    )
-    if metadata.st_uid != SYSTEM_OWNER_UID:
-        raise InstallError("service authority database has an unexpected owner")
-    lock_path = database_path.parent / ".broker-service.lock"
-    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0)
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    lock_fd = os.open(lock_path, flags, 0o600)
-    try:
-        lock_info = os.fstat(lock_fd)
-        if (
-            not stat.S_ISREG(lock_info.st_mode)
-            or lock_info.st_uid != SYSTEM_OWNER_UID
-            or stat.S_IMODE(lock_info.st_mode) != 0o600
-        ):
-            raise InstallError("broker service lifetime lock is unsafe")
-        try:
-            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as error:
-            raise InstallError(
-                "authority service is active; stop it before the explicit test-admission schema migration"
-            ) from error
-        module_root = ROOT / "skills/codex-dev-coordinator/scripts"
-        module_root_text = os.fspath(module_root)
-        if module_root_text not in sys.path:
-            sys.path.insert(0, module_root_text)
-        from devcoordinator.universal_test_admission import (  # type: ignore[import-not-found]
-            install_legacy_test_admission_schema,
-        )
-
-        connection = sqlite3.connect(
-            os.fspath(database_path), isolation_level=None, timeout=5.0
-        )
-        try:
-            connection.execute("PRAGMA foreign_keys = ON")
-            connection.execute("BEGIN IMMEDIATE")
-            created = install_legacy_test_admission_schema(connection)
-            integrity = str(connection.execute("PRAGMA quick_check").fetchone()[0])
-            if integrity != "ok":
-                raise InstallError(
-                    "authority database failed quick_check during admission schema migration"
-                )
-            connection.execute("COMMIT")
-        except BaseException:
-            if connection.in_transaction:
-                connection.execute("ROLLBACK")
-            raise
-        finally:
-            connection.close()
-        return {
-            "status": "installed" if created else "present",
-            "database": os.fspath(database_path),
-            "table": "broker_test_admission_fences",
-        }
-    finally:
-        try:
-            fcntl.flock(lock_fd, fcntl.LOCK_UN)
-        finally:
-            os.close(lock_fd)
-
-
 def validate_broker_unit_source(path: Path = BROKER_UNIT_SOURCE) -> None:
     """Refuse to install a broker unit with a weakened production boundary."""
 
@@ -2948,7 +2867,6 @@ def apply_install(names: list[str], transaction_raw: str, allow_noncanonical: bo
         "client_journals": [],
         "legacy_docker_dropin": None,
         "legacy_docker_dropin_removed": False,
-        "test_admission_schema": None,
         "restart_precondition": restart_precondition,
     }
     atomic_json(transaction / JOURNAL_NAME, journal)
@@ -2979,8 +2897,6 @@ def apply_install(names: list[str], transaction_raw: str, allow_noncanonical: bo
 
         run(command("systemd-sysusers"), "/etc/sysusers.d/devcoordinator.conf")
         run(command("systemd-tmpfiles"), "--create", "/etc/tmpfiles.d/devcoordinator.conf")
-        journal["test_admission_schema"] = install_test_admission_fence_schema()
-        atomic_json(transaction / JOURNAL_NAME, journal)
         try:
             pwd.getpwnam(SERVICE_USER)
         except KeyError as error:

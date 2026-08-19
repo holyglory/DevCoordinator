@@ -461,20 +461,12 @@ class CoordinatorBrokerTicketIssuer(BrokerLaunchTicketIssuer):
             "network",
             "ttl_seconds",
             "kill_after_run",
-            "resources",
             "worktree_key",
             "issued_at",
             "expires_at",
         }
         if set(result) != expected or result.get("kill_after_run") is not True:
             raise TestStoreContractError("broker launch ticket fields are invalid")
-        resources = result["resources"]
-        if not isinstance(resources, Mapping) or set(resources) != {
-            "cpu_millis",
-            "memory_mib",
-            "pids",
-        }:
-            raise TestStoreContractError("broker launch ticket resources are invalid")
         return BrokerLaunchTicket(
             ticket_id=result["ticket_id"],
             attempt_id=result["attempt_id"],
@@ -499,9 +491,6 @@ class CoordinatorBrokerTicketIssuer(BrokerLaunchTicketIssuer):
             network=result["network"],
             ttl_seconds=result["ttl_seconds"],
             kill_after_run=True,
-            cpu_millis=resources["cpu_millis"],
-            memory_mib=resources["memory_mib"],
-            pids=resources["pids"],
             worktree_key=result["worktree_key"],
             issued_at=result["issued_at"],
             expires_at=result["expires_at"],
@@ -1430,6 +1419,42 @@ class CoordinatorRuntimeRequestSubmitter(RuntimeRequestSubmitter):
             return {"cancelled": False}
         context.cancelled = bool(result["cancelled"])
         return {"cancelled": context.cancelled}
+
+    def collect(self, runtime_id: str) -> Mapping[str, object]:
+        context = self._runtimes.get(runtime_id)
+        if context is None:
+            raise TestStoreConflict("runtime is not owned by this testd generation")
+        operation_id = str(
+            uuid.uuid5(
+                uuid.NAMESPACE_URL,
+                "devcoordinator-test-collect:"
+                + context.repository_id
+                + ":"
+                + str(context.repository_generation)
+                + ":"
+                + context.attempt_id
+                + ":"
+                + str(context.generation),
+            )
+        )
+        result = self.calls.call(
+            repository_id=context.repository_id,
+            repository_generation=context.repository_generation,
+            resource_id=context.attempt_id,
+            operation=BrokerOperation.TEST_ATTEMPT_COLLECT,
+            arguments={"runtime_id": runtime_id},
+            operation_id=operation_id,
+            timeout_seconds=context.launch_request_timeout_seconds,
+        )
+        if (
+            not isinstance(result, Mapping)
+            or set(result) != {"runtime_id", "collected"}
+            or result.get("runtime_id") != runtime_id
+            or result.get("collected") is not True
+        ):
+            raise TestStoreContractError("broker runtime collection result is invalid")
+        self._runtimes.pop(runtime_id, None)
+        return {"collected": True}
 
 
 __all__ = [

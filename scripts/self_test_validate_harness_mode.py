@@ -184,16 +184,6 @@ def exercise_dogfood_partition_contract() -> None:
     )
     grouped = COORDINATOR_PARTITIONS.partitioned_modules()
     expect(
-        COORDINATOR_PARTITIONS.non_gate_compatibility_modules()
-        == ("test_universal_test_migration",),
-        "legacy test-history migration must remain explicit operator-only coverage",
-    )
-    expect(
-        "test_universal_test_migration"
-        not in {module for modules in grouped.values() for module in modules},
-        "legacy test-history migration leaked into normal evidence gates",
-    )
-    expect(
         "test_universal_test_fresh_store" in grouped["universal-harness"],
         "fresh test-store initialization is missing from normal harness evidence",
     )

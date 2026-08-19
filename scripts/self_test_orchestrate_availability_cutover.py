@@ -25,9 +25,6 @@ if str(ROOT / "skills/codex-dev-coordinator/scripts") not in sys.path:
     sys.path.insert(0, str(ROOT / "skills/codex-dev-coordinator/scripts"))
 
 import orchestrate_availability_cutover as cutover  # noqa: E402
-from devcoordinator.universal_test_admission import (  # noqa: E402
-    build_legacy_test_admission_drain_proof,
-)
 
 
 RELEASE = "a" * 64
@@ -202,11 +199,11 @@ def schema_readiness() -> dict[str, object]:
         {
             "operation_id": "00000000-0000-4000-8000-000000000014",
             "test_database": TEST_DATABASE,
-            "action": "attested-fresh-v5",
-            "journal_kind": "schema_readiness_v5",
+            "action": "attested-fresh",
+            "journal_kind": "schema_readiness",
             "journal": {"replayed": False},
             "store": {
-                "schema_version": 5,
+                "schema_version": 6,
                 "store_generation": TEST_GENERATION,
             },
             "published_at": "2026-07-28T00:00:00Z",
@@ -240,7 +237,7 @@ def bootstrap_attestation() -> dict[str, object]:
             "schema_readiness": {
                 "path": SCHEMA_ATTESTATION,
                 "document_sha256": schema["document_sha256"],
-                "branch": "attested-fresh-v5",
+                "branch": "attested-fresh",
                 "store_generation": TEST_GENERATION,
             },
             "created_at": "2026-07-28T00:00:00Z",
@@ -261,15 +258,10 @@ def authority_readiness_attestation(
         "foreign_key_violations": 0,
         "repositories": 1,
         "installations": 1,
-        "principals": 1,
-        "enrollments": 1,
         "hosts": 1,
         "open_blocking_conflicts": 0,
         "missing_installations": 0,
         "orphan_installations": 0,
-        "orphan_repository_enrollments": 0,
-        "orphan_principal_enrollments": 0,
-        "partial_v13_tables": [],
     }
     metadata = {
         "schema_version": 12,
@@ -345,11 +337,21 @@ def sealed_state(
         if release is not None
         else f"/opt/devcoordinator/releases/{RELEASE}"
     )
+    authority_backup = backup("authority") if authority_backup_required else None
+    evidence = {
+        "first-deployment-bootstrap": bootstrap_attestation(),
+        "authority-readiness": authority_readiness_attestation(
+            release=release_path
+        ),
+        "test-history-discard": schema_readiness(),
+    }
+    if authority_backup is not None:
+        evidence["authority-backup"] = authority_backup
     return cutover.seal(
         cutover.STATE_KIND,
         {
             "cutover_id": str(uuid.uuid4()),
-            "phase": "planned",
+            "phase": "sealed",
             "release": release_path,
             "release_digest": RELEASE,
             "rendered_units": "/run/devcoordinator/cutover/units",
@@ -360,19 +362,10 @@ def sealed_state(
             "test_database": TEST_DATABASE,
             "inventory_canary_project": INVENTORY_PROJECT,
             "authority_backup_directory": "/var/backups/devcoordinator",
-            "test_backup_directory": "/var/backups/devcoordinator-testd",
-            "migration_state": "/var/lib/devcoordinator/cutover.json",
-            "drain_proof": "/var/lib/devcoordinator/drain.json",
-            "cutover_seal": "/var/lib/devcoordinator/seal.json",
             "reserve_bytes": 1_000_000,
             "retain_until": "2026-09-01T00:00:00Z",
             "authority_backup_required": authority_backup_required,
-            "evidence": {
-                "first-deployment-bootstrap": bootstrap_attestation(),
-                "authority-readiness": authority_readiness_attestation(
-                    release=release_path
-                ),
-            },
+            "evidence": evidence,
             "created_at": "2026-07-28T00:00:00Z",
             "updated_at": "2026-07-28T00:00:00Z",
             "state_generation": 0,
@@ -403,25 +396,6 @@ def backup(role: str) -> dict[str, object]:
         },
     )
 
-
-def imported(pass_kind: str, *, migration_id: str) -> dict[str, object]:
-    return cutover.seal(
-        cutover.INITIAL_IMPORT_KIND,
-        {
-            "migration_id": migration_id,
-            "pass_kind": pass_kind,
-            "authority_generation": AUTHORITY_GENERATION,
-            "watermark_fingerprint": ("5" if pass_kind == "initial" else "6") * 64,
-            "export_fingerprint": ("7" if pass_kind == "initial" else "8") * 64,
-            "test_store_generation": TEST_GENERATION,
-            "chunk_count": 2,
-            "final_chunk_sha256": "9" * 64,
-            "run_count": 100,
-            "case_count": 1000,
-            "destination_projection_chain_sha256": "b" * 64,
-            "source_retained": True,
-        },
-    )
 
 def profile_inventory_readiness(
     *, release: Path | str | None = None
@@ -592,72 +566,15 @@ def candidate(*, release: Path | str | None = None) -> dict[str, object]:
 
 def through_seal(
     *, release: Path | str | None = None
-) -> tuple[dict[str, object], dict[str, object], dict[str, object]]:
+) -> tuple[dict[str, object], dict[str, object], None]:
     state = sealed_state(release=release)
-    authority_backup = backup("authority")
-    test_backup = backup("testd")
-    state = cutover.transition(
-        state, evidence_kind="authority-backup", evidence=authority_backup
-    )
-    state = cutover.transition(
-        state, evidence_kind="testd-backup", evidence=test_backup
-    )
-    migration_id = str(uuid.uuid4())
-    initial = imported("initial", migration_id=migration_id)
-    final = imported("final", migration_id=migration_id)
-    state = cutover.transition(state, evidence_kind="initial-import", evidence=initial)
-    drain = dict(
-        build_legacy_test_admission_drain_proof(
-            drain_id=str(uuid.uuid4()),
-            authority_generation=AUTHORITY_GENERATION,
-            activated_at_epoch=100,
-            activated_by_uid=0,
-            drained_at_epoch=101,
-            broker_instance_id="broker-instance",
-        )
-    )
-    state = cutover.transition(state, evidence_kind="admission-drain", evidence=drain)
-    state = cutover.transition(state, evidence_kind="final-import", evidence=final)
-    migration_seal = cutover.seal(
-        cutover.SEAL_KIND,
-        {
-            "migration_id": migration_id,
-            "authority_database": LEGACY_AUTHORITY_DATABASE,
-            "authority_generation": AUTHORITY_GENERATION,
-            "test_database": TEST_DATABASE,
-            "test_store_generation": TEST_GENERATION,
-            "drain_proof_fingerprint": cutover._digest(drain),
-            "final_export_fingerprint": final["export_fingerprint"],
-            "final_watermark_fingerprint": final["watermark_fingerprint"],
-            "destination_attestation_fingerprint": final["document_sha256"],
-            "legacy_source_retained": True,
-            "activation_ready": True,
-            "rollback": {"safe": True},
-        },
-    )
-    state = cutover.transition(
-        state, evidence_kind="migration-seal", evidence=migration_seal
-    )
-    return state, authority_backup, test_backup
+    return state, state["evidence"]["authority-backup"], None
 
 
 def through_discarded_store(
     *, release: Path | str | None = None
 ) -> dict[str, object]:
-    state = sealed_state(release=release)
-    unsigned = {
-        key: value
-        for key, value in state.items()
-        if key not in {"schema_version", "kind", "document_sha256"}
-    }
-    unsigned.update(
-        {
-            "phase": "sealed",
-            "evidence": dict(state["evidence"])
-            | {"test-history-discard": schema_readiness()},
-        }
-    )
-    return cutover.seal(cutover.STATE_KIND, unsigned)
+    return sealed_state(release=release)
 
 
 def through_activation() -> tuple[
@@ -678,7 +595,7 @@ def through_activation() -> tuple[
             if key not in {"schema_version", "kind", "document_sha256"}
         }
         | {
-            "migration_seal_sha256": state["evidence"]["migration-seal"][
+            "migration_seal_sha256": state["evidence"]["test-history-discard"][
                 "document_sha256"
             ]
         },
@@ -904,27 +821,22 @@ class CutoverTransitionTests(unittest.TestCase):
         with self.assertRaisesRegex(cutover.CutoverError, "identity is unsafe"):
             observe(0o660, 2310)
 
-    def test_first_adoption_binding_finalization_accepts_only_unstarted_or_discarded_history(self) -> None:
-        planned = cutover.validate_state(sealed_state())
-        self.assertIsNone(cutover._first_adoption_binding_completion(planned))
-
+    def test_first_adoption_binding_finalization_requires_fresh_store(self) -> None:
         discarded = cutover.validate_state(through_discarded_store())
         completion = cutover._first_adoption_binding_completion(discarded)
         self.assertEqual(completion["mode"], "history-discarded")
 
-        migrated = cutover.validate_state(through_seal()[0])
+        contradictory = {
+            key: value
+            for key, value in discarded.items()
+            if key not in {"schema_version", "kind", "document_sha256"}
+        }
+        contradictory["evidence"] = dict(discarded["evidence"])
+        contradictory["evidence"].pop("test-history-discard")
         with self.assertRaisesRegex(
-            cutover.CutoverError, "sealed discarded Test Store"
+            cutover.CutoverError, "fresh disposable Test Store"
         ):
-            cutover._first_adoption_binding_completion(migrated)
-
-        contradictory = dict(planned)
-        contradictory["evidence"] = dict(planned["evidence"])
-        contradictory["evidence"]["test-history-discard"] = schema_readiness()
-        with self.assertRaisesRegex(
-            cutover.CutoverError, "sealed discarded Test Store"
-        ):
-            cutover._first_adoption_binding_completion(contradictory)
+            cutover.validate_state(cutover.seal(cutover.STATE_KIND, contradictory))
 
     def test_destructive_fresh_store_is_a_complete_fail_closed_cutover_branch(self) -> None:
         state = through_discarded_store()
@@ -963,11 +875,9 @@ class CutoverTransitionTests(unittest.TestCase):
             if key not in {"schema_version", "kind", "document_sha256"}
         }
         unsigned["evidence"] = dict(contradictory["evidence"])
-        unsigned["evidence"]["migration-seal"] = through_seal()[0]["evidence"][
-            "migration-seal"
-        ]
+        unsigned["evidence"]["migration-seal"] = {"obsolete": True}
         with self.assertRaisesRegex(
-            cutover.CutoverError, "cannot both migrate and discard"
+            cutover.CutoverError, "invalid entry"
         ):
             cutover.validate_state(cutover.seal(cutover.STATE_KIND, unsigned))
 
@@ -985,7 +895,7 @@ class CutoverTransitionTests(unittest.TestCase):
             if key not in {"schema_version", "kind", "document_sha256"}
         }
         fresh_values["store"] = {
-            "schema_version": 5,
+            "schema_version": 6,
             "store_generation": "another-generation",
         }
         stale_evidence["test-history-discard"] = cutover.seal(

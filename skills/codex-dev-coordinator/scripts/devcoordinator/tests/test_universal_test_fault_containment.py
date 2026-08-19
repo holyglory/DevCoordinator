@@ -107,9 +107,6 @@ class UniversalTestFaultContainmentTests(unittest.TestCase):
             fixtures=(),
             network="none",
             ttl_seconds=37,
-            cpu_millis=750,
-            memory_mib=96,
-            pids=11,
         )
 
     def test_attempts_keep_ttl_and_isolation_without_resource_quotas(self) -> None:
