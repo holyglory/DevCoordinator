@@ -2679,6 +2679,71 @@ volumes:
             "observer_backend_failed",
         )
 
+    def test_exact_compose_replay_reconciles_without_repeating_host_action(
+        self,
+    ) -> None:
+        observation_count = 0
+        runner_count = 0
+
+        def observer(store: CoordinatorStore) -> Mapping[str, Any]:
+            nonlocal observation_count
+            observation_count += 1
+            if observation_count == 2:
+                raise BrokerError(
+                    "observer_backend_failed", "observer fixture failed"
+                )
+            return self.fixture.observe_full_docker(store)
+
+        def runner(
+            command: tuple[str, ...],
+            cwd: str,
+            timeout: float,
+            environment: Mapping[str, str],
+        ) -> subprocess.CompletedProcess[str]:
+            nonlocal runner_count
+            del cwd, timeout, environment
+            runner_count += 1
+            return subprocess.CompletedProcess(
+                command, 0, stdout="ok\n", stderr=""
+            )
+
+        service, _ = service_for(
+            self.fixture,
+            compose_runner=runner,
+            observer=observer,
+        )
+        request = self.fixture.request(
+            BrokerOperation.COMPOSE_UP,
+            resource_id=COMPOSE_ALPHA,
+            operation_id=str(uuid.uuid4()),
+        )
+
+        first = service.reply_for_document(self.fixture.peer(), request.to_wire())
+        replay = service.reply_for_document(self.fixture.peer(), request.to_wire())
+
+        self.assertFalse(first["ok"], first)
+        self.assertEqual(first["error"]["code"], "operation_outcome_uncertain")
+        self.assertFalse(replay["ok"], replay)
+        self.assertEqual(replay["error"]["code"], "compose_outcome_reconciled")
+        self.assertEqual(runner_count, 1)
+        with CoordinatorStore.open(
+            self.fixture.persistence.database_path, expected_uid=os.geteuid()
+        ) as store:
+            with store.read_transaction() as connection:
+                operation = connection.execute(
+                    "SELECT status, phase, error_code FROM operations "
+                    "WHERE operation_id = ?",
+                    (request.operation_id,),
+                ).fetchone()
+        self.assertEqual(
+            dict(operation),
+            {
+                "status": "failed",
+                "phase": "reconciled",
+                "error_code": "compose_outcome_reconciled",
+            },
+        )
+
     def test_missing_effective_model_evidence_requires_fingerprint_abandonment(
         self,
     ) -> None:

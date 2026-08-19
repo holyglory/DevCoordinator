@@ -1642,6 +1642,139 @@ class AgentCliTests(unittest.TestCase):
             operation_id=operation_id,
         )
 
+    def test_runtime_ensure_reconciles_uncertain_bootstrap_then_retries_once(
+        self,
+    ) -> None:
+        operation_id = "00000000-0000-4000-8000-000000000001"
+        child_operation_id = str(
+            uuid.uuid5(uuid.UUID(operation_id), "compose.bootstrap:postgres")
+        )
+        retry_operation_id = str(
+            uuid.uuid5(
+                uuid.UUID(operation_id), "compose.bootstrap.retry:postgres"
+            )
+        )
+        repository = mock.Mock(repo_id="repo-1")
+        repository.compose_id.return_value = "compose-1"
+        profile = mock.Mock()
+        profile.resolve_repository.return_value = repository
+        profile.call.side_effect = [
+            BrokerError(
+                "operation_outcome_uncertain",
+                "post-action observation failed",
+                operation_id=child_operation_id,
+            ),
+            BrokerError(
+                "compose_outcome_reconciled",
+                "fresh observation terminalized the child",
+                operation_id=child_operation_id,
+            ),
+            (retry_operation_id, {"ok": True}),
+        ]
+        profile.runtime_ensure.return_value = {
+            "schema_version": 1,
+            "ok": True,
+            "operation_id": operation_id,
+        }
+        namespace = agent_cli._parser().parse_args(
+            [
+                "runtime",
+                "ensure",
+                "postgres",
+                "--desired",
+                "ready",
+                "--operation-id",
+                operation_id,
+            ]
+        )
+        namespace.argv = []
+
+        with (
+            mock.patch.object(
+                agent_cli, "_declared_compose_selector", return_value=True
+            ),
+            mock.patch.object(
+                agent_cli,
+                "_runtime_target",
+                return_value={"id": "database-1", "kind": "database_stack"},
+            ),
+        ):
+            result = agent_cli._runtime(
+                namespace,
+                profile=profile,
+                capabilities={"runtime": {"ensure_states": ["ready"]}},
+                context=_Context(),
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(
+            [call.kwargs["operation_id"] for call in profile.call.call_args_list],
+            [child_operation_id, child_operation_id, retry_operation_id],
+        )
+
+    def test_runtime_ensure_parent_replay_uses_completed_retry_child(self) -> None:
+        operation_id = "00000000-0000-4000-8000-000000000001"
+        child_operation_id = str(
+            uuid.uuid5(uuid.UUID(operation_id), "compose.bootstrap:postgres")
+        )
+        retry_operation_id = str(
+            uuid.uuid5(
+                uuid.UUID(operation_id), "compose.bootstrap.retry:postgres"
+            )
+        )
+        repository = mock.Mock(repo_id="repo-1")
+        repository.compose_id.return_value = "compose-1"
+        profile = mock.Mock()
+        profile.resolve_repository.return_value = repository
+        profile.call.side_effect = [
+            BrokerError(
+                "compose_outcome_reconciled",
+                "the first child was already reconciled",
+                operation_id=child_operation_id,
+            ),
+            (retry_operation_id, {"ok": True}),
+        ]
+        profile.runtime_ensure.return_value = {
+            "schema_version": 1,
+            "ok": True,
+            "operation_id": operation_id,
+        }
+        namespace = agent_cli._parser().parse_args(
+            [
+                "runtime",
+                "ensure",
+                "postgres",
+                "--desired",
+                "ready",
+                "--operation-id",
+                operation_id,
+            ]
+        )
+        namespace.argv = []
+
+        with (
+            mock.patch.object(
+                agent_cli, "_declared_compose_selector", return_value=True
+            ),
+            mock.patch.object(
+                agent_cli,
+                "_runtime_target",
+                return_value={"id": "database-1", "kind": "database_stack"},
+            ),
+        ):
+            result = agent_cli._runtime(
+                namespace,
+                profile=profile,
+                capabilities={"runtime": {"ensure_states": ["ready"]}},
+                context=_Context(),
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(
+            [call.kwargs["operation_id"] for call in profile.call.call_args_list],
+            [child_operation_id, retry_operation_id],
+        )
+
     def test_runtime_ensure_seals_missing_declared_compose_before_bootstrap(self) -> None:
         operation_id = "00000000-0000-4000-8000-000000000001"
         configuration_operation_id = str(

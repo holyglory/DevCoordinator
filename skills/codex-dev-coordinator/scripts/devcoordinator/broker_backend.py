@@ -2381,6 +2381,36 @@ class StoreBackedMutationBackend:
                 if existing.state == "completed":
                     return dict(existing.result or {})
                 if existing.state == "failed":
+                    if existing.error_code == "operation_outcome_uncertain":
+                        candidate = (
+                            self._persistence.compose_reconciliation_candidate(
+                                request.operation_id
+                            )
+                        )
+                        if (
+                            candidate["repo_id"] != request.project_id
+                            or candidate["compose_definition_id"]
+                            != request.resource_id
+                        ):
+                            raise BrokerBackendError(
+                                "compose_reconciliation_identity_mismatch",
+                                "The uncertain Compose operation no longer matches the exact accepted repository definition.",
+                                operation_id=request.operation_id,
+                            )
+                        reconciliation_evidence = self._observe_fresh_full_docker(
+                            request.operation_id,
+                            project_id=request.project_id,
+                        )
+                        self._persistence.reconcile_compose_operation(
+                            request.operation_id,
+                            evidence=reconciliation_evidence,
+                            accepted=accepted,
+                        )
+                        raise BrokerBackendError(
+                            "compose_outcome_reconciled",
+                            "The uncertain Compose invocation was terminally reconciled from fresh complete host evidence; a distinct operation may now ensure the desired state.",
+                            operation_id=request.operation_id,
+                        )
                     raise BrokerBackendError(
                         existing.error_code or "mutation_failed",
                         existing.error_message or "Broker mutation failed.",
