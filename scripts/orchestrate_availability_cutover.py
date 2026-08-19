@@ -1015,8 +1015,24 @@ STATE_FIELDS = frozenset(
         "state_generation",
     }
 )
+LEGACY_STATE_FIELDS = STATE_FIELDS - {"legacy_authority_database"}
+
+
 def validate_state(value: object) -> dict[str, object]:
-    state = verify_seal(value, kind=STATE_KIND, fields=STATE_FIELDS)
+    try:
+        state = verify_seal(value, kind=STATE_KIND, fields=STATE_FIELDS)
+    except CutoverError:
+        # A pre-split sealed DevCoordinator cutover used one authority path.
+        # Normalize it in memory so the existing integrity-gated binding step
+        # can durably record distinct legacy-source and final-destination paths.
+        legacy = verify_seal(value, kind=STATE_KIND, fields=LEGACY_STATE_FIELDS)
+        unsigned = {
+            key: item
+            for key, item in legacy.items()
+            if key not in {"schema_version", "kind", "document_sha256"}
+        }
+        unsigned["legacy_authority_database"] = legacy["authority_database"]
+        state = seal(STATE_KIND, unsigned)
     try:
         cutover_id = str(uuid.UUID(str(state["cutover_id"])))
     except (ValueError, TypeError, AttributeError) as error:

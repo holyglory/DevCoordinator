@@ -2,7 +2,7 @@
 
 ## Confirmed scope
 
-The user approved implementation of the testing simplifications identified by the August 19 testing/API review. The current production assumptions remain authoritative: one developer owns the server; test history and attempt state are disposable; repository source may be valuable; crashes, stale work, lost replies, path escape, runaway processes, and cross-project interference remain credible; secrets and public identities retain their dedicated boundaries.
+The user approved implementation of the testing simplifications identified by the August 19 testing/API review. “Production,” “installation,” and “cutover” in this decision refer only to DevCoordinator itself, never to deployment of a repository under test. One developer owns the server. Every repository's test runs, cases, artifacts, timing, rollups, queues, attempt state, and Test Store compatibility history are disposable. Repository registrations, routes, users and grants remain durable control data; repository source and project databases may be valuable. Crashes, stale work, lost replies, path escape, runaway processes, and cross-project interference remain credible; secrets and public identities retain their dedicated boundaries.
 
 ## Selected architecture
 
@@ -10,17 +10,17 @@ The user approved implementation of the testing simplifications identified by th
 - Make testd and its Test Store the sole semantic authority for registered plan inputs, run/attempt state, dependency readiness, target deadline, lease renewal, result-chunk ordering, terminal conclusion, and retry eligibility. The privileged runtime reports exact process/result facts and executes prepare/start/observe/stop/collect; it never invents or persists a competing run conclusion.
 - Persist the complete normalized target execution specification with plan registration. Do not keep submission-critical plan resources only in process memory.
 - Introduce the next Test Store schema without compatibility-only CPU, memory, or PID target declarations. Admission continues to use learned measured memory; CPU and PID observations remain telemetry, not schema placeholders or quotas.
-- Treat an incompatible Test Store release as a controlled disposable-state cutover: stop admission, cancel/drain active attempts with exact evidence, activate a fresh store, and retain no legacy authority-history importer or admission-drain protocol. Same-schema process replacement continues to recover exact active attempts from the durable spool.
+- Treat an incompatible Test Store release as a controlled disposable-state reset inside the DevCoordinator delivery: stop testd, cancel/drain active attempts with exact evidence, delete only the isolated Test Store and attempt spool, activate a fresh store, and retain no history importer, backup, admission-drain, or Test Store payload-compatibility protocol. Same-schema process replacement continues to recover exact active attempts from the durable spool.
 - Keep the routine agent journey centered on `enqueue`, reviewed `submit`, `follow`, and `cancel`. Bounded failure/artifact/retry diagnostics remain continuation actions; redundant routine status/summary/wait aliases are removed. The advanced administrative CLI retains exact drill-down operations.
 - Move framework-specific command adaptation, dependency preparation, and reporter parsing into explicit driver modules. The scheduler, store, and agent projections consume normalized driver-neutral attempts and results.
 
 ## Why this preserves the security posture
 
-This change applies the confirmed assumptions in `security-assumptions.md`; it does not weaken a security control. Repository code still never runs as root or as the control plane. Exact identities, generation fences, path containment, dedicated credential transport, systemd cgroup isolation, output bounds, and TTL/cancellation remain. Removed fields and migration paths are compatibility mechanisms for disposable data, not authorization, secret, or source-protection gates.
+This change applies the confirmed assumptions in `security-assumptions.md`; it does not weaken a security control. Repository code still never runs as root or as the control plane. Exact identities, generation fences, path containment, dedicated credential transport, systemd cgroup isolation, output bounds, and TTL/cancellation remain. Removed fields and migration paths are compatibility mechanisms for disposable test data, not authorization, secret, source-protection, route, user/grant, or retained repository-registration gates. The integrity-gated compatibility that preserves a sealed DevCoordinator authority cutover's exact old/new database paths remains because it protects retained control data rather than test history.
 
 ## Supersession and compatibility
 
-This decision narrows DC-2026-08-09-TESTD-RECOVERY-01 to same-schema crash/restart recovery. It supersedes preservation of active attempts across an incompatible Test Store contract and retires the legacy authority-to-Test-Store migration path. It does not change DC-2026-08-09-TEST-BATCHING-01 or the agent-local 20-case/10-second boundary.
+This decision narrows DC-2026-08-09-TESTD-RECOVERY-01 to same-schema crash/restart recovery. It supersedes preservation of active attempts across an incompatible Test Store contract and retires every authority-to-Test-Store history migration path. It does not retire DevCoordinator authority-database recovery, repository/route/user/grant retention, DC-2026-08-09-TEST-BATCHING-01, or the agent-local 20-case/10-second boundary.
 
 ## Verification
 

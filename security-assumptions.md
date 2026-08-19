@@ -23,8 +23,12 @@ new gate.
 
 ## Assets and sensitivity
 
-- Test history, timing, rollups, and test-attempt state are disposable. Console
-  user settings and authority/project configuration are retained.
+- All repositories' test runs, cases, artifacts, timing, rollups, queues,
+  attempt state, and Test Store compatibility history are disposable. An
+  incompatible DevCoordinator release creates an empty current Test Store; it
+  does not back up, import, or migrate prior test data.
+- Repository registrations, routes, Console users and their grants, Console
+  settings, and authority/project configuration are retained control data.
 - Credentials, external identity assertions, bot tokens, and fixture secrets
   remain secret and must use their dedicated server-owned transport. They must
   never be placed in a repository manifest or ordinary launch descriptor.
