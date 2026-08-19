@@ -158,6 +158,9 @@ class BrokerOperation(str, Enum):
     RUNTIME_ENSURE = "runtime.ensure"
     RUNTIME_REQUEST = "runtime.request"
     REPOSITORY_ENSURE = "repository.ensure"
+    REPOSITORY_APPROVE_COMPOSE_HOST_ACCESS = (
+        "repository.approve_compose_host_access"
+    )
     REPOSITORY_RESOLVE = "repository.resolve"
     WORKER_LAUNCH_TICKET = "worker.launch_ticket"
     WORKER_LAUNCHED = "worker.launched"
@@ -2164,6 +2167,38 @@ def _validate_arguments(
             "canonical_root": canonical_root,
             "project_kind": project_kind,
             "reconcile_scope": reconcile_scope,
+        }
+
+    if operation == BrokerOperation.REPOSITORY_APPROVE_COMPOSE_HOST_ACCESS:
+        if set(value) != {"agent", "canonical_root", "approve"}:
+            raise BrokerError(
+                "invalid_arguments",
+                "Compose host-access approval requires one canonical root, explicit approve=true, and agent attribution.",
+                operation_id=operation_id,
+            )
+        canonical_root = value["canonical_root"]
+        if (
+            not isinstance(canonical_root, str)
+            or not 1 <= len(os.fsencode(canonical_root)) <= 4096
+            or "\x00" in canonical_root
+            or not Path(canonical_root).is_absolute()
+            or os.path.normpath(canonical_root) != canonical_root
+        ):
+            raise BrokerError(
+                "invalid_arguments",
+                "canonical_root must be one normalized absolute path.",
+                operation_id=operation_id,
+            )
+        if value["approve"] is not True:
+            raise BrokerError(
+                "invalid_arguments",
+                "Compose host-access approval requires explicit approve=true.",
+                operation_id=operation_id,
+            )
+        return {
+            "agent": _bounded_agent(value["agent"], operation_id),
+            "canonical_root": canonical_root,
+            "approve": True,
         }
 
     if operation == BrokerOperation.REPOSITORY_RESOLVE:

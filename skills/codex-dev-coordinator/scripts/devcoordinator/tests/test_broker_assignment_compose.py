@@ -14,6 +14,7 @@ import subprocess
 import tempfile
 import threading
 import time
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 import uuid
@@ -936,6 +937,93 @@ class BrokerComposeTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.fixture.close()
+
+    def test_live_host_access_approval_is_fingerprint_bound_and_replayable(self) -> None:
+        def risky_model(**arguments: object) -> bytes:
+            services = tuple(str(item) for item in arguments["declared_services"])
+            return json.dumps(
+                {
+                    "services": {
+                        name: {
+                            "image": f"example.invalid/{name}:test",
+                            **(
+                                {"ports": ["25001:8080"]}
+                                if name == "web"
+                                else {}
+                            ),
+                        }
+                        for name in services
+                    }
+                }
+            ).encode("utf-8")
+
+        self.fixture.persistence.compose_model_renderer = risky_model
+        declared = {
+            "declared": True,
+            "files": ["compose.yml"],
+            "env_files": [],
+            "profiles": [],
+            "services": ["db", "web"],
+            "run_once_services": [],
+            "project_name": "alpha-stack",
+        }
+        context = SimpleNamespace(
+            project_kind="primary",
+            temporary=None,
+            root=SimpleNamespace(canonical_root=str(self.fixture.alpha_root)),
+        )
+        service, _ = service_for(self.fixture)
+        operation_id = str(uuid.uuid4())
+        request = self.fixture.request(
+            BrokerOperation.REPOSITORY_APPROVE_COMPOSE_HOST_ACCESS,
+            resource_id=REPO_ALPHA,
+            operation_id=operation_id,
+            arguments={
+                "agent": "admin-session",
+                "canonical_root": str(self.fixture.alpha_root),
+                "approve": True,
+            },
+        )
+        with (
+            mock.patch(
+                "devcoordinator.repository_context."
+                "resolve_effective_repository_context",
+                return_value=context,
+            ),
+            mock.patch.object(
+                broker_configuration,
+                "declared_compose_from_runtime_manifest",
+                return_value=declared,
+            ),
+            mock.patch.object(
+                broker_persistence,
+                "_service_administrator_uid",
+                return_value=0,
+            ),
+        ):
+            first = service.reply_for_document(
+                self.fixture.peer(), request.to_wire()
+            )
+            replay = service.reply_for_document(
+                self.fixture.peer(), request.to_wire()
+            )
+
+        self.assertTrue(first["ok"], first)
+        self.assertEqual(replay, first)
+        result = first["result"]
+        self.assertEqual(result["status"], "compose_host_access_approved")
+        self.assertEqual(result["compose_definition_id"], COMPOSE_ALPHA)
+        self.assertTrue(result["host_access_approved"])
+        self.assertEqual(result["host_access_risks"], ["published_host_ports"])
+        self.assertRegex(result["definition_fingerprint"], r"^sha256:[0-9a-f]{64}$")
+        retained = self.fixture.persistence.compose_host_access_status(
+            repo_id=REPO_ALPHA
+        )
+        self.assertEqual(
+            retained["definition_fingerprint"],
+            result["definition_fingerprint"],
+        )
+        self.assertTrue(retained["host_access_approved"])
 
     def _add_observed_compose_container(
         self,

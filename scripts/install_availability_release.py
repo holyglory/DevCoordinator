@@ -263,8 +263,13 @@ WRAPPERS = {
     ),
     "devcoordinator-authority-repository-repair": (
         "python",
-        "scripts/orchestrate_availability_cutover.py",
-        ("recover-authority-repository-disable",),
+        "skills/codex-dev-coordinator/scripts/dev_coordinator.py",
+        ("broker", "approve-compose-host-access"),
+    ),
+    "devcoordinator-compose-host-access": (
+        "python",
+        "skills/codex-dev-coordinator/scripts/dev_coordinator.py",
+        ("broker", "approve-compose-host-access"),
     ),
     "devcoordinator-maintenance": (
         "python",
@@ -933,6 +938,49 @@ def _smoke_test_bug_wrapper(release: Path) -> None:
             raise ReleaseError(
                 "release bug wrapper failed its grammar smoke test: "
                 f"{' '.join(arguments)}: {detail or completed.returncode}"
+            )
+
+
+def _smoke_test_compose_host_access_wrappers(release: Path) -> None:
+    """Prove both packaged approval names bind the current live grammar."""
+
+    for name in (
+        "devcoordinator-compose-host-access",
+        "devcoordinator-authority-repository-repair",
+    ):
+        executable = release / "bin" / name
+        try:
+            completed = subprocess.run(
+                [str(executable), "--help"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+                timeout=15,
+                cwd="/",
+                env={
+                    "PATH": "/usr/bin:/bin",
+                    "LANG": "C.UTF-8",
+                    "LC_ALL": "C.UTF-8",
+                    "PYTHONDONTWRITEBYTECODE": "1",
+                },
+            )
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise ReleaseError(
+                f"release Compose host-access wrapper could not execute: {name}: {error}"
+            ) from error
+        if (
+            completed.returncode != 0
+            or b"approve-compose-host-access" not in completed.stdout
+            or b"--approve-compose-host-access" not in completed.stdout
+            or completed.stderr
+        ):
+            detail = completed.stderr.decode(
+                "utf-8", errors="replace"
+            ).strip()
+            raise ReleaseError(
+                "release Compose host-access wrapper failed its grammar smoke test: "
+                f"{name}: {detail or completed.returncode}"
             )
 
 
@@ -1628,6 +1676,7 @@ def verify_release(
         _smoke_test_agent_mcp_wrapper(release)
     if manifest["capabilities"].get("out_of_band_bug_registry") is True:
         _smoke_test_bug_wrapper(release)
+    _smoke_test_compose_host_access_wrappers(release)
     return {
         "ok": True,
         "release_digest": release.name,

@@ -13,6 +13,7 @@ and repository tests do not need this reference.
 - [Fleet test-manifest adoption](#fleet-test-manifest-adoption)
 - [Docker admission](#docker-admission)
 - [Sealed project capabilities](#sealed-project-capabilities)
+- [Compose host-access approval](#compose-host-access-approval)
 - [Exact Compose service recreation](#exact-compose-service-recreation)
 - [Project systemd commissioning](#project-systemd-commissioning)
 - [Database protection](#database-protection)
@@ -123,6 +124,29 @@ Use executable help for the current contracts:
 python3 "$COORDINATOR" ephemeral --help
 python3 "$COORDINATOR" docker compose-run-once --help
 ```
+
+## Compose host-access approval
+
+A declared Compose model that requests non-loopback ports, bind mounts,
+devices, host namespaces, added capabilities, or another host-equivalent risk
+requires one explicit approval of its current rendered fingerprint. Use the
+immutable live-authority wrapper; do not stop the authority or fall back to
+offline `broker configure`:
+
+```bash
+devcoordinator-compose-host-access \
+  --project /absolute/repository \
+  --agent admin-session \
+  --operation-id 00000000-0000-4000-8000-000000000000 \
+  --approve-compose-host-access
+```
+
+The result names the exact Compose definition, generation, fingerprint, and
+approved risk set. Replay only the same operation UUID after an uncertain
+reply. Any changed or added risk requires a new explicit approval operation.
+`devcoordinator-authority-repository-repair` is retained as a compatibility
+alias for this same live command; it no longer invokes historical cutover
+repair actions.
 
 ## Exact Compose service recreation
 

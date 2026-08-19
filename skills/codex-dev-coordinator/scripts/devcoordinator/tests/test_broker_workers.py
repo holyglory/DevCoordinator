@@ -69,6 +69,24 @@ def worker_request(
 
 
 class WorkerBrokerWireTests(unittest.TestCase):
+    def test_default_worker_log_root_stays_inside_authority_state(self) -> None:
+        if sys.platform == "darwin":
+            self.assertEqual(
+                worker_artifacts.SYSTEM_WORKER_LOG_ROOT,
+                Path(
+                    "/Library/Application Support/DevCoordinator/Authority/worker-logs"
+                ),
+            )
+        else:
+            self.assertEqual(
+                worker_artifacts.SYSTEM_WORKER_LOG_ROOT,
+                Path("/var/lib/devcoordinator/worker-logs"),
+            )
+            self.assertNotEqual(
+                worker_artifacts.SYSTEM_WORKER_LOG_ROOT,
+                Path("/var/lib/devcoordinator-clients"),
+            )
+
     def test_worker_wire_is_strict_and_never_accepts_launch_paths_or_commands(self) -> None:
         generation = "authority"
         ticket = {
@@ -370,7 +388,7 @@ class WorkerBrokerBackendTests(unittest.TestCase):
         self.log_directory.mkdir(mode=0o700, parents=True)
         os.chmod(self.log_directory, 0o700)
         self.artifact_patch = mock.patch.object(
-            worker_artifacts, "SYSTEM_CLIENT_JOURNAL_ROOT", self.log_root
+            worker_artifacts, "SYSTEM_WORKER_LOG_ROOT", self.log_root
         )
         self.artifact_patch.start()
 

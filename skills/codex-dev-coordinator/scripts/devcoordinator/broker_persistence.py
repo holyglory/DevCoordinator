@@ -112,7 +112,10 @@ _REPOSITORY_LIFECYCLE_OPERATIONS = frozenset(
     }
 )
 _REPOSITORY_BOOTSTRAP_OPERATIONS = frozenset(
-    {BrokerOperation.REPOSITORY_ENSURE}
+    {
+        BrokerOperation.REPOSITORY_ENSURE,
+        BrokerOperation.REPOSITORY_APPROVE_COMPOSE_HOST_ACCESS,
+    }
 )
 _REPOSITORY_DISCOVERY_OPERATIONS = frozenset(
     {BrokerOperation.REPOSITORY_RESOLVE}
@@ -3043,6 +3046,68 @@ class BrokerPersistence:
             )
         selected = enabled[0] if enabled else (rows[0] if rows else None)
         return None if selected is None else str(selected["compose_definition_id"])
+
+    def compose_host_access_status(self, *, repo_id: str) -> dict[str, Any]:
+        """Return the exact effective approval bound to one active definition."""
+
+        _require_identifier(repo_id, "project_id")
+        with self._store() as store:
+            with store.read_transaction() as connection:
+                rows = list(
+                    connection.execute(
+                        """
+                        SELECT definition.compose_definition_id,
+                               definition.definition_fingerprint,
+                               definition.generation,
+                               effective.host_access_risks_json,
+                               effective.host_access_approved,
+                               effective.approved_by_uid,
+                               effective.approved_at
+                        FROM broker_compose_definitions definition
+                        JOIN broker_compose_effective_model_evidence effective
+                          USING(compose_definition_id)
+                        WHERE definition.repo_id = ?
+                          AND definition.enabled = 1
+                        ORDER BY definition.compose_definition_id
+                        """,
+                        (repo_id,),
+                    )
+                )
+        if len(rows) != 1:
+            raise BrokerError(
+                "compose_definition_conflict",
+                "Repository host-access approval requires exactly one active Compose definition.",
+            )
+        row = rows[0]
+        try:
+            risks = json.loads(str(row["host_access_risks_json"]))
+        except (json.JSONDecodeError, TypeError, ValueError) as error:
+            raise StoreInvariantError(
+                "Retained Compose host-access risks are invalid."
+            ) from error
+        if (
+            not isinstance(risks, list)
+            or any(not isinstance(item, str) or not item for item in risks)
+            or risks != sorted(set(risks))
+        ):
+            raise StoreInvariantError(
+                "Retained Compose host-access risks are invalid."
+            )
+        return {
+            "compose_definition_id": str(row["compose_definition_id"]),
+            "definition_fingerprint": str(row["definition_fingerprint"]),
+            "generation": int(row["generation"]),
+            "host_access_risks": list(risks),
+            "host_access_approved": bool(row["host_access_approved"]),
+            "approved_by_uid": (
+                None
+                if row["approved_by_uid"] is None
+                else int(row["approved_by_uid"])
+            ),
+            "approved_at": (
+                None if row["approved_at"] is None else str(row["approved_at"])
+            ),
+        }
 
     def compose_configuration_container_scope(
         self,

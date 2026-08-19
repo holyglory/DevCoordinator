@@ -35,6 +35,43 @@ class CapabilityContractTests(unittest.TestCase):
             )
         self.assertEqual(raised.exception.code, "invalid_arguments")
 
+    def test_compose_host_access_approval_requires_explicit_exact_shape(self) -> None:
+        request = BrokerRequest.create(
+            account_id="account",
+            project_id="repo-1",
+            resource_id="repo-1",
+            operation=BrokerOperation.REPOSITORY_APPROVE_COMPOSE_HOST_ACCESS,
+            arguments={
+                "agent": "admin-session",
+                "canonical_root": "/repositories/example",
+                "approve": True,
+            },
+        )
+        self.assertEqual(request.arguments["approve"], True)
+        for arguments in (
+            {},
+            {
+                "agent": "admin-session",
+                "canonical_root": "/repositories/example",
+                "approve": False,
+            },
+            {
+                "agent": "admin-session",
+                "canonical_root": "relative",
+                "approve": True,
+            },
+        ):
+            with self.subTest(arguments=arguments), self.assertRaises(BrokerError):
+                BrokerRequest.create(
+                    account_id="account",
+                    project_id="repo-1",
+                    resource_id="repo-1",
+                    operation=(
+                        BrokerOperation.REPOSITORY_APPROVE_COMPOSE_HOST_ACCESS
+                    ),
+                    arguments=arguments,
+                )
+
     def test_capability_document_is_compact_and_conservative(self) -> None:
         document = broker_capabilities(
             protocol_version=1,

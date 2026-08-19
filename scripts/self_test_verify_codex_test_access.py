@@ -112,6 +112,96 @@ class FakeRunner:
         )
 
 
+class CatalogRecoveryTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory(
+            prefix="codex-catalog-recovery-"
+        )
+        self.root = Path(self.temporary.name)
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    @staticmethod
+    def ready(argv: list[str]) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(
+            argv,
+            0,
+            stdout=json.dumps({"ok": True, "status": "ready"}),
+            stderr="",
+        )
+
+    def test_transient_setup_timeout_retries_then_succeeds(self) -> None:
+        calls: list[list[str]] = []
+        now = [0.0]
+
+        def runner(argv, _label, *, timeout_seconds=None):
+            del timeout_seconds
+            values = list(argv)
+            calls.append(values)
+            if len(calls) == 1:
+                raise access.VerificationError(
+                    "test scheduler recovering", code="request_timeout"
+                )
+            return self.ready(values)
+
+        result = access.load_catalog_with_recovery(
+            self.root,
+            launcher=Path("/fixture/devcoordinator-test"),
+            command_runner=runner,
+            recovery_timeout_seconds=10,
+            clock=lambda: now[0],
+            sleeper=lambda seconds: now.__setitem__(0, now[0] + seconds),
+        )
+
+        self.assertEqual(result["status"], "ready")
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0], calls[1])
+
+    def test_permanent_setup_error_fails_without_retry(self) -> None:
+        calls = 0
+
+        def runner(_argv, _label, *, timeout_seconds=None):
+            del timeout_seconds
+            nonlocal calls
+            calls += 1
+            raise access.VerificationError(
+                "manifest invalid", code="test_manifest_invalid"
+            )
+
+        with self.assertRaisesRegex(access.VerificationError, "manifest invalid"):
+            access.load_catalog_with_recovery(
+                self.root,
+                command_runner=runner,
+                recovery_timeout_seconds=10,
+            )
+        self.assertEqual(calls, 1)
+
+    def test_transient_setup_recovery_has_one_overall_deadline(self) -> None:
+        now = [0.0]
+        calls = 0
+
+        def runner(_argv, _label, *, timeout_seconds=None):
+            del timeout_seconds
+            nonlocal calls
+            calls += 1
+            raise access.VerificationError(
+                "still recovering", code="test_scheduler_unavailable"
+            )
+
+        with self.assertRaisesRegex(
+            access.VerificationError, "3s setup deadline"
+        ):
+            access.load_catalog_with_recovery(
+                self.root,
+                command_runner=runner,
+                recovery_timeout_seconds=3,
+                clock=lambda: now[0],
+                sleeper=lambda seconds: now.__setitem__(0, now[0] + seconds),
+            )
+        self.assertEqual(calls, 2)
+
+
 class RunnerExerciseTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory(prefix="codex-access-probe-")
@@ -288,6 +378,21 @@ class RunnerExerciseTests(unittest.TestCase):
             access.VerificationError, "caller-defined 17s deadline"
         ):
             access.run(["fixture"], "fixture command", timeout_seconds=17)
+
+    def test_subprocess_typed_failure_preserves_retry_code(self) -> None:
+        completed = subprocess.CompletedProcess(
+            ["fixture"],
+            1,
+            stdout="",
+            stderr=json.dumps(
+                {"ok": False, "code": "request_timeout", "error": "busy"}
+            ),
+        )
+        with mock.patch.object(
+            access.subprocess, "run", return_value=completed
+        ), self.assertRaises(access.VerificationError) as raised:
+            access.run(["fixture"], "fixture command")
+        self.assertEqual(raised.exception.code, "request_timeout")
 
 
 class LivePlanExerciseTests(unittest.TestCase):
