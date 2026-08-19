@@ -1914,31 +1914,20 @@ class StoreBackedMutationBackend:
             operation_id=request.operation_id,
         ) from cause
 
-    def _reconcile_repository_runtime_contract(
+    def _reconcile_repository_compose_contract(
         self,
         *,
         request: BrokerRequest,
         repo_id: str,
         root: str,
-        execution_uid: int,
-        reconcile_scope: str = "runtime",
+        host_access_approved: bool | None = None,
     ) -> Mapping[str, Any]:
-        """Reconcile only the catalog family required by the start-like intent."""
+        """Reconcile one declared Compose model and its retained operation."""
 
-        if reconcile_scope not in {"runtime", "test"}:
-            raise TestStoreContractError("repository reconciliation scope is invalid")
-        compose: Mapping[str, Any] = {
-            "changed": False,
-            "compose_definition_id": None,
-            "compose_run_once_services": {},
-        }
-        servers: Mapping[str, Any] = {"changed": False, "servers": {}}
-        compose_definition_id = (
-            self._persistence.configured_compose_definition_id(repo_id=repo_id)
-            if reconcile_scope == "runtime"
-            else None
+        compose_definition_id = self._persistence.configured_compose_definition_id(
+            repo_id=repo_id
         )
-        if reconcile_scope == "runtime" and compose_definition_id is not None:
+        if compose_definition_id is not None:
             prior_operation_id = (
                 self._persistence.reconcilable_compose_operation_for_definition(
                     repo_id=repo_id,
@@ -1967,11 +1956,37 @@ class StoreBackedMutationBackend:
                     prior_operation_id,
                     evidence=evidence,
                 )
+        return reconcile_declared_compose_first_use(
+            self._persistence,
+            repo_id=repo_id,
+            root=Path(root),
+            host_access_approved=host_access_approved,
+        )
+
+    def _reconcile_repository_runtime_contract(
+        self,
+        *,
+        request: BrokerRequest,
+        repo_id: str,
+        root: str,
+        execution_uid: int,
+        reconcile_scope: str = "runtime",
+    ) -> Mapping[str, Any]:
+        """Reconcile only the catalog family required by the start-like intent."""
+
+        if reconcile_scope not in {"runtime", "test"}:
+            raise TestStoreContractError("repository reconciliation scope is invalid")
+        compose: Mapping[str, Any] = {
+            "changed": False,
+            "compose_definition_id": None,
+            "compose_run_once_services": {},
+        }
+        servers: Mapping[str, Any] = {"changed": False, "servers": {}}
         if reconcile_scope == "runtime":
-            compose = reconcile_declared_compose_first_use(
-                self._persistence,
+            compose = self._reconcile_repository_compose_contract(
+                request=request,
                 repo_id=repo_id,
-                root=Path(root),
+                root=root,
             )
             servers = reconcile_declared_servers_first_use(
                 self._persistence,
@@ -2101,6 +2116,107 @@ class StoreBackedMutationBackend:
             cause=failure_cause,
         )
 
+    def _execute_compose_host_access_approval(
+        self, accepted: AcceptedBrokerRequest
+    ) -> Mapping[str, Any]:
+        """Approve only the current repository-declared effective Compose risks."""
+
+        from .repository_context import (
+            RepositoryContextError,
+            resolve_effective_repository_context,
+        )
+
+        request = accepted.request
+        disposition = self._persistence.reserve_operation(accepted)
+        if disposition.state == "completed":
+            return dict(disposition.result or {})
+        if disposition.state == "failed":
+            raise BrokerBackendError(
+                disposition.error_code or "compose_host_access_approval_failed",
+                disposition.error_message
+                or "Compose host-access approval previously failed.",
+                operation_id=request.operation_id,
+            )
+        try:
+            context = resolve_effective_repository_context(
+                project=str(request.arguments["canonical_root"])
+            )
+            if (
+                context.project_kind != "primary"
+                or context.temporary is not None
+                or context.root.canonical_root
+                != str(request.arguments["canonical_root"])
+            ):
+                raise RepositoryContextError(
+                    "Compose host-access approval requires the exact primary repository root"
+                )
+            reconciled = self._reconcile_repository_compose_contract(
+                request=request,
+                repo_id=request.project_id,
+                root=context.root.canonical_root,
+                host_access_approved=True,
+            )
+            approval = self._persistence.compose_host_access_status(
+                repo_id=request.project_id
+            )
+            if (
+                approval["host_access_approved"] is not True
+                or not approval["host_access_risks"]
+                or reconciled.get("compose_definition_id")
+                != approval["compose_definition_id"]
+            ):
+                raise BrokerBackendError(
+                    "compose_host_access_approval_not_required",
+                    "The current declared Compose model has no host-access risk set requiring approval.",
+                    operation_id=request.operation_id,
+                )
+            result = {
+                "status": "compose_host_access_approved",
+                "repository_id": request.project_id,
+                "compose_definition_id": approval["compose_definition_id"],
+                "definition_fingerprint": approval["definition_fingerprint"],
+                "generation": approval["generation"],
+                "host_access_risks": list(approval["host_access_risks"]),
+                "host_access_approved": True,
+                "approved_at": approval["approved_at"],
+                "changed": bool(reconciled.get("changed")),
+            }
+            self._persistence.finish_operation(
+                request.operation_id, result=result
+            )
+            return result
+        except BrokerBackendError as error:
+            self._persistence.finish_operation(
+                request.operation_id,
+                error_code=error.code,
+                error_message=str(error),
+            )
+            raise
+        except (
+            BrokerError,
+            DeclaredComposeConfigurationError,
+            RepositoryContextError,
+            StoreError,
+            OSError,
+            RuntimeError,
+            TypeError,
+            ValueError,
+        ) as error:
+            code = "compose_host_access_approval_invalid"
+            message = _repository_adoption_message(
+                "Compose host-access approval could not seal the current declared model.",
+                "Correct the exact repository runtime condition, then create a fresh approval operation; do not use offline broker configuration while authority is live.",
+                cause=error,
+            )
+            self._persistence.finish_operation(
+                request.operation_id,
+                error_code=code,
+                error_message=message,
+            )
+            raise BrokerBackendError(
+                code, message, operation_id=request.operation_id
+            ) from error
+
     def execute(self, accepted: AcceptedBrokerRequest) -> Mapping[str, Any]:
         request = accepted.request
         if request.operation in TESTD_INTERNAL_OPERATIONS:
@@ -2120,6 +2236,11 @@ class StoreBackedMutationBackend:
             return self._persistence.resolve_repository_catalog_entry(accepted)
         if request.operation == BrokerOperation.REPOSITORY_ENSURE:
             return self._execute_repository_ensure(accepted)
+        if (
+            request.operation
+            == BrokerOperation.REPOSITORY_APPROVE_COMPOSE_HOST_ACCESS
+        ):
+            return self._execute_compose_host_access_approval(accepted)
         if request.operation == BrokerOperation.OPERATION_FOLLOW:
             return self._persistence.operation_follow(accepted)
         if request.operation == BrokerOperation.INVENTORY_READ:
@@ -2208,6 +2329,36 @@ class StoreBackedMutationBackend:
                 if existing.state == "completed":
                     return dict(existing.result or {})
                 if existing.state == "failed":
+                    if existing.error_code == "operation_outcome_uncertain":
+                        candidate = (
+                            self._persistence.compose_reconciliation_candidate(
+                                request.operation_id
+                            )
+                        )
+                        if (
+                            candidate["repo_id"] != request.project_id
+                            or candidate["compose_definition_id"]
+                            != request.resource_id
+                        ):
+                            raise BrokerBackendError(
+                                "compose_reconciliation_identity_mismatch",
+                                "The uncertain Compose operation no longer matches the exact accepted repository definition.",
+                                operation_id=request.operation_id,
+                            )
+                        reconciliation_evidence = self._observe_fresh_full_docker(
+                            request.operation_id,
+                            project_id=request.project_id,
+                        )
+                        self._persistence.reconcile_compose_operation(
+                            request.operation_id,
+                            evidence=reconciliation_evidence,
+                            accepted=accepted,
+                        )
+                        raise BrokerBackendError(
+                            "compose_outcome_reconciled",
+                            "The uncertain Compose invocation was terminally reconciled from fresh complete host evidence; a distinct operation may now ensure the desired state.",
+                            operation_id=request.operation_id,
+                        )
                     raise BrokerBackendError(
                         existing.error_code or "mutation_failed",
                         existing.error_message or "Broker mutation failed.",

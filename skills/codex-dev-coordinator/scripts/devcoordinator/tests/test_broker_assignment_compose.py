@@ -14,6 +14,7 @@ import subprocess
 import tempfile
 import threading
 import time
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 import uuid
@@ -936,6 +937,93 @@ class BrokerComposeTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.fixture.close()
+
+    def test_live_host_access_approval_is_fingerprint_bound_and_replayable(self) -> None:
+        def risky_model(**arguments: object) -> bytes:
+            services = tuple(str(item) for item in arguments["declared_services"])
+            return json.dumps(
+                {
+                    "services": {
+                        name: {
+                            "image": f"example.invalid/{name}:test",
+                            **(
+                                {"ports": ["25001:8080"]}
+                                if name == "web"
+                                else {}
+                            ),
+                        }
+                        for name in services
+                    }
+                }
+            ).encode("utf-8")
+
+        self.fixture.persistence.compose_model_renderer = risky_model
+        declared = {
+            "declared": True,
+            "files": ["compose.yml"],
+            "env_files": [],
+            "profiles": [],
+            "services": ["db", "web"],
+            "run_once_services": [],
+            "project_name": "alpha-stack",
+        }
+        context = SimpleNamespace(
+            project_kind="primary",
+            temporary=None,
+            root=SimpleNamespace(canonical_root=str(self.fixture.alpha_root)),
+        )
+        service, _ = service_for(self.fixture)
+        operation_id = str(uuid.uuid4())
+        request = self.fixture.request(
+            BrokerOperation.REPOSITORY_APPROVE_COMPOSE_HOST_ACCESS,
+            resource_id=REPO_ALPHA,
+            operation_id=operation_id,
+            arguments={
+                "agent": "admin-session",
+                "canonical_root": str(self.fixture.alpha_root),
+                "approve": True,
+            },
+        )
+        with (
+            mock.patch(
+                "devcoordinator.repository_context."
+                "resolve_effective_repository_context",
+                return_value=context,
+            ),
+            mock.patch.object(
+                broker_configuration,
+                "declared_compose_from_runtime_manifest",
+                return_value=declared,
+            ),
+            mock.patch.object(
+                broker_persistence,
+                "_service_administrator_uid",
+                return_value=0,
+            ),
+        ):
+            first = service.reply_for_document(
+                self.fixture.peer(), request.to_wire()
+            )
+            replay = service.reply_for_document(
+                self.fixture.peer(), request.to_wire()
+            )
+
+        self.assertTrue(first["ok"], first)
+        self.assertEqual(replay, first)
+        result = first["result"]
+        self.assertEqual(result["status"], "compose_host_access_approved")
+        self.assertEqual(result["compose_definition_id"], COMPOSE_ALPHA)
+        self.assertTrue(result["host_access_approved"])
+        self.assertEqual(result["host_access_risks"], ["published_host_ports"])
+        self.assertRegex(result["definition_fingerprint"], r"^sha256:[0-9a-f]{64}$")
+        retained = self.fixture.persistence.compose_host_access_status(
+            repo_id=REPO_ALPHA
+        )
+        self.assertEqual(
+            retained["definition_fingerprint"],
+            result["definition_fingerprint"],
+        )
+        self.assertTrue(retained["host_access_approved"])
 
     def _add_observed_compose_container(
         self,
@@ -2589,6 +2677,71 @@ volumes:
         self.assertEqual(
             candidate["uncertain_outcome"]["observation_failure_code"],
             "observer_backend_failed",
+        )
+
+    def test_exact_compose_replay_reconciles_without_repeating_host_action(
+        self,
+    ) -> None:
+        observation_count = 0
+        runner_count = 0
+
+        def observer(store: CoordinatorStore) -> Mapping[str, Any]:
+            nonlocal observation_count
+            observation_count += 1
+            if observation_count == 2:
+                raise BrokerError(
+                    "observer_backend_failed", "observer fixture failed"
+                )
+            return self.fixture.observe_full_docker(store)
+
+        def runner(
+            command: tuple[str, ...],
+            cwd: str,
+            timeout: float,
+            environment: Mapping[str, str],
+        ) -> subprocess.CompletedProcess[str]:
+            nonlocal runner_count
+            del cwd, timeout, environment
+            runner_count += 1
+            return subprocess.CompletedProcess(
+                command, 0, stdout="ok\n", stderr=""
+            )
+
+        service, _ = service_for(
+            self.fixture,
+            compose_runner=runner,
+            observer=observer,
+        )
+        request = self.fixture.request(
+            BrokerOperation.COMPOSE_UP,
+            resource_id=COMPOSE_ALPHA,
+            operation_id=str(uuid.uuid4()),
+        )
+
+        first = service.reply_for_document(self.fixture.peer(), request.to_wire())
+        replay = service.reply_for_document(self.fixture.peer(), request.to_wire())
+
+        self.assertFalse(first["ok"], first)
+        self.assertEqual(first["error"]["code"], "operation_outcome_uncertain")
+        self.assertFalse(replay["ok"], replay)
+        self.assertEqual(replay["error"]["code"], "compose_outcome_reconciled")
+        self.assertEqual(runner_count, 1)
+        with CoordinatorStore.open(
+            self.fixture.persistence.database_path, expected_uid=os.geteuid()
+        ) as store:
+            with store.read_transaction() as connection:
+                operation = connection.execute(
+                    "SELECT status, phase, error_code FROM operations "
+                    "WHERE operation_id = ?",
+                    (request.operation_id,),
+                ).fetchone()
+        self.assertEqual(
+            dict(operation),
+            {
+                "status": "failed",
+                "phase": "reconciled",
+                "error_code": "compose_outcome_reconciled",
+            },
         )
 
     def test_missing_effective_model_evidence_requires_fingerprint_abandonment(

@@ -119,6 +119,8 @@ def main() -> int:
         "bin/devcoordinator-api",
         "bin/devcoordinator-authority",
         "bin/devcoordinator-testd",
+        "bin/devcoordinator-compose-host-access",
+        "bin/devcoordinator-authority-repository-repair",
         "bin/devcoordinator-clean-adoption",
         "bin/devcoordinator-availability-activate",
         "scripts/clean_adopt_availability.py",

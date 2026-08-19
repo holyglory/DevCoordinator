@@ -1217,6 +1217,7 @@ def _broker_client_timeout_seconds(
     if operation in {
         BrokerOperation.REPOSITORY_REMOVE,
         BrokerOperation.REPOSITORY_ENSURE,
+        BrokerOperation.REPOSITORY_APPROVE_COMPOSE_HOST_ACCESS,
         BrokerOperation.RESOURCE_ATTACH,
         BrokerOperation.RESOURCE_RETIRE,
     }:

@@ -11,10 +11,10 @@ import uuid
 
 MAX_WORKER_LOG_BYTES = 1024 * 1024
 MAX_WORKER_LOG_LINES = 2000
-SYSTEM_CLIENT_JOURNAL_ROOT = Path(
-    "/Library/Application Support/DevCoordinator/Clients"
+SYSTEM_WORKER_LOG_ROOT = Path(
+    "/Library/Application Support/DevCoordinator/Authority/worker-logs"
     if sys.platform == "darwin"
-    else "/var/lib/devcoordinator-clients"
+    else "/var/lib/devcoordinator/worker-logs"
 )
 
 
@@ -25,13 +25,17 @@ class WorkerArtifactError(RuntimeError):
 def worker_log_directory(execution_uid: int) -> Path:
     if type(execution_uid) is not int or execution_uid < 0:
         raise ValueError("execution_uid must be a non-negative integer")
-    return SYSTEM_CLIENT_JOURNAL_ROOT / str(execution_uid) / "logs"
+    return SYSTEM_WORKER_LOG_ROOT / str(execution_uid) / "logs"
 
 
 def provision_worker_log_directory(execution_uid: int) -> Path:
     """Create the system-mode peer journal/log roots as root-owned/user-owned 0700."""
 
-    root = SYSTEM_CLIENT_JOURNAL_ROOT
+    # security-assumptions.md keeps repository source read-only while allowing
+    # service-owned runtime artifacts. Keep worker logs beneath the authority's
+    # existing state root; never widen the systemd writable sandbox to a second
+    # host directory.
+    root = SYSTEM_WORKER_LOG_ROOT
     _require_absolute_safe_root(root)
     created_root = not root.exists()
     root.mkdir(mode=0o711, parents=True, exist_ok=True)
@@ -179,7 +183,7 @@ def _require_private_directory_descriptor(descriptor: int, owner_uid: int) -> No
 __all__ = [
     "MAX_WORKER_LOG_BYTES",
     "MAX_WORKER_LOG_LINES",
-    "SYSTEM_CLIENT_JOURNAL_ROOT",
+    "SYSTEM_WORKER_LOG_ROOT",
     "WorkerArtifactError",
     "provision_worker_log_directory",
     "verify_worker_log_artifact",

@@ -1800,8 +1800,12 @@ def reconcile_declared_compose_first_use(
     *,
     repo_id: str,
     root: Path,
+    host_access_approved: bool | None = None,
 ) -> Mapping[str, Any]:
     """Seal one repository-declared Compose definition idempotently."""
+
+    if host_access_approved is not None and type(host_access_approved) is not bool:
+        raise TypeError("host_access_approved must be boolean or null")
 
     compose = declared_compose_from_runtime_manifest(root)
     if compose is None:
@@ -1828,7 +1832,7 @@ def reconcile_declared_compose_first_use(
             root=root,
             compose=compose,
             observation_snapshot_id=None,
-            host_access_approved=None,
+            host_access_approved=host_access_approved,
         )
     except (BrokerError, OSError, RuntimeError, TypeError, ValueError) as error:
         raise DeclaredComposeConfigurationError(str(error)) from error

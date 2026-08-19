@@ -980,6 +980,60 @@ class LifecycleParserContractTests(unittest.TestCase):
             ],
         )
 
+    def test_live_compose_host_access_approval_uses_exact_broker_operation(self) -> None:
+        operation_id = "00000000-0000-4000-8000-000000000211"
+        repository = mock.Mock(repo_id="repo-1")
+        profile = mock.Mock()
+        profile.repository.return_value = repository
+        profile.call.return_value = (
+            operation_id,
+            {
+                "status": "compose_host_access_approved",
+                "compose_definition_id": "compose-1",
+                "definition_fingerprint": "sha256:" + "a" * 64,
+                "generation": 3,
+                "host_access_risks": ["published_host_ports"],
+                "host_access_approved": True,
+            },
+        )
+        args = argparse.Namespace(
+            project="/repository",
+            agent="admin-session",
+            operation_id=operation_id,
+            approve_compose_host_access=True,
+        )
+        with (
+            mock.patch.object(
+                dev_coordinator,
+                "canonical_project",
+                return_value="/repository",
+            ),
+            mock.patch.object(
+                dev_coordinator,
+                "configured_broker_profile",
+                return_value=profile,
+            ),
+        ):
+            result = (
+                dev_coordinator.coordinated_broker_approve_compose_host_access(
+                    args
+                )
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["operation_id"], operation_id)
+        profile.call.assert_called_once_with(
+            repository=repository,
+            resource_id="repo-1",
+            operation=BrokerOperation.REPOSITORY_APPROVE_COMPOSE_HOST_ACCESS,
+            arguments={
+                "agent": "admin-session",
+                "canonical_root": "/repository",
+                "approve": True,
+            },
+            operation_id=operation_id,
+        )
+
     def test_broker_configuration_rejects_unresolved_port_placeholder(self) -> None:
         with self.assertRaisesRegex(ValueError, "web.*no declared port"):
             dev_coordinator.materialize_configured_servers(

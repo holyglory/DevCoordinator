@@ -204,6 +204,7 @@ def main() -> int:
             "authority without dedicated browser telemetry write access was not rejected",
         )
 
+
         authority_runtime_conflict = Path(raw) / "authority-runtime-conflict"
         shutil.copytree(clean, authority_runtime_conflict)
         replace(

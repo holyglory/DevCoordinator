@@ -179,6 +179,23 @@ def add_broker_parser(subparsers: Any) -> None:
         ),
     )
 
+    approve_compose = actions.add_parser(
+        "approve-compose-host-access",
+        help=(
+            "approve the exact current repository-declared Compose host-access "
+            "risk set through the live authority"
+        ),
+    )
+    approve_compose.add_argument("--project", required=True)
+    approve_compose.add_argument("--agent", required=True)
+    approve_compose.add_argument("--operation-id")
+    approve_compose.add_argument(
+        "--approve-compose-host-access",
+        action="store_true",
+        required=True,
+        help="explicitly approve the current fingerprinted effective risk set",
+    )
+
     port_range = actions.add_parser(
         "configure-port-range",
         help="configure the allocatable port range for one server definition",

@@ -813,20 +813,57 @@ def _bootstrap_declared_compose_target(
     child_operation_id = str(
         uuid.uuid5(uuid.UUID(operation_id), "compose.bootstrap:" + selector)
     )
-    returned_id, report = profile.call(
-        repository=effective,
-        resource_id=compose_id,
-        operation=BrokerOperation.COMPOSE_UP,
-        arguments={},
-        operation_id=child_operation_id,
+    retry_operation_id = str(
+        uuid.uuid5(uuid.UUID(operation_id), "compose.bootstrap.retry:" + selector)
     )
-    if returned_id != child_operation_id or not isinstance(report, Mapping):
-        raise AgentCliError(
-            "compose_bootstrap_reply_invalid",
-            "Compose bootstrap returned contradictory operation evidence",
-            classification="invalid_reply",
-            phase="transport",
+
+    def invoke(exact_operation_id: str) -> None:
+        returned_id, report = profile.call(
+            repository=effective,
+            resource_id=compose_id,
+            operation=BrokerOperation.COMPOSE_UP,
+            arguments={},
+            operation_id=exact_operation_id,
         )
+        if returned_id != exact_operation_id or not isinstance(report, Mapping):
+            raise AgentCliError(
+                "compose_bootstrap_reply_invalid",
+                "Compose bootstrap returned contradictory operation evidence",
+                classification="invalid_reply",
+                phase="transport",
+            )
+
+    try:
+        invoke(child_operation_id)
+        return
+    except BaseException as first_error:
+        first_code = getattr(first_error, "code", None)
+        if first_code == "operation_outcome_uncertain":
+            # Replaying the exact child never repeats a proven action. The
+            # authority either returns its completed result or uses a fresh
+            # complete Docker observation to terminally reconcile it.
+            try:
+                invoke(child_operation_id)
+                return
+            except BaseException as reconciliation_error:
+                if getattr(reconciliation_error, "code", None) != (
+                    "compose_outcome_reconciled"
+                ):
+                    raise
+        elif first_code != "compose_outcome_reconciled":
+            raise
+
+    try:
+        invoke(retry_operation_id)
+    except BaseException as retry_error:
+        if getattr(retry_error, "code", None) == "compose_outcome_reconciled":
+            raise AgentCliError(
+                "compose_bootstrap_retry_exhausted",
+                "The bounded Compose bootstrap retry was also reconciled; submit a new runtime ensure operation after inspecting its exact continuation.",
+                classification="outcome_uncertain",
+                phase="authority",
+            ) from retry_error
+        raise
 
 
 def _runtime(

@@ -2506,6 +2506,10 @@ class BrokerProfileTrustTests(unittest.TestCase):
             (BrokerOperation.TEST_RUN_SUBMIT, 60.0),
             (BrokerOperation.REPOSITORY_REMOVE, 60.0),
             (
+                BrokerOperation.REPOSITORY_APPROVE_COMPOSE_HOST_ACCESS,
+                60.0,
+            ),
+            (
                 BrokerOperation.HOST_OBSERVE,
                 broker_profile_module.HOST_OBSERVE_CLIENT_TIMEOUT_SECONDS,
             ),
@@ -2543,12 +2547,20 @@ class BrokerProfileTrustTests(unittest.TestCase):
                                 BrokerOperation.HOST_OBSERVE,
                                 BrokerOperation.CLEANUP_PLAN,
                                 BrokerOperation.CLEANUP_APPLY,
+                                BrokerOperation.REPOSITORY_APPROVE_COMPOSE_HOST_ACCESS,
                             }
                             else "container-postgres"
                         ),
                         operation=operation,
                         arguments=(
                             {
+                                "agent": "admin-session",
+                                "canonical_root": "/repositories/example",
+                                "approve": True,
+                            }
+                            if operation
+                            == BrokerOperation.REPOSITORY_APPROVE_COMPOSE_HOST_ACCESS
+                            else {
                                 "action": "purge",
                                 "target_kind": "project",
                                 "target_id": REPO_ID,

@@ -11,6 +11,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import time
 from typing import Callable, Mapping, Sequence
 import uuid
 
@@ -23,10 +24,18 @@ RUNNER_PROBE_TARGET = "software-delivery-runner-probe"
 MAX_EXECUTION_TIMEOUT_SECONDS = 86_400
 MAX_LAUNCH_TIMEOUT_SECONDS = 3_600
 MAX_WAIT_TIMEOUT_SECONDS = 86_400
+SETUP_RECOVERY_TIMEOUT_SECONDS = 180
+TRANSIENT_SETUP_CODES = frozenset(
+    {"request_timeout", "server_busy", "test_scheduler_unavailable"}
+)
 
 
 class VerificationError(RuntimeError):
     """Installed Codex test access does not satisfy its public contract."""
+
+    def __init__(self, message: str, *, code: str | None = None) -> None:
+        super().__init__(message)
+        self.code = code
 
 
 def regular(path: Path, mode: int) -> None:
@@ -67,11 +76,77 @@ def run(
         ) from error
     if completed.returncode != 0:
         detail = (completed.stderr.strip() or completed.stdout.strip())[-1000:]
-        raise VerificationError(f"{label} failed" + (f": {detail}" if detail else ""))
+        code = None
+        try:
+            document = json.loads(completed.stderr or completed.stdout)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            document = None
+        if isinstance(document, Mapping) and isinstance(document.get("code"), str):
+            code = str(document["code"])
+        raise VerificationError(
+            f"{label} failed" + (f": {detail}" if detail else ""),
+            code=code,
+        )
     return completed
 
 
 CommandRunner = Callable[..., subprocess.CompletedProcess[str]]
+
+
+def load_catalog_with_recovery(
+    root_repo: Path,
+    *,
+    launcher: Path = LAUNCHER,
+    command_runner: CommandRunner = run,
+    recovery_timeout_seconds: int = SETUP_RECOVERY_TIMEOUT_SECONDS,
+    clock: Callable[[], float] = time.monotonic,
+    sleeper: Callable[[float], None] = time.sleep,
+) -> dict[str, object]:
+    """Retry only typed post-restart setup transients within one deadline."""
+
+    if (
+        isinstance(recovery_timeout_seconds, bool)
+        or not isinstance(recovery_timeout_seconds, int)
+        or not 1 <= recovery_timeout_seconds <= 600
+    ):
+        raise VerificationError(
+            "setup recovery timeout must be from 1 through 600 seconds"
+        )
+    deadline = float(clock()) + recovery_timeout_seconds
+    command = [
+        str(launcher),
+        "catalog",
+        "--root-repo",
+        str(root_repo.resolve(strict=True)),
+    ]
+    while True:
+        remaining = deadline - float(clock())
+        if remaining <= 0:
+            raise VerificationError(
+                "immutable test launcher catalog did not recover before its "
+                f"{recovery_timeout_seconds}s setup deadline",
+                code="request_timeout",
+            )
+        try:
+            completed = command_runner(
+                command,
+                "immutable test launcher catalog",
+                timeout_seconds=max(1, min(70, int(remaining) + 1)),
+            )
+            return json_object(
+                completed, label="immutable test launcher catalog"
+            )
+        except VerificationError as error:
+            if error.code not in TRANSIENT_SETUP_CODES:
+                raise
+            remaining = deadline - float(clock())
+            if remaining <= 0:
+                raise VerificationError(
+                    "immutable test launcher catalog did not recover before "
+                    f"its {recovery_timeout_seconds}s setup deadline",
+                    code=error.code,
+                ) from error
+            sleeper(min(2.0, remaining))
 
 
 def json_object(
@@ -612,11 +687,7 @@ def verify(
         is not None
     ):
         raise VerificationError("mutable source execution unexpectedly bypasses approval")
-    catalog = run(
-        [str(LAUNCHER), "catalog", "--root-repo", str(root_repo.resolve(strict=True))],
-        "immutable test launcher catalog",
-    )
-    catalog_value = json_object(catalog, label="immutable test launcher catalog")
+    catalog_value = load_catalog_with_recovery(root_repo)
     result: dict[str, object] = {
         "ok": True,
         "verification_uid": os.geteuid(),

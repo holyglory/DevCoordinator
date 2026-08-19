@@ -12719,6 +12719,57 @@ def coordinated_broker_configure(args: argparse.Namespace) -> dict[str, Any]:
     return result
 
 
+def coordinated_broker_approve_compose_host_access(
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    """Approve one exact current Compose risk set through the live authority."""
+
+    if args.approve_compose_host_access is not True:
+        raise ValueError(
+            "Compose host-access approval requires --approve-compose-host-access"
+        )
+    project = canonical_project(str(args.project))
+    profile = configured_broker_profile()
+    if profile is None:
+        raise BrokerProfileError(
+            "server-wide broker authority is not configured"
+        )
+    repository = profile.repository(project)
+    operation_id = (
+        str(uuid.uuid4())
+        if args.operation_id is None
+        else str(args.operation_id)
+    )
+    try:
+        if str(uuid.UUID(operation_id)) != operation_id:
+            raise ValueError
+    except (AttributeError, TypeError, ValueError) as error:
+        raise ValueError("--operation-id must be one canonical UUID") from error
+    returned_operation_id, result = profile.call(
+        repository=repository,
+        resource_id=repository.repo_id,
+        operation=BrokerOperation.REPOSITORY_APPROVE_COMPOSE_HOST_ACCESS,
+        arguments={
+            "agent": str(args.agent),
+            "canonical_root": project,
+            "approve": True,
+        },
+        operation_id=operation_id,
+    )
+    if returned_operation_id != operation_id or not isinstance(result, Mapping):
+        raise RuntimeError(
+            "Compose host-access approval returned a contradictory operation identity"
+        )
+    return {
+        "schema_version": 1,
+        "ok": True,
+        "action": "compose_host_access_approved",
+        "operation_id": operation_id,
+        "repository_id": repository.repo_id,
+        **dict(result),
+    }
+
+
 def coordinated_broker_publish_image(args: argparse.Namespace) -> dict[str, Any]:
     """Run the explicit root-only image publication lifecycle.
 
@@ -20209,6 +20260,11 @@ def handle_cli(args: argparse.Namespace) -> Any:
         return coordinated_worker_runner(args.worker_id)
     if args.group == "broker" and args.action == "configure":
         return coordinated_broker_configure(args)
+    if (
+        args.group == "broker"
+        and args.action == "approve-compose-host-access"
+    ):
+        return coordinated_broker_approve_compose_host_access(args)
     if args.group == "broker" and args.action == "reconcile-compose":
         return coordinated_broker_compose_reconcile(args)
     if args.group == "broker" and args.action == "reconcile-docker":
