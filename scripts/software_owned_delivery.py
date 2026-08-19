@@ -32,13 +32,23 @@ from typing import Any, Mapping, Sequence
 
 
 ROOT = Path(__file__).resolve().parents[1]
+MODULE_ROOT = ROOT / "skills/codex-dev-coordinator/scripts"
+if str(MODULE_ROOT) not in sys.path:
+    sys.path.insert(0, str(MODULE_ROOT))
+
+from devcoordinator.repository_context import (  # noqa: E402
+    RepositoryContextError,
+    resolve_effective_repository_context,
+)
+
+
 SCHEMA_VERSION = 2
 PLAN_KIND = "devcoordinator-software-delivery-plan"
 STATE_KIND = "devcoordinator-software-delivery-state"
 REPORT_KIND = "devcoordinator-software-delivery-report"
 RELEASE_RE = re.compile(r"^[0-9a-f]{64}$")
 TOKEN_RE = re.compile(
-    r"\{(repo|run_root|release|release_digest|transaction_root|caller_uid|caller_gid|"
+    r"\{(repo|canonical_repo|run_root|release|release_digest|transaction_root|caller_uid|caller_gid|"
     r"acceptance_execution_timeout_seconds|"
     r"acceptance_launch_timeout_seconds|acceptance_wait_timeout_seconds)\}"
 )
@@ -304,8 +314,14 @@ class Delivery:
         acceptance_execution_timeout_seconds: int | None = None,
         acceptance_launch_timeout_seconds: int | None = None,
         acceptance_wait_timeout_seconds: int | None = None,
+        canonical_repo: Path | None = None,
     ) -> None:
         self.repo = repo.expanduser().resolve()
+        self.canonical_repo = (
+            self.repo
+            if canonical_repo is None
+            else canonical_repo.expanduser().resolve()
+        )
         self.run_root = run_root.expanduser().absolute()
         self.release_root = release_root.expanduser().absolute()
         self.transaction_root = transaction_root.expanduser().absolute()
@@ -413,6 +429,7 @@ class Delivery:
             release_transaction_root = self.transaction_root / release_digest
         return {
             "repo": str(self.repo),
+            "canonical_repo": str(self.canonical_repo),
             "run_root": str(self.run_root),
             "release": release_path,
             "release_digest": release_digest,
@@ -1041,6 +1058,13 @@ def make_delivery(args: argparse.Namespace) -> Delivery:
         else run_root / "transaction"
     )
     plan = load_plan(args.plan)
+    source_repo = args.repo.expanduser().resolve()
+    try:
+        context = resolve_effective_repository_context(project=str(source_repo))
+    except RepositoryContextError as error:
+        raise DeliveryError(
+            "delivery source is not one stable Git worktree"
+        ) from error
     return Delivery(
         repo=args.repo,
         run_root=run_root,
@@ -1057,6 +1081,7 @@ def make_delivery(args: argparse.Namespace) -> Delivery:
         acceptance_wait_timeout_seconds=getattr(
             args, "acceptance_wait_timeout_seconds", None
         ),
+        canonical_repo=Path(context.root.canonical_root),
     )
 
 

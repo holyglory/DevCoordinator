@@ -19,7 +19,7 @@
       "argv": [
         "{release}/bin/devcoordinator-codex-test-access-verify",
         "--root-repo",
-        "{repo}",
+        "{canonical_repo}",
         "--exercise-runner",
         "--execution-timeout-seconds",
         "{acceptance_execution_timeout_seconds}",
@@ -46,7 +46,7 @@
         "skills/codex-dev-coordinator/scripts/dev_coordinator.py",
         "inventory",
         "--project",
-        "{repo}",
+        "{canonical_repo}",
         "--compact-json"
       ],
       "blocking": false,
@@ -60,7 +60,7 @@
         "manifest",
         "validate",
         "--root-repo",
-        "{repo}"
+        "{canonical_repo}"
       ],
       "blocking": false,
       "name": "test-manifest"

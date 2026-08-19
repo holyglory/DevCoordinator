@@ -156,6 +156,7 @@ class DeliveryTests(unittest.TestCase):
         acceptance_launch_timeout_seconds: int | None = None,
         acceptance_wait_timeout_seconds: int | None = None,
         root_prefix: Sequence[str] | None = None,
+        canonical_repo: Path | None = None,
     ) -> delivery.Delivery:
         return delivery.Delivery(
             repo=ROOT,
@@ -169,6 +170,7 @@ class DeliveryTests(unittest.TestCase):
             acceptance_execution_timeout_seconds=acceptance_execution_timeout_seconds,
             acceptance_launch_timeout_seconds=acceptance_launch_timeout_seconds,
             acceptance_wait_timeout_seconds=acceptance_wait_timeout_seconds,
+            canonical_repo=canonical_repo,
         )
 
     def test_source_batch_runs_every_check_and_aggregates_findings(self) -> None:
@@ -212,6 +214,8 @@ class DeliveryTests(unittest.TestCase):
         encoded = json.dumps(production["acceptance"], sort_keys=True)
         self.assertNotIn("/home/holyglory/", encoded)
         self.assertNotIn("first-use-development-server", encoded)
+        self.assertIn("{canonical_repo}", encoded)
+        self.assertNotIn('"{repo}"', encoded)
 
     def test_same_schema_commands_use_one_release_scoped_transaction(self) -> None:
         executor = FakeExecutor()
@@ -442,6 +446,32 @@ class DeliveryTests(unittest.TestCase):
                     "47",
                 ]
             ],
+        )
+
+    def test_acceptance_distinguishes_source_and_canonical_repository(self) -> None:
+        selected_plan = plan()
+        selected_plan["acceptance_setup"] = []
+        selected_plan["acceptance"] = [
+            {
+                "name": "repository-scope",
+                "argv": ["fixture", "{repo}", "{canonical_repo}"],
+                "blocking": True,
+            }
+        ]
+        canonical = self.root / "canonical-repository"
+        executor = FakeExecutor()
+        subject = self.subject(
+            executor=executor,
+            selected_plan=selected_plan,
+            canonical_repo=canonical,
+        )
+
+        result = subject.acceptance()
+
+        self.assertTrue(result[0].ok)
+        self.assertEqual(
+            executor.calls,
+            [["fixture", str(ROOT.resolve()), str(canonical.resolve())]],
         )
 
     def test_acceptance_runs_as_actual_caller_not_privileged_prefix(self) -> None:
