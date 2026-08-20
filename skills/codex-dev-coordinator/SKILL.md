@@ -193,7 +193,14 @@ When `.codex/tests.json` exists, enqueue the policy-derived workflow once:
 ```bash
 devcoordinator test enqueue --intent change
 devcoordinator test follow dc1:run:RUN_ID --wait-seconds 30
+devcoordinator test failures dc1:run:RUN_ID
+devcoordinator test cases dc1:run:RUN_ID
 ```
+
+Failure and case reads are cursor-bounded. Follow each returned `next_cursor`
+with `--after` until it is null; every page stays within the agent result
+contract, while the retained index preserves every failure and case from the
+bounded reporter stream.
 
 Do not recreate the selected batch by invoking its test files, packages, or
 targets one at a time locally. If `.codex/tests.json` is absent or invalid, a

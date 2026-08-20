@@ -48,7 +48,9 @@ MAX_TRX_INPUT_BYTES = 512 * 1024 * 1024
 MAX_TRX_DETAIL_CHARACTERS = 16 * 1024
 MAX_TRX_XML_DEPTH = 128
 MAX_CASES = 100_000
-MAX_FAILURES = 64
+# A detailed failure is part of each failed/error case's result, not a sample.
+# The chunk stream already bounds transport and storage independently.
+MAX_FAILURES = MAX_CASES
 MAX_ARTIFACTS = 64
 MAX_FAILURE_DIAGNOSTIC_BYTES = 256 * 1024
 MAX_FAILURE_DIAGNOSTIC_FILE_BYTES = 64 * 1024
@@ -3028,7 +3030,6 @@ def run(
                 "artifact_id": evidence["artifact_id"],
             }
         )
-    failures = failures[:MAX_FAILURES]
     artifacts = artifacts[:MAX_ARTIFACTS]
     artifacts, artifact_sources = _artifact_sources(
         artifacts,

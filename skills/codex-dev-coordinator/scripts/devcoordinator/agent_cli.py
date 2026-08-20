@@ -125,6 +125,40 @@ def _bounded_test_failure_page(result: Mapping[str, Any]) -> dict[str, Any]:
             document["next_cursor"] = cursor
 
 
+def _bounded_test_case_page(result: Mapping[str, Any]) -> dict[str, Any]:
+    """Keep ordered case-result progress inside the agent contract."""
+
+    document = dict(result)
+    document.setdefault("ok", True)
+    raw_cases = document.get("cases")
+    if not isinstance(raw_cases, list):
+        return require_agent_result(document, surface="test cases")
+    cases = list(raw_cases)
+    document["cases"] = cases
+    server_cursor = document.get("next_cursor")
+    while True:
+        try:
+            bounded = require_agent_result(document, surface="test cases")
+            if cases and server_cursor is not None:
+                cursor = cases[-1].get("cursor")
+                if type(cursor) is not int or cursor < 0:
+                    raise AgentContractError(
+                        "test case page cannot publish a safe continuation cursor"
+                    )
+                bounded["next_cursor"] = cursor
+            return bounded
+        except AgentContractError:
+            if len(cases) <= 1:
+                raise
+            cases.pop()
+            cursor = cases[-1].get("cursor")
+            if type(cursor) is not int or cursor < 0:
+                raise AgentContractError(
+                    "test case page cannot publish a safe continuation cursor"
+                )
+            document["next_cursor"] = cursor
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = _Parser(
         prog="devcoordinator",
@@ -372,6 +406,14 @@ def _parser() -> argparse.ArgumentParser:
     failures.add_argument("--limit", type=int, default=10)
     _add_scoped_project(failures)
 
+    cases = test_actions.add_parser(
+        "cases", help="read one cursor-bounded page of retained case results"
+    )
+    cases.add_argument("run", help="dc1:run handle or exact run ID")
+    cases.add_argument("--after", type=int, default=0)
+    cases.add_argument("--limit", type=int, default=10)
+    _add_scoped_project(cases)
+
     artifact = test_actions.add_parser(
         "artifact", help="resolve one exact verified test artifact"
     )
@@ -492,6 +534,7 @@ def _allows_compatible_release(namespace: argparse.Namespace) -> bool:
 
     return namespace.command == "test" and namespace.test_action in {
         "artifact",
+        "cases",
         "failures",
         "follow",
         "queue-status",
@@ -2150,6 +2193,20 @@ def _test(
             limit=namespace.limit,
         )
         return _bounded_test_failure_page(result)
+    if action == "cases":
+        if not 0 <= namespace.after or not 1 <= namespace.limit <= 50:
+            raise AgentCliError(
+                "case_page_invalid",
+                "--after must be non-negative and --limit must be from 1 through 50",
+            )
+        run_id = _handle_identity(namespace.run, expected_kind="run")
+        result = profile.test_run_cases(
+            repository=root.repo_id,
+            run_id=run_id,
+            after=namespace.after,
+            limit=namespace.limit,
+        )
+        return _bounded_test_case_page(result)
     if action == "artifact":
         run_id = _handle_identity(namespace.run, expected_kind="run")
         artifact_id = _handle_identity(namespace.artifact, expected_kind="artifact")

@@ -98,6 +98,56 @@ class OversizedSummaryProfile:
         return {"run_id": run_id, "detail": "x" * 9000}
 
 
+class OversizedFailuresProfile:
+    def test_run_failures(
+        self,
+        *,
+        repository: str,
+        run_id: str,
+        after: str | None = None,
+        limit: int = 25,
+    ) -> dict[str, object]:
+        del after
+        return {
+            "repository_id": repository,
+            "run_id": run_id,
+            "failures": [
+                {
+                    "failure_id": f"failure-{index:04d}",
+                    "message": "m" * 2048,
+                    "location": "l" * 2048,
+                }
+                for index in range(limit)
+            ],
+            "next_cursor": None,
+        }
+
+
+class OversizedCasesProfile:
+    def test_run_cases(
+        self,
+        *,
+        repository: str,
+        run_id: str,
+        after: int = 0,
+        limit: int = 25,
+    ) -> dict[str, object]:
+        return {
+            "repository_id": repository,
+            "run_id": run_id,
+            "cases": [
+                {
+                    "cursor": after + index + 1,
+                    "case_id": f"case-{index:04d}",
+                    "display_name": "n" * 4096,
+                    "location": "l" * 2048,
+                }
+                for index in range(limit)
+            ],
+            "next_cursor": None,
+        }
+
+
 class RecordingSchedulerProfile:
     METHODS = frozenset(
         {
@@ -106,6 +156,7 @@ class RecordingSchedulerProfile:
             "test_run_summary",
             "test_run_failures",
             "test_run_artifacts",
+            "test_run_cases",
             "test_artifact",
             "cancel_test_run",
             "retry_test_run",
@@ -488,6 +539,7 @@ class UniversalTestCliTests(unittest.TestCase):
             "status",
             "summary",
             "failures",
+            "cases",
             "artifact",
             "cancel",
             "retry",
@@ -570,6 +622,10 @@ class UniversalTestCliTests(unittest.TestCase):
         with self.assertRaises(SystemExit):
             parser().parse_args(
                 ["test", "failures", *RUN_REPOSITORY_ARGS, "--run-id", "run-1", "--limit", "51"]
+            )
+        with self.assertRaises(SystemExit):
+            parser().parse_args(
+                ["test", "cases", *RUN_REPOSITORY_ARGS, "--run-id", "run-1", "--limit", "51"]
             )
         with self.assertRaises(SystemExit):
             parser().parse_args(
@@ -1163,6 +1219,26 @@ class UniversalTestCliTests(unittest.TestCase):
             (
                 [
                     "test",
+                    "cases",
+                    *RUN_REPOSITORY_ARGS,
+                    "--run-id",
+                    "run-abc",
+                    "--after",
+                    "7",
+                    "--limit",
+                    "3",
+                ],
+                "test_run_cases",
+                {
+                    "repository": REPOSITORY_ID,
+                    "run_id": "run-abc",
+                    "after": 7,
+                    "limit": 3,
+                },
+            ),
+            (
+                [
+                    "test",
                     "artifact",
                     *RUN_REPOSITORY_ARGS,
                     "--run-id",
@@ -1264,6 +1340,70 @@ class UniversalTestCliTests(unittest.TestCase):
                 broker_profile_loader=OversizedSummaryProfile,
                 statistics_reader=lambda **_kwargs: self.fail("statistics called"),
             )
+
+    def test_advanced_failure_page_preserves_cursor_inside_agent_envelope(
+        self,
+    ) -> None:
+        parsed = parser().parse_args(
+            [
+                "test",
+                "failures",
+                *RUN_REPOSITORY_ARGS,
+                "--run-id",
+                "run-abc",
+                "--limit",
+                "25",
+            ]
+        )
+
+        result = handle_universal_test_cli(
+            parsed,
+            canonical_project=lambda value: value,
+            broker_profile_loader=OversizedFailuresProfile,
+            statistics_reader=lambda **_kwargs: self.fail("statistics called"),
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertGreaterEqual(len(result["failures"]), 1)
+        self.assertLess(len(result["failures"]), 25)
+        self.assertEqual(
+            result["next_cursor"], result["failures"][-1]["failure_id"]
+        )
+        self.assertLessEqual(
+            len(json.dumps(result, separators=(",", ":")).encode("utf-8")),
+            8 * 1024,
+        )
+
+    def test_advanced_case_page_preserves_cursor_inside_agent_envelope(
+        self,
+    ) -> None:
+        parsed = parser().parse_args(
+            [
+                "test",
+                "cases",
+                *RUN_REPOSITORY_ARGS,
+                "--run-id",
+                "run-abc",
+                "--limit",
+                "25",
+            ]
+        )
+
+        result = handle_universal_test_cli(
+            parsed,
+            canonical_project=lambda value: value,
+            broker_profile_loader=OversizedCasesProfile,
+            statistics_reader=lambda **_kwargs: self.fail("statistics called"),
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertGreaterEqual(len(result["cases"]), 1)
+        self.assertLess(len(result["cases"]), 25)
+        self.assertEqual(result["next_cursor"], result["cases"][-1]["cursor"])
+        self.assertLessEqual(
+            len(json.dumps(result, separators=(",", ":")).encode("utf-8")),
+            8 * 1024,
+        )
 
     def test_default_plan_envelope_is_bounded_and_marks_truncation(self) -> None:
         self._committed_repository()

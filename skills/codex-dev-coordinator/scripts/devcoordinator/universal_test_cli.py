@@ -147,6 +147,70 @@ def _require_agent_envelope(
     return document
 
 
+def _bounded_failure_page(document: Mapping[str, object]) -> dict[str, Any]:
+    """Keep ordered failure progress inside the default agent envelope."""
+
+    bounded = dict(document)
+    raw_failures = bounded.get("failures")
+    if not isinstance(raw_failures, list):
+        return _require_agent_envelope(bounded, surface="test failures")
+    failures = [dict(item) if isinstance(item, Mapping) else item for item in raw_failures]
+    bounded["failures"] = failures
+    server_cursor = bounded.get("next_cursor")
+    while _encoded_size(bounded) > MAX_AGENT_ENVELOPE_BYTES:
+        if len(failures) <= 1:
+            raise UniversalTestCliError(
+                "one test failure exceeds the 8 KiB default agent output contract"
+            )
+        failures.pop()
+        cursor = failures[-1].get("failure_id")
+        if not isinstance(cursor, str) or not cursor:
+            raise UniversalTestCliError(
+                "test failure page cannot publish a safe continuation cursor"
+            )
+        bounded["next_cursor"] = cursor
+    if failures and server_cursor is not None:
+        cursor = failures[-1].get("failure_id")
+        if not isinstance(cursor, str) or not cursor:
+            raise UniversalTestCliError(
+                "test failure page cannot publish a safe continuation cursor"
+            )
+        bounded["next_cursor"] = cursor
+    return bounded
+
+
+def _bounded_case_page(document: Mapping[str, object]) -> dict[str, Any]:
+    """Keep ordered case-result progress inside the default agent envelope."""
+
+    bounded = dict(document)
+    raw_cases = bounded.get("cases")
+    if not isinstance(raw_cases, list):
+        return _require_agent_envelope(bounded, surface="test cases")
+    cases = [dict(item) if isinstance(item, Mapping) else item for item in raw_cases]
+    bounded["cases"] = cases
+    server_cursor = bounded.get("next_cursor")
+    while _encoded_size(bounded) > MAX_AGENT_ENVELOPE_BYTES:
+        if len(cases) <= 1:
+            raise UniversalTestCliError(
+                "one test case exceeds the 8 KiB default agent output contract"
+            )
+        cases.pop()
+        cursor = cases[-1].get("cursor")
+        if type(cursor) is not int or cursor < 0:
+            raise UniversalTestCliError(
+                "test case page cannot publish a safe continuation cursor"
+            )
+        bounded["next_cursor"] = cursor
+    if cases and server_cursor is not None:
+        cursor = cases[-1].get("cursor")
+        if type(cursor) is not int or cursor < 0:
+            raise UniversalTestCliError(
+                "test case page cannot publish a safe continuation cursor"
+            )
+        bounded["next_cursor"] = cursor
+    return bounded
+
+
 def _bounded_positive(raw: str, *, name: str, maximum: int) -> int:
     try:
         value = int(raw)
@@ -159,6 +223,16 @@ def _bounded_positive(raw: str, *, name: str, maximum: int) -> int:
 
 def _page_limit(raw: str) -> int:
     return _bounded_positive(raw, name="limit", maximum=50)
+
+
+def _case_cursor(raw: str) -> int:
+    try:
+        value = int(raw)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("case cursor must be an integer") from error
+    if value < 0:
+        raise argparse.ArgumentTypeError("case cursor must be non-negative")
+    return value
 
 
 def _wait_timeout(raw: str) -> int:
@@ -349,6 +423,14 @@ def add_universal_test_cli_parser(subparsers: Any) -> argparse.ArgumentParser:
     failures.add_argument("--run-id", required=True, type=_opaque_id)
     failures.add_argument("--after", type=_opaque_id)
     failures.add_argument("--limit", type=_page_limit, default=25)
+
+    cases = actions.add_parser(
+        "cases", help="read one cursor-bounded page of retained case results"
+    )
+    _add_run_repository(cases)
+    cases.add_argument("--run-id", required=True, type=_opaque_id)
+    cases.add_argument("--after", type=_case_cursor, default=0)
+    cases.add_argument("--limit", type=_page_limit, default=25)
 
     artifact = actions.add_parser(
         "artifact", help="resolve one exact verified artifact handle"
@@ -1648,6 +1730,10 @@ def _scheduler_result_or_pending(
         broker_profile, method_name, action=action, **dict(arguments)
     )
     if result is not None:
+        if action == "failures":
+            return _bounded_failure_page(result)
+        if action == "cases":
+            return _bounded_case_page(result)
         if action in {"summary", "wait"}:
             encoded = json.dumps(
                 result, separators=(",", ":"), sort_keys=True
@@ -1797,6 +1883,7 @@ def handle_universal_test_cli(
         "status": "test_run_status",
         "summary": "test_run_summary",
         "failures": "test_run_failures",
+        "cases": "test_run_cases",
         "artifact": "test_artifact",
         "cancel": "cancel_test_run",
         "retry": "retry_test_run",

@@ -164,6 +164,7 @@ class AgentCliTests(unittest.TestCase):
             ["test", "enqueue", "--project", "/repo"],
             ["test", "submit", "plan-1", "--project", "/repo"],
             ["test", "follow", "run-1", "--project", "/repo"],
+            ["test", "cases", "run-1", "--project", "/repo"],
             ["test", "failures", "run-1", "--project", "/repo"],
             ["test", "artifact", "run-1", "artifact-1", "--project", "/repo"],
             ["test", "status", "run-1", "--project", "/repo"],
@@ -1054,6 +1055,33 @@ class AgentCliTests(unittest.TestCase):
         self.assertEqual(result["next_cursor"], None)
         self.assertEqual(len(result["failures"]), 10)
 
+    def test_case_page_preserves_a_cursor_while_enforcing_agent_bound(self) -> None:
+        result = {
+            "schema_version": 1,
+            "repository_id": "repo-1",
+            "run_id": "run-1",
+            "cases": [
+                {
+                    "cursor": index + 1,
+                    "case_id": f"case-{index}",
+                    "display_name": "x" * 4096,
+                    "location": "y" * 2048,
+                }
+                for index in range(10)
+            ],
+            "next_cursor": None,
+        }
+
+        bounded = agent_cli._bounded_test_case_page(result)
+
+        self.assertTrue(bounded["ok"])
+        self.assertGreaterEqual(len(bounded["cases"]), 1)
+        self.assertLess(len(bounded["cases"]), 10)
+        self.assertEqual(bounded["next_cursor"], bounded["cases"][-1]["cursor"])
+        self.assertLessEqual(
+            len(agent_cli.canonical_json_bytes(bounded)), 8 * 1024
+        )
+
     def test_successful_retry_without_broker_ok_still_exits_successfully(self) -> None:
         operation_id = "00000000-0000-4000-8000-000000000001"
         repository = mock.Mock(repo_id="repo-1")
@@ -1097,6 +1125,7 @@ class AgentCliTests(unittest.TestCase):
             {
                 "artifact",
                 "cancel",
+                "cases",
                 "enqueue",
                 "failures",
                 "follow",
@@ -1112,6 +1141,7 @@ class AgentCliTests(unittest.TestCase):
     def test_only_read_only_test_continuations_allow_compatible_release(self) -> None:
         allowed = (
             ["test", "artifact", "run-1", "artifact-1"],
+            ["test", "cases", "run-1"],
             ["test", "failures", "run-1"],
             ["test", "follow", "run-1"],
             ["test", "queue-status"],
