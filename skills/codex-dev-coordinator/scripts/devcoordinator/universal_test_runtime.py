@@ -4281,8 +4281,6 @@ class BrokerTestAttemptCoordinator:
             "network": descriptor.network,
             "ttl_seconds": descriptor.ttl_seconds,
             "kill_after_run": True,
-            "resources": {
-            },
             "worktree_key": descriptor.worktree_key,
             "issued_at": now,
             "expires_at": now + ticket_lifetime,

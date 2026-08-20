@@ -55,9 +55,6 @@ class PreviewTestPlane:
             raise self.preview_error
         resources = {
             target: {
-                "cpu_millis": 1000,
-                "memory_mib": 512,
-                "pids": 128,
                 "estimated_seconds": 60.0,
                 "shard_count": 1,
                 "max_attempts": 2,

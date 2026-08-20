@@ -133,11 +133,6 @@ def setup_document(repository_id: str = "repo-tests") -> dict[str, object]:
                 "network": "none",
                 "fixtures": [],
                 "depends_on": [],
-                "resources": {
-                    "cpu_millis": 1_000,
-                    "memory_mib": 1_024,
-                    "pids": 128,
-                },
             },
             {
                 "name": "unit",
@@ -146,11 +141,6 @@ def setup_document(repository_id: str = "repo-tests") -> dict[str, object]:
                 "network": "none",
                 "fixtures": [],
                 "depends_on": ["lint"],
-                "resources": {
-                    "cpu_millis": 1_000,
-                    "memory_mib": 1_024,
-                    "pids": 128,
-                },
             },
         ],
         "target_graph": {"lint": [], "unit": ["lint"]},
@@ -166,9 +156,6 @@ def setup_document(repository_id: str = "repo-tests") -> dict[str, object]:
         "network_requirements": ["none"],
         "isolation": {
             "network": "none",
-            "cpu_millis": 1_000,
-            "memory_mib": 1_024,
-            "pids": 128,
             "private_scratch": True,
             "kill_after_run": True,
         },
@@ -375,7 +362,7 @@ class UniversalTestStoreTests(StoreFixture):
         )
         self.assertEqual(recovered["action"], "attested-fresh")
 
-    def test_schema_preparation_rejects_non_v5_with_fresh_store_instruction(self) -> None:
+    def test_schema_preparation_rejects_noncurrent_with_fresh_store_instruction(self) -> None:
         path = Path(self.temporary.name) / "obsolete.sqlite3"
         UniversalTestStore.create(path)
         connection = sqlite3.connect(path)
@@ -389,7 +376,7 @@ class UniversalTestStoreTests(StoreFixture):
 
         with self.assertRaisesRegex(
             TestStoreConflict,
-            "initialize a fresh schema-5 store",
+                "initialize a fresh current store",
         ):
             prepare_test_store_schema(path, operation_id=operation_id())
         unchanged = sqlite3.connect(path)
@@ -440,7 +427,7 @@ class UniversalTestStoreTests(StoreFixture):
             connection.close()
         with self.assertRaisesRegex(
             TestStoreConflict,
-            "initialize a fresh schema-5 store",
+                "initialize a fresh current store",
         ):
             UniversalTestStore.open(legacy)
 
@@ -2067,7 +2054,6 @@ def candidate(
     priority: int = 0,
     estimated: float = 1,
     exclusive: tuple[str, ...] = (),
-    cpu: int = 1_000,
 ) -> RunnableTarget:
     return RunnableTarget(
         target_id=identifier,
@@ -2080,9 +2066,6 @@ def candidate(
         wave_index=0,
         shard_index=0,
         shard_count=1,
-        cpu_millis=cpu,
-        memory_mib=512,
-        pids=64,
         estimated_seconds=estimated,
         worktree_key=worktree or "/work/" + identifier,
         source_mode="live",
@@ -2149,15 +2132,15 @@ class WeightedFairSchedulerTests(unittest.TestCase):
         self.assertEqual(reasons["exclusive"], "exclusive_resource_busy")
         self.assertEqual(reasons["capacity"], "host_memory")
 
-    def test_cpu_and_pid_declarations_never_affect_admission(self) -> None:
+    def test_cpu_and_pid_declarations_are_absent_from_admission(self) -> None:
         scheduler = self.scheduler()
         extreme = candidate("extreme", uid=1, repo="repo-a")
-        extreme = RunnableTarget(
-            **{**extreme.__dict__, "cpu_millis": 64_000, "pids": 32_768}
-        )
         decision = scheduler.select((extreme,), launch_batch=1)
         self.assertEqual([item.target_id for item in decision.selected], ["extreme"])
         self.assertEqual(decision.rejected, ())
+        self.assertFalse(
+            {"cpu_millis", "memory_mib", "pids"} & set(extreme.__dict__)
+        )
 
     def test_never_seen_targets_are_not_serialized_when_memory_is_available(self) -> None:
         scheduler = self.scheduler(total_mib=16_384, available_mib=8_192)

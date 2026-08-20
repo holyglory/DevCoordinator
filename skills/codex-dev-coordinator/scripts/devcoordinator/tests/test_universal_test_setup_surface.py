@@ -177,9 +177,6 @@ class RepositorySetupSurfaceTests(unittest.TestCase):
             result["isolation"],
             {
                 "network": "loopback",
-                "cpu_millis": 1_000,
-                "memory_mib": 512,
-                "pids": 256,
                 "private_scratch": True,
                 "kill_after_run": True,
             },

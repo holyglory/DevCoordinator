@@ -536,19 +536,18 @@ class TestdEngineTests(EngineFixture):
             initial_expiry,
         )
 
-    def test_declared_ticket_resources_do_not_gate_or_throttle_launch(self) -> None:
+    def test_ticket_has_no_declared_resource_quota_fields(self) -> None:
         submitted = self.submit_live()
-        self.issuer.mutate = lambda values: values.update(
-            cpu_millis=64_000,
-            memory_mib=262_144,
-            pids=32_768,
-        )
 
         result = self.engine.schedule(launch_batch=1)
 
         self.assertEqual(len(result["launched_target_ids"]), 1)
         self.assertEqual(result["launch_failures"], [])
         self.assertEqual(len(self.launcher.requests), 1)
+        self.assertFalse(
+            {"cpu_millis", "memory_mib", "pids"}
+            & set(self.launcher.requests[0].ticket.public_document())
+        )
         self.assertEqual(self.store.get_run(submitted.run_id)["state"], "running")
 
     def test_exact_worktree_remains_serialized_across_runs(self) -> None:

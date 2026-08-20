@@ -77,9 +77,6 @@ class CachedPlanPreviewer:
             raise AssertionError("unexpected warm plan preview request")
         resources = {
             name: {
-                "cpu_millis": 500,
-                "memory_mib": 256,
-                "pids": 32,
                 "estimated_seconds": 1.0,
                 "shard_count": 1,
                 "max_attempts": 2,
