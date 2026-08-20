@@ -197,6 +197,16 @@ timeout, post-launch heartbeat loss, or other infrastructure outcome is retried
 by this policy. Schema 3 is the only accepted manifest schema; every earlier or
 unknown schema is rejected rather than normalized or upgraded during planning.
 
+Schema-3 manifests may also define bounded named SQLite `state_handles` for
+authoritative uncommitted repository state that cannot truthfully be copied
+into an immutable snapshot. A target opts into a handle explicitly. The root
+boundary validates a real contained database and parent directory, pins both
+identities in the launch catalog, and revalidates them before reintroducing the
+exact canonical directory read-only inside the unit-private namespace. Only
+the declared non-secret environment path is added to the runner. Undeclared targets receive
+nothing; path escape, symlinks, special files, duplicate destinations or
+environments, identity drift, and write attempts fail closed.
+
 Network defaults to none. Private `loopback` is ordinary isolated test
 reachability on this confirmed single-developer host and needs no separate
 repository-generation grant. Host loopback and external access remain separate

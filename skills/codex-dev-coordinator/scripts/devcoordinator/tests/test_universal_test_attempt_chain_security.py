@@ -13,7 +13,11 @@ import unittest
 import uuid
 
 from devcoordinator.broker import BrokerError
-from devcoordinator.universal_test_contract import SourceMode, parse_test_manifest
+from devcoordinator.universal_test_contract import (
+    SourceMode,
+    deterministic_fingerprint,
+    parse_test_manifest,
+)
 from devcoordinator.universal_test_broker import (
     BrokerConnection,
     CoordinatorBrokerTicketIssuer,
@@ -1421,6 +1425,53 @@ class UniversalTestAttemptChainSecurityTests(unittest.TestCase):
         self.assertEqual(recovered_descriptor, descriptor)
         self.assertEqual(recovered_ticket, ticket_id)
         self.assertIn(b'"schema_version":2', launch_path.read_bytes())
+
+    def test_protected_launch_evidence_accepts_prior_descriptor_shape(self) -> None:
+        candidate, lease = self._submit_and_lease(
+            "repo-prior-descriptor", self.repo_a, os.geteuid()
+        )
+        descriptor = self._descriptor(candidate, lease, self.repo_a)
+        runtime_id = "devcoordinator-test-" + hashlib.sha256(
+            descriptor.attempt_id.encode("utf-8")
+        ).hexdigest()[:32]
+        state = self.root / "prior-descriptor" / runtime_id
+        state.mkdir(mode=0o711, parents=True)
+        manager = SystemdTestAttemptManager(
+            attempt_root=state.parent,
+            artifact_root=self.root / "unused-prior-descriptor-artifacts",
+        )
+        launch_path, _result_path = manager._publish_runner_launch(
+            descriptor,
+            state=state,
+            execution_root=self.repo_a,
+            owner_gid=os.getegid(),
+            launch_ticket_id="test-ticket-prior-descriptor",
+        )
+        launch = json.loads(launch_path.read_text(encoding="utf-8"))
+        legacy_descriptor = dict(launch["descriptor"])
+        legacy_descriptor.pop("state_bindings")
+        launch["descriptor"] = legacy_descriptor
+        launch["descriptor_fingerprint"] = deterministic_fingerprint(
+            legacy_descriptor
+        )
+        launch_path.chmod(0o600)
+        launch_path.write_text(
+            json.dumps(
+                launch,
+                ensure_ascii=True,
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+            encoding="utf-8",
+        )
+
+        recovered_descriptor, recovered_ticket = manager.recover_launch_binding(
+            runtime_id
+        )
+
+        self.assertEqual(recovered_descriptor, descriptor)
+        self.assertEqual(recovered_ticket, "test-ticket-prior-descriptor")
 
     def test_broker_ticket_intent_and_credentials_survive_testd_adapter(self) -> None:
         candidate, lease = self._submit_and_lease(

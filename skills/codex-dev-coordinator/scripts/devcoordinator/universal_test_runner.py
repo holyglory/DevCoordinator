@@ -102,6 +102,9 @@ _DOTNET_RESTORE_GRAPH_PROPERTIES = frozenset(
         "targetframeworks",
     }
 )
+_DOTNET_GRAPH_NEUTRAL_BOOLEAN_PROPERTIES = frozenset(
+    {"usesharedcompilation"}
+)
 _DOTNET_RESTORE_OWNED_OPTIONS = frozenset(
     {
         "--source",
@@ -1244,17 +1247,28 @@ def _dotnet_restore_semantic_options(argv: Sequence[str]) -> tuple[str, ...]:
         if property_prefix is not None:
             assignment = raw[len(property_prefix) :]
             name, separator, value = assignment.partition("=")
-            if name.lower() == "restorelockedmode":
+            normalized_name = name.lower()
+            if normalized_name == "restorelockedmode":
                 if separator and value.lower() in {"1", "true"}:
                     index += 1
                     continue
                 raise TestStoreContractError(
                     "dotnet locked restore policy is runner-owned"
                 )
+            if normalized_name in _DOTNET_GRAPH_NEUTRAL_BOOLEAN_PROPERTIES:
+                if separator and value.lower() in {"0", "1", "false", "true"}:
+                    # This build-only setting remains on the final no-restore
+                    # test invocation. It does not select packages and is
+                    # intentionally omitted from the runner-owned restore.
+                    index += 1
+                    continue
+                raise TestStoreContractError(
+                    "dotnet graph-neutral MSBuild property requires a boolean value"
+                )
             if (
                 not separator
                 or not value
-                or name.lower() not in _DOTNET_RESTORE_GRAPH_PROPERTIES
+                or normalized_name not in _DOTNET_RESTORE_GRAPH_PROPERTIES
             ):
                 raise TestStoreContractError(
                     "dotnet restore MSBuild property is not an allowed graph selector"

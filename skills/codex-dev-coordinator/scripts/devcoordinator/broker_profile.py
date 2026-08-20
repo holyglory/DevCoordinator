@@ -53,6 +53,7 @@ HOST_OBSERVE_CLIENT_TIMEOUT_SECONDS = 11 * 60.0
 INVENTORY_READ_CLIENT_TIMEOUT_SECONDS = 60.0
 TEST_CATALOG_READ_CLIENT_TIMEOUT_SECONDS = 60.0
 TEST_SETUP_READ_CLIENT_TIMEOUT_SECONDS = 60.0
+TEST_WAIT_RESPONSE_MARGIN_SECONDS = 1.0
 _TRANSIENT_TEST_WAIT_CODES = frozenset(
     {
         "maintenance_in_progress",
@@ -1014,7 +1015,7 @@ class BrokerClientProfile:
 
         while True:
             remaining = deadline - time.monotonic()
-            if remaining <= 0:
+            if remaining <= TEST_WAIT_RESPONSE_MARGIN_SECONDS:
                 return timed_out()
             try:
                 status_arguments: dict[str, Any] = {
@@ -1027,7 +1028,7 @@ class BrokerClientProfile:
                                 BrokerOperation.TEST_RUN_STATUS,
                                 arguments={"run_id": str(run_id)},
                             ),
-                            remaining,
+                            remaining - TEST_WAIT_RESPONSE_MARGIN_SECONDS,
                         ),
                     ),
                 }
@@ -1036,22 +1037,28 @@ class BrokerClientProfile:
                 if error.code not in _TRANSIENT_TEST_WAIT_CODES:
                     raise
                 remaining = deadline - time.monotonic()
-                if remaining <= 0:
+                if remaining <= TEST_WAIT_RESPONSE_MARGIN_SECONDS:
                     return timed_out()
-                time.sleep(min(0.25, remaining))
+                time.sleep(
+                    min(0.25, remaining - TEST_WAIT_RESPONSE_MARGIN_SECONDS)
+                )
                 continue
             except OSError:
                 remaining = deadline - time.monotonic()
-                if remaining <= 0:
+                if remaining <= TEST_WAIT_RESPONSE_MARGIN_SECONDS:
                     return timed_out()
-                time.sleep(min(0.25, remaining))
+                time.sleep(
+                    min(0.25, remaining - TEST_WAIT_RESPONSE_MARGIN_SECONDS)
+                )
                 continue
             if str(status.get("state") or status.get("status") or "") in terminal:
                 return status
             remaining = deadline - time.monotonic()
-            if remaining <= 0:
+            if remaining <= TEST_WAIT_RESPONSE_MARGIN_SECONDS:
                 return timed_out()
-            time.sleep(min(0.25, remaining))
+            time.sleep(
+                min(0.25, remaining - TEST_WAIT_RESPONSE_MARGIN_SECONDS)
+            )
 
     def check_test_evidence(
         self, *, repository: str, policy: str, snapshot: str

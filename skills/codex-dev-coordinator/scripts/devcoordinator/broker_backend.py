@@ -6351,8 +6351,8 @@ class StoreBackedMutationBackend:
             synthetic_request = self._synthetic_lifecycle_request(
                 request,
                 operation=BrokerOperation.REPOSITORY_PLAN_REMOVE,
-                project_id=request.project_id,
-                resource_id=request.project_id,
+                project_id=target_id,
+                resource_id=target_id,
                 arguments={"reason": reason},
             )
         elif target_kind in {"server", "container"}:

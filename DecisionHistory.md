@@ -18,9 +18,19 @@ Confirmed test-execution direction: direct local tests are narrow feedback only�
 
 Confirmed test-simplification direction: testd and its disposable Test Store are the sole semantic authority for plans, runs, attempts, deadlines, result order, terminal conclusions, and leases; the privileged snapshot/runtime boundary returns exact host facts and performs only idempotent prepare/start/observe/stop/collect actions. New incompatible Test Store releases drain current attempts and activate a fresh store instead of retaining legacy migration, admission-drain, or payload-compatibility machinery; same-schema crash recovery remains. Routine agents use enqueue, reviewed submit, follow, and cancel, with bounded diagnostic continuations. Framework-specific command adaptation, dependency preparation, and reporter parsing live behind explicit drivers rather than in the scheduler/store core. See [DC-2026-08-19-TEST-SIMPLIFICATION-01](DecisionDetails/DC-2026-08-19-TEST-SIMPLIFICATION-01.md).
 
+Confirmed immutable state direction: an immutable target may consume a repository-owned live SQLite state directory only through a bounded manifest-declared handle that the root boundary containment-checks, identity-pins, and reintroduces read-only at its canonical path inside the unit-private namespace. The database remains live and authoritative; it is never copied into the snapshot, made writable, or exposed to another target. See [DC-2026-08-20-IMMUTABLE-STATE-HANDLE-01](DecisionDetails/DC-2026-08-20-IMMUTABLE-STATE-HANDLE-01.md).
+
 Confirmed acceptance-scope direction: DevCoordinator readiness is held open by acceptance of DevCoordinator-owned capabilities and interfaces, not by live canaries tied to a particular external consumer repository. External repositories may supply regression evidence, but their names, resources, credentials, or application-specific browser journeys do not remain DevCoordinator completion blockers. See [DC-2026-08-11-ACCEPTANCE-SCOPE-01](DecisionDetails/DC-2026-08-11-ACCEPTANCE-SCOPE-01.md).
 
 Confirmed efficiency direction: delivery-efficiency measurement remains owned by each account's standalone recorder, while Coordinator optionally accepts one bounded cumulative snapshot per account and repository and presents merged repository-first statistics. Unknown counters remain unknown, account projections remain separate, and missing or unhealthy integration never blocks recording or delivery. See [DC-2026-08-12-EFFICIENCY-PROJECTION-01](DecisionDetails/DC-2026-08-12-EFFICIENCY-PROJECTION-01.md).
+
+## DC-2026-08-20-IMMUTABLE-STATE-HANDLE-01 — Immutable tests receive explicit read-only live state handles
+
+ID: DC-2026-08-20-IMMUTABLE-STATE-HANDLE-01 · Details: [supporting record](DecisionDetails/DC-2026-08-20-IMMUTABLE-STATE-HANDLE-01.md)
+
+Decision: Extend schema-3 test manifests with bounded named SQLite state handles. Only targets that explicitly reference a handle receive its root-validated repository-contained directory as an identity-pinned read-only bind at its canonical path plus the declared non-secret environment path; snapshots and artifacts never contain the database.
+
+Why: Snapshot-copying the database, exposing the primary checkout, using a writable bind, hard-coding a product repository, and a generic arbitrary mount surface were considered. Copies break live database identity, checkout exposure and writable binds weaken isolation, repository-specific rules couple Coordinator to a consumer, and arbitrary mounts are too broad. A typed SQLite handle is the narrow reusable behavior required by authoritative repository state.
 
 ## DC-2026-08-19-TEST-SIMPLIFICATION-01 — Testd owns one disposable execution state machine
 

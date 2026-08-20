@@ -228,6 +228,16 @@ lease before launch; test failures are never retried as infrastructure.
 Targets that request no protected capability do not need a capability grant;
 network, fixture, secret, and other declared capabilities remain policy-gated.
 
+An immutable target that must query authoritative uncommitted repository state
+may reference a top-level named `state_handles` declaration. Only `sqlite` is
+supported: the declaration names one contained database path and a non-secret
+environment variable, while the target names the handle. Coordinator pins the
+live directory/database identity and reintroduces that exact canonical
+directory read-only inside the unit-private mount namespace; the environment
+value names the database there. The database is never copied into the snapshot
+or exposed to another target. A consuming command must use its reviewed
+read-only mode because writes through the handle fail.
+
 ## Report Coordinator failures without blocking source work
 
 An ordinary measured assertion failure is a project bug, not a Coordinator

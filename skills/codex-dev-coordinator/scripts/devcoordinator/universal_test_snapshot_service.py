@@ -939,6 +939,25 @@ class RootSnapshotService:
             ),
             "toolchain": {} if provenance is None else dict(provenance.toolchain),
         }
+        raw_launch_catalog = planned.get("launch_catalog")
+        if not isinstance(raw_launch_catalog, Mapping):
+            raise SnapshotMaterializationError("snapshot launch catalog is invalid")
+        launch_catalog: dict[str, object] = {}
+        for target_name, raw_launch in raw_launch_catalog.items():
+            if not isinstance(target_name, str) or not isinstance(raw_launch, Mapping):
+                raise SnapshotMaterializationError(
+                    "snapshot launch catalog target is invalid"
+                )
+            launch = dict(raw_launch)
+            launch["state_bindings"] = [
+                dict(binding)
+                for binding in self._repository_state_bindings(
+                    launch,
+                    original_root=plan.source.original_root,
+                )
+            ]
+            launch_catalog[target_name] = launch
+        planned = {**dict(planned), "launch_catalog": launch_catalog}
         self._publish_catalog(
             plan_id=plan.plan_id,
             snapshot_id=source_catalog_id,
@@ -952,9 +971,6 @@ class RootSnapshotService:
                 "source_provenance": source_provenance,
             },
         )
-        launch_catalog = planned["launch_catalog"]
-        if not isinstance(launch_catalog, Mapping):
-            raise SnapshotMaterializationError("snapshot launch catalog is invalid")
         networks: set[str] = set()
         fixtures: set[str] = set()
         credentials: set[str] = set()
@@ -1210,6 +1226,98 @@ class RootSnapshotService:
         ):
             raise TestStoreConflict(f"{field} is unsafe")
         return metadata
+
+    @classmethod
+    def _repository_state_bindings(
+        cls, launch: Mapping[str, object], *, original_root: str
+    ) -> tuple[Mapping[str, object], ...]:
+        """Pin bounded live repository state without copying it into a snapshot."""
+
+        raw_handles = launch.get("state_handles", ())
+        if not isinstance(raw_handles, Sequence) or isinstance(
+            raw_handles, (str, bytes)
+        ):
+            raise TestStoreContractError("test state handles are invalid")
+        if len(raw_handles) > 8:
+            raise TestStoreContractError("test state handles exceed their bound")
+        root = Path(original_root).absolute()
+        root_metadata = cls._real_dependency_directory(
+            root, field="repository state root"
+        )
+        del root_metadata
+        bindings: list[Mapping[str, object]] = []
+        names: set[str] = set()
+        environments: set[str] = set()
+        destinations: set[str] = set()
+        for raw in raw_handles:
+            if not isinstance(raw, Mapping) or set(raw) != {
+                "name",
+                "kind",
+                "path",
+                "environment",
+            }:
+                raise TestStoreContractError("test state handle fields are invalid")
+            name = str(raw["name"])
+            kind = str(raw["kind"])
+            environment = str(raw["environment"])
+            relative = PurePosixPath(str(raw["path"]))
+            if (
+                not name
+                or len(name) > 64
+                or any(character not in "abcdefghijklmnopqrstuvwxyz0123456789_.-" for character in name)
+                or kind != "sqlite"
+                or relative.is_absolute()
+                or relative in {PurePosixPath("."), PurePosixPath("")}
+                or any(part in {"", ".", ".."} for part in relative.parts)
+            ):
+                raise TestStoreContractError("test state handle identity is invalid")
+            database = root.joinpath(*relative.parts)
+            source_directory = database.parent
+            try:
+                directory_metadata = source_directory.lstat()
+                database_metadata = database.lstat()
+                resolved_directory = source_directory.resolve(strict=True)
+                resolved_database = database.resolve(strict=True)
+            except OSError as error:
+                raise TestStoreConflict("test state handle is unavailable") from error
+            if (
+                resolved_directory != source_directory
+                or resolved_database != database
+                or not stat.S_ISDIR(directory_metadata.st_mode)
+                or stat.S_ISLNK(directory_metadata.st_mode)
+                or not stat.S_ISREG(database_metadata.st_mode)
+                or stat.S_ISLNK(database_metadata.st_mode)
+                or root not in source_directory.parents
+            ):
+                raise TestStoreConflict("test state handle is unsafe")
+            # Preserve the database's canonical path identity inside the
+            # unit-private mount namespace. ProtectHome still hides every
+            # undeclared home path; only this exact directory is reintroduced.
+            destination = str(source_directory)
+            if (
+                name in names
+                or environment in environments
+                or destination in destinations
+            ):
+                raise TestStoreContractError("test state handle is ambiguous")
+            names.add(name)
+            environments.add(environment)
+            destinations.add(destination)
+            bindings.append(
+                {
+                    "name": name,
+                    "kind": kind,
+                    "source_directory": str(source_directory),
+                    "source_device": int(directory_metadata.st_dev),
+                    "source_inode": int(directory_metadata.st_ino),
+                    "database_name": database.name,
+                    "database_device": int(database_metadata.st_dev),
+                    "database_inode": int(database_metadata.st_ino),
+                    "destination_directory": destination,
+                    "environment": environment,
+                }
+            )
+        return tuple(bindings)
 
     @classmethod
     def _dependency_file_bytes(
@@ -2350,6 +2458,7 @@ class RootSnapshotService:
             ttl_seconds=launch["timeout_seconds"],  # type: ignore[arg-type]
             source_provenance=source_provenance,
             dependency_bindings=dependency_bindings,
+            state_bindings=tuple(launch.get("state_bindings", ())),  # type: ignore[arg-type]
             toolchain_bindings=toolchain_bindings,
             supplementary_gids=supplementary_gids,
         )

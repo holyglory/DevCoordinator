@@ -208,6 +208,53 @@ class ImmutableDependencyBindingTests(unittest.TestCase):
             self.descriptor(*changed_bindings).fingerprint,
         )
 
+    def test_repository_sqlite_state_is_identity_pinned_and_bound_read_only(self) -> None:
+        state = self.original / ".product-delivery"
+        state.mkdir()
+        database = state / "delivery.sqlite3"
+        database.write_bytes(b"live authoritative state")
+        bindings = RootSnapshotService._repository_state_bindings(
+            {
+                "state_handles": [
+                    {
+                        "name": "delivery-state",
+                        "kind": "sqlite",
+                        "path": ".product-delivery/delivery.sqlite3",
+                        "environment": "DELIVERY_STATE_DATABASE",
+                    }
+                ]
+            },
+            original_root=str(self.original),
+        )
+        descriptor = replace(self.descriptor(), state_bindings=bindings)
+        output = self.base / "output"
+        output.mkdir()
+
+        round_trip = TestAttemptDescriptor.from_document(descriptor.to_document())
+        environment = SystemdTestAttemptManager._state_environment(round_trip)
+        properties = SystemdTestAttemptManager._systemd_properties(
+            round_trip,
+            execution_root=self.materialized,
+            output_root=output,
+        )
+
+        self.assertEqual(
+            environment,
+            {
+                "DELIVERY_STATE_DATABASE": str(state / "delivery.sqlite3")
+            },
+        )
+        self.assertIn(
+            "--property=BindReadOnlyPaths=" + str(state),
+            properties,
+        )
+        self.assertFalse((self.materialized / ".product-delivery").exists())
+
+        database.unlink()
+        database.write_bytes(b"substituted state")
+        with self.assertRaisesRegex(TestStoreConflict, "changed after planning"):
+            SystemdTestAttemptManager._state_environment(round_trip)
+
     def test_preferred_python_environment_wins_over_retained_legacy_environment(self) -> None:
         legacy_python = self.original / ".venv" / "bin" / "python"
         legacy_python.parent.mkdir(parents=True)

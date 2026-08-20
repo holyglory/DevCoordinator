@@ -1513,6 +1513,37 @@ raise SystemExit(1)
             ),
             ("-p:Configuration=Release",),
         )
+        for property_argument in (
+            "-p:UseSharedCompilation=false",
+            "/p:UseSharedCompilation=0",
+            "--property:UseSharedCompilation=true",
+        ):
+            self.assertEqual(
+                _dotnet_restore_semantic_options(
+                    (
+                        "/usr/bin/dotnet",
+                        "test",
+                        first.name,
+                        property_argument,
+                    )
+                ),
+                (),
+            )
+        for property_argument in (
+            "-p:UseSharedCompilation",
+            "-p:UseSharedCompilation=maybe",
+        ):
+            with self.assertRaisesRegex(
+                TestStoreContractError, "requires a boolean value"
+            ):
+                _dotnet_restore_semantic_options(
+                    (
+                        "/usr/bin/dotnet",
+                        "test",
+                        first.name,
+                        property_argument,
+                    )
+                )
         self.assertEqual(
             _dotnet_restore_project(
                 ("/usr/bin/dotnet", "build", second.name, "--no-restore"),

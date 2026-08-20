@@ -816,7 +816,7 @@ class UniversalTestCliTests(unittest.TestCase):
                 repository=REPOSITORY_ID, run_id="run-pending", timeout_seconds=3
             )
 
-        self.assertEqual(profile.timeouts, [3.0])
+        self.assertEqual(profile.timeouts, [2.0])
         self.assertEqual(
             result,
             {

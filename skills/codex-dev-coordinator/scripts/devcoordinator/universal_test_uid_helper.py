@@ -1058,6 +1058,15 @@ def _plan_documents(manifest, plan, execution_root: Path) -> Mapping[str, object
             "credentials": [
                 manifest.credentials[name].binding for name in target.credentials
             ],
+            "state_handles": [
+                {
+                    "name": handle_name,
+                    "kind": manifest.state_handles[handle_name].kind,
+                    "path": manifest.state_handles[handle_name].path,
+                    "environment": manifest.state_handles[handle_name].environment,
+                }
+                for handle_name in target.state_handles
+            ],
             "fixture_bindings": [
                 {
                     "name": fixture_name,

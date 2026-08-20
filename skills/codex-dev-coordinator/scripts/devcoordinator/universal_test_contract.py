@@ -7,7 +7,7 @@ it.  Execution code should consume :class:`TestManifest`, never the raw document
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 import errno
 import hashlib
@@ -33,6 +33,7 @@ _TOP_LEVEL_FIELDS = frozenset(
         "intents",
         "fixtures",
         "credentials",
+        "state_handles",
         "evidence_policies",
     }
 )
@@ -51,6 +52,7 @@ _TARGET_FIELDS = frozenset(
         "exclusive_resources",
         "fixtures",
         "credentials",
+        "state_handles",
         "shard",
         "retry",
         "artifacts",
@@ -60,6 +62,7 @@ _TARGET_FIELDS = frozenset(
 _INTENT_FIELDS = frozenset({"source_mode", "allow_reuse"})
 _FIXTURE_FIELDS = frozenset({"template", "network"})
 _CREDENTIAL_FIELDS = frozenset({"binding"})
+_STATE_HANDLE_FIELDS = frozenset({"kind", "path", "environment"})
 _EVIDENCE_FIELDS = frozenset(
     {"intent", "required_targets", "max_age_seconds", "allow_reuse"}
 )
@@ -193,6 +196,14 @@ class CredentialContract:
 
 
 @dataclass(frozen=True)
+class StateHandleContract:
+    name: str
+    kind: str
+    path: str
+    environment: str
+
+
+@dataclass(frozen=True)
 class IntentContract:
     name: str
     source_mode: SourceMode
@@ -245,6 +256,7 @@ class TargetContract:
     retry: RetryPolicy
     artifacts: tuple[ArtifactContract, ...]
     environment: Mapping[str, str]
+    state_handles: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -258,6 +270,7 @@ class TestManifest:
     credentials: Mapping[str, CredentialContract]
     evidence_policies: Mapping[str, EvidencePolicy]
     fingerprint: str
+    state_handles: Mapping[str, StateHandleContract] = field(default_factory=dict)
 
 
 def _canonical_json(value: object) -> bytes:
@@ -665,6 +678,70 @@ def _parse_credentials(value: object) -> Mapping[str, CredentialContract]:
     return MappingProxyType(credentials)
 
 
+def _parse_state_handles(
+    value: object, *, repository_root: Path | None
+) -> Mapping[str, StateHandleContract]:
+    raw = _object(value, path="$.state_handles")
+    if len(raw) > 16:
+        raise ManifestContractError(
+            "must contain at most 16 repository state handles",
+            path="$.state_handles",
+        )
+    handles: dict[str, StateHandleContract] = {}
+    environments: set[str] = set()
+    for raw_name in sorted(raw):
+        name = _name(raw_name, path=f"$.state_handles.{raw_name}")
+        path = f"$.state_handles.{name}"
+        definition = _object(raw[name], path=path)
+        _reject_unknown(definition, _STATE_HANDLE_FIELDS, path=path)
+        kind = _string(
+            _required(definition, "kind", path=path),
+            path=f"{path}.kind",
+            maximum=32,
+        )
+        if kind != "sqlite":
+            raise ManifestContractError(
+                "only sqlite state handles are supported", path=f"{path}.kind"
+            )
+        relative = normalize_repository_path(
+            _required(definition, "path", path=path),
+            path=f"{path}.path",
+            allow_glob=False,
+        )
+        if relative == "." or PurePosixPath(relative).parent == PurePosixPath("."):
+            raise ManifestContractError(
+                "sqlite state handle must name a file below a contained directory",
+                path=f"{path}.path",
+            )
+        _verify_host_containment(repository_root, relative, path=f"{path}.path")
+        environment = _string(
+            _required(definition, "environment", path=path),
+            path=f"{path}.environment",
+            maximum=64,
+        )
+        if (
+            _ENVIRONMENT_NAME.fullmatch(environment) is None
+            or _SECRET_ENVIRONMENT_NAME.search(environment)
+        ):
+            raise ManifestContractError(
+                "state handle environment name is unsafe",
+                path=f"{path}.environment",
+            )
+        if environment in environments:
+            raise ManifestContractError(
+                "state handle environment name is duplicated",
+                path=f"{path}.environment",
+            )
+        environments.add(environment)
+        handles[name] = StateHandleContract(
+            name=name,
+            kind=kind,
+            path=relative,
+            environment=environment,
+        )
+    return MappingProxyType(handles)
+
+
 def _parse_artifacts(
     value: object,
     *,
@@ -799,6 +876,7 @@ def _parse_targets(
     intents: Mapping[str, IntentContract],
     fixtures: Mapping[str, FixtureContract],
     credentials: Mapping[str, CredentialContract],
+    state_handles: Mapping[str, StateHandleContract],
     repository_root: Path | None,
 ) -> Mapping[str, TargetContract]:
     raw = _object(value, path="$.targets")
@@ -910,6 +988,39 @@ def _parse_targets(
                 "operational credentials require a manual-only target",
                 path=f"{path}.intents",
             )
+        target_state_handles = tuple(
+            _name(item, path=f"{path}.state_handles[{index}]")
+            for index, item in enumerate(
+                _string_list(
+                    definition.get("state_handles", []),
+                    path=f"{path}.state_handles",
+                    allow_empty=True,
+                    maximum_items=8,
+                )
+            )
+        )
+        if len(set(target_state_handles)) != len(target_state_handles):
+            raise ManifestContractError(
+                "state handle references must be unique",
+                path=f"{path}.state_handles",
+            )
+        unknown_state_handles = sorted(set(target_state_handles) - set(state_handles))
+        if unknown_state_handles:
+            raise ManifestContractError(
+                "unknown state handle(s): " + ", ".join(unknown_state_handles),
+                path=f"{path}.state_handles",
+            )
+        reusable_state_intents = sorted(
+            intent_name
+            for intent_name in target_intents
+            if target_state_handles and intents[intent_name].allow_reuse
+        )
+        if reusable_state_intents:
+            raise ManifestContractError(
+                "live state handles require non-reusable intent(s): "
+                + ", ".join(reusable_state_intents),
+                path=f"{path}.intents",
+            )
         network = _network(
             definition.get("network", defaults.network), path=f"{path}.network"
         )
@@ -937,6 +1048,17 @@ def _parse_targets(
                 definition.get("environment", {}), path=f"{path}.environment"
             )
         )
+        state_environment_collisions = sorted(
+            state_handles[name].environment
+            for name in target_state_handles
+            if state_handles[name].environment in environment
+        )
+        if state_environment_collisions:
+            raise ManifestContractError(
+                "state handle environment conflicts with target environment: "
+                + ", ".join(state_environment_collisions),
+                path=f"{path}.environment",
+            )
         targets[name] = TargetContract(
             name=name,
             driver=driver,
@@ -981,6 +1103,7 @@ def _parse_targets(
                 repository_root=repository_root,
             ),
             environment=MappingProxyType(dict(sorted(environment.items()))),
+            state_handles=target_state_handles,
         )
     target_names = set(targets)
     for target in targets.values():
@@ -1132,6 +1255,14 @@ def manifest_to_document(manifest: TestManifest) -> dict[str, object]:
             name: {"binding": credential.binding}
             for name, credential in manifest.credentials.items()
         },
+        "state_handles": {
+            name: {
+                "kind": handle.kind,
+                "path": handle.path,
+                "environment": handle.environment,
+            }
+            for name, handle in manifest.state_handles.items()
+        },
         "targets": {
             name: {
                 "driver": target.driver,
@@ -1146,6 +1277,7 @@ def manifest_to_document(manifest: TestManifest) -> dict[str, object]:
                 "exclusive_resources": list(target.exclusive_resources),
                 "fixtures": list(target.fixtures),
                 "credentials": list(target.credentials),
+                "state_handles": list(target.state_handles),
                 "shard": {
                     "mode": target.shard.mode,
                     "max_shards": target.shard.max_shards,
@@ -1202,6 +1334,9 @@ def parse_test_manifest(
     intents = _parse_intents(_required(raw, "intents", path="$"))
     fixtures = _parse_fixtures(_required(raw, "fixtures", path="$"))
     credentials = _parse_credentials(raw.get("credentials", {}))
+    state_handles = _parse_state_handles(
+        raw.get("state_handles", {}), repository_root=repository_root
+    )
     global_values = _string_list(
         _required(raw, "global_inputs", path="$"), path="$.global_inputs"
     )
@@ -1227,8 +1362,23 @@ def parse_test_manifest(
         intents=intents,
         fixtures=fixtures,
         credentials=credentials,
+        state_handles=state_handles,
         repository_root=repository_root,
     )
+    unused_state_handles = sorted(
+        set(state_handles)
+        - {
+            handle_name
+            for target in targets.values()
+            for handle_name in target.state_handles
+        }
+    )
+    if unused_state_handles:
+        raise ManifestContractError(
+            "state handle(s) are not attached to a target: "
+            + ", ".join(unused_state_handles),
+            path="$.state_handles",
+        )
     evidence_policies = _parse_evidence_policies(
         _required(raw, "evidence_policies", path="$"),
         intents=intents,
@@ -1244,6 +1394,7 @@ def parse_test_manifest(
         credentials=credentials,
         evidence_policies=evidence_policies,
         fingerprint="",
+        state_handles=state_handles,
     )
     fingerprint = deterministic_fingerprint(manifest_to_document(provisional))
     return TestManifest(
@@ -1256,6 +1407,7 @@ def parse_test_manifest(
         credentials=credentials,
         evidence_policies=evidence_policies,
         fingerprint=fingerprint,
+        state_handles=state_handles,
     )
 
 

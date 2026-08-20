@@ -1552,8 +1552,11 @@ class TestdEngine:
                 if state in {"cancelling", "superseding"}:
                     # A result can publish immediately before cancellation or
                     # during release recovery. Observe first so measured
-                    # terminal evidence wins; cancel only a genuinely running
-                    # runtime with no published result.
+                    # terminal evidence wins. Once its atomic manifest is
+                    # visible, stopping the exact cgroup cannot remove the
+                    # already-published chunk files; do not leave a large
+                    # result stream running beyond the unit stop bound merely
+                    # because testd still has chunks to import.
                     observation = self.launcher.observe(active.handle)
                     if observation.state == "running":
                         reason = (
@@ -1576,6 +1579,18 @@ class TestdEngine:
                                     "stage": "terminal_replay",
                                 })
                             continue
+                    elif observation.state == "result":
+                        reason = (
+                            "run cancellation requested after result publication"
+                            if state == "cancelling"
+                            else "run superseded after result publication"
+                        )
+                        if not self.launcher.cancel(active.handle, reason=reason):
+                            failed.append({
+                                "attempt_id": attempt_id,
+                                "error_type": "TestStoreConflict",
+                                "stage": "result_stream_native_stop",
+                            })
                 if observation is None:
                     observation = self.launcher.observe(active.handle)
                 if observation.launch_confirmed and not active.handle.launch_confirmed:
