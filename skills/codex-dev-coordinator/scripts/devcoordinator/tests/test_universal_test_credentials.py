@@ -104,9 +104,6 @@ class UniversalTestOperationalCredentialTests(unittest.TestCase):
             fixtures=(),
             network="loopback",
             ttl_seconds=ttl_seconds,
-            cpu_millis=1_000,
-            memory_mib=256,
-            pids=64,
             intent="manual",
             credentials=(self.ALIAS,),
         )

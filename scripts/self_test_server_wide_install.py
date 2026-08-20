@@ -439,7 +439,6 @@ def _activation_transaction(
         "client_journals": [],
         "legacy_docker_dropin": None,
         "legacy_docker_dropin_removed": False,
-        "test_admission_schema": {"status": "present"},
         "restart_precondition": precondition,
         "starts_service": False,
         "requires_service_restart_for_sandbox_changes": True,

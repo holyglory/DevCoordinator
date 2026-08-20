@@ -85,9 +85,6 @@ class FakeTicketIssuer:
             "intent": plan_document["intent"],
             "network": "none",
             "ttl_seconds": 300,
-            "cpu_millis": candidate.cpu_millis,
-            "memory_mib": candidate.memory_mib,
-            "pids": candidate.pids,
             "worktree_key": candidate.worktree_key,
             "issued_at": self.clock(),
             "expires_at": self.clock() + 60,
@@ -113,6 +110,7 @@ class FakeLauncher:
         self.requests = []
         self.observations = {} if observations is None else observations
         self.cancelled = []
+        self.collected = []
         self.recoveries = []
         self.fail_launch = False
 
@@ -140,6 +138,10 @@ class FakeLauncher:
 
     def cancel(self, handle, *, reason):
         self.cancelled.append((handle.runtime_id, reason))
+        return True
+
+    def collect(self, handle):
+        self.collected.append(handle.runtime_id)
         return True
 
 
@@ -182,15 +184,9 @@ class EngineFixture(unittest.TestCase):
             owner_uid=1001,
             target_resources={
                 "lint": TargetResources(
-                    cpu_millis=1_000,
-                    memory_mib=1_024,
-                    pids=128,
                     worktree_key="/home/example/worktree",
                 ),
                 "unit": TargetResources(
-                    cpu_millis=1_000,
-                    memory_mib=1_024,
-                    pids=128,
                     worktree_key="/home/example/worktree",
                 ),
             },
@@ -209,9 +205,6 @@ class EngineFixture(unittest.TestCase):
             owner_uid=1001,
             target_resources={
                 name: TargetResources(
-                    cpu_millis=1_000,
-                    memory_mib=1_024,
-                    pids=128,
                     worktree_key=selected.source.original_root,
                 )
                 for name in selected.selected_targets
@@ -285,7 +278,7 @@ class TestdEngineTests(EngineFixture):
         self.assertEqual(first.failures[0].failure_id, replay.failures[0].failure_id)
         self.assertNotEqual(first.failures[0].failure_id, second.failures[0].failure_id)
 
-    def test_store_discards_declared_capacity_values(self) -> None:
+    def test_store_has_no_declared_capacity_values(self) -> None:
         selected = plan(mode=SourceMode.LIVE, fingerprint=uuid.uuid4().hex * 2)
         submitted = self.store.submit_plan(
             selected,
@@ -294,9 +287,6 @@ class TestdEngineTests(EngineFixture):
             owner_uid=1001,
             target_resources={
                 name: TargetResources(
-                    cpu_millis=-1,
-                    memory_mib=1_000_000_000,
-                    pids=0,
                     worktree_key="/home/example/worktree",
                 )
                 for name in selected.selected_targets
@@ -308,9 +298,9 @@ class TestdEngineTests(EngineFixture):
             for item in self.store.runnable_targets()
             if item.run_id == submitted.run_id
         )
-        self.assertEqual(candidate.cpu_millis, TargetResources.cpu_millis)
-        self.assertEqual(candidate.memory_mib, TargetResources.memory_mib)
-        self.assertEqual(candidate.pids, TargetResources.pids)
+        self.assertFalse(
+            {"cpu_millis", "memory_mib", "pids"} & set(candidate.__dict__)
+        )
 
     def test_host_loopback_ticket_for_nonmanual_plan_fails_closed(self) -> None:
         submitted = self.submit_live()
@@ -440,7 +430,10 @@ class TestdEngineTests(EngineFixture):
             "kill_after_run": True,
         })
         self.assertTrue(document["isolation"]["clean_environment"])
-        self.assertEqual(document["isolation"]["cpu_millis"], 1_000)
+        self.assertFalse(
+            {"cpu_millis", "memory_mib", "pids"}
+            & set(document["isolation"])
+        )
         self.assertEqual(document["command"]["environment"], {"PYTHONUNBUFFERED": "1"})
         self.assertEqual(document["ticket"]["intent"], "change")
         self.assertEqual(document["ticket"]["credentials"], [])
@@ -582,9 +575,6 @@ class TestdEngineTests(EngineFixture):
             owner_uid=1001,
             target_resources={
                 name: TargetResources(
-                    cpu_millis=1_000,
-                    memory_mib=1_024,
-                    pids=128,
                     worktree_key="/home/example/other-worktree",
                 )
                 for name in second_plan.selected_targets
@@ -1252,6 +1242,7 @@ class TestdEngineTests(EngineFixture):
             self.store.get_attempt(request.ticket.attempt_id)["state"],
             "succeeded",
         )
+        self.assertEqual(self.launcher.collected, [runtime_id])
 
     def test_running_runtime_survives_replacement_after_ordinary_lease_expiry(
         self,
@@ -1384,6 +1375,9 @@ class FakeSubmitter:
 
     def cancel(self, runtime_id, *, reason):
         return {"cancelled": True}
+
+    def collect(self, runtime_id):
+        return {"collected": True}
 
 
 class TestdLaunchAdapterTests(EngineFixture):

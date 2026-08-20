@@ -145,23 +145,6 @@ class SourceMode(str, Enum):
 
 
 @dataclass(frozen=True)
-class ResourceLimits:
-    cpu_millis: int
-    memory_mib: int
-    pids: int
-
-
-# Python owns this fixed internal accounting and storage placeholder. It is not
-# accepted from repository manifests, and neither admission nor transient
-# execution treats it as a caller-authored quota.
-NON_AUTHORITATIVE_RESOURCES = ResourceLimits(
-    cpu_millis=1_000,
-    memory_mib=512,
-    pids=256,
-)
-
-
-@dataclass(frozen=True)
 class ManifestDefaults:
     timeout_seconds: int
     network: str
@@ -254,7 +237,6 @@ class TargetContract:
     depends_on: tuple[str, ...]
     intents: tuple[str, ...]
     timeout_seconds: int
-    resources: ResourceLimits
     network: str
     exclusive_resources: tuple[str, ...]
     fixtures: tuple[str, ...]
@@ -974,7 +956,6 @@ def _parse_targets(
                 minimum=1,
                 maximum=86_400,
             ),
-            resources=NON_AUTHORITATIVE_RESOURCES,
             network=network,
             exclusive_resources=tuple(
                 _name(item, path=f"{path}.exclusive_resources[{index}]")
@@ -1438,7 +1419,6 @@ __all__ = [
     "MANIFEST_SCHEMA_VERSION",
     "ManifestContractError",
     "ManifestDefaults",
-    "ResourceLimits",
     "RetryPolicy",
     "ShardPolicy",
     "SourceMode",

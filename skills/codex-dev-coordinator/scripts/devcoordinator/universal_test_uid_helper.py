@@ -698,9 +698,6 @@ def _setup_status(status: str, *, code: str | None = None) -> dict[str, object]:
         "network_requirements": [],
         "isolation": {
             "network": "none",
-            "cpu_millis": 0,
-            "memory_mib": 0,
-            "pids": 0,
             "private_scratch": True,
             "kill_after_run": True,
         },
@@ -842,11 +839,6 @@ def _setup(root: Path) -> Mapping[str, object]:
                 manifest.credentials[name].binding for name in target.credentials
             ),
             "depends_on": sorted(target.depends_on),
-            "resources": {
-                "cpu_millis": target.resources.cpu_millis,
-                "memory_mib": target.resources.memory_mib,
-                "pids": target.resources.pids,
-            },
         }
         for name, target in sorted(manifest.targets.items())
     ]
@@ -894,13 +886,6 @@ def _setup(root: Path) -> Mapping[str, object]:
         "network_requirements": networks,
         "isolation": {
             "network": max(networks, key=network_rank.__getitem__),
-            "cpu_millis": max(
-                target.resources.cpu_millis for target in manifest.targets.values()
-            ),
-            "memory_mib": max(
-                target.resources.memory_mib for target in manifest.targets.values()
-            ),
-            "pids": max(target.resources.pids for target in manifest.targets.values()),
             "private_scratch": True,
             "kill_after_run": True,
         },
@@ -1052,9 +1037,6 @@ def _plan_documents(manifest, plan, execution_root: Path) -> Mapping[str, object
             else plan.timeouts.execution_seconds
         )
         resources[name] = {
-            "cpu_millis": target.resources.cpu_millis,
-            "memory_mib": target.resources.memory_mib,
-            "pids": target.resources.pids,
             "estimated_seconds": float(execution_timeout),
             # This is a policy ceiling. Testd lowers it to a history-backed
             # effective count before submission; one shard still covers all
@@ -1072,11 +1054,6 @@ def _plan_documents(manifest, plan, execution_root: Path) -> Mapping[str, object
             "environment": dict(target.environment),
             "network": target.network,
             "timeout_seconds": execution_timeout,
-            "resources": {
-                "cpu_millis": target.resources.cpu_millis,
-                "memory_mib": target.resources.memory_mib,
-                "pids": target.resources.pids,
-            },
             "fixtures": list(target.fixtures),
             "credentials": [
                 manifest.credentials[name].binding for name in target.credentials

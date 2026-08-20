@@ -167,9 +167,6 @@ class AgentCliTests(unittest.TestCase):
             ["test", "cases", "run-1", "--project", "/repo"],
             ["test", "failures", "run-1", "--project", "/repo"],
             ["test", "artifact", "run-1", "artifact-1", "--project", "/repo"],
-            ["test", "status", "run-1", "--project", "/repo"],
-            ["test", "summary", "run-1", "--project", "/repo"],
-            ["test", "wait", "run-1", "--timeout-seconds", "1", "--project", "/repo"],
         )
         for argv in cases:
             with self.subTest(argv=argv):
@@ -1131,10 +1128,7 @@ class AgentCliTests(unittest.TestCase):
                 "follow",
                 "queue-status",
                 "retry",
-                "status",
                 "submit",
-                "summary",
-                "wait",
             },
         )
 
@@ -1145,9 +1139,6 @@ class AgentCliTests(unittest.TestCase):
             ["test", "failures", "run-1"],
             ["test", "follow", "run-1"],
             ["test", "queue-status"],
-            ["test", "status", "run-1"],
-            ["test", "summary", "run-1"],
-            ["test", "wait", "run-1", "--timeout-seconds", "1"],
         )
         strict = (
             ["test", "cancel", "run-1", "--reason", "stop"],

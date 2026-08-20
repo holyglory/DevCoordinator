@@ -14,7 +14,6 @@ from devcoordinator.universal_test_contract import (
     MANIFEST_SCHEMA_VERSION,
     MAX_MANIFEST_BYTES,
     ManifestContractError,
-    NON_AUTHORITATIVE_RESOURCES,
     SourceMode,
     load_test_manifest,
     manifest_to_document,
@@ -167,11 +166,6 @@ class ManifestContractTests(unittest.TestCase):
         contract = parse_test_manifest(valid_manifest())
         self.assertEqual(contract.schema_version, MANIFEST_SCHEMA_VERSION)
         self.assertEqual(contract.intents["handoff"].source_mode, SourceMode.IMMUTABLE)
-        self.assertEqual(contract.targets["unit"].resources, NON_AUTHORITATIVE_RESOURCES)
-        self.assertEqual(
-            contract.targets["integration"].resources,
-            NON_AUTHORITATIVE_RESOURCES,
-        )
         self.assertEqual(
             dict(contract.targets["unit"].environment),
             {"LOG_LEVEL": "warning", "PYTHONWARNINGS": "error"},

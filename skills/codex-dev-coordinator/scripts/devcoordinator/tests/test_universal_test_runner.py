@@ -76,9 +76,6 @@ class UniversalTestRunnerTests(unittest.TestCase):
             fixtures=(),
             network="none",
             ttl_seconds=30,
-            cpu_millis=1000,
-            memory_mib=128,
-            pids=32,
         )
 
     def result_cases(self, result_path: Path) -> list[dict[str, object]]:

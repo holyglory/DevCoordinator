@@ -69,7 +69,6 @@ from .universal_test_credentials import (
     DEFAULT_TEST_CREDENTIAL_REGISTRY_PATH,
     DEFAULT_TEST_CREDENTIAL_RUNTIME_ROOT,
 )
-from .universal_test_admission import TestSubmissionAdmissionGate
 from .broker_configuration import (
     DeclaredComposeConfigurationError,
     DeclaredRuntimeConfigurationError,
@@ -213,9 +212,6 @@ def _test_target_resources(
         if not isinstance(name, str) or not isinstance(raw, Mapping) or set(raw) != expected:
             raise TestStoreContractError("test target resource fields are invalid")
         result[name] = TargetResources(
-            cpu_millis=raw["cpu_millis"],
-            memory_mib=raw["memory_mib"],
-            pids=raw["pids"],
             estimated_seconds=raw["estimated_seconds"],
             shard_count=raw["shard_count"],
             max_attempts=raw["max_attempts"],
@@ -560,7 +556,6 @@ class StoreBackedMutationBackend:
         secret_manager: VolatileRunSecretManager | None = None,
         test_plane: TestPlaneClient | None = None,
         test_attempt_manager: NativeTestAttemptManager | None = None,
-        test_submission_gate: TestSubmissionAdmissionGate | None = None,
         temporary_dev_services: TemporaryDevServiceManager | None = None,
         container_remover: Callable[[str], Mapping[str, Any]] | None = None,
     ) -> None:
@@ -582,9 +577,6 @@ class StoreBackedMutationBackend:
         )
         self._worker_operations = BrokerWorkerOperations(persistence)
         self._test_plane = test_plane
-        self._test_submission_gate = (
-            test_submission_gate or TestSubmissionAdmissionGate()
-        )
         self._temporary_dev_services = (
             temporary_dev_services or TemporaryDevServiceManager()
         )
@@ -707,49 +699,6 @@ class StoreBackedMutationBackend:
             "already_absent": already_absent,
             "reclaimed_bytes": reclaimed_bytes,
         }
-
-    def _execute_test_admission_admin(
-        self, accepted: AcceptedBrokerRequest
-    ) -> Mapping[str, Any]:
-        request = accepted.request
-        try:
-            if request.operation is BrokerOperation.TEST_ADMISSION_DRAIN_STATUS:
-                proof = self._persistence.active_test_admission_proof()
-                return {
-                    "state": "drained" if proof is not None else "open",
-                    "proof": None if proof is None else dict(proof),
-                }
-            if request.operation is BrokerOperation.TEST_ADMISSION_DRAIN_BEGIN:
-                timing = self._test_submission_gate.begin_drain(
-                    timeout_seconds=0.0
-                )
-                proof = self._persistence.activate_test_admission_drain(
-                    activated_at_epoch=int(timing["activated_at_epoch"]),
-                    activated_by_uid=accepted.peer.uid,
-                    drained_at_epoch=int(timing["drained_at_epoch"]),
-                    broker_instance_id=self._broker_instance_id,
-                )
-                return {"state": "drained", "proof": dict(proof)}
-            if request.operation is BrokerOperation.TEST_ADMISSION_DRAIN_CLEAR:
-                proof = self._persistence.clear_test_admission_drain(
-                    drain_id=str(request.arguments["drain_id"]),
-                    proof_sha256=str(request.arguments["proof_sha256"]),
-                )
-                return {
-                    "state": "open",
-                    "cleared_proof": dict(proof),
-                }
-        except TestStoreContractError as error:
-            raise BrokerBackendError(
-                "test_admission_fence_conflict",
-                str(error),
-                operation_id=request.operation_id,
-            ) from error
-        raise BrokerBackendError(
-            "unsupported_operation",
-            "Unsupported test admission administration operation.",
-            operation_id=request.operation_id,
-        )
 
     def _execute_async_test(
         self, accepted: AcceptedBrokerRequest
@@ -1036,9 +985,6 @@ class StoreBackedMutationBackend:
                 worktree_key = plan.source.temporary_root or plan.source.original_root
                 resources = {
                     name: TargetResources(
-                        cpu_millis=manifest.targets[name].resources.cpu_millis,
-                        memory_mib=manifest.targets[name].resources.memory_mib,
-                        pids=manifest.targets[name].resources.pids,
                         estimated_seconds=float(
                             manifest.targets[name].timeout_seconds
                             if plan.timeouts.execution_seconds is None
@@ -1703,6 +1649,14 @@ class StoreBackedMutationBackend:
                     expected_repository_generation=request.repository_generation,
                 )
 
+            if request.operation is BrokerOperation.TEST_ATTEMPT_COLLECT:
+                return coordinator.collect(
+                    str(request.arguments["runtime_id"]),
+                    expected_attempt_id=request.resource_id,
+                    expected_repository_id=request.project_id,
+                    expected_repository_generation=request.repository_generation,
+                )
+
             descriptor = coordinator.runtime_descriptor(
                 str(request.arguments["runtime_id"])
             )
@@ -2265,12 +2219,6 @@ class StoreBackedMutationBackend:
 
     def execute(self, accepted: AcceptedBrokerRequest) -> Mapping[str, Any]:
         request = accepted.request
-        if request.operation in {
-            BrokerOperation.TEST_ADMISSION_DRAIN_BEGIN,
-            BrokerOperation.TEST_ADMISSION_DRAIN_STATUS,
-            BrokerOperation.TEST_ADMISSION_DRAIN_CLEAR,
-        }:
-            return self._execute_test_admission_admin(accepted)
         if request.operation in TESTD_INTERNAL_OPERATIONS:
             return self._execute_test_attempt(accepted)
         if request.operation in _ASYNC_TEST_OPERATIONS:
@@ -7199,10 +7147,6 @@ def build_store_backed_broker_runtime(
         expected_uid=uid,
         compose_model_renderer=render_compose_effective_model,
     )
-    active_test_admission_proof = persistence.active_test_admission_proof()
-    test_submission_gate = TestSubmissionAdmissionGate(
-        initially_fenced=active_test_admission_proof is not None
-    )
     secret_manager = VolatileRunSecretManager(expected_uid=uid)
     if test_attempt_manager is None:
         fixture_provider = BrokerSealedFixtureProvider(
@@ -7227,13 +7171,11 @@ def build_store_backed_broker_runtime(
         observe_before_lifecycle_plan=observe_before_lifecycle_plan,
         test_plane=test_plane,
         test_attempt_manager=test_attempt_manager,
-        test_submission_gate=test_submission_gate,
         secret_manager=secret_manager,
     )
     writer = SerializedMutationWriter(
         backend,
         max_concurrent_host_observations=max(0, min(4, max_clients - 1)),
-        test_submission_gate=test_submission_gate,
     )
     call_journal = (
         None

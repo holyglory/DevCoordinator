@@ -10,7 +10,6 @@ import uuid
 from typing import Mapping
 
 from devcoordinator import live_fault_acceptance as acceptance
-from devcoordinator.universal_test_contract import NON_AUTHORITATIVE_RESOURCES
 from devcoordinator.universal_test_runtime import (
     NativeTestAttemptState,
     _runtime_id_for_attempt,
@@ -35,11 +34,6 @@ def request_document() -> dict[str, object]:
                 "unit_scope": policy["unit_scope"],
                 "ttl_seconds": policy["ttl_seconds"],
                 "kill_after_run": True,
-                "resources": {
-                    "cpu_millis": policy["cpu_millis"],
-                    "memory_mib": policy["memory_mib"],
-                    "pids": policy["pids"],
-                },
                 "expected_terminal": policy["expected_terminal"],
             }
         )
@@ -180,7 +174,6 @@ class FakeRuntime:
             "unit_scope": scenario["unit_scope"],
             "ttl_seconds": scenario["ttl_seconds"],
             "kill_after_run": True,
-            "resources": dict(scenario["resources"]),
         }
 
     def status(self, handle):
@@ -279,16 +272,14 @@ class LiveFaultAcceptanceTests(unittest.TestCase):
             acceptance.validate_request(request, now=NOW)
         self.assertEqual(raised.exception.code, "board_continuity_unsupported")
 
-    def test_scenario_policy_cannot_weaken_ttl_clamps_or_cleanup(self) -> None:
+    def test_scenario_policy_cannot_weaken_ttl_or_cleanup(self) -> None:
         request = request_document()
-        for mutation in ("ttl", "pids", "kill"):
+        for mutation in ("ttl", "kill"):
             raw = dict(request)
             raw.pop("document_sha256")
             raw["scenarios"] = deepcopy(request["scenarios"])
             if mutation == "ttl":
                 raw["scenarios"][0]["ttl_seconds"] += 1
-            elif mutation == "pids":
-                raw["scenarios"][0]["resources"]["pids"] += 1
             else:
                 raw["scenarios"][0]["kill_after_run"] = False
             forged = acceptance._seal(
@@ -426,19 +417,10 @@ class LiveFaultAcceptanceTests(unittest.TestCase):
         self.assertEqual(descriptor.target_id, scenario["resource_id"])
         self.assertEqual(descriptor.repository_generation, 7)
         self.assertEqual(descriptor.ttl_seconds, scenario["ttl_seconds"])
-        self.assertEqual(
-            (
-                descriptor.cpu_millis,
-                descriptor.memory_mib,
-                descriptor.pids,
-            ),
-            (
-                NON_AUTHORITATIVE_RESOURCES.cpu_millis,
-                NON_AUTHORITATIVE_RESOURCES.memory_mib,
-                NON_AUTHORITATIVE_RESOURCES.pids,
-            ),
+        self.assertFalse(
+            {"cpu_millis", "memory_mib", "pids"}
+            & set(descriptor.to_document())
         )
-        self.assertNotEqual(descriptor.pids, scenario["resources"]["pids"])
         self.assertTrue(handle["kill_after_run"])
         slow = native._descriptor(request["scenarios"][4])
         self.assertEqual(

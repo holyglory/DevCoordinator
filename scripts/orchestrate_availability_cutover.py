@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Resumable, evidence-gated availability and test-history cutover.
+"""Resumable, evidence-gated availability and disposable Test Store cutover.
 
-This program owns the durable cutover ledger, split-UID SQLite backups, and
-the small set of explicit maintenance-fenced broker transactions required for
-authority readiness, exact listener-port reservation, and stale-repository
-repair. It validates artifacts produced by the existing history migrator and
-broker drain, and refuses activation unless the exact migration seal,
-candidate topology, and socket-inode continuity are proved.
+This program owns the durable cutover ledger and the small set of explicit
+maintenance-fenced transactions required for authority readiness, exact
+listener-port reservation, fresh Test Store activation, and stale-repository
+repair. Legacy test-history import and broker admission-drain protocols are not
+accepted; activation requires the exact fresh-store, candidate-topology, and
+socket-continuity evidence.
 """
 
 from __future__ import annotations
@@ -53,11 +53,10 @@ MODULE_ROOT = ROOT / "skills/codex-dev-coordinator/scripts"
 if str(MODULE_ROOT) not in sys.path:
     sys.path.insert(0, str(MODULE_ROOT))
 
-from devcoordinator.universal_test_admission import (  # noqa: E402
-    normalize_legacy_test_admission_drain_proof,
-    verify_legacy_test_admission_drain_proof,
+from devcoordinator.universal_test_store import (  # noqa: E402
+    TEST_STORE_SCHEMA_VERSION,
+    UniversalTestStore,
 )
-from devcoordinator.universal_test_store import UniversalTestStore  # noqa: E402
 from devcoordinator.broker_profile import (  # noqa: E402
     BrokerProfileError,
     profile_from_document,
@@ -86,8 +85,6 @@ from devcoordinator.maintenance import (  # noqa: E402
 SCHEMA_VERSION = 1
 STATE_KIND = "devcoordinator-availability-cutover"
 BACKUP_KIND = "devcoordinator-cutover-database-backup"
-INITIAL_IMPORT_KIND = "legacy-test-history-import-attestation"
-SEAL_KIND = "universal-test-history-split-cutover-seal"
 CANDIDATE_KIND = "devcoordinator-cutover-candidate-attestation"
 CANDIDATE_PREPARATION_KIND = "devcoordinator-candidate-preparation-attestation"
 BACKGROUND_CONFIG_KIND = "devcoordinator-background-config-transaction"
@@ -237,11 +234,6 @@ MAX_FIRST_ADOPTION_HANDOFF_TTL_SECONDS = 86400
 EVIDENCE_KEYS = frozenset(
     {
         "authority-backup",
-        "testd-backup",
-        "initial-import",
-        "admission-drain",
-        "final-import",
-        "migration-seal",
         "test-history-discard",
         "profile-inventory-readiness",
         "candidate",
@@ -662,38 +654,6 @@ PROFILE_INVENTORY_READINESS_FIELDS = frozenset(
     }
 )
 
-IMPORT_FIELDS = frozenset(
-    {
-        "migration_id",
-        "pass_kind",
-        "authority_generation",
-        "watermark_fingerprint",
-        "export_fingerprint",
-        "test_store_generation",
-        "chunk_count",
-        "final_chunk_sha256",
-        "run_count",
-        "case_count",
-        "destination_projection_chain_sha256",
-        "source_retained",
-    }
-)
-SEAL_FIELDS = frozenset(
-    {
-        "migration_id",
-        "authority_database",
-        "authority_generation",
-        "test_database",
-        "test_store_generation",
-        "drain_proof_fingerprint",
-        "final_export_fingerprint",
-        "final_watermark_fingerprint",
-        "destination_attestation_fingerprint",
-        "legacy_source_retained",
-        "activation_ready",
-        "rollback",
-    }
-)
 CANDIDATE_FIELDS = frozenset(
     {
         "release_digest",
@@ -751,7 +711,6 @@ ACTIVATION_FIELDS = frozenset(
 RETENTION_FIELDS = frozenset(
     {
         "authority_backup_sha256",
-        "test_backup_sha256",
         "legacy_source_retained",
         "retain_until",
         "rollback_rehearsal_sha256",
@@ -791,7 +750,6 @@ ROLLBACK_REHEARSAL_FIELDS = frozenset(
         "activation_sha256",
         "executor_release",
         "authority_backup_sha256",
-        "test_backup_sha256",
         "restores",
         "publication_inverse_plan",
         "continuity_probe_sha256",
@@ -836,7 +794,6 @@ ROLLBACK_FIELDS = frozenset(
         "credential_preflight_sha256",
         "publication_switch",
         "authority_backup_sha256",
-        "test_backup_sha256",
         "socket_inodes_before",
         "socket_inodes_after",
         "connection_refused_count",
@@ -1049,10 +1006,6 @@ STATE_FIELDS = frozenset(
         "test_database",
         "inventory_canary_project",
         "authority_backup_directory",
-        "test_backup_directory",
-        "migration_state",
-        "drain_proof",
-        "cutover_seal",
         "reserve_bytes",
         "retain_until",
         "authority_backup_required",
@@ -1062,26 +1015,8 @@ STATE_FIELDS = frozenset(
         "state_generation",
     }
 )
-LEGACY_STATE_FIELDS = STATE_FIELDS - {"legacy_authority_database"}
-
-
 def validate_state(value: object) -> dict[str, object]:
-    try:
-        state = verify_seal(value, kind=STATE_KIND, fields=STATE_FIELDS)
-    except CutoverError:
-        # Ledgers sealed before first-adoption split planning used one
-        # authority path for both the live source and the future destination.
-        # Normalize them in memory so a sealed first-adoption request can bind
-        # the distinct final path without discarding completed migration
-        # evidence.  The next durable write upgrades the ledger to STATE_FIELDS.
-        legacy = verify_seal(value, kind=STATE_KIND, fields=LEGACY_STATE_FIELDS)
-        unsigned = {
-            key: item
-            for key, item in legacy.items()
-            if key not in {"schema_version", "kind", "document_sha256"}
-        }
-        unsigned["legacy_authority_database"] = legacy["authority_database"]
-        state = seal(STATE_KIND, unsigned)
+    state = verify_seal(value, kind=STATE_KIND, fields=STATE_FIELDS)
     try:
         cutover_id = str(uuid.UUID(str(state["cutover_id"])))
     except (ValueError, TypeError, AttributeError) as error:
@@ -1096,10 +1031,6 @@ def validate_state(value: object) -> dict[str, object]:
         "test_database",
         "inventory_canary_project",
         "authority_backup_directory",
-        "test_backup_directory",
-        "migration_state",
-        "drain_proof",
-        "cutover_seal",
     ):
         _absolute(str(state[field]), field)
     if (
@@ -1174,39 +1105,20 @@ def validate_state(value: object) -> dict[str, object]:
             inventory_canary_project=str(state["inventory_canary_project"]),
         )
     discarded = state["evidence"].get("test-history-discard")
-    migrated = state["evidence"].get("migration-seal")
-    if discarded is not None and migrated is not None:
+    if discarded is None:
+        raise CutoverError("cutover requires a fresh disposable Test Store")
+    fresh = _fresh_test_store_attestation(
+        discarded,
+        expected_test_database=str(state["test_database"]),
+    )
+    if (
+        validated_bootstrap is None
+        or fresh["store"] != validated_bootstrap["test_store"]
+        or state["phase"] == "planned"
+    ):
         raise CutoverError(
-            "cutover cannot both migrate and discard legacy test history"
+            "discarded Test Store evidence contradicts the cutover ledger"
         )
-    if discarded is not None:
-        fresh = _fresh_test_store_attestation(
-            discarded,
-            expected_test_database=str(state["test_database"]),
-        )
-        legacy_history_keys = {
-            "testd-backup",
-            "initial-import",
-            "admission-drain",
-            "final-import",
-            "migration-seal",
-        }
-        if (
-            validated_bootstrap is None
-            or fresh["store"] != validated_bootstrap["test_store"]
-            or legacy_history_keys & set(state["evidence"])
-            or state["phase"]
-            in {
-                "planned",
-                "backups_verified",
-                "initial_migrated",
-                "admission_drained",
-                "tail_migrated",
-            }
-        ):
-            raise CutoverError(
-                "discarded Test Store evidence contradicts the cutover ledger"
-            )
     state["cutover_id"] = cutover_id
     return state
 
@@ -1455,12 +1367,12 @@ def _first_deployment_bootstrap(
         or type(testd.get("uid")) is not int
         or int(testd["uid"]) <= 0
         or not isinstance(store, Mapping)
-        or store.get("schema_version") != 5
+        or store.get("schema_version") != TEST_STORE_SCHEMA_VERSION
         or not isinstance(store.get("store_generation"), str)
         or not isinstance(readiness, Mapping)
         or set(readiness)
         != {"path", "document_sha256", "branch", "store_generation"}
-        or readiness.get("branch") != "attested-fresh-v5"
+        or readiness.get("branch") != "attested-fresh"
         or readiness.get("store_generation") != store.get("store_generation")
         or re.fullmatch(r"[0-9a-f]{64}", str(readiness.get("document_sha256")))
         is None
@@ -1500,11 +1412,11 @@ def _fresh_test_store_attestation(
     store = document.get("store")
     journal = document.get("journal")
     if (
-        document.get("action") != "attested-fresh-v5"
-        or document.get("journal_kind") != "schema_readiness_v5"
+        document.get("action") != "attested-fresh"
+        or document.get("journal_kind") != "schema_readiness"
         or not isinstance(journal, Mapping)
         or not isinstance(store, Mapping)
-        or store.get("schema_version") != 5
+        or store.get("schema_version") != TEST_STORE_SCHEMA_VERSION
         or not isinstance(store.get("store_generation"), str)
         or not str(store["store_generation"])
         or not isinstance(document.get("published_at"), str)
@@ -1609,7 +1521,7 @@ def bootstrap_first_deployment(
         raise CutoverError(
             "first-deployment split authority/inventory outputs already exist"
         )
-    helper = release / "bin/devcoordinator-test-history"
+    helper = release / "bin/devcoordinator-test-store"
     if not helper.is_file() or not os.access(helper, os.X_OK):
         raise CutoverError("immutable release lacks the Test Store bootstrap helper")
     prefix = [
@@ -1636,7 +1548,7 @@ def bootstrap_first_deployment(
     if run(
         [
             *prefix,
-            "testd-prepare-schema",
+            "prepare",
             "--test-database",
             str(test_database),
             "--operation-id",
@@ -1657,9 +1569,9 @@ def bootstrap_first_deployment(
     if (
         schema.get("operation_id") != operation_id
         or schema.get("test_database") != str(test_database)
-        or schema.get("action") != "attested-fresh-v5"
+        or schema.get("action") != "attested-fresh"
         or not isinstance(store, Mapping)
-        or store.get("schema_version") != 5
+        or store.get("schema_version") != TEST_STORE_SCHEMA_VERSION
     ):
         raise CutoverError("Test Store schema readiness evidence is contradictory")
     _database_identity(test_database, uid=int(testd["uid"]))
@@ -2629,10 +2541,6 @@ def initialize(
     test_database: Path,
     inventory_canary_project: Path,
     authority_backup_directory: Path,
-    test_backup_directory: Path,
-    migration_state: Path,
-    drain_proof: Path,
-    cutover_seal: Path,
     first_deployment_bootstrap: Path,
     authority_readiness: Path,
     first_adoption_port_reservations: Path,
@@ -2653,30 +2561,20 @@ def initialize(
         raise CutoverError("capacity reserve must be non-negative")
     if type(authority_backup_required) is not bool:
         raise CutoverError("authority backup requirement must be boolean")
-    discard_requested = discard_test_history is not None
-    if discard_requested:
-        if discard_test_history != DISCARD_TEST_HISTORY_CONFIRMATION:
-            raise CutoverError("discard Test Store confirmation is invalid")
-        if (
-            fresh_test_store_attestation is None
-            or fresh_test_store_attestation_sha256 is None
-        ):
-            raise CutoverError(
-                "discarding test history requires the exact fresh Test Store attestation"
-            )
-    elif (
-        fresh_test_store_attestation is not None
-        or fresh_test_store_attestation_sha256 is not None
+    if discard_test_history != DISCARD_TEST_HISTORY_CONFIRMATION:
+        raise CutoverError(
+            "cutover requires explicit disposable Test Store confirmation"
+        )
+    if (
+        fresh_test_store_attestation is None
+        or fresh_test_store_attestation_sha256 is None
     ):
         raise CutoverError(
-            "fresh Test Store evidence requires explicit discard confirmation"
+            "cutover requires the exact fresh Test Store attestation"
         )
     state_path = _absolute(state_path, "cutover ledger")
     release = _absolute(release, "release")
     rendered_units = _absolute(rendered_units, "rendered units")
-    migration_state = _absolute(migration_state, "migration state")
-    drain_proof = _absolute(drain_proof, "drain proof")
-    cutover_seal = _absolute(cutover_seal, "cutover seal")
     first_deployment_bootstrap = _absolute(
         first_deployment_bootstrap, "first-deployment bootstrap attestation"
     )
@@ -2711,26 +2609,14 @@ def initialize(
     authority_identity = _database_identity(
         legacy_authority_database, uid=authority_uid
     )
-    test_identity = _database_identity(test_database, uid=testd_uid)
     authority_backup_directory = _absolute(
         authority_backup_directory, "authority backup directory"
     )
-    test_backup_directory = _absolute(test_backup_directory, "test backup directory")
     _private_parent(authority_backup_directory, uid=authority_uid)
-    if not discard_requested:
-        _private_parent(test_backup_directory, uid=testd_uid)
     authority_required = authority_identity["size"] + reserve_bytes
-    test_required = test_identity["size"] + reserve_bytes
     authority_available = int(shutil.disk_usage(authority_backup_directory).free)
-    test_available = (
-        int(shutil.disk_usage(test_backup_directory).free)
-        if not discard_requested
-        else 0
-    )
     if authority_backup_required and authority_available < authority_required:
         raise CutoverError("authority backup destination lacks required capacity")
-    if not discard_requested and test_available < test_required:
-        raise CutoverError("test backup destination lacks required capacity")
     release_result = _load_release_verifier().verify_release(release)
     if not all(release_result["capabilities"].values()):
         raise CutoverError("immutable release lacks a required activation capability")
@@ -2840,33 +2726,31 @@ def initialize(
         or schema_document["store"] != bootstrap["test_store"]
     ):
         raise CutoverError("first-deployment schema readiness evidence changed")
-    fresh_store: dict[str, object] | None = None
-    if discard_requested:
-        if fresh_test_store_attestation is None:
-            raise CutoverError("fresh Test Store attestation is missing")
-        fresh_store = _fresh_test_store_attestation(
-            read_private_json(fresh_test_store_attestation, uid=testd_uid),
-            expected_test_database=str(test_database),
+    if fresh_test_store_attestation is None:
+        raise CutoverError("fresh Test Store attestation is missing")
+    fresh_store = _fresh_test_store_attestation(
+        read_private_json(fresh_test_store_attestation, uid=testd_uid),
+        expected_test_database=str(test_database),
+    )
+    expected_fresh_path = test_database.parent / (
+        f"schema-readiness-{fresh_store['operation_id']}.json"
+    )
+    if (
+        test_database.name != "tests.sqlite3"
+        or fresh_test_store_attestation != expected_fresh_path
+        or re.fullmatch(
+            r"[0-9a-f]{64}",
+            str(fresh_test_store_attestation_sha256),
         )
-        expected_fresh_path = test_database.parent / (
-            f"schema-readiness-{fresh_store['operation_id']}.json"
+        is None
+        or fresh_store["document_sha256"]
+        != fresh_test_store_attestation_sha256
+        or fresh_store["store"] != bootstrap["test_store"]
+        or fresh_store["store"] != schema_document["store"]
+    ):
+        raise CutoverError(
+            "fresh Test Store attestation changed or belongs to another store"
         )
-        if (
-            test_database.name != "tests.sqlite3"
-            or fresh_test_store_attestation != expected_fresh_path
-            or re.fullmatch(
-                r"[0-9a-f]{64}",
-                str(fresh_test_store_attestation_sha256),
-            )
-            is None
-            or fresh_store["document_sha256"]
-            != fresh_test_store_attestation_sha256
-            or fresh_store["store"] != bootstrap["test_store"]
-            or fresh_store["store"] != schema_document["store"]
-        ):
-            raise CutoverError(
-                "fresh Test Store attestation changed or belongs to another store"
-            )
     findings = _load_topology_verifier().validate_topology(
         rendered_units, release_digest=digest
     )
@@ -2883,10 +2767,6 @@ def initialize(
         "test_database": str(test_database),
         "inventory_canary_project": str(inventory_canary_project),
         "authority_backup_directory": str(authority_backup_directory),
-        "test_backup_directory": str(test_backup_directory),
-        "migration_state": str(migration_state),
-        "drain_proof": str(drain_proof),
-        "cutover_seal": str(cutover_seal),
         "reserve_bytes": reserve_bytes,
         "retain_until": retain_until,
         "authority_backup_required": authority_backup_required,
@@ -2900,26 +2780,12 @@ def initialize(
             "required_free_bytes": authority_required if authority_backup_required else 0,
             "available_bytes": authority_available,
         },
-        "testd": {
-            "required": not discard_requested,
-            "source_bytes": test_identity["size"],
-            "estimated_backup_bytes": (
-                test_identity["size"] if not discard_requested else 0
-            ),
-            "reserve_bytes": reserve_bytes if not discard_requested else 0,
-            "required_free_bytes": test_required if not discard_requested else 0,
-            "available_bytes": test_available,
-        },
     }
     expected_initial_evidence = {
         "first-deployment-bootstrap": bootstrap,
         "authority-readiness": readiness,
         "first-adoption-port-reservations": reservations,
-        **(
-            {"test-history-discard": fresh_store}
-            if fresh_store is not None
-            else {}
-        ),
+        "test-history-discard": fresh_store,
     }
     if state_path.exists() or state_path.is_symlink():
         current = load_state(state_path, authority_uid=authority_uid)
@@ -2929,10 +2795,7 @@ def initialize(
                 current["evidence"].get(key) != value
                 for key, value in expected_initial_evidence.items()
             )
-            or (
-                "test-history-discard" in current["evidence"]
-            )
-            != discard_requested
+            or "test-history-discard" not in current["evidence"]
         ):
             raise CutoverError("cutover ledger already exists with another plan")
         return {
@@ -3043,10 +2906,7 @@ def initialize(
                         current["evidence"].get(key) != value
                         for key, value in expected_initial_evidence.items()
                     )
-                    or (
-                        "test-history-discard" in current["evidence"]
-                    )
-                    != discard_requested
+                    or "test-history-discard" not in current["evidence"]
                 ):
                     raise CutoverError(
                         "cutover ledger already exists with another plan"
@@ -3063,7 +2923,7 @@ def initialize(
         timestamp = _now()
         unsigned = {
             "cutover_id": str(uuid.uuid4()),
-            "phase": "sealed" if discard_requested else "planned",
+            "phase": "sealed",
             **expected_plan,
             "evidence": expected_initial_evidence,
             "created_at": timestamp,
@@ -3081,7 +2941,7 @@ def initialize(
             )
     return {
         "ok": True,
-        "phase": "sealed" if discard_requested else "planned",
+        "phase": "sealed",
         "cutover_id": unsigned["cutover_id"],
         "state_generation": 0,
         "resumed": False,
@@ -8758,8 +8618,8 @@ def prepare_atomic_first_adoption_bindings(
 
 def _first_adoption_binding_completion(
     state: Mapping[str, object],
-) -> dict[str, object] | None:
-    """Validate the only two ledger states accepted by binding finalization."""
+) -> dict[str, object]:
+    """Validate the fresh-store ledger state accepted by binding finalization."""
 
     phase = state.get("phase")
     evidence = state.get("evidence")
@@ -8767,17 +8627,13 @@ def _first_adoption_binding_completion(
         raise CutoverError(
             "atomic first-adoption finalization requires a valid cutover ledger"
         )
-    migrated = evidence.get("migration-seal")
     discarded = evidence.get("test-history-discard")
-    if phase == "planned" and migrated is None and discarded is None:
-        return None
-    if phase == "sealed" and migrated is None and discarded is not None:
+    if phase == "sealed" and discarded is not None:
         completion = _test_store_cutover_completion(state)
         if completion["mode"] == "history-discarded":
             return completion
     raise CutoverError(
-        "atomic first-adoption finalization requires planned history or "
-        "a sealed discarded Test Store"
+        "atomic first-adoption finalization requires a sealed fresh Test Store"
     )
 
 
@@ -10285,10 +10141,6 @@ def _normalize_replay(
 ) -> dict[str, object]:
     sealed = {
         "authority-backup": (BACKUP_KIND, BACKUP_FIELDS),
-        "testd-backup": (BACKUP_KIND, BACKUP_FIELDS),
-        "initial-import": (INITIAL_IMPORT_KIND, IMPORT_FIELDS),
-        "final-import": (INITIAL_IMPORT_KIND, IMPORT_FIELDS),
-        "migration-seal": (SEAL_KIND, SEAL_FIELDS),
         "test-history-discard": (SCHEMA_READINESS_KIND, SCHEMA_READINESS_FIELDS),
         "profile-inventory-readiness": (
             PROFILE_INVENTORY_READINESS_KIND,
@@ -10307,8 +10159,6 @@ def _normalize_replay(
         "retention": (RETENTION_KIND, RETENTION_FIELDS),
         "rollback": (ROLLBACK_KIND, ROLLBACK_FIELDS),
     }
-    if evidence_kind == "admission-drain":
-        return dict(normalize_legacy_test_admission_drain_proof(evidence))
     contract = sealed.get(evidence_kind)
     if contract is None:
         raise CutoverError("unsupported cutover evidence kind")
@@ -10325,31 +10175,13 @@ def _test_store_cutover_completion(
 ) -> dict[str, object]:
     """Return the one completion proof accepted by activation.
 
-    The retained ``migration_seal_sha256`` fields in candidate/activation
-    documents bind this digest for compatibility; on a destructive first
-    adoption it is the exact fresh-store readiness digest instead.
+    Candidate and activation documents bind the exact fresh-store readiness
+    digest. Legacy Test Store migration evidence is no longer accepted.
     """
 
-    migrated = _recorded(state, "migration-seal")
     discarded = _recorded(state, "test-history-discard")
-    if (migrated is None) == (discarded is None):
-        raise CutoverError(
-            "cutover requires exactly one migrated or discarded Test Store proof"
-        )
-    if migrated is not None:
-        document = verify_seal(
-            migrated,
-            kind=SEAL_KIND,
-            fields=SEAL_FIELDS,
-        )
-        return {
-            "mode": "history-migrated",
-            "document_sha256": document["document_sha256"],
-            "authority_generation": document["authority_generation"],
-            "test_store_generation": document["test_store_generation"],
-        }
     if discarded is None:
-        raise CutoverError("discarded Test Store proof is missing")
+        raise CutoverError("fresh disposable Test Store proof is missing")
     document = _fresh_test_store_attestation(
         discarded,
         expected_test_database=str(state["test_database"]),
@@ -10402,95 +10234,7 @@ def transition(
         return current
     normalized: dict[str, object]
     next_phase = phase
-    if evidence_kind in {"authority-backup", "testd-backup"}:
-        if phase != "planned":
-            raise CutoverError("backup evidence is allowed only before migration")
-        if (
-            evidence_kind == "authority-backup"
-            and current["authority_backup_required"] is not True
-        ):
-            raise CutoverError(
-                "authority backup is forbidden when no authority transaction is planned"
-            )
-        normalized = verify_seal(evidence, kind=BACKUP_KIND, fields=BACKUP_FIELDS)
-        expected_uid = (
-            int(current["authority_uid"])
-            if evidence_kind == "authority-backup"
-            else int(current["testd_uid"])
-        )
-        expected_database = (
-            current["legacy_authority_database"]
-            if evidence_kind == "authority-backup"
-            else current["test_database"]
-        )
-        if (
-            normalized["expected_uid"] != expected_uid
-            or normalized["database"] != expected_database
-            or normalized["quick_check"] != "ok"
-            or normalized["foreign_key_violations"] != 0
-            or int(normalized["available_bytes"]) < int(normalized["required_bytes"])
-        ):
-            raise CutoverError("database backup evidence contradicts the cutover plan")
-        required_backups = {"testd-backup"}
-        if current["authority_backup_required"] is True:
-            required_backups.add("authority-backup")
-        if required_backups <= (set(indexed) | {key}):
-            next_phase = "backups_verified"
-    elif evidence_kind == "initial-import":
-        if phase != "backups_verified":
-            raise CutoverError("initial import requires all planned verified backups")
-        normalized = verify_seal(
-            evidence, kind=INITIAL_IMPORT_KIND, fields=IMPORT_FIELDS
-        )
-        if normalized["pass_kind"] != "initial" or normalized["source_retained"] is not True:
-            raise CutoverError("initial import attestation is contradictory")
-        next_phase = "initial_migrated"
-    elif evidence_kind == "admission-drain":
-        if phase != "initial_migrated":
-            raise CutoverError("admission drain requires the initial import")
-        normalized = dict(normalize_legacy_test_admission_drain_proof(evidence))
-        key = "admission-drain"
-        next_phase = "admission_drained"
-    elif evidence_kind == "final-import":
-        if phase != "admission_drained":
-            raise CutoverError("final import requires an active admission drain")
-        normalized = verify_seal(
-            evidence, kind=INITIAL_IMPORT_KIND, fields=IMPORT_FIELDS
-        )
-        initial = _recorded(current, "initial-import")
-        drain = _recorded(current, "admission-drain")
-        if (
-            normalized["pass_kind"] != "final"
-            or normalized["source_retained"] is not True
-            or initial is None
-            or drain is None
-            or normalized["migration_id"] != initial["migration_id"]
-            or normalized["authority_generation"] != drain["authority_generation"]
-        ):
-            raise CutoverError("final import attestation is contradictory")
-        next_phase = "tail_migrated"
-    elif evidence_kind == "migration-seal":
-        if phase != "tail_migrated":
-            raise CutoverError("migration seal requires the imported tail")
-        normalized = verify_seal(evidence, kind=SEAL_KIND, fields=SEAL_FIELDS)
-        final = _recorded(current, "final-import")
-        drain = _recorded(current, "admission-drain")
-        if (
-            normalized["activation_ready"] is not True
-            or normalized["legacy_source_retained"] is not True
-            or normalized["authority_database"]
-            != current["legacy_authority_database"]
-            or normalized["test_database"] != current["test_database"]
-            or final is None
-            or drain is None
-            or normalized["migration_id"] != final["migration_id"]
-            or normalized["drain_proof_fingerprint"] != _digest(drain)
-            or normalized["destination_attestation_fingerprint"]
-            != final["document_sha256"]
-        ):
-            raise CutoverError("migration seal contradicts the imported destination")
-        next_phase = "sealed"
-    elif evidence_kind == "profile-inventory-readiness":
+    if evidence_kind == "profile-inventory-readiness":
         if phase != "sealed":
             raise CutoverError("routing readiness requires the sealed migration")
         normalized = verify_seal(
@@ -10785,7 +10529,6 @@ def transition(
         )
         activation = _recorded(current, "activation")
         authority_backup = _recorded(current, "authority-backup")
-        test_backup = _recorded(current, "testd-backup")
         expected_authority_sha = (
             authority_backup["backup_sha256"]
             if authority_backup is not None
@@ -10793,17 +10536,15 @@ def transition(
         )
         if (
             activation is None
-            or test_backup is None
             or normalized["activation_sha256"] != activation["document_sha256"]
             or normalized["executor_release"] != current["release"]
             or normalized["authority_backup_sha256"] != expected_authority_sha
-            or normalized["test_backup_sha256"] != test_backup["backup_sha256"]
             or normalized["continuity_probe_sha256"]
             != activation["continuity_probe"]["document_sha256"]
             or normalized["legacy_source_retained"] is not True
             or not isinstance(normalized["restores"], Mapping)
             or set(normalized["restores"])
-            != ({"testd"} | ({"authority"} if authority_backup is not None else set()))
+            != ({"authority"} if authority_backup is not None else set())
             or any(
                 not isinstance(item, Mapping)
                 or set(item)
@@ -11012,7 +10753,6 @@ def transition(
             raise CutoverError("retention evidence requires completed activation")
         normalized = verify_seal(evidence, kind=RETENTION_KIND, fields=RETENTION_FIELDS)
         authority_backup = _recorded(current, "authority-backup")
-        test_backup = _recorded(current, "testd-backup")
         expected_authority_sha = (
             authority_backup["backup_sha256"]
             if authority_backup is not None
@@ -11032,10 +10772,8 @@ def transition(
             "verified_at",
         }
         if (
-            test_backup is None
-            or (current["authority_backup_required"] is True) != (authority_backup is not None)
+            (current["authority_backup_required"] is True) != (authority_backup is not None)
             or normalized["authority_backup_sha256"] != expected_authority_sha
-            or normalized["test_backup_sha256"] != test_backup["backup_sha256"]
             or normalized["legacy_source_retained"] is not True
             or rehearsal is None
             or live_rehearsal is None
@@ -11070,7 +10808,6 @@ def transition(
         normalized = verify_seal(evidence, kind=ROLLBACK_KIND, fields=ROLLBACK_FIELDS)
         activation = _recorded(current, "activation")
         authority_backup = _recorded(current, "authority-backup")
-        test_backup = _recorded(current, "testd-backup")
         expected_authority_sha = (
             authority_backup["backup_sha256"]
             if authority_backup is not None
@@ -11086,7 +10823,6 @@ def transition(
         )
         if (
             activation is None
-            or test_backup is None
             or normalized["executor_release"] != current["release"]
             or re.fullmatch(
                 r"[0-9a-f]{64}", str(normalized["credential_preflight_sha256"])
@@ -11095,7 +10831,6 @@ def transition(
             or (current["authority_backup_required"] is True) != (authority_backup is not None)
             or normalized["activation_sha256"] != activation["document_sha256"]
             or normalized["authority_backup_sha256"] != expected_authority_sha
-            or normalized["test_backup_sha256"] != test_backup["backup_sha256"]
             or _socket_map(normalized["socket_inodes_before"])
             != _socket_map(normalized["socket_inodes_after"])
             or normalized["connection_refused_count"] != 0
@@ -11135,14 +10870,6 @@ def record_evidence(
 ) -> dict[str, object]:
     state = load_state(state_path, authority_uid=authority_uid)
     evidence = read_private_json(evidence_path, uid=evidence_uid)
-    if evidence_kind == "admission-drain":
-        evidence = dict(
-            verify_legacy_test_admission_drain_proof(
-                Path(str(state["legacy_authority_database"])),
-                evidence,
-                expected_uid=authority_uid,
-            )
-        )
     updated = transition(state, evidence_kind=evidence_kind, evidence=evidence)
     if updated == state:
         return {
@@ -11165,130 +10892,6 @@ def record_evidence(
         "state_generation": updated["state_generation"],
         "cutover_id": updated["cutover_id"],
         "replayed": False,
-    }
-
-
-def _authority_generation(path: Path, *, uid: int) -> str:
-    before = _database_identity(path, uid=uid)
-    connection = sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True)
-    try:
-        connection.execute("PRAGMA query_only = ON")
-        row = connection.execute(
-            "SELECT database_generation FROM schema_metadata WHERE singleton = 1"
-        ).fetchone()
-    finally:
-        connection.close()
-    after = _database_identity(path, uid=uid)
-    if before != after or row is None or not isinstance(row[0], str) or not row[0]:
-        raise CutoverError("authority generation is unavailable or changed")
-    return str(row[0])
-
-
-def execute_admission_drain(
-    *,
-    state_path: Path,
-    proof_output: Path,
-    broker_socket: Path,
-    authority_uid: int,
-    expected_broker_uid: int,
-    expected_socket_gid: int | None = None,
-    expected_socket_mode: int = 0o660,
-    broker_call=None,
-) -> dict[str, object]:
-    """Begin or replay the one generation-bound legacy admission drain."""
-
-    if os.geteuid() != authority_uid or authority_uid != 0:
-        raise CutoverError("admission drain executor must run as root")
-    state_path = _absolute(state_path, "cutover ledger")
-    proof_output = _absolute(proof_output, "admission drain proof")
-    broker_socket = _absolute(broker_socket, "authority broker socket")
-    state = load_state(state_path, authority_uid=authority_uid)
-    if state["phase"] not in {"initial_migrated", "admission_drained"}:
-        raise CutoverError("admission drain requires the initial import")
-    if proof_output != Path(str(state["drain_proof"])):
-        raise CutoverError("admission drain output disagrees with the ledger")
-    recorded = state["evidence"].get("admission-drain")
-    if isinstance(recorded, Mapping):
-        proof = dict(
-            verify_legacy_test_admission_drain_proof(
-                Path(str(state["legacy_authority_database"])),
-                recorded,
-                expected_uid=authority_uid,
-            )
-        )
-        if proof_output.exists() or proof_output.is_symlink():
-            if read_private_json(proof_output, uid=authority_uid) != proof:
-                raise CutoverError("recorded admission drain proof output changed")
-        else:
-            _publish_evidence(proof_output, proof, uid=authority_uid)
-        return {
-            "ok": True,
-            "phase": state["phase"],
-            "replayed": True,
-            "operation_id": None,
-            "proof": proof,
-        }
-    generation = _authority_generation(
-        Path(str(state["legacy_authority_database"])), uid=authority_uid
-    )
-    operation_id = str(
-        uuid.uuid5(
-            uuid.NAMESPACE_URL,
-            f"devcoordinator-admission-drain:{state['cutover_id']}:{generation}",
-        )
-    )
-    request = BrokerRequest.create(
-        account_id="devcoordinator-authority",
-        project_id="authority",
-        resource_id="test-admission",
-        repository_generation=0,
-        authority_generation=generation,
-        operation=BrokerOperation.TEST_ADMISSION_DRAIN_BEGIN,
-        operation_id=operation_id,
-        arguments={"purpose": "legacy-test-history-cutover"},
-    )
-    if broker_call is None:
-        client = BrokerClient(
-            broker_socket,
-            expected_broker_uid=expected_broker_uid,
-            expected_socket_gid=expected_socket_gid,
-            expected_socket_mode=expected_socket_mode,
-            timeout_seconds=60.0,
-        )
-        reply = client.call(request)
-    else:
-        reply = broker_call(request)
-    if not isinstance(reply, Mapping) or reply.get("ok") is not True:
-        raise CutoverError("authority broker did not activate test admission drain")
-    result = reply.get("result")
-    proof_value = result.get("proof") if isinstance(result, Mapping) else None
-    proof = dict(
-        verify_legacy_test_admission_drain_proof(
-            Path(str(state["legacy_authority_database"])),
-            proof_value if isinstance(proof_value, Mapping) else {},
-            expected_uid=authority_uid,
-        )
-    )
-    if proof["authority_generation"] != generation:
-        raise CutoverError("admission drain proof generation changed")
-    if proof_output.exists() or proof_output.is_symlink():
-        if read_private_json(proof_output, uid=authority_uid) != proof:
-            raise CutoverError("admission drain output belongs to another proof")
-    else:
-        _publish_evidence(proof_output, proof, uid=authority_uid)
-    transition_result = record_evidence(
-        state_path=state_path,
-        evidence_kind="admission-drain",
-        evidence_path=proof_output,
-        authority_uid=authority_uid,
-        evidence_uid=authority_uid,
-    )
-    return {
-        "ok": True,
-        "phase": transition_result["phase"],
-        "replayed": bool(transition_result["replayed"]),
-        "operation_id": operation_id,
-        "proof": proof,
     }
 
 
@@ -11399,23 +11002,14 @@ def produce_rollback_rehearsal(
             "ledger_replayed": bool(recorded_result["replayed"]),
         }
     activation = _recorded(state, "activation")
-    test_backup = _recorded(state, "testd-backup")
     authority_backup = _recorded(state, "authority-backup")
-    if activation is None or test_backup is None:
-        raise CutoverError("rollback rehearsal lacks activation or backup evidence")
+    if activation is None:
+        raise CutoverError("rollback rehearsal lacks activation evidence")
     continuity = _continuity_probe(
         activation["continuity_probe"],
         expected_release=str(state["release_digest"]),
     )
-    restores = {
-        "testd": _restore_backup_for_rehearsal(
-            role="testd",
-            backup_evidence=test_backup,
-            source_uid=int(state["testd_uid"]),
-            scratch_directory=scratch_directory,
-            authority_uid=authority_uid,
-        )
-    }
+    restores: dict[str, object] = {}
     if authority_backup is not None:
         restores["authority"] = _restore_backup_for_rehearsal(
             role="authority",
@@ -11460,7 +11054,6 @@ def produce_rollback_rehearsal(
                 if authority_backup is None
                 else authority_backup["backup_sha256"]
             ),
-            "test_backup_sha256": test_backup["backup_sha256"],
             "restores": {key: restores[key] for key in sorted(restores)},
             "publication_inverse_plan": inverse_plan,
             "continuity_probe_sha256": continuity["document_sha256"],
@@ -11542,14 +11135,12 @@ def produce_retention_attestation(
     live_rehearsal = _recorded(state, "live-rollback-rehearsal")
     activation = _recorded(state, "activation")
     readiness = _recorded(state, "profile-inventory-readiness")
-    test_backup = _recorded(state, "testd-backup")
     authority_backup = _recorded(state, "authority-backup")
     if (
         rehearsal is None
         or live_rehearsal is None
         or activation is None
         or readiness is None
-        or test_backup is None
     ):
         raise CutoverError(
             "retention requires rollback rehearsals and profile inventory readiness"
@@ -11622,7 +11213,6 @@ def produce_retention_attestation(
         ),
     )
     for role, evidence, uid in (
-        ("testd", test_backup, int(state["testd_uid"])),
         ("authority", authority_backup, authority_uid),
     ):
         if evidence is None:
@@ -11642,7 +11232,6 @@ def produce_retention_attestation(
                 if authority_backup is None
                 else authority_backup["backup_sha256"]
             ),
-            "test_backup_sha256": test_backup["backup_sha256"],
             "legacy_source_retained": True,
             "retain_until": state["retain_until"],
             "rollback_rehearsal_sha256": rehearsal["document_sha256"],
@@ -11683,142 +11272,8 @@ def next_actions(state: Mapping[str, object]) -> dict[str, object]:
     phase = str(state["phase"])
     release_bin = Path(str(state["release"])) / "bin"
     cutover = str(release_bin / "devcoordinator-cutover")
-    migration = str(release_bin / "devcoordinator-test-history")
     actions: list[dict[str, object]] = []
-    if phase == "planned":
-        if not isinstance(state["evidence"].get("authority-readiness"), Mapping):
-            raise CutoverError(
-                "cutover ledger lacks authority readiness recovery evidence"
-            )
-        backups = [
-            (
-                "testd",
-                state["testd_uid"],
-                state["test_database"],
-                state["test_backup_directory"],
-            )
-        ]
-        if state["authority_backup_required"] is True:
-            backups.insert(
-                0,
-                (
-                    "authority",
-                    state["authority_uid"],
-                    state["legacy_authority_database"],
-                    state["authority_backup_directory"],
-                ),
-            )
-        for role, uid, database, directory in backups:
-            actions.append(
-                {
-                    "run_as_uid": uid,
-                    "purpose": f"verified {role} SQLite backup and capacity proof",
-                    "argv": [
-                        cutover,
-                        "backup",
-                        "--database",
-                        database,
-                        "--backup",
-                        f"{directory}/{role}.sqlite3",
-                        "--attestation",
-                        f"{directory}/{role}.backup.json",
-                        "--expected-uid",
-                        str(uid),
-                        "--reserve-bytes",
-                        str(state["reserve_bytes"]),
-                    ],
-                }
-            )
-        if state["authority_backup_required"] is not True:
-            actions.append(
-                {
-                    "purpose": "authority backup intentionally omitted: this cutover declares no authority schema or pointer transaction; migration remains a bounded test-history export with retained source rows",
-                    "authority_backup_required": False,
-                }
-            )
-    elif phase == "backups_verified":
-        bootstrap = state["evidence"].get("first-deployment-bootstrap")
-        if not isinstance(bootstrap, Mapping):
-            raise CutoverError(
-                "cutover ledger lacks first-deployment bootstrap evidence"
-            )
-        schema = bootstrap.get("schema_readiness")
-        if not isinstance(schema, Mapping):
-            raise CutoverError("bootstrap schema readiness binding is invalid")
-        actions.extend(
-            [
-                {
-                    "purpose": "validate administrator-supplied explicit manifests and seal the exact authority-independent template that first adoption will bind to the post-split authority export",
-                    "executable": f"{state['release']}/bin/devcoordinator-availability-activate",
-                    "argv_prefix": [
-                        "build-first-adoption-manifest-template",
-                        "--input",
-                        "<root-private-explicit-manifest-input>",
-                        "--output",
-                        "<root-private-sealed-manifest-template>",
-                    ],
-                    "input_contract": "schema_version 1, one UUID operation_id, and sorted unique explicit repository_id/manifest rows",
-                    "output_contract": "root-owned mode 0600 sealed devcoordinator-first-adoption-manifest-template",
-                    "then": "bind the output path and document_sha256 in the first-adoption request",
-                },
-                {
-                    "purpose": (
-                        "consume the generation-bound Test Store readiness branch; "
-                        "fresh v4 stores are attested and only exact v3 stores are migrated"
-                    ),
-                    "completed_evidence": schema["path"],
-                    "branch": schema["branch"],
-                    "document_sha256": schema["document_sha256"],
-                },
-                {
-                    "run_as_uid": state["authority_uid"],
-                    "purpose": "capture and export the live initial history watermark after the exact Test Store schema attestation is retained",
-                    "argv_prefix": [migration, "authority-capture"],
-                    "then": "authority-export-initial until phase initial_exported; import manifest as testd UID; record initial-import attestation",
-                },
-            ]
-        )
-    elif phase == "initial_migrated":
-        actions.append(
-            {
-                "run_as_uid": state["authority_uid"],
-                "purpose": "activate the DB-backed legacy submission drain and publish its exact proof",
-                "argv_prefix": [
-                    cutover,
-                    "admission-drain",
-                    "--state",
-                    "<root-private-cutover-state>",
-                    "--proof-output",
-                    state["drain_proof"],
-                    "--broker-socket",
-                    AUTHORITY_SOCKET_PATH,
-                    "--authority-uid",
-                    str(state["authority_uid"]),
-                    "--expected-broker-uid",
-                    str(state["authority_uid"]),
-                ],
-                "proof_contract": "generation-bound, DB-verified, private, and ledger-recorded idempotently",
-            }
-        )
-    elif phase == "admission_drained":
-        actions.append(
-            {
-                "run_as_uid": state["authority_uid"],
-                "purpose": "export the drained tail and abandon unrecoverable legacy running rows",
-                "argv_prefix": [migration, "authority-finalize"],
-                "then": "import final manifest as testd UID and record final-import attestation",
-            }
-        )
-    elif phase == "tail_migrated":
-        actions.append(
-            {
-                "run_as_uid": state["authority_uid"],
-                "purpose": "bind drain, tail export, destination attestation, and rollback retention",
-                "argv_prefix": [migration, "authority-seal"],
-                "output": state["cutover_seal"],
-            }
-        )
-    elif phase == "sealed":
+    if phase == "sealed":
         actions.extend(
             [
                 {
@@ -12108,10 +11563,6 @@ def _parser() -> argparse.ArgumentParser:
         "test-database",
         "inventory-canary-project",
         "authority-backup-directory",
-        "test-backup-directory",
-        "migration-state",
-        "drain-proof",
-        "cutover-seal",
         "first-deployment-bootstrap",
         "authority-readiness",
         "first-adoption-port-reservations",
@@ -12219,15 +11670,6 @@ def _parser() -> argparse.ArgumentParser:
     reattest.add_argument("--maintenance-gid", type=int, required=True)
     reattest.add_argument("--authority-uid", type=int, default=0)
 
-    drain = actions.add_parser("admission-drain")
-    drain.add_argument("--state", required=True)
-    drain.add_argument("--proof-output", required=True)
-    drain.add_argument("--broker-socket", default=AUTHORITY_SOCKET_PATH)
-    drain.add_argument("--authority-uid", type=int, default=0)
-    drain.add_argument("--expected-broker-uid", type=int, default=0)
-    drain.add_argument("--expected-socket-gid", type=int)
-    drain.add_argument("--expected-socket-mode", type=_octal_mode, default=0o660)
-
     rehearsal = actions.add_parser("rehearse-rollback")
     rehearsal.add_argument("--state", required=True)
     rehearsal.add_argument("--scratch-directory", required=True)
@@ -12257,11 +11699,6 @@ def _parser() -> argparse.ArgumentParser:
         required=True,
         choices=(
             "authority-backup",
-            "testd-backup",
-            "initial-import",
-            "admission-drain",
-            "final-import",
-            "migration-seal",
             "profile-inventory-readiness",
             "candidate",
             "activation",
@@ -12470,10 +11907,6 @@ def main(argv: list[str] | None = None) -> int:
                 test_database=Path(arguments.test_database),
                 inventory_canary_project=Path(arguments.inventory_canary_project),
                 authority_backup_directory=Path(arguments.authority_backup_directory),
-                test_backup_directory=Path(arguments.test_backup_directory),
-                migration_state=Path(arguments.migration_state),
-                drain_proof=Path(arguments.drain_proof),
-                cutover_seal=Path(arguments.cutover_seal),
                 first_deployment_bootstrap=Path(
                     arguments.first_deployment_bootstrap
                 ),
@@ -12582,16 +12015,6 @@ def main(argv: list[str] | None = None) -> int:
                 ),
                 operation_id=arguments.operation_id,
                 authority_uid=arguments.authority_uid,
-            )
-        elif arguments.action == "admission-drain":
-            result = execute_admission_drain(
-                state_path=Path(arguments.state),
-                proof_output=Path(arguments.proof_output),
-                broker_socket=Path(arguments.broker_socket),
-                authority_uid=arguments.authority_uid,
-                expected_broker_uid=arguments.expected_broker_uid,
-                expected_socket_gid=arguments.expected_socket_gid,
-                expected_socket_mode=arguments.expected_socket_mode,
             )
         elif arguments.action == "rehearse-rollback":
             result = produce_rollback_rehearsal(

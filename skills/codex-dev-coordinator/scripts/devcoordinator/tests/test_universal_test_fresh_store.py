@@ -15,7 +15,7 @@ def _load_repository_cli():
     skill_root = test_file.parents[3]
     repository_root = skill_root.parent.parent
     configured_skill = repository_root / "skills" / skill_root.name
-    cli_path = repository_root / "scripts" / "migrate_universal_test_history.py"
+    cli_path = repository_root / "scripts" / "manage_test_store.py"
     try:
         source_tree_matches = configured_skill.samefile(skill_root)
     except OSError:
@@ -25,7 +25,7 @@ def _load_repository_cli():
             "fresh-store administrator CLI is unavailable in a standalone skill copy"
         )
     spec = importlib.util.spec_from_file_location(
-        "migrate_universal_test_history_fresh_store", cli_path
+        "manage_test_store_fresh_store", cli_path
     )
     if spec is None or spec.loader is None:
         raise RuntimeError("could not load fresh-store administrator CLI")
@@ -34,7 +34,7 @@ def _load_repository_cli():
     return module
 
 
-MIGRATION_CLI = _load_repository_cli()
+TEST_STORE_CLI = _load_repository_cli()
 
 
 class FreshTestStoreInitializationTests(unittest.TestCase):
@@ -80,24 +80,24 @@ class FreshTestStoreInitializationTests(unittest.TestCase):
         authority_sentinel.write_bytes(b"authority-must-not-be-opened-or-changed")
         authority_before = authority_sentinel.read_bytes()
 
-        result = MIGRATION_CLI.testd_initialize_fresh_store(
+        result = TEST_STORE_CLI.initialize_fresh_store(
             test_database=self.test_path,
             operation_id=self.operation_id,
             attestation_output=self.attestation,
             expected_test_uid=os.geteuid(),
-            confirmation=MIGRATION_CLI.DISCARD_TEST_HISTORY_CONFIRMATION,
+            confirmation=TEST_STORE_CLI.DISCARD_CONFIRMATION,
         )
 
         self.assertTrue(result["ok"])
-        self.assertEqual(result["action"], "testd-initialize-fresh")
-        self.assertEqual(result["branch"], "attested-fresh-v5")
+        self.assertEqual(result["action"], "test-store-initialize-fresh")
+        self.assertEqual(result["branch"], "attested-fresh")
         self.assertTrue(result["discarded_existing"])
         self.assertFalse(result["replayed"])
         self.assertNotEqual(result["store_generation"], old_generation)
         self.assertEqual(authority_sentinel.read_bytes(), authority_before)
 
         store = UniversalTestStore.open(self.test_path)
-        self.assertEqual(store.verify()["schema_version"], 5)
+        self.assertEqual(store.verify()["schema_version"], 6)
         connection = store._connect(readonly=True)
         try:
             rows = connection.execute(
@@ -121,16 +121,16 @@ class FreshTestStoreInitializationTests(unittest.TestCase):
             connection.close()
         self.assertEqual(
             [(str(row["operation_id"]), str(row["operation_kind"])) for row in rows],
-            [(self.operation_id, "schema_readiness_v5")],
+            [(self.operation_id, "schema_readiness")],
         )
         self.assertEqual(counts, (0, 0, 0, 0, 0, 0))
 
-        replay = MIGRATION_CLI.testd_initialize_fresh_store(
+        replay = TEST_STORE_CLI.initialize_fresh_store(
             test_database=self.test_path,
             operation_id=self.operation_id,
             attestation_output=self.attestation,
             expected_test_uid=os.geteuid(),
-            confirmation=MIGRATION_CLI.DISCARD_TEST_HISTORY_CONFIRMATION,
+            confirmation=TEST_STORE_CLI.DISCARD_CONFIRMATION,
         )
         self.assertTrue(replay["replayed"])
         self.assertEqual(replay["store_generation"], result["store_generation"])
@@ -138,10 +138,10 @@ class FreshTestStoreInitializationTests(unittest.TestCase):
     def test_fresh_initializer_requires_confirmation_before_discard(self) -> None:
         generation = self._seed_disposable_history()
         with self.assertRaisesRegex(
-            MIGRATION_CLI.MigrationCommandError,
+            TEST_STORE_CLI.TestStoreCommandError,
             "confirmation",
         ):
-            MIGRATION_CLI.testd_initialize_fresh_store(
+            TEST_STORE_CLI.initialize_fresh_store(
                 test_database=self.test_path,
                 operation_id=self.operation_id,
                 attestation_output=self.attestation,
@@ -157,15 +157,15 @@ class FreshTestStoreInitializationTests(unittest.TestCase):
         self.test_path.write_bytes(b"not-a-private-test-store")
         self.test_path.chmod(0o644)
         with self.assertRaisesRegex(
-            MIGRATION_CLI.MigrationCommandError,
-            "private regular files",
+            TEST_STORE_CLI.TestStoreCommandError,
+            "private Test Store file",
         ):
-            MIGRATION_CLI.testd_initialize_fresh_store(
+            TEST_STORE_CLI.initialize_fresh_store(
                 test_database=self.test_path,
                 operation_id=self.operation_id,
                 attestation_output=self.attestation,
                 expected_test_uid=os.geteuid(),
-                confirmation=MIGRATION_CLI.DISCARD_TEST_HISTORY_CONFIRMATION,
+                confirmation=TEST_STORE_CLI.DISCARD_CONFIRMATION,
             )
         self.assertEqual(self.test_path.read_bytes(), b"not-a-private-test-store")
 
@@ -174,28 +174,28 @@ class FreshTestStoreInitializationTests(unittest.TestCase):
         protected.write_bytes(b"authority")
         protected.chmod(0o600)
         with self.assertRaisesRegex(
-            MIGRATION_CLI.MigrationCommandError,
+            TEST_STORE_CLI.TestStoreCommandError,
             "only the tests.sqlite3",
         ):
-            MIGRATION_CLI.testd_initialize_fresh_store(
+            TEST_STORE_CLI.initialize_fresh_store(
                 test_database=protected,
                 operation_id=self.operation_id,
                 attestation_output=self.attestation,
                 expected_test_uid=os.geteuid(),
-                confirmation=MIGRATION_CLI.DISCARD_TEST_HISTORY_CONFIRMATION,
+                confirmation=TEST_STORE_CLI.DISCARD_CONFIRMATION,
             )
         self.assertEqual(protected.read_bytes(), b"authority")
 
         with self.assertRaisesRegex(
-            MIGRATION_CLI.MigrationCommandError,
-            "operation-bound file",
+            TEST_STORE_CLI.TestStoreCommandError,
+            "bound to the store operation",
         ):
-            MIGRATION_CLI.testd_initialize_fresh_store(
+            TEST_STORE_CLI.initialize_fresh_store(
                 test_database=self.test_path,
                 operation_id=self.operation_id,
                 attestation_output=self.test_parent / "schema-readiness.json",
                 expected_test_uid=os.geteuid(),
-                confirmation=MIGRATION_CLI.DISCARD_TEST_HISTORY_CONFIRMATION,
+                confirmation=TEST_STORE_CLI.DISCARD_CONFIRMATION,
             )
 
 

@@ -181,7 +181,7 @@ SOURCE_FILES = (
     Path("scripts/manage_maintenance_mode.py"),
     Path("scripts/manage_universal_test_adoption.py"),
     Path("scripts/manage_universal_test_credentials.py"),
-    Path("scripts/migrate_universal_test_history.py"),
+    Path("scripts/manage_test_store.py"),
     Path("scripts/orchestrate_availability_cutover.py"),
     Path("scripts/prepare_background_service_handoff.py"),
     Path("scripts/read_coordinator_call_log.py"),
@@ -426,9 +426,9 @@ WRAPPERS = {
         "scripts/manage_universal_test_credentials.py",
         (),
     ),
-    "devcoordinator-test-history": (
+    "devcoordinator-test-store": (
         "python",
-        "scripts/migrate_universal_test_history.py",
+        "scripts/manage_test_store.py",
         (),
     ),
     "devcoordinator-test-preflight": (
@@ -500,7 +500,6 @@ AGENT_CLIENT_RUNTIME_PATHS = (
     "skills/codex-dev-coordinator/scripts/devcoordinator/schema.py",
     "skills/codex-dev-coordinator/scripts/devcoordinator/store.py",
     "skills/codex-dev-coordinator/scripts/devcoordinator/test_actor.py",
-    "skills/codex-dev-coordinator/scripts/devcoordinator/universal_test_admission.py",
     "skills/codex-dev-coordinator/scripts/devcoordinator/universal_test_contract.py",
     "skills/codex-dev-coordinator/scripts/devcoordinator/universal_test_planner.py",
     "skills/codex-dev-coordinator/scripts/devcoordinator/universal_test_store.py",

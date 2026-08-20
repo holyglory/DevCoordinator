@@ -23,7 +23,7 @@ import clean_adopt_availability as subject
 
 
 _AUTHORITY_SCHEMA_VERSION = 15
-_TEST_STORE_SCHEMA_VERSION = 5
+_TEST_STORE_SCHEMA_VERSION = 6
 _INVENTORY_STORE_SCHEMA_VERSION = 1
 
 
@@ -513,7 +513,7 @@ class CleanAdoptionTests(unittest.TestCase):
         test_plane_result = {
             "status": "ready",
             "schema_version": 1,
-            "test_store_schema_version": 5,
+            "test_store_schema_version": 6,
             "store_generation": "store-generation",
             "repository_count": 1,
             "setup_repository_id": repo_id,
@@ -583,7 +583,7 @@ class CleanAdoptionTests(unittest.TestCase):
                 return {
                     "schema_version": 1,
                     "status": "ok",
-                    "test_store_schema_version": 5,
+                    "test_store_schema_version": 6,
                     "store_generation": "fresh-store-generation",
                 }
 
@@ -649,7 +649,7 @@ class CleanAdoptionTests(unittest.TestCase):
                 return {
                     "schema_version": 1,
                     "status": "ok",
-                    "test_store_schema_version": 5,
+                    "test_store_schema_version": 6,
                     "store_generation": "fresh-store-generation",
                 }
 

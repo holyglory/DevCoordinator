@@ -49,7 +49,6 @@ from .maintenance import (
     PUBLIC_MAINTENANCE_MESSAGE,
     load_maintenance_state,
 )
-from .universal_test_admission import TestSubmissionAdmissionGate
 
 PROTOCOL_VERSION = 1
 # Inventory is a bounded whole-host graph.  Keep the local protocol bounded,
@@ -99,7 +98,6 @@ _NON_TERMINAL_OPERATION_ERRORS = frozenset(
         "operation_in_progress",
         "operation_outcome_uncertain",
         "service_shutting_down",
-        "test_admission_drained",
         "test_attempt_runtime_unavailable",
         "worker_operation_uncertain",
     }
@@ -148,13 +146,11 @@ class BrokerOperation(str, Enum):
     TEST_REPOSITORY_CATALOG = "test.repository_catalog"
     TEST_EVIDENCE_CHECK = "test.evidence_check"
     TEST_EVIDENCE_CONSUME = "test.evidence_consume"
-    TEST_ADMISSION_DRAIN_BEGIN = "test.admission_drain_begin"
-    TEST_ADMISSION_DRAIN_STATUS = "test.admission_drain_status"
-    TEST_ADMISSION_DRAIN_CLEAR = "test.admission_drain_clear"
     TEST_ATTEMPT_TICKET = "test.attempt_ticket"
     TEST_ATTEMPT_LAUNCH = "test.attempt_launch"
     TEST_ATTEMPT_STATUS = "test.attempt_status"
     TEST_ATTEMPT_CANCEL = "test.attempt_cancel"
+    TEST_ATTEMPT_COLLECT = "test.attempt_collect"
     RUNTIME_ENSURE = "runtime.ensure"
     RUNTIME_REQUEST = "runtime.request"
     REPOSITORY_ENSURE = "repository.ensure"
@@ -217,6 +213,7 @@ TESTD_INTERNAL_OPERATIONS = frozenset(
         BrokerOperation.TEST_ATTEMPT_LAUNCH,
         BrokerOperation.TEST_ATTEMPT_STATUS,
         BrokerOperation.TEST_ATTEMPT_CANCEL,
+        BrokerOperation.TEST_ATTEMPT_COLLECT,
     }
 )
 
@@ -615,8 +612,6 @@ class SerializedMutationWriter:
         completed_cache_size: int = DEFAULT_COMPLETED_OPERATION_CACHE,
         max_result_bytes: int = DEFAULT_MAX_MESSAGE_BYTES // 2,
         max_concurrent_host_observations: int = 4,
-        test_submission_gate: TestSubmissionAdmissionGate | None = None,
-        test_admission_drain_timeout_seconds: float = 30.0,
     ) -> None:
         if not _is_exact_int(completed_cache_size) or completed_cache_size <= 0:
             raise ValueError("completed_cache_size must be positive")
@@ -629,8 +624,6 @@ class SerializedMutationWriter:
             raise ValueError(
                 "max_concurrent_host_observations must be a non-negative integer"
             )
-        if test_admission_drain_timeout_seconds < 0:
-            raise ValueError("test admission drain timeout must be non-negative")
         self._backend = backend
         self._completed_cache_size = completed_cache_size
         self._max_result_bytes = max_result_bytes
@@ -645,12 +638,6 @@ class SerializedMutationWriter:
         self._inflight_mutation_count = 0
         self._admitted_mutation_count = 0
         self._accepting_mutations = True
-        self._test_submission_gate = (
-            test_submission_gate or TestSubmissionAdmissionGate()
-        )
-        self._test_admission_drain_timeout_seconds = float(
-            test_admission_drain_timeout_seconds
-        )
         self._host_observation_slots = (
             threading.BoundedSemaphore(max_concurrent_host_observations)
             if max_concurrent_host_observations > 0
@@ -743,7 +730,6 @@ class SerializedMutationWriter:
             BrokerOperation.TEST_REPOSITORY_SETUP,
             BrokerOperation.TEST_REPOSITORY_CATALOG,
             BrokerOperation.TEST_EVIDENCE_CHECK,
-            BrokerOperation.TEST_ADMISSION_DRAIN_STATUS,
             BrokerOperation.TEST_ATTEMPT_STATUS,
             BrokerOperation.EPHEMERAL_STATUS,
             BrokerOperation.EPHEMERAL_IMAGE_STATUS,
@@ -762,63 +748,35 @@ class SerializedMutationWriter:
             )
         operation_id = request.request.operation_id
         operation = request.request.operation
-        admitted_test_submission = False
-        if operation is BrokerOperation.TEST_RUN_SUBMIT:
-            admitted_test_submission = self._test_submission_gate.admit_submission()
-            if not admitted_test_submission:
+        with self._metrics_condition:
+            if not self._accepting_mutations:
                 raise BrokerError(
-                    "test_admission_drained",
-                    "New test submissions are temporarily paused for a verified history cutover; retry shortly.",
+                    "service_shutting_down",
+                    "The broker is shutting down; retry with its replacement.",
                     operation_id=operation_id,
                 )
+            self._inflight_mutation_count += 1
+            self._metrics_condition.notify_all()
         try:
-            if operation is BrokerOperation.TEST_ADMISSION_DRAIN_BEGIN:
+            if operation == BrokerOperation.HOST_OBSERVE:
+                slots = self._host_observation_slots
+                if slots is None or not slots.acquire(blocking=False):
+                    raise BrokerError(
+                        "host_observation_busy",
+                        "The broker already has the maximum number of host observation callers; retry later.",
+                        operation_id=operation_id,
+                    )
                 try:
-                    self._test_submission_gate.begin_drain(
-                        timeout_seconds=self._test_admission_drain_timeout_seconds
-                    )
-                except TimeoutError as error:
-                    raise BrokerError(
-                        "test_admission_drain_timeout",
-                        "Existing test submissions did not drain before the migration deadline.",
-                        operation_id=operation_id,
-                    ) from error
-            with self._metrics_condition:
-                if not self._accepting_mutations:
-                    raise BrokerError(
-                        "service_shutting_down",
-                        "The broker is shutting down; retry with its replacement.",
-                        operation_id=operation_id,
-                    )
-                self._inflight_mutation_count += 1
-                self._metrics_condition.notify_all()
-            try:
-                if operation == BrokerOperation.HOST_OBSERVE:
-                    slots = self._host_observation_slots
-                    if slots is None or not slots.acquire(blocking=False):
-                        raise BrokerError(
-                            "host_observation_busy",
-                            "The broker already has the maximum number of host observation callers; retry later.",
-                            operation_id=operation_id,
-                        )
-                    try:
-                        result = self._execute_mutation(request)
-                    finally:
-                        slots.release()
-                else:
-                    result = self._execute_mutation(request)
-                if operation is BrokerOperation.TEST_ADMISSION_DRAIN_CLEAR:
-                    self._test_submission_gate.resume()
-                return result
-            finally:
-                with self._metrics_condition:
-                    self._inflight_mutation_count -= 1
-                    if self._inflight_mutation_count < 0:
-                        raise RuntimeError("broker mutation in-flight count underflow")
-                    self._metrics_condition.notify_all()
+                    return self._execute_mutation(request)
+                finally:
+                    slots.release()
+            return self._execute_mutation(request)
         finally:
-            if admitted_test_submission:
-                self._test_submission_gate.finish_submission()
+            with self._metrics_condition:
+                self._inflight_mutation_count -= 1
+                if self._inflight_mutation_count < 0:
+                    raise RuntimeError("broker mutation in-flight count underflow")
+                self._metrics_condition.notify_all()
 
     def _execute_mutation(
         self, request: AcceptedBrokerRequest
@@ -2928,40 +2886,6 @@ def _validate_arguments(
             ),
         }
 
-    if operation == BrokerOperation.TEST_ADMISSION_DRAIN_BEGIN:
-        if set(value) != {"purpose"} or value["purpose"] != "legacy-test-history-cutover":
-            raise BrokerError(
-                "invalid_arguments",
-                "Test admission drain requires the fixed legacy-history purpose.",
-                operation_id=operation_id,
-            )
-        return {"purpose": "legacy-test-history-cutover"}
-
-    if operation == BrokerOperation.TEST_ADMISSION_DRAIN_STATUS:
-        if value:
-            raise BrokerError(
-                "invalid_arguments",
-                "Test admission drain status accepts no arguments.",
-                operation_id=operation_id,
-            )
-        return {}
-
-    if operation == BrokerOperation.TEST_ADMISSION_DRAIN_CLEAR:
-        if set(value) != {"drain_id", "proof_sha256"}:
-            raise BrokerError(
-                "invalid_arguments",
-                "Test admission drain clear requires the exact drain ID and proof fingerprint.",
-                operation_id=operation_id,
-            )
-        return {
-            "drain_id": _canonical_uuid_argument(
-                value["drain_id"], "drain_id", operation_id
-            ),
-            "proof_sha256": _bare_sha256_argument(
-                value["proof_sha256"], "proof_sha256", operation_id
-            ),
-        }
-
     if operation == BrokerOperation.TEST_ATTEMPT_TICKET:
         if set(value) != {"descriptor", "launch_timeout_seconds"}:
             raise BrokerError(
@@ -3041,19 +2965,29 @@ def _validate_arguments(
             "result_chunk_index": result_chunk_index,
         }
 
-    if operation == BrokerOperation.TEST_ATTEMPT_CANCEL:
-        if set(value) != {"runtime_id", "reason"}:
+    if operation in {
+        BrokerOperation.TEST_ATTEMPT_CANCEL,
+        BrokerOperation.TEST_ATTEMPT_COLLECT,
+    }:
+        expected = (
+            {"runtime_id", "reason"}
+            if operation is BrokerOperation.TEST_ATTEMPT_CANCEL
+            else {"runtime_id"}
+        )
+        if set(value) != expected:
             raise BrokerError(
                 "invalid_arguments",
-                "Internal test cancellation requires runtime_id and reason.",
+                "Internal test cleanup arguments are invalid.",
                 operation_id=operation_id,
             )
-        return {
+        normalized = {
             "runtime_id": _opaque_argument(
                 value["runtime_id"], "runtime_id", operation_id
             ),
-            "reason": _bounded_reason(value["reason"], operation_id),
         }
+        if operation is BrokerOperation.TEST_ATTEMPT_CANCEL:
+            normalized["reason"] = _bounded_reason(value["reason"], operation_id)
+        return normalized
 
     if operation in {
         BrokerOperation.EPHEMERAL_START,

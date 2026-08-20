@@ -390,14 +390,6 @@ def _parser() -> argparse.ArgumentParser:
     )
     _add_scoped_project(queue_status)
 
-    for action, help_text in (
-        ("status", "read compact current state for one run"),
-        ("summary", "read the bounded terminal summary for one run"),
-    ):
-        command = test_actions.add_parser(action, help=help_text)
-        command.add_argument("run", help="dc1:run handle or exact run ID")
-        _add_scoped_project(command)
-
     failures = test_actions.add_parser(
         "failures", help="read one cursor-bounded page of actionable failures"
     )
@@ -420,13 +412,6 @@ def _parser() -> argparse.ArgumentParser:
     artifact.add_argument("run", help="dc1:run handle or exact run ID")
     artifact.add_argument("artifact", help="exact artifact ID")
     _add_scoped_project(artifact)
-
-    wait = test_actions.add_parser(
-        "wait", help="wait for one run up to an explicit bounded deadline"
-    )
-    wait.add_argument("run", help="dc1:run handle or exact run ID")
-    wait.add_argument("--timeout-seconds", type=int, required=True)
-    _add_scoped_project(wait)
 
     cancel = test_actions.add_parser(
         "cancel", help="request cancellation of one exact run"
@@ -538,9 +523,6 @@ def _allows_compatible_release(namespace: argparse.Namespace) -> bool:
         "failures",
         "follow",
         "queue-status",
-        "status",
-        "summary",
-        "wait",
     }
 
 
@@ -2139,14 +2121,8 @@ def _test(
             project_queue_status(status, repository_id=root.repo_id),
             project=context.root.canonical_root,
         )
-    if action in {"follow", "status", "summary", "wait"}:
-        wait_seconds = (
-            namespace.timeout_seconds
-            if action == "wait"
-            else namespace.wait_seconds
-            if action == "follow"
-            else 0
-        )
+    if action == "follow":
+        wait_seconds = namespace.wait_seconds
         if not 0 <= wait_seconds <= 86_400:
             raise AgentCliError(
                 "wait_deadline_invalid", "test wait deadline must be from 0 through 86400"
@@ -2173,7 +2149,7 @@ def _test(
 
         summary = (
             profile.test_run_summary(run_id=run_id, repository=root.repo_id)
-            if action == "summary" or state in TERMINAL_STATES
+            if state in TERMINAL_STATES
             else None
         )
         return _scope_test_result(

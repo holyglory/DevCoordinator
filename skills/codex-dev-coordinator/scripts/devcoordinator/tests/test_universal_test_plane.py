@@ -55,7 +55,7 @@ from devcoordinator.universal_test_store import (
     TestStoreNotFound,
     UniversalTestStore,
     _attempt_progress_document,
-    prepare_test_store_schema_v5,
+    prepare_test_store_schema,
 )
 
 
@@ -334,18 +334,18 @@ class UniversalTestStoreTests(StoreFixture):
 
     def test_schema_preparation_attests_fresh_v5_and_replays(self) -> None:
         mutation = operation_id()
-        first = prepare_test_store_schema_v5(
+        first = prepare_test_store_schema(
             self.path,
             operation_id=mutation,
         )
-        replay = prepare_test_store_schema_v5(
+        replay = prepare_test_store_schema(
             self.path,
             operation_id=mutation,
         )
         self.assertEqual(first, replay)
-        self.assertEqual(first["action"], "attested-fresh-v5")
-        self.assertEqual(first["journal_kind"], "schema_readiness_v5")
-        self.assertEqual(first["store"]["schema_version"], 5)
+        self.assertEqual(first["action"], "attested-fresh")
+        self.assertEqual(first["journal_kind"], "schema_readiness")
+        self.assertEqual(first["store"]["schema_version"], 6)
 
     def test_schema_preparation_fresh_v5_interruption_rolls_back(self) -> None:
         mutation = operation_id()
@@ -355,7 +355,7 @@ class UniversalTestStoreTests(StoreFixture):
                 raise RuntimeError("injected readiness interruption")
 
         with self.assertRaisesRegex(RuntimeError, "readiness interruption"):
-            prepare_test_store_schema_v5(
+            prepare_test_store_schema(
                 self.path,
                 operation_id=mutation,
                 checkpoint=interrupt,
@@ -369,11 +369,11 @@ class UniversalTestStoreTests(StoreFixture):
         finally:
             connection.close()
         self.assertEqual(count, 0)
-        recovered = prepare_test_store_schema_v5(
+        recovered = prepare_test_store_schema(
             self.path,
             operation_id=mutation,
         )
-        self.assertEqual(recovered["action"], "attested-fresh-v5")
+        self.assertEqual(recovered["action"], "attested-fresh")
 
     def test_schema_preparation_rejects_non_v5_with_fresh_store_instruction(self) -> None:
         path = Path(self.temporary.name) / "obsolete.sqlite3"
@@ -391,7 +391,7 @@ class UniversalTestStoreTests(StoreFixture):
             TestStoreConflict,
             "initialize a fresh schema-5 store",
         ):
-            prepare_test_store_schema_v5(path, operation_id=operation_id())
+            prepare_test_store_schema(path, operation_id=operation_id())
         unchanged = sqlite3.connect(path)
         try:
             self.assertEqual(

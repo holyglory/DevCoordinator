@@ -17,7 +17,6 @@ import os
 from pathlib import Path
 import re
 import stat
-from threading import RLock
 from types import MappingProxyType
 from typing import Callable, Mapping, Protocol, Sequence, runtime_checkable
 
@@ -216,10 +215,8 @@ _SETUP_TARGET_FIELDS = frozenset(
         "fixtures",
         "credentials",
         "depends_on",
-        "resources",
     }
 )
-_SETUP_RESOURCE_FIELDS = frozenset({"cpu_millis", "memory_mib", "pids"})
 _SETUP_INPUT_FIELDS = frozenset(
     {"global_input_count", "target_input_count", "targets_with_inputs"}
 )
@@ -227,9 +224,6 @@ _SETUP_INPUT_GAP_FIELDS = frozenset({"code", "message", "detail", "path"})
 _SETUP_ISOLATION_FIELDS = frozenset(
     {
         "network",
-        "cpu_millis",
-        "memory_mib",
-        "pids",
         "private_scratch",
         "kill_after_run",
     }
@@ -532,14 +526,6 @@ def decode_repository_setup_document(
         _exact_fields(
             f"repository setup targets[{index}]", target, _SETUP_TARGET_FIELDS
         )
-        resources = _mapping(
-            f"repository setup targets[{index}].resources", target["resources"]
-        )
-        _exact_fields(
-            f"repository setup targets[{index}].resources",
-            resources,
-            _SETUP_RESOURCE_FIELDS,
-        )
         dependencies = _setup_names(
             f"repository setup targets[{index}].depends_on",
             target["depends_on"],
@@ -581,26 +567,6 @@ def decode_repository_setup_document(
                 "fixtures": list(target_fixtures),
                 "credentials": list(target_credentials),
                 "depends_on": list(dependencies),
-                "resources": {
-                    "cpu_millis": _setup_integer(
-                        "repository setup target cpu_millis",
-                        resources["cpu_millis"],
-                        minimum=50,
-                        maximum=64_000,
-                    ),
-                    "memory_mib": _setup_integer(
-                        "repository setup target memory_mib",
-                        resources["memory_mib"],
-                        minimum=32,
-                        maximum=262_144,
-                    ),
-                    "pids": _setup_integer(
-                        "repository setup target pids",
-                        resources["pids"],
-                        minimum=8,
-                        maximum=32_768,
-                    ),
-                },
             }
         )
     target_names = tuple(str(target["name"]) for target in targets)
@@ -699,24 +665,6 @@ def decode_repository_setup_document(
         raise TestStoreContractError("repository setup isolation network is invalid")
     isolation = {
         "network": isolation_network,
-        "cpu_millis": _setup_integer(
-            "repository setup isolation.cpu_millis",
-            isolation_raw["cpu_millis"],
-            minimum=0,
-            maximum=64_000,
-        ),
-        "memory_mib": _setup_integer(
-            "repository setup isolation.memory_mib",
-            isolation_raw["memory_mib"],
-            minimum=0,
-            maximum=262_144,
-        ),
-        "pids": _setup_integer(
-            "repository setup isolation.pids",
-            isolation_raw["pids"],
-            minimum=0,
-            maximum=32_768,
-        ),
         "private_scratch": isolation_raw["private_scratch"],
         "kill_after_run": isolation_raw["kill_after_run"],
     }
@@ -768,15 +716,6 @@ def decode_repository_setup_document(
             )
         expected_isolation = {
             "network": max(network_values, key=_SETUP_NETWORKS.__getitem__),
-            "cpu_millis": max(
-                int(target["resources"]["cpu_millis"]) for target in targets  # type: ignore[index]
-            ),
-            "memory_mib": max(
-                int(target["resources"]["memory_mib"]) for target in targets  # type: ignore[index]
-            ),
-            "pids": max(
-                int(target["resources"]["pids"]) for target in targets  # type: ignore[index]
-            ),
             "private_scratch": True,
             "kill_after_run": True,
         }
@@ -797,9 +736,6 @@ def decode_repository_setup_document(
             )
         if any(coverage.values()) or isolation != {
             "network": "none",
-            "cpu_millis": 0,
-            "memory_mib": 0,
-            "pids": 0,
             "private_scratch": True,
             "kill_after_run": True,
         }:
@@ -1377,9 +1313,6 @@ class StoreTestPlaneAdapter:
         if canceller is not None and not callable(canceller):
             raise TestStoreContractError("test run canceller is invalid")
         self._canceller = canceller
-        self._plans: dict[str, TestPlan] = {}
-        self._preview_resources: dict[str, Mapping[str, TargetResources]] = {}
-        self._lock = RLock()
 
     def health(self) -> Mapping[str, object]:
         metadata = self._store.health()
@@ -1408,9 +1341,6 @@ class StoreTestPlaneAdapter:
             if set(raw) != expected:
                 raise TestStoreContractError("preview target resource fields are invalid")
             result[target_name] = TargetResources(
-                cpu_millis=raw["cpu_millis"],
-                memory_mib=raw["memory_mib"],
-                pids=raw["pids"],
                 estimated_seconds=raw["estimated_seconds"],
                 shard_count=raw["shard_count"],
                 max_attempts=raw["max_attempts"],
@@ -2145,8 +2075,6 @@ class StoreTestPlaneAdapter:
         }
         if resources_value is not None:
             resources = self._preview_target_resources(resources_value, plan=plan)
-            with self._lock:
-                self._preview_resources[plan.plan_id] = resources
             result["target_resources"] = {
                 name: {
                     field: (
@@ -2242,13 +2170,6 @@ class StoreTestPlaneAdapter:
         durable = self._store.register_plan(
             plan, target_resources=target_resources
         )
-        with self._lock:
-            existing = self._plans.get(plan.plan_id)
-            if existing is not None and existing.fingerprint != plan.fingerprint:
-                raise TestStoreConflict("plan_id is registered with another fingerprint")
-            self._plans[plan.plan_id] = plan
-            if target_resources is not None:
-                self._preview_resources[plan.plan_id] = target_resources
         return self._bounded(
             {
                 "schema_version": 1,
@@ -2284,9 +2205,6 @@ class StoreTestPlaneAdapter:
                 "submitted repository_id does not match the registered plan"
             )
         if target_resources is None:
-            with self._lock:
-                target_resources = self._preview_resources.get(plan.plan_id)
-        if target_resources is None:
             target_resources = self._store.get_plan_target_resources(plan.plan_id)
         result = self._store.submit_plan(
             plan,
@@ -2305,10 +2223,6 @@ class StoreTestPlaneAdapter:
         )
 
     def _resolve_plan(self, plan_id: str) -> TestPlan:
-        with self._lock:
-            plan = self._plans.get(plan_id)
-        if plan is not None:
-            return plan
         try:
             plan = decode_test_plan_document(
                 self._store.get_plan_document(plan_id)
@@ -2319,8 +2233,6 @@ class StoreTestPlaneAdapter:
             raise TestStoreConflict(
                 "plan is not registered with the current testd"
             ) from error
-        with self._lock:
-            self._plans[plan.plan_id] = plan
         return plan
 
     def status(

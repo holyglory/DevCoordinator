@@ -136,9 +136,6 @@ class ImmutableDependencyBindingTests(unittest.TestCase):
             fixtures=(),
             network="none",
             ttl_seconds=30,
-            cpu_millis=0,
-            memory_mib=0,
-            pids=0,
             source_provenance=self.provenance,
             dependency_bindings=tuple(bindings),
         )

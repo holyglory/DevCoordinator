@@ -56,7 +56,10 @@ from devcoordinator.normalized_server_lifecycle import (  # noqa: E402
 )
 from devcoordinator.store import AccountStore, deterministic_id, utc_timestamp  # noqa: E402
 from devcoordinator.schema import SCHEMA_VERSION  # noqa: E402
-from devcoordinator.universal_test_store import UniversalTestStore  # noqa: E402
+from devcoordinator.universal_test_store import (  # noqa: E402
+    TEST_STORE_SCHEMA_VERSION,
+    UniversalTestStore,
+)
 from devcoordinator.universal_test_transport import (  # noqa: E402
     TestPlaneTransportError,
     UnixTestPlaneClient,
@@ -997,7 +1000,6 @@ def _synthetic_sealed_state(
             "test_database": str(destinations["test_database"]),
             "inventory_canary_project": str(manifest["background_project_root"]),
             "authority_backup_directory": str(transaction_root / "authority-backups"),
-            "test_backup_directory": str(transaction_root / "test-backups"),
             "migration_state": str(transaction_root / "migration.json"),
             "drain_proof": str(transaction_root / "drain.json"),
             "cutover_seal": str(transaction_root / "seal.json"),
@@ -1390,7 +1392,7 @@ def _test_plane_application_canary(
     if (
         health.get("schema_version") != 1
         or health.get("status") != "ok"
-        or health.get("test_store_schema_version") != 5
+        or health.get("test_store_schema_version") != TEST_STORE_SCHEMA_VERSION
         or not isinstance(health.get("store_generation"), str)
         or not health["store_generation"]
     ):
@@ -1424,7 +1426,7 @@ def _test_plane_application_canary(
     return {
         "status": "ready",
         "schema_version": 1,
-        "test_store_schema_version": 5,
+        "test_store_schema_version": TEST_STORE_SCHEMA_VERSION,
         "store_generation": health["store_generation"],
         "repository_count": len(repository_ids),
         "setup_repository_id": setup_repository_id,
@@ -1576,7 +1578,7 @@ def _final_health_gate(
         "test_plane": test_plane,
         "authority_schema_version": SCHEMA_VERSION,
         "inventory_generation": inventory["generation"],
-        "test_schema_version": 5,
+        "test_schema_version": TEST_STORE_SCHEMA_VERSION,
         "public_status": public_status,
     }
 

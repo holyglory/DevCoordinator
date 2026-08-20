@@ -8986,20 +8986,13 @@ def _first_adoption_test_store_completion(
         completion = cutover._test_store_cutover_completion(state)
     except cutover.CutoverError as error:
         raise ActivationError(str(error)) from error
-    history_migrated = completion["mode"] == "history-migrated"
     if (
         state.get("phase") != "sealed"
-        or (
-            history_migrated
-            and "final-import" not in state.get("evidence", {})
-        )
-        or (
-            not history_migrated
-            and "test-history-discard" not in state.get("evidence", {})
-        )
+        or completion["mode"] != "history-discarded"
+        or "test-history-discard" not in state.get("evidence", {})
     ):
         raise ActivationError(
-            "first adoption requires one sealed migrated or discarded Test Store"
+            "first adoption requires one sealed fresh disposable Test Store"
         )
     return completion
 

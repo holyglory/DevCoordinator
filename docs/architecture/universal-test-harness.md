@@ -75,6 +75,14 @@ may inspect source metadata, after which the root boundary revalidates and
 clamps the launch descriptor. Repository content is never executed while
 parsing a manifest, and filesystem stat ownership never selects execution.
 
+Testd and the disposable Test Store are the sole semantic authority for plan
+inputs, dependency readiness, runs, attempts, deadlines, leases, result order,
+and conclusions. The privileged snapshot/runtime boundary returns exact host
+facts and performs idempotent prepare/start/observe/stop/collect actions; it
+does not retain a second run state machine. Framework invocation, dependency,
+and reporter selection is routed through explicit driver registries before the
+normalized attempt/result crosses the store or scheduler.
+
 1. `test plan` validates the manifest, computes changed inputs, expands target
    dependencies and reverse dependencies, and registers a durable plan.
 2. `test submit` is idempotent and returns a run ID immediately.
@@ -112,8 +120,9 @@ parsing a manifest, and filesystem stat ownership never selects execution.
 7. Chunked result and exit evidence is durably spooled. Exact attempt,
    repository-generation, attempt-generation, chunk, and operation IDs make
    replay idempotent and prevent an abandoned attempt from completing a retry.
-8. Terminalization requires a complete, internally consistent chunk set and
-   updates materialized rollups without joining high-volume reads to raw cases.
+8. Terminalization requires a complete, internally consistent chunk set.
+   Testd commits that conclusion first, then requests exact privileged runtime
+   collection; rollups update without joining high-volume reads to raw cases.
 
 Lease expiry, missed heartbeat, crash, timeout, cancellation, incomplete
 reporting, abandonment, test failure, infrastructure failure, and superseded
@@ -519,18 +528,18 @@ errors and path-discovery detail remain inside the repository-UID boundary.
 Missing or invalid manifests have no input-coverage claims; their existing
 sanitized manifest issue is the sole Setup blocker.
 
-## Migration and activation
+## Test Store cutover and activation
 
-Test history is disposable unless an operator explicitly requests retention.
-The normal first deployment therefore keeps testd offline, recreates only its
+Test history is disposable. An incompatible deployment keeps testd offline,
+recreates only its
 private store at the current schema, publishes schema-readiness evidence, and
 starts testd. It does not capture, drain, export, import, or seal prior test
 rows, and it never opens the authority, profile, inventory, or Console stores:
 
 ```bash
 sudo -n -H -u devcoordinator-testd \
-  /opt/devcoordinator/releases/<digest>/bin/devcoordinator-test-history \
-  testd-initialize-fresh \
+  /opt/devcoordinator/releases/<digest>/bin/devcoordinator-test-store \
+  initialize-fresh \
   --test-database /var/lib/devcoordinator-testd/tests.sqlite3 \
   --operation-id <canonical-operation-uuid> \
   --attestation-output \
@@ -542,8 +551,8 @@ sudo -n -H -u devcoordinator-testd \
 The database parent must be testd-owned mode `0700`; the database and SQLite
 sidecars, when present, must be testd-owned private regular files. A completed
 operation replays through its unique attestation without deleting newly
-recorded data. History-preserving watermark/export/import machinery remains an
-optional offline recovery tool, not a deployment or readiness requirement.
+recorded data. There is no authority-history importer or admission-drain
+protocol.
 The availability cutover `init` consumes the exact attestation with
 `--discard-test-history discard-test-history`,
 `--fresh-test-store-attestation`, and its sealed SHA-256; it enters `sealed`
@@ -555,8 +564,7 @@ Activation is evidence-gated. It requires:
 - root-owned protected profiles reconstructed from current authority evidence;
 - a generation-bound capability policy covering every enrolled repository;
 - sealed credential and filesystem preflight;
-- a current test-store schema-readiness attestation; historical migration and
-  retention attestations only when retention was explicitly selected;
+- a current Test Store schema-readiness attestation;
 - verified candidate health and socket-listener continuity;
 - an executable rollback to the exact prior publication and service graph.
 
@@ -577,7 +585,7 @@ hashes the current candidate files, rejects another release or boot, and
 allows at most five minutes between observation and use.
 
 Console/API code uses start-verify-switch-drain. Same-schema broker code uses
-admission drain and socket-preserving replacement. Test, observer, notification,
+socket-preserving replacement. Test, observer, notification,
 and their databases replace locally. Only an authority transaction uses the
 global mutation fence.
 
@@ -587,7 +595,7 @@ Readiness requires focused and full tests for manifest fuzzing, source
 selection, live supersession, immutable provenance, fairness, sharding,
 deduplication, cancellation, timeouts, lost heartbeats, spool replay, reporter
 integration, secret leakage, cross-UID authorization, stale-generation reuse,
-artifact substitution, migration interruption, and rollback.
+artifact substitution, fresh-store interruption, and rollback.
 
 Fault and load gates must prove that project/test fork bombs, OOMs, crash
 loops, malformed output, slow upstreams, and request bursts cannot restart,

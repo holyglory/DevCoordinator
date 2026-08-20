@@ -83,11 +83,6 @@ from .ephemeral_secrets import (
     deterministic_secret_binding_id,
     normalize_ephemeral_secret_policy,
 )
-from .universal_test_admission import (
-    clear_legacy_test_admission_drain_proof,
-    persist_legacy_test_admission_drain_proof,
-    read_legacy_test_admission_drain_proof,
-)
 
 
 DEFAULT_PORT_LEASE_TTL_SECONDS = 600
@@ -97,13 +92,6 @@ OPERATION_FOLLOW_TARGET_SCAN_LIMIT = 32
 # any client can connect. Keep that one transaction bounded by the service's
 # startup envelope rather than the short per-request mutation budget.
 BROKER_INITIALIZATION_MAX_SECONDS = 60.0
-TEST_ADMISSION_ADMIN_OPERATIONS = frozenset(
-    {
-        BrokerOperation.TEST_ADMISSION_DRAIN_BEGIN,
-        BrokerOperation.TEST_ADMISSION_DRAIN_STATUS,
-        BrokerOperation.TEST_ADMISSION_DRAIN_CLEAR,
-    }
-)
 _REPOSITORY_LIFECYCLE_OPERATIONS = frozenset(
     {
         BrokerOperation.REPOSITORY_PLAN_REMOVE,
@@ -1199,8 +1187,6 @@ class StoreBackedRequestAcceptor:
     def accept(
         self, peer: PeerCredentials, request: BrokerRequest
     ) -> AcceptedBrokerRequest:
-        if request.operation in TEST_ADMISSION_ADMIN_OPERATIONS:
-            return self._persistence.accept_test_admission_admin(peer, request)
         if request.operation in TESTD_INTERNAL_OPERATIONS:
             return self._persistence.accept_internal_testd(peer, request)
         return self._persistence.accept(peer, request)
@@ -1594,74 +1580,6 @@ class BrokerPersistence:
                         "ephemeral_secret_policies": {},
                     },
                 }
-
-    def accept_test_admission_admin(
-        self, peer: PeerCredentials, request: BrokerRequest
-    ) -> AcceptedBrokerRequest:
-        """Validate the fixed test-admission target namespace."""
-
-        if request.operation not in TEST_ADMISSION_ADMIN_OPERATIONS:
-            raise BrokerError(
-                "operation_unavailable",
-                "This request is not a test-admission administration operation.",
-                operation_id=request.operation_id,
-            )
-        if (
-            request.project_id != "authority"
-            or request.resource_id != "test-admission"
-            or request.repository_generation != 0
-        ):
-            raise BrokerError(
-                "resource_identity_mismatch",
-                "Test admission migration controls require the exact typed target namespace.",
-                operation_id=request.operation_id,
-            )
-        with self._store() as store:
-            with store.read_transaction() as connection:
-                generation = connection.execute(
-                    "SELECT database_generation FROM schema_metadata WHERE singleton = 1"
-                ).fetchone()
-        if generation is None or str(generation[0]) != request.authority_generation:
-            raise BrokerError(
-                "broker_generation_mismatch",
-                "The migration request belongs to another database generation.",
-                operation_id=request.operation_id,
-            )
-        return AcceptedBrokerRequest(peer=peer, request=request)
-
-    def active_test_admission_proof(self) -> Mapping[str, object] | None:
-        with self._store() as store:
-            with store.read_transaction() as connection:
-                return read_legacy_test_admission_drain_proof(connection)
-
-    def activate_test_admission_drain(
-        self,
-        *,
-        activated_at_epoch: int,
-        activated_by_uid: int,
-        drained_at_epoch: int,
-        broker_instance_id: str,
-    ) -> Mapping[str, object]:
-        with self._store() as store:
-            with store.immediate_transaction(max_seconds=5.0) as connection:
-                return persist_legacy_test_admission_drain_proof(
-                    connection,
-                    activated_at_epoch=activated_at_epoch,
-                    activated_by_uid=activated_by_uid,
-                    drained_at_epoch=drained_at_epoch,
-                    broker_instance_id=broker_instance_id,
-                )
-
-    def clear_test_admission_drain(
-        self, *, drain_id: str, proof_sha256: str
-    ) -> Mapping[str, object]:
-        with self._store() as store:
-            with store.immediate_transaction(max_seconds=5.0) as connection:
-                return clear_legacy_test_admission_drain_proof(
-                    connection,
-                    drain_id=drain_id,
-                    proof_sha256=proof_sha256,
-                )
 
     def retarget_test_repository(
         self,

@@ -27,13 +27,6 @@ PACKAGE_ROOT = ROOT / "skills" / "codex-dev-coordinator" / "scripts"
 TEST_ROOT = PACKAGE_ROOT / "devcoordinator" / "tests"
 TEST_PACKAGE = "devcoordinator.tests"
 
-# These modules preserve operator-invoked recovery coverage, but they are not
-# part of normal change/handoff/release evidence. Production initializes an
-# empty current-schema test store; legacy history migration runs only when an
-# operator explicitly asks to retain history.
-NON_GATE_COMPATIBILITY_MODULES = frozenset({"test_universal_test_migration"})
-
-
 @dataclass(frozen=True)
 class Partition:
     name: str
@@ -77,15 +70,7 @@ def discovered_modules(test_root: Path = TEST_ROOT) -> tuple[str, ...]:
     return tuple(
         path.stem
         for path in sorted(test_root.glob("test_*.py"))
-        if path.stem not in NON_GATE_COMPATIBILITY_MODULES
     )
-
-
-def non_gate_compatibility_modules(
-    test_root: Path = TEST_ROOT,
-) -> tuple[str, ...]:
-    present = {path.stem for path in test_root.glob("test_*.py")}
-    return tuple(sorted(present & NON_GATE_COMPATIBILITY_MODULES))
 
 
 def partitioned_modules(
@@ -109,14 +94,6 @@ def partition_contract_errors(
     discovered = discovered_modules() if modules is None else tuple(modules)
     grouped = partitioned_modules(discovered)
     errors: list[str] = []
-    missing_compatibility = sorted(
-        NON_GATE_COMPATIBILITY_MODULES - set(non_gate_compatibility_modules())
-    )
-    if missing_compatibility:
-        errors.append(
-            "declared non-gate compatibility module(s) missing: "
-            + ", ".join(missing_compatibility)
-        )
     empty = [name for name, values in grouped.items() if not values]
     if empty:
         errors.append("empty partition(s): " + ", ".join(empty))

@@ -78,15 +78,16 @@ class HistoryRunner(FakeRunner):
 
     def require_json(self, argv: list[str], _label: str) -> dict[str, object]:
         self.commands.append(list(argv))
-        if "testd-initialize-fresh" in argv:
+        if "initialize-fresh" in argv:
             attestation = argv[argv.index("--attestation-output") + 1]
             return {
                 "ok": True,
-                "action": "testd-initialize-fresh",
-                "branch": "attested-fresh-v5",
+                "action": "test-store-initialize-fresh",
+                "branch": "attested-fresh",
                 "attestation": attestation,
                 "attestation_fingerprint": "c" * 64,
                 "store_generation": "forward-generation",
+                "schema_version": 6,
                 "discarded_existing": True,
                 "replayed": False,
             }
@@ -787,9 +788,9 @@ def exercise_release_packaging_contract() -> None:
         "same-schema immutable wrapper is missing or points elsewhere",
     )
     expect(
-        switch.installer.WRAPPERS.get("devcoordinator-test-history")
-        == ("python", "scripts/migrate_universal_test_history.py", ()),
-        "test-history reset wrapper is absent from immutable releases",
+        switch.installer.WRAPPERS.get("devcoordinator-test-store")
+        == ("python", "scripts/manage_test_store.py", ()),
+        "Test Store reset wrapper is absent from immutable releases",
     )
     expect(
         switch.installer.WRAPPERS.get(switch.BROWSER_ACCOUNTING_WRAPPER)
@@ -1290,8 +1291,8 @@ def exercise_opt_in_test_history_reset_and_previous_release_rollback() -> None:
                 "forward test-history reset was not journaled",
             )
             expect(
-                reset["forward_evidence"]["schema_version"] == 5,
-                "forward reset did not attest schema 5",
+                reset["forward_evidence"]["schema_version"] == 6,
+                "forward reset did not attest schema 6",
             )
             expect(
                 reset["forward_evidence"]["spool"]["fresh"] is True,
@@ -1306,7 +1307,7 @@ def exercise_opt_in_test_history_reset_and_previous_release_rollback() -> None:
             initialize = next(
                 command
                 for command in runner.commands
-                if "testd-initialize-fresh" in command
+                if "initialize-fresh" in command
             )
             stop = next(
                 command
@@ -1350,7 +1351,11 @@ def exercise_opt_in_test_history_reset_and_previous_release_rollback() -> None:
             )
             create = next(command for command in runner.commands if "create" in command)
             expect(
-                str(previous / "bin" / switch.TEST_HISTORY_WRAPPER) in create,
+                (
+                    str(previous / "bin" / switch.TEST_HISTORY_WRAPPER) in create
+                    or str(previous / "bin" / switch.PREVIOUS_TEST_HISTORY_WRAPPER)
+                    in create
+                ),
                 "rollback did not use the previous release's test-history wrapper",
             )
             expect(
