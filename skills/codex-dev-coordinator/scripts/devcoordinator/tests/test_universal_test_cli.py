@@ -623,10 +623,18 @@ class UniversalTestCliTests(unittest.TestCase):
             parser().parse_args(
                 ["test", "failures", *RUN_REPOSITORY_ARGS, "--run-id", "run-1", "--limit", "51"]
             )
+        compact_failures = parser().parse_args(
+            ["test", "failures", *RUN_REPOSITORY_ARGS, "--run-id", "run-1"]
+        )
+        self.assertTrue(compact_failures.compact_json)
         with self.assertRaises(SystemExit):
             parser().parse_args(
                 ["test", "cases", *RUN_REPOSITORY_ARGS, "--run-id", "run-1", "--limit", "51"]
             )
+        compact_cases = parser().parse_args(
+            ["test", "cases", *RUN_REPOSITORY_ARGS, "--run-id", "run-1"]
+        )
+        self.assertTrue(compact_cases.compact_json)
         with self.assertRaises(SystemExit):
             parser().parse_args(
                 ["test", "wait", *RUN_REPOSITORY_ARGS, "--run-id", "run-1", "--timeout-seconds", "86401"]

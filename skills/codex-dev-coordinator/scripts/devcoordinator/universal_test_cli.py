@@ -423,6 +423,7 @@ def add_universal_test_cli_parser(subparsers: Any) -> argparse.ArgumentParser:
     failures.add_argument("--run-id", required=True, type=_opaque_id)
     failures.add_argument("--after", type=_opaque_id)
     failures.add_argument("--limit", type=_page_limit, default=25)
+    failures.set_defaults(compact_json=True)
 
     cases = actions.add_parser(
         "cases", help="read one cursor-bounded page of retained case results"
@@ -431,6 +432,7 @@ def add_universal_test_cli_parser(subparsers: Any) -> argparse.ArgumentParser:
     cases.add_argument("--run-id", required=True, type=_opaque_id)
     cases.add_argument("--after", type=_case_cursor, default=0)
     cases.add_argument("--limit", type=_page_limit, default=25)
+    cases.set_defaults(compact_json=True)
 
     artifact = actions.add_parser(
         "artifact", help="resolve one exact verified artifact handle"
