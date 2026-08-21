@@ -60,8 +60,6 @@ _FAILURE_CLASSIFICATIONS = frozenset(
         "timeout",
         "cancellation",
         "incomplete_reporting",
-        "abandonment",
-        "superseded",
     }
 )
 _TERMINAL_OUTCOMES = frozenset(

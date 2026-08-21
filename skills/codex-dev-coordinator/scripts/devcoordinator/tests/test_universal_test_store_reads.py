@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 import tempfile
 import unittest
@@ -9,8 +10,10 @@ from devcoordinator.universal_test_contract import SourceMode, parse_test_manife
 from devcoordinator.universal_test_planner import SourceIdentity, create_test_plan
 from devcoordinator.universal_test_store import (
     AttemptConclusion,
-    AttemptResultChunk,
     CaseResult,
+    ExecutionResultPackage,
+    FailureClassification,
+    FailureRecord,
     TestStoreContractError,
     TestStoreNotFound,
     UniversalTestStore,
@@ -131,43 +134,65 @@ class UniversalTestStoreReadTests(unittest.TestCase):
     def test_case_details_are_reduced_to_current_run_counts(self) -> None:
         submitted = self.submit()
         target = self.store.runnable_targets()[0]
-        grant = self.store.lease_target(
+        execution_id = self.store.execution_identity(target.target_id)
+        systemd_unit = (
+            "devcoordinator-test-"
+            + hashlib.sha256(execution_id.encode("utf-8")).hexdigest()[:32]
+            + ".service"
+        )
+        grant = self.store.begin_execution(
             target.target_id,
-            lease_owner="testd",
-            lease_seconds=30,
+            repository_generation=1,
+            systemd_unit=systemd_unit,
+            launch_operation_id=operation_id(),
+            descriptor_fingerprint="a" * 64,
+            launch_deadline_at=self.clock() + 30,
             operation_id=operation_id(),
         )
-        self.store.acknowledge_launch(
-            grant.attempt_id,
+        self.store.record_started(
+            grant.execution_id,
             generation=grant.generation,
+            systemd_unit=systemd_unit,
             launch_ack_id="launch-1",
+            started_at=self.clock(),
             operation_id=operation_id(),
         )
-        self.store.append_result_chunk(
-            grant.attempt_id,
+        self.store.complete_from_package(
+            grant.execution_id,
             generation=grant.generation,
-            chunk=AttemptResultChunk(
-                chunk_id="chunk-1",
-                chunk_index=0,
+            systemd_unit=systemd_unit,
+            package=ExecutionResultPackage(
+                package_id="package-1",
                 cases=(
                     CaseResult("case-a", "case a", "passed", 0.1),
                     CaseResult("case-b", "case b", "failed", 0.2),
                 ),
+                failures=(
+                    FailureRecord(
+                        failure_id="failure-1",
+                        classification=FailureClassification.TEST_FAILURE,
+                        message="case b failed",
+                        case_id="case-b",
+                    ),
+                ),
                 reporter_complete=True,
             ),
-        )
-        self.store.terminalize_attempt(
-            grant.attempt_id,
-            generation=grant.generation,
             conclusion=AttemptConclusion.TEST_FAILED,
             duration_seconds=0.3,
             operation_id=operation_id(),
+            unit_inactive=True,
+            cgroup_empty=True,
         )
 
         metrics = self.store.run_metrics(submitted.run_id)
         self.assertEqual(metrics["passed_count"], 1)
         self.assertEqual(metrics["failed_count"], 1)
-        self.assertFalse(hasattr(self.store, "cases"))
+        cases = self.store.cases(run_id=submitted.run_id, limit=1)
+        self.assertEqual(cases[0]["case_id"], "case-a")
+        next_page = self.store.cases(
+            run_id=submitted.run_id, after=int(cases[0]["cursor"]), limit=1
+        )
+        self.assertEqual(next_page[0]["case_id"], "case-b")
 
 
 if __name__ == "__main__":
