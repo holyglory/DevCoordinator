@@ -27,7 +27,6 @@ from typing import Callable, Mapping, Protocol, Sequence, runtime_checkable
 import uuid
 import zipfile
 
-from .universal_test_artifacts import package_directory
 from .universal_test_contract import deterministic_fingerprint
 from .universal_test_repository_binding import (
     publish_immutable_repository_binding,
@@ -41,6 +40,13 @@ from .universal_test_snapshot import (
     snapshot_regular_file_digest,
 )
 from .universal_test_store import TestStoreConflict, TestStoreContractError
+from .universal_test_result_package import (
+    RESULT_PACKAGE_FILE_NAME,
+    ResultPackageError,
+    ValidatedResultPackage,
+    copy_result_package_artifact,
+    validate_result_package,
+)
 
 
 _LOGGER = logging.getLogger(__name__)
@@ -240,23 +246,6 @@ def _systemd_counter(value: str | None, *, field: str) -> int | None:
     parsed = int(value)
     # systemd uses UINT64_MAX when an accounting value is unavailable.
     return None if parsed == (1 << 64) - 1 else parsed
-
-
-def _runner_resource_usage(
-    result: Mapping[str, object] | None,
-) -> tuple[int | None, float | None]:
-    if result is None:
-        return None, None
-    has_peak = "peak_memory_bytes" in result
-    has_cpu = "cpu_seconds" in result
-    if not has_peak and not has_cpu:
-        return None, None
-    if not has_peak or not has_cpu:
-        raise TestStoreContractError("test runner resource measurements are incomplete")
-    return (
-        _validated_peak_memory_bytes(result["peak_memory_bytes"]),
-        _validated_cpu_seconds(result["cpu_seconds"]),
-    )
 
 
 def _stable_file_identity(metadata: os.stat_result) -> tuple[int, ...]:
@@ -1437,7 +1426,7 @@ class NativeTestAttemptState:
     exit_status: int | None
     started_at: float | None = None
     finished_at: float | None = None
-    result_document: Mapping[str, object] | None = None
+    result_package: Mapping[str, object] | None = None
     systemd_result: str | None = None
     exec_main_code: int | None = None
     termination_reason: str | None = None
@@ -1446,6 +1435,10 @@ class NativeTestAttemptState:
     cpu_seconds: float | None = None
     current_memory_bytes: int | None = None
     output_progress: Mapping[str, object] | None = None
+    systemd_unit: str | None = None
+    invocation_id: str | None = None
+    control_group: str | None = None
+    cgroup_populated: bool | None = None
 
 
 @runtime_checkable
@@ -1454,11 +1447,11 @@ class NativeTestAttemptManager(Protocol):
 
     def status(self, runtime_id: str) -> NativeTestAttemptState: ...
 
-    def read_result_chunk(
-        self, runtime_id: str, chunk_index: int
-    ) -> Mapping[str, object] | None: ...
-
     def cancel(self, runtime_id: str) -> NativeTestAttemptState: ...
+
+    def resolve_result_package(
+        self, storage_handle: str
+    ) -> ValidatedResultPackage: ...
 
     def collect(self, runtime_id: str) -> None: ...
 
@@ -1480,6 +1473,8 @@ class SystemdTestAttemptManager:
         snapshot_root: Path = Path("/var/lib/devcoordinator-test-snapshots"),
         attempt_root: Path = Path("/var/lib/devcoordinator-test-runs"),
         artifact_root: Path = Path("/var/lib/devcoordinator-test-artifacts"),
+        result_package_root: Path = Path("/var/lib/devcoordinator-test-results"),
+        cgroup_root: Path = Path("/sys/fs/cgroup"),
         fixture_provider: TestFixtureProvider | None = None,
         credential_provider: TestCredentialProvider | None = None,
         runner: Runner = subprocess.run,
@@ -1497,6 +1492,8 @@ class SystemdTestAttemptManager:
         self.snapshot_root = Path(snapshot_root).absolute()
         self.attempt_root = Path(attempt_root).absolute()
         self.artifact_root = Path(artifact_root).absolute()
+        self.result_package_root = Path(result_package_root).absolute()
+        self.cgroup_root = Path(cgroup_root).absolute()
         if fixture_provider is not None and not isinstance(
             fixture_provider, TestFixtureProvider
         ):
@@ -2808,7 +2805,7 @@ class SystemdTestAttemptManager:
         output = state / "output"
         output.mkdir(mode=0o700)
         os.chown(output, descriptor.owner_uid, owner_gid)
-        result_path = output / "result.json"
+        result_path = output / RESULT_PACKAGE_FILE_NAME
         launch_path = state / "launch.json"
         runtime_environment = dict(descriptor.environment)
         for binding in descriptor.dependency_bindings:
@@ -2931,7 +2928,7 @@ class SystemdTestAttemptManager:
             document["descriptor_fingerprint"]
             not in {descriptor.fingerprint, retained_descriptor_fingerprint}
             or document["output_root"] != str(output_root)
-            or document["result_path"] != str(output_root / "result.json")
+            or document["result_path"] != str(output_root / RESULT_PACKAGE_FILE_NAME)
             or self._runtime_id(descriptor) != runtime_id
         ):
             raise TestStoreConflict("test attempt launch identity is contradictory")
@@ -2950,43 +2947,164 @@ class SystemdTestAttemptManager:
 
         return self._recover_launch_evidence(runtime_id)
 
-    def _read_runner_result(self, runtime_id: str) -> Mapping[str, object] | None:
-        state = self.attempt_root / runtime_id
-        launch_path = state / "launch.json"
-        result_path = state / "output" / "result.json"
+    @staticmethod
+    def _native_invocation_id() -> str:
+        return "test-invocation-" + uuid.uuid4().hex
+
+    def _native_path(self, runtime_id: str) -> Path:
+        runtime_id = _safe_id("runtime_id", runtime_id)
+        return self.attempt_root / runtime_id / "native.json"
+
+    def _publish_native_evidence(
+        self,
+        runtime_id: str,
+        descriptor: TestAttemptDescriptor,
+        *,
+        invocation_id: str,
+        prepared_at: float,
+        started_at: float | None,
+        control_group: str | None,
+    ) -> Mapping[str, object]:
+        invocation_id = _safe_id("invocation_id", invocation_id)
+        if not invocation_id.startswith("test-invocation-"):
+            raise TestStoreContractError("test invocation identity is invalid")
+        document = {
+            "schema_version": 1,
+            "runtime_id": runtime_id,
+            "systemd_unit": self._unit(runtime_id),
+            "invocation_id": invocation_id,
+            "descriptor_sha256": descriptor.fingerprint,
+            "prepared_at": float(prepared_at),
+            "started_at": None if started_at is None else float(started_at),
+            "control_group": control_group,
+        }
+        payload = json.dumps(
+            document,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+        path = self._native_path(runtime_id)
+        temporary = path.with_name(f".native-{uuid.uuid4().hex}.tmp")
+        descriptor_fd = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+            0o400,
+        )
         try:
-            launch_info = launch_path.lstat()
-        except FileNotFoundError:
-            return None
+            os.fchmod(descriptor_fd, 0o400)
+            view = memoryview(payload)
+            written = 0
+            while written < len(view):
+                written += os.write(descriptor_fd, view[written:])
+            os.fsync(descriptor_fd)
+        finally:
+            os.close(descriptor_fd)
+        os.replace(temporary, path)
+        directory_fd = os.open(
+            path.parent,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+        )
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+        return document
+
+    def _read_native_evidence(self, runtime_id: str) -> Mapping[str, object]:
+        path = self._native_path(runtime_id)
+        try:
+            before = path.lstat()
+            payload = path.read_bytes()
+            after = path.lstat()
+        except OSError as error:
+            raise TestStoreConflict("test native invocation evidence is unavailable") from error
         if (
-            not stat.S_ISREG(launch_info.st_mode)
-            or stat.S_ISLNK(launch_info.st_mode)
-            or launch_info.st_size > 256 * 1024
+            not stat.S_ISREG(before.st_mode)
+            or stat.S_ISLNK(before.st_mode)
+            or before.st_size > 16 * 1024
+            or _stable_file_identity(before) != _stable_file_identity(after)
         ):
-            raise TestStoreConflict("test runner launch evidence is unsafe")
+            raise TestStoreConflict("test native invocation evidence is unsafe")
         try:
-            launch = json.loads(launch_path.read_bytes())
-            if not isinstance(launch, Mapping):
-                raise ValueError("not an object")
-            descriptor = TestAttemptDescriptor.from_document(launch["descriptor"])
-            result_info = result_path.lstat()
-        except FileNotFoundError:
-            return None
-        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
-            raise TestStoreConflict("test runner launch evidence is invalid") from error
+            value = json.loads(payload)
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise TestStoreConflict("test native invocation evidence is invalid") from error
+        expected = {
+            "schema_version",
+            "runtime_id",
+            "systemd_unit",
+            "invocation_id",
+            "descriptor_sha256",
+            "prepared_at",
+            "started_at",
+            "control_group",
+        }
         if (
-            not stat.S_ISREG(result_info.st_mode)
-            or stat.S_ISLNK(result_info.st_mode)
-            or result_info.st_size > 2 * 1024 * 1024
+            not isinstance(value, Mapping)
+            or set(value) != expected
+            or value.get("schema_version") != 1
+            or value.get("runtime_id") != runtime_id
+            or value.get("systemd_unit") != self._unit(runtime_id)
+            or not isinstance(value.get("invocation_id"), str)
+            or not str(value["invocation_id"]).startswith("test-invocation-")
+            or re.fullmatch(r"[0-9a-f]{64}", str(value.get("descriptor_sha256"))) is None
         ):
-            raise TestStoreConflict("test runner result evidence is unsafe")
-        try:
-            value = json.loads(result_path.read_bytes())
-        except (OSError, ValueError, json.JSONDecodeError) as error:
-            raise TestStoreConflict("test runner result evidence is invalid") from error
-        if not isinstance(value, Mapping):
-            raise TestStoreConflict("test runner result evidence is invalid")
+            raise TestStoreConflict("test native invocation evidence is invalid")
+        for field in ("prepared_at", "started_at"):
+            raw = value[field]
+            if raw is not None and (
+                isinstance(raw, bool)
+                or not isinstance(raw, (int, float))
+                or not math.isfinite(float(raw))
+                or float(raw) < 0
+            ):
+                raise TestStoreConflict("test native invocation time is invalid")
+        control_group = value["control_group"]
+        if control_group is not None:
+            self._control_group_path(str(control_group))
         return dict(value)
+
+    def _control_group_path(self, control_group: str) -> Path:
+        if (
+            not isinstance(control_group, str)
+            or not control_group.startswith("/")
+            or "\x00" in control_group
+            or any(part in {"", ".", ".."} for part in control_group.split("/")[1:])
+        ):
+            raise TestStoreConflict("systemd returned an invalid test control group")
+        return self.cgroup_root.joinpath(*control_group.split("/")[1:])
+
+    def _control_group_populated(
+        self, control_group: str, *, allow_missing: bool = False
+    ) -> bool:
+        events = self._control_group_path(control_group) / "cgroup.events"
+        try:
+            payload = events.read_text(encoding="ascii")
+        except FileNotFoundError:
+            if allow_missing:
+                return False
+            raise TestStoreConflict("test cgroup.events is unavailable")
+        except OSError as error:
+            raise TestStoreConflict("test cgroup.events is unavailable") from error
+        values = dict(
+            line.split(" ", 1) for line in payload.splitlines() if " " in line
+        )
+        if values.get("populated") not in {"0", "1"}:
+            raise TestStoreConflict("test cgroup.events populated evidence is invalid")
+        return values["populated"] == "1"
+
+    @staticmethod
+    def _package_identity(descriptor: TestAttemptDescriptor) -> dict[str, object]:
+        return {
+            "attempt_id": descriptor.attempt_id,
+            "target_id": descriptor.target_id,
+            "run_id": descriptor.run_id,
+            "repository_id": descriptor.repository_id,
+            "repository_generation": descriptor.repository_generation,
+            "generation": descriptor.generation,
+            "descriptor_sha256": descriptor.fingerprint,
+        }
 
     def _runner_output_progress(
         self, runtime_id: str
@@ -3112,89 +3230,6 @@ class SystemdTestAttemptManager:
             "observed_at": float(self.clock()),
         }
 
-    def read_result_chunk(
-        self, runtime_id: str, chunk_index: int
-    ) -> Mapping[str, object] | None:
-        """Read one digest-bound owner-private chunk without exposing its path."""
-
-        runtime_id = _safe_id("runtime_id", runtime_id)
-        if type(chunk_index) is not int or not 0 <= chunk_index < 4_096:
-            raise TestStoreContractError("test result chunk index is invalid")
-        result = self._read_runner_result(runtime_id)
-        if result is None:
-            return None
-        manifest = result.get("chunk_manifest")
-        if (
-            not isinstance(manifest, list)
-            or len(manifest) > 4_096
-            or chunk_index >= len(manifest)
-        ):
-            return None
-        item = manifest[chunk_index]
-        if not isinstance(item, Mapping) or set(item) != {
-            "chunk_id",
-            "chunk_index",
-            "file_name",
-            "sha256",
-            "size_bytes",
-            "reporter_complete",
-        }:
-            raise TestStoreConflict("test runner chunk manifest is invalid")
-        file_name = item["file_name"]
-        digest = item["sha256"]
-        size_bytes = item["size_bytes"]
-        if (
-            item["chunk_index"] != chunk_index
-            or not isinstance(file_name, str)
-            or file_name != f"result-chunk-{chunk_index:06d}.json"
-            or not isinstance(digest, str)
-            or re.fullmatch(r"[0-9a-f]{64}", digest) is None
-            or type(size_bytes) is not int
-            or not 1 <= size_bytes <= 240 * 1024
-            or type(item["reporter_complete"]) is not bool
-        ):
-            raise TestStoreConflict("test runner chunk manifest is invalid")
-        launch_path = self.attempt_root / runtime_id / "launch.json"
-        try:
-            launch = json.loads(launch_path.read_bytes())
-            descriptor = TestAttemptDescriptor.from_document(launch["descriptor"])
-        except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
-            raise TestStoreConflict("test runner launch evidence is invalid") from error
-        path = self.attempt_root / runtime_id / "output" / file_name
-        try:
-            before = path.lstat()
-        except OSError as error:
-            raise TestStoreConflict("test runner result chunk is unavailable") from error
-        if (
-            not stat.S_ISREG(before.st_mode)
-            or stat.S_ISLNK(before.st_mode)
-            or before.st_size != size_bytes
-        ):
-            raise TestStoreConflict("test runner result chunk evidence is unsafe")
-        try:
-            payload = path.read_bytes()
-            after = path.lstat()
-        except OSError as error:
-            raise TestStoreConflict("test runner result chunk is unavailable") from error
-        if (
-            (before.st_dev, before.st_ino, before.st_size)
-            != (after.st_dev, after.st_ino, after.st_size)
-            or hashlib.sha256(payload).hexdigest() != digest
-        ):
-            raise TestStoreConflict("test runner result chunk changed during read")
-        try:
-            value = json.loads(payload)
-        except (UnicodeDecodeError, json.JSONDecodeError) as error:
-            raise TestStoreConflict("test runner result chunk JSON is invalid") from error
-        if (
-            not isinstance(value, Mapping)
-            or value.get("chunk_id") != item["chunk_id"]
-            or value.get("chunk_index") != chunk_index
-            or value.get("reporter_complete") != item["reporter_complete"]
-        ):
-            raise TestStoreConflict("test runner result chunk identity is invalid")
-        return dict(value)
-
     @staticmethod
     def _artifact_identity(storage_handle: object) -> tuple[str, str]:
         if not isinstance(storage_handle, str):
@@ -3216,194 +3251,168 @@ class SystemdTestAttemptManager:
             self.artifact_root, field="test artifact store"
         )
 
-    def _collect_result_artifacts(
+    def _ensure_result_package_root(self) -> None:
+        self.result_package_root.mkdir(mode=0o750, parents=True, exist_ok=True)
+        self._require_real_directory(
+            self.result_package_root, field="test result package store"
+        )
+
+    @staticmethod
+    def _result_package_handle(package: ValidatedResultPackage) -> str:
+        return (
+            "test-result-package://"
+            + package.evidence.package_id
+            + "/"
+            + package.evidence.sha256
+        )
+
+    def _result_package_file(self, package_id: str, digest: str) -> Path:
+        package_id = _safe_id("package_id", package_id)
+        if not package_id.startswith("result-package-") or re.fullmatch(
+            r"[0-9a-f]{64}", digest
+        ) is None:
+            raise TestStoreContractError("test result package handle is invalid")
+        return self.result_package_root / f"{package_id}-{digest}.tar"
+
+    def _copy_result_package(
         self,
-        runtime_id: str,
-        result: Mapping[str, object],
-    ) -> None:
-        raw_sources = result.get("artifact_sources")
-        if not isinstance(raw_sources, list) or len(raw_sources) > 64:
-            raise TestStoreConflict("test artifact source manifest is invalid")
-        launch_path = self.attempt_root / runtime_id / "launch.json"
+        package: ValidatedResultPackage,
+    ) -> ValidatedResultPackage:
+        self._ensure_result_package_root()
+        destination = self._result_package_file(
+            package.evidence.package_id, package.evidence.sha256
+        )
+        if destination.exists():
+            try:
+                return validate_result_package(
+                    destination,
+                    expected_identity=package.evidence.identity,
+                    expected_sha256=package.evidence.sha256,
+                )
+            except ResultPackageError as error:
+                raise TestStoreConflict(
+                    "retained test result package is contradictory"
+                ) from error
+        directory_fd = os.open(
+            self.result_package_root,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+        )
+        temporary_name = f".package-{uuid.uuid4().hex}.tmp"
+        source_fd = os.open(
+            package.path,
+            os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
+        )
+        destination_fd = -1
         try:
-            launch = json.loads(launch_path.read_bytes())
-            descriptor = TestAttemptDescriptor.from_document(launch["descriptor"])
-        except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
-            raise TestStoreConflict("test runner launch evidence is invalid") from error
-        self._ensure_artifact_root()
-        credential_sequences: tuple[bytes, ...] | None = None
-        seen: set[str] = set()
-        for raw in raw_sources:
-            if not isinstance(raw, Mapping) or set(raw) != {
-                "artifact_id",
-                "storage_handle",
-                "kind",
-                "scope",
-                "relative_path",
-                "packaged_from",
-                "sha256",
-                "size_bytes",
-            }:
-                raise TestStoreConflict("test artifact source fields are invalid")
-            artifact_id, handle_digest = self._artifact_identity(
-                raw["storage_handle"]
+            destination_fd = os.open(
+                temporary_name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                0o440,
+                dir_fd=directory_fd,
             )
-            relative = raw["relative_path"]
-            kind = raw["kind"]
-            packaged_from = raw["packaged_from"]
-            size_bytes = raw["size_bytes"]
+            os.fchmod(destination_fd, 0o440)
+            digest = hashlib.sha256()
+            copied = 0
+            while True:
+                payload = os.read(source_fd, 1024 * 1024)
+                if not payload:
+                    break
+                copied += len(payload)
+                digest.update(payload)
+                view = memoryview(payload)
+                written = 0
+                while written < len(view):
+                    written += os.write(destination_fd, view[written:])
+            os.fsync(destination_fd)
+            if (
+                copied != package.evidence.size_bytes
+                or digest.hexdigest() != package.evidence.sha256
+            ):
+                raise TestStoreConflict("test result package changed during copy")
+            temporary = self.result_package_root / temporary_name
+            validate_result_package(
+                temporary,
+                expected_identity=package.evidence.identity,
+                expected_sha256=package.evidence.sha256,
+            )
+            try:
+                os.link(
+                    temporary_name,
+                    destination.name,
+                    src_dir_fd=directory_fd,
+                    dst_dir_fd=directory_fd,
+                    follow_symlinks=False,
+                )
+                os.fsync(directory_fd)
+            except FileExistsError:
+                pass
+        except ResultPackageError as error:
+            raise TestStoreConflict("test result package copy is invalid") from error
+        finally:
+            os.close(source_fd)
+            if destination_fd >= 0:
+                os.close(destination_fd)
+            try:
+                os.unlink(temporary_name, dir_fd=directory_fd)
+                os.fsync(directory_fd)
+            except FileNotFoundError:
+                pass
+            os.close(directory_fd)
+        try:
+            return validate_result_package(
+                destination,
+                expected_identity=package.evidence.identity,
+                expected_sha256=package.evidence.sha256,
+            )
+        except ResultPackageError as error:
+            raise TestStoreConflict("retained test result package is invalid") from error
+
+    def _collect_package_artifacts(self, package: ValidatedResultPackage) -> None:
+        self._ensure_artifact_root()
+        for raw in package.manifest["artifacts"]:
+            artifact_id, digest = self._artifact_identity(raw["storage_handle"])
             if (
                 raw["artifact_id"] != artifact_id
-                or raw["sha256"] != handle_digest
-                or artifact_id in seen
-                or raw["scope"] not in {"output", "execution"}
-                or kind not in {
-                    "log", "jsonl", "junit", "trx", "coverage", "trace", "directory"
-                }
-                or not isinstance(relative, str)
-                or not relative
-                or PurePosixPath(relative).is_absolute()
-                or any(part in {".", ".."} for part in PurePosixPath(relative).parts)
-                or type(size_bytes) is not int
-                or not 0 <= size_bytes <= 32 * 1024 * 1024
-                or (
-                    kind == "directory"
-                    and (
-                        not isinstance(packaged_from, str)
-                        or not packaged_from
-                        or PurePosixPath(packaged_from).is_absolute()
-                        or any(
-                            part in {".", ".."}
-                            for part in PurePosixPath(packaged_from).parts
-                        )
-                    )
-                )
-                or (kind != "directory" and packaged_from is not None)
+                or raw["sha256"] != digest
+                or raw["verified"] is not True
             ):
-                raise TestStoreConflict("test artifact source identity is invalid")
-            seen.add(artifact_id)
-            source_root = (
-                self.attempt_root / runtime_id / "output"
-                if raw["scope"] == "output"
-                else Path(descriptor.execution_root)
-            )
-            source = source_root / relative
-            try:
-                resolved = source.resolve(strict=True)
-                root_resolved = source_root.resolve(strict=True)
-                before = source.lstat()
-            except OSError as error:
-                raise TestStoreConflict("test artifact source is unavailable") from error
-            if (
-                resolved != source
-                or (resolved != root_resolved and root_resolved not in resolved.parents)
-                or not stat.S_ISREG(before.st_mode)
-                or stat.S_ISLNK(before.st_mode)
-                or before.st_size != size_bytes
-            ):
-                raise TestStoreConflict("test artifact source is unsafe")
-            destination = self._artifact_file(artifact_id, handle_digest)
+                raise TestStoreConflict("test result artifact identity is contradictory")
+            destination = self._artifact_file(artifact_id, digest)
             if destination.exists():
                 self.resolve_artifact(
-                    str(raw["storage_handle"]),
-                    expected_size=size_bytes,
+                    str(raw["storage_handle"]), expected_size=int(raw["size_bytes"])
                 )
                 continue
-            if kind == "directory":
-                if credential_sequences is None:
-                    credential_sequences = self._credential_artifact_sequences(
-                        runtime_id,
-                        descriptor,
-                    )
-                if any(
-                    value in os.fsencode(str(packaged_from))
-                    for value in credential_sequences
-                ):
-                    raise TestStoreConflict(
-                        "test directory artifact path contains credential material"
-                    )
-                directory_source = Path(descriptor.execution_root) / str(packaged_from)
-                try:
-                    directory_resolved = directory_source.resolve(strict=True)
-                    execution_resolved = Path(descriptor.execution_root).resolve(strict=True)
-                except OSError as error:
-                    raise TestStoreConflict(
-                        "test directory artifact source is unavailable"
-                    ) from error
-                if (
-                    directory_resolved != directory_source
-                    or (
-                        directory_resolved != execution_resolved
-                        and execution_resolved not in directory_resolved.parents
-                    )
-                ):
-                    raise TestStoreConflict("test directory artifact source is unsafe")
-                destination_fd = os.open(
-                    destination,
-                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
-                    0o600,
-                )
-                try:
-                    with os.fdopen(os.dup(destination_fd), "wb", closefd=True) as output:
-                        evidence = package_directory(
-                            directory_source,
-                            output,
-                            expected_uid=descriptor.owner_uid,
-                            maximum_bytes=size_bytes,
-                            prohibited_sequences=credential_sequences,
-                        )
-                        output.flush()
-                    os.fsync(destination_fd)
-                except Exception:
-                    destination.unlink(missing_ok=True)
-                    raise
-                finally:
-                    os.close(destination_fd)
-                if evidence.sha256 != handle_digest or evidence.size_bytes != size_bytes:
-                    destination.unlink(missing_ok=True)
-                    raise TestStoreConflict(
-                        "test directory artifact differs from protected packaging"
-                    )
-                continue
-            source_fd = os.open(source, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+            temporary = self.artifact_root / f".artifact-{uuid.uuid4().hex}.tmp"
+            descriptor = os.open(
+                temporary,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+            )
             try:
-                destination_fd = os.open(
-                    destination,
-                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
-                    0o600,
-                )
-                digest = hashlib.sha256()
-                copied = 0
-                try:
-                    while True:
-                        chunk = os.read(source_fd, 1024 * 1024)
-                        if not chunk:
-                            break
-                        copied += len(chunk)
-                        if copied > size_bytes:
-                            raise TestStoreConflict("test artifact source grew during collection")
-                        digest.update(chunk)
-                        view = memoryview(chunk)
-                        written = 0
-                        while written < len(view):
-                            written += os.write(destination_fd, view[written:])
-                    os.fsync(destination_fd)
-                finally:
-                    os.close(destination_fd)
-            except Exception:
-                destination.unlink(missing_ok=True)
+                with os.fdopen(os.dup(descriptor), "wb", closefd=True) as output:
+                    observed_digest, observed_size = copy_result_package_artifact(
+                        package, artifact_id, output
+                    )
+                    output.flush()
+                os.fsync(descriptor)
+            except BaseException:
+                temporary.unlink(missing_ok=True)
                 raise
             finally:
-                os.close(source_fd)
-            after = source.lstat()
-            if (
-                copied != size_bytes
-                or digest.hexdigest() != handle_digest
-                or (before.st_dev, before.st_ino, before.st_size)
-                != (after.st_dev, after.st_ino, after.st_size)
-            ):
-                destination.unlink(missing_ok=True)
-                raise TestStoreConflict("test artifact source changed during collection")
+                os.close(descriptor)
+            if observed_digest != digest or observed_size != raw["size_bytes"]:
+                temporary.unlink(missing_ok=True)
+                raise TestStoreConflict("test result artifact copy is contradictory")
+            try:
+                os.link(temporary, destination, follow_symlinks=False)
+            except FileExistsError:
+                pass
+            finally:
+                temporary.unlink(missing_ok=True)
+            self.resolve_artifact(
+                str(raw["storage_handle"]), expected_size=int(raw["size_bytes"])
+            )
         directory_fd = os.open(
             self.artifact_root,
             os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
@@ -3412,6 +3421,63 @@ class SystemdTestAttemptManager:
             os.fsync(directory_fd)
         finally:
             os.close(directory_fd)
+
+    def _result_package_metadata(
+        self, package: ValidatedResultPackage
+    ) -> Mapping[str, object]:
+        return {
+            "schema_version": 1,
+            "package_id": package.evidence.package_id,
+            "storage_handle": self._result_package_handle(package),
+            "sha256": package.evidence.sha256,
+            "size_bytes": package.evidence.size_bytes,
+            "manifest_sha256": package.evidence.manifest_sha256,
+            "identity": dict(package.evidence.identity),
+            "counts": dict(package.evidence.counts),
+        }
+
+    def resolve_result_package(
+        self, storage_handle: str
+    ) -> ValidatedResultPackage:
+        matched = re.fullmatch(
+            r"test-result-package://(result-package-[0-9a-f]{32})/([0-9a-f]{64})",
+            storage_handle,
+        )
+        if matched is None:
+            raise TestStoreContractError("test result package handle is invalid")
+        path = self._result_package_file(matched.group(1), matched.group(2))
+        try:
+            return validate_result_package(path, expected_sha256=matched.group(2))
+        except ResultPackageError as error:
+            raise TestStoreConflict("test result package is unavailable") from error
+
+    def _finalize_result_package(
+        self, runtime_id: str, descriptor: TestAttemptDescriptor
+    ) -> Mapping[str, object] | None:
+        source = self.attempt_root / runtime_id / "output" / RESULT_PACKAGE_FILE_NAME
+        try:
+            source.lstat()
+        except FileNotFoundError:
+            return None
+        try:
+            package = validate_result_package(
+                source,
+                expected_identity=self._package_identity(descriptor),
+                prohibited_metadata_sequences=tuple(
+                    os.fsencode(value)
+                    for value in {
+                        descriptor.original_root,
+                        descriptor.execution_root,
+                        descriptor.worktree_key,
+                        *( () if descriptor.temporary_root is None else (descriptor.temporary_root,) ),
+                    }
+                ),
+            )
+            retained = self._copy_result_package(package)
+            self._collect_package_artifacts(retained)
+        except ResultPackageError as error:
+            raise TestStoreConflict("test result package is invalid") from error
+        return self._result_package_metadata(retained)
 
     def resolve_artifact(
         self,
@@ -3767,7 +3833,7 @@ class SystemdTestAttemptManager:
         exact_output_root = _systemd_bind_path("test output root", output_root)
         properties = [
             "--property=Type=exec",
-            "--property=CollectMode=inactive-or-failed",
+            "--property=RemainAfterExit=yes",
             "--property=CPUAccounting=yes",
             "--property=MemoryAccounting=yes",
             "--property=KillMode=control-group",
@@ -3946,6 +4012,35 @@ class SystemdTestAttemptManager:
             )
         return properties
 
+    def _systemd_show(self, runtime_id: str) -> tuple[dict[str, str], int]:
+        completed = self._run(
+            [
+                self.systemctl,
+                "show",
+                self._unit(runtime_id),
+                "--property=LoadState",
+                "--property=ActiveState",
+                "--property=SubState",
+                "--property=Result",
+                "--property=ExecMainCode",
+                "--property=ExecMainStatus",
+                "--property=OOMKilled",
+                "--property=CPUUsageNSec",
+                "--property=MemoryPeak",
+                "--property=MemoryCurrent",
+                "--property=ControlGroup",
+                "--all",
+                "--no-pager",
+            ],
+            allow_failure=True,
+        )
+        fields: dict[str, str] = {}
+        for line in completed.stdout.splitlines():
+            if "=" in line:
+                name, value = line.split("=", 1)
+                fields[name] = value
+        return fields, completed.returncode
+
     def start(self, descriptor: TestAttemptDescriptor) -> NativeTestAttemptState:
         """Compatibility entrypoint for isolated managers without broker binding."""
 
@@ -4031,10 +4126,19 @@ class SystemdTestAttemptManager:
                 runtime_id, reason="launch_property_validation_failed"
             )
             raise
+        invocation_id = self._native_invocation_id()
+        prepared_at = float(self.clock())
+        self._publish_native_evidence(
+            runtime_id,
+            effective_descriptor,
+            invocation_id=invocation_id,
+            prepared_at=prepared_at,
+            started_at=None,
+            control_group=None,
+        )
         argv = [
             self.systemd_run,
             "--quiet",
-            "--collect",
             f"--unit={runtime_id}",
             f"--uid={identity.pw_uid}",
             f"--gid={identity.pw_gid}",
@@ -4089,6 +4193,25 @@ class SystemdTestAttemptManager:
             self._cleanup_attempt_resources(runtime_id, reason="launch_failed")
             raise
         started_at = float(self.clock())
+        fields, returncode = self._systemd_show(runtime_id)
+        control_group = fields.get("ControlGroup") or None
+        if (
+            returncode != 0
+            or fields.get("LoadState") != "loaded"
+            or control_group is None
+        ):
+            raise TestStoreConflict(
+                "systemd did not retain the exact test invocation identity"
+            )
+        self._control_group_path(control_group)
+        self._publish_native_evidence(
+            runtime_id,
+            effective_descriptor,
+            invocation_id=invocation_id,
+            prepared_at=prepared_at,
+            started_at=started_at,
+            control_group=control_group,
+        )
         self._started[runtime_id] = started_at
         # A successful Type=exec systemd-run reply is the launch
         # acknowledgement. Observing the transient unit is heartbeat work: a
@@ -4101,235 +4224,65 @@ class SystemdTestAttemptManager:
             state="running",
             exit_status=None,
             started_at=started_at,
+            systemd_unit=self._unit(runtime_id),
+            invocation_id=invocation_id,
+            control_group=control_group,
+            cgroup_populated=self._control_group_populated(
+                control_group, allow_missing=True
+            ),
         )
 
-    def _collected_status(self, runtime_id: str) -> NativeTestAttemptState:
-        """Drain a durable result after systemd has collected its unit."""
-
-        result_document = self._read_runner_result(runtime_id)
-        if result_document is None:
-            self._cleanup_attempt_resources(
+    # Schema-v8 lifecycle operates only on exact native evidence and one
+    # atomic result package.
+    def _native_context(
+        self, runtime_id: str
+    ) -> tuple[TestAttemptDescriptor, Mapping[str, object]]:
+        descriptor = self.recover_descriptor(runtime_id)
+        native = self._read_native_evidence(runtime_id)
+        if native["descriptor_sha256"] != descriptor.fingerprint:
+            raise TestStoreConflict("test native invocation descriptor is stale")
+        if native.get("control_group") is None:
+            fields, returncode = self._systemd_show(runtime_id)
+            control_group = fields.get("ControlGroup") or None
+            if (
+                returncode != 0
+                or fields.get("LoadState") != "loaded"
+                or control_group is None
+            ):
+                raise TestStoreConflict(
+                    "prepared test invocation has no exact native identity"
+                )
+            native = self._publish_native_evidence(
                 runtime_id,
-                reason="attempt_not_found_terminal",
+                descriptor,
+                invocation_id=str(native["invocation_id"]),
+                prepared_at=float(native["prepared_at"]),
+                # The root-owned preparation time precedes native start and
+                # is therefore a conservative, non-extending recovered origin.
+                started_at=float(native["prepared_at"]),
+                control_group=control_group,
             )
-            return NativeTestAttemptState(
-                runtime_id, False, False, "not-found", None
-            )
-        returncode = result_document.get("returncode")
-        if type(returncode) is not int:
-            raise TestStoreConflict("retained test runner result is invalid")
-        peak_memory_bytes, cpu_seconds = _runner_resource_usage(result_document)
-        try:
-            self._collect_result_artifacts(runtime_id, result_document)
-        finally:
-            self._cleanup_attempt_resources(
-                runtime_id, reason="attempt_terminal"
-            )
-        return NativeTestAttemptState(
-            runtime_id=runtime_id,
-            loaded=False,
-            active=False,
-            state="collected",
-            exit_status=returncode,
-            started_at=self._attempt_started_at(runtime_id),
-            finished_at=float(self.clock()),
-            result_document=result_document,
-            systemd_result="success" if returncode == 0 else "exit-code",
-            exec_main_code=1,
-            termination_reason="success" if returncode == 0 else "exit_code",
-            oom_killed=False,
-            peak_memory_bytes=peak_memory_bytes,
-            cpu_seconds=cpu_seconds,
-        )
+        return descriptor, native
 
-    def status(self, runtime_id: str) -> NativeTestAttemptState:
-        unit = self._unit(runtime_id)
-        completed = self._run(
-            [
-                self.systemctl,
-                "show",
-                unit,
-                "--property=LoadState",
-                "--property=ActiveState",
-                "--property=SubState",
-                "--property=Result",
-                "--property=ExecMainCode",
-                "--property=ExecMainStatus",
-                "--property=OOMKilled",
-                "--property=CPUUsageNSec",
-                "--property=MemoryPeak",
-                "--property=MemoryCurrent",
-                "--property=ActiveEnterTimestampMonotonic",
-                "--property=InactiveEnterTimestampMonotonic",
-                # systemctl suppresses empty properties by default. A newly
-                # starting unit legitimately has no terminal status yet, so
-                # request the selected empty fields instead of misclassifying
-                # a valid launch as a malformed observation.
-                "--all",
-                "--no-pager",
-            ],
-            allow_failure=True,
-        )
-        if completed.returncode != 0:
-            # ``systemd-run --collect`` may unload the transient unit before a
-            # restarted broker/testd observes it. The root-protected launch
-            # record and owner-private, generation-bound runner result remain
-            # authoritative and must be drained rather than downgraded to an
-            # infrastructure failure merely because the unit was collected.
-            return self._collected_status(runtime_id)
-        fields: dict[str, str] = {}
-        for line in completed.stdout.splitlines():
-            if "=" in line:
-                name, value = line.split("=", 1)
-                fields[name] = value
-        required = {"LoadState", "ActiveState", "SubState"}
-        missing = sorted(required - set(fields))
-        if missing:
-            raise TestStoreConflict(
-                "native test attempt observation is incomplete: missing "
-                + ", ".join(missing)
-            )
-        # ``systemctl show`` can itself succeed after ``--collect`` has
-        # unloaded a transient unit. In that case it returns a synthetic
-        # not-found record whose success/zero exit fields are defaults, not
-        # terminal evidence. Drain the generation-bound durable result just as
-        # when the observation command fails.
-        if fields["LoadState"] == "not-found":
-            return self._collected_status(runtime_id)
-        # ``deactivating`` is a transitional state, not terminal evidence.
-        # systemd can expose Result=success/ExecMainCode=0 while the unit is
-        # still draining and before the runner has atomically published its
-        # result document.  Treating that window as exited loses the result and
-        # turns a healthy attempt into a fabricated infrastructure failure.
-        active = fields["ActiveState"] in {
+    @staticmethod
+    def _unit_is_active(fields: Mapping[str, str]) -> bool:
+        return fields.get("ActiveState") in {
             "active",
             "activating",
             "deactivating",
             "reloading",
         }
-        status = fields.get("ExecMainStatus", "")
-        exit_status = int(status) if status.lstrip("-").isdigit() else None
-        raw_code = fields.get("ExecMainCode", "")
-        exec_main_code = int(raw_code) if raw_code.lstrip("-").isdigit() else None
-        raw_oom = fields.get("OOMKilled", "")
-        if raw_oom not in {"", "yes", "no"}:
-            raise TestStoreConflict("native test attempt OOM observation is invalid")
-        oom_killed = raw_oom == "yes"
-        systemd_result = fields.get("Result", "")
-        peak_memory_bytes = _systemd_counter(
-            fields.get("MemoryPeak"), field="peak memory measurement"
-        )
-        cpu_usage_nsec = _systemd_counter(
-            fields.get("CPUUsageNSec"), field="CPU measurement"
-        )
-        cpu_seconds = (
-            None if cpu_usage_nsec is None else float(cpu_usage_nsec) / 1_000_000_000
-        )
-        current_memory_bytes = _systemd_counter(
-            fields.get("MemoryCurrent"), field="current memory measurement"
-        )
-        termination_reason = None
-        if not active:
-            if oom_killed or systemd_result == "oom-kill":
-                termination_reason = "oom_kill"
-            elif systemd_result == "timeout":
-                termination_reason = "timeout"
-            elif systemd_result in {"signal", "core-dump", "watchdog"} or exec_main_code in {2, 3}:
-                termination_reason = "signal"
-            elif systemd_result == "exit-code" or (
-                exec_main_code == 1 and exit_status not in {None, 0}
-            ):
-                termination_reason = "exit_code"
-            elif systemd_result == "success" and exit_status == 0:
-                termination_reason = "success"
-            elif systemd_result == "resources":
-                termination_reason = "resource_failure"
-            elif systemd_result == "start-limit-hit":
-                termination_reason = "start_limit"
-            elif systemd_result == "protocol":
-                termination_reason = "protocol_failure"
-            else:
-                termination_reason = "systemd_failure"
-        started = self._attempt_started_at(runtime_id)
-        output_progress = self._runner_output_progress(runtime_id) if active else None
-        result_document = self._read_runner_result(runtime_id) if active else None
-        if not active:
-            try:
-                result_document = self._read_runner_result(runtime_id)
-                if result_document is not None:
-                    self._collect_result_artifacts(runtime_id, result_document)
-            finally:
-                self._cleanup_attempt_resources(
-                    runtime_id, reason="attempt_terminal"
-                )
-            runner_peak_memory, runner_cpu_seconds = _runner_resource_usage(
-                result_document
-            )
-            # Cgroup accounting covers the entire transient unit and is the
-            # authoritative measurement when systemd provides it. The
-            # owner-written getrusage values are a durable fallback for
-            # collected units or unavailable accounting fields.
-            if peak_memory_bytes is None and runner_peak_memory is not None:
-                peak_memory_bytes = runner_peak_memory
-            if cpu_seconds is None and runner_cpu_seconds is not None:
-                cpu_seconds = runner_cpu_seconds
-        return NativeTestAttemptState(
-            runtime_id=runtime_id,
-            loaded=fields["LoadState"] == "loaded",
-            active=active,
-            state=fields["SubState"],
-            exit_status=None if active else exit_status,
-            started_at=started,
-            finished_at=None if active or started is None else float(self.clock()),
-            result_document=result_document,
-            systemd_result=None if active else systemd_result,
-            exec_main_code=None if active else exec_main_code,
-            termination_reason=termination_reason,
-            oom_killed=False if active else oom_killed,
-            peak_memory_bytes=peak_memory_bytes,
-            cpu_seconds=cpu_seconds,
-            current_memory_bytes=(current_memory_bytes if active else None),
-            output_progress=output_progress,
-        )
 
-    def _attempt_started_at(self, runtime_id: str) -> float | None:
-        retained = self._started.get(runtime_id)
-        if retained is not None:
-            return retained
-        launch_path = self.attempt_root / runtime_id / "launch.json"
-        try:
-            metadata = launch_path.lstat()
-        except FileNotFoundError:
-            return None
-        except OSError as error:
-            raise TestStoreConflict(
-                "test attempt launch time is unavailable"
-            ) from error
-        if (
-            not stat.S_ISREG(metadata.st_mode)
-            or stat.S_ISLNK(metadata.st_mode)
-            or metadata.st_size > 256 * 1024
-            or not math.isfinite(float(metadata.st_mtime))
-            or float(metadata.st_mtime) <= 0
-        ):
-            raise TestStoreConflict("test attempt launch time is invalid")
-        # Legacy launch records predate an explicit start-time field. Their
-        # root-owned creation time precedes native start, so using it as the
-        # recovered origin can only shorten the deadline; it never grants an
-        # overdue runner more execution time after authority replacement.
-        recovered = float(metadata.st_mtime)
-        self._started[runtime_id] = recovered
-        return recovered
-
-    def cancel(self, runtime_id: str) -> NativeTestAttemptState:
-        unit = self._unit(runtime_id)
+    def _stop_exact_unit(
+        self, runtime_id: str, *, native: Mapping[str, object]
+    ) -> dict[str, str]:
+        unit = str(native["systemd_unit"])
+        control_group = native.get("control_group")
+        if not isinstance(control_group, str):
+            raise TestStoreConflict("test native control group is unavailable")
         self._run([self.systemctl, "stop", unit], allow_failure=True)
-        state = self.status(runtime_id)
-        if state.active:
-            # A runner can leave a descendant or obsolete release process in
-            # its exact transient cgroup after the main result is complete.
-            # Cancellation owns this deterministic unit, so escalate only its
-            # control group and then require one fresh observation.
+        fields, _returncode = self._systemd_show(runtime_id)
+        if self._unit_is_active(fields):
             self._run(
                 [
                     self.systemctl,
@@ -4341,14 +4294,171 @@ class SystemdTestAttemptManager:
                 allow_failure=True,
             )
             self._run([self.systemctl, "stop", unit], allow_failure=True)
-            state = self.status(runtime_id)
-        return state
+            fields, _returncode = self._systemd_show(runtime_id)
+        if self._unit_is_active(fields):
+            raise TestStoreConflict("test systemd unit remained transitional after stop")
+        if self._control_group_populated(control_group, allow_missing=True):
+            raise TestStoreConflict("test control group remained populated after stop")
+        return fields
+
+    def _package_resource_usage(
+        self, result_package: Mapping[str, object] | None
+    ) -> tuple[int | None, float | None, int | None]:
+        if result_package is None:
+            return None, None, None
+        package = self.resolve_result_package(str(result_package["storage_handle"]))
+        usage = package.manifest["resource_usage"]
+        outcome = package.manifest["outcome"]
+        return (
+            _validated_peak_memory_bytes(usage["peak_memory_bytes"]),
+            _validated_cpu_seconds(usage["cpu_seconds"]),
+            int(outcome["returncode"]),
+        )
+
+    def _collected_status(self, runtime_id: str) -> NativeTestAttemptState:
+        descriptor, native = self._native_context(runtime_id)
+        control_group = native.get("control_group")
+        if not isinstance(control_group, str):
+            raise TestStoreConflict("test native control group is unavailable")
+        if self._control_group_populated(control_group, allow_missing=True):
+            raise TestStoreConflict("unloaded test unit retained a populated cgroup")
+        result_package = self._finalize_result_package(runtime_id, descriptor)
+        peak, cpu, exit_status = self._package_resource_usage(result_package)
+        return NativeTestAttemptState(
+            runtime_id=runtime_id,
+            loaded=False,
+            active=False,
+            state="absent",
+            exit_status=exit_status,
+            started_at=self._attempt_started_at(runtime_id),
+            finished_at=float(self.clock()),
+            result_package=result_package,
+            termination_reason=(None if exit_status is None else "success" if exit_status == 0 else "exit_code"),
+            peak_memory_bytes=peak,
+            cpu_seconds=cpu,
+            systemd_unit=str(native["systemd_unit"]),
+            invocation_id=str(native["invocation_id"]),
+            control_group=control_group,
+            cgroup_populated=False,
+        )
+
+    def status(self, runtime_id: str) -> NativeTestAttemptState:
+        runtime_id = _safe_id("runtime_id", runtime_id)
+        descriptor, native = self._native_context(runtime_id)
+        fields, returncode = self._systemd_show(runtime_id)
+        if returncode != 0 or fields.get("LoadState") == "not-found":
+            return self._collected_status(runtime_id)
+        required = {"LoadState", "ActiveState", "SubState"}
+        if not required.issubset(fields):
+            raise TestStoreConflict("native test attempt observation is incomplete")
+        control_group = fields.get("ControlGroup") or native.get("control_group")
+        if not isinstance(control_group, str):
+            raise TestStoreConflict("native test attempt control group is unavailable")
+        if native.get("control_group") not in {None, control_group}:
+            raise TestStoreConflict("native test attempt control group changed")
+        populated = self._control_group_populated(control_group, allow_missing=True)
+        active = self._unit_is_active(fields)
+        if active and fields.get("SubState") == "exited" and not populated:
+            fields = self._stop_exact_unit(runtime_id, native=native)
+            active = False
+        if not active and populated:
+            raise TestStoreConflict("inactive test unit retained a populated cgroup")
+
+        raw_status = fields.get("ExecMainStatus", "")
+        exit_status = int(raw_status) if raw_status.lstrip("-").isdigit() else None
+        raw_code = fields.get("ExecMainCode", "")
+        exec_main_code = int(raw_code) if raw_code.lstrip("-").isdigit() else None
+        systemd_result = fields.get("Result") or None
+        raw_oom = fields.get("OOMKilled", "")
+        if raw_oom not in {"", "yes", "no"}:
+            raise TestStoreConflict("native test attempt OOM observation is invalid")
+        oom_killed = raw_oom == "yes"
+        peak = _systemd_counter(fields.get("MemoryPeak"), field="peak memory measurement")
+        cpu_nsec = _systemd_counter(fields.get("CPUUsageNSec"), field="CPU measurement")
+        cpu = None if cpu_nsec is None else float(cpu_nsec) / 1_000_000_000
+        current = _systemd_counter(fields.get("MemoryCurrent"), field="current memory measurement")
+        result_package = None
+        termination_reason = None
+        if not active:
+            result_package = self._finalize_result_package(runtime_id, descriptor)
+            runner_peak, runner_cpu, runner_status = self._package_resource_usage(
+                result_package
+            )
+            if peak is None:
+                peak = runner_peak
+            if cpu is None:
+                cpu = runner_cpu
+            if runner_status is not None:
+                exit_status = runner_status
+            if oom_killed or systemd_result == "oom-kill":
+                termination_reason = "oom_kill"
+            elif systemd_result == "timeout":
+                termination_reason = "timeout"
+            elif systemd_result in {"signal", "core-dump", "watchdog"} or exec_main_code in {2, 3}:
+                termination_reason = "signal"
+            elif exit_status == 0:
+                termination_reason = "success"
+            elif exit_status is not None:
+                termination_reason = "exit_code"
+            else:
+                termination_reason = "systemd_failure"
+        return NativeTestAttemptState(
+            runtime_id=runtime_id,
+            loaded=fields.get("LoadState") == "loaded",
+            active=active,
+            state=("running" if active else "exited"),
+            exit_status=None if active else exit_status,
+            started_at=self._attempt_started_at(runtime_id),
+            finished_at=None if active else float(self.clock()),
+            result_package=result_package,
+            systemd_result=None if active else systemd_result,
+            exec_main_code=None if active else exec_main_code,
+            termination_reason=termination_reason,
+            oom_killed=False if active else oom_killed,
+            peak_memory_bytes=peak,
+            cpu_seconds=cpu,
+            current_memory_bytes=current if active else None,
+            output_progress=self._runner_output_progress(runtime_id) if active else None,
+            systemd_unit=str(native["systemd_unit"]),
+            invocation_id=str(native["invocation_id"]),
+            control_group=control_group,
+            cgroup_populated=populated,
+        )
+
+    def _attempt_started_at(self, runtime_id: str) -> float | None:
+        native = self._read_native_evidence(runtime_id)
+        value = native.get("started_at")
+        if value is None:
+            value = native.get("prepared_at")
+        return None if value is None else float(value)
+
+    def cancel(self, runtime_id: str) -> NativeTestAttemptState:
+        runtime_id = _safe_id("runtime_id", runtime_id)
+        _descriptor, native = self._native_context(runtime_id)
+        self._stop_exact_unit(runtime_id, native=native)
+        return self.status(runtime_id)
 
     def collect(self, runtime_id: str) -> None:
+        runtime_id = _safe_id("runtime_id", runtime_id)
         state = self.status(runtime_id)
-        if state.active:
-            raise TestStoreConflict("active test attempt cannot be collected")
+        if state.active or state.cgroup_populated is not False:
+            raise TestStoreConflict("test attempt lacks stopped cgroup proof")
+        if state.result_package is not None:
+            package = self.resolve_result_package(
+                str(state.result_package["storage_handle"])
+            )
+            package.path.unlink(missing_ok=True)
+            self._ensure_result_package_root()
+            directory_fd = os.open(
+                self.result_package_root,
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+            )
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
         self._run([self.systemctl, "reset-failed", self._unit(runtime_id)], allow_failure=True)
+        self._cleanup_attempt_resources(runtime_id, reason="attempt_collected")
         materialized = self._materialized.pop(runtime_id, None)
         if materialized is None:
             candidate = self.attempt_root / runtime_id
@@ -4595,8 +4705,8 @@ class BrokerTestAttemptCoordinator:
         if (
             not state.loaded
             and not state.active
-            and state.result_document is None
-            and state.state == "not-found"
+            and state.result_package is None
+            and state.state in {"absent", "not-found"}
         ):
             raise TestAttemptLaunchUncertain(
                 "test attempt native launch outcome is not yet observable"
@@ -4655,236 +4765,6 @@ class BrokerTestAttemptCoordinator:
         ):
             raise TestStoreConflict("native test attempt state identity is invalid")
         return state
-
-    def observe(
-        self, runtime_id: str, *, result_chunk_index: int = 0
-    ) -> dict[str, object]:
-        runtime_id = _safe_id("runtime_id", runtime_id)
-        if type(result_chunk_index) is not int or not 0 <= result_chunk_index < 4_096:
-            raise TestStoreContractError("test result chunk index is invalid")
-        state = self.manager.status(runtime_id)
-        descriptor = self.runtime_descriptor(runtime_id)
-        if state.active and state.result_document is None:
-            if state.started_at is None:
-                # Without a durable origin there is no truthful way to decide
-                # whether another heartbeat would extend an overdue attempt.
-                # Fail observation so testd cannot renew the lease blindly.
-                raise TestStoreConflict(
-                    "active test attempt execution deadline is unavailable"
-                )
-            execution_deadline = (
-                float(state.started_at) + descriptor.ttl_seconds
-            )
-            if float(self.clock()) >= execution_deadline:
-                expired = self._require_exact_native_state(
-                    runtime_id, self.manager.cancel(runtime_id)
-                )
-                if expired.active:
-                    raise TestStoreConflict(
-                        "expired test attempt remained active after exact cancellation"
-                    )
-                if expired.result_document is None:
-                    state = replace(
-                        expired,
-                        exit_status=124,
-                        finished_at=(
-                            float(self.clock())
-                            if expired.finished_at is None
-                            else expired.finished_at
-                        ),
-                        termination_reason="timeout",
-                        systemd_result="timeout",
-                        exec_main_code=1,
-                        oom_killed=False,
-                        current_memory_bytes=None,
-                        output_progress=None,
-                    )
-                else:
-                    # A complete atomic result published between the first
-                    # observation and deadline cancellation remains the
-                    # measured terminal truth and is drained normally below.
-                    state = expired
-        result_summary: dict[str, object] | None = None
-        result_chunk: Mapping[str, object] | None = None
-        if state.result_document is not None:
-            result = state.result_document
-            if not isinstance(result, Mapping) or set(result) != {
-                "schema_version",
-                "attempt_id",
-                "generation",
-                "returncode",
-                "duration_seconds",
-                "peak_memory_bytes",
-                "cpu_seconds",
-                "incomplete_reporting",
-                "terminal_outcome",
-                "captures",
-                "artifact_sources",
-                "chunk_manifest",
-            }:
-                raise TestStoreConflict("test runner result fields are invalid")
-            manifest = result["chunk_manifest"]
-            if (
-                result["schema_version"] != 3
-                or result["attempt_id"] != descriptor.attempt_id
-                or result["generation"] != descriptor.generation
-                or type(result["returncode"]) is not int
-                or type(result["incomplete_reporting"]) is not bool
-                or result["terminal_outcome"] not in {
-                    "succeeded",
-                    "test_failed",
-                    "infrastructure_failed",
-                    "timed_out",
-                    "incomplete",
-                }
-                or not isinstance(result["captures"], Mapping)
-                or not isinstance(result["artifact_sources"], list)
-                or not isinstance(manifest, list)
-                or not 1 <= len(manifest) <= 4_096
-            ):
-                raise TestStoreConflict("test runner result identity is invalid")
-            result_summary = {
-                "schema_version": 3,
-                "attempt_id": descriptor.attempt_id,
-                "generation": descriptor.generation,
-                "returncode": result["returncode"],
-                "duration_seconds": result["duration_seconds"],
-                "incomplete_reporting": result["incomplete_reporting"],
-                "terminal_outcome": result["terminal_outcome"],
-                "captures": dict(result["captures"]),
-                "chunk_count": len(manifest),
-            }
-            if result_chunk_index < len(manifest):
-                result_chunk = self.manager.read_result_chunk(
-                    runtime_id, result_chunk_index
-                )
-                if result_chunk is None:
-                    raise TestStoreConflict("test runner result chunk is unavailable")
-        termination_reason = state.termination_reason
-        systemd_result = state.systemd_result
-        exec_main_code = state.exec_main_code
-        peak_memory_bytes = _validated_peak_memory_bytes(
-            state.peak_memory_bytes
-        )
-        cpu_seconds = _validated_cpu_seconds(state.cpu_seconds)
-        current_memory_bytes = _validated_peak_memory_bytes(
-            state.current_memory_bytes
-        )
-        terminal_from_result = result_summary is not None
-        effective_active = state.active and not terminal_from_result
-        output_progress = (
-            _validated_output_progress(state.output_progress)
-            if effective_active
-            else None
-        )
-        if terminal_from_result:
-            runner_peak_memory, runner_cpu_seconds = _runner_resource_usage(result)
-            if peak_memory_bytes is None and runner_peak_memory is not None:
-                peak_memory_bytes = runner_peak_memory
-            if cpu_seconds is None and runner_cpu_seconds is not None:
-                cpu_seconds = runner_cpu_seconds
-            exit_status = int(result["returncode"])
-            terminal_outcome = str(result["terminal_outcome"])
-            termination_reason = (
-                "success"
-                if terminal_outcome == "succeeded"
-                else "timeout"
-                if terminal_outcome == "timed_out"
-                else "exit_code"
-            )
-            systemd_result = "success" if exit_status == 0 else "exit-code"
-            exec_main_code = 1
-        else:
-            exit_status = state.exit_status
-        if not effective_active and termination_reason is None:
-            # Protocol fakes and alternate native managers may not expose the
-            # richer systemd fields. Preserve the old interface without
-            # silently claiming OOM/timeout evidence that was not observed.
-            termination_reason = (
-                "success" if state.exit_status == 0 else "exit_code"
-                if type(state.exit_status) is int else "systemd_failure"
-            )
-            systemd_result = (
-                "success" if state.exit_status == 0 else "exit-code"
-                if type(state.exit_status) is int else "unknown"
-            )
-            exec_main_code = 1 if type(state.exit_status) is int else 0
-        return {
-            "runtime_id": runtime_id,
-            "attempt_id": descriptor.attempt_id,
-            "repository_id": descriptor.repository_id,
-            "repository_generation": descriptor.repository_generation,
-            "state": "running" if effective_active else "exited",
-            "exit_status": exit_status,
-            "started_at": state.started_at,
-            "finished_at": (
-                float(self.clock())
-                if terminal_from_result and state.finished_at is None
-                else state.finished_at
-            ),
-            "result": result_summary,
-            "result_chunk": (
-                None if result_chunk is None else dict(result_chunk)
-            ),
-            "termination": (
-                None
-                if effective_active
-                else {
-                    "reason": termination_reason,
-                    "systemd_result": systemd_result,
-                    "exec_main_code": exec_main_code,
-                    "oom_killed": state.oom_killed,
-                }
-            ),
-            "resource_usage": (
-                {"current_memory_bytes": current_memory_bytes}
-                if effective_active
-                else {
-                    "peak_memory_bytes": peak_memory_bytes,
-                    "cpu_seconds": cpu_seconds,
-                }
-            ),
-            "progress": output_progress,
-        }
-
-    def collect(
-        self,
-        runtime_id: str,
-        *,
-        expected_attempt_id: str,
-        expected_repository_id: str,
-        expected_repository_generation: int,
-    ) -> dict[str, object]:
-        """Stop and remove one measured runtime after testd commits terminal state."""
-
-        runtime_id = _safe_id("runtime_id", runtime_id)
-        descriptor = self.runtime_descriptor(runtime_id)
-        if (
-            descriptor.attempt_id != _safe_id("expected_attempt_id", expected_attempt_id)
-            or descriptor.repository_id
-            != _safe_id("expected_repository_id", expected_repository_id)
-            or descriptor.repository_generation != expected_repository_generation
-        ):
-            raise TestStoreConflict("test attempt collection identity is contradictory")
-        state = self._require_exact_native_state(
-            runtime_id, self.manager.status(runtime_id)
-        )
-        if state.result_document is None:
-            raise TestStoreConflict(
-                "test attempt cannot be collected before measured result publication"
-            )
-        if state.active:
-            state = self._require_exact_native_state(
-                runtime_id, self.manager.cancel(runtime_id)
-            )
-        if state.active:
-            raise TestStoreConflict("test attempt remained active during collection")
-        self.manager.collect(runtime_id)
-        ticket_id = self._runtimes.pop(runtime_id, None)
-        if ticket_id is not None:
-            self._tickets.pop(ticket_id, None)
-        self._recovered_runtimes.pop(runtime_id, None)
-        return {"runtime_id": runtime_id, "collected": True}
 
     def cancel(
         self,
@@ -4958,6 +4838,135 @@ class BrokerTestAttemptCoordinator:
             "cancelled": not state.active,
             "absent": absent,
         }
+
+    # Package/fact projection consumed by the schema-v8 broker adapter.
+    def observe(
+        self, runtime_id: str, *, result_chunk_index: int | None = None
+    ) -> dict[str, object]:
+        if result_chunk_index is not None:
+            raise TestStoreContractError(
+                "result chunk observation is not supported by atomic packages"
+            )
+        runtime_id = _safe_id("runtime_id", runtime_id)
+        state = self._require_exact_native_state(
+            runtime_id, self.manager.status(runtime_id)
+        )
+        descriptor = self.runtime_descriptor(runtime_id)
+        if state.active:
+            lifecycle = (
+                "starting"
+                if state.state in {"start", "start-pre", "start-post", "activating"}
+                else "running"
+            )
+        elif not state.loaded and state.state in {"absent", "not-found"}:
+            lifecycle = "absent"
+        else:
+            lifecycle = "exited"
+        return {
+            "execution_id": runtime_id,
+            "runtime_id": runtime_id,
+            "attempt_id": descriptor.attempt_id,
+            "generation": descriptor.generation,
+            "repository_id": descriptor.repository_id,
+            "repository_generation": descriptor.repository_generation,
+            "systemd_unit": state.systemd_unit or f"{runtime_id}.service",
+            "invocation_id": state.invocation_id,
+            "state": lifecycle,
+            "unit_inactive": not state.active,
+            "cgroup_empty": state.cgroup_populated is False,
+            "launch_confirmed": state.started_at is not None,
+            "started_at": state.started_at,
+            "finished_at": state.finished_at,
+            "result_package": (
+                None if state.result_package is None else dict(state.result_package)
+            ),
+            "exit": (
+                None
+                if state.active
+                else {
+                    "status": state.exit_status,
+                    "reason": state.termination_reason,
+                    "systemd_result": state.systemd_result,
+                    "exec_main_code": state.exec_main_code,
+                    "oom_killed": state.oom_killed,
+                }
+            ),
+            "resource_usage": (
+                {"current_memory_bytes": state.current_memory_bytes}
+                if state.active
+                else {
+                    "peak_memory_bytes": state.peak_memory_bytes,
+                    "cpu_seconds": state.cpu_seconds,
+                }
+            ),
+            "progress": (
+                None
+                if state.output_progress is None
+                else dict(state.output_progress)
+            ),
+        }
+
+    def resolve_package(
+        self,
+        runtime_id: str,
+        *,
+        storage_handle: str,
+    ) -> Mapping[str, object]:
+        descriptor = self.runtime_descriptor(runtime_id)
+        package = self.manager.resolve_result_package(storage_handle)
+        expected_identity = {
+            "attempt_id": descriptor.attempt_id,
+            "target_id": descriptor.target_id,
+            "run_id": descriptor.run_id,
+            "repository_id": descriptor.repository_id,
+            "repository_generation": descriptor.repository_generation,
+            "generation": descriptor.generation,
+            "descriptor_sha256": descriptor.fingerprint,
+        }
+        if package.evidence.identity != expected_identity:
+            raise TestStoreConflict("test result package binding is contradictory")
+        return {
+            "result_package": {
+                "schema_version": 1,
+                "package_id": package.evidence.package_id,
+                "storage_handle": storage_handle,
+                "sha256": package.evidence.sha256,
+                "size_bytes": package.evidence.size_bytes,
+                "manifest_sha256": package.evidence.manifest_sha256,
+                "identity": dict(package.evidence.identity),
+                "counts": dict(package.evidence.counts),
+            },
+            "manifest": dict(package.manifest),
+        }
+
+    def collect(
+        self,
+        runtime_id: str,
+        *,
+        expected_attempt_id: str,
+        expected_repository_id: str,
+        expected_repository_generation: int,
+    ) -> dict[str, object]:
+        runtime_id = _safe_id("runtime_id", runtime_id)
+        descriptor = self.runtime_descriptor(runtime_id)
+        if (
+            descriptor.attempt_id != _safe_id("expected_attempt_id", expected_attempt_id)
+            or descriptor.repository_id
+            != _safe_id("expected_repository_id", expected_repository_id)
+            or descriptor.repository_generation != expected_repository_generation
+        ):
+            raise TestStoreConflict("test attempt collection identity is contradictory")
+        state = self._require_exact_native_state(
+            runtime_id, self.manager.status(runtime_id)
+        )
+        if state.active or state.cgroup_populated is not False:
+            raise TestStoreConflict("test attempt lacks stopped cgroup proof")
+        self.manager.collect(runtime_id)
+        ticket_id = self._runtimes.pop(runtime_id, None)
+        if ticket_id is not None:
+            self._tickets.pop(ticket_id, None)
+        self._recovered_runtimes.pop(runtime_id, None)
+        return {"runtime_id": runtime_id, "collected": True}
 
 
 __all__ = [
