@@ -12,7 +12,8 @@ one owned host, local Unix identities as attribution rather than tenants,
 root-owned service configuration, and credentials kept out of repository and
 ordinary environment transport.  These assumptions permit host-wide retained
 catalog publication; they do not permit copying secret-shaped environment
-values into the new authority.
+values into the new authority.  ``UIL-OPERATIONS-024`` keeps secret transport
+as an independent control after local repository authorization is removed.
 """
 
 from __future__ import annotations
@@ -41,6 +42,16 @@ from .broker_persistence import (
 from .broker import BrokerError
 from .broker_profile import BrokerProfileError, profile_from_document
 from .schema import SCHEMA_VERSION, initialize_schema, invariant_violations
+from .server_credentials import (
+    MAX_SERVER_CREDENTIAL_BYTES,
+    SERVER_CREDENTIAL_FILE_SUFFIX,
+    ServerCredentialError,
+    secret_environment_literal,
+    server_credential_id,
+    staged_material_path,
+    validate_server_credential_binding,
+    validate_server_credential_material,
+)
 
 
 KIND = "devcoordinator-retained-control-rebaseline"
@@ -54,15 +65,6 @@ SECRET_TRANSPORT_FILES = ("upstream-auth.json", "telegram-control.json")
 _IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:@-]{0,255}")
 _SLUG = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
 _EMAIL = re.compile(r'[^\s@<>(),;:"\[\]]+@[^\s@<>(),;:"\[\]]+\.[^\s@<>(),;:"\[\]]+')
-_SECRET_NAME = re.compile(
-    r"(?:^|_)(?:secret|password|passwd|token|credential|private_key|api_key|access_key|authorization)(?:$|_)",
-    re.IGNORECASE,
-)
-_SECRET_VALUE = re.compile(
-    r"(?:-----BEGIN [A-Z ]*PRIVATE KEY-----|\bBearer\s+[A-Za-z0-9._~+/=-]{8,}|[a-z][a-z0-9+.-]*://[^\s/@:]+:[^\s/@]+@)",
-    re.IGNORECASE,
-)
-
 # The rebaseline is intentionally a one-time schema-15 -> schema-16 boundary.
 # These columns are the reviewed schema-15 control surface.  Do not derive this
 # map from the current schema: doing so would silently turn a future column into
@@ -336,7 +338,11 @@ def _advanced(value: object, field: str) -> int:
 def _reject_secret_environment(row: Mapping[str, Any], table: str) -> dict[str, Any]:
     name = str(row.get("name") or "")
     value = str(row.get("value") or "")
-    if _SECRET_NAME.search(name) or _SECRET_VALUE.search(value):
+    try:
+        secret = secret_environment_literal(name, value)
+    except ServerCredentialError as error:
+        raise RetainedControlError(f"{table} contains an invalid environment entry") from error
+    if secret:
         raise RetainedControlError(
             f"{table} contains secret-shaped environment transport: {name!r}"
         )
@@ -599,6 +605,203 @@ def _copy_collection(
             raise RetainedControlError(f"retained {table} row is incompatible: {error}") from error
         copied += 1
     return copied
+
+
+def _copy_server_environment(
+    source: sqlite3.Connection,
+    target: sqlite3.Connection,
+    *,
+    output_root: Path,
+    timestamp: str,
+) -> tuple[dict[str, int], list[dict[str, Any]], set[str]]:
+    """Split schema-15 literals from exact staged credential bindings."""
+
+    table = "server_environment"
+    expected_columns = SCHEMA_15_RETAINED_COLUMNS[table]
+    if _columns(source, table) != expected_columns or _columns(target, table) != expected_columns:
+        raise RetainedControlError("server environment schema changed during retained split")
+    credential_columns = (
+        "server_definition_id",
+        "name",
+        "credential_id",
+        "created_at",
+        "updated_at",
+    )
+    if _columns(target, "server_environment_credentials") != credential_columns:
+        raise RetainedControlError("server credential binding schema is incompatible")
+
+    literals: list[tuple[str, str, str]] = []
+    credentials: list[tuple[str, str, str, bytes, Path]] = []
+    credential_ids: set[str] = set()
+    material_paths: set[Path] = set()
+    material_root = output_root / "server-credentials"
+    rows = sorted(
+        _rows(source, table),
+        key=lambda row: (str(row.get("server_definition_id") or ""), str(row.get("name") or "")),
+    )
+    for row in rows:
+        server_id = row.get("server_definition_id")
+        name = row.get("name")
+        value = row.get("value")
+        if not all(isinstance(item, str) for item in (server_id, name, value)):
+            raise RetainedControlError("server environment contains a non-text entry")
+        try:
+            secret = secret_environment_literal(name, value)
+        except ServerCredentialError as error:
+            raise RetainedControlError("server environment contains an invalid entry") from error
+        if not secret:
+            literals.append((server_id, name, value))
+            continue
+        payload = value.encode("utf-8")
+        if not 1 <= len(payload) <= MAX_SERVER_CREDENTIAL_BYTES:
+            raise RetainedControlError(
+                f"server credential material is empty or oversized: {name!r}"
+            )
+        try:
+            credential_id = server_credential_id(server_id, name)
+            binding = validate_server_credential_binding(
+                server_id, {"name": name, "credential_id": credential_id}
+            )
+            material_path = staged_material_path(material_root, credential_id)
+        except ServerCredentialError as error:
+            raise RetainedControlError("server credential binding is invalid") from error
+        if binding.credential_id in credential_ids or material_path in material_paths:
+            raise RetainedControlError("server credential identity collision")
+        credential_ids.add(binding.credential_id)
+        material_paths.add(material_path)
+        credentials.append((server_id, binding.name, binding.credential_id, payload, material_path))
+
+    if literals:
+        target.executemany(
+            "INSERT INTO server_environment(server_definition_id,name,value) VALUES (?,?,?)",
+            literals,
+        )
+
+    evidence: list[dict[str, Any]] = []
+    affected: set[str] = set()
+    for server_id, name, credential_id, payload, material_path in credentials:
+        if material_path.exists() or material_path.is_symlink():
+            raise RetainedControlError("server credential staged material already exists")
+        _atomic_bytes(material_path, payload, 0o600)
+        try:
+            observed_material = validate_server_credential_material(
+                material_path.parent,
+                credential_id,
+                expected_uid=os.geteuid(),
+            )
+        except ServerCredentialError as error:
+            raise RetainedControlError("server credential staged material is unsafe") from error
+        if observed_material.encode("utf-8") != payload:
+            raise RetainedControlError("server credential staged material changed")
+        material = _file_identity(material_path, maximum=MAX_SERVER_CREDENTIAL_BYTES)
+        if material["mode"] != 0o600 or material["bytes"] != len(payload):
+            raise RetainedControlError("server credential staged material is unsafe")
+        try:
+            target.execute(
+                """
+                INSERT INTO server_environment_credentials(
+                    server_definition_id,name,credential_id,created_at,updated_at
+                ) VALUES (?,?,?,?,?)
+                """,
+                (server_id, name, credential_id, timestamp, timestamp),
+            )
+        except sqlite3.Error as error:
+            raise RetainedControlError("server credential binding is incompatible") from error
+        evidence.append(
+            {
+                "server_definition_id": server_id,
+                "name": name,
+                "credential_id": credential_id,
+                "material": material,
+            }
+        )
+        affected.add(server_id)
+    return (
+        {
+            "server_environment": len(literals),
+            "server_environment_credentials": len(credentials),
+        },
+        evidence,
+        affected,
+    )
+
+
+def _credentialized_server_fingerprint(
+    connection: sqlite3.Connection, server_definition_id: str
+) -> str:
+    row = connection.execute(
+        """
+        SELECT name,role,cwd,health_url_template
+        FROM server_definitions WHERE server_definition_id=?
+        """,
+        (server_definition_id,),
+    ).fetchone()
+    if row is None:
+        raise RetainedControlError("server credential binding lost its definition")
+    arguments = [
+        str(item[0])
+        for item in connection.execute(
+            "SELECT argument FROM server_command_arguments "
+            "WHERE server_definition_id=? ORDER BY ordinal",
+            (server_definition_id,),
+        )
+    ]
+    environment = {
+        str(item[0]): str(item[1])
+        for item in connection.execute(
+            "SELECT name,value FROM server_environment "
+            "WHERE server_definition_id=? ORDER BY name",
+            (server_definition_id,),
+        )
+    }
+    bindings: list[dict[str, str]] = []
+    for item in connection.execute(
+        "SELECT name,credential_id FROM server_environment_credentials "
+        "WHERE server_definition_id=? ORDER BY name",
+        (server_definition_id,),
+    ):
+        try:
+            binding = validate_server_credential_binding(
+                server_definition_id,
+                {"name": str(item[0]), "credential_id": str(item[1])},
+            )
+        except ServerCredentialError as error:
+            raise RetainedControlError("server credential target binding is invalid") from error
+        bindings.append(binding.to_document())
+    document = {
+        "name": str(row[0]),
+        "role": str(row[1] or ""),
+        "cwd": str(row[2]),
+        "argv": arguments,
+        "environment": environment,
+        "credential_bindings": bindings,
+        "health_url": None if row[3] is None else str(row[3]),
+    }
+    return "sha256:" + _digest_bytes(_canonical(document))
+
+
+def _rekey_credentialized_servers(
+    connection: sqlite3.Connection,
+    server_definition_ids: set[str],
+    *,
+    timestamp: str,
+) -> None:
+    for server_id in sorted(server_definition_ids):
+        fingerprint = _credentialized_server_fingerprint(connection, server_id)
+        changed = connection.execute(
+            "UPDATE server_definitions SET definition_fingerprint=?,updated_at=? "
+            "WHERE server_definition_id=?",
+            (fingerprint, timestamp, server_id),
+        ).rowcount
+        if changed != 1:
+            raise RetainedControlError("server credential definition rekey failed")
+        connection.execute(
+            """
+            UPDATE startup_policies SET immutable_fingerprint=?,updated_at=?
+            WHERE resource_kind='server' AND resource_id=?
+            """,
+            (fingerprint, timestamp, server_id),
+        )
 
 
 def _copy_repository_topology(source: sqlite3.Connection, target: sqlite3.Connection) -> dict[str, int]:
@@ -1053,6 +1256,87 @@ def _profile_document(connection: sqlite3.Connection) -> dict[str, Any]:
     return document
 
 
+def _validate_server_credentials_document(
+    document: Mapping[str, Any], *, transaction_root: Path, target_database: Path
+) -> None:
+    raw = document.get("server_credentials")
+    if not isinstance(raw, list):
+        raise RetainedControlError("existing server credential evidence is invalid")
+    material_root = transaction_root / "server-credentials"
+    expected_paths: set[Path] = set()
+    expected_rows: set[tuple[str, str, str]] = set()
+    for item in raw:
+        if not isinstance(item, Mapping) or set(item) != {
+            "server_definition_id",
+            "name",
+            "credential_id",
+            "material",
+        }:
+            raise RetainedControlError("existing server credential evidence is invalid")
+        server_id = item.get("server_definition_id")
+        try:
+            binding = validate_server_credential_binding(
+                server_id,
+                {"name": item.get("name"), "credential_id": item.get("credential_id")},
+            )
+            path = staged_material_path(material_root, binding.credential_id)
+        except ServerCredentialError as error:
+            raise RetainedControlError("existing server credential binding is invalid") from error
+        material = item.get("material")
+        if not isinstance(material, Mapping) or material.get("path") != str(path):
+            raise RetainedControlError("existing server credential material identity is invalid")
+        try:
+            validate_server_credential_material(
+                material_root,
+                binding.credential_id,
+                expected_uid=os.geteuid(),
+            )
+            actual = _file_identity(path, maximum=MAX_SERVER_CREDENTIAL_BYTES)
+        except (RetainedControlError, ServerCredentialError) as error:
+            raise RetainedControlError("existing server credential material changed") from error
+        if actual != dict(material) or actual["mode"] != 0o600:
+            raise RetainedControlError("existing server credential material changed")
+        row = (str(server_id), binding.name, binding.credential_id)
+        if row in expected_rows or path in expected_paths:
+            raise RetainedControlError("existing server credential evidence is duplicated")
+        expected_rows.add(row)
+        expected_paths.add(path)
+
+    if expected_paths:
+        try:
+            root_info = material_root.lstat()
+        except OSError as error:
+            raise RetainedControlError("existing server credential root is unavailable") from error
+        if (
+            stat.S_ISLNK(root_info.st_mode)
+            or not stat.S_ISDIR(root_info.st_mode)
+            or root_info.st_uid != os.geteuid()
+            or stat.S_IMODE(root_info.st_mode) != 0o700
+        ):
+            raise RetainedControlError("existing server credential root is unsafe")
+        actual_paths = set(material_root.iterdir())
+        if actual_paths != expected_paths:
+            raise RetainedControlError("existing server credential root has unknown material")
+    elif material_root.exists() or material_root.is_symlink():
+        raise RetainedControlError("empty server credential evidence has a material root")
+
+    target = sqlite3.connect(f"{target_database.as_uri()}?mode=ro", uri=True)
+    try:
+        observed_rows = {
+            (str(row[0]), str(row[1]), str(row[2]))
+            for row in target.execute(
+                "SELECT server_definition_id,name,credential_id "
+                "FROM server_environment_credentials"
+            )
+        }
+    except sqlite3.Error as error:
+        raise RetainedControlError("existing server credential target is unreadable") from error
+    finally:
+        target.close()
+    if observed_rows != expected_rows:
+        raise RetainedControlError("existing server credential target binding changed")
+
+
 def _load_prepared_transaction(
     manifest_path: Path,
     *,
@@ -1097,6 +1381,11 @@ def _load_prepared_transaction(
         or _file_identity(target_profile) != dict(target_profile_value)
     ):
         raise RetainedControlError("existing retained-control staged target changed")
+    _validate_server_credentials_document(
+        document,
+        transaction_root=manifest_path.parent,
+        target_database=target_database,
+    )
     console_files = document.get("console_files")
     if not isinstance(console_files, dict) or set(console_files) != set(CONSOLE_FILES):
         raise RetainedControlError("existing retained Console evidence is invalid")
@@ -1131,6 +1420,15 @@ def _discard_incomplete_staging(output_root: Path) -> None:
     allowed_temporary = re.compile(
         r"\.(?:authority\.sqlite3|client-profiles\.json|routes\.json|access-control\.json|ui-prefs\.json)\.\d+\.[0-9a-f]{32}\.tmp"
     )
+    credential_material = re.compile(
+        r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+        + re.escape(SERVER_CREDENTIAL_FILE_SUFFIX)
+    )
+    credential_temporary = re.compile(
+        r"\."
+        + credential_material.pattern
+        + r"\.\d+\.[0-9a-f]{32}\.tmp"
+    )
     entries = list(output_root.iterdir())
     for entry in entries:
         if entry.name == "console":
@@ -1148,6 +1446,29 @@ def _discard_incomplete_staging(output_root: Path) -> None:
                     )
                 ):
                     raise RetainedControlError("partial retained Console output is unknown")
+                child.unlink()
+            entry.rmdir()
+            continue
+        if entry.name == "server-credentials":
+            info = entry.lstat()
+            if (
+                stat.S_ISLNK(info.st_mode)
+                or not stat.S_ISDIR(info.st_mode)
+                or info.st_uid != os.geteuid()
+                or stat.S_IMODE(info.st_mode) != 0o700
+            ):
+                raise RetainedControlError("partial server credential root is unsafe")
+            for child in list(entry.iterdir()):
+                child_info = child.lstat()
+                if (
+                    stat.S_ISLNK(child_info.st_mode)
+                    or not stat.S_ISREG(child_info.st_mode)
+                    or (
+                        credential_material.fullmatch(child.name) is None
+                        and credential_temporary.fullmatch(child.name) is None
+                    )
+                ):
+                    raise RetainedControlError("partial server credential output is unknown")
                 child.unlink()
             entry.rmdir()
             continue
@@ -1208,6 +1529,8 @@ def prepare_rebaseline(
     if _IDENTIFIER.fullmatch(generation) is None:
         raise RetainedControlError("new database generation is invalid")
     recorded_at = timestamp or _now()
+    server_credentials: list[dict[str, Any]] = []
+    credentialized_server_ids: set[str] = set()
 
     source = sqlite3.connect(f"{source_database.as_uri()}?mode=ro", uri=True)
     source.row_factory = sqlite3.Row
@@ -1231,6 +1554,10 @@ def prepare_rebaseline(
                 "retained-control rebaseline accepts exactly authority schema 15"
             )
         source_table_names = _tables(source)
+        if "server_environment_credentials" in source_table_names:
+            raise RetainedControlError(
+                "schema-15 authority contains unknown server credential bindings"
+            )
         required_source_tables = set(SCHEMA_15_RETAINED_COLUMNS)
         if not required_source_tables <= source_table_names:
             raise RetainedControlError(
@@ -1262,7 +1589,23 @@ def prepare_rebaseline(
             counts[table] = _copy_collection(source, target, table, transform)
         counts.update(_copy_repository_topology(source, target))
         for table, transform in RETAINED_COLLECTIONS[2:]:
-            counts[table] = _copy_collection(source, target, table, transform)
+            if table == "server_environment":
+                environment_counts, server_credentials, credentialized_server_ids = (
+                    _copy_server_environment(
+                        source,
+                        target,
+                        output_root=output_root,
+                        timestamp=recorded_at,
+                    )
+                )
+                counts.update(environment_counts)
+            else:
+                counts[table] = _copy_collection(source, target, table, transform)
+        _rekey_credentialized_servers(
+            target,
+            credentialized_server_ids,
+            timestamp=recorded_at,
+        )
         target.execute(
             """
             INSERT INTO worker_supervisor_states(
@@ -1373,10 +1716,16 @@ def prepare_rebaseline(
         "console_files": console_files,
         "console_sources": console_sources,
         "console_counts": console_counts,
+        "server_credentials": server_credentials,
         "redacted_secret_references": secret_refs,
         "external_secret_transport": external_secret_transport,
         "created_at": recorded_at,
     }
+    _validate_server_credentials_document(
+        manifest,
+        transaction_root=output_root,
+        target_database=target_path,
+    )
     manifest["document_sha256"] = _digest_bytes(_canonical(manifest))
     _atomic_bytes(
         manifest_path,

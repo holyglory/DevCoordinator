@@ -5,14 +5,15 @@ from pathlib import Path
 import sqlite3
 import tempfile
 import unittest
+import uuid
 
-from devcoordinator import retained_control
+from devcoordinator import retained_control, server_credentials
 from devcoordinator.broker_persistence import BROKER_SCHEMA
 from devcoordinator.compose_run_once import (
     ComposeRunOncePolicy,
     ComposeRunOnceReceiptContract,
 )
-from devcoordinator.schema import initialize_schema
+from devcoordinator.schema import initialize_schema, invariant_violations
 
 
 STAMP = "2026-08-21T00:00:00.000Z"
@@ -104,6 +105,7 @@ class RetainedControlTests(unittest.TestCase):
             connection.execute("PRAGMA foreign_keys=ON")
             initialize_schema(connection, database_generation="source-generation", timestamp=STAMP)
             retained_control._execute_script(connection, BROKER_SCHEMA)
+            connection.execute("DROP TABLE server_environment_credentials")
             connection.execute(
                 "UPDATE schema_metadata SET schema_version=15,authority_mode='sqlite',migration_state='ready'"
             )
@@ -228,6 +230,19 @@ class RetainedControlTests(unittest.TestCase):
             )
             connection.execute(
                 """
+                INSERT INTO startup_policies(
+                    policy_id,repo_id,resource_kind,resource_id,policy_kind,
+                    current_value,desired_disabled_value,immutable_fingerprint,
+                    generation,updated_at
+                ) VALUES (?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    "startup-1", "repo-1", "server", "server-1", "coordinator",
+                    "enabled", "disabled", "fingerprint", 9, STAMP,
+                ),
+            )
+            connection.execute(
+                """
                 INSERT INTO worker_policies(
                     server_definition_id,repo_id,execution_uid,keep_alive,desired_state,
                     breaker_state,crash_limit,crash_window_seconds,generation,requested_by,
@@ -341,7 +356,7 @@ class RetainedControlTests(unittest.TestCase):
 
     def _prepare(self, name: str = "out") -> dict[str, object]:
         output = self.root / name
-        output.mkdir(mode=0o700)
+        output.mkdir(mode=0o700, exist_ok=True)
         return retained_control.prepare_rebaseline(
             source_database=self.database,
             source_profile=self.profile,
@@ -366,6 +381,17 @@ class RetainedControlTests(unittest.TestCase):
             self.assertEqual(metadata, (16, "target-generation", 0, 0, "ready"))
             self.assertEqual(target.execute("SELECT generation FROM repositories").fetchone()[0], 8)
             self.assertEqual(target.execute("SELECT generation FROM server_definitions").fetchone()[0], 4)
+            self.assertEqual(
+                target.execute(
+                    "SELECT immutable_fingerprint,generation FROM startup_policies "
+                    "WHERE policy_id='startup-1'"
+                ).fetchone(),
+                ("fingerprint", 10),
+            )
+            self.assertEqual(
+                target.execute("SELECT COUNT(*) FROM server_environment_credentials").fetchone()[0],
+                0,
+            )
             self.assertEqual(target.execute("SELECT generation FROM broker_compose_definitions").fetchone()[0], 6)
             self.assertEqual(target.execute("SELECT generation FROM ephemeral_container_templates").fetchone()[0], 7)
             self.assertEqual(
@@ -448,6 +474,8 @@ class RetainedControlTests(unittest.TestCase):
             target.close()
         access = json.loads((self.root / "out/console/access-control.json").read_text())
         self.assertEqual(access["requests"], {})
+        self.assertEqual(result["server_credentials"], [])
+        self.assertFalse((self.root / "out/server-credentials").exists())
         self.assertEqual(result["console_counts"], {"routes": 1, "users": 1, "grants": 2, "settings": 1})
         self.assertEqual(
             result["redacted_secret_references"][0]["binding_sha256"],
@@ -474,13 +502,236 @@ class RetainedControlTests(unittest.TestCase):
         self.assertEqual(result["source"]["profile"]["path"], str(self.profile))
         self.assertTrue(result["console_sources"]["routes.json"]["present"])
 
-    def test_secret_shaped_environment_is_rejected(self) -> None:
+    def test_secret_shaped_ephemeral_template_environment_is_rejected(self) -> None:
         connection = sqlite3.connect(self.database)
-        connection.execute("UPDATE server_environment SET name='API_TOKEN'")
+        connection.execute(
+            "INSERT INTO ephemeral_template_environment VALUES (?,?,?)",
+            ("template-1", "API_TOKEN", "synthetic-secret-sentinel"),
+        )
         connection.commit()
         connection.close()
-        with self.assertRaisesRegex(retained_control.RetainedControlError, "secret-shaped"):
-            self._prepare("secret-out")
+        with self.assertRaisesRegex(
+            retained_control.RetainedControlError,
+            "ephemeral_template_environment contains secret-shaped",
+        ) as raised:
+            self._prepare("ephemeral-secret-out")
+        self.assertNotIn("synthetic-secret-sentinel", str(raised.exception))
+
+    def test_credential_free_database_url_remains_a_literal(self) -> None:
+        value = "postgresql://127.0.0.1/app"
+        connection = sqlite3.connect(self.database)
+        connection.execute(
+            "UPDATE server_environment SET name='DATABASE_URL',value=?",
+            (value,),
+        )
+        connection.commit()
+        connection.close()
+
+        result = self._prepare("safe-database-url-out")
+        target = sqlite3.connect(result["target"]["database"]["path"])
+        try:
+            self.assertEqual(
+                target.execute(
+                    "SELECT name,value FROM server_environment "
+                    "WHERE server_definition_id='server-1'"
+                ).fetchone(),
+                ("DATABASE_URL", value),
+            )
+            self.assertEqual(
+                target.execute("SELECT COUNT(*) FROM server_environment_credentials").fetchone()[0],
+                0,
+            )
+        finally:
+            target.close()
+        self.assertEqual(result["server_credentials"], [])
+        self.assertEqual(result["retained_collections"]["server_environment"], 1)
+        self.assertEqual(
+            result["retained_collections"]["server_environment_credentials"], 0
+        )
+
+    def test_credential_database_url_is_externalized_without_secret_echo(self) -> None:
+        sentinel = "credential-sentinel-94d70d47"
+        value = f"postgresql://app:{sentinel}@127.0.0.1/app"
+        connection = sqlite3.connect(self.database)
+        connection.execute(
+            "UPDATE server_environment SET name='DATABASE_URL',value=?",
+            (value,),
+        )
+        connection.commit()
+        connection.close()
+        source_before = self.database.read_bytes()
+
+        result = self._prepare("credential-out")
+        expected_id = server_credentials.server_credential_id("server-1", "DATABASE_URL")
+        self.assertEqual(len(result["server_credentials"]), 1)
+        credential = result["server_credentials"][0]
+        self.assertEqual(
+            {key: credential[key] for key in ("server_definition_id", "name", "credential_id")},
+            {
+                "server_definition_id": "server-1",
+                "name": "DATABASE_URL",
+                "credential_id": expected_id,
+            },
+        )
+        material_path = Path(credential["material"]["path"])
+        self.assertEqual(
+            material_path,
+            server_credentials.staged_material_path(
+                self.root / "credential-out/server-credentials", expected_id
+            ),
+        )
+        self.assertEqual(material_path.read_bytes(), value.encode("utf-8"))
+        self.assertEqual(material_path.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(
+            sorted(self.root.joinpath("credential-out/server-credentials").iterdir()),
+            [material_path],
+        )
+
+        target = sqlite3.connect(result["target"]["database"]["path"])
+        try:
+            self.assertEqual(
+                target.execute("SELECT COUNT(*) FROM server_environment").fetchone()[0],
+                0,
+            )
+            self.assertEqual(
+                target.execute(
+                    "SELECT server_definition_id,name,credential_id,created_at,updated_at "
+                    "FROM server_environment_credentials"
+                ).fetchone(),
+                ("server-1", "DATABASE_URL", expected_id, STAMP, STAMP),
+            )
+            fingerprint, generation = target.execute(
+                "SELECT definition_fingerprint,generation FROM server_definitions "
+                "WHERE server_definition_id='server-1'"
+            ).fetchone()
+            self.assertRegex(fingerprint, r"^sha256:[0-9a-f]{64}$")
+            self.assertNotEqual(fingerprint, "fingerprint")
+            self.assertEqual(generation, 4)
+            self.assertEqual(
+                target.execute(
+                    "SELECT immutable_fingerprint,generation FROM startup_policies "
+                    "WHERE policy_id='startup-1'"
+                ).fetchone(),
+                (fingerprint, 10),
+            )
+        finally:
+            target.close()
+
+        self.assertEqual(result["retained_collections"]["server_environment"], 0)
+        self.assertEqual(
+            result["retained_collections"]["server_environment_credentials"], 1
+        )
+        self.assertEqual(self.database.read_bytes(), source_before)
+        self.assertNotIn(sentinel, json.dumps(result, sort_keys=True))
+        for path in sorted((self.root / "credential-out").rglob("*")):
+            if path.is_file() and path != material_path:
+                self.assertNotIn(sentinel.encode("utf-8"), path.read_bytes(), str(path))
+
+        identity_before = credential["material"]
+        replay = self._prepare("credential-out")
+        self.assertEqual(replay, result)
+        self.assertEqual(replay["server_credentials"][0]["material"], identity_before)
+
+    def test_changed_or_unknown_server_credential_evidence_is_rejected(self) -> None:
+        sentinel = "credential-sentinel-no-echo-1038"
+        value = f"postgresql://app:{sentinel}@127.0.0.1/app"
+        for scenario in ("changed-binding", "unknown-material"):
+            with self.subTest(scenario=scenario):
+                self.tearDown()
+                self.setUp()
+                connection = sqlite3.connect(self.database)
+                connection.execute(
+                    "UPDATE server_environment SET name='DATABASE_URL',value=?",
+                    (value,),
+                )
+                connection.commit()
+                connection.close()
+                result = self._prepare(f"credential-{scenario}")
+                output = self.root / f"credential-{scenario}"
+                if scenario == "changed-binding":
+                    manifest_path = output / "retained-control.json"
+                    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                    manifest.pop("document_sha256")
+                    manifest["server_credentials"][0]["credential_id"] = str(uuid.uuid4())
+                    manifest["document_sha256"] = retained_control._digest_bytes(
+                        retained_control._canonical(manifest)
+                    )
+                    manifest_path.write_text(
+                        json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+                        encoding="utf-8",
+                    )
+                    message = "binding is invalid"
+                else:
+                    unknown_id = str(uuid.uuid4())
+                    unknown_path = server_credentials.staged_material_path(
+                        output / "server-credentials", unknown_id
+                    )
+                    unknown_path.write_text("unknown", encoding="utf-8")
+                    unknown_path.chmod(0o600)
+                    message = "unknown material"
+                with self.assertRaisesRegex(
+                    retained_control.RetainedControlError, message
+                ) as raised:
+                    self._prepare(f"credential-{scenario}")
+                self.assertNotIn(sentinel, str(raised.exception))
+                self.assertNotIn(sentinel, json.dumps(result, sort_keys=True))
+
+    def test_current_schema_credential_bindings_are_unique_exact_and_unambiguous(self) -> None:
+        result = self._prepare("credential-schema-out")
+        target = sqlite3.connect(result["target"]["database"]["path"])
+        target.execute("PRAGMA foreign_keys=ON")
+        try:
+            credential_id = server_credentials.server_credential_id(
+                "server-1", "API_TOKEN"
+            )
+            target.execute(
+                "INSERT INTO server_environment_credentials VALUES (?,?,?,?,?)",
+                ("server-1", "API_TOKEN", credential_id, STAMP, STAMP),
+            )
+            with self.assertRaises(sqlite3.IntegrityError):
+                target.execute(
+                    "INSERT INTO server_environment_credentials VALUES (?,?,?,?,?)",
+                    ("server-2", "OTHER_TOKEN", credential_id, STAMP, STAMP),
+                )
+            with self.assertRaises(sqlite3.IntegrityError):
+                target.execute(
+                    "INSERT INTO server_environment_credentials VALUES (?,?,?,?,?)",
+                    (
+                        "server-2",
+                        "OTHER_TOKEN",
+                        server_credentials.server_credential_id(
+                            "server-2", "OTHER_TOKEN"
+                        ).upper(),
+                        STAMP,
+                        STAMP,
+                    ),
+                )
+
+            wrong_id = str(uuid.uuid4())
+            target.execute(
+                "INSERT INTO server_environment_credentials VALUES (?,?,?,?,?)",
+                ("server-2", "OTHER_TOKEN", wrong_id, STAMP, STAMP),
+            )
+            target.execute(
+                "INSERT INTO server_environment_credentials VALUES (?,?,?,?,?)",
+                (
+                    "server-1",
+                    "LOG_LEVEL",
+                    server_credentials.server_credential_id("server-1", "LOG_LEVEL"),
+                    STAMP,
+                    STAMP,
+                ),
+            )
+            codes = {
+                violation.code
+                for violation in invariant_violations(
+                    target, include_foreign_keys=False
+                )
+            }
+            self.assertIn("server_environment_credential_binding_invalid", codes)
+            self.assertIn("server_environment_transport_conflict", codes)
+        finally:
+            target.close()
 
     def test_unknown_source_collection_is_rejected(self) -> None:
         connection = sqlite3.connect(self.database)
@@ -489,6 +740,27 @@ class RetainedControlTests(unittest.TestCase):
         connection.close()
         with self.assertRaisesRegex(retained_control.RetainedControlError, "unknown collections"):
             self._prepare("unknown-out")
+
+    def test_schema_15_source_with_unknown_credential_bindings_is_rejected(self) -> None:
+        connection = sqlite3.connect(self.database)
+        connection.execute(
+            """
+            CREATE TABLE server_environment_credentials(
+                server_definition_id TEXT,
+                name TEXT,
+                credential_id TEXT,
+                created_at TEXT,
+                updated_at TEXT
+            )
+            """
+        )
+        connection.commit()
+        connection.close()
+        with self.assertRaisesRegex(
+            retained_control.RetainedControlError,
+            "schema-15 authority contains unknown server credential bindings",
+        ):
+            self._prepare("unknown-credential-bindings-out")
 
     def test_changed_retired_enrollment_shape_is_rejected(self) -> None:
         connection = sqlite3.connect(self.database)

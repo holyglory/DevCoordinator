@@ -266,6 +266,25 @@ CREATE TABLE IF NOT EXISTS server_environment (
     PRIMARY KEY(server_definition_id, name)
 );
 
+-- Secret material is never stored in SQLite.  This table binds one server
+-- environment name to an opaque deterministic credential file identity.
+CREATE TABLE IF NOT EXISTS server_environment_credentials (
+    server_definition_id TEXT NOT NULL REFERENCES server_definitions(server_definition_id) ON DELETE CASCADE,
+    name TEXT NOT NULL,
+    credential_id TEXT NOT NULL UNIQUE CHECK (
+        length(credential_id) = 36
+        AND substr(credential_id, 9, 1) = '-'
+        AND substr(credential_id, 14, 1) = '-'
+        AND substr(credential_id, 19, 1) = '-'
+        AND substr(credential_id, 24, 1) = '-'
+        AND length(replace(credential_id, '-', '')) = 32
+        AND credential_id NOT GLOB '*[^0-9a-f-]*'
+    ),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(server_definition_id, name)
+);
+
 CREATE TABLE IF NOT EXISTS server_source_records (
     server_definition_id TEXT NOT NULL REFERENCES server_definitions(server_definition_id) ON DELETE CASCADE,
     source_resource_id TEXT NOT NULL REFERENCES source_resources(source_resource_id) ON DELETE RESTRICT,
@@ -1426,6 +1445,13 @@ def initialize_schema(
     required_columns = {
         "docker_resources": {"repo_id"},
         "leases": {"protocol"},
+        "server_environment_credentials": {
+            "server_definition_id",
+            "name",
+            "credential_id",
+            "created_at",
+            "updated_at",
+        },
     }
     for table, expected in required_columns.items():
         missing = expected - _table_columns(connection, table)
@@ -1690,6 +1716,16 @@ def invariant_violations(
             "worker policy belongs to a different repository than its definition",
         ),
         (
+            "server_environment_transport_conflict",
+            """
+            SELECT literal.server_definition_id || ':' || literal.name
+            FROM server_environment literal
+            JOIN server_environment_credentials credential
+              USING(server_definition_id, name)
+            """,
+            "server environment name has both literal and credential transport",
+        ),
+        (
             "worker_supervisor_repository_mismatch",
             """
             SELECT supervisor.server_definition_id
@@ -1743,4 +1779,28 @@ def invariant_violations(
     for code, sql, prefix in checks:
         for row in connection.execute(sql):
             violations.append(InvariantViolation(code, f"{prefix}: {row[0]}"))
+    # Import lazily: server_credentials uses store.deterministic_id, while the
+    # store imports this module for its transaction invariant boundary.
+    from .server_credentials import (  # pylint: disable=import-outside-toplevel
+        ServerCredentialError,
+        validate_server_credential_binding,
+    )
+
+    for row in connection.execute(
+        "SELECT server_definition_id,name,credential_id "
+        "FROM server_environment_credentials ORDER BY server_definition_id,name"
+    ):
+        try:
+            validate_server_credential_binding(
+                str(row[0]),
+                {"name": str(row[1]), "credential_id": str(row[2])},
+            )
+        except ServerCredentialError:
+            violations.append(
+                InvariantViolation(
+                    "server_environment_credential_binding_invalid",
+                    "server credential binding does not match its definition and name: "
+                    f"{row[0]}:{row[1]}",
+                )
+            )
     return violations
