@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import contextlib
 import hashlib
 import io
@@ -14,6 +15,7 @@ import threading
 import time
 import unittest
 import uuid
+from urllib.parse import quote
 from unittest import mock
 
 from devcoordinator.broker import BrokerError, BrokerOperation
@@ -868,32 +870,69 @@ class WorkerRunnerTests(unittest.TestCase):
     def test_bounded_log_uses_uuid_filename_line_tail_and_redaction(self) -> None:
         worker_id = str(self.worker_id)
         attempt_id = deterministic_id("runner-artifact-attempt", worker_id)
+        secret = "exact secret+/value"
+        encoded = base64.b64encode(secret.encode()).decode()
+        url_encoded = quote(secret, safe="")
         capture = WorkerLogCapture(
             root=self.home / "logs",
             worker_id=worker_id,
             attempt_id=attempt_id,
             maximum_bytes=4096,
-            maximum_lines=4,
+            maximum_lines=6,
             redaction_request={
-                "options": {"environment": {"SECRET": "exact-secret"}}
+                "options": {"environment": {"SECRET": secret}}
             },
         )
+        raw = (
+            "first\nnon-secret\npassword=hunter2\n"
+            f"{secret}\n{encoded}\n{url_encoded}\nlast\n"
+        ).encode()
         os.write(
             capture.child_output_fd,
-            ("first\nsecond\nthird\npassword=hunter2\nexact-secret\nlast\n").encode(),
+            raw,
         )
         capture.child_spawned()
+        deadline = time.monotonic() + 1.0
+        while capture._received < len(raw) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(capture._received, len(raw))
+        self.assertEqual(capture.path.read_bytes(), b"")
         artifact = capture.finish()
         path = Path(artifact["path"])
         self.assertEqual(path.name, f"worker-attempt-{artifact['artifact_id']}.log")
         payload = path.read_bytes()
         self.assertNotIn(b"first", payload)
         self.assertNotIn(b"hunter2", payload)
-        self.assertNotIn(b"exact-secret", payload)
+        self.assertNotIn(secret.encode(), payload)
+        self.assertNotIn(encoded.encode(), payload)
+        self.assertNotIn(url_encoded.encode(), payload)
         self.assertIn(b"password=[REDACTED]", payload)
-        self.assertLessEqual(len(payload.splitlines()), 4)
+        self.assertIn(b"last", payload)
+        self.assertLessEqual(len(payload.splitlines()), 6)
         self.assertEqual(hashlib.sha256(payload).hexdigest(), artifact["sha256"])
         self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+    def test_unfinished_log_capture_never_persists_buffered_secret(self) -> None:
+        secret = b"unfinished-secret-value"
+        capture = WorkerLogCapture(
+            root=self.home / "logs",
+            worker_id=str(self.worker_id),
+            attempt_id=deterministic_id("runner-unfinished-attempt", self.worker_id),
+            redaction_request={
+                "options": {
+                    "environment": {"DATABASE_PASSWORD": secret.decode()}
+                }
+            },
+        )
+        os.write(capture.child_output_fd, b"non-secret\n" + secret + b"\n")
+        capture.child_spawned()
+        deadline = time.monotonic() + 1.0
+        while capture._received == 0 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertGreater(capture._received, 0)
+        self.assertEqual(capture.path.read_bytes(), b"")
+        capture.abandon()
+        self.assertEqual(capture.path.read_bytes(), b"")
 
     def test_internal_cli_accepts_only_worker_identity_not_json(self) -> None:
         parser = argparse.ArgumentParser()

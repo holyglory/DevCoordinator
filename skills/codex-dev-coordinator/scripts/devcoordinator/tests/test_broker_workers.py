@@ -39,6 +39,7 @@ from devcoordinator.broker_profile import (  # noqa: E402
 from devcoordinator.server_credentials import server_credential_id  # noqa: E402
 from devcoordinator.store import CoordinatorStore, utc_timestamp  # noqa: E402
 from devcoordinator.worker_supervision import WorkerSupervision  # noqa: E402
+from devcoordinator.worker_native import WorkerNativeError  # noqa: E402
 import devcoordinator.worker_artifacts as worker_artifacts  # noqa: E402
 from devcoordinator.tests.test_broker import (  # noqa: E402
     ACCOUNT_ID,
@@ -409,8 +410,14 @@ class WorkerBrokerBackendTests(unittest.TestCase):
             worker_artifacts, "SYSTEM_WORKER_LOG_ROOT", self.log_root
         )
         self.artifact_patch.start()
+        self.caller_patch = mock.patch(
+            "devcoordinator.broker_workers.verify_systemd_worker_caller",
+            return_value={"verified": True},
+        )
+        self.caller_proof = self.caller_patch.start()
 
     def tearDown(self) -> None:
+        self.caller_patch.stop()
         self.artifact_patch.stop()
         self.temporary.__exit__(None, None, None)
 
@@ -560,6 +567,40 @@ class WorkerBrokerBackendTests(unittest.TestCase):
                 self.assertEqual(
                     connection.execute("SELECT COUNT(*) FROM worker_attempts").fetchone()[0],
                     1,
+                )
+
+    def test_manual_runner_is_rejected_before_candidate_or_attempt_creation(self) -> None:
+        self.caller_proof.side_effect = WorkerNativeError(
+            "injected manual runner identity"
+        )
+        service = self._service()
+        peer = PeerCredentials(uid=os.geteuid(), gid=os.getegid(), pid=os.getpid())
+        preview = self._reply(
+            service,
+            peer,
+            worker_request(
+                BrokerOperation.WORKER_POLICY_READ,
+                authority_generation=self.authority_generation,
+            ),
+        )
+        self.assertFalse(preview["ok"])
+        self.assertEqual(preview["error"]["code"], "worker_native_caller_invalid")
+        ticket = self._reply(service, peer, self._ticket_request())
+        self.assertFalse(ticket["ok"])
+        self.assertEqual(ticket["error"]["code"], "worker_native_caller_invalid")
+        with CoordinatorStore.open(
+            self.persistence.database_path, expected_uid=os.geteuid()
+        ) as store:
+            with store.read_transaction() as connection:
+                self.assertEqual(
+                    connection.execute("SELECT COUNT(*) FROM worker_attempts").fetchone()[0],
+                    0,
+                )
+                self.assertEqual(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM broker_worker_operation_requests"
+                    ).fetchone()[0],
+                    0,
                 )
 
     def test_launch_report_is_durably_fenced_after_stop(self) -> None:

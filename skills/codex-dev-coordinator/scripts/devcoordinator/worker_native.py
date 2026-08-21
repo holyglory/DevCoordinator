@@ -12,14 +12,14 @@ from dataclasses import dataclass, replace
 import grp
 import hashlib
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import plistlib
 import pwd
 import re
 import stat
 import subprocess
 import sys
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Mapping, Sequence
 import uuid
 
 from .server_credentials import (
@@ -39,6 +39,7 @@ _PROJECT_IO_WEIGHT = 100
 _PROJECT_MEMORY_HIGH = "16G"
 _PROJECT_MEMORY_MAX = "20G"
 _PROJECT_TASKS_MAX = 4096
+SYSTEMD_CREDENTIAL_DIRECTORY_ROOT = Path("/run/credentials")
 
 
 class WorkerNativeError(RuntimeError):
@@ -575,6 +576,174 @@ class SystemdWorkerManager:
             control_group=control_group,
             cgroup_populated=populated,
         )
+
+
+class SystemdWorkerCallerVerifier:
+    """Prove a broker peer is the exact fixed systemd worker runner."""
+
+    def __init__(
+        self,
+        *,
+        systemctl_executable: str = "/usr/bin/systemctl",
+        proc_root: Path = Path("/proc"),
+        credential_directory_root: Path = SYSTEMD_CREDENTIAL_DIRECTORY_ROOT,
+        runner: Runner = subprocess.run,
+    ) -> None:
+        self.systemctl = _trusted_executable(
+            systemctl_executable, description="systemctl executable"
+        )
+        self.proc_root = Path(proc_root)
+        self.credential_directory_root = Path(credential_directory_root)
+        if not self.proc_root.is_absolute() or not self.credential_directory_root.is_absolute():
+            raise WorkerNativeError("worker caller proof roots must be absolute")
+        self.runner = runner
+
+    def _show(self, unit: str) -> dict[str, str]:
+        completed = _run(
+            self.runner,
+            [
+                self.systemctl,
+                "show",
+                unit,
+                "--property=LoadState",
+                "--property=MainPID",
+                "--property=ControlGroup",
+                "--property=Slice",
+                "--no-pager",
+            ],
+        )
+        values: dict[str, str] = {}
+        for line in completed.stdout.splitlines():
+            if "=" in line:
+                key, value = line.split("=", 1)
+                values[key] = value
+        if set(values) != {"LoadState", "MainPID", "ControlGroup", "Slice"}:
+            raise WorkerNativeError("systemd returned incomplete worker caller evidence")
+        return values
+
+    def _read_proc(self, pid: int, name: str, *, maximum: int) -> bytes:
+        path = self.proc_root / str(pid) / name
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            descriptor = os.open(path, flags)
+        except OSError as error:
+            raise WorkerNativeError("worker caller process evidence is unavailable") from error
+        payload = bytearray()
+        try:
+            metadata = os.fstat(descriptor)
+            if not stat.S_ISREG(metadata.st_mode):
+                raise WorkerNativeError("worker caller process evidence is unsafe")
+            while len(payload) <= maximum:
+                block = os.read(descriptor, min(65536, maximum + 1 - len(payload)))
+                if not block:
+                    break
+                payload.extend(block)
+        finally:
+            os.close(descriptor)
+        if len(payload) > maximum:
+            raise WorkerNativeError("worker caller process evidence is excessive")
+        return bytes(payload)
+
+    def prove(
+        self,
+        *,
+        worker_id: str,
+        peer_pid: int,
+        execution_uid: int,
+        repository_id: str,
+        credential_bindings: object = (),
+    ) -> Mapping[str, object]:
+        worker_id = _worker_id(worker_id)
+        execution_uid = _positive_id(execution_uid, "uid")
+        if type(peer_pid) is not int or peer_pid <= 1:
+            raise WorkerNativeError("worker caller PID is invalid")
+        bindings = validate_server_credential_bindings(worker_id, credential_bindings)
+        unit = SystemdWorkerManager.unit(worker_id)
+        expected_slice = project_repository_slice(
+            uid=execution_uid, repository_id=repository_id
+        )
+        before = self._show(unit)
+        if (
+            before["LoadState"] != "loaded"
+            or not before["MainPID"].isdigit()
+            or int(before["MainPID"]) != peer_pid
+            or before["Slice"] != expected_slice
+        ):
+            raise WorkerNativeError("worker broker caller is not the exact systemd MainPID")
+        control_group = PurePosixPath(before["ControlGroup"])
+        if (
+            not control_group.is_absolute()
+            or ".." in control_group.parts
+            or control_group.name != unit
+            or expected_slice not in control_group.parts
+        ):
+            raise WorkerNativeError("worker caller control group is invalid")
+
+        try:
+            status = self._read_proc(peer_pid, "status", maximum=256 * 1024).decode(
+                "ascii", errors="strict"
+            )
+            cgroups = self._read_proc(peer_pid, "cgroup", maximum=256 * 1024).decode(
+                "ascii", errors="strict"
+            )
+        except UnicodeError as error:
+            raise WorkerNativeError("worker caller process evidence is invalid") from error
+        uid_lines = [line for line in status.splitlines() if line.startswith("Uid:")]
+        if len(uid_lines) != 1:
+            raise WorkerNativeError("worker caller UID evidence is invalid")
+        uid_values = uid_lines[0].split()[1:]
+        if (
+            len(uid_values) != 4
+            or any(not value.isdigit() for value in uid_values)
+            or any(int(value) != execution_uid for value in uid_values)
+        ):
+            raise WorkerNativeError("worker caller UID does not match execution identity")
+        unified = [
+            line.partition("::")[2]
+            for line in cgroups.splitlines()
+            if line.startswith("0::")
+        ]
+        if unified != [str(control_group)]:
+            raise WorkerNativeError("worker caller cgroup membership is invalid")
+
+        environ = self._read_proc(peer_pid, "environ", maximum=1024 * 1024)
+        credential_values = [
+            item.partition(b"=")[2]
+            for item in environ.split(b"\0")
+            if item.startswith(b"CREDENTIALS_DIRECTORY=")
+        ]
+        expected_directory = str(
+            self.credential_directory_root / unit
+        ).encode("utf-8")
+        if bindings:
+            if credential_values != [expected_directory]:
+                raise WorkerNativeError(
+                    "worker caller credential directory is not the systemd directory"
+                )
+        elif credential_values:
+            raise WorkerNativeError(
+                "credential-free worker caller has an unexpected credential directory"
+            )
+        after = self._show(unit)
+        if after != before:
+            raise WorkerNativeError("worker caller systemd identity changed during proof")
+        return {
+            "worker_id": worker_id,
+            "peer_pid": peer_pid,
+            "execution_uid": execution_uid,
+            "unit": unit,
+            "slice": expected_slice,
+            "control_group": str(control_group),
+            "credential_directory": (
+                expected_directory.decode("utf-8") if bindings else None
+            ),
+        }
+
+
+def verify_systemd_worker_caller(**arguments: object) -> Mapping[str, object]:
+    """Use production systemd/proc evidence for one broker worker call."""
+
+    return SystemdWorkerCallerVerifier().prove(**arguments)  # type: ignore[arg-type]
 
 
 class LaunchdWorkerManager:

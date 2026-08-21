@@ -8,6 +8,7 @@ come from the Coordinator authority; none can be supplied on the runner CLI.
 from __future__ import annotations
 
 import argparse
+import base64
 from dataclasses import dataclass
 import hashlib
 import json
@@ -26,6 +27,7 @@ import threading
 import time
 from typing import Any, Callable, Mapping, Protocol, Sequence
 import uuid
+from urllib.parse import quote, quote_plus
 
 from .broker import BrokerError, BrokerOperation
 from .broker_profile import (
@@ -34,7 +36,7 @@ from .broker_profile import (
     BrokerRepositoryProfile,
     load_broker_profile,
 )
-from .runtime_redaction import redact_runtime_value
+from .runtime_redaction import redact_runtime_value, runtime_secret_values
 from .server_credentials import (
     ServerCredentialBinding,
     ServerCredentialError,
@@ -72,6 +74,40 @@ _TRANSIENT_BROKER_ERRORS = frozenset(
         "worker_operation_uncertain",
     }
 )
+
+
+def _redaction_request_with_encoded_variants(
+    request: Mapping[str, Any] | None,
+) -> Mapping[str, Any] | None:
+    """Keep raw and common encoded forms in memory for final log redaction."""
+
+    secrets = runtime_secret_values(request)
+    if not secrets:
+        return request
+    variants: set[str] = set(secrets)
+    for secret in secrets:
+        payload = secret.encode("utf-8")
+        variants.update(
+            {
+                quote(secret, safe=""),
+                quote_plus(secret, safe=""),
+                base64.b64encode(payload).decode("ascii"),
+                base64.urlsafe_b64encode(payload).decode("ascii"),
+                base64.b64encode(payload).decode("ascii").rstrip("="),
+                base64.urlsafe_b64encode(payload).decode("ascii").rstrip("="),
+                payload.hex(),
+                json.dumps(secret, ensure_ascii=True)[1:-1],
+            }
+        )
+    return {
+        "options": {
+            "environment": {
+                f"REDACTION_VALUE_{index}": value
+                for index, value in enumerate(sorted(variants))
+                if value
+            }
+        }
+    }
 
 
 class WorkerRunnerError(RuntimeError):
@@ -469,7 +505,19 @@ class WorkerLogCapture:
         self.attempt_id = _canonical_uuid("attempt_id", attempt_id)
         self.maximum_bytes = maximum_bytes
         self.maximum_lines = maximum_lines
-        self.redaction_request = redaction_request
+        self.redaction_request = _redaction_request_with_encoded_variants(
+            redaction_request
+        )
+        maximum_secret_bytes = max(
+            (
+                len(value.encode("utf-8"))
+                for value in runtime_secret_values(self.redaction_request)
+            ),
+            default=0,
+        )
+        # Retain enough extra context that truncation cannot cut a secret at
+        # the final artifact boundary and leave only an unredactable suffix.
+        self._tail_limit = self.maximum_bytes + maximum_secret_bytes
         ensure_private_store_directory(self.root, expected_uid=os.geteuid())
         self.artifact_id = str(uuid.uuid4())
         self.path = self.root / f"worker-attempt-{self.artifact_id}.log"
@@ -482,7 +530,6 @@ class WorkerLogCapture:
         self._lock = threading.Lock()
         self._tail = bytearray()
         self._received = 0
-        self._written = 0
         self._truncated = False
         self._finished = False
         self._stop = threading.Event()
@@ -514,14 +561,8 @@ class WorkerLogCapture:
         with self._lock:
             self._received += len(payload)
             self._tail.extend(payload)
-            if len(self._tail) > self.maximum_bytes:
-                del self._tail[: len(self._tail) - self.maximum_bytes]
-            if self._written < self.maximum_bytes:
-                selected = payload[: self.maximum_bytes - self._written]
-                offset = 0
-                while offset < len(selected):
-                    offset += os.write(self._file_fd, selected[offset:])
-                self._written += len(selected)
+            if len(self._tail) > self._tail_limit:
+                del self._tail[: len(self._tail) - self._tail_limit]
             self._truncated = self._received > self.maximum_bytes
 
     def _drain(self) -> None:
@@ -544,10 +585,7 @@ class WorkerLogCapture:
             except OSError:
                 pass
 
-    def finish(self) -> dict[str, str]:
-        if self._finished:
-            raise WorkerRunnerError("worker log artifact was already finalized")
-        self._finished = True
+    def _stop_drain(self) -> None:
         self.child_spawned()
         self._stop.set()
         self._reader.join(timeout=2.0)
@@ -558,8 +596,117 @@ class WorkerLogCapture:
                 pass
             self._reader.join(timeout=1.0)
         if self._reader.is_alive():
-            os.close(self._file_fd)
             raise WorkerRunnerError("worker log drain did not stop at process exit")
+
+    def abandon(self) -> None:
+        """Stop capture without publishing any buffered child bytes."""
+
+        if self._finished:
+            raise WorkerRunnerError("worker log artifact was already finalized")
+        self._finished = True
+        try:
+            self._stop_drain()
+            placeholder = os.fstat(self._file_fd)
+            current = self.path.lstat()
+            if (
+                not stat.S_ISREG(placeholder.st_mode)
+                or placeholder.st_size != 0
+                or (placeholder.st_dev, placeholder.st_ino, placeholder.st_size)
+                != (current.st_dev, current.st_ino, current.st_size)
+            ):
+                raise WorkerRunnerError(
+                    "unfinished worker log placeholder contains data"
+                )
+            os.fsync(self._file_fd)
+        finally:
+            if self._file_fd >= 0:
+                os.close(self._file_fd)
+                self._file_fd = -1
+
+    def _publish_redacted(self, payload: bytes) -> str:
+        """Atomically replace the empty placeholder with redacted bytes."""
+
+        placeholder = os.fstat(self._file_fd)
+        current_placeholder = self.path.lstat()
+        if (
+            not stat.S_ISREG(placeholder.st_mode)
+            or stat.S_IMODE(placeholder.st_mode) != 0o600
+            or placeholder.st_size != 0
+            or (placeholder.st_dev, placeholder.st_ino, placeholder.st_size)
+            != (
+                current_placeholder.st_dev,
+                current_placeholder.st_ino,
+                current_placeholder.st_size,
+            )
+        ):
+            raise WorkerRunnerError("worker log placeholder identity is unsafe")
+        os.close(self._file_fd)
+        self._file_fd = -1
+        temporary = self.path.with_name(
+            f".{self.path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+        )
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = -1
+        try:
+            descriptor = os.open(temporary, flags, 0o600)
+            os.fchmod(descriptor, 0o600)
+            offset = 0
+            while offset < len(payload):
+                offset += os.write(descriptor, payload[offset:])
+            os.fsync(descriptor)
+            published = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(published.st_mode)
+                or stat.S_IMODE(published.st_mode) != 0o600
+                or published.st_nlink != 1
+                or published.st_size != len(payload)
+            ):
+                raise WorkerRunnerError("worker log artifact identity is unsafe")
+            os.close(descriptor)
+            descriptor = -1
+            os.replace(temporary, self.path)
+            directory = os.open(
+                self.root,
+                os.O_RDONLY
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+            )
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+            current = self.path.lstat()
+            if (
+                (published.st_dev, published.st_ino, published.st_size)
+                != (current.st_dev, current.st_ino, current.st_size)
+                or stat.S_IMODE(current.st_mode) != 0o600
+                or current.st_nlink != 1
+            ):
+                raise WorkerRunnerError(
+                    "worker log artifact changed during publication"
+                )
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+        return hashlib.sha256(payload).hexdigest()
+
+    def finish(self) -> dict[str, str]:
+        if self._finished:
+            raise WorkerRunnerError("worker log artifact was already finalized")
+        self._finished = True
+        try:
+            self._stop_drain()
+        except BaseException:
+            if self._file_fd >= 0:
+                os.close(self._file_fd)
+                self._file_fd = -1
+            raise
         with self._lock:
             raw_text = bytes(self._tail).decode("utf-8", errors="replace")
             raw_lines = raw_text.splitlines()
@@ -573,7 +720,6 @@ class WorkerLogCapture:
                 request=self.redaction_request,
             )
             if not isinstance(redacted, str):
-                os.close(self._file_fd)
                 raise WorkerRunnerError("worker log redaction returned invalid text")
             payload = redacted.encode("utf-8")
             byte_truncated = len(payload) > self.maximum_bytes
@@ -596,51 +742,16 @@ class WorkerLogCapture:
                 payload = payload.decode("utf-8", errors="ignore").encode("utf-8")
                 if len(payload) > self.maximum_bytes:
                     payload = payload[-self.maximum_bytes :]
-            os.lseek(self._file_fd, 0, os.SEEK_SET)
-            os.ftruncate(self._file_fd, 0)
-            offset = 0
-            while offset < len(payload):
-                offset += os.write(self._file_fd, payload[offset:])
-            os.fsync(self._file_fd)
-            before = os.fstat(self._file_fd)
-            if (
-                not stat.S_ISREG(before.st_mode)
-                or before.st_size > self.maximum_bytes
-            ):
-                os.close(self._file_fd)
-                raise WorkerRunnerError("worker log artifact identity is unsafe")
-            os.lseek(self._file_fd, 0, os.SEEK_SET)
-            digest = hashlib.sha256()
-            line_count = 0
-            final_byte = b""
-            remaining = int(before.st_size)
-            while remaining:
-                chunk = os.read(self._file_fd, min(64 * 1024, remaining))
-                if not chunk:
-                    break
-                digest.update(chunk)
-                line_count += chunk.count(b"\n")
-                final_byte = chunk[-1:]
-                remaining -= len(chunk)
-            if before.st_size and final_byte != b"\n":
+            line_count = payload.count(b"\n")
+            if payload and not payload.endswith(b"\n"):
                 line_count += 1
-            if remaining or line_count > self.maximum_lines:
-                os.close(self._file_fd)
+            if len(payload) > self.maximum_bytes or line_count > self.maximum_lines:
                 raise WorkerRunnerError("worker log artifact exceeds its bound")
-            after = os.fstat(self._file_fd)
-            os.close(self._file_fd)
-        current = self.path.lstat()
-        if (
-            (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
-            != (current.st_dev, current.st_ino, current.st_size, current.st_mtime_ns)
-            or (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
-            != (current.st_dev, current.st_ino, current.st_size, current.st_mtime_ns)
-        ):
-            raise WorkerRunnerError("worker log artifact changed during finalization")
+        digest = self._publish_redacted(payload)
         return {
             "artifact_id": self.artifact_id,
             "path": str(self.path),
-            "sha256": digest.hexdigest(),
+            "sha256": digest,
         }
 
 

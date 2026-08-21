@@ -19,6 +19,7 @@ from .server_credentials import (
     validate_server_credential_bindings,
 )
 from .store import CoordinatorStore, canonical_json, utc_timestamp
+from .worker_native import WorkerNativeError, verify_systemd_worker_caller
 from .worker_artifacts import (
     WorkerArtifactError,
     verify_worker_log_artifact,
@@ -88,6 +89,11 @@ class BrokerWorkerOperations:
         accepted = self._persistence.accept(accepted.peer, request)
         if request.operation in WORKER_READ_OPERATIONS:
             return self._execute_read(accepted)
+
+        if request.operation is BrokerOperation.WORKER_LAUNCH_TICKET:
+            # Prove the caller before even reserving a durable operation row;
+            # same-UID manual runners are not native worker identities.
+            self._prove_native_caller(accepted)
 
         disposition = self._reserve(accepted)
         if disposition["status"] == "succeeded":
@@ -176,6 +182,7 @@ class BrokerWorkerOperations:
                     epoch = policy.get("supervisor_epoch")
                     if isinstance(epoch, str) and epoch:
                         try:
+                            self._prove_native_caller(accepted, policy=policy)
                             candidate = supervision.launch_candidate(
                                 server_definition_id=request.resource_id,
                                 supervisor_epoch=epoch,
@@ -352,6 +359,55 @@ class BrokerWorkerOperations:
             )
         if int(policy["execution_uid"]) <= 0:
             raise WorkerSupervisionConflict("worker execution identity is invalid")
+
+    def _prove_native_caller(
+        self,
+        accepted: AcceptedBrokerRequest,
+        *,
+        policy: Mapping[str, Any] | None = None,
+    ) -> None:
+        request = accepted.request
+        with self._store() as store:
+            current = (
+                WorkerSupervision(store).policy(request.resource_id)
+                if policy is None
+                else dict(policy)
+            )
+            self._require_policy_identity(accepted, current)
+            with store.read_transaction() as connection:
+                raw_bindings = [
+                    {
+                        "name": str(row["name"]),
+                        "credential_id": str(row["credential_id"]),
+                    }
+                    for row in connection.execute(
+                        """
+                        SELECT name,credential_id
+                        FROM server_environment_credentials
+                        WHERE server_definition_id=? ORDER BY name
+                        """,
+                        (request.resource_id,),
+                    )
+                ]
+        try:
+            bindings = validate_server_credential_bindings(
+                request.resource_id, raw_bindings
+            )
+            verify_systemd_worker_caller(
+                worker_id=request.resource_id,
+                peer_pid=accepted.peer.pid,
+                execution_uid=int(current["execution_uid"]),
+                repository_id=request.project_id,
+                credential_bindings=[
+                    binding.to_document() for binding in bindings
+                ],
+            )
+        except (ServerCredentialError, WorkerNativeError) as error:
+            raise BrokerBackendError(
+                "worker_native_caller_invalid",
+                "Worker launch requires the exact fixed systemd runner identity.",
+                operation_id=request.operation_id,
+            ) from error
 
     def _require_candidate_tokens(
         self, accepted: AcceptedBrokerRequest, candidate: Mapping[str, Any]

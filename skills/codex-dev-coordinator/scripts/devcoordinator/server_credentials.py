@@ -18,6 +18,7 @@ import re
 import stat
 from typing import Mapping, Sequence
 import uuid
+from urllib.parse import urlsplit
 
 from .store import deterministic_id
 
@@ -33,14 +34,32 @@ _SECRET_NAME = re.compile(
     r"(?:^|_)(?:secret|password|passwd|token|credential|private_key|api_key|access_key|authorization)(?:$|_)",
     re.IGNORECASE,
 )
+_STANDARD_SECRET_ENVIRONMENT = frozenset({"PGPASSWORD", "MYSQL_PWD"})
 _SECRET_VALUE = re.compile(
-    r"(?:-----BEGIN [A-Z ]*PRIVATE KEY-----|\bBearer\s+[A-Za-z0-9._~+/=-]{8,}|[a-z][a-z0-9+.-]*://[^\s/@:]+:[^\s/@]+@)",
+    r"(?:-----BEGIN [A-Z ]*PRIVATE KEY-----|\bBearer\s+[A-Za-z0-9._~+/=-]{8,}|[a-z][a-z0-9+.-]*://[^\s/@:]*:[^\s/@]+@)",
     re.IGNORECASE,
 )
 _SECRET_QUERY = re.compile(
-    r"[?&](?:secret|password|passwd|token|credential|api_key|access_key)=[^&#\s]+",
+    r"[?&](?:secret|client_secret|password|passwd|token|access_token|credential|api_key|access_key)=[^&#\s]+",
     re.IGNORECASE,
 )
+_CONNECTION_SECRET = re.compile(
+    r"(?:^|[;,\s])(?:password|pwd|token|secret)\s*=\s*[^;,\s]+",
+    re.IGNORECASE,
+)
+_SECRET_ARGUMENT_OPTION = re.compile(
+    r"^--?(?:(?:database|db|client)[-_])?"
+    r"(?:password|passwd|pwd|token|secret|credential|api[-_]key|access[-_]key)"
+    r"(?:=(.*))?$",
+    re.IGNORECASE,
+)
+_SECRET_FILE_OPTION = re.compile(
+    r"^--?(?:(?:database|db|client)[-_])?"
+    r"(?:password|passwd|pwd|token|secret|credential|api[-_]key|access[-_]key)"
+    r"[-_](?:file|path)(?:=(.*))?$",
+    re.IGNORECASE,
+)
+_REFERENCE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:@/-]{0,255}$")
 
 
 class ServerCredentialError(RuntimeError):
@@ -94,11 +113,80 @@ def secret_environment_literal(name: object, value: object) -> bool:
     normalized_name = _environment_name(name)
     if not isinstance(value, str) or "\x00" in value:
         raise ServerCredentialError("server credential literal is invalid")
+    upper_name = normalized_name.upper()
+    reference = _environment_reference(upper_name, value)
+    secret_name = bool(
+        upper_name in _STANDARD_SECRET_ENVIRONMENT
+        or (
+            not upper_name.startswith("PUBLIC_")
+            and _SECRET_NAME.search(upper_name)
+            and not reference
+        )
+    )
     return bool(
-        _SECRET_NAME.search(normalized_name)
+        secret_name
         or _SECRET_VALUE.search(value)
         or _SECRET_QUERY.search(value)
+        or _CONNECTION_SECRET.search(value)
     )
+
+
+def _environment_reference(name: str, value: str) -> bool:
+    if name.endswith(("_URL", "_URI", "_ENDPOINT")):
+        try:
+            parsed = urlsplit(value)
+        except ValueError:
+            return False
+        return bool(parsed.scheme and (parsed.netloc or parsed.scheme == "file"))
+    if name.endswith("_ID"):
+        return _REFERENCE_ID.fullmatch(value) is not None
+    return False
+
+
+def secret_argument_literal(value: object) -> bool:
+    """Return whether one argv item carries credential bytes inline.
+
+    Secret-shaped file/path flags are also rejected: persistent servers have
+    exactly one reviewed transport, the managed binding delivered through
+    systemd ``LoadCredential``.
+    """
+
+    if not isinstance(value, str) or "\x00" in value:
+        raise ServerCredentialError("server credential argument is invalid")
+    file_option = _SECRET_FILE_OPTION.fullmatch(value)
+    if file_option is not None:
+        return True
+    if _SECRET_ARGUMENT_OPTION.fullmatch(value) is not None:
+        return True
+    return bool(
+        _SECRET_VALUE.search(value)
+        or _SECRET_QUERY.search(value)
+        or _CONNECTION_SECRET.search(value)
+    )
+
+
+def secret_argument_sequence(values: object) -> bool:
+    """Detect inline credentials across one complete structured argv."""
+
+    if isinstance(values, (str, bytes, Mapping)) or not isinstance(values, Sequence):
+        raise ServerCredentialError("server credential argv is invalid")
+    if len(values) > 256:
+        raise ServerCredentialError("server credential argv is excessive")
+    arguments: list[str] = []
+    for value in values:
+        if not isinstance(value, str) or "\x00" in value:
+            raise ServerCredentialError("server credential argv is invalid")
+        arguments.append(value)
+    index = 0
+    while index < len(arguments):
+        value = arguments[index]
+        file_option = _SECRET_FILE_OPTION.fullmatch(value)
+        if file_option is not None and file_option.group(1) is None:
+            return True
+        if secret_argument_literal(value):
+            return True
+        index += 1
+    return False
 
 
 def server_credential_id(server_definition_id: object, name: object) -> str:
@@ -446,6 +534,8 @@ __all__ = [
     "ServerCredentialBinding",
     "ServerCredentialError",
     "secret_environment_literal",
+    "secret_argument_literal",
+    "secret_argument_sequence",
     "server_credential_id",
     "staged_material_path",
     "load_server_credential_environment",

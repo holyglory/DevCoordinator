@@ -9,6 +9,8 @@ from devcoordinator.server_credentials import (
     MAX_SERVER_CREDENTIAL_BYTES,
     ServerCredentialError,
     load_server_credential_environment,
+    secret_argument_literal,
+    secret_argument_sequence,
     secret_environment_literal,
     server_credential_id,
     staged_material_path,
@@ -57,6 +59,28 @@ class ServerCredentialTests(unittest.TestCase):
             )
         )
         self.assertTrue(secret_environment_literal("API_TOKEN", "fixture"))
+        self.assertTrue(secret_environment_literal("PGPASSWORD", "fixture"))
+        self.assertTrue(secret_environment_literal("MYSQL_PWD", "fixture"))
+        self.assertFalse(
+            secret_environment_literal(
+                "OAUTH_AUTHORIZATION_URL", "https://identity.example/authorize"
+            )
+        )
+        self.assertFalse(
+            secret_environment_literal("PUBLIC_API_KEY", "public-value")
+        )
+        self.assertTrue(
+            secret_environment_literal(
+                "DATABASE_PASSWORD_FILE", "/run/credentials/database-password"
+            )
+        )
+        self.assertTrue(
+            secret_environment_literal("TOKEN_PATH", "%d/service-token")
+        )
+        self.assertTrue(secret_environment_literal("TOKEN_PATH", "literal-token"))
+        self.assertTrue(
+            secret_environment_literal("API_KEY_FILE", "literal-api-key")
+        )
         self.assertTrue(
             secret_environment_literal(
                 "DATABASE_URL",
@@ -66,6 +90,70 @@ class ServerCredentialTests(unittest.TestCase):
         self.assertTrue(
             secret_environment_literal(
                 "SERVICE_URL", "https://127.0.0.1/path?token=fixture"
+            )
+        )
+        self.assertTrue(
+            secret_environment_literal(
+                "REDIS_URL", "redis://:fixture-password@127.0.0.1/0"
+            )
+        )
+        self.assertTrue(
+            secret_environment_literal(
+                "OAUTH_URL", "https://identity.example/callback?client_secret=fixture"
+            )
+        )
+        self.assertFalse(
+            secret_environment_literal(
+                "CONNECTION_STRING", "Server=127.0.0.1;Database=example"
+            )
+        )
+        self.assertTrue(
+            secret_environment_literal(
+                "CONNECTION_STRING",
+                "Server=127.0.0.1;Database=example;Password=fixture",
+            )
+        )
+
+    def test_argument_detection_catches_inline_credentials_but_not_file_references(self) -> None:
+        for value in (
+            "--password=fixture",
+            "--database-password=fixture",
+            "--password-file=/run/credentials/database-password",
+            "--token_file=%d/service-token",
+            "--connection=Server=localhost;Pwd=fixture",
+            "https://identity.example/callback?client_secret=fixture",
+            "redis://:fixture@localhost/0",
+            "Authorization: Bearer abcdefghijklmnop",
+            "-----BEGIN PRIVATE KEY-----",
+        ):
+            with self.subTest(value=value):
+                self.assertTrue(secret_argument_literal(value))
+        for value in (
+            "--config-file=/srv/application/config.json",
+            "/run/credentials/database-password",
+            "--database-url=postgresql://localhost/example",
+            "--endpoint=https://identity.example/authorize",
+        ):
+            with self.subTest(value=value):
+                self.assertFalse(secret_argument_literal(value))
+        self.assertTrue(secret_argument_sequence(["program", "--password", "fixture"]))
+        self.assertTrue(
+            secret_argument_sequence(
+                ["program", "--password-file", "literal-password"]
+            )
+        )
+        self.assertTrue(
+            secret_argument_sequence(
+                [
+                    "program",
+                    "--password-file",
+                    "/run/credentials/database-password",
+                ]
+            )
+        )
+        self.assertTrue(
+            secret_argument_sequence(
+                ["program", "--token-file=%d/service-token"]
             )
         )
 

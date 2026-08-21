@@ -16,6 +16,7 @@ from devcoordinator import worker_native
 from devcoordinator.server_credentials import server_credential_id, staged_material_path
 from devcoordinator.worker_native import (
     LaunchdWorkerManager,
+    SystemdWorkerCallerVerifier,
     SystemdWorkerManager,
     WorkerNativeError,
     project_repository_slice,
@@ -100,6 +101,59 @@ class WorkerNativeTests(unittest.TestCase):
             runner=runner,
             system_domain=system_domain,
         )
+
+    def _caller_verifier(
+        self,
+        *,
+        main_pid: int = 4312,
+        uids: tuple[int, int, int, int] = (501, 501, 501, 501),
+        systemd_cgroup: str | None = None,
+        process_cgroup: str | None = None,
+        slice_name: str | None = None,
+        credential_directory: str | None = None,
+        include_credentials: bool = True,
+    ) -> tuple[SystemdWorkerCallerVerifier, FakeRunner, list[dict[str, str]]]:
+        unit = f"devcoordinator-worker-{self.worker_id}.service"
+        expected_slice = project_repository_slice(
+            uid=501, repository_id="repo-one"
+        )
+        cgroup = systemd_cgroup or (
+            f"/devcoordinator-projects.slice/{expected_slice}/{unit}"
+        )
+        proc_cgroup = process_cgroup or cgroup
+        output = (
+            "LoadState=loaded\n"
+            f"MainPID={main_pid}\n"
+            f"ControlGroup={cgroup}\n"
+            f"Slice={slice_name or expected_slice}\n"
+        )
+        runner = FakeRunner([(0, output, ""), (0, output, "")])
+        proc = self.root / "proc" / "4312"
+        proc.mkdir(parents=True, exist_ok=True)
+        (proc / "status").write_text(
+            "Name:\tworker\nUid:\t" + "\t".join(str(item) for item in uids) + "\n",
+            encoding="ascii",
+        )
+        (proc / "cgroup").write_text(f"0::{proc_cgroup}\n", encoding="ascii")
+        credential_id = server_credential_id(self.worker_id, "DATABASE_URL")
+        bindings = (
+            [{"name": "DATABASE_URL", "credential_id": credential_id}]
+            if include_credentials
+            else []
+        )
+        directory = credential_directory or f"/run/credentials/{unit}"
+        environment = b"PATH=/usr/bin\0"
+        if include_credentials:
+            environment += (
+                b"CREDENTIALS_DIRECTORY=" + directory.encode("utf-8") + b"\0"
+            )
+        (proc / "environ").write_bytes(environment)
+        verifier = SystemdWorkerCallerVerifier(
+            systemctl_executable=str(self.systemctl),
+            proc_root=self.root / "proc",
+            runner=runner,
+        )
+        return verifier, runner, bindings
 
     def test_project_slice_is_deterministic_and_separates_uid_and_repository(self) -> None:
         first = project_repository_slice(uid=501, repository_id="repo-one")
@@ -262,6 +316,60 @@ class WorkerNativeTests(unittest.TestCase):
             f"--property=LoadCredential={credential_id}:{material}", flattened
         )
         self.assertNotIn("synthetic-private-value", flattened)
+
+    def test_systemd_caller_proof_binds_pid_uids_cgroup_slice_and_credentials(self) -> None:
+        verifier, runner, bindings = self._caller_verifier()
+        evidence = verifier.prove(
+            worker_id=self.worker_id,
+            peer_pid=4312,
+            execution_uid=501,
+            repository_id="repo-one",
+            credential_bindings=bindings,
+        )
+        self.assertEqual(evidence["peer_pid"], 4312)
+        self.assertEqual(evidence["execution_uid"], 501)
+        self.assertEqual(len(runner.calls), 2)
+        verifier, _runner, bindings = self._caller_verifier(
+            include_credentials=False
+        )
+        credential_free = verifier.prove(
+            worker_id=self.worker_id,
+            peer_pid=4312,
+            execution_uid=501,
+            repository_id="repo-one",
+            credential_bindings=bindings,
+        )
+        self.assertIsNone(credential_free["credential_directory"])
+
+    def test_systemd_caller_proof_rejects_manual_or_substituted_identity(self) -> None:
+        unit = f"devcoordinator-worker-{self.worker_id}.service"
+        expected_slice = project_repository_slice(
+            uid=501, repository_id="repo-one"
+        )
+        cases = (
+            {"main_pid": 9999},
+            {"uids": (501, 501, 0, 501)},
+            {"process_cgroup": "/system.slice/substituted.service"},
+            {"slice_name": "system.slice"},
+            {"credential_directory": "/tmp/substituted-credentials"},
+            {
+                "systemd_cgroup": (
+                    f"/devcoordinator-projects.slice/{expected_slice}/"
+                    "substituted.service"
+                )
+            },
+        )
+        for overrides in cases:
+            with self.subTest(overrides=overrides):
+                verifier, _runner, bindings = self._caller_verifier(**overrides)
+                with self.assertRaises(WorkerNativeError):
+                    verifier.prove(
+                        worker_id=self.worker_id,
+                        peer_pid=4312,
+                        execution_uid=501,
+                        repository_id="repo-one",
+                        credential_bindings=bindings,
+                    )
 
     def test_launchd_fails_closed_for_server_credentials(self) -> None:
         credential_id = server_credential_id(self.worker_id, "DATABASE_URL")
