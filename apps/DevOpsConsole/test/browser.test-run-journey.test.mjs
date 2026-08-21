@@ -377,8 +377,8 @@ test('Current repositories run tests on desktop and mobile, then render a blocke
                   available: true,
                   peak_memory_mib: 14_336,
                   cpu_seconds: 912.25,
-                  measured_attempts: 2,
-                  total_attempts: 2,
+                  measured_executions: 2,
+                  total_executions: 2,
                 },
                 summary: {
                   queue_seconds: 0,
@@ -465,7 +465,7 @@ test('Current repositories run tests on desktop and mobile, then render a blocke
       const expandedEvidence = page.locator('.test-run-history-evidence-body').first();
       assert.match(await expandedEvidence.textContent(), /Peak memory14\.0 GiB/);
       assert.match(await expandedEvidence.textContent(), /CPU time15m 12s/);
-      assert.match(await expandedEvidence.textContent(), /Measurements2 of 2 attempts/);
+      assert.match(await expandedEvidence.textContent(), /Measurements2 of 2 executions/);
       assert.doesNotMatch(await expandedEvidence.textContent(), /null/,
         'absent evidence sections must not be coerced into literal null text nodes');
       const evidenceGeometry = await expandedEvidence.evaluate((node) => {
@@ -524,7 +524,7 @@ test('Current repositories run tests on desktop and mobile, then render a blocke
       await page.getByText('fixture-run-2', { exact: true }).waitFor();
       assert.match(
         await page.locator('.test-run-history-evidence-body').first().textContent(),
-        /Peak memory14\.0 GiB.*CPU time15m 12s.*Measurements2 of 2 attempts/s,
+        /Peak memory14\.0 GiB.*CPU time15m 12s.*Measurements2 of 2 executions/s,
       );
       await page.locator('#test-detail-close').click();
 

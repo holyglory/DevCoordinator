@@ -4184,9 +4184,9 @@
   }
   function testRunStateLabel(value) {
     return ({
-      queued: 'Queued', running: 'Running', cancelling: 'Cancelling', superseding: 'Superseding',
+      queued: 'Queued', running: 'Running', cancelling: 'Cancelling',
       succeeded: 'Passed', failed: 'Failed', timed_out: 'Timed out', cancelled: 'Cancelled',
-      incomplete: 'Incomplete', abandoned: 'Abandoned', superseded: 'Superseded',
+      incomplete: 'Incomplete',
     })[value] || 'Unknown';
   }
 
@@ -4238,13 +4238,13 @@
 
   function testRunMeasurementCoverage(usage) {
     if (!usage || usage.available !== true) return null;
-    const measured = usage.measured_attempts;
-    const total = usage.total_attempts;
+    const measured = usage.measured_executions;
+    const total = usage.total_executions;
     if (!Number.isInteger(measured) || measured < 0) return null;
     if (Number.isInteger(total) && total >= measured) {
-      return `${measured} of ${total} ${total === 1 ? 'attempt' : 'attempts'}`;
+      return `${measured} of ${total} ${total === 1 ? 'execution' : 'executions'}`;
     }
-    return `${measured} measured ${measured === 1 ? 'attempt' : 'attempts'}`;
+    return `${measured} measured ${measured === 1 ? 'execution' : 'executions'}`;
   }
 
   function testRunEvidenceFact(label, value, { wide = false, mono = false } = {}) {
@@ -4334,7 +4334,7 @@
     const completed = Number(run.completed_target_count || 0);
     const progress = targetCount > 0
       ? Math.max(0, Math.min(100, (completed / targetCount) * 100)) : 100;
-    const active = ['queued', 'running', 'cancelling', 'superseding'].includes(run.state);
+    const active = ['queued', 'running', 'cancelling'].includes(run.state);
     const wallSeconds = run.wall_seconds ?? (run.started_at
       ? Number(run.finished_at || Date.now() / 1000) - Number(run.started_at) : null);
     const waitLabel = run.state === 'queued'
@@ -8073,7 +8073,7 @@
     'project-runtimes': '#16d39a',
     'coordinator-control': '#2f81f7',
     'coordinator-background': '#b56cff',
-    'active-test-attempts': '#ff8a2a',
+    'active-test-executions': '#ff8a2a',
     'developer-sessions': '#e8eef6',
     'agent-browsers': '#8bd5ff',
     'control-other': '#8056b3',
@@ -8164,8 +8164,8 @@
     if (kind === 'coordinator-background' || kind === 'background-scheduler') {
       return 'coordinator-background';
     }
-    if (kind === 'active-test-attempts' || kind === 'test-attempts') {
-      return 'active-test-attempts';
+    if (kind === 'active-test-executions') {
+      return 'active-test-executions';
     }
     if (kind === 'developer-sessions' || kind === 'developer-account-sessions') {
       return 'developer-sessions';
@@ -8182,7 +8182,7 @@
     if (kind === 'project-runtimes') return 'Project runtimes';
     if (kind === 'coordinator-control') return 'Coordinator control plane';
     if (kind === 'coordinator-background') return 'Coordinator background / scheduler';
-    if (kind === 'active-test-attempts') return 'Active test attempts';
+    if (kind === 'active-test-executions') return 'Active test executions';
     if (kind === 'developer-sessions') return 'Developer-account sessions';
     if (kind === 'agent-browsers') return 'Agent browsers';
     if (kind === 'control-other') {
@@ -9216,7 +9216,7 @@
     if (role === 'project-runtimes') return 'Project runtimes';
     if (role === 'coordinator-control') return 'Coordinator control plane';
     if (role === 'coordinator-background') return 'Coordinator background / scheduler';
-    if (role === 'active-test-attempts') return 'Active test attempts';
+    if (role === 'active-test-executions') return 'Active test executions';
     if (role === 'developer-sessions') return 'Developer-account sessions';
     if (role === 'system-services') return 'System services';
     return group?.label || role || 'Host cgroup';
@@ -9266,7 +9266,7 @@
       h('span', { class: 'perf-residual-diagnostic-name' },
         h('strong', null, perfDiagnosticCgroupName(group)),
         h('span', { class: group?.additive === true ? 'is-additive' : 'is-overlap' }, relationship),
-        role === 'active-test-attempts' && active
+        role === 'active-test-executions' && active
           ? h('span', { class: 'is-count' }, active + ' active') : null),
       perfDiagnosticValues(group));
     const crosscheckNode = role === 'project-runtimes' && crosscheck

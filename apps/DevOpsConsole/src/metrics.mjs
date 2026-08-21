@@ -257,7 +257,7 @@ function performanceMemoryDiagnostics(value) {
     'project-runtimes',
     'coordinator-control',
     'coordinator-background',
-    'active-test-attempts',
+    'active-test-executions',
     'developer-sessions',
   ]);
   const normalizeCgroup = (row, depth = 0) => {

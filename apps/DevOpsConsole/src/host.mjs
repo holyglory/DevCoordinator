@@ -37,10 +37,10 @@ const DEFAULT_CGROUP_SLICES = [
     maxDepth: 1,
   },
   {
-    key: 'active-test-attempts',
-    role: 'active-test-attempts',
+    key: 'active-test-executions',
+    role: 'active-test-executions',
     path: 'devcoordinator.slice/devcoordinator-tests.slice',
-    label: 'Active test attempts',
+    label: 'Active test executions',
     additive: true,
     maxDepth: 2,
   },

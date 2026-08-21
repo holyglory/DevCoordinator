@@ -69,7 +69,7 @@ test('Performance exposes the required accounting and residual semantics', async
     'Project runtimes',
     'Coordinator control plane',
     'Coordinator background / scheduler',
-    'Active test attempts',
+    'Active test executions',
     'Developer-account sessions',
   ]) {
     assert.match(app, new RegExp(copy.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')),
@@ -110,7 +110,7 @@ test('host accounting distinguishes additive roots from bounded overlapping dril
     'Project runtimes',
     'Coordinator control plane',
     'Coordinator background / scheduler',
-    'Active test attempts',
+    'Active test executions',
     'Developer-account sessions',
     'System services',
   ]) {

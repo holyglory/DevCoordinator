@@ -124,6 +124,7 @@ async function preparePage(context, unexpectedRequests, browserErrors) {
 async function settle(page) {
   await page.evaluate(async () => {
     await document.fonts.ready;
+    window.scrollTo(0, 0);
     await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
   });
 }

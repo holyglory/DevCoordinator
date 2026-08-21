@@ -143,13 +143,13 @@ function hostFixture(version) {
             (version === 1 ? .25 : .35) * GIB, 16, 4),
           cgroup('coordinator-background', 'Coordinator background / scheduler',
             (version === 1 ? .125 : .2) * GIB, 8, 3),
-          cgroup('active-test-attempts', 'Active test attempts',
+          cgroup('active-test-executions', 'Active test executions',
             (version === 1 ? .125 : .3) * GIB, version === 1 ? 16 : 24, 2, {
               activeChildCount: 1,
               children: [cgroup('attempt-1.scope', 'GlobalFinance test attempt',
                 (version === 1 ? .125 : .3) * GIB, version === 1 ? 16 : 24, 2, {
                   additive: false,
-                  overlap: 'active-test-attempts',
+                  overlap: 'active-test-executions',
                 })],
             }),
           cgroup('developer-sessions', 'Developer-account sessions', developerBytes,
@@ -949,7 +949,7 @@ async function exerciseViewport(browser, stack, sessionCookie, viewport) {
       'Project runtimes',
       'Coordinator control plane',
       'Coordinator background / scheduler',
-      'Active test attempts',
+      'Active test executions',
       'Developer-account sessions',
       'Agent browsers',
       'Available',
@@ -1033,7 +1033,7 @@ async function exerciseViewport(browser, stack, sessionCookie, viewport) {
     assert.match(diagnosticText, /PSS is not inferred\./);
     assert.match(diagnosticText, /Coordinator control plane/);
     assert.match(diagnosticText, /Coordinator background \/ scheduler/);
-    assert.match(diagnosticText, /Active test attempts/);
+    assert.match(diagnosticText, /Active test executions/);
     assert.match(diagnosticText, /Developer(?:-account| \/ user)? sessions/i);
     assert.match(diagnosticText, /shared(?:[-\s])memory|shmem/i,
       'accessible diagnostics may use the compound adjective shared-memory or the counter name Shmem');

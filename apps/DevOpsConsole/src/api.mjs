@@ -219,23 +219,10 @@ export function createConsoleApi({
       const value = optionalTestNumber(usage[field]);
       if (value !== undefined) view[field] = value;
     }
-    for (const field of ['measured_attempts', 'total_attempts']) {
+    for (const field of ['measured_executions', 'total_executions']) {
       const value = optionalTestNumber(usage[field], { integer: true });
       if (value !== undefined) view[field] = value;
     }
-    return view;
-  }
-
-  function testAttemptView(attempt) {
-    const view = {};
-    for (const field of [
-      'attempt_id', 'target_id', 'target_name', 'generation', 'state', 'conclusion',
-      'started_at', 'finished_at', 'duration_seconds',
-    ]) {
-      if (Object.hasOwn(attempt || {}, field)) view[field] = attempt[field];
-    }
-    const usage = testUsageView(attempt?.usage);
-    if (usage) view.usage = usage;
     return view;
   }
 
@@ -244,6 +231,22 @@ export function createConsoleApi({
     delete view.usage;
     const usage = testUsageView(summary?.usage);
     if (usage) view.usage = usage;
+    return view;
+  }
+
+  function testExecutionView(execution) {
+    const view = {};
+    for (const field of [
+      'execution_id', 'generation', 'repository_generation', 'systemd_unit',
+      'systemd_invocation_id', 'launch_confirmed', 'launch_deadline_at',
+      'started_at', 'deadline_at', 'last_observed_at',
+    ]) {
+      if (Object.hasOwn(execution || {}, field)) view[field] = execution[field];
+    }
+    if (execution?.output_progress && typeof execution.output_progress === 'object'
+      && !Array.isArray(execution.output_progress)) {
+      view.output_progress = { ...execution.output_progress };
+    }
     return view;
   }
 
@@ -269,8 +272,7 @@ export function createConsoleApi({
         const item = {};
         for (const field of [
           'target_id', 'target_name', 'wave_index', 'shard_index', 'shard_count',
-          'state', 'estimated_seconds',
-          'max_attempts', 'queued_at', 'started_at', 'finished_at',
+          'state', 'estimated_seconds', 'queued_at', 'started_at', 'finished_at',
         ]) {
           if (Object.hasOwn(target || {}, field)) item[field] = target[field];
         }
@@ -278,13 +280,11 @@ export function createConsoleApi({
         if (targetWait) item.wait = targetWait;
         const targetUsage = testUsageView(target?.usage);
         if (targetUsage) item.usage = targetUsage;
-        if (Array.isArray(target?.attempts)) {
-          item.attempts = target.attempts.map(testAttemptView);
-        }
+        if (target?.execution && typeof target.execution === 'object'
+          && !Array.isArray(target.execution)) item.execution = testExecutionView(target.execution);
         return item;
       });
     }
-    if (Array.isArray(run?.attempts)) view.attempts = run.attempts.map(testAttemptView);
     return { ...view, ...actions };
   }
 
@@ -2425,7 +2425,7 @@ export function createConsoleApi({
         if ((result?.repository_id ?? result?.repo_id) !== repoId || !Array.isArray(result?.runs)) {
           throw new ApiError(502, 'coordinator returned contradictory current test runs');
         }
-        const activeStates = new Set(['queued', 'running', 'cancelling', 'superseding']);
+        const activeStates = new Set(['queued', 'running', 'cancelling']);
         const runs = result.runs.map((run) => {
           return testRunView(run, {
             can_cancel: activeStates.has(run.state),

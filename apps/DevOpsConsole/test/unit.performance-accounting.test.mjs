@@ -489,7 +489,7 @@ test('schema-2 performance accounting stacks disjoint cgroup roots and keeps rep
             cgroup('project-runtimes', 3 * GIB, 80, 8),
             cgroup('coordinator-control', 1 * GIB, 16, 3),
             cgroup('coordinator-background', 1 * GIB, 8, 2),
-            cgroup('active-test-attempts', 2 * GIB, 24, 4, { activeChildCount: 2 }),
+            cgroup('active-test-executions', 2 * GIB, 24, 4, { activeChildCount: 2 }),
             cgroup('developer-sessions', 1 * GIB, 32, 5),
             { ...cgroup('system-services', 7 * GIB, 10, 20), additive: false },
           ],
@@ -525,7 +525,7 @@ test('schema-2 performance accounting stacks disjoint cgroup roots and keeps rep
 
   for (const key of [
     'project-runtimes', 'coordinator-control', 'coordinator-background',
-    'active-test-attempts', 'developer-sessions',
+    'active-test-executions', 'developer-sessions',
   ]) {
     assert.equal(segment(result, key).additive, true, `${key} must be in the host stack`);
   }

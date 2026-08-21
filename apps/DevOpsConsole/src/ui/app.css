@@ -2471,7 +2471,7 @@ select:disabled { color: var(--dim); }
 .test-run-status { color: var(--muted); font-size: 10.5px; font-weight: 680; text-transform: capitalize; }
 .test-run-status.is-succeeded { color: var(--ok); }
 .test-run-status.is-failed, .test-run-status.is-timed_out,
-.test-run-status.is-incomplete, .test-run-status.is-abandoned { color: var(--err); }
+.test-run-status.is-incomplete { color: var(--err); }
 .test-run-status.is-running, .test-run-status.is-queued,
 .test-run-status.is-cancelling { color: var(--accent); }
 .test-run-wait {
