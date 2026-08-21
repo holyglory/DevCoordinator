@@ -7,7 +7,7 @@ These rules apply to every agent working in this repository.
 - Before broad changes, run `python3 scripts/check_repository_freshness.py --repo "$PWD" --json`.
 - Reconcile `behind`, `diverged`, and `dirty-on-stale-base` without resetting,
   rebasing, stashing, cleaning, or overwriting valuable work.
-- This checkout is the only writable source for both skills. Install links only
+- This checkout is the only writable source for all three skills. Install links only
   with `scripts/manage_skill_links.py`; never edit installed copies.
 - Keep credentials, environment files, logs, backups, runtime state, rollback
   data, and non-canonical screenshots out of Git.
@@ -21,6 +21,7 @@ These rules apply to every agent working in this repository.
   no host-visible or shared state, and it is not one fragment of a suite split
   across repeated local commands. Use one Coordinator test enqueue when either
   bound is unknown or exceeded, or when durable shared evidence is required.
+  Use the `codex-governed-tests` skill for this governed test journey.
 - Never start, stop, restart, replace, remove, or inspect a process, Docker
   resource, Compose stack, or local database directly. Use:
   `python3 skills/codex-dev-coordinator/scripts/dev_coordinator.py runtime --help`.

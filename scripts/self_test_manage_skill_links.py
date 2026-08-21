@@ -95,11 +95,20 @@ def expect_error(callable_object, *args, contains: str | None = None, **kwargs):
     raise AssertionError("expected LinkManagerError")
 
 
-def make_skill(repository: Path, name: str, marker: str) -> Path:
+def make_skill(
+    repository: Path, name: str, marker: str, *, executable: bool = True
+) -> Path:
     skill = repository / "skills" / name
-    (skill / "scripts").mkdir(parents=True)
-    (skill / "SKILL.md").write_text(f"---\nname: {name}\n---\n# {marker}\n", encoding="utf-8")
-    (skill / "scripts" / "tool.py").write_text(f"VALUE = {marker!r}\n", encoding="utf-8")
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text(
+        f"---\nname: {name}\ndescription: fixture\n---\n# {marker}\n",
+        encoding="utf-8",
+    )
+    if executable:
+        (skill / "scripts").mkdir()
+        (skill / "scripts" / "tool.py").write_text(
+            f"VALUE = {marker!r}\n", encoding="utf-8"
+        )
     return skill
 
 
@@ -150,6 +159,41 @@ def test_plan_apply_verify_rollback_and_unrelated(base: Path) -> None:
     check(not manager.lexical_exists(target / "beta-skill"), "originally missing skill should be removed")
     check((unrelated / "owner.txt").read_text(encoding="utf-8") == "do not touch\n", "rollback touched unrelated skill")
     manager.rollback_transaction(transaction)  # idempotent
+
+
+def test_documentation_only_skill_is_managed_with_executable_skills(base: Path) -> None:
+    repository = base / "three canonical skills"
+    runtime = make_skill(
+        repository, "codex-dev-coordinator", "runtime", executable=True
+    )
+    governed = make_skill(
+        repository, "codex-governed-tests", "tests", executable=False
+    )
+    backup = make_skill(
+        repository, "postgres-docker-backup", "backup", executable=True
+    )
+    target = base / "three skill target"
+    target.mkdir()
+
+    plan = manager.build_plan(repository, [target])
+    check(
+        plan["skills"]
+        == ["codex-dev-coordinator", "codex-governed-tests", "postgres-docker-backup"],
+        f"documentation-only skill was not discovered: {plan['skills']}",
+    )
+    transaction = base / "three skill transaction"
+    manager.apply_links(repository, [target], transaction)
+    for name, source in (
+        ("codex-dev-coordinator", runtime),
+        ("codex-governed-tests", governed),
+        ("postgres-docker-backup", backup),
+    ):
+        assert_direct(target / name, source)
+    check(
+        not (governed / "scripts").exists(),
+        "link management added scripts to the documentation-only skill",
+    )
+    manager.rollback_transaction(transaction)
 
 
 def test_divergence_requires_explicit_acceptance(base: Path) -> None:
@@ -618,6 +662,7 @@ def main() -> int:
     base = Path(tempfile.mkdtemp(prefix="devcoordinator-link-self-test-")).resolve(strict=True)
     try:
         test_plan_apply_verify_rollback_and_unrelated(base)
+        test_documentation_only_skill_is_managed_with_executable_skills(base)
         test_divergence_requires_explicit_acceptance(base)
         test_v2_transaction_remains_rollback_compatible(base)
         test_broken_and_chained_links(base)

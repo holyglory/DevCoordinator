@@ -20,10 +20,12 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 VALIDATION_REQUIREMENTS = ROOT / "ci" / "validation-requirements.txt"
 VALIDATION_ENVIRONMENT_MARKER = "DEVCOORDINATOR_VALIDATION_ENVIRONMENT"
-SKILLS = [
+EXECUTABLE_SKILLS = [
     ROOT / "skills" / "codex-dev-coordinator",
     ROOT / "skills" / "postgres-docker-backup",
 ]
+DOCUMENTATION_SKILLS = [ROOT / "skills" / "codex-governed-tests"]
+SKILLS = [*EXECUTABLE_SKILLS, *DOCUMENTATION_SKILLS]
 
 DECISION_ENTRY_HEADER = re.compile(r"^## (DC-[A-Z0-9-]+) — ([^\n]+)$", re.MULTILINE)
 DECISION_METADATA = re.compile(
@@ -183,9 +185,10 @@ def check_agent_documentation_contract() -> None:
     """Keep agent entrypoints short; executable help owns operational detail."""
 
     limits = {
-        ROOT / "AGENTS.md": 60,
+        ROOT / "AGENTS.md": 90,
         ROOT / "README.md": 120,
-        ROOT / "skills" / "codex-dev-coordinator" / "SKILL.md": 300,
+        ROOT / "skills" / "codex-dev-coordinator" / "SKILL.md": 200,
+        ROOT / "skills" / "codex-governed-tests" / "SKILL.md": 200,
         ROOT / "skills" / "codex-dev-coordinator" / "README.md": 80,
     }
     errors: list[str] = []
@@ -195,7 +198,10 @@ def check_agent_documentation_contract() -> None:
             errors.append(f"{path.relative_to(ROOT)} has {count} lines; limit is {limit}")
 
     agents = (ROOT / "AGENTS.md").read_text(encoding="utf-8")
-    skill = (ROOT / "skills" / "codex-dev-coordinator" / "SKILL.md").read_text(
+    runtime_skill = (ROOT / "skills" / "codex-dev-coordinator" / "SKILL.md").read_text(
+        encoding="utf-8"
+    )
+    test_skill = (ROOT / "skills" / "codex-governed-tests" / "SKILL.md").read_text(
         encoding="utf-8"
     )
     for label, text, needles in (
@@ -212,7 +218,7 @@ def check_agent_documentation_contract() -> None:
         ),
         (
             "codex-dev-coordinator/SKILL.md",
-            skill,
+            runtime_skill,
             (
                 "dev_coordinator.py runtime --help",
                 "root_repo",
@@ -220,6 +226,19 @@ def check_agent_documentation_contract() -> None:
                 "kill_after_run",
                 "ok=false",
                 "status/start/stop/restart/remove",
+            ),
+        ),
+        (
+            "codex-governed-tests/SKILL.md",
+            test_skill,
+            (
+                "20 cases",
+                "10 seconds",
+                "devcoordinator test enqueue",
+                "devcoordinator test submit",
+                "queue-status",
+                "artifact-export",
+                "local/advisory — non-governed; not Coordinator evidence",
             ),
         ),
     ):
@@ -1246,7 +1265,11 @@ def check_standalone_skill(
     try:
         copied = tmp / skill.name
         shutil.copytree(skill, copied)
-        run([sys.executable, str(copied / "scripts" / "self_test.py")])
+        self_test = copied / "scripts" / "self_test.py"
+        if self_test.is_file():
+            run([sys.executable, str(self_test)])
+        elif skill in EXECUTABLE_SKILLS:
+            raise SystemExit(f"executable skill self-test is missing: {self_test}")
         if copied.name == "codex-dev-coordinator":
             run_normalized_coordinator_tests(
                 copied,
@@ -2206,6 +2229,7 @@ def main(argv: list[str] | None = None) -> int:
         return run_in_validation_environment(arguments)
     check_validation_environment_contract()
     check_agent_documentation_contract()
+    run([sys.executable, str(ROOT / "scripts" / "self_test_documentation_contracts.py")])
     check_duplicate_literal_dict_keys()
     check_decision_history_contract()
     run([sys.executable, str(ROOT / "scripts" / "self_test_cleanup_contract.py")])
@@ -2259,7 +2283,7 @@ def main(argv: list[str] | None = None) -> int:
             str(ROOT / "skills" / "postgres-docker-backup" / "scripts" / "p0_regression_test.py"),
         ]
     )
-    for skill in SKILLS:
+    for skill in EXECUTABLE_SKILLS:
         if args.harness_mode and skill.name == "codex-dev-coordinator":
             # The standalone copy below still runs the Coordinator self-test;
             # the dedicated harness target owns the ordinary source-tree unit

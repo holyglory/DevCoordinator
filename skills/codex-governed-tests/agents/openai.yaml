@@ -1,0 +1,4 @@
+interface:
+  display_name: "Codex Governed Tests"
+  short_description: "Run bounded governed test evidence"
+  default_prompt: "Use $codex-governed-tests to route this repository's tests and return bounded governed evidence."

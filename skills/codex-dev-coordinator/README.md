@@ -1,25 +1,21 @@
-# Codex DevCoordinator
+# Codex DevCoordinator Runtime
 
-DevCoordinator is the single attributed Python authority for host-visible local
-runtimes and durable asynchronous tests across repositories, agents, and local
-accounts.
+This canonical skill guides attributed host-visible runtime work through the
+server-wide DevCoordinator. Governed repository testing is documented by the
+separate `codex-governed-tests` skill.
 
-## Routine agents
+## Routine runtime
 
-Run the immutable client in the active Git worktree:
+Run the installed client in the active worktree:
 
 ```bash
 devcoordinator capabilities
 devcoordinator targets web --kind service
 devcoordinator runtime status web --kind service
 devcoordinator runtime ensure web --kind service --desired ready
-devcoordinator storage remove container EXACT_RESOURCE_ID --reason "obsolete container"
-devcoordinator test enqueue --intent change
 ```
 
-For a development server in a valid repository that has never used the host
-authority, discovery is pure and reports `repository.state=unenrolled`. The
-first bounded start adopts and starts it in one broker-owned operation:
+For a valid first-use repository, use one structured bounded service start:
 
 ```bash
 devcoordinator runtime serve prototype --cwd . --port 4173 \
@@ -27,79 +23,34 @@ devcoordinator runtime serve prototype --cwd . --port 4173 \
   npm run dev -- --host 0.0.0.0 --port 4173 --strictPort
 ```
 
-The cwd is repository-relative, the port is exact, and argv is never a shell
-string. Do not substitute a coding-sandbox bind, administrator enrollment, or
-local fallback. Failures say whether validation or broker execution failed,
-whether anything changed, whether retrying helps, and what to do next.
+The cwd is contained, the port is exact, argv is shell-free, execution is
+non-root, and systemd owns the cgroup and TTL cleanup. Direct sandbox binds,
+manual enrollment, and local fallback are not substitutes.
 
-It derives root/temporary-worktree context and attribution, validates the one
-active release/generation/protocol contract, resolves the exact target, creates
-mutation operation IDs, and emits a bounded decision. Use command-scoped
-`--project /absolute/worktree` only from arbitrary cwd. Supply an operation ID
-only to replay the exact prior mutation after an uncertain reply.
+Use `--project /absolute/worktree` only from another cwd. Reuse an operation ID
+only for exact replay after an uncertain reply:
 
 ```bash
 devcoordinator operation follow dc1:operation:OPERATION_UUID
-devcoordinator test follow dc1:run:RUN_ID --wait-seconds 30
 ```
-
-Routine change/checkpoint/manual tests plan and submit in one call. Handoff and
-release return an immutable plan for review and require a separate exact
-`devcoordinator test submit dc1:plan:…` decision. `devcoordinator-mcp` stdio
-tools expose the same contract and accept only MCP protocol `2025-11-25`.
-
-Local tests are narrow feedback only: one invocation must be proven before
-launch to collect at most 20 cases, enforce at most 10 seconds of execution,
-need no shared runtime, and not be one fragment of a suite split across local
-commands. Unknown or larger scope, an unenforceable deadline, and durable
-evidence use one governed enqueue. Static checks remain local.
-
-See [the agent-client reference](references/agent-client.md) for call counts,
-bounds, timing/token-proxy evidence, outcomes, MCP, and ownership.
 
 ## Authority
 
-One service-owned SQLite/WAL authority behind a peer-authenticated Unix socket
-owns repository/resource identity, runtime/test admission, lifecycle, replay,
-cleanup, and evidence. One canonical worktree is one project; Python proves the
-root → temporary → resource tree. Names, paths, ports, images, and UI heuristics
-never establish ownership.
-
-On the confirmed single-developer host, local accounts are attribution and
-failure domains, not mutually distrusting principals. Developer-directed
-container removal is deliberately one direct `docker rm -f` call with no
-ownership, cleanup-grant, archive, state, fingerprint, plan, or confirmation
-gate and never removes volumes. Other runtime and data paths retain their
-documented identity, generation, containment, public-authorization, and secret
-transport controls.
-
-Python owns mechanical context/target resolution, validation, runtime no-op and
-convergence, schema-3-only test planning/submission/follow, safe pre-launch
-retry, supported durable cleanup/recovery/supersession, and
-`scripts/software_owned_delivery.py`. The agent or user retains semantic goals,
-material test choices/deadlines, attention remediation, destructive/data work,
-handoff/release review, and publication.
+Python owns immutable target resolution, generation fencing, observation,
+idempotent mutation, convergence, and cleanup. Local accounts are attribution
+and execution domains, not mutually distrusting tenants. Credentials use the
+separate sealed transport and never ordinary metadata or argv.
 
 ## Advanced work
 
-Lower-level commands are separate current capabilities for structured
-definitions, replacement, bounded run, staged removal, manifest
-authoring/doctoring, exact artifact drill-down, Compose run-once, ephemeral
-containers, enrollment, migration, backup, and recovery:
-
 ```bash
 python3 skills/codex-dev-coordinator/scripts/dev_coordinator.py runtime --help
-devcoordinator-test --help
-```
-
-For correlated failures and source-side efficiency evidence:
-
-```bash
 devcoordinator-call-log --operation-id OPERATION_UUID --limit 20
-python3 scripts/check_agent_client_efficiency.py
-python3 scripts/self_test_agent_client_efficiency.py
 ```
 
-See [the runtime API](references/runtime-api.md) and
-[admin operations](references/admin-operations.md). Install source links with
-`scripts/manage_skill_links.py`; deliver with `software_owned_delivery.py`.
+Read [the stable client](references/agent-client.md),
+[runtime API](references/runtime-api.md), or
+[server administration](references/admin-operations.md) only as needed.
+
+Install canonical links with `scripts/manage_skill_links.py`. DevCoordinator
+itself is verified and delivered only by `scripts/software_owned_delivery.py`.

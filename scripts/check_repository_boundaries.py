@@ -13,7 +13,11 @@ from dataclasses import asdict, dataclass
 from pathlib import Path, PurePosixPath
 
 
-EXPECTED_SKILLS = {"codex-dev-coordinator", "postgres-docker-backup"}
+EXPECTED_SKILLS = {
+    "codex-dev-coordinator",
+    "codex-governed-tests",
+    "postgres-docker-backup",
+}
 EXPECTED_APPS = {"DevOpsBoard", "DevOpsConsole"}
 PUBLIC_HISTORY_REF_PREFIXES = ("refs/heads", "refs/remotes", "refs/tags")
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg"}

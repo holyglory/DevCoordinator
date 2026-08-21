@@ -1,115 +1,67 @@
 # DevCoordinator
 
-DevCoordinator is the host coordinator for local development runtimes shared by
-multiple Codex, Claude, desktop, and OS-user sessions. It owns attributed port
-leases, processes, Docker/Compose resources, local database stacks, telemetry,
-logs, lifecycle evidence, short-lived workload policy, repository-scoped test
-admission, and cleanup. A separate bounded test plane owns high-volume test
-history, artifacts, and rollups.
-
-The repository also contains:
-
-- `codex-dev-coordinator`, the agent-facing runtime skill and Python API.
-- `postgres-docker-backup`, verified PostgreSQL-in-Docker backup and restore.
-- `DevOpsBoard`, the native macOS operations interface.
-- `DevOpsConsole`, the authenticated web interface and routing edge.
-
-When the independently installed delivery-efficiency recorder detects the
-advertised Coordinator capability, it may publish one bounded cumulative
-snapshot for the current account and configured repository. DevOps Console
-then exposes repository-first provider-token, phase-attribution, timing,
-account, and repeated-work statistics. The page is absent when the capability
-is not configured; recorder operation never depends on Coordinator.
+DevCoordinator is the server-wide Python authority for attributed local
+runtimes and governed asynchronous test evidence across repositories, agents,
+and trusted local accounts.
 
 ## Architecture
 
-- One local broker and server-wide SQLite store own exact repository/resource
-  identity, lifecycle policy, and generation fences; test, inventory, and
-  Console state live in separate stores. Multiple Unix accounts are trusted
-  execution contexts for one developer, not tenants; filesystem metadata is
-  not an authorization boundary.
-- A stable TLS/auth/routing edge and socket-owned listeners keep public routes
-  and retained Console content available across backend replacement.
-- The asynchronous test scheduler launches generation-fenced per-UID attempts
-  outside the protected control slice and returns submissions immediately.
-- Declared Compose one-shots accept an exact cataloged service,
-  bounded timeout, and replay UUID; the broker publishes a typed receipt and
-  never exposes raw process streams.
-- One canonical Git worktree is one repository/project; repository families
-  retain exact original and temporary-worktree identities.
-- Python owns observation, repository association, lifecycle, cleanup, diagnostics, and
-  the `repository_trees` UI model.
-- Inventory is a pure read; explicit observation updates host evidence.
-- Ordinary lifecycle paths fail closed on unknown target identity, stale generation,
-  and partial cleanup. Developer-directed container removal is the explicit
-  single-developer exception: one selected catalog target invokes only
-  `docker rm -f <full-id>` without repository association, archive, grant, state, plan, or
-  confirmation gates and without deleting volumes.
+- One canonical Git worktree is one project; linked worktrees remain children.
+- Immutable IDs, generations, operation UUIDs, and lifecycle state—not names,
+  paths, ports, images, or local account—select work.
+- Repository code runs as the recorded non-root caller in systemd cgroups with
+  bounded TTL and cleanup.
+- Testd and its isolated Test Store own plans, runs, attempts, deadlines,
+  ordered results, conclusions, and same-schema recovery.
+- Credentials use separate sealed transport and never ordinary metadata, argv,
+  results, or logs.
+- Public identity and route grants remain authorization boundaries. Local Unix
+  identities are attribution and execution domains on this single-developer
+  host.
 
-See [Single-developer local trust](docs/architecture/single-developer-local-trust.md)
-for the deliberately simple trusted-local model.
+See [single-developer local trust](docs/architecture/single-developer-local-trust.md)
+and the [universal test harness](docs/architecture/universal-test-harness.md).
 
 ## Agent quick start
 
-Use the unified runtime API; do not coordinate individual commands in shell:
+Ordinary source inspection, editing, Git work, formatting, and static checks do
+not need Coordinator.
+
+For host-visible runtime work, use `$codex-dev-coordinator`:
 
 ```bash
-python3 skills/codex-dev-coordinator/scripts/dev_coordinator.py runtime --help
-python3 skills/codex-dev-coordinator/scripts/dev_coordinator.py runtime status \
-  --agent "$AGENT" --root-repo "$ROOT_REPO" --no-temporary-repo \
-  --target-kind service --target-id "$RESOURCE_ID" --target-name worker \
-  --purpose development --no-ttl --kill-after-run false
-python3 skills/codex-dev-coordinator/scripts/dev_coordinator.py \
-  runtime --request-file /absolute/request.json
+devcoordinator capabilities
+devcoordinator targets web --kind service
+devcoordinator runtime status web --kind service
+devcoordinator runtime ensure web --kind service --desired ready
 ```
 
-Use flags for routine existing-target status/start/stop/restart/remove calls;
-reserve request files for structured definitions, replacement, and bounded
-run commands. Every request includes the agent, original root repository,
-explicit nullable temporary repository, immutable target identity, and
-`kill_after_run` boolean. Test and temporary start-like actions also require a
-TTL; status, removal, and explicit stop do not. See
-[Agent Runtime API](skills/codex-dev-coordinator/references/runtime-api.md).
-
-Evidence-producing repository tests use the asynchronous harness:
+For a new development server, use one contained, exact-port, TTL-owned start:
 
 ```bash
-python3 skills/codex-dev-coordinator/scripts/dev_coordinator.py test manifest validate \
-  --root-repo "$PWD"
-python3 skills/codex-dev-coordinator/scripts/dev_coordinator.py test plan \
-  --agent "$AGENT" --root-repo "$PWD" --no-temporary-repo --intent change \
-  --execution-timeout-seconds 1800 --launch-timeout-seconds 300 \
-  --operation-id "$PLAN_OPERATION_UUID"
-python3 skills/codex-dev-coordinator/scripts/dev_coordinator.py test submit \
-  --repository-id "$REPOSITORY_ID" --plan-id "$PLAN_ID" --operation-id "$OPERATION_UUID"
+devcoordinator runtime serve prototype --cwd . --port 4173 \
+  --ttl-seconds 3600 --kill-after-run false --launch-timeout-seconds 30 -- \
+  npm run dev -- --host 0.0.0.0 --port 4173 --strictPort
 ```
 
-The execution timeout caps selected test processes; omitting it uses each manifest target's deadline. The launch timeout
-separately bounds immutable materialization, startup, and lost-reply reconciliation. Every advanced submit, run read,
-run control, artifact, and wait command carries the immutable repository ID returned by planning; opaque continuation
-IDs never select repository scope. `test wait --timeout-seconds` controls only caller patience (up to 86,400 seconds),
-never either execution deadline. Immutable plan preview uses the same launch budget because materialization is launch work.
-
-The complete production contract is
-[Universal test harness and control-plane isolation](docs/architecture/universal-test-harness.md).
-
-Operators can correlate an actual Coordinator request without reading service
-journals or caller-local filesystem metadata:
+For repository tests, use `$codex-governed-tests`. A local invocation is allowed
+only when proven before launch to collect at most 20 cases, enforce at most 10
+seconds, need no shared runtime, and not split a larger suite. Otherwise:
 
 ```bash
-devcoordinator-call-log --failures-only --limit 100
-devcoordinator-call-log --operation-id "$OPERATION_UUID" --limit 20
-devcoordinator-call-log --run-id "$RUN_ID" --limit 20
+devcoordinator test enqueue --intent change
+devcoordinator test follow dc1:run:RUN_ID --wait-seconds 30
 ```
 
-The authority, API, scheduler, and snapshot boundaries share one JSONL journal
-that rotates at a fixed size and retains only sanitized call stages, durations,
-correlation IDs, and outcomes. Raw request payloads, environment values, and
-credentials are not recorded.
+Handoff and release enqueue return a plan for review; run the exact returned
+`devcoordinator test submit dc1:plan:…` command. Stable diagnostics remain
+`queue-status`, `failures`, `cases`, `artifact`, `artifact-export`, and `retry`;
+`cancel` targets one exact run.
 
-Coordinator infrastructure and tool failures use a separate outage-safe,
-open-only bug channel. It does not depend on repository enrollment, profiles,
-the broker, API, authority, testd, or the call journal:
+## Failure handling
+
+Report a typed Coordinator infrastructure/tool failure through the independent
+open-only registry:
 
 ```bash
 devcoordinator-bug report \
@@ -124,69 +76,38 @@ devcoordinator-bug list --limit 20
 devcoordinator-bug close BUG_ID
 ```
 
-Include every available call, operation, run, and attempt correlation. The
-equivalent integrated form is `devcoordinator bug report|list|close`. Do not
-auto-message a guessed Codex task. Closing physically removes the current open
-record; there is no closed-report archive. Report only typed Coordinator tool
-or infrastructure behavior: invalid caller arguments and direct sandbox
-binds/probes that never contacted Coordinator are caller misuse, not
-automatically Coordinator bugs.
-
-If only the governed test harness fails, report it first and keep coding with
-static checks and repository-native tests that collect at most 20 cases and
-enforce at most 10 seconds of execution, labelled
-`local/advisory — non-governed; not Coordinator evidence`. Do not split a
-larger suite into repeated bounded commands. These checks never establish
-handoff or release readiness and the governed tests must run after repair. This
-fallback never covers host listeners, Docker/Compose, databases, shared
-processes, or host mutation. Ordinary measured assertion failures are project
-bugs, not Coordinator bugs. See
-[DC-2026-08-09-TEST-BATCHING-01](DecisionDetails/DC-2026-08-09-TEST-BATCHING-01.md),
-[DC-2026-08-04-BUG-INTAKE-01](DecisionDetails/DC-2026-08-04-BUG-INTAKE-01.md),
-and the confirmed [security assumptions](security-assumptions.md).
+Do not auto-message a guessed task. After a harness report, bounded local checks
+may continue only as `local/advisory — non-governed; not Coordinator evidence`;
+they never prove handoff or release and never cover listeners, Docker/Compose,
+databases, shared processes, or host mutation.
 
 ## Install the skills
 
-This checkout is the only writable source. Preview and apply direct absolute
-links with the repository manager:
+This checkout is the only writable source for `codex-dev-coordinator`,
+`codex-governed-tests`, and `postgres-docker-backup`:
 
 ```bash
 python3 scripts/manage_skill_links.py plan \
   --repo-root "$PWD" --target-root /absolute/runtime/skills
-
 python3 scripts/manage_skill_links.py apply \
   --repo-root "$PWD" --target-root /absolute/runtime/skills \
   --transaction-dir /private/path/outside-git
 ```
 
-Use `scripts/manage_skill_links.py --help` for verification, rollback, and
-multi-runtime options. Server-wide installation is exposed by
-`scripts/install_server_wide_coordinator.py --help`.
-
-## Layout
-
-- `skills/` — canonical skills and coordinator implementation
-- `apps/DevOpsBoard/` — SwiftPM macOS app
-- `apps/DevOpsConsole/` — Node 20 Console
-- `scripts/` — installation, verification, migration, and release tools
-- `docs/` — API, architecture, history, and operational references
-- `DecisionHistory.md` — compact architecture/product decision index
-- `CompletionLedger.md` — current unresolved delivery work only
-
 ## Verification
 
-Run the non-native repository gate:
-
-```bash
-python3 scripts/validate.py --skip-macos-app
-```
-
-DevOps Board build, XCTest, launch, and packaging must run through the Build
-macOS Apps workflow. Release checks also require:
+DevCoordinator never tests or installs itself through its installed runtime or
+test surface. Use the repository-owned workflow:
 
 ```bash
 python3 scripts/check_repository_freshness.py --repo "$PWD" --json
-python3 scripts/check_repository_boundaries.py --repo "$PWD"
+python3 scripts/run_fast_repository_validation.py
+python3 scripts/software_owned_delivery.py run --help
 ```
 
-Operational detail lives with the [Coordinator skill](skills/codex-dev-coordinator/README.md), [PostgreSQL backup skill](skills/postgres-docker-backup/README.md), [DevOps Board](apps/DevOpsBoard/README.md), [DevOps Console](apps/DevOpsConsole/README.md), and [repository history](docs/history/README.md).
+Board build, XCTest, launch, and packaging run through Build macOS Apps. The
+full non-native gate remains `python3 scripts/validate.py --skip-macos-app`.
+
+Canonical code lives in `skills/codex-dev-coordinator/scripts`; skills live in
+`skills/`, applications in `apps/`, release/verification tools in `scripts/`,
+and durable architecture records in `docs/` and `DecisionHistory.md`.

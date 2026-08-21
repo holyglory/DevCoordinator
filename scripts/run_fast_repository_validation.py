@@ -169,7 +169,12 @@ def manifest_contract() -> str:
 
 def skill_contract() -> str:
     checked: list[str] = []
-    for name in ("codex-dev-coordinator", "postgres-docker-backup"):
+    skill_specs = (
+        ("codex-dev-coordinator", True),
+        ("codex-governed-tests", False),
+        ("postgres-docker-backup", True),
+    )
+    for name, expects_scripts in skill_specs:
         root = ROOT / "skills" / name
         skill = root / "SKILL.md"
         if not skill.is_file() or skill.is_symlink():
@@ -188,9 +193,23 @@ def skill_contract() -> str:
                 metadata[key.strip()] = value.strip()
         if metadata.get("name") != name or not metadata.get("description"):
             raise RuntimeError(f"{name} skill name/description is invalid")
+        agent_metadata = root / "agents" / "openai.yaml"
+        if not agent_metadata.is_file() or agent_metadata.is_symlink():
+            raise RuntimeError(f"{name} OpenAI metadata is unavailable")
+        interface = agent_metadata.read_text(encoding="utf-8")
+        if (
+            "display_name:" not in interface
+            or "short_description:" not in interface
+            or f"${name}" not in interface
+        ):
+            raise RuntimeError(f"{name} OpenAI metadata is incomplete")
         scripts = root / "scripts"
-        if not scripts.is_dir() or not any(scripts.glob("*.py")):
+        if expects_scripts and (
+            not scripts.is_dir() or not any(scripts.glob("*.py"))
+        ):
             raise RuntimeError(f"{name} skill has no executable scripts")
+        if not expects_scripts and scripts.exists():
+            raise RuntimeError(f"{name} must remain a documentation-only skill")
         checked.append(name)
     return "canonical skill metadata ok: " + ", ".join(checked)
 
@@ -282,6 +301,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         ("release-syntax", lambda: internal("release-syntax", release_syntax)),
         ("test-manifest", lambda: internal("test-manifest", manifest_contract)),
         ("skill-contract", lambda: internal("skill-contract", skill_contract)),
+        (
+            "documentation-contracts",
+            lambda: external(
+                "documentation-contracts",
+                [sys.executable, "scripts/self_test_documentation_contracts.py"],
+            ),
+        ),
         (
             "test-simplification",
             lambda: internal("test-simplification", test_simplification_contract),

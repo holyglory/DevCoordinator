@@ -116,7 +116,11 @@ def main() -> int:
         git(repo, "init", "-q")
         git(repo, "config", "user.name", "boundary-fixture")
         git(repo, "config", "user.email", "fixture@example.invalid")
-        for skill in ("codex-dev-coordinator", "postgres-docker-backup"):
+        for skill in (
+            "codex-dev-coordinator",
+            "codex-governed-tests",
+            "postgres-docker-backup",
+        ):
             write(repo / "skills" / skill / "SKILL.md", f"---\nname: {skill}\ndescription: fixture\n---\n")
         write(repo / "apps/DevOpsBoard/Sources/DevOpsBoard/App.swift")
         write(repo / "apps/DevOpsConsole/src/app.mjs")

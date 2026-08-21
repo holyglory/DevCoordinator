@@ -13,6 +13,21 @@ performs one typed action, and returns one bounded report. Agents must not
 reproduce its discovery, preflight, retry, convergence, or cleanup logic in
 shell commands.
 
+## Contents
+
+- [Routine intent calls](#routine-intent-calls)
+- [First use and sandboxed development servers](#first-use-and-sandboxed-development-servers)
+- [Current authority boundary](#current-authority-boundary)
+- [Advanced governed Compose run-once](#advanced-governed-compose-run-once)
+- [Advanced structured call](#advanced-structured-call)
+- [Advanced request document](#advanced-request-document)
+- [Advanced structured request examples](#advanced-structured-request-examples)
+- [Repository families](#repository-families)
+- [Result](#result)
+- [Worker supervision and removal](#worker-supervision-and-removal)
+- [Temporary cleanup](#temporary-cleanup)
+- [Lower-level and operator interfaces](#lower-level-and-operator-interfaces)
+
 ## Routine intent calls
 
 Run inside the active Git worktree; add command-scoped
