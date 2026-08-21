@@ -26,7 +26,6 @@ const CONSOLE_FILES = [
   'access-control.json',
   'telegram-control.json',
   'ui-prefs.json',
-  'test-stats-cache-v1.json',
 ];
 const MAX_FILE = new Map([
   ['telegram-control.json', 16 * 1024 * 1024],
@@ -116,13 +115,6 @@ async function loadStores(stateDir, envFile) {
   });
   await telegram.load();
   createPrefsStore({ file: path.join(stateDir, 'ui-prefs.json') }).get();
-  const cacheFile = path.join(stateDir, 'test-stats-cache-v1.json');
-  try {
-    const cache = JSON.parse(await fsp.readFile(cacheFile, 'utf8'));
-    if (cache?.version !== 1 || !Array.isArray(cache.entries) || cache.entries.length > 1000) fail('test statistics cache contract is invalid');
-  } catch (error) {
-    if (error?.code !== 'ENOENT') throw error;
-  }
   return { config, routeStore, upstream, access, telegram };
 }
 

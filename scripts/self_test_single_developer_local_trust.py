@@ -362,7 +362,6 @@ def authorize_host_call(peer, request):
         identity_gate = case(base, temp, "identity-gate")
         append(
             identity_gate,
-            "skills/codex-dev-coordinator/scripts/devcoordinator/universal_test_adoption.py",
             """
 def reject_identity(root_identity, expected_uid):
     if root_identity.get("uid") != expected_uid:

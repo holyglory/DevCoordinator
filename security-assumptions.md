@@ -27,8 +27,18 @@ new gate.
   attempt state, and Test Store compatibility history are disposable. An
   incompatible DevCoordinator release creates an empty current Test Store; it
   does not back up, import, or migrate prior test data.
+- Unfinished test processes are also disposable. A testd, authority, or
+  DevCoordinator release restart cancels and cleans their exact transient
+  units; callers rerun them. No active-attempt recovery lease, result-chunk
+  replay, progress compatibility, cross-run evidence reuse, or historical
+  statistics is a required control.
 - Repository registrations, routes, Console users and their grants, Console
   settings, and authority/project configuration are retained control data.
+- Across an incompatible authority schema, only approved retained control
+  collections are exported and imported. Current resource observations,
+  terminal operations, lifecycle history, cleanup tombstones, legacy-import
+  records, and other reconstructable operational state may be discarded; a
+  fresh authority generation invalidates old handles before reobservation.
 - Credentials, external identity assertions, bot tokens, and fixture secrets
   remain secret and must use their dedicated server-owned transport. They must
   never be placed in a repository manifest or ordinary launch descriptor.
@@ -119,6 +129,9 @@ new gate.
   execute.
 - Same-host communication needs no agent-authored bearer token, signature,
   encryption layer, or duplicate cryptographic handshake.
+- A root-owned release transaction document needs atomic write, ownership,
+  strict semantic validation, and exact previous/candidate release digests; it
+  needs no self-hash, signature, or pre-availability database-path binding.
 - Non-secret broker catalogs, retained inventory, and bounded launch
   descriptors may be readable by every local account. Root ownership may still
   make generated descriptors immutable to those accounts.

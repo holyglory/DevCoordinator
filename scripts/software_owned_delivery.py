@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
 """Fast, software-owned DevCoordinator test, package, deploy, and acceptance.
 
-The workflow composes existing repository and immutable-release commands.  It
-does not implement another migration engine.  Routine ``same-schema`` delivery
-executes one administrator-authored command plan with an exact rollback path
-and mandatory control-plane health probes.  The destructive clean-adoption
-path is available only through the explicit ``reset`` mode.
+The workflow composes existing repository and immutable-release commands. It
+executes one current-format command plan with an exact rollback path and
+mandatory control-plane health probes.
 
 Every subprocess receives its own stdout/stderr files.  Durable JSONL events,
 state, and a compact report let one invocation collect all non-safety failures
@@ -815,80 +813,6 @@ class Delivery:
         self._save_state()
         return results
 
-    def _reset_manifest(self, template: Path) -> Path:
-        document = read_json(template)
-        if not isinstance(document, Mapping):
-            raise DeliveryError("clean-adoption template is invalid")
-        release = self.state.get("release")
-        if not isinstance(release, Mapping):
-            raise DeliveryError("reset requires a packaged release")
-        patched = dict(document)
-        # These are the only release-specific values.  Console settings,
-        # grants, Telegram state, repositories, routes, and fixed ports remain
-        # byte-for-byte inherited from the explicit template.
-        patched["release"] = str(release["path"])
-        release_digest = str(release["digest"])
-        if RELEASE_RE.fullmatch(release_digest) is None:
-            raise DeliveryError("reset requires a valid packaged release digest")
-        release_transaction_root = self.transaction_root / release_digest
-        patched["rendered_units"] = str(
-            release_transaction_root / "rendered-units"
-        )
-        patched["candidate_slot_source"] = str(
-            release_transaction_root / f"{release_digest}.env"
-        )
-        release_transaction_root.mkdir(parents=True, exist_ok=True)
-        output = release_transaction_root / "manifest.json"
-        atomic_json(output, patched)
-        os.chmod(output, 0o600)
-        return output
-
-    def deploy_reset(self, template: Path) -> list[CommandResult]:
-        manifest = self._reset_manifest(template)
-        release = self.state.get("release")
-        if not isinstance(release, Mapping):
-            raise DeliveryError("reset requires a packaged release")
-        release_digest = str(release.get("digest") or "")
-        if RELEASE_RE.fullmatch(release_digest) is None:
-            raise DeliveryError("reset requires a valid packaged release digest")
-        release_transaction_root = self.transaction_root / release_digest
-        helper = str(Path(str(release["path"])) / "bin/devcoordinator-clean-adoption")
-        plan = self.run_step(
-            phase="reset-prepare",
-            name="clean-adoption-plan",
-            argv=[helper, "plan", "--manifest", str(manifest)],
-            blocking=True,
-            root=True,
-        )
-        if not plan.ok:
-            self.state["deployment"] = {"status": "blocked-before-mutation"}
-            self._save_state()
-            return [plan]
-        apply = self.run_step(
-            phase="reset-apply",
-            name="clean-adoption-apply",
-            argv=[
-                helper,
-                "apply",
-                "--manifest",
-                str(manifest),
-                "--transaction-root",
-                str(release_transaction_root),
-                "--journal",
-                str(release_transaction_root / "journal.json"),
-                "--expected-uid",
-                "0",
-            ],
-            blocking=True,
-            root=True,
-        )
-        self.state["deployment"] = {
-            "status": "healthy" if apply.ok else "reset-incomplete",
-            "mode": "reset",
-        }
-        self._save_state()
-        return [plan, apply]
-
     def acceptance(self) -> list[CommandResult]:
         setup = self.plan.get("acceptance_setup", [])
         steps = self.plan.get("acceptance", [])
@@ -929,7 +853,6 @@ class Delivery:
             "rolled-back-after-apply-failure",
             "rolled-back-after-health-failure",
             "rollback-incomplete",
-            "reset-incomplete",
         }:
             conclusion = "blocked"
         elif health or blocking or acceptance:
@@ -1025,10 +948,6 @@ def parser() -> argparse.ArgumentParser:
     deploy = actions.add_parser("deploy")
     common(deploy)
     deploy.add_argument(
-        "--deployment-mode", choices=("same-schema", "reset"), default="same-schema"
-    )
-    deploy.add_argument("--adoption-template", type=Path)
-    deploy.add_argument(
         "--reset-test-history",
         action="store_true",
         help="discard only disposable test history during same-schema delivery",
@@ -1036,10 +955,6 @@ def parser() -> argparse.ArgumentParser:
     full = actions.add_parser("run")
     common(full)
     acceptance_timeouts(full)
-    full.add_argument(
-        "--deployment-mode", choices=("same-schema", "reset"), default="same-schema"
-    )
-    full.add_argument("--adoption-template", type=Path)
     full.add_argument(
         "--reset-test-history",
         action="store_true",
@@ -1144,35 +1059,17 @@ def main(argv: list[str] | None = None) -> int:
             elif args.action == "acceptance":
                 delivery.acceptance()
             elif args.action == "deploy":
-                if args.deployment_mode == "reset":
-                    if args.reset_test_history:
-                        raise DeliveryError(
-                            "--reset-test-history is only valid for same-schema delivery"
-                        )
-                    if args.adoption_template is None:
-                        raise DeliveryError("reset mode requires --adoption-template")
-                    delivery.deploy_reset(args.adoption_template)
-                else:
-                    delivery.deploy_same_schema(
-                        reset_test_history=args.reset_test_history
-                    )
+                delivery.deploy_same_schema(
+                    reset_test_history=args.reset_test_history
+                )
             else:
                 source = delivery.source_check()
                 if not delivery._blocking_failed(source):
                     packaged = delivery.package()
                     if not delivery._blocking_failed(packaged):
-                        if args.deployment_mode == "reset":
-                            if args.reset_test_history:
-                                raise DeliveryError(
-                                    "--reset-test-history is only valid for same-schema delivery"
-                                )
-                            if args.adoption_template is None:
-                                raise DeliveryError("reset mode requires --adoption-template")
-                            delivery.deploy_reset(args.adoption_template)
-                        else:
-                            delivery.deploy_same_schema(
-                                reset_test_history=args.reset_test_history
-                            )
+                        delivery.deploy_same_schema(
+                            reset_test_history=args.reset_test_history
+                        )
                         deployment = delivery.state.get("deployment")
                         if (
                             isinstance(deployment, Mapping)

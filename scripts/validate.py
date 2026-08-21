@@ -1351,7 +1351,6 @@ def run_availability_architecture_tests() -> None:
         "self_test_orchestrate_availability_cutover.py",
         "self_test_activate_availability_release.py",
         "self_test_refresh_edge_tls_credential.py",
-        "self_test_background_service_handoff.py",
         "self_test_project_isolation.py",
     )
     for script_name in suites:

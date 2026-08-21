@@ -1834,48 +1834,6 @@ class AccountStore(CoordinatorStore):
             )
         return host_id
 
-    def import_legacy_homes(
-        self,
-        paths: Iterable[str | os.PathLike[str]],
-        backup_root: str | os.PathLike[str],
-        *,
-        dry_run: bool = False,
-        fault_injector: Callable[[str], None] | None = None,
-    ) -> Any:
-        from .legacy_import import import_legacy_homes
-
-        return import_legacy_homes(
-            self,
-            paths,
-            backup_root,
-            dry_run=dry_run,
-            fault_injector=fault_injector,
-        )
-
-    def load_legacy_state_projection(self) -> dict[str, Any]:
-        from .legacy_import import load_legacy_state_projection
-
-        return load_legacy_state_projection(self)
-
-    def replace_legacy_state_projection(
-        self,
-        state: dict[str, Any],
-        expected_revision: int | None = None,
-    ) -> int:
-        from .legacy_import import replace_legacy_state_projection
-
-        return replace_legacy_state_projection(self, state, expected_revision=expected_revision)
-
-    def detect_late_legacy_writers(self) -> tuple[str, ...]:
-        from .legacy_import import detect_late_legacy_writers
-
-        return detect_late_legacy_writers(self)
-
-    def reconcile_imported_legacy_conflicts(self) -> Any:
-        from .legacy_import import reconcile_imported_legacy_conflicts
-
-        return reconcile_imported_legacy_conflicts(self)
-
     def inventory_v2(self) -> dict[str, Any]:
         """Build a normalized graph from one pure read transaction."""
 

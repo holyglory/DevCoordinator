@@ -377,16 +377,14 @@ class RunnerObservation:
 
 
 @dataclass(frozen=True)
-class RunnerRecoveryContext:
-    """Generation-fenced attachment context retained outside testd memory."""
+class RunnerCleanupContext:
+    """Exact interrupted-runtime identity used only for cancellation."""
 
     repository_id: str
     repository_generation: int
     attempt_id: str
     generation: int
-    started_at: float = 0.0
-    next_chunk_index: int = 0
-    result_chunk_ids: tuple[str, ...] = ()
+    started_at: float
     launch_ticket_id: str | None = None
     launch_operation_id: str | None = None
     launch_timeout_seconds: int = 300
@@ -403,8 +401,8 @@ class RuntimeRequestSubmitter(Protocol):
 
     def observe(self, runtime_id: str) -> Mapping[str, object]: ...
 
-    def recover(
-        self, runtime_id: str, *, context: RunnerRecoveryContext
+    def attach_for_cleanup(
+        self, runtime_id: str, *, context: RunnerCleanupContext
     ) -> None: ...
 
     def cancel(self, runtime_id: str, *, reason: str) -> Mapping[str, object]: ...
@@ -418,8 +416,8 @@ class RunnerLauncher(Protocol):
 
     def observe(self, handle: RunnerHandle) -> RunnerObservation: ...
 
-    def recover(
-        self, handle: RunnerHandle, *, context: RunnerRecoveryContext
+    def attach_for_cleanup(
+        self, handle: RunnerHandle, *, context: RunnerCleanupContext
     ) -> None: ...
 
     def cancel(self, handle: RunnerHandle, *, reason: str) -> bool: ...
@@ -668,14 +666,14 @@ class TestdLaunchAdapter:
             launch_confirmed=launch_confirmed,
         )
 
-    def recover(
-        self, handle: RunnerHandle, *, context: RunnerRecoveryContext
+    def attach_for_cleanup(
+        self, handle: RunnerHandle, *, context: RunnerCleanupContext
     ) -> None:
         if not isinstance(handle, RunnerHandle) or not isinstance(
-            context, RunnerRecoveryContext
+            context, RunnerCleanupContext
         ):
-            raise TestStoreContractError("runtime recovery binding is invalid")
-        self._submitter.recover(handle.runtime_id, context=context)
+            raise TestStoreContractError("runtime cleanup binding is invalid")
+        self._submitter.attach_for_cleanup(handle.runtime_id, context=context)
 
     def cancel(self, handle: RunnerHandle, *, reason: str) -> bool:
         reason = _bounded_text("cancel reason", reason, maximum=1024)
@@ -859,8 +857,45 @@ class TestdEngine:
         self.live_source_check_seconds = float(live_source_check_seconds)
         self.clock = clock
         self._active: dict[str, _ActiveAttempt] = {}
-        self._recover_active_attempts()
-        self.store.reconcile_nonterminal_runs(now=float(self.clock()))
+        self._cancel_interrupted_attempts()
+
+    def _cancel_interrupted_attempts(self) -> None:
+        """Stop and discard unfinished work instead of recovering it."""
+
+        for envelope in self.spool.active_envelopes():
+            handle = RunnerHandle(
+                runtime_id=envelope.runtime_id,
+                launch_ack_id=envelope.launch_ack_id,
+                launch_ticket_id=envelope.launch_ticket_id,
+                launch_operation_id=envelope.launch_operation_id,
+                launch_timeout_seconds=envelope.launch_timeout_seconds,
+                launch_confirmed=envelope.launch_confirmed,
+            )
+            self.launcher.attach_for_cleanup(
+                handle,
+                context=RunnerCleanupContext(
+                    repository_id=str(envelope.candidate["repository_id"]),
+                    repository_generation=envelope.repository_generation,
+                    attempt_id=envelope.attempt_id,
+                    generation=envelope.generation,
+                    started_at=envelope.launched_at,
+                    launch_ticket_id=envelope.launch_ticket_id,
+                    launch_operation_id=envelope.launch_operation_id,
+                    launch_timeout_seconds=envelope.launch_timeout_seconds,
+                    launch_confirmed=envelope.launch_confirmed,
+                ),
+            )
+            cancelled = self.launcher.cancel(handle, reason="testd restarted")
+            if not cancelled:
+                observation = self.launcher.observe(handle)
+                if observation.state not in {"exited", "result"}:
+                    raise TestStoreConflict(
+                        "interrupted test runtime could not be stopped"
+                    )
+        self.store.cancel_interrupted_runs(
+            reason="testd restarted", now=float(self.clock())
+        )
+        self.spool.discard_all()
 
     def _active_envelope(self, active: _ActiveAttempt) -> ActiveAttemptEnvelope:
         return ActiveAttemptEnvelope(
@@ -887,115 +922,6 @@ class TestdEngine:
 
     def _retain_active(self, active: _ActiveAttempt) -> None:
         self.spool.retain_active(self._active_envelope(active))
-
-    def _recover_active_attempts(self) -> None:
-        pending_terminal = {
-            envelope.attempt_id for envelope in self.spool.pending_envelopes()
-        }
-        candidate_fields = set(RunnableTarget.__dataclass_fields__)
-        lease_fields = set(LeaseGrant.__dataclass_fields__)
-        for envelope in self.spool.active_envelopes():
-            if set(envelope.candidate) != candidate_fields or set(
-                envelope.lease
-            ) != lease_fields:
-                raise TestStoreContractError(
-                    "active attempt recovery binding fields are invalid"
-                )
-            candidate_values = dict(envelope.candidate)
-            raw_exclusive = candidate_values.get("exclusive_resources")
-            if not isinstance(raw_exclusive, (list, tuple)):
-                raise TestStoreContractError(
-                    "active attempt exclusive resources are invalid"
-                )
-            candidate_values["exclusive_resources"] = tuple(raw_exclusive)
-            candidate = RunnableTarget(**candidate_values)
-            lease = LeaseGrant(**dict(envelope.lease))
-            if (
-                envelope.attempt_id != lease.attempt_id
-                or envelope.generation != lease.generation
-                or candidate.target_id != lease.target_id
-                or candidate.run_id != lease.run_id
-                or candidate.target_name != lease.target_name
-                or candidate.shard_index != lease.shard_index
-                or candidate.shard_count != lease.shard_count
-            ):
-                raise TestStoreConflict(
-                    "active attempt recovery binding is contradictory"
-                )
-            attempt = self.store.get_attempt(envelope.attempt_id)
-            state = str(attempt["state"])
-            if state not in {"leased", "running"}:
-                self.spool.discard_active(envelope.attempt_id)
-                continue
-            if (
-                int(attempt["generation"]) != envelope.generation
-                or str(attempt["target_id"]) != candidate.target_id
-                or str(attempt["run_id"]) != candidate.run_id
-                or str(attempt["lease_owner"]) != lease.lease_owner
-            ):
-                raise TestStoreConflict(
-                    "active attempt recovery evidence is stale"
-                )
-            # A durable terminal envelope is already sufficient to converge;
-            # avoid requiring the runtime to remain observable while it replays.
-            if envelope.attempt_id in pending_terminal:
-                continue
-            handle = RunnerHandle(
-                runtime_id=envelope.runtime_id,
-                launch_ack_id=envelope.launch_ack_id,
-                launch_ticket_id=envelope.launch_ticket_id,
-                launch_operation_id=envelope.launch_operation_id,
-                launch_timeout_seconds=envelope.launch_timeout_seconds,
-                launch_confirmed=envelope.launch_confirmed,
-            )
-            self.launcher.recover(
-                handle,
-                context=RunnerRecoveryContext(
-                    repository_id=candidate.repository_id,
-                    repository_generation=envelope.repository_generation,
-                    attempt_id=envelope.attempt_id,
-                    generation=envelope.generation,
-                    started_at=envelope.launched_at,
-                    next_chunk_index=len(envelope.result_chunk_ids),
-                    result_chunk_ids=envelope.result_chunk_ids,
-                    launch_ticket_id=envelope.launch_ticket_id,
-                    launch_operation_id=envelope.launch_operation_id,
-                    launch_timeout_seconds=envelope.launch_timeout_seconds,
-                    launch_confirmed=envelope.launch_confirmed,
-                ),
-            )
-            self._active[envelope.attempt_id] = _ActiveAttempt(
-                candidate=candidate,
-                lease=lease,
-                handle=handle,
-                launched_at=envelope.launched_at,
-                next_source_check_at=envelope.next_source_check_at,
-                repository_generation=envelope.repository_generation,
-                result_chunk_ids=list(envelope.result_chunk_ids),
-                terminal_envelope=(
-                    None
-                    if envelope.terminal_envelope is None
-                    else AttemptExitEnvelope.from_document(
-                        envelope.terminal_envelope
-                    )
-                ),
-            )
-            active = self._active[envelope.attempt_id]
-            # The native runner is independently supervised and can outlive a
-            # same-schema testd replacement.  Renew the exact private spool
-            # binding before the ordinary heartbeat/reaper turn so downtime
-            # beyond the short lease cannot falsely abandon live work.
-            self.store.recover_attempt_lease(
-                envelope.attempt_id,
-                generation=envelope.generation,
-                lease_owner=lease.lease_owner,
-                lease_seconds=(
-                    self.lease_seconds
-                    if handle.launch_confirmed
-                    else self._pending_launch_lease_seconds(active)
-                ),
-                operation_id=str(uuid.uuid4()),
-            )
 
     def _acknowledge_active(self, active: _ActiveAttempt) -> None:
         if not active.handle.launch_confirmed:
@@ -1030,7 +956,7 @@ class TestdEngine:
             max(self.lease_seconds, remaining),
         )
 
-    def _prune_terminal_recovery(self) -> None:
+    def _collect_terminal_attempts(self) -> None:
         for envelope in self.spool.active_envelopes():
             state = str(self.store.get_attempt(envelope.attempt_id)["state"])
             if state not in {"leased", "running"}:
@@ -1869,7 +1795,7 @@ class TestdEngine:
             limit=limit,
             priority_names=priority_exit_names,
         )
-        self._prune_terminal_recovery()
+        self._collect_terminal_attempts()
         return {**exits, "result_chunks": chunks}
 
     def _import_terminal_envelope(

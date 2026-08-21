@@ -58,7 +58,6 @@ PARTITIONS = (
             "test_database_backups",
             "test_docker_grouping_regressions",
             "test_ephemeral_",
-            "test_storage_split",
             "test_store_backup",
         ),
     ),

@@ -29,7 +29,6 @@ test('published HTTP contract describes normalized query-only inventory and its 
     'unassigned_resources',
     'lifecycle_violations',
     'observations',
-    'test_statistics',
     'agent_browsers',
   ]);
   assert.equal(contract.inventory_contract.compatibility_projection, 'v1_compatibility');
@@ -41,27 +40,6 @@ test('published HTTP contract describes normalized query-only inventory and its 
   assert.match(contract.inventory_contract.no_docker, /excludes unrelated services/);
   assert.equal(contract.state.persistence_model, 'normalized SQLite');
   assert.ok(contract.endpoints.POST.includes('/v1/ports/relocate'));
-});
-
-test('test statistics use one bounded repository-scoped coordinator read', async (t) => {
-  const response = { schema_version: 1, repo_id: 'repo-1', days: 30, summary: {} };
-  const responder = async ({ req, res }) => {
-    if (req.url !== '/v1/tests?project=repo-1&days=30&limit=25') return false;
-    res.writeHead(200, { 'content-type': 'application/json' });
-    res.end(JSON.stringify(response));
-    return true;
-  };
-  const { client, requests } = await fixture(t, { responder });
-  assert.deepEqual(await client.testStats({ project: 'repo-1' }), response);
-  assert.equal(requests.at(-1).authorization, null);
-  assert.throws(
-    () => client.testStats({ project: '', days: 30, limit: 25 }),
-    (error) => error instanceof CoordError && error.status === 400,
-  );
-  assert.throws(
-    () => client.testStats({ project: 'repo-1', days: 0, limit: 25 }),
-    (error) => error instanceof CoordError && error.status === 400,
-  );
 });
 
 test('test plan and submission forward only typed repository-scoped contracts', async (t) => {
@@ -133,34 +111,25 @@ test('test run reads and operations use bounded repository-scoped routes', async
   };
   const { client } = await fixture(t, { responder });
 
-  await client.testRuns({ repoId: 'Repo-A', after: 'run-0', limit: 25, state: 'running' });
+  await client.testRuns({ repoId: 'Repo-A' });
   await client.testRunStatus({ repoId: 'Repo-A', runId: 'run-1' });
   await client.testRunSummary({ repoId: 'Repo-A', runId: 'run-1' });
   await client.testRunFailures({ repoId: 'Repo-A', runId: 'run-1', after: 'failure-11', limit: 20 });
   await client.testRunArtifacts({ repoId: 'Repo-A', runId: 'run-1' });
-  await client.testRunCases({ repoId: 'Repo-A', runId: 'run-1' });
   await client.cancelTestRun({ repoId: 'Repo-A', runId: 'run-1', reason: 'operator request', operationId, actor });
-  await client.retryTestRun({ repoId: 'Repo-A', runId: 'run-1', failedOnly: true, operationId, actor });
   await client.testRepositorySetup({ repoId: 'Repo-A' });
-  await client.testEvents({ repoId: 'Repo-A', after: 13, limit: 50 });
 
   assert.deepEqual(requests.map(({ method, path }) => ({ method, path })), [
-    { method: 'GET', path: '/v1/test-runs?repo_id=Repo-A&limit=25&after=run-0&state=running' },
+    { method: 'GET', path: '/v1/test-runs?repo_id=Repo-A&limit=50' },
     { method: 'GET', path: '/v1/test-runs/run-1?repo_id=Repo-A' },
     { method: 'GET', path: '/v1/test-runs/run-1/summary?repo_id=Repo-A' },
     { method: 'GET', path: '/v1/test-runs/run-1/failures?repo_id=Repo-A&limit=20&after=failure-11' },
     { method: 'GET', path: '/v1/test-runs/run-1/artifacts?repo_id=Repo-A&limit=50' },
-    { method: 'GET', path: '/v1/test-runs/run-1/cases?repo_id=Repo-A&limit=50' },
     { method: 'POST', path: '/v1/test-runs/run-1/cancel' },
-    { method: 'POST', path: '/v1/test-runs/run-1/retry' },
     { method: 'GET', path: '/v1/test-repositories/Repo-A/setup' },
-    { method: 'GET', path: '/v1/test-events?repo_id=Repo-A&after=13&limit=50' },
   ]);
-  assert.deepEqual(requests[6].body, {
+  assert.deepEqual(requests[5].body, {
     repo_id: 'Repo-A', reason: 'operator request', operation_id: operationId, actor,
-  });
-  assert.deepEqual(requests[7].body, {
-    repo_id: 'Repo-A', failed_only: true, operation_id: operationId, actor,
   });
 });
 
@@ -260,206 +229,6 @@ test('test setup preserves and logs the terminal error after one failed retry', 
   assert.equal(entries[1].fields.finalCode, 'test_repository_setup_unavailable');
   assert.equal(entries[1].fields.finalStatus, 502);
   assert.equal(entries[1].fields.attempts, 2);
-});
-
-test('fleet test statistics use one retained bounded host-wide read', async (t) => {
-  const response = {
-    schema_version: 2,
-    window: { hours: 24, start: '2026-07-27T00:00:00Z', end: '2026-07-28T00:00:00Z' },
-    snapshot: {
-      generated_at: '2026-07-28T00:00:00Z',
-      observed_through: '2026-07-27T23:59:00Z',
-      source: 'coordinator-test-store',
-      retention: { eligible: true, max_age_seconds: 86400 },
-    },
-    summary: { repository_count: 1, test_count: 42 },
-    hours: [], repositories: [], capacity: [], attention: [],
-  };
-  let requestsSeen = 0;
-  const responder = async ({ req, res }) => {
-    if (req.url !== '/v1/test-fleet?hours=24') return false;
-    requestsSeen += 1;
-    res.writeHead(200, { 'content-type': 'application/json' });
-    res.end(JSON.stringify(response));
-    return true;
-  };
-  const { client, requests, config } = await fixture(t, { responder });
-  const [first, second] = await Promise.all([client.testFleet(), client.testFleet()]);
-
-  assert.equal(first.snapshot.delivery.state, 'fresh');
-  assert.equal(first.snapshot.delivery.refreshing, false);
-  assert.deepEqual(first, second);
-  assert.equal(requestsSeen, 1);
-  assert.equal(requests.at(-1).authorization, null);
-
-  const warm = await client.testFleet();
-  assert.equal(warm.snapshot.delivery.state, 'retained');
-  assert.equal(warm.snapshot.delivery.refreshing, false);
-  assert.equal(requestsSeen, 1, 'a completed warm cache must not start another read');
-  const persisted = JSON.parse(await fsp.readFile(
-    path.join(config.stateDir, 'test-stats-cache-v1.json'),
-    'utf8',
-  ));
-  assert.equal(persisted.version, 1);
-  assert.equal(persisted.semantics_revision, 2,
-    'persisted test projections must bind the renderer semantics that produced them');
-
-  const restarted = createCoordinator({ config, log: null });
-  t.after(() => restarted.close());
-  const retained = await restarted.testFleet();
-  assert.equal(retained.snapshot.delivery.state, 'retained');
-  assert.equal(retained.snapshot.delivery.refreshing, true);
-  assert.throws(
-    () => client.testFleet({ hours: 0 }),
-    (error) => error instanceof CoordError && error.status === 400,
-  );
-});
-
-test('a legacy persisted fleet projection is invalidated before first paint', async (t) => {
-  const fresh = {
-    schema_version: 2,
-    window: { hours: 24, start: '2026-07-30T00:00:00Z', end: '2026-07-31T00:00:00Z' },
-    snapshot: {
-      generated_at: '2026-07-31T00:00:00Z',
-      observed_through: '2026-07-30T23:59:00Z',
-      source: 'fresh-test-store',
-    },
-    summary: { repository_count: 1, test_count: 42 },
-    hours: [], repositories: [], capacity: [], attention: [],
-  };
-  let requestsSeen = 0;
-  const responder = async ({ req, res }) => {
-    if (req.url !== '/v1/test-fleet?hours=24') return false;
-    requestsSeen += 1;
-    res.writeHead(200, { 'content-type': 'application/json' });
-    res.end(JSON.stringify(fresh));
-    return true;
-  };
-  const { config } = await fixture(t, { responder });
-  const legacy = {
-    schema_version: 2,
-    window: fresh.window,
-    snapshot: {
-      generated_at: '2026-07-30T00:00:00Z',
-      observed_through: '2026-07-29T23:59:00Z',
-      source: 'legacy-test-store',
-    },
-    summary: { repository_count: 1, test_count: 999 },
-    hours: [], repositories: [], capacity: [], attention: [],
-  };
-  await fsp.writeFile(
-    path.join(config.stateDir, 'test-stats-cache-v1.json'),
-    `${JSON.stringify({
-      version: 1,
-      entries: [{ key: 'fleet:hours=24', at: Date.now(), value: legacy }],
-    })}\n`,
-  );
-
-  const restarted = createCoordinator({ config, log: null });
-  t.after(() => restarted.close());
-  const result = await restarted.testFleet();
-
-  assert.equal(requestsSeen, 1,
-    'an unrevisioned cache must never satisfy a request after semantics change');
-  assert.equal(result.summary.test_count, 42);
-  assert.equal(result.snapshot.delivery.state, 'fresh');
-  const replaced = JSON.parse(await fsp.readFile(
-    path.join(config.stateDir, 'test-stats-cache-v1.json'),
-    'utf8',
-  ));
-  assert.equal(replaced.semantics_revision, 2);
-  assert.equal(replaced.entries[0].value.summary.test_count, 42);
-});
-
-test('repository test statistics distinguish cold, retained, and refreshing delivery', async (t) => {
-  let requestsSeen = 0;
-  let releaseRefresh;
-  const refreshGate = new Promise((resolve) => { releaseRefresh = resolve; });
-  const responder = async ({ req, res }) => {
-    if (req.url !== '/v1/tests?project=repo-1&days=30&limit=25') return false;
-    requestsSeen += 1;
-    const requestNumber = requestsSeen;
-    if (requestNumber === 2) await refreshGate;
-    res.writeHead(200, { 'content-type': 'application/json' });
-    res.end(JSON.stringify({
-      schema_version: 1,
-      repo_id: 'repo-1',
-      days: 30,
-      snapshot: {
-        generated_at: `2026-07-28T00:00:0${requestNumber}Z`,
-        observed_through: null,
-        source: 'coordinator-test-store',
-        retention: { eligible: true, max_age_seconds: 86400 },
-      },
-      summary: { request_number: requestNumber },
-    }));
-    return true;
-  };
-  const { client } = await fixture(t, { responder });
-
-  const cold = await client.testStats({ project: 'repo-1' });
-  assert.equal(cold.snapshot.delivery.state, 'fresh');
-  assert.equal(cold.snapshot.delivery.refreshing, false);
-
-  const warm = await client.testStats({ project: 'repo-1' });
-  assert.equal(warm.snapshot.delivery.state, 'retained');
-  assert.equal(warm.snapshot.delivery.refreshing, false);
-  assert.equal(requestsSeen, 1);
-
-  const refreshing = await client.testStats({ project: 'repo-1', maxAgeMs: 0 });
-  assert.equal(refreshing.snapshot.delivery.state, 'retained');
-  assert.equal(refreshing.snapshot.delivery.refreshing, true);
-  assert.equal(refreshing.summary.request_number, 1);
-
-  releaseRefresh();
-  let refreshed = null;
-  for (let attempt = 0; attempt < 100; attempt += 1) {
-    await new Promise((resolve) => setTimeout(resolve, 2));
-    refreshed = await client.testStats({ project: 'repo-1' });
-    if (refreshed.summary.request_number === 2) break;
-  }
-  assert.equal(refreshed.summary.request_number, 2);
-  assert.equal(refreshed.snapshot.delivery.state, 'retained');
-  assert.equal(refreshed.snapshot.delivery.refreshing, false);
-  assert.equal(requestsSeen, 2, 'the retained refresh must remain coalesced');
-});
-
-test('test statistics survive a Console restart and refresh stale data in the background', async (t) => {
-  const response = {
-    schema_version: 1,
-    repo_id: 'repo-1',
-    days: 30,
-    summary: { test_count: 42 },
-  };
-  let slow = false;
-  let statisticsRequests = 0;
-  const responder = async ({ req, res }) => {
-    if (req.url !== '/v1/tests?project=repo-1&days=30&limit=25') return false;
-    statisticsRequests += 1;
-    if (slow) await new Promise((resolve) => setTimeout(resolve, 150));
-    res.writeHead(200, { 'content-type': 'application/json' });
-    res.end(JSON.stringify(response));
-    return true;
-  };
-  const { client, config } = await fixture(t, { responder });
-  assert.deepEqual(await client.testStats({ project: 'repo-1' }), response);
-
-  slow = true;
-  const restarted = createCoordinator({ config, log: null });
-  t.after(() => restarted.close());
-  const started = performance.now();
-  const retained = await restarted.testStats({
-    project: 'repo-1',
-    maxAgeMs: 0,
-    maxStaleMs: 60_000,
-  });
-  const elapsedMs = performance.now() - started;
-
-  assert.deepEqual(retained, response);
-  assert.ok(elapsedMs < 50, `retained test statistics waited ${elapsedMs.toFixed(1)}ms`);
-  await new Promise((resolve) => setTimeout(resolve, 20));
-  assert.equal(statisticsRequests, 2,
-    'a stale retained response must start exactly one background refresh');
 });
 
 test('test repository discovery is a lightweight cached coordinator read', async (t) => {

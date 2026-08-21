@@ -1088,8 +1088,8 @@ SAMPLE_FIELDS = frozenset(
         "navigation_status",
         "api_status",
         "authenticated",
-        "retained_tests",
-        "fleet_delivery_state",
+        "current_tests",
+        "test_delivery_state",
         "state",
         "lcp_ms",
         "lcp_entry_count",
@@ -1111,7 +1111,7 @@ def _verify_sample(
     sample = _exact_mapping(value, SAMPLE_FIELDS, "browser LCP sample")
     expected_url = tests_url if journey == "tests" else console_url
     expected_state = (
-        "authenticated_retained_tests"
+        "authenticated_current_tests"
         if journey == "tests"
         else "authenticated_console_shell"
     )
@@ -1137,16 +1137,16 @@ def _verify_sample(
     if journey == "tests":
         if (
             sample["api_status"] != 200
-            or sample["retained_tests"] is not True
-            or sample["fleet_delivery_state"] != "retained"
+            or sample["current_tests"] is not True
+            or sample["test_delivery_state"] != "current"
         ):
             raise BrowserLcpAcceptanceError(
-                "Tests LCP sample is not the authenticated retained projection"
+                "Tests LCP sample is not the authenticated current catalog"
             )
     elif (
         sample["api_status"] is not None
-        or sample["retained_tests"] is not False
-        or sample["fleet_delivery_state"] is not None
+        or sample["current_tests"] is not False
+        or sample["test_delivery_state"] is not None
     ):
         raise BrowserLcpAcceptanceError("Console shell LCP sample state is contradictory")
     return sample

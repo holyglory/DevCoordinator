@@ -251,11 +251,6 @@ class LifecycleApplyObservationTests(unittest.TestCase):
                 args,
                 coordinator_home=self.home,
                 canonical_project=lambda value: str(Path(value).resolve()),
-                bootstrap_legacy_import=lambda _store: {
-                    "attempted": False,
-                    "committed": False,
-                    "late_writer_sources": [],
-                },
                 adapter_factory=lambda: self.adapter,
                 **callbacks,
             )
@@ -967,7 +962,6 @@ class LifecycleApplyObservationTests(unittest.TestCase):
                 args,
                 coordinator_home=self.home,
                 canonical_project=lambda value: str(Path(value).resolve()),
-                bootstrap_legacy_import=lambda _store: {},
             )
         self.assertEqual([row["repo_id"] for row in result], ["repo-expired"])
         broker_call.assert_called_once()

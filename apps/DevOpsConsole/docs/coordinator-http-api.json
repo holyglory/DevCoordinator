@@ -26,17 +26,13 @@
       "/v1/servers",
       "/v1/archives",
       "/v1/events",
-      "/v1/tests",
-      "/v1/test-fleet",
       "/v1/test-repositories",
       "/v1/test-repositories/:repo_id/setup",
       "/v1/test-runs?repo_id=:repo_id",
       "/v1/test-runs/:run_id",
       "/v1/test-runs/:run_id/summary",
       "/v1/test-runs/:run_id/failures",
-      "/v1/test-runs/:run_id/artifacts",
-      "/v1/test-runs/:run_id/cases",
-      "/v1/test-events?repo_id=:repo_id"
+      "/v1/test-runs/:run_id/artifacts"
     ],
     "POST": [
       "/v1/ports/lease",
@@ -69,7 +65,6 @@
       "/v1/test-plan",
       "/v1/test-runs",
       "/v1/test-runs/:run_id/cancel",
-      "/v1/test-runs/:run_id/retry",
       "/v1/observe"
     ]
   },
@@ -131,7 +126,6 @@
       "unassigned_resources",
       "lifecycle_violations",
       "observations",
-      "test_statistics",
       "agent_browsers"
     ],
     "compatibility_projection": "v1_compatibility",
@@ -143,22 +137,16 @@
     "project_reports": "ok=false must be treated as failure even when HTTP status is 200; inspect partial, preflight_failed, classification, actions, and action_errors"
   },
   "test_contract": {
-    "repositories": "GET /v1/test-repositories returns every current protected-profile repository ID and display name joined to testd's retained ready, missing, or invalid setup projection; the response never scans user worktrees and never exposes canonical paths, manifest text, argv, environment values, or fixture secrets",
-    "setup": "GET /v1/test-repositories/:repo_id/setup executes the bounded repository-UID setup projection and returns only ready, missing, or invalid plus sanitized graph, policy, fixture, network, isolation, and input-coverage facts; it never returns argv, environment values, absolute repository paths, or manifest text",
-    "read": "GET /v1/tests requires one configured repo_id plus optional days (1-3650) and limit (1-500), and serves summary, comparison, daily and hourly data from testd-owned materialized TestDB rollups rather than legacy authority test tables",
-    "fleet": "GET /v1/test-fleet accepts hours (1-168, default 24) and returns one bounded projection from testd-owned materialized TestDB rollups, scoped to the caller's exact current repository enrollments and keyed only by immutable repo_id: sparse repository-by-hour exact test seconds, capacity, health, efficiency, queue wait, freshness and actionable repository attention. Test assertion/error failures and infrastructure/setup failures have separate state, count, rate and detail fields. Repository state_scope is selected_window: it describes observations in the requested window and does not claim a historical failure remains unresolved. The read never accesses legacy authority test records or returns paths, commands, logs, or case identities",
+    "repositories": "GET /v1/test-repositories returns the current configured repository IDs, display names, and setup status; it never exposes canonical paths, manifest text, argv, environment values, or fixture secrets",
+    "setup": "GET /v1/test-repositories/:repo_id/setup executes the bounded current repository setup read and returns sanitized targets, intent, fixture, network, isolation, and input-coverage facts; it never returns argv, environment values, absolute repository paths, or manifest text",
     "plan": "POST /v1/test-plan accepts repo_id, intent, one caller-generated canonical operation_id UUID, one exact schema-1 source selector, and an optional bounded requested_targets list for manual intent only. Original and temporary selectors carry an immutable repository ID plus catalog generation; temporary canonical paths are resolved only from the installed broker profile and revalidated by the broker. The returned plan preserves operation_id so retries are durably idempotent. Target names must come from the sanitized configured-repository setup catalog; dependency closure, manifest, argv, resources and policy remain derived inside the test plane",
     "submit": "POST /v1/test-runs accepts repo_id, plan_id and operation_id plus the trusted API's bounded diagnostic actor; the canonical UUID is the durable idempotency key, and the plan must resolve to the same immutable repository before mutation",
-    "history": "GET /v1/test-runs requires repo_id and accepts one opaque after cursor, one state filter, and limit 1-200; results are repository-scoped and do not expose another repository's run existence",
-    "run_reads": "GET /v1/test-runs/:run_id and /summary return bounded run status and the <=8 KiB agent summary. /failures, /artifacts and /cases use cursor pagination with a maximum page of 50 and are reauthorized against the run's immutable repository before any result is disclosed",
-    "events": "GET /v1/test-events requires repo_id and accepts a non-negative numeric event cursor plus limit 1-500; events are repository-scoped and polling never clears retained Console content",
-    "control": "POST /v1/test-runs/:run_id/cancel accepts reason and operation_id. POST /retry accepts failed_only and operation_id. Every mutation is idempotent, reauthorizes the actual run repository, and does not trust the run ID as an ownership claim",
-    "google_authorization": "Google sign-in protects the Console as a whole. Every signed-in Console user can read, run, cancel, and retry tests for every configured repository; no repository grants, memberships, or owner-only release gate exist. Repository-scoped routes still verify returned target identity for correctness",
-    "hourly": "the read returns seven complete UTC days of hourly buckets; exact case intervals are split at hour boundaries and parallel intervals add, so test_seconds may exceed 3600 in one wall-clock hour; failure_count is attributed to the case start hour",
-    "comparison": "comparison_summary and previous_daily cover the immediately preceding equal period, while dynamics reports suite-level current_seconds, previous_seconds, change_percent, failures, and last_run",
-    "ownership": "the service-owned broker database stores repository-attributed sessions, group runs, and exact individual case timings; clients never receive a database handle",
-    "inventory": "server-wide normalized inventory includes a bounded 30-day test_statistics projection per active repository for DevOps Board",
-    "privacy": "run records retain command fingerprints and selectors, never raw child output, commands, environment values, credentials, or failure payloads"
+    "current_runs": "GET /v1/test-runs requires exactly repo_id and returns at most 50 unfinished runs from the current testd lifetime; it has no history cursor or completed-run filter and does not expose another repository's run existence",
+    "follow": "GET /v1/test-runs/:run_id and /summary return bounded current status and the <=8 KiB agent summary. /failures and /artifacts use bounded pagination and are reauthorized against the run's immutable repository before disclosure",
+    "control": "POST /v1/test-runs/:run_id/cancel accepts reason and operation_id, is idempotent, reauthorizes the actual run repository, and does not trust the run ID as an ownership claim",
+    "google_authorization": "Google sign-in protects the Console as a whole. Every signed-in Console user can read, run, follow, cancel, and resolve artifacts for every configured repository; repository-scoped routes still verify returned target identity for correctness",
+    "lifecycle": "Test Store contents are disposable. A testd replacement cancels unfinished work instead of recovering it, and software-owned delivery may reset the store without migrating prior runs, cases, rollups, queues, plans, attempts, timings, or evidence-consumption state",
+    "privacy": "current run records retain bounded command fingerprints and selectors, never raw child output, commands, environment values, credentials, or failure payloads"
   },
   "lifecycle_contract": {
     "archives": "GET /v1/archives returns {archives:[...]}; rows carry target_kind, target_id, display_name, archived_at, reason, actor and may include project_id/parent, restorable, removable, status, retained, effects, and blockers",

@@ -2,6 +2,20 @@
 
 ## Direction
 
+Confirmed simplification direction: retain repository registrations, routes,
+Console users/grants/settings, secret references, valuable repository source,
+project databases, and recoverable database-backup artifacts; rebuild all
+other incompatible execution state. Tests, plans, cases, artifacts, rollups,
+queues, retries, progress, evidence reuse, and unfinished attempts are
+disposable. A DevCoordinator restart cancels unfinished tests for rerun. The
+public test surface is run, follow, cancel, and artifact retrieval. The
+completed pre-availability cutover, legacy authority import/storage split,
+temporary handoff services, historical test journal, and rollback to the old
+layout are unsupported. Current releases use immutable packaging, atomic
+activation, health verification, and rollback to the preceding current-format
+release. See
+[DC-2026-08-19-ARCHITECTURE-SIMPLIFICATION-02](DecisionDetails/DC-2026-08-19-ARCHITECTURE-SIMPLIFICATION-02.md).
+
 Confirmed product direction: one canonical Git worktree is one project, temporary worktrees remain children of their original repository, and immutable Coordinator identities determine every resource relationship. Python publishes one root-repository → temporary-repository → resource tree; Board and Console render it without ownership heuristics and keep current, actionable content compact. The Board separates resource work from incident review into one active center workspace with one vertical scroll owner, while the selected resource inspector remains stable. Performance reconciles whole-host totals as dense stacked composition with explicit attribution coverage and residuals; project and Agent-browser detail appears only on demand. Headless automation browsers are measured host workloads whose caller-independent idle cleanup belongs to Coordinator, while project/test owners retain their own browser lifecycle. See [DC-2026-08-03-BROWSER-LIFECYCLE-01](DecisionDetails/DC-2026-08-03-BROWSER-LIFECYCLE-01.md), [DC-2026-08-03-PERFORMANCE-01](DecisionDetails/DC-2026-08-03-PERFORMANCE-01.md), [DC-2026-07-27-BOARD-INCIDENTS-01](DecisionDetails/DC-2026-07-27-BOARD-INCIDENTS-01.md), [DC-2026-07-25-RUNTIME-01](DecisionDetails/DC-2026-07-25-RUNTIME-01.md), and [DC-2026-07-21-CONSOLE-DATA-01](DecisionDetails/DC-2026-07-21-CONSOLE-DATA-01.md).
 
 Confirmed authority and lifecycle direction: one kernel-attributed service authority owns host state, observation, runtime/test coordination, and mutation. On this single-developer host there is no local repository-, account-, UID-, GID-, group-, action-, resource-, enrollment-, membership-, controller-, source-, or grant-scoped authorization; any trusted local agent may issue any supported command for any current resource. Repository association is optional non-authorizing presentation, routing, accounting, execution, and cleanup context. Calls remain globally exact-ID based, evidence-carrying, and fail closed on malformed input, stale identity/generation, path escape, replay conflict, or invalid lifecycle state. Short-lived work is durably attributed before creation, temporary work expires, archive and permanent removal remain distinct, removed identities cannot silently return, and supervised workers retain crash evidence behind an explicit crash-loop re-arm. A valid first-use Git repository remains non-mutating during discovery and atomically adopts itself only with its first structured TTL-owned service mutation, running repository code as the actual non-root local caller rather than filesystem stat owner, root, or control plane. Public Google/domain/upstream identities and secrets remain authorization boundaries; local fallback and shell commands stay disabled. See [DC-2026-08-12-LOCAL-AUTH-SIMPLIFICATION-01](DecisionDetails/DC-2026-08-12-LOCAL-AUTH-SIMPLIFICATION-01.md), [DC-2026-08-04-FIRST-USE-TRUST-01](DecisionDetails/DC-2026-08-04-FIRST-USE-TRUST-01.md), [DC-2026-07-15-HOST-01](DecisionDetails/DC-2026-07-15-HOST-01.md), and [DC-2026-07-25-RUNTIME-01](DecisionDetails/DC-2026-07-25-RUNTIME-01.md).
@@ -21,6 +35,23 @@ Confirmed test-simplification direction: a DevCoordinator cutover changes DevCoo
 Confirmed acceptance-scope direction: DevCoordinator readiness is held open by acceptance of DevCoordinator-owned capabilities and interfaces, not by live canaries tied to a particular external consumer repository. External repositories may supply regression evidence, but their names, resources, credentials, or application-specific browser journeys do not remain DevCoordinator completion blockers. See [DC-2026-08-11-ACCEPTANCE-SCOPE-01](DecisionDetails/DC-2026-08-11-ACCEPTANCE-SCOPE-01.md).
 
 Confirmed efficiency direction: delivery-efficiency measurement remains owned by each account's standalone recorder, while Coordinator optionally accepts one bounded cumulative snapshot per account and repository and presents merged repository-first statistics. Unknown counters remain unknown, account projections remain separate, and missing or unhealthy integration never blocks recording or delivery. See [DC-2026-08-12-EFFICIENCY-PROJECTION-01](DecisionDetails/DC-2026-08-12-EFFICIENCY-PROJECTION-01.md).
+
+## DC-2026-08-19-ARCHITECTURE-SIMPLIFICATION-02 — Retain control data, rebuild disposable execution state
+
+ID: DC-2026-08-19-ARCHITECTURE-SIMPLIFICATION-02 · Details: [supporting record](DecisionDetails/DC-2026-08-19-ARCHITECTURE-SIMPLIFICATION-02.md)
+
+Decision: Remove the completed pre-availability cutover and legacy authority
+compatibility product; make test execution current-run-only; cancel unfinished
+attempts on restart; expose only run/follow/cancel/artifact; rebuild
+incompatible operational state from retained repositories, routes, users,
+grants/settings and current host observation; and keep only the public,
+application, root-authority, scheduler, and transient-execution boundaries.
+
+Why: Keeping or merely refactoring compatibility retained two test journals,
+historical analytics, recovery/chunk state machines, one hundred authority and
+broker table names, and 36k production lines for a completed cutover. A clean
+current-state architecture directly matches the confirmed retention boundary;
+rerunning disposable work is simpler than recovering it.
 
 ## DC-2026-08-19-TEST-SIMPLIFICATION-01 — Testd owns one disposable execution state machine
 

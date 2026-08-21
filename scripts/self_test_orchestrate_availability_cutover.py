@@ -203,7 +203,7 @@ def schema_readiness() -> dict[str, object]:
             "journal_kind": "schema_readiness",
             "journal": {"replayed": False},
             "store": {
-                "schema_version": 6,
+                "schema_version": 7,
                 "store_generation": TEST_GENERATION,
             },
             "published_at": "2026-07-28T00:00:00Z",
@@ -895,7 +895,7 @@ class CutoverTransitionTests(unittest.TestCase):
             if key not in {"schema_version", "kind", "document_sha256"}
         }
         fresh_values["store"] = {
-            "schema_version": 6,
+            "schema_version": 7,
             "store_generation": "another-generation",
         }
         stale_evidence["test-history-discard"] = cutover.seal(

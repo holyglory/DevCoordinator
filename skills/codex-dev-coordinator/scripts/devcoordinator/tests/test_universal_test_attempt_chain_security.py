@@ -42,7 +42,7 @@ from devcoordinator.universal_test_store import (
     UniversalTestStore,
 )
 from devcoordinator.universal_testd import (
-    RunnerRecoveryContext,
+    RunnerCleanupContext,
     _attempt_result_chunk,
 )
 
@@ -1069,6 +1069,7 @@ class UniversalTestAttemptChainSecurityTests(unittest.TestCase):
         self.assertEqual(len(requests), 4)
         self.assertEqual(len({request.operation_id for request in requests}), 1)
 
+    @unittest.skip("testd restart now cancels rather than recovers pending launches")
     def test_pending_launch_spool_survives_restart_and_replays_exact_operation(self) -> None:
         requests = []
         expected_runtime_id = "devcoordinator-test-" + hashlib.sha256(
@@ -1145,9 +1146,9 @@ class UniversalTestAttemptChainSecurityTests(unittest.TestCase):
             client_factory=Client,
             clock=lambda: 10.0,
         )
-        replacement.recover(
+        replacement.attach_for_cleanup(
             retained.runtime_id,
-            context=RunnerRecoveryContext(
+            context=RunnerCleanupContext(
                 repository_id="repo-restart-pending",
                 repository_generation=retained.repository_generation,
                 attempt_id=retained.attempt_id,
@@ -1716,9 +1717,9 @@ class UniversalTestAttemptChainSecurityTests(unittest.TestCase):
             BrokerConnection(Path("/tmp/devcoordinator-unused.sock"), "authority-1"),
             clock=lambda: 100.0,
         )
-        submitter.recover(
+        submitter.attach_for_cleanup(
             runtime_id,
-            context=RunnerRecoveryContext(
+            context=RunnerCleanupContext(
                 repository_id="repo-deadline-cleanup-proof",
                 repository_generation=2,
                 attempt_id=attempt_id,
@@ -1767,9 +1768,9 @@ class UniversalTestAttemptChainSecurityTests(unittest.TestCase):
         submitter = CoordinatorRuntimeRequestSubmitter(
             BrokerConnection(Path("/tmp/devcoordinator-unused.sock"), "authority-1")
         )
-        submitter.recover(
+        submitter.attach_for_cleanup(
             runtime_id,
-            context=RunnerRecoveryContext(
+            context=RunnerCleanupContext(
                 repository_id="repo-cancel-uncertain",
                 repository_generation=4,
                 attempt_id=attempt_id,
@@ -1822,9 +1823,9 @@ class UniversalTestAttemptChainSecurityTests(unittest.TestCase):
             BrokerConnection(Path("/tmp/devcoordinator-unused.sock"), "authority-1"),
             clock=lambda: 10.0,
         )
-        submitter.recover(
+        submitter.attach_for_cleanup(
             runtime_id,
-            context=RunnerRecoveryContext(
+            context=RunnerCleanupContext(
                 repository_id="repo-cancel-result-race",
                 repository_generation=1,
                 attempt_id=attempt_id,
@@ -1913,9 +1914,9 @@ class UniversalTestAttemptChainSecurityTests(unittest.TestCase):
             clock=lambda: 12.0,
         )
         submitter.calls = Calls()
-        submitter.recover(
+        submitter.attach_for_cleanup(
             runtime_id,
-            context=RunnerRecoveryContext(
+            context=RunnerCleanupContext(
                 repository_id="repo-recovered",
                 repository_generation=5,
                 attempt_id="attempt-recovered",

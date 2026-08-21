@@ -250,8 +250,8 @@ class BrowserLcpAcceptanceTests(unittest.TestCase):
                         "navigation_status": 200,
                         "api_status": None,
                         "authenticated": True,
-                        "retained_tests": False,
-                        "fleet_delivery_state": None,
+                        "current_tests": False,
+                        "test_delivery_state": None,
                         "state": "authenticated_console_shell",
                         "lcp_ms": float(300 + viewport["width"] / 10),
                         "lcp_entry_count": 2,
@@ -265,9 +265,9 @@ class BrowserLcpAcceptanceTests(unittest.TestCase):
                         "navigation_status": 200,
                         "api_status": 200,
                         "authenticated": True,
-                        "retained_tests": True,
-                        "fleet_delivery_state": "retained",
-                        "state": "authenticated_retained_tests",
+                        "current_tests": True,
+                        "test_delivery_state": "current",
+                        "state": "authenticated_current_tests",
                         "lcp_ms": float(400 + viewport["width"] / 10),
                         "lcp_entry_count": 3,
                         "observed_at": observed,
@@ -447,8 +447,8 @@ class BrowserLcpAcceptanceTests(unittest.TestCase):
 
     def test_fresh_tests_projection_does_not_satisfy_retained_gate(self) -> None:
         fresh = json.loads(json.dumps(self.attestation))
-        fresh["samples"][1]["fleet_delivery_state"] = "fresh"
-        fresh["samples"][1]["retained_tests"] = False
+        fresh["samples"][1]["test_delivery_state"] = "fresh"
+        fresh["samples"][1]["current_tests"] = False
         fresh = self._resign(fresh)
         path = self._private_document("fresh-tests.json", fresh)
         with self.assertRaisesRegex(

@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
-"""Switch the production graph to one immutable compatible release.
+"""Switch the production graph to one immutable current-format release.
 
-This is the routine fast release path. Authority data, inventory, routes,
-Telegram configuration, Console settings, and test history stay in place
-unless the target authority schema declares a supported transactional upgrade
-or the caller explicitly selects the disposable test-history reset. A schema
-upgrade is performed only with the writers stopped and an exact rollback
-backup already recorded in this switch journal.
+Retained control data stays at the fixed authority path. This routine release
+path deliberately refuses an incompatible authority schema; the separate
+retained-control rebaseline creates a fresh current database instead of
+carrying an in-place schema migration chain.
 
 The switch installs the immutable unit set, refreshes systemd identities and
 runtime directories, starts a second Console slot on two unused loopback
@@ -44,9 +42,9 @@ SCRIPT_ROOT = Path(__file__).resolve().parent
 if str(SCRIPT_ROOT) not in sys.path:
     sys.path.insert(0, str(SCRIPT_ROOT))
 
-import activate_availability_release as activation  # noqa: E402
+import browser_lcp_acceptance as browser_lcp  # noqa: E402
 import install_availability_release as installer  # noqa: E402
-from devcoordinator.store import AccountStore  # noqa: E402
+from devcoordinator.schema import SCHEMA_VERSION as COORDINATOR_SCHEMA_VERSION  # noqa: E402
 
 
 KIND = "devcoordinator-same-schema-release-switch"
@@ -163,7 +161,35 @@ RUNTIME_SOCKET_REBIND_ORDER = (
     "devcoordinator-test-snapshotd.socket",
     "devcoordinator-testd.socket",
 )
-REQUIRED_SOCKETS = activation.SOCKET_UNITS
+TOPOLOGY_FILES = (
+    "devcoordinator-api.service",
+    "devcoordinator-api.socket",
+    "devcoordinator-authority.service",
+    "devcoordinator-authority.socket",
+    "devcoordinator-background.slice",
+    "devcoordinator-console@.service",
+    "devcoordinator-control.slice",
+    "devcoordinator-edge-http.socket",
+    "devcoordinator-edge-https.socket",
+    "devcoordinator-edge-publication.socket",
+    "devcoordinator-edge.service",
+    "devcoordinator-observer.service",
+    "devcoordinator-notifications.service",
+    "devcoordinator-projects.slice",
+    "devcoordinator-test-snapshotd.service",
+    "devcoordinator-test-snapshotd.socket",
+    "devcoordinator-testd.service",
+    "devcoordinator-testd.socket",
+)
+REQUIRED_SOCKETS = (
+    "devcoordinator-edge-http.socket",
+    "devcoordinator-edge-https.socket",
+    "devcoordinator-edge-publication.socket",
+    "devcoordinator-api.socket",
+    "devcoordinator-authority.socket",
+    "devcoordinator-testd.socket",
+    "devcoordinator-test-snapshotd.socket",
+)
 API_SOCKET = "devcoordinator-api.socket"
 
 
@@ -253,12 +279,12 @@ def browser_runtime_lock_payload(path: Path) -> tuple[dict[str, object], bytes]:
     if not isinstance(value, Mapping):
         raise SwitchError("browser runtime inventory is not an object")
     try:
-        verified = activation.browser_lcp.verify_runtime_lock_document(
+        verified = browser_lcp.verify_runtime_lock_document(
             value,
             expected_uid=0,
             expected_gid=0,
         )
-    except (OSError, ValueError, activation.browser_lcp.BrowserLcpAcceptanceError) as error:
+    except (OSError, ValueError, browser_lcp.BrowserLcpAcceptanceError) as error:
         raise SwitchError(f"browser runtime inventory is invalid: {error}") from error
     return dict(verified), payload
 
@@ -854,7 +880,7 @@ def render_release(release: Path, transaction_root: Path) -> dict[str, object]:
     rendered.mkdir(parents=True)
     capacity = installer.derive_slice_capacity(installer.host_memory_bytes())
     for name in (
-        *activation.TOPOLOGY_FILES,
+        *TOPOLOGY_FILES,
         "devcoordinator-availability.sysusers.conf",
         "devcoordinator-availability.tmpfiles.conf",
         MAIN_TMPFILES_RENDERED,
@@ -893,7 +919,7 @@ def render_release(release: Path, transaction_root: Path) -> dict[str, object]:
 
 
 def destinations(rendered: Path) -> dict[str, Path]:
-    result = {name: UNIT_ROOT / name for name in activation.TOPOLOGY_FILES}
+    result = {name: UNIT_ROOT / name for name in TOPOLOGY_FILES}
     result["devcoordinator-availability.sysusers.conf"] = (
         SYSUSERS_ROOT / "devcoordinator-availability.sysusers.conf"
     )
@@ -1200,168 +1226,16 @@ def _authority_schema_version(path: Path = AUTHORITY_DATABASE) -> int:
     return int(row[0])
 
 
-def _sqlite_backup(source: Path, destination: Path) -> dict[str, object]:
-    if destination.exists() or destination.is_symlink():
-        raise SwitchError("authority rollback backup destination already exists")
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    source_connection = sqlite3.connect(f"{source.as_uri()}?mode=ro", uri=True)
-    destination_connection = sqlite3.connect(destination)
-    try:
-        source_connection.backup(destination_connection)
-        destination_connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-    except sqlite3.Error as error:
-        destination_connection.close()
-        source_connection.close()
-        destination.unlink(missing_ok=True)
-        raise SwitchError(f"authority rollback backup failed: {error}") from error
-    destination_connection.close()
-    source_connection.close()
-    os.chmod(destination, 0o600)
-    return {
-        "path": str(destination),
-        "sha256": digest_file(destination),
-        "schema_version": _authority_schema_version(destination),
-    }
+def require_current_authority_schema() -> int:
+    """Refuse in-place upgrades; retained-control rebaseline owns incompatibility."""
 
-
-def migrate_trusted_local_authority(
-    document: dict[str, object],
-    journal_path: Path,
-    transaction_root: Path,
-    runner: Runner,
-) -> dict[str, object]:
-    """Upgrade a supported legacy authority with exact rollback evidence."""
-
-    target_schema = int(activation.COORDINATOR_SCHEMA_VERSION)
-    current_schema = _authority_schema_version()
-    recorded = document.get("authority_migration")
-    if current_schema == target_schema:
-        if isinstance(recorded, Mapping) and recorded.get("phase") == "migrated":
-            return dict(recorded)
-        api_uid = int(pwd.getpwnam("devcoordinator-api").pw_uid)
-        profile = activation.cutover.reconstruct_api_profile_from_authority(
-            authority_database=AUTHORITY_DATABASE,
-            destination=CLIENT_PROFILE,
-            validation_uid=api_uid,
-            authority_uid=0,
-        )
-        result = {
-            "phase": "current",
-            "before_schema": target_schema,
-            "after_schema": target_schema,
-            "profile": profile,
-        }
-        document["authority_migration"] = result
-        atomic_json(journal_path, document)
-        return result
-    if current_schema not in {12, 13, 14}:
+    current = _authority_schema_version()
+    if current != COORDINATOR_SCHEMA_VERSION:
         raise SwitchError(
-            f"authority schema {current_schema} cannot migrate to {target_schema}"
+            "authority schema is incompatible with this release; run the "
+            "retained-control rebaseline instead of a same-schema switch"
         )
-    if recorded is not None:
-        raise SwitchError("authority migration journal contradicts the live schema")
-
-    # Stop every process that can read or write authority state before taking
-    # the exact rollback backup and opening the current release's store.
-    for unit in (
-        "devcoordinator-api.service",
-        "devcoordinator-test-snapshotd.service",
-        "devcoordinator-authority.service",
-    ):
-        runner.require(["/usr/bin/systemctl", "stop", unit], f"quiesce {unit}")
-
-    migration_root = transaction_root / "authority-migration"
-    migration_root.mkdir(parents=True, exist_ok=True)
-    database_backup = _sqlite_backup(
-        AUTHORITY_DATABASE, migration_root / "authority-before.sqlite3"
-    )
-    profile_info = CLIENT_PROFILE.lstat()
-    if stat.S_ISLNK(profile_info.st_mode) or not stat.S_ISREG(profile_info.st_mode):
-        raise SwitchError("authority routing profile is not a regular file")
-    profile_payload = CLIENT_PROFILE.read_bytes()
-    profile_backup = migration_root / "profile-before.json"
-    atomic_bytes(profile_backup, profile_payload, 0o600)
-    migration: dict[str, object] = {
-        "phase": "backed-up",
-        "before_schema": current_schema,
-        "after_schema": None,
-        "database_backup": database_backup,
-        "profile_backup": {
-            "path": str(profile_backup),
-            "sha256": hashlib.sha256(profile_payload).hexdigest(),
-            "mode": stat.S_IMODE(profile_info.st_mode),
-        },
-    }
-    document["authority_migration"] = migration
-    atomic_json(journal_path, document)
-
-    store = AccountStore.open(AUTHORITY_DATABASE, expected_uid=0)
-    try:
-        migrated_schema = int(store.metadata.schema_version)
-    finally:
-        store.close()
-    if migrated_schema != target_schema or _authority_schema_version() != target_schema:
-        raise SwitchError("trusted-local authority migration did not reach target schema")
-    api_uid = int(pwd.getpwnam("devcoordinator-api").pw_uid)
-    profile = activation.cutover.reconstruct_api_profile_from_authority(
-        authority_database=AUTHORITY_DATABASE,
-        destination=CLIENT_PROFILE,
-        validation_uid=api_uid,
-        authority_uid=0,
-    )
-    migration.update(
-        {
-            "phase": "migrated",
-            "after_schema": target_schema,
-            "profile": profile,
-        }
-    )
-    atomic_json(journal_path, document)
-    return migration
-
-
-def restore_authority_migration(
-    document: Mapping[str, object], runner: Runner
-) -> None:
-    migration = document.get("authority_migration")
-    if not isinstance(migration, Mapping) or migration.get("phase") not in {
-        "backed-up",
-        "migrated",
-    }:
-        return
-    database = migration.get("database_backup")
-    profile = migration.get("profile_backup")
-    if not isinstance(database, Mapping) or not isinstance(profile, Mapping):
-        raise SwitchError("authority migration rollback evidence is invalid")
-    database_backup = Path(str(database.get("path")))
-    profile_backup = Path(str(profile.get("path")))
-    if (
-        not database_backup.is_file()
-        or database_backup.is_symlink()
-        or digest_file(database_backup) != database.get("sha256")
-        or not profile_backup.is_file()
-        or profile_backup.is_symlink()
-        or digest_file(profile_backup) != profile.get("sha256")
-    ):
-        raise SwitchError("authority migration rollback backup changed")
-    for unit in (
-        "devcoordinator-api.service",
-        "devcoordinator-test-snapshotd.service",
-        "devcoordinator-authority.service",
-    ):
-        runner.require(["/usr/bin/systemctl", "stop", unit], f"quiesce {unit} for rollback")
-    source = sqlite3.connect(f"{database_backup.as_uri()}?mode=ro", uri=True)
-    target = sqlite3.connect(AUTHORITY_DATABASE)
-    try:
-        source.backup(target)
-    except sqlite3.Error as error:
-        raise SwitchError(f"authority rollback restore failed: {error}") from error
-    finally:
-        target.close()
-        source.close()
-    atomic_bytes(CLIENT_PROFILE, profile_backup.read_bytes(), int(profile["mode"]))
-    if _authority_schema_version() != int(migration["before_schema"]):
-        raise SwitchError("authority rollback schema did not restore exactly")
+    return current
 
 
 def restart_services(runner: Runner) -> None:
@@ -2201,12 +2075,7 @@ def apply(
             journal_path,
             runner,
         )
-        migrate_trusted_local_authority(
-            document,
-            journal_path,
-            transaction_root,
-            runner,
-        )
+        require_current_authority_schema()
         restart_services(runner)
     finally:
         for listener in reservations:
@@ -2656,7 +2525,6 @@ def rollback(
     if not isinstance(directory_states, Mapping):
         raise SwitchError("Codex configuration directory rollback plan is unavailable")
     restore_codex_directories(directory_states)
-    restore_authority_migration(document, runner)
     retire_legacy_control_plane(runner)
     runner.require(["/usr/bin/systemctl", "daemon-reload"], "rollback daemon reload")
     if reset is not None and reset.get("status") in {

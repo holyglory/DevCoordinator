@@ -385,7 +385,7 @@ class RepositorySetupSurfaceTests(unittest.TestCase):
         self.assertEqual(invalid["issues"][0]["code"], "manifest_invalid")
         self.assertNotIn("must-not-leak", json.dumps(invalid, sort_keys=True))
 
-    def test_adapter_revalidates_identity_shape_and_secret_free_fields(self) -> None:
+    def test_adapter_revalidates_on_demand_identity_shape_and_secret_free_fields(self) -> None:
         path = Path(self.temporary.name) / "test-plane.sqlite3"
         previewer = FakePreviewer(self.full_setup())
         adapter = StoreTestPlaneAdapter(
@@ -396,10 +396,9 @@ class RepositorySetupSurfaceTests(unittest.TestCase):
         self.assertEqual(previewer.calls, [
             {"repository_id": "repo-setup", "owner_uid": self.owner_uid}
         ])
-        catalog = adapter.repository_catalog(repository_ids=("repo-setup",))
-        self.assertEqual(catalog["repositories"][0]["setup_status"], "ready")
-        self.assertTrue(catalog["repositories"][0]["retained"])
-        self.assertEqual(len(previewer.calls), 1, "catalog reads must not rescan the worktree")
+        repeated = adapter.setup(repository_id="repo-setup", owner_uid=self.owner_uid)
+        self.assertEqual(repeated["status"], "ready")
+        self.assertEqual(len(previewer.calls), 2)
 
         poisoned = self.full_setup()
         poisoned["repository_root"] = "/private/must-not-leak"

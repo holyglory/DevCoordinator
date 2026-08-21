@@ -14,15 +14,11 @@ const RUNTIME_ARTIFACT_KINDS = new Set([
 ]);
 const RUNTIME_ARTIFACT_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const RUNTIME_ARTIFACT_MAX_BYTES = 1024 * 1024;
-const TEST_STATS_CACHE_MAX_BYTES = 8 * 1024 * 1024;
-const TEST_STATS_CACHE_MAX_ENTRIES = 32;
-const TEST_STATS_MAX_STALE_MS = 24 * 60 * 60 * 1000;
 // The envelope remains version 1 so the state-copy validator can safely carry
 // it across Console slots.  This separate revision is intentionally bumped
 // whenever the meaning of a cached test projection changes; entries written by
 // an older renderer are ignored instead of surviving a deploy with stale UI
 // semantics.
-const TEST_STATS_CACHE_SEMANTICS_REVISION = 2;
 const FULL_DOCKER_OBSERVER_DOMAIN = 'host-runtime-v2:full-docker';
 const OPERATIONAL_SERVER_STATES = new Set([
   'running', 'starting', 'unhealthy', 'stopping', 'stopped',
@@ -379,82 +375,9 @@ export function createCoordinator({ config, log }) {
   const invCache = { value: undefined, at: 0, inflight: null, generation: 0, dirty: false };
   const srvCache = { value: undefined, at: 0, inflight: null, generation: 0, dirty: false };
   const testRepositoryCache = { value: undefined, at: 0, inflight: null, generation: 0 };
-  const testStatsCaches = new Map();
   const trustedDockerObservations = new Map();
   const observationFlights = new Map();
   let inventoryOverviewFailure = null;
-
-  const testStatsSnapshotPath = path.join(config.stateDir, 'test-stats-cache-v1.json');
-
-  function loadTestStatsSnapshots() {
-    try {
-      const info = fs.lstatSync(testStatsSnapshotPath);
-      if (!info.isFile() || info.isSymbolicLink() || info.size > TEST_STATS_CACHE_MAX_BYTES) return;
-      const document = JSON.parse(fs.readFileSync(testStatsSnapshotPath, 'utf8'));
-      if (
-        document?.version !== 1
-        || document.semantics_revision !== TEST_STATS_CACHE_SEMANTICS_REVISION
-        || !Array.isArray(document.entries)
-      ) return;
-      const now = Date.now();
-      for (const entry of document.entries.slice(0, TEST_STATS_CACHE_MAX_ENTRIES)) {
-        if (
-          typeof entry?.key !== 'string'
-          || entry.key.length < 1
-          || entry.key.length > 8192
-          || !Number.isFinite(entry.at)
-          || entry.at > now
-          || now - entry.at > TEST_STATS_MAX_STALE_MS
-          || ![1, 2].includes(entry.value?.schema_version)
-        ) continue;
-        testStatsCaches.set(entry.key, {
-          value: entry.value,
-          at: entry.at,
-          inflight: null,
-          generation: 0,
-          retained: true,
-        });
-      }
-    } catch (err) {
-      if (err?.code !== 'ENOENT') {
-        clog?.warn?.('ignored invalid persisted test statistics cache', {
-          error: String(err?.message ?? err),
-        });
-      }
-    }
-  }
-
-  function persistTestStatsSnapshots() {
-    const now = Date.now();
-    const entries = [...testStatsCaches.entries()]
-      .filter(([, cache]) => (
-        [1, 2].includes(cache.value?.schema_version)
-        && Number.isFinite(cache.at)
-        && now - cache.at <= TEST_STATS_MAX_STALE_MS
-      ))
-      .sort((a, b) => b[1].at - a[1].at)
-      .slice(0, TEST_STATS_CACHE_MAX_ENTRIES)
-      .map(([key, cache]) => ({ key, at: cache.at, value: cache.value }));
-    const encoded = `${JSON.stringify({
-      version: 1,
-      semantics_revision: TEST_STATS_CACHE_SEMANTICS_REVISION,
-      entries,
-    })}\n`;
-    if (Buffer.byteLength(encoded) > TEST_STATS_CACHE_MAX_BYTES) return;
-    const temporary = `${testStatsSnapshotPath}.${process.pid}.${Date.now()}.tmp`;
-    try {
-      fs.mkdirSync(path.dirname(testStatsSnapshotPath), { recursive: true, mode: 0o700 });
-      fs.writeFileSync(temporary, encoded, { encoding: 'utf8', mode: 0o600, flag: 'wx' });
-      fs.renameSync(temporary, testStatsSnapshotPath);
-    } catch (err) {
-      try { fs.unlinkSync(temporary); } catch { /* best-effort temporary cleanup */ }
-      clog?.warn?.('could not persist test statistics cache', {
-        error: String(err?.message ?? err),
-      });
-    }
-  }
-
-  loadTestStatsSnapshots();
 
   function noteAlive() {
     ok = true;
@@ -1035,25 +958,11 @@ export function createCoordinator({ config, log }) {
     });
   }
 
-  function testRuns({ repoId, after = null, limit = 50, state = null } = {}) {
+  function testRuns({ repoId } = {}) {
     if (typeof repoId !== 'string' || !repoId || repoId.length > 256) {
-      throw new CoordError('test run history requires one immutable repository id', { status: 400 });
+      throw new CoordError('current test runs require one immutable repository id', { status: 400 });
     }
-    if (!Number.isInteger(limit) || limit < 1 || limit > 200) {
-      throw new CoordError('test run history limit must be 1 through 200', { status: 400 });
-    }
-    if (after !== null && (typeof after !== 'string' || !after || after.length > 256)) {
-      throw new CoordError('test run history cursor is invalid', { status: 400 });
-    }
-    if (state !== null && ![
-      'queued', 'running', 'cancelling', 'superseding', 'succeeded', 'failed',
-      'timed_out', 'cancelled', 'incomplete', 'abandoned', 'superseded',
-    ].includes(state)) {
-      throw new CoordError('test run history state is invalid', { status: 400 });
-    }
-    const query = new URLSearchParams({ repo_id: repoId, limit: String(limit) });
-    if (after !== null) query.set('after', String(after));
-    if (state !== null) query.set('state', String(state));
+    const query = new URLSearchParams({ repo_id: repoId, limit: '50' });
     return request('GET', `/v1/test-runs?${query.toString()}`);
   }
 
@@ -1082,17 +991,13 @@ export function createCoordinator({ config, log }) {
   }
 
   function testRunEvidence(kind, { repoId, runId, after = null, limit = 50 } = {}) {
-    if (!['failures', 'artifacts', 'cases'].includes(kind)) {
+    if (!['failures', 'artifacts'].includes(kind)) {
       throw new CoordError('test evidence kind is invalid', { status: 400 });
     }
     if (!Number.isInteger(limit) || limit < 1 || limit > 50) {
       throw new CoordError('test evidence limit must be 1 through 50', { status: 400 });
     }
-    if (kind === 'cases') {
-      if (after !== null && (!Number.isInteger(after) || after < 0)) {
-        throw new CoordError('test case cursor is invalid', { status: 400 });
-      }
-    } else if (after !== null && (typeof after !== 'string' || !after || after.length > 256)) {
+    if (after !== null && (typeof after !== 'string' || !after || after.length > 256)) {
       throw new CoordError('test evidence cursor is invalid', { status: 400 });
     }
     const query = new URLSearchParams({ limit: String(limit) });
@@ -1108,17 +1013,6 @@ export function createCoordinator({ config, log }) {
     validateTestMutation(operationId, actor);
     return request('POST', `/v1/test-runs/${encodeURIComponent(runId)}/cancel`, {
       repo_id: repoId, reason, operation_id: operationId, actor,
-    });
-  }
-
-  function retryTestRun({ repoId, runId, failedOnly = true, operationId, actor } = {}) {
-    validateTestRunIdentity(repoId, runId);
-    if (typeof failedOnly !== 'boolean') {
-      throw new CoordError('test retry failed-only flag is invalid', { status: 400 });
-    }
-    validateTestMutation(operationId, actor);
-    return request('POST', `/v1/test-runs/${encodeURIComponent(runId)}/retry`, {
-      repo_id: repoId, failed_only: failedOnly, operation_id: operationId, actor,
     });
   }
 
@@ -1186,132 +1080,6 @@ export function createCoordinator({ config, log }) {
         throw retryError;
       }
     }
-  }
-
-  function testEvents({ repoId, after = 0, limit = 200 } = {}) {
-    if (typeof repoId !== 'string' || !repoId || repoId.length > 256) {
-      throw new CoordError('test events require one immutable repository id', { status: 400 });
-    }
-    if (!Number.isInteger(after) || after < 0 || !Number.isInteger(limit) || limit < 1 || limit > 500) {
-      throw new CoordError('test event cursor or limit is invalid', { status: 400 });
-    }
-    const query = new URLSearchParams({ repo_id: repoId, after: String(after), limit: String(limit) });
-    return request('GET', `/v1/test-events?${query.toString()}`);
-  }
-
-  function withTestSnapshotDelivery(value, cache, state, refreshing) {
-    if (!value?.snapshot || typeof value.snapshot !== 'object') return value;
-    return {
-      ...value,
-      snapshot: {
-        ...value.snapshot,
-        delivery: {
-          state,
-          age_seconds: Math.max(0, Math.round((Date.now() - cache.at) / 1000)),
-          refreshing,
-        },
-      },
-    };
-  }
-
-  function cachedTestSnapshot({
-    cache,
-    apiPath,
-    maxAgeMs,
-    maxStaleMs,
-    onRefreshError,
-  }) {
-    const ageMs = cache.value === undefined ? Number.POSITIVE_INFINITY : Date.now() - cache.at;
-    if (cache.value !== undefined && ageMs <= maxStaleMs) {
-      if (cache.retained === true || ageMs >= maxAgeMs) {
-        // A usable completed projection must stay on the response path while
-        // its replacement is fetched. startCachedGet coalesces concurrent
-        // refreshes; the live promise is the exact refreshing signal.
-        startCachedGet(cache, apiPath, persistTestStatsSnapshots).catch(onRefreshError);
-      }
-      return Promise.resolve(withTestSnapshotDelivery(
-        cache.value,
-        cache,
-        'retained',
-        cache.inflight !== null,
-      ));
-    }
-
-    // Only callers that had no usable completed projection and therefore
-    // awaited the Coordinator read receive a fresh delivery.
-    return startCachedGet(cache, apiPath, persistTestStatsSnapshots)
-      .then((value) => withTestSnapshotDelivery(value, cache, 'fresh', false));
-  }
-
-  function testStats({
-    project,
-    days = 30,
-    limit = 25,
-    maxAgeMs = 30_000,
-    maxStaleMs = TEST_STATS_MAX_STALE_MS,
-  } = {}) {
-    if (typeof project !== 'string' || !project || project.length > 4096) {
-      throw new CoordError('test statistics require one bounded project identity', { status: 400 });
-    }
-    if (!Number.isInteger(days) || days < 1 || days > 3650) {
-      throw new CoordError('test statistics days must be an integer from 1 through 3650', { status: 400 });
-    }
-    if (!Number.isInteger(limit) || limit < 1 || limit > 500) {
-      throw new CoordError('test statistics limit must be an integer from 1 through 500', { status: 400 });
-    }
-    const query = new URLSearchParams({ project, days: String(days), limit: String(limit) });
-    const key = query.toString();
-    let cache = testStatsCaches.get(key);
-    if (!cache) {
-      cache = { value: undefined, at: 0, inflight: null, generation: 0, retained: false };
-      testStatsCaches.set(key, cache);
-      if (testStatsCaches.size > 128) testStatsCaches.delete(testStatsCaches.keys().next().value);
-    }
-    const apiPath = `/v1/tests?${key}`;
-    return cachedTestSnapshot({
-      cache,
-      apiPath,
-      maxAgeMs,
-      maxStaleMs,
-      onRefreshError: (err) => {
-        clog?.warn?.('test statistics refresh failed; serving retained data', {
-          project,
-          error: String(err?.message ?? err),
-        });
-      },
-    });
-  }
-
-  function testFleet({
-    hours = 24,
-    maxAgeMs = 15_000,
-    maxStaleMs = TEST_STATS_MAX_STALE_MS,
-  } = {}) {
-    if (!Number.isInteger(hours) || hours < 1 || hours > 168) {
-      throw new CoordError('fleet test statistics hours must be an integer from 1 through 168', {
-        status: 400,
-      });
-    }
-    const query = new URLSearchParams({ hours: String(hours) });
-    const key = `fleet:${query.toString()}`;
-    let cache = testStatsCaches.get(key);
-    if (!cache) {
-      cache = { value: undefined, at: 0, inflight: null, generation: 0, retained: false };
-      testStatsCaches.set(key, cache);
-      if (testStatsCaches.size > 128) testStatsCaches.delete(testStatsCaches.keys().next().value);
-    }
-    const apiPath = `/v1/test-fleet?${query.toString()}`;
-    return cachedTestSnapshot({
-      cache,
-      apiPath,
-      maxAgeMs,
-      maxStaleMs,
-      onRefreshError: (err) => {
-        clog?.warn?.('fleet test statistics refresh failed; serving retained data', {
-          error: String(err?.message ?? err),
-        });
-      },
-    });
   }
 
   async function dockerAction(name, action, body = {}) {
@@ -1426,13 +1194,8 @@ export function createCoordinator({ config, log }) {
     testRunSummary,
     testRunFailures: (options = {}) => testRunEvidence('failures', options),
     testRunArtifacts: (options = {}) => testRunEvidence('artifacts', options),
-    testRunCases: (options = {}) => testRunEvidence('cases', options),
     cancelTestRun,
-    retryTestRun,
     testRepositorySetup,
-    testEvents,
-    testStats,
-    testFleet,
     observeHost,
     request,
     leasePort: (b = {}) => request('POST', '/v1/ports/lease', b),

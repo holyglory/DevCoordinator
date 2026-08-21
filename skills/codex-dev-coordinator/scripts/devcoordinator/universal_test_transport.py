@@ -34,7 +34,6 @@ from .universal_test_service import (
     TestPlanPreviewUnavailable,
 )
 from .universal_test_store import (
-    LiveRetryReplanRequired,
     TargetResources,
     TestStoreConflict,
     TestStoreContractError,
@@ -53,57 +52,33 @@ LOGGER = logging.getLogger(__name__)
 
 TEST_HEALTH = "test.health"
 TEST_REPOSITORY_SETUP = "test.repository_setup"
-TEST_REPOSITORY_CATALOG = "test.repository_catalog"
-TEST_DASHBOARD_STATS = "test.dashboard_stats"
-TEST_DASHBOARD_FLEET = "test.dashboard_fleet"
 TEST_PLAN_PREVIEW = "test.plan_preview"
 TEST_PLAN_REGISTER = "test.plan_register"
 TEST_PLAN_REPOSITORY = "test.plan_repository"
 TEST_RUN_SUBMIT = "test.run_submit"
 TEST_RUN_LIST = "test.run_list"
-TEST_QUEUE_STATUS = "test.queue_status"
 TEST_RUN_STATUS = "test.run_status"
 TEST_RUN_SUMMARY = "test.run_summary"
 TEST_RUN_FAILURES = "test.run_failures"
 TEST_RUN_ARTIFACTS = "test.run_artifacts"
 TEST_ARTIFACT_RESOLVE = "test.artifact_resolve"
-TEST_RUN_CASES = "test.run_cases"
 TEST_RUN_CANCEL = "test.run_cancel"
-TEST_RUN_RETRY = "test.run_retry"
-TEST_EVENTS_READ = "test.events_read"
-TEST_EVIDENCE_CHECK = "test.evidence_check"
-TEST_EVIDENCE_CONSUME = "test.evidence_consume"
-TEST_STATS_READ = "test.stats_read"
-TEST_FLEET_OVERVIEW = "test.fleet_overview"
-TEST_REPOSITORY_DETAIL = "test.repository_detail"
 
 TEST_PLANE_OPERATIONS = frozenset(
     {
         TEST_HEALTH,
         TEST_REPOSITORY_SETUP,
-        TEST_REPOSITORY_CATALOG,
-        TEST_DASHBOARD_STATS,
-        TEST_DASHBOARD_FLEET,
         TEST_PLAN_PREVIEW,
         TEST_PLAN_REGISTER,
         TEST_PLAN_REPOSITORY,
         TEST_RUN_SUBMIT,
         TEST_RUN_LIST,
-        TEST_QUEUE_STATUS,
         TEST_RUN_STATUS,
         TEST_RUN_SUMMARY,
         TEST_RUN_FAILURES,
         TEST_RUN_ARTIFACTS,
         TEST_ARTIFACT_RESOLVE,
-        TEST_RUN_CASES,
         TEST_RUN_CANCEL,
-        TEST_RUN_RETRY,
-        TEST_EVENTS_READ,
-        TEST_EVIDENCE_CHECK,
-        TEST_EVIDENCE_CONSUME,
-        TEST_STATS_READ,
-        TEST_FLEET_OVERVIEW,
-        TEST_REPOSITORY_DETAIL,
     }
 )
 
@@ -111,18 +86,6 @@ _OPERATION_ARGUMENTS = {
     TEST_HEALTH: (frozenset(), frozenset()),
     TEST_REPOSITORY_SETUP: (
         frozenset({"repository_id", "owner_uid"}),
-        frozenset(),
-    ),
-    TEST_REPOSITORY_CATALOG: (
-        frozenset({"repository_ids"}),
-        frozenset(),
-    ),
-    TEST_DASHBOARD_STATS: (
-        frozenset({"repository_id", "days"}),
-        frozenset({"limit"}),
-    ),
-    TEST_DASHBOARD_FLEET: (
-        frozenset({"repository_ids", "hours"}),
         frozenset(),
     ),
     TEST_PLAN_PREVIEW: (
@@ -156,7 +119,6 @@ _OPERATION_ARGUMENTS = {
         frozenset({"repository_id"}),
         frozenset({"after", "limit", "state"}),
     ),
-    TEST_QUEUE_STATUS: (frozenset({"repository_id"}), frozenset()),
     TEST_RUN_STATUS: (frozenset({"run_id", "repository_id"}), frozenset()),
     TEST_RUN_SUMMARY: (frozenset({"run_id", "repository_id"}), frozenset()),
     TEST_RUN_FAILURES: (
@@ -171,47 +133,11 @@ _OPERATION_ARGUMENTS = {
         frozenset({"run_id", "repository_id", "artifact_id"}),
         frozenset(),
     ),
-    TEST_RUN_CASES: (
-        frozenset({"run_id", "repository_id"}),
-        frozenset({"after", "limit"}),
-    ),
     TEST_RUN_CANCEL: (
         frozenset(
             {"run_id", "repository_id", "actor", "reason", "operation_id"}
         ),
         frozenset(),
-    ),
-    TEST_RUN_RETRY: (
-        frozenset(
-            {"run_id", "repository_id", "actor", "failed_only", "operation_id"}
-        ),
-        frozenset(),
-    ),
-    TEST_EVENTS_READ: (
-        frozenset({"repository_id"}),
-        frozenset({"after_event_id", "limit"}),
-    ),
-    TEST_EVIDENCE_CHECK: (
-        frozenset({"repository_id", "snapshot_id", "policy_name"}),
-        frozenset(),
-    ),
-    TEST_EVIDENCE_CONSUME: (
-        frozenset(
-            {"repository_id", "snapshot_id", "policy_name", "operation_id"}
-        ),
-        frozenset(),
-    ),
-    TEST_STATS_READ: (
-        frozenset({"repository_id", "grain", "since"}),
-        frozenset({"limit"}),
-    ),
-    TEST_FLEET_OVERVIEW: (
-        frozenset({"grain", "since"}),
-        frozenset({"repository_limit", "bucket_limit"}),
-    ),
-    TEST_REPOSITORY_DETAIL: (
-        frozenset({"repository_id", "grain", "since"}),
-        frozenset({"limit"}),
     ),
 }
 
@@ -560,8 +486,6 @@ class TestPlaneDispatcher:
                 code, message = str(getattr(error, "code")), str(error)
             elif isinstance(error, TestStoreNotFound):
                 code, message = "not_found", str(error)
-            elif isinstance(error, LiveRetryReplanRequired):
-                code, message = error.code, str(error)
             elif isinstance(error, TestStoreConflict):
                 code, message = "conflict", str(error)
             elif isinstance(error, TestStoreContractError):
@@ -631,12 +555,6 @@ class TestPlaneDispatcher:
             return self.service.health()
         if operation == TEST_REPOSITORY_SETUP:
             return self.service.setup(**arguments)
-        if operation == TEST_REPOSITORY_CATALOG:
-            return self.service.repository_catalog(**arguments)
-        if operation == TEST_DASHBOARD_STATS:
-            return self.service.dashboard_stats(**arguments)
-        if operation == TEST_DASHBOARD_FLEET:
-            return self.service.dashboard_fleet(**arguments)
         if operation == TEST_PLAN_PREVIEW:
             return self.service.preview(**arguments)
         if operation == TEST_PLAN_REGISTER:
@@ -655,8 +573,6 @@ class TestPlaneDispatcher:
             return self.service.submit(**values)
         if operation == TEST_RUN_LIST:
             return self.service.runs(**arguments)
-        if operation == TEST_QUEUE_STATUS:
-            return self.service.queue_status(**arguments)
         if operation == TEST_RUN_STATUS:
             return self.service.status(**arguments)
         if operation == TEST_RUN_SUMMARY:
@@ -667,24 +583,8 @@ class TestPlaneDispatcher:
             return self.service.artifacts(**arguments)
         if operation == TEST_ARTIFACT_RESOLVE:
             return self.service.artifact(**arguments)
-        if operation == TEST_RUN_CASES:
-            return self.service.cases(**arguments)
         if operation == TEST_RUN_CANCEL:
             return self.service.cancel(**arguments)
-        if operation == TEST_RUN_RETRY:
-            return self.service.retry(**arguments)
-        if operation == TEST_EVENTS_READ:
-            return self.service.events(**arguments)
-        if operation == TEST_EVIDENCE_CHECK:
-            return self.service.policy_check(**arguments)
-        if operation == TEST_EVIDENCE_CONSUME:
-            return self.service.policy_consume(**arguments)
-        if operation == TEST_STATS_READ:
-            return self.service.stats(**arguments)
-        if operation == TEST_FLEET_OVERVIEW:
-            return self.service.fleet_overview(**arguments)
-        if operation == TEST_REPOSITORY_DETAIL:
-            return self.service.repository_detail(**arguments)
         raise AssertionError("fixed operation allowlist and dispatcher diverged")
 
 
@@ -1336,21 +1236,6 @@ class UnixTestPlaneClient:
     def health(self):
         return self._call(TEST_HEALTH, {})
 
-    def repository_catalog(
-        self, *, timeout_seconds: float | None = None, **arguments
-    ):
-        return self._call(
-            TEST_REPOSITORY_CATALOG,
-            arguments,
-            timeout_seconds=timeout_seconds,
-        )
-
-    def dashboard_stats(self, **arguments):
-        return self._call(TEST_DASHBOARD_STATS, arguments)
-
-    def dashboard_fleet(self, **arguments):
-        return self._call(TEST_DASHBOARD_FLEET, arguments)
-
     def preview(self, **arguments):
         launch_timeout = arguments.get("launch_timeout_seconds")
         if launch_timeout is not None and (
@@ -1418,12 +1303,6 @@ class UnixTestPlaneClient:
     def runs(self, **arguments):
         return self._call(TEST_RUN_LIST, arguments)
 
-    def queue_status(self, *, repository_id: str):
-        return self._call(
-            TEST_QUEUE_STATUS,
-            {"repository_id": repository_id},
-        )
-
     def status(self, *, run_id: str, repository_id: str):
         return self._call(
             TEST_RUN_STATUS,
@@ -1480,24 +1359,6 @@ class UnixTestPlaneClient:
             },
         )
 
-    def cases(
-        self,
-        *,
-        run_id: str,
-        repository_id: str,
-        after: int = 0,
-        limit: int = 25,
-    ):
-        return self._call(
-            TEST_RUN_CASES,
-            {
-                "run_id": run_id,
-                "repository_id": repository_id,
-                "after": after,
-                "limit": limit,
-            },
-        )
-
     def cancel(
         self,
         *,
@@ -1518,54 +1379,12 @@ class UnixTestPlaneClient:
             },
         )
 
-    def retry(
-        self,
-        *,
-        run_id: str,
-        repository_id: str,
-        actor: str,
-        failed_only: bool,
-        operation_id: str,
-    ):
-        return self._call(
-            TEST_RUN_RETRY,
-            {
-                "run_id": run_id,
-                "repository_id": repository_id,
-                "actor": actor,
-                "failed_only": failed_only,
-                "operation_id": operation_id,
-            },
-        )
-
-    def events(self, **arguments):
-        return self._call(TEST_EVENTS_READ, arguments)
-
-    def stats(self, **arguments):
-        return self._call(TEST_STATS_READ, arguments)
-
-    def policy_check(self, **arguments):
-        return self._call(TEST_EVIDENCE_CHECK, arguments)
-
-    def policy_consume(self, **arguments):
-        return self._call(TEST_EVIDENCE_CONSUME, arguments)
-
-    def fleet_overview(self, **arguments):
-        return self._call(TEST_FLEET_OVERVIEW, arguments)
-
-    def repository_detail(self, **arguments):
-        return self._call(TEST_REPOSITORY_DETAIL, arguments)
-
 
 __all__ = [
     "TEST_PLANE_OPERATIONS",
     "TEST_HEALTH",
     "TEST_ARTIFACT_RESOLVE",
-    "TEST_EVIDENCE_CONSUME",
     "TEST_REPOSITORY_SETUP",
-    "TEST_REPOSITORY_CATALOG",
-    "TEST_DASHBOARD_STATS",
-    "TEST_DASHBOARD_FLEET",
     "TestPlaneDispatcher",
     "TestPlaneTransportError",
     "UnixTestPlaneClient",

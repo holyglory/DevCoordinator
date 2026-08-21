@@ -123,29 +123,19 @@ class BrokerOperation(str, Enum):
     INVENTORY_READ = "inventory.read"
     EVENTS_READ = "events.read"
     HOST_OBSERVE = "host.observe"
-    TEST_RUN_START = "test.run_start"
-    TEST_RUN_FINISH = "test.run_finish"
-    TEST_STATS_READ = "test.stats_read"
     TEST_HEALTH = "test.health"
-    TEST_FLEET_STATS_READ = "test.fleet_stats_read"
     TEST_PLAN_PREVIEW = "test.plan_preview"
     TEST_PLAN_REGISTER = "test.plan_register"
     TEST_RUN_SUBMIT = "test.run_submit"
     TEST_RUN_LIST = "test.run_list"
-    TEST_QUEUE_STATUS = "test.queue_status"
     TEST_RUN_STATUS = "test.run_status"
     TEST_RUN_SUMMARY = "test.run_summary"
     TEST_RUN_FAILURES = "test.run_failures"
     TEST_RUN_ARTIFACTS = "test.run_artifacts"
     TEST_ARTIFACT_RESOLVE = "test.artifact_resolve"
-    TEST_RUN_CASES = "test.run_cases"
     TEST_RUN_CANCEL = "test.run_cancel"
-    TEST_RUN_RETRY = "test.run_retry"
-    TEST_EVENTS_READ = "test.events_read"
     TEST_REPOSITORY_SETUP = "test.repository_setup"
     TEST_REPOSITORY_CATALOG = "test.repository_catalog"
-    TEST_EVIDENCE_CHECK = "test.evidence_check"
-    TEST_EVIDENCE_CONSUME = "test.evidence_consume"
     TEST_ATTEMPT_TICKET = "test.attempt_ticket"
     TEST_ATTEMPT_LAUNCH = "test.attempt_launch"
     TEST_ATTEMPT_STATUS = "test.attempt_status"
@@ -715,21 +705,15 @@ class SerializedMutationWriter:
             BrokerOperation.OPERATION_FOLLOW,
             BrokerOperation.INVENTORY_READ,
             BrokerOperation.EVENTS_READ,
-            BrokerOperation.TEST_STATS_READ,
             BrokerOperation.TEST_HEALTH,
-            BrokerOperation.TEST_FLEET_STATS_READ,
             BrokerOperation.TEST_RUN_LIST,
-            BrokerOperation.TEST_QUEUE_STATUS,
             BrokerOperation.TEST_RUN_STATUS,
             BrokerOperation.TEST_RUN_SUMMARY,
             BrokerOperation.TEST_RUN_FAILURES,
             BrokerOperation.TEST_RUN_ARTIFACTS,
             BrokerOperation.TEST_ARTIFACT_RESOLVE,
-            BrokerOperation.TEST_RUN_CASES,
-            BrokerOperation.TEST_EVENTS_READ,
             BrokerOperation.TEST_REPOSITORY_SETUP,
             BrokerOperation.TEST_REPOSITORY_CATALOG,
-            BrokerOperation.TEST_EVIDENCE_CHECK,
             BrokerOperation.TEST_ATTEMPT_STATUS,
             BrokerOperation.EPHEMERAL_STATUS,
             BrokerOperation.EPHEMERAL_IMAGE_STATUS,
@@ -2242,202 +2226,6 @@ def _validate_arguments(
             )
         return {}
 
-    if operation == BrokerOperation.TEST_RUN_START:
-        required = {
-            "agent",
-            "suite",
-            "run_kind",
-            "selection",
-            "command_fingerprint",
-            "started_at",
-        }
-        allowed = required | {"parent_run_id"}
-        if not required <= set(value) or set(value) - allowed:
-            raise BrokerError(
-                "invalid_arguments",
-                "Test run start requires agent, suite, run_kind, selection, command_fingerprint and started_at.",
-                operation_id=operation_id,
-            )
-        suite = value["suite"]
-        if (
-            not isinstance(suite, str)
-            or not 1 <= len(suite) <= 160
-            or any(ord(character) < 32 for character in suite)
-        ):
-            raise BrokerError(
-                "invalid_arguments",
-                "suite must be bounded printable text.",
-                operation_id=operation_id,
-            )
-        if value["run_kind"] not in {"session", "test", "automation"}:
-            raise BrokerError(
-                "invalid_arguments",
-                "run_kind must be session, test or automation.",
-                operation_id=operation_id,
-            )
-        selection = value["selection"]
-        if (
-            not isinstance(selection, list)
-            or len(selection) > 2_000
-            or any(
-                not isinstance(item, str) or not 1 <= len(item) <= 2_048
-                for item in selection
-            )
-        ):
-            raise BrokerError(
-                "invalid_arguments",
-                "selection must contain at most 2000 bounded test selectors.",
-                operation_id=operation_id,
-            )
-        command_fingerprint = value["command_fingerprint"]
-        if not isinstance(command_fingerprint, str) or not _SHA256_FINGERPRINT.fullmatch(
-            command_fingerprint
-        ):
-            raise BrokerError(
-                "invalid_arguments",
-                "command_fingerprint must be an exact sha256 digest.",
-                operation_id=operation_id,
-            )
-        started_at = value["started_at"]
-        if not isinstance(started_at, str) or not 1 <= len(started_at) <= 64:
-            raise BrokerError(
-                "invalid_arguments",
-                "started_at must be a bounded ISO-8601 timestamp.",
-                operation_id=operation_id,
-            )
-        parent_run_id = value.get("parent_run_id")
-        if parent_run_id is not None and _canonical_uuid_value(parent_run_id) is None:
-            raise BrokerError(
-                "invalid_arguments",
-                "parent_run_id must be a canonical UUID.",
-                operation_id=operation_id,
-            )
-        return {
-            "agent": _bounded_agent(value["agent"], operation_id),
-            "suite": suite,
-            "run_kind": value["run_kind"],
-            "selection": selection,
-            "command_fingerprint": command_fingerprint,
-            "started_at": started_at,
-            **({"parent_run_id": parent_run_id} if parent_run_id is not None else {}),
-        }
-
-    if operation == BrokerOperation.TEST_RUN_FINISH:
-        required = {
-            "run_id",
-            "status",
-            "finished_at",
-            "duration_seconds",
-            "exit_code",
-            "cases",
-        }
-        if set(value) != required:
-            raise BrokerError(
-                "invalid_arguments",
-                "Test run finish requires exactly run_id, status, finished_at, duration_seconds, exit_code and cases.",
-                operation_id=operation_id,
-            )
-        run_id = value["run_id"]
-        if _canonical_uuid_value(run_id) is None:
-            raise BrokerError(
-                "invalid_arguments", "run_id must be a canonical UUID.", operation_id=operation_id
-            )
-        status = value["status"]
-        if status not in {"passed", "failed", "cancelled", "incomplete"}:
-            raise BrokerError(
-                "invalid_arguments",
-                "status must be passed, failed, cancelled or incomplete.",
-                operation_id=operation_id,
-            )
-        finished_at = value["finished_at"]
-        duration = value["duration_seconds"]
-        exit_code = value["exit_code"]
-        if not isinstance(finished_at, str) or not 1 <= len(finished_at) <= 64:
-            raise BrokerError(
-                "invalid_arguments",
-                "finished_at must be a bounded ISO-8601 timestamp.",
-                operation_id=operation_id,
-            )
-        if (
-            isinstance(duration, bool)
-            or not isinstance(duration, (int, float))
-            or not 0 <= float(duration) <= 31 * 24 * 60 * 60
-        ):
-            raise BrokerError(
-                "invalid_arguments",
-                "duration_seconds must be a non-negative number no greater than 31 days.",
-                operation_id=operation_id,
-            )
-        if not _is_exact_int(exit_code) or not -255 <= exit_code <= 255:
-            raise BrokerError(
-                "invalid_arguments",
-                "exit_code must be an integer from -255 through 255.",
-                operation_id=operation_id,
-            )
-        cases = value["cases"]
-        if not isinstance(cases, list) or len(cases) > 100_000:
-            raise BrokerError(
-                "invalid_arguments",
-                "cases must contain at most 100000 individual results.",
-                operation_id=operation_id,
-            )
-        normalized_cases = []
-        case_fields = {
-            "test_id",
-            "display_name",
-            "status",
-            "started_at",
-            "finished_at",
-            "duration_seconds",
-        }
-        for case in cases:
-            if not isinstance(case, dict) or set(case) != case_fields:
-                raise BrokerError(
-                    "invalid_arguments",
-                    "Each test case must use the exact structured timing result fields.",
-                    operation_id=operation_id,
-                )
-            if case["status"] not in {"passed", "failed", "skipped", "error"}:
-                raise BrokerError(
-                    "invalid_arguments",
-                    "Individual test status is invalid.",
-                    operation_id=operation_id,
-                )
-            if any(
-                not isinstance(case[field], str) or not 1 <= len(case[field]) <= maximum
-                for field, maximum in (
-                    ("test_id", 2_048),
-                    ("display_name", 2_048),
-                    ("started_at", 64),
-                    ("finished_at", 64),
-                )
-            ):
-                raise BrokerError(
-                    "invalid_arguments",
-                    "Individual test identity and timestamps must be bounded strings.",
-                    operation_id=operation_id,
-                )
-            case_duration = case["duration_seconds"]
-            if (
-                isinstance(case_duration, bool)
-                or not isinstance(case_duration, (int, float))
-                or not 0 <= float(case_duration) <= 31 * 24 * 60 * 60
-            ):
-                raise BrokerError(
-                    "invalid_arguments",
-                    "Individual test duration is invalid.",
-                    operation_id=operation_id,
-                )
-            normalized_cases.append(dict(case))
-        return {
-            "run_id": run_id,
-            "status": status,
-            "finished_at": finished_at,
-            "duration_seconds": float(duration),
-            "exit_code": exit_code,
-            "cases": normalized_cases,
-        }
-
     if operation == BrokerOperation.TEST_HEALTH:
         if value:
             raise BrokerError(
@@ -2446,41 +2234,6 @@ def _validate_arguments(
                 operation_id=operation_id,
             )
         return {}
-
-    if operation == BrokerOperation.TEST_STATS_READ:
-        if set(value) - {"days", "limit"}:
-            raise BrokerError(
-                "invalid_arguments",
-                "Test statistics accept only days and limit.",
-                operation_id=operation_id,
-            )
-        days = value.get("days", 30)
-        limit = value.get("limit", 25)
-        if not _is_exact_int(days) or not 1 <= days <= 3_650:
-            raise BrokerError(
-                "invalid_arguments", "days must be from 1 through 3650.", operation_id=operation_id
-            )
-        if not _is_exact_int(limit) or not 1 <= limit <= 500:
-            raise BrokerError(
-                "invalid_arguments", "limit must be from 1 through 500.", operation_id=operation_id
-            )
-        return {"days": days, "limit": limit}
-
-    if operation == BrokerOperation.TEST_FLEET_STATS_READ:
-        if set(value) - {"hours"}:
-            raise BrokerError(
-                "invalid_arguments",
-                "Fleet test statistics accept only hours.",
-                operation_id=operation_id,
-            )
-        hours = value.get("hours", 24)
-        if not _is_exact_int(hours) or not 1 <= hours <= 168:
-            raise BrokerError(
-                "invalid_arguments",
-                "hours must be from 1 through 168.",
-                operation_id=operation_id,
-            )
-        return {"hours": hours}
 
     if operation == BrokerOperation.TEST_PLAN_PREVIEW:
         expected = {
@@ -2661,22 +2414,6 @@ def _validate_arguments(
             normalized["state"] = state
         return normalized
 
-    if operation == BrokerOperation.TEST_QUEUE_STATUS:
-        if set(value) - {"expected_repository_id"}:
-            raise BrokerError(
-                "invalid_arguments",
-                "Test queue status accepts no selectors.",
-                operation_id=operation_id,
-            )
-        normalized = {}
-        if "expected_repository_id" in value:
-            normalized["expected_repository_id"] = _opaque_argument(
-                value["expected_repository_id"],
-                "expected_repository_id",
-                operation_id,
-            )
-        return normalized
-
     if operation in {BrokerOperation.TEST_RUN_STATUS, BrokerOperation.TEST_RUN_SUMMARY}:
         if "run_id" not in value or set(value) - {"run_id", "expected_repository_id"}:
             raise BrokerError(
@@ -2724,65 +2461,6 @@ def _validate_arguments(
             )
         return normalized
 
-    if operation == BrokerOperation.TEST_RUN_CASES:
-        allowed = {"run_id", "after", "limit", "expected_repository_id"}
-        if "run_id" not in value or set(value) - allowed:
-            raise BrokerError(
-                "invalid_arguments",
-                "Test case reads require run_id and accept only after and limit.",
-                operation_id=operation_id,
-            )
-        limit = value.get("limit", 25)
-        after = value.get("after", 0)
-        if not _is_exact_int(limit) or not 1 <= limit <= 50:
-            raise BrokerError(
-                "invalid_arguments",
-                "Test case limit must be from 1 through 50.",
-                operation_id=operation_id,
-            )
-        if not _is_exact_int(after) or after < 0:
-            raise BrokerError(
-                "invalid_arguments",
-                "Test case cursor must be non-negative.",
-                operation_id=operation_id,
-            )
-        normalized = {
-            "run_id": _opaque_argument(value["run_id"], "run_id", operation_id),
-            "after": after,
-            "limit": limit,
-        }
-        if "expected_repository_id" in value:
-            normalized["expected_repository_id"] = _opaque_argument(
-                value["expected_repository_id"],
-                "expected_repository_id",
-                operation_id,
-            )
-        return normalized
-
-    if operation == BrokerOperation.TEST_EVENTS_READ:
-        allowed = {"after_event_id", "limit"}
-        if set(value) - allowed:
-            raise BrokerError(
-                "invalid_arguments",
-                "Test event reads accept only after_event_id and limit.",
-                operation_id=operation_id,
-            )
-        after_event_id = value.get("after_event_id", 0)
-        limit = value.get("limit", 200)
-        if not _is_exact_int(after_event_id) or after_event_id < 0:
-            raise BrokerError(
-                "invalid_arguments",
-                "Test event cursor must be non-negative.",
-                operation_id=operation_id,
-            )
-        if not _is_exact_int(limit) or not 1 <= limit <= 500:
-            raise BrokerError(
-                "invalid_arguments",
-                "Test event limit must be from 1 through 500.",
-                operation_id=operation_id,
-            )
-        return {"after_event_id": after_event_id, "limit": limit}
-
     if operation == BrokerOperation.TEST_REPOSITORY_SETUP:
         if value:
             raise BrokerError(
@@ -2828,63 +2506,6 @@ def _validate_arguments(
                 operation_id,
             )
         return normalized
-
-    if operation == BrokerOperation.TEST_RUN_RETRY:
-        if (
-            not {"run_id", "failed_only", "actor"}.issubset(value)
-            or set(value) - {"run_id", "failed_only", "actor", "expected_repository_id"}
-            or type(value["failed_only"]) is not bool
-        ):
-            raise BrokerError(
-                "invalid_arguments",
-                "Test retry requires exactly run_id, boolean failed_only, and actor.",
-                operation_id=operation_id,
-            )
-        normalized = {
-            "run_id": _opaque_argument(value["run_id"], "run_id", operation_id),
-            "failed_only": value["failed_only"],
-            "actor": _bounded_single_line_argument(
-                value["actor"],
-                "actor",
-                operation_id,
-                maximum_bytes=256,
-            ),
-        }
-        if "expected_repository_id" in value:
-            normalized["expected_repository_id"] = _opaque_argument(
-                value["expected_repository_id"],
-                "expected_repository_id",
-                operation_id,
-            )
-        return normalized
-
-    if operation == BrokerOperation.TEST_EVIDENCE_CHECK:
-        if set(value) != {"snapshot_id", "policy_name"}:
-            raise BrokerError(
-                "invalid_arguments",
-                "Evidence checks require snapshot_id and policy_name.",
-                operation_id=operation_id,
-            )
-        return {
-            "snapshot_id": _opaque_argument(value["snapshot_id"], "snapshot_id", operation_id),
-            "policy_name": _opaque_argument(value["policy_name"], "policy_name", operation_id),
-        }
-
-    if operation == BrokerOperation.TEST_EVIDENCE_CONSUME:
-        if set(value) != {"snapshot_id", "policy_name"}:
-            raise BrokerError(
-                "invalid_arguments",
-                "Evidence consumption requires snapshot_id and policy_name.",
-                operation_id=operation_id,
-            )
-        return {
-            "snapshot_id": _opaque_argument(
-                value["snapshot_id"], "snapshot_id", operation_id
-            ),
-            "policy_name": _opaque_argument(
-                value["policy_name"], "policy_name", operation_id
-            ),
-        }
 
     if operation == BrokerOperation.TEST_ATTEMPT_TICKET:
         if set(value) != {"descriptor", "launch_timeout_seconds"}:

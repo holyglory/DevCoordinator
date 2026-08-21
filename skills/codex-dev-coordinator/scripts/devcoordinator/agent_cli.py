@@ -309,34 +309,27 @@ def _parser() -> argparse.ArgumentParser:
     _add_scoped_project(operation)
 
     tests = commands.add_parser(
-        "test", help="plan, enqueue, submit, or follow asynchronous tests"
+        "test", help="run, follow, cancel, or retrieve artifacts"
     )
     test_actions = tests.add_subparsers(dest="test_action", required=True)
-    enqueue = test_actions.add_parser(
-        "enqueue", help="register and enqueue one policy-derived test plan"
+    run = test_actions.add_parser(
+        "run", help="validate and start one asynchronous test run"
     )
-    enqueue.add_argument(
+    run.add_argument(
         "--intent",
         choices=("change", "checkpoint", "handoff", "release", "manual"),
         default="change",
     )
-    enqueue.add_argument(
+    run.add_argument(
         "--target",
         action="append",
         default=[],
         help="declared target for manual intent (repeatable)",
     )
-    enqueue.add_argument("--execution-timeout-seconds", type=int)
-    enqueue.add_argument("--launch-timeout-seconds", type=int, default=300)
-    enqueue.add_argument("--operation-id")
-    _add_scoped_project(enqueue)
-
-    submit = test_actions.add_parser(
-        "submit", help="submit one explicitly reviewed plan handle"
-    )
-    submit.add_argument("plan", help="dc1:plan handle or exact plan ID")
-    submit.add_argument("--operation-id")
-    _add_scoped_project(submit)
+    run.add_argument("--execution-timeout-seconds", type=int)
+    run.add_argument("--launch-timeout-seconds", type=int, default=300)
+    run.add_argument("--operation-id")
+    _add_scoped_project(run)
 
     follow = test_actions.add_parser(
         "follow", help="read or wait for one run and return a compact decision"
@@ -349,20 +342,6 @@ def _parser() -> argparse.ArgumentParser:
         help="broker-side status polling deadline, from 0 through 86400",
     )
     _add_scoped_project(follow)
-
-    queue_status = test_actions.add_parser(
-        "queue-status",
-        help="read bounded current queue state without requiring a run handle",
-    )
-    _add_scoped_project(queue_status)
-
-    failures = test_actions.add_parser(
-        "failures", help="read one cursor-bounded page of actionable failures"
-    )
-    failures.add_argument("run", help="dc1:run handle or exact run ID")
-    failures.add_argument("--after")
-    failures.add_argument("--limit", type=int, default=10)
-    _add_scoped_project(failures)
 
     artifact = test_actions.add_parser(
         "artifact", help="resolve one exact verified test artifact"
@@ -378,14 +357,6 @@ def _parser() -> argparse.ArgumentParser:
     cancel.add_argument("--reason", required=True)
     cancel.add_argument("--operation-id")
     _add_scoped_project(cancel)
-
-    retry = test_actions.add_parser(
-        "retry", help="retry only failed work from one exact run"
-    )
-    retry.add_argument("run", help="dc1:run handle or exact run ID")
-    retry.add_argument("--failed-only", action="store_true", required=True)
-    retry.add_argument("--operation-id")
-    _add_scoped_project(retry)
 
     # Bug intake is intentionally registered on the stable agent client but
     # executes before repository/profile/authority discovery.  The dedicated
@@ -477,9 +448,7 @@ def _allows_compatible_release(namespace: argparse.Namespace) -> bool:
 
     return namespace.command == "test" and namespace.test_action in {
         "artifact",
-        "failures",
         "follow",
-        "queue-status",
     }
 
 
@@ -1996,10 +1965,8 @@ def _test(
     context: Any,
 ) -> dict[str, Any]:
     from .agent_test import (
-        enqueue_test,
-        project_queue_status,
+        run_test,
         project_test_follow,
-        submit_test_plan,
     )
 
     test_caps = capabilities.get("tests")
@@ -2011,12 +1978,12 @@ def _test(
             phase="handshake",
         )
     action = namespace.test_action
-    if action == "enqueue":
-        allowed = test_caps.get("enqueue_intents")
+    if action == "run":
+        allowed = test_caps.get("run_intents")
         if not isinstance(allowed, list) or namespace.intent not in allowed:
             raise AgentCliError(
                 "capability_unavailable",
-                f"active authority does not advertise test enqueue intent {namespace.intent}",
+                f"active authority does not advertise test run intent {namespace.intent}",
                 classification="unsupported_capability",
                 phase="handshake",
             )
@@ -2045,8 +2012,8 @@ def _test(
     effective = _require_resolved_repository(
         profile, context.effective.canonical_root
     )
-    if action == "enqueue":
-        return _scope_test_result(enqueue_test(
+    if action == "run":
+        return _scope_test_result(run_test(
             profile=profile,
             repository=root,
             temporary_repository=(effective if context.temporary is not None else None),
@@ -2057,27 +2024,6 @@ def _test(
             actor=_attribution(),
             operation_id=namespace.operation_id,
         ), project=context.root.canonical_root)
-    if action == "submit":
-        return _scope_test_result(submit_test_plan(
-            profile=profile,
-            repository=root,
-            plan_id=_handle_identity(namespace.plan, expected_kind="plan"),
-            actor=_attribution(),
-            operation_id=namespace.operation_id,
-        ), project=context.root.canonical_root)
-    if action == "queue-status":
-        status = profile.test_queue_status(repository=root.repo_id)
-        if not isinstance(status, Mapping):
-            raise AgentCliError(
-                "test_reply_invalid",
-                "test queue status reply is not an object",
-                classification="invalid_reply",
-                phase="transport",
-            )
-        return _scope_test_result(
-            project_queue_status(status, repository_id=root.repo_id),
-            project=context.root.canonical_root,
-        )
     if action == "follow":
         wait_seconds = namespace.wait_seconds
         if not 0 <= wait_seconds <= 86_400:
@@ -2113,19 +2059,6 @@ def _test(
             project_test_follow(status, run_id=run_id, summary=summary),
             project=context.root.canonical_root,
         )
-    if action == "failures":
-        if not 1 <= namespace.limit <= 50:
-            raise AgentCliError(
-                "failure_limit_invalid", "--limit must be from 1 through 50"
-            )
-        run_id = _handle_identity(namespace.run, expected_kind="run")
-        result = profile.test_run_failures(
-            repository=root.repo_id,
-            run_id=run_id,
-            after=namespace.after,
-            limit=namespace.limit,
-        )
-        return _bounded_test_failure_page(result)
     if action == "artifact":
         run_id = _handle_identity(namespace.run, expected_kind="run")
         artifact_id = _handle_identity(namespace.artifact, expected_kind="artifact")
@@ -2137,31 +2070,22 @@ def _test(
             ),
             surface="test artifact",
         )
-    if action in {"cancel", "retry"}:
+    if action == "cancel":
         run_id = _handle_identity(namespace.run, expected_kind="run")
         operation_id = namespace.operation_id
         assert operation_id is not None
-        if action == "cancel":
-            if not namespace.reason.strip() or len(namespace.reason) > 500:
-                raise AgentCliError(
-                    "cancel_reason_invalid",
-                    "--reason must be from 1 through 500 characters",
-                )
-            result = profile.cancel_test_run(
-                repository=root.repo_id,
-                run_id=run_id,
-                reason=namespace.reason,
-                operation_id=operation_id,
-                actor=_attribution(),
+        if not namespace.reason.strip() or len(namespace.reason) > 500:
+            raise AgentCliError(
+                "cancel_reason_invalid",
+                "--reason must be from 1 through 500 characters",
             )
-        else:
-            result = profile.retry_test_run(
-                repository=root.repo_id,
-                run_id=run_id,
-                failed_only=True,
-                operation_id=operation_id,
-                actor=_attribution(),
-            )
+        result = profile.cancel_test_run(
+            repository=root.repo_id,
+            run_id=run_id,
+            reason=namespace.reason,
+            operation_id=operation_id,
+            actor=_attribution(),
+        )
         document = dict(result)
         document.setdefault("ok", True)
         document["operation_id"] = operation_id
@@ -2173,7 +2097,7 @@ def _test(
         document.pop("continuation", None)
         document["run"] = run_handle
         document["next_command"] = f"devcoordinator test follow {run_handle}"
-        return require_agent_result(document, surface=f"test {action}")
+        return require_agent_result(document, surface="test cancel")
     raise AgentCliError("command_unsupported", "test action is unsupported")
 
 
@@ -2327,9 +2251,7 @@ def _command_mutates(namespace: argparse.Namespace | None) -> bool:
         return namespace.action == "image-prefetch"
     return namespace.command == "test" and namespace.test_action in {
         "cancel",
-        "enqueue",
-        "retry",
-        "submit",
+        "run",
     }
 
 
@@ -2491,7 +2413,7 @@ def _next_action_for_failure(
         )
     if code == "live_retry_replan_required":
         return (
-            "Create a fresh current-source plan with `devcoordinator test enqueue`; "
+            "Start a fresh current-source run with `devcoordinator test run`; "
             "the retained live plan was not replayed and no retry run was created."
         )
     if code == "invalid_arguments":
@@ -2917,9 +2839,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         elif namespace.command == "test" and namespace.test_action in {
             "cancel",
-            "enqueue",
-            "retry",
-            "submit",
+            "run",
         }:
             namespace.operation_id = _canonical_operation_id(
                 namespace.operation_id, mutate=True
@@ -2928,21 +2848,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         # broker transport.  A caller can therefore recover a lost reply from
         # the bounded journal without inventing or guessing an operation ID.
         record("received", "received")
-        if namespace.command == "test" and namespace.test_action == "enqueue":
+        if namespace.command == "test" and namespace.test_action == "run":
             operation_handle = continuation_handle(
                 "operation", namespace.operation_id
             )
             replay_arguments = list(raw_arguments)
             if "--operation-id" not in replay_arguments:
                 replay_arguments.extend(["--operation-id", namespace.operation_id])
-            queue_arguments = ["devcoordinator", "test", "queue-status"]
-            if getattr(namespace, "project", None):
-                queue_arguments.extend(["--project", namespace.project])
             _emit(
                 {
                     "schema_version": 1,
                     "ok": True,
-                    "classification": "test_enqueue_started",
+                    "classification": "test_run_started",
                     "status": "snapshot_planning",
                     "operation_id": namespace.operation_id,
                     "continuation": operation_handle,
@@ -2950,7 +2867,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "next_command": (
                         f"devcoordinator operation follow {operation_handle}"
                     ),
-                    "queue_status_command": shlex.join(queue_arguments),
                     "replay_command": shlex.join(
                         ["devcoordinator", *replay_arguments]
                     ),
@@ -2984,7 +2900,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                         namespace is not None
                         and getattr(namespace, "command", None) == "test"
                         and getattr(namespace, "test_action", None)
-                        in {"cancel", "retry"}
+                        == "cancel"
                     ),
                     broker_contacted=execution_state["broker_contacted"],
                     observed_mutation=execution_state["mutation_performed"],

@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """Build, verify, and render an immutable DevCoordinator release.
 
-This installer never starts or switches a service.  It creates a content-
-addressed, non-writable release and renders unit templates into a caller-owned
-staging directory.  A separate, explicit cutover must verify candidate
-readiness before installing or activating the rendered units.
+This installer never starts or switches a service. It creates one content-
+addressed, non-writable current-format release. The repository-owned delivery
+driver performs the fenced activation, health verification, and rollback.
 """
 
 from __future__ import annotations
@@ -127,11 +126,8 @@ MAX_PORT_RESERVATIONS_BYTES = 1024 * 1024
 AVAILABILITY_TEMPLATES = (
     "devcoordinator-api.service",
     "devcoordinator-api.socket",
-    "devcoordinator-api-handoff.service",
-    "devcoordinator-api-handoff.socket",
     "devcoordinator-authority.service",
     "devcoordinator-authority.socket",
-    "devcoordinator-broker.service",
     "devcoordinator-availability.sysusers.conf",
     "devcoordinator-availability.tmpfiles.conf",
     "devcoordinator.tmpfiles.conf",
@@ -139,9 +135,6 @@ AVAILABILITY_TEMPLATES = (
     "devcoordinator-console@.service",
     "devcoordinator-control.slice",
     "devcoordinator-edge-http.socket",
-    "devcoordinator-edge-handoff-http.socket",
-    "devcoordinator-edge-handoff-https.socket",
-    "devcoordinator-edge-handoff.service",
     "devcoordinator-edge-https.socket",
     "devcoordinator-edge-publication.socket",
     "devcoordinator-edge.service",
@@ -167,23 +160,19 @@ SOURCE_FILES = (
     Path("apps/DevOpsConsole/Tools/browser-lcp-producer.mjs"),
     Path("apps/DevOpsConsole/Tools/prepare-production-acceptance-storage-state.mjs"),
     Path("apps/DevOpsConsole/Tools/production-console-acceptance.mjs"),
-    Path("deploy/devcoordinator-broker.service"),
     Path("deploy/devcoordinator-read-only.rules"),
     Path("deploy/devcoordinator-test.rules"),
     Path("scripts/activate_availability_release.py"),
     Path("scripts/availability_schema_check.py"),
     Path("scripts/browser_lcp_acceptance.py"),
     Path("scripts/check_availability_topology.py"),
-    Path("scripts/clean_adopt_availability.py"),
     Path("scripts/devcoordinator_observer.py"),
     Path("scripts/install_availability_release.py"),
     Path("scripts/install_browser_lcp_runtime.py"),
     Path("scripts/manage_maintenance_mode.py"),
-    Path("scripts/manage_universal_test_adoption.py"),
     Path("scripts/manage_universal_test_credentials.py"),
     Path("scripts/manage_test_store.py"),
     Path("scripts/orchestrate_availability_cutover.py"),
-    Path("scripts/prepare_background_service_handoff.py"),
     Path("scripts/read_coordinator_call_log.py"),
     Path("scripts/audit_project_runtime_isolation.py"),
     Path("scripts/refresh_edge_tls_credential.py"),
@@ -226,19 +215,9 @@ WRAPPERS = {
         "skills/codex-dev-coordinator/scripts/dev_coordinator.py",
         ("systemd-unit",),
     ),
-    "devcoordinator-clean-adoption": (
-        "python",
-        "scripts/clean_adopt_availability.py",
-        (),
-    ),
     "devcoordinator-availability-activate": (
         "python",
         "scripts/activate_availability_release.py",
-        (),
-    ),
-    "devcoordinator-cutover": (
-        "python",
-        "scripts/orchestrate_availability_cutover.py",
         (),
     ),
     "devcoordinator-authority-readiness": (
@@ -256,11 +235,6 @@ WRAPPERS = {
         "scripts/orchestrate_availability_cutover.py",
         ("reattest-authority-readiness",),
     ),
-    "devcoordinator-first-adoption-bindings": (
-        "python",
-        "scripts/orchestrate_availability_cutover.py",
-        (),
-    ),
     "devcoordinator-authority-repository-repair": (
         "python",
         "skills/codex-dev-coordinator/scripts/dev_coordinator.py",
@@ -275,11 +249,6 @@ WRAPPERS = {
         "python",
         "scripts/manage_maintenance_mode.py",
         (),
-    ),
-    "devcoordinator-port-reservations": (
-        "python",
-        "scripts/orchestrate_availability_cutover.py",
-        ("reserve-first-adoption-ports",),
     ),
     "devcoordinator-edge": (
         "node",
@@ -306,11 +275,6 @@ WRAPPERS = {
         "apps/DevOpsConsole/edge/console-state-migration-cli.mjs",
         (),
     ),
-    "devcoordinator-first-adoption-route-resolution": (
-        "node",
-        "apps/DevOpsConsole/edge/first-adoption-route-resolution-cli.mjs",
-        (),
-    ),
     "devcoordinator-edge-publication": (
         "node",
         "apps/DevOpsConsole/edge/publication-cli.mjs",
@@ -319,11 +283,6 @@ WRAPPERS = {
     "devcoordinator-edge-cert-refresh": (
         "python",
         "scripts/refresh_edge_tls_credential.py",
-        (),
-    ),
-    "devcoordinator-background-handoff": (
-        "python",
-        "scripts/prepare_background_service_handoff.py",
         (),
     ),
     "devcoordinator-browser-lcp": (
@@ -388,7 +347,7 @@ WRAPPERS = {
     ),
     "devcoordinator-test": (
         "python",
-        "skills/codex-dev-coordinator/scripts/dev_coordinator.py",
+        "skills/codex-dev-coordinator/scripts/devcoordinator/agent_cli.py",
         ("test",),
     ),
     "devcoordinator-call-log": (
@@ -414,11 +373,6 @@ WRAPPERS = {
     "devcoordinator-notifications": (
         "node",
         "apps/DevOpsConsole/bin/devops-console-notifications.mjs",
-        (),
-    ),
-    "devcoordinator-test-manifest-adoption": (
-        "python",
-        "scripts/manage_universal_test_adoption.py",
         (),
     ),
     "devcoordinator-test-credential": (
@@ -495,7 +449,6 @@ AGENT_CLIENT_RUNTIME_PATHS = (
     "skills/codex-dev-coordinator/scripts/devcoordinator/authority_retention.py",
     "skills/codex-dev-coordinator/scripts/devcoordinator/compose_run_once.py",
     "skills/codex-dev-coordinator/scripts/devcoordinator/ephemeral_secrets.py",
-    "skills/codex-dev-coordinator/scripts/devcoordinator/legacy_import.py",
     "skills/codex-dev-coordinator/scripts/devcoordinator/maintenance.py",
     "skills/codex-dev-coordinator/scripts/devcoordinator/schema.py",
     "skills/codex-dev-coordinator/scripts/devcoordinator/store.py",
@@ -1120,13 +1073,6 @@ def plan_release(repo: Path, release_root: Path) -> dict[str, Any]:
                 "skills/codex-dev-coordinator/scripts/devcoordinator/broker_host.py",
             )
         ),
-        "background_service_handoff": all(
-            path in paths
-            for path in (
-                "bin/devcoordinator-background-handoff",
-                "scripts/prepare_background_service_handoff.py",
-            )
-        ),
         "authority_readiness_recovery": all(
             path in paths
             for path in (
@@ -1149,15 +1095,6 @@ def plan_release(repo: Path, release_root: Path) -> dict[str, Any]:
             path in paths
             for path in (
                 "bin/devcoordinator-authority-readiness-reattest",
-                "scripts/orchestrate_availability_cutover.py",
-                "skills/codex-dev-coordinator/scripts/devcoordinator/broker_cli.py",
-                "skills/codex-dev-coordinator/scripts/devcoordinator/maintenance.py",
-            )
-        ),
-        "atomic_first_adoption_bindings": all(
-            path in paths
-            for path in (
-                "bin/devcoordinator-first-adoption-bindings",
                 "scripts/orchestrate_availability_cutover.py",
                 "skills/codex-dev-coordinator/scripts/devcoordinator/broker_cli.py",
                 "skills/codex-dev-coordinator/scripts/devcoordinator/maintenance.py",

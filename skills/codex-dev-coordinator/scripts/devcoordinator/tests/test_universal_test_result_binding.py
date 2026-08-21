@@ -177,47 +177,6 @@ class ResultPlane:
             },
         )
 
-    def retry(self, **_arguments):
-        self.downstream_calls.append("retry")
-        return self.overrides.get(
-            "retry",
-            {
-                "schema_version": 1,
-                "run_id": "run-retry",
-                "repository_id": _arguments["repository_id"],
-                "state": "queued",
-                "deduplicated": False,
-            },
-        )
-
-    def policy_consume(
-        self,
-        *,
-        repository_id: str,
-        snapshot_id: str,
-        policy_name: str,
-        operation_id: str,
-    ):
-        return self.overrides.get(
-            "policy_consume",
-            {
-                "schema_version": 1,
-                "repository_id": repository_id,
-                "snapshot_id": snapshot_id,
-                "policy_name": policy_name,
-                "operation_id": operation_id,
-                "satisfied": True,
-                "consumed": True,
-                "reusable": False,
-                "requires_consumption": True,
-                "attestation_id": "attestation-a",
-                "consumption_id": "consumption-a",
-                "run_id": "run-authorized",
-                "consumed_at": 1.0,
-            },
-        )
-
-
 class UniversalTestResultBindingTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
@@ -306,7 +265,7 @@ class UniversalTestResultBindingTests(unittest.TestCase):
         )
         self.assertEqual(self.plane.submit_calls, 0)
 
-    def test_nested_run_and_event_pages_cannot_cross_repository_boundary(self) -> None:
+    def test_nested_run_pages_cannot_cross_repository_boundary(self) -> None:
         self.plane.overrides["runs"] = {
             "schema_version": 1,
             "repository_id": "repo-tests",
@@ -317,20 +276,8 @@ class UniversalTestResultBindingTests(unittest.TestCase):
             self.execute(BrokerOperation.TEST_RUN_LIST, {"limit": 25})
         self.assertEqual(runs.exception.code, "test_repository_mismatch")
 
-        self.plane.overrides["events"] = {
-            "schema_version": 1,
-            "repository_id": "repo-tests",
-            "events": [
-                {"event_id": 1, "repository_id": "repo-foreign", "run_id": "run-foreign"}
-            ],
-            "next_cursor": None,
-        }
-        with self.assertRaises(BrokerBackendError) as events:
-            self.execute(
-                BrokerOperation.TEST_EVENTS_READ,
-                {"after_event_id": 0, "limit": 25},
-            )
-        self.assertEqual(events.exception.code, "test_repository_mismatch")
+        with self.assertRaises(ValueError):
+            BrokerOperation("test.events_read")
 
     def test_run_specific_reads_and_cancel_require_exact_returned_run(self) -> None:
         cases = (
@@ -341,11 +288,6 @@ class UniversalTestResultBindingTests(unittest.TestCase):
                 BrokerOperation.TEST_ARTIFACT_RESOLVE,
                 "artifact",
                 {"artifact_id": "artifact-a"},
-            ),
-            (
-                BrokerOperation.TEST_RUN_CASES,
-                "cases",
-                {"after": 0, "limit": 25},
             ),
             (
                 BrokerOperation.TEST_RUN_CANCEL,
@@ -379,11 +321,6 @@ class UniversalTestResultBindingTests(unittest.TestCase):
                 {"artifact_id": "artifact-a"},
             ),
             (
-                BrokerOperation.TEST_RUN_CASES,
-                "cases",
-                {"after": 0, "limit": 25},
-            ),
-            (
                 BrokerOperation.TEST_RUN_CANCEL,
                 "cancel",
                 {"reason": "operator request", "actor": TEST_ACTOR},
@@ -414,14 +351,9 @@ class UniversalTestResultBindingTests(unittest.TestCase):
                 BrokerOperation.TEST_ARTIFACT_RESOLVE,
                 {"artifact_id": "artifact-a"},
             ),
-            (BrokerOperation.TEST_RUN_CASES, {"after": 0, "limit": 25}),
             (
                 BrokerOperation.TEST_RUN_CANCEL,
                 {"reason": "operator request", "actor": TEST_ACTOR},
-            ),
-            (
-                BrokerOperation.TEST_RUN_RETRY,
-                {"failed_only": True, "actor": TEST_ACTOR},
             ),
         )
         self.plane.repository_id = "repo-foreign"
@@ -443,36 +375,8 @@ class UniversalTestResultBindingTests(unittest.TestCase):
                 self.assertEqual(self.plane.downstream_calls, [])
 
     def test_retry_result_is_reauthorized_against_new_run_repository(self) -> None:
-        self.plane.overrides["retry"] = {
-            "schema_version": 1,
-            "run_id": "run-retry-foreign",
-            "repository_id": "repo-tests",
-            "state": "queued",
-            "deduplicated": False,
-        }
-        self.plane.overrides["status:run-retry-foreign"] = {
-            "schema_version": 1,
-            "run_id": "run-retry-foreign",
-            "repository_id": "repo-foreign",
-            "state": "queued",
-        }
-        with self.assertRaises(BrokerBackendError) as raised:
-            self.execute(
-                BrokerOperation.TEST_RUN_RETRY,
-                {
-                    "run_id": self.plane.source_run_id,
-                    "failed_only": True,
-                    "actor": TEST_ACTOR,
-                },
-            )
-        self.assertEqual(raised.exception.code, "test_repository_mismatch")
-        self.assertEqual(
-            self.plane.status_calls,
-            [
-                (self.plane.source_run_id, "repo-tests"),
-                ("run-retry-foreign", "repo-tests"),
-            ],
-        )
+        with self.assertRaises(ValueError):
+            BrokerOperation("test.run_retry")
 
     def test_remote_not_found_is_not_reported_as_scheduler_unavailable(self) -> None:
         self.plane.status_error = TestPlaneTransportError(
@@ -517,34 +421,10 @@ class UniversalTestResultBindingTests(unittest.TestCase):
         )
         self.assertEqual(artifact["artifact"]["artifact_id"], "artifact-a")
         self.assertEqual(artifact["repository_id"], "repo-tests")
-        retry = self.execute(
-            BrokerOperation.TEST_RUN_RETRY,
-            {
-                "run_id": self.plane.source_run_id,
-                "failed_only": True,
-                "actor": TEST_ACTOR,
-            },
-        )
-        self.assertEqual(retry["repository_id"], "repo-tests")
 
-    def test_evidence_consumption_is_exactly_bound_to_broker_operation(self) -> None:
-        consumed = self.execute(
-            BrokerOperation.TEST_EVIDENCE_CONSUME,
-            {"snapshot_id": "snapshot-a", "policy_name": "release"},
-        )
-        self.assertTrue(consumed["consumed"])
-        self.plane.overrides["policy_consume"] = {
-            **consumed,
-            "operation_id": "00000000-0000-4000-8000-000000000000",
-        }
-        with self.assertRaises(BrokerBackendError) as raised:
-            self.execute(
-                BrokerOperation.TEST_EVIDENCE_CONSUME,
-                {"snapshot_id": "snapshot-a", "policy_name": "release"},
-            )
-        self.assertEqual(
-            raised.exception.code, "test_evidence_consumption_mismatch"
-        )
+    def test_retired_evidence_consumption_is_not_a_broker_operation(self) -> None:
+        with self.assertRaises(ValueError):
+            BrokerOperation("test.evidence_consume")
 
 
 if __name__ == "__main__":

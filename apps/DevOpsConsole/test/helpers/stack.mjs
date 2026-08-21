@@ -380,7 +380,6 @@ export async function apiCall(stack, jar, method, apiPath, body, extraHeaders = 
 async function runNormalizedObservation({
   home,
   extraEnv,
-  legacySeedHome,
   agent,
   project,
 }) {
@@ -395,8 +394,6 @@ async function runNormalizedObservation({
       project,
       '--max-age-seconds',
       '0',
-      '--legacy-home',
-      legacySeedHome,
       '--compact-json',
     ],
     {
@@ -488,36 +485,6 @@ async function initializeNormalizedCoordinator(
   extraEnv = {},
   { expectDocker = false, repositoryRoots = [] } = {},
 ) {
-  // A production SQLite mutation deliberately discovers every eligible
-  // same-UID legacy home before it establishes authority. E2E must not import
-  // the developer/runner's real coordinator state, so create one exact,
-  // isolated legacy source through the public compatibility CLI and name only
-  // that source on the explicit normalized observation.
-  const legacySeedHome = path.join(home, 'legacy-seed');
-  const baseEnv = { ...process.env, ...extraEnv };
-  await execFileAsync(
-    'python3',
-    [
-      COORDINATOR_SCRIPT,
-      'state',
-      'reset',
-      '--force',
-      '--agent',
-      'devops-console-e2e-bootstrap',
-      '--project',
-      REPO_ROOT,
-    ],
-    {
-      env: {
-        ...baseEnv,
-        CODEX_AGENT_COORDINATOR_HOME: legacySeedHome,
-        DEVCOORDINATOR_STATE_BACKEND: 'legacy-json-test-only',
-      },
-      timeout: 60_000,
-      maxBuffer: 4 * 1024 * 1024,
-    },
-  );
-
   // Observation deliberately never invents execution ownership from Docker
   // labels or filesystem UID. Test Docker projects therefore use the same
   // explicit owner-authority boundary as production enrollment.
@@ -526,48 +493,45 @@ async function initializeNormalizedCoordinator(
   const observation = await runNormalizedObservation({
     home,
     extraEnv,
-    legacySeedHome,
     agent: 'devops-console-e2e-bootstrap',
     project: REPO_ROOT,
   });
 
-  const imported = observation?.imported;
   if (
     observation?.schema_version !== OBSERVATION_WIRE_SCHEMA_VERSION
     || observation?.status !== 'completed'
     || observation?.observer_domain !== 'host-runtime-v2:full-docker'
-    || imported?.committed !== true
-    || imported?.source_count !== 1
-    || imported?.blocking_conflict_count !== 0
   ) {
     throw new Error(
-      `E2E coordinator bootstrap must commit one conflict-free legacy seed into a wire-schema-v${OBSERVATION_WIRE_SCHEMA_VERSION} full-Docker observation: ${JSON.stringify(observation)}`,
+      `E2E coordinator bootstrap must produce one wire-schema-v${OBSERVATION_WIRE_SCHEMA_VERSION} full-Docker observation: ${JSON.stringify(observation)}`,
     );
   }
   if (expectDocker && observation?.observed !== true) {
     throw new Error(`E2E fake Docker was not freshly observed: ${JSON.stringify(observation)}`);
   }
-  return { observation, legacySeedHome };
+  return { observation };
 }
 
 async function assertNormalizedCoordinatorAuthority(coordinator, initialization, { expectDocker = false } = {}) {
   const inventory = await coordinator.api('GET', '/v1/inventory');
   const canonicalHome = await fsp.realpath(coordinator.home);
+  const currentSchemaMigrationState = ['empty', 'ready'].includes(
+    inventory?.store?.migration_state,
+  );
   const completedFullDockerSnapshot = (inventory?.observations?.snapshots || []).some(
     (snapshot) => snapshot?.observer_domain === 'host-runtime-v2:full-docker' && snapshot?.status === 'completed',
   );
   if (
-    initialization?.observation?.imported?.blocking_conflict_count !== 0
-    || inventory?.schema_version !== INVENTORY_WIRE_SCHEMA_VERSION
+    inventory?.schema_version !== INVENTORY_WIRE_SCHEMA_VERSION
     || inventory?.store?.schema_version !== COORDINATOR_STORE_SCHEMA_VERSION
     || inventory?.store?.authority_mode !== 'sqlite'
-    || inventory?.store?.migration_state !== 'ready'
+    || !currentSchemaMigrationState
     || inventory?.coordinator_home !== canonicalHome
     || inventory?.state_path !== path.join(canonicalHome, 'coordinator.sqlite3')
     || !completedFullDockerSnapshot
   ) {
     throw new Error(
-      `E2E coordinator authority guard failed (expected inventory wire schema v${INVENTORY_WIRE_SCHEMA_VERSION}, store schema v${COORDINATOR_STORE_SCHEMA_VERSION}, sqlite/ready, no blocking migration conflicts, and one committed full-Docker snapshot): ${JSON.stringify({ initialization, inventory })}`,
+      `E2E coordinator authority guard failed (expected inventory wire schema v${INVENTORY_WIRE_SCHEMA_VERSION}, store schema v${COORDINATOR_STORE_SCHEMA_VERSION}, sqlite with current-schema empty/ready migration state, no blocking migration conflicts, and one committed full-Docker snapshot): ${JSON.stringify({ initialization, inventory })}`,
     );
   }
   if (expectDocker && inventory?.docker?.available !== true) {

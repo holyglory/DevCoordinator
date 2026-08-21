@@ -97,7 +97,7 @@ class FreshTestStoreInitializationTests(unittest.TestCase):
         self.assertEqual(authority_sentinel.read_bytes(), authority_before)
 
         store = UniversalTestStore.open(self.test_path)
-        self.assertEqual(store.verify()["schema_version"], 6)
+        self.assertEqual(store.verify()["schema_version"], 7)
         connection = store._connect(readonly=True)
         try:
             rows = connection.execute(
@@ -110,11 +110,8 @@ class FreshTestStoreInitializationTests(unittest.TestCase):
                 int(connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
                 for table in (
                     "test_runs",
-                    "test_case_results",
                     "test_failures",
                     "test_artifacts",
-                    "test_rollup_hourly",
-                    "test_rollup_daily",
                 )
             )
         finally:
@@ -123,7 +120,7 @@ class FreshTestStoreInitializationTests(unittest.TestCase):
             [(str(row["operation_id"]), str(row["operation_kind"])) for row in rows],
             [(self.operation_id, "schema_readiness")],
         )
-        self.assertEqual(counts, (0, 0, 0, 0, 0, 0))
+        self.assertEqual(counts, (0, 0, 0))
 
         replay = TEST_STORE_CLI.initialize_fresh_store(
             test_database=self.test_path,

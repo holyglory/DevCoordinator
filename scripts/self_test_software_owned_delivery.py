@@ -512,38 +512,6 @@ class DeliveryTests(unittest.TestCase):
         self.assertEqual(report["conclusion"], "failed")
         self.assertEqual(report["counts"]["acceptance_failures"], 2)
 
-    def test_reset_inherits_every_setting_and_changes_only_release_paths(self) -> None:
-        subject = self.subject()
-        subject.state["release"] = {
-            "digest": DIGEST,
-            "path": f"/opt/devcoordinator/releases/{DIGEST}",
-        }
-        template = {
-            "schema_version": 1,
-            "kind": "devcoordinator-clean-adoption",
-            "release": f"/opt/devcoordinator/releases/{'b' * 64}",
-            "rendered_units": "/old/rendered",
-            "candidate_slot_source": "/old/slot.env",
-            "console_state_files": [
-                "routes.json",
-                "upstream-auth.json",
-                "access-control.json",
-                "telegram-control.json",
-            ],
-            "settings_sentinel": {"gmail": ["developer@example.test"]},
-        }
-        source = self.root / "template.json"
-        source.write_text(json.dumps(template), encoding="utf-8")
-        output = subject._reset_manifest(source)
-        patched = delivery.read_json(output)
-        changed = {
-            key for key in template if patched.get(key) != template.get(key)
-        }
-        self.assertEqual(
-            changed, {"release", "rendered_units", "candidate_slot_source"}
-        )
-        self.assertEqual(patched["settings_sentinel"], template["settings_sentinel"])
-
     def test_plan_rejects_missing_rollback_or_health(self) -> None:
         value = plan()
         value["same_schema"]["rollback"] = []

@@ -131,7 +131,7 @@ class FakeLauncher:
             return observed.pop(0)
         return observed
 
-    def recover(self, handle, *, context):
+    def attach_for_cleanup(self, handle, *, context):
         if handle.runtime_id not in self.observations:
             self.observations[handle.runtime_id] = RunnerObservation("running")
         self.recoveries.append((handle, context))
@@ -697,7 +697,7 @@ class TestdEngineTests(EngineFixture):
         self.assertEqual(self.store.get_run(submitted.run_id)["state"], "failed")
         self.assertEqual(len(self.store.failures(run_id=submitted.run_id)), 1)
 
-    def test_restart_reconciles_terminal_prior_wave_with_queued_downstream(self) -> None:
+    def test_restart_cancels_terminal_prior_wave_with_queued_downstream(self) -> None:
         submitted = self.submit_live()
         lint = next(
             target
@@ -738,17 +738,15 @@ class TestdEngineTests(EngineFixture):
         )
 
         repaired = self.store.get_run(submitted.run_id)
-        self.assertEqual(repaired["state"], "failed")
-        self.assertEqual(
-            repaired["failure_classification"], "infrastructure_failure"
-        )
+        self.assertEqual(repaired["state"], "cancelled")
+        self.assertEqual(repaired["failure_classification"], "cancellation")
         self.assertEqual(
             [target["state"] for target in repaired["targets"]],
             ["infrastructure_failed", "cancelled"],
         )
         self.assertEqual(self.store.runnable_targets(), ())
 
-    def test_restart_reconciliation_preserves_a_valid_queued_run(self) -> None:
+    def test_restart_cancels_a_valid_queued_run(self) -> None:
         submitted = self.submit_live()
 
         TestdEngine(
@@ -760,11 +758,13 @@ class TestdEngineTests(EngineFixture):
             clock=self.clock,
         )
 
-        self.assertEqual(self.store.get_run(submitted.run_id)["state"], "queued")
+        restarted = self.store.get_run(submitted.run_id)
+        self.assertEqual(restarted["state"], "cancelled")
         self.assertEqual(
-            [target.run_id for target in self.store.runnable_targets()],
-            [submitted.run_id],
+            [target["state"] for target in restarted["targets"]],
+            ["cancelled", "cancelled"],
         )
+        self.assertEqual(self.store.runnable_targets(), ())
 
     def test_heartbeat_and_cancel_use_injected_launcher(self) -> None:
         submitted = self.submit_live()
@@ -986,6 +986,7 @@ class TestdEngineTests(EngineFixture):
         self.assertEqual(self.store.get_run(submitted.run_id)["state"], "failed")
         self.assertEqual(self.launcher.cancelled, [])
 
+    @unittest.skip("testd restart cancels disposable attempts")
     def test_durable_exit_replays_after_testd_crash(self) -> None:
         submitted = self.submit_live()
         self.engine.schedule(launch_batch=1)
@@ -1063,9 +1064,10 @@ class TestdEngineTests(EngineFixture):
             for item in self.store.runnable_targets()
             if item.run_id == followup.run_id and item.target_name == "lint"
         )
-        self.assertEqual(cold.memory_estimate_source, "cold_start_default")
+        self.assertEqual(cold.memory_estimate_source, "fixed_default")
         self.assertEqual(cold.memory_sample_count, 0)
 
+    @unittest.skip("testd restart discards result replay")
     def test_result_chunk_and_exit_replay_after_testd_crash(self) -> None:
         submitted = self.submit_live()
         self.engine.schedule(launch_batch=1)
@@ -1123,6 +1125,7 @@ class TestdEngineTests(EngineFixture):
         self.assertEqual(attempt["state"], "succeeded")
         self.assertEqual(attempt["passed_count"], 1)
 
+    @unittest.skip("testd restart cancels disposable attempts")
     def test_runtime_exit_while_testd_is_absent_is_recovered_exactly_once(self) -> None:
         submitted = self.submit_live()
         self.engine.schedule(launch_batch=1)
@@ -1243,6 +1246,7 @@ class TestdEngineTests(EngineFixture):
         )
         self.assertEqual(self.launcher.collected, [runtime_id])
 
+    @unittest.skip("testd restart cancels disposable attempts")
     def test_running_runtime_survives_replacement_after_ordinary_lease_expiry(
         self,
     ) -> None:
@@ -1275,30 +1279,8 @@ class TestdEngineTests(EngineFixture):
         self.assertEqual(len(replacement_launcher.recoveries), 1)
         self.assertEqual(replacement_launcher.requests, [])
 
-    def test_recovery_lease_rejects_wrong_owner_and_reaped_attempt(self) -> None:
-        self.submit_live()
-        self.engine.schedule(launch_batch=1)
-        request = self.launcher.requests[0]
-        self.clock.advance(31)
-
-        with self.assertRaisesRegex(TestStoreConflict, "lease owner changed"):
-            self.store.recover_attempt_lease(
-                request.ticket.attempt_id,
-                generation=request.ticket.generation,
-                lease_owner="another-testd",
-                operation_id=operation_id(),
-            )
-        self.assertEqual(
-            self.store.reap_expired_attempts()["abandoned_attempt_ids"],
-            [request.ticket.attempt_id],
-        )
-        with self.assertRaisesRegex(TestStoreConflict, "no longer active"):
-            self.store.recover_attempt_lease(
-                request.ticket.attempt_id,
-                generation=request.ticket.generation,
-                lease_owner="devcoordinator-testd",
-                operation_id=operation_id(),
-            )
+    def test_recovery_lease_surface_is_retired(self) -> None:
+        self.assertFalse(hasattr(self.store, "recover_attempt_lease"))
 
     def test_launched_attempt_is_abandoned_not_duplicated_after_lost_heartbeat(self) -> None:
         submitted = self.submit_live()
@@ -1369,7 +1351,7 @@ class FakeSubmitter:
             },
         }
 
-    def recover(self, runtime_id, *, context):
+    def attach_for_cleanup(self, runtime_id, *, context):
         del runtime_id, context
 
     def cancel(self, runtime_id, *, reason):
@@ -1392,6 +1374,7 @@ class TestdLaunchAdapterTests(EngineFixture):
         self.assertNotIn("lease_token", json.dumps(document))
         self.assertNotIn("ticket_token", json.dumps(document))
 
+    @unittest.skip("testd restart cancels pending launches")
     def test_pending_identity_is_spooled_before_first_rpc_and_recovers_exactly(self) -> None:
         launch_requests = []
         active_at_rpc = []

@@ -215,9 +215,9 @@ TOOLS: tuple[dict[str, Any], ...] = (
         read_only=True,
     ),
     _tool(
-        "test_enqueue",
-        "Enqueue tests",
-        "Plan and enqueue a policy-derived asynchronous test workflow.",
+        "test_run",
+        "Run tests",
+        "Validate and start one asynchronous test run.",
         _object_schema(
             {
                 "intent": {
@@ -259,18 +259,6 @@ TOOLS: tuple[dict[str, Any], ...] = (
         idempotent=False,
     ),
     _tool(
-        "test_submit",
-        "Submit reviewed test plan",
-        "Submit one explicitly reviewed plan as an asynchronous test run.",
-        _object_schema(
-            {"plan": _HANDLE, "operation_id": _operation_id_schema()},
-            required=("plan",),
-        ),
-        read_only=False,
-        destructive=False,
-        idempotent=False,
-    ),
-    _tool(
         "test_follow",
         "Follow test run",
         "Read or wait for one exact asynchronous run and return its next decision.",
@@ -285,6 +273,32 @@ TOOLS: tuple[dict[str, Any], ...] = (
                 },
             },
             required=("run",),
+        ),
+        read_only=True,
+    ),
+    _tool(
+        "test_cancel",
+        "Cancel test run",
+        "Cancel one exact active test run.",
+        _object_schema(
+            {
+                "run": _HANDLE,
+                "reason": _string_schema("Bounded cancellation reason.", maximum=500),
+                "operation_id": _operation_id_schema(),
+            },
+            required=("run", "reason"),
+        ),
+        read_only=False,
+        destructive=True,
+        idempotent=True,
+    ),
+    _tool(
+        "test_artifact",
+        "Read test artifact",
+        "Resolve one exact verified artifact from a current test run.",
+        _object_schema(
+            {"run": _HANDLE, "artifact": _HANDLE},
+            required=("run", "artifact"),
         ),
         read_only=True,
     ),
@@ -392,7 +406,7 @@ TOOLS: tuple[dict[str, Any], ...] = (
 )
 
 _TOOLS_BY_NAME = {tool["name"]: tool for tool in TOOLS}
-_MUTATING_TOOLS = frozenset({"runtime_ensure", "test_enqueue", "test_submit"})
+_MUTATING_TOOLS = frozenset({"runtime_ensure", "test_run", "test_cancel"})
 
 
 def _arguments(value: Any, *, allowed: frozenset[str]) -> dict[str, Any]:
@@ -542,7 +556,7 @@ def _argv_for_tool(name: str, raw_arguments: Any) -> list[str]:
         operation = _string(arguments, "operation", required=True)
         return ["operation", "follow", str(operation)]
 
-    if name == "test_enqueue":
+    if name == "test_run":
         arguments = _arguments(
             raw_arguments,
             allowed=frozenset(
@@ -598,7 +612,7 @@ def _argv_for_tool(name: str, raw_arguments: Any) -> list[str]:
         operation_id = _operation_id(arguments)
         argv = [
             "test",
-            "enqueue",
+            "run",
             "--intent",
             str(intent),
             "--launch-timeout-seconds",
@@ -610,17 +624,6 @@ def _argv_for_tool(name: str, raw_arguments: Any) -> list[str]:
             argv.extend(("--operation-id", operation_id))
         for target in validated_targets:
             argv.append("--target=" + target)
-        return argv
-
-    if name == "test_submit":
-        arguments = _arguments(
-            raw_arguments, allowed=frozenset({"plan", "operation_id"})
-        )
-        plan = _string(arguments, "plan", required=True)
-        operation_id = _operation_id(arguments)
-        argv = ["test", "submit", str(plan)]
-        if operation_id is not None:
-            argv.extend(("--operation-id", operation_id))
         return argv
 
     if name == "test_follow":
@@ -642,6 +645,26 @@ def _argv_for_tool(name: str, raw_arguments: Any) -> list[str]:
             "--wait-seconds",
             str(wait_seconds),
         ]
+
+    if name == "test_cancel":
+        arguments = _arguments(
+            raw_arguments, allowed=frozenset({"run", "reason", "operation_id"})
+        )
+        run = _string(arguments, "run", required=True)
+        reason = _string(arguments, "reason", required=True, maximum_bytes=500)
+        operation_id = _operation_id(arguments)
+        argv = ["test", "cancel", str(run), "--reason", str(reason)]
+        if operation_id is not None:
+            argv.extend(("--operation-id", operation_id))
+        return argv
+
+    if name == "test_artifact":
+        arguments = _arguments(
+            raw_arguments, allowed=frozenset({"run", "artifact"})
+        )
+        run = _string(arguments, "run", required=True)
+        artifact = _string(arguments, "artifact", required=True)
+        return ["test", "artifact", str(run), str(artifact)]
 
     if name == "bug_report":
         allowed = frozenset(

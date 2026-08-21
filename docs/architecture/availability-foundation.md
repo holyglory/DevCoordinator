@@ -13,28 +13,19 @@ schema is 2. The local trust model has no repository/account authorization,
 membership, controller binding, source permission, client allowlist, or group
 policy. A release must not recreate those artifacts.
 
-## Clean adoption
+## Initial installation
 
-`scripts/clean_adopt_availability.py` installs a host with no prior supported
-authority. It:
-
-1. verifies the immutable candidate release and current host topology;
-2. creates service-owned state directories and one host-wide routing profile;
-3. initializes schema 15 and catalogs configured repositories as operational
-   inventory, without owner/member/grant rows;
-4. installs and starts the stable services through systemd;
-5. verifies the broker, API, Console, test plane, and cross-repository command
-   routing from an unrelated local UID;
-6. records an exact rollback boundary until readiness is proved.
-
-The host-wide routing profile is readable by local accounts and contains only
-the broker socket and database generation. It is not a credential.
+The immutable-release installer stages files but does not start or switch a
+service. The current-format release switch installs the fixed systemd topology,
+creates missing service-owned directories and empty current stores, activates
+the release, and verifies health. There is no clean-adoption product, legacy
+checkout migration, bridge daemon, handoff listener, or dual-write period.
 
 ## Same-schema delivery
 
 `scripts/software_owned_delivery.py` owns production delivery. It runs the
-source validation cycle, packages an immutable release, asks the Coordinator
-to perform the runtime transition, verifies stable services and API contracts,
+source validation cycle, packages an immutable release, performs the
+current-format runtime transition, verifies stable services and API contracts,
 executes production-shaped Console/browser journeys, and preserves rollback
 evidence until the new release is healthy.
 
@@ -43,13 +34,13 @@ It never writes application state directly and never hand-manages processes or
 containers. Failed convergence retains exact artifacts and restores the prior
 release when the verified rollback contract permits it.
 
-## Schema migration
+## Schema changes
 
-Schema 15 accepts legacy schemas 12–14 only through the one transactional
-trusted-local migration in `devcoordinator/schema.py`. Useful direct repository
-association is copied into current resource rows. Obsolete local authorization
-tables and columns are then dropped. No bridge daemon, shadow broker, legacy
-client enrollment, or dual-write period exists.
+Startup creates schema 15 only for an empty database and refuses every other
+schema. There is no in-place upgrade or legacy importer. A same-schema switch
+also refuses an incompatible authority database before starting the candidate;
+the retained-control rebaseline remains tracked in `CompletionLedger.md` until
+its export/import and rollback path are implemented and verified.
 
 ## Readiness
 
@@ -73,8 +64,8 @@ retained evidence.
 
 Releases are immutable and selected by a stable current-release pointer.
 Rollback restores that pointer only after the prior release and schema contract
-are verified compatible. User settings and project runtime state are retained;
-test history is disposable unless explicitly requested otherwise. Credentials,
+are verified compatible. User settings and project runtime state are retained.
+Test history is always disposable and may be reset during delivery. Credentials,
 logs, backups, runtime state, and acceptance screenshots remain outside Git.
 
 ## External boundaries

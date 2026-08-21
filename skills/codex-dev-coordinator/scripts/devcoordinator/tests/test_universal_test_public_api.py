@@ -26,15 +26,12 @@ from devcoordinator.tests.test_universal_test_store_reads import selected_plan
 from devcoordinator.universal_test_service import StoreTestPlaneAdapter
 from devcoordinator.universal_test_store import UniversalTestStore
 from devcoordinator.universal_test_transport import (
-    TEST_EVENTS_READ,
     TEST_ARTIFACT_RESOLVE,
     TEST_PLAN_REPOSITORY,
     TEST_RUN_ARTIFACTS,
     TEST_RUN_CANCEL,
-    TEST_RUN_CASES,
     TEST_RUN_FAILURES,
     TEST_RUN_LIST,
-    TEST_RUN_RETRY,
     TEST_RUN_STATUS,
     TEST_RUN_SUMMARY,
     TestPlaneDispatcher,
@@ -76,34 +73,14 @@ class UniversalTestPublicReadTests(unittest.TestCase):
             owner_uid=1001,
         )
 
-    def test_adapter_projects_run_history_cases_and_events(self) -> None:
+    def test_adapter_projects_current_runs(self) -> None:
         run_id = str(self.submission["run_id"])
         history = self.adapter.runs(repository_id="repo-tests", limit=1)
         self.assertEqual(history["repository_id"], "repo-tests")
         self.assertEqual(history["runs"][0]["run_id"], run_id)
         self.assertEqual(history["next_cursor"], run_id)
 
-        cases = self.adapter.cases(
-            run_id=run_id,
-            repository_id="repo-tests",
-            after=0,
-            limit=25,
-        )
-        self.assertEqual(cases, {
-            "schema_version": 1,
-            "repository_id": "repo-tests",
-            "run_id": run_id,
-            "cases": [],
-            "next_cursor": None,
-        })
-        events = self.adapter.events(
-            repository_id="repo-tests", after_event_id=0, limit=200
-        )
-        self.assertEqual(events["repository_id"], "repo-tests")
-        self.assertGreaterEqual(len(events["events"]), 1)
-        self.assertIsNone(events["next_cursor"])
-
-    def test_transport_dispatches_cursorable_public_reads(self) -> None:
+    def test_transport_dispatches_current_run_reads(self) -> None:
         run_id = str(self.submission["run_id"])
         dispatcher = TestPlaneDispatcher(self.adapter)
 
@@ -130,22 +107,11 @@ class UniversalTestPublicReadTests(unittest.TestCase):
             run_id,
         )
         self.assertEqual(
-            dispatch(TEST_RUN_CASES, {
-                "run_id": run_id,
-                "repository_id": "repo-tests",
-                "after": 0,
-                "limit": 25,
-            })[
-                "cases"
-            ],
-            [],
-        )
-        self.assertEqual(
             dispatch(
-                TEST_EVENTS_READ,
-                {"repository_id": "repo-tests", "after_event_id": 0, "limit": 200},
-            )["repository_id"],
-            "repo-tests",
+                TEST_RUN_STATUS,
+                {"repository_id": "repo-tests", "run_id": run_id},
+            )["run_id"],
+            run_id,
         )
 
     def test_transport_rejects_every_unscoped_plan_and_run_operation(self) -> None:
@@ -163,22 +129,12 @@ class UniversalTestPublicReadTests(unittest.TestCase):
                     "artifact_id": "artifact-retired",
                 },
             ),
-            (TEST_RUN_CASES, {"run_id": str(self.submission["run_id"])}),
             (
                 TEST_RUN_CANCEL,
                 {
                     "run_id": str(self.submission["run_id"]),
                     "actor": "codex:test",
                     "reason": "retired contract",
-                    "operation_id": operation_id(),
-                },
-            ),
-            (
-                TEST_RUN_RETRY,
-                {
-                    "run_id": str(self.submission["run_id"]),
-                    "actor": "codex:test",
-                    "failed_only": True,
                     "operation_id": operation_id(),
                 },
             ),
@@ -202,13 +158,6 @@ class UniversalTestPublicReadTests(unittest.TestCase):
     def test_broker_arguments_are_exact_and_bounded(self) -> None:
         listed = broker_request(BrokerOperation.TEST_RUN_LIST, {})
         self.assertEqual(listed.arguments, {"limit": 50})
-        events = broker_request(BrokerOperation.TEST_EVENTS_READ, {})
-        self.assertEqual(events.arguments, {"after_event_id": 0, "limit": 200})
-        cases = broker_request(
-            BrokerOperation.TEST_RUN_CASES,
-            {"run_id": "run-tests", "after": 41, "limit": 25},
-        )
-        self.assertEqual(cases.arguments["after"], 41)
         delegated = BrokerRequest.create(
             account_id="devcoordinator-api",
             project_id="repo-tests",
@@ -231,26 +180,10 @@ class UniversalTestPublicReadTests(unittest.TestCase):
                 "actor": "codex:thread-1",
             },
         )
-        retried = broker_request(
-            BrokerOperation.TEST_RUN_RETRY,
-            {
-                "run_id": "run-tests",
-                "failed_only": True,
-                "actor": "codex:thread-1",
-            },
-        )
         self.assertEqual(cancelled.arguments["actor"], "codex:thread-1")
-        self.assertEqual(retried.arguments["actor"], "codex:thread-1")
 
         with self.assertRaises(BrokerError):
             broker_request(BrokerOperation.TEST_RUN_LIST, {"limit": 201})
-        with self.assertRaises(BrokerError):
-            broker_request(BrokerOperation.TEST_EVENTS_READ, {"after_event_id": -1})
-        with self.assertRaises(BrokerError):
-            broker_request(
-                BrokerOperation.TEST_RUN_CASES,
-                {"run_id": "run-tests", "after": "41"},
-            )
         with self.assertRaises(BrokerError):
             broker_request(
                 BrokerOperation.TEST_RUN_SUBMIT,
@@ -282,10 +215,6 @@ class UniversalTestPublicReadTests(unittest.TestCase):
             (
                 BrokerOperation.TEST_RUN_CANCEL,
                 {"run_id": "run-tests", "reason": "requested"},
-            ),
-            (
-                BrokerOperation.TEST_RUN_RETRY,
-                {"run_id": "run-tests", "failed_only": True},
             ),
         )
         for operation, arguments in missing_actor_cases:
@@ -339,10 +268,7 @@ class UniversalTestPublicReadTests(unittest.TestCase):
             _test_run_actor(authorized("devcoordinator-api", "codex:uid:1234")),
             "codex:uid:1234",
         )
-        for operation in (
-            BrokerOperation.TEST_RUN_CANCEL,
-            BrokerOperation.TEST_RUN_RETRY,
-        ):
+        for operation in (BrokerOperation.TEST_RUN_CANCEL,):
             with self.subTest(operation=operation):
                 self.assertEqual(
                     _test_run_actor(

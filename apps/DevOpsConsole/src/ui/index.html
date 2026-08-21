@@ -8,8 +8,8 @@
 <title>DevOps Console — vr.ae</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2016%2016'%3E%3Crect%20width='16'%20height='16'%20rx='3'%20fill='%230e1116'/%3E%3Ccircle%20cx='8'%20cy='8'%20r='4'%20fill='none'%20stroke='%234da3ff'%20stroke-width='2'/%3E%3Ccircle%20cx='8'%20cy='8'%20r='1.4'%20fill='%233fc97c'/%3E%3C/svg%3E">
 <!-- ?v= busts the 1h immutable asset cache on deploys; index.html itself is no-cache. -->
-  <link rel="stylesheet" href="/app.css?v=770af7f24586">
-  <script src="/app.js?v=770af7f24586" defer></script>
+  <link rel="stylesheet" href="/app.css?v=160ec56225ab">
+  <script src="/app.js?v=160ec56225ab" defer></script>
 </head>
 <body>
 
@@ -65,27 +65,8 @@
 
   <section id="sec-tests" class="card" data-page="tests" aria-labelledby="tests-h" hidden>
     <div class="sec-head collection-head test-head">
-      <div class="test-title">
-        <h2 id="tests-h">Tests <span class="count" id="tests-count" hidden></span></h2>
-        <p class="sec-sub">Fleet-wide test coverage, freshness and efficiency. Select a repository only when you need the detail.</p>
-      </div>
-      <div class="test-filters" role="search">
-        <label class="test-search" for="tests-search">
-          <span class="visually-hidden">Search repositories</span>
-          <input id="tests-search" type="search" autocomplete="off" spellcheck="false" placeholder="Search repositories">
-        </label>
-        <label class="test-window" for="tests-hours">
-          <span class="visually-hidden">Fleet time window</span>
-          <select id="tests-hours" aria-label="Fleet time window">
-            <option value="24" selected>Last 24 hours</option>
-          </select>
-        </label>
-        <button id="tests-run" class="btn primary" type="button" disabled>Run tests</button>
-      </div>
-    </div>
-    <div class="test-refresh-line" hidden>
-      <span id="tests-updated"></span>
-      <span id="tests-retained" hidden>Latest refresh failed — showing last available data</span>
+      <h2 id="tests-h">Tests <span class="count" id="tests-count" hidden></span></h2>
+      <button id="tests-run" class="btn primary" type="button" disabled>Run tests</button>
     </div>
     <div id="tests-body" class="sec-body" aria-live="off">
       <div class="skel" aria-hidden="true"></div>
@@ -389,29 +370,13 @@
   <div class="test-detail-shell">
     <div class="test-detail-head">
       <div>
-        <p class="test-detail-kicker">Repository testing</p>
         <h2 id="test-detail-h">Repository</h2>
-        <p id="test-detail-status" class="meta-passive">Loading statistics…</p>
+        <p id="test-detail-status" class="meta-passive">Current runs</p>
       </div>
-      <div class="test-detail-head-actions">
-        <label for="tests-days" class="visually-hidden">Repository statistics period</label>
-        <select id="tests-days" aria-label="Repository statistics period">
-          <option value="7">7 days</option>
-          <option value="30" selected>30 days</option>
-          <option value="90">90 days</option>
-          <option value="365">1 year</option>
-        </select>
-        <button id="test-detail-close" class="iconbtn" type="button" aria-label="Close repository test details" title="Close"></button>
-      </div>
+      <button id="test-detail-close" class="iconbtn" type="button" aria-label="Close current test runs" title="Close"></button>
     </div>
-    <div class="test-detail-tabs" role="tablist" aria-label="Repository test information">
-      <button id="test-detail-tab-overview" type="button" role="tab" aria-controls="test-detail-body" aria-selected="true" data-test-detail-tab="overview">Overview</button>
-      <button id="test-detail-tab-runs" type="button" role="tab" aria-controls="test-detail-body" aria-selected="false" tabindex="-1" data-test-detail-tab="runs">Runs</button>
-      <button id="test-detail-tab-setup" type="button" role="tab" aria-controls="test-detail-body" aria-selected="false" tabindex="-1" data-test-detail-tab="setup">Setup</button>
-    </div>
-    <div id="test-detail-body" class="test-detail-body" role="tabpanel" aria-labelledby="test-detail-tab-overview" aria-live="polite"></div>
+    <div id="test-detail-body" class="test-detail-body" aria-live="polite"></div>
     <div class="test-detail-actions">
-      <button id="test-detail-runs" class="btn" type="button">View runs</button>
       <button id="test-detail-run" class="btn primary" type="button">Run tests</button>
     </div>
   </div>

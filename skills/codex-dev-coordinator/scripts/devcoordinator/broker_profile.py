@@ -597,24 +597,6 @@ class BrokerClientProfile:
         )
         return result
 
-    def fleet_test_statistics(self, *, hours: int = 24) -> dict[str, Any]:
-        """Read one host-wide bounded test projection through one route."""
-
-        if not self.repositories:
-            raise BrokerProfileError(
-                "broker routing profile has no repository anchor for fleet test access"
-            )
-        repository = min(
-            self.repositories.values(), key=lambda item: item.canonical_root
-        )
-        _operation_id, result = self.call(
-            repository=repository,
-            resource_id=repository.repo_id,
-            operation=BrokerOperation.TEST_FLEET_STATS_READ,
-            arguments={"hours": hours},
-        )
-        return result
-
     def test_health(self) -> dict[str, Any]:
         """Read the current testd/store identity through the broker."""
 
@@ -843,14 +825,6 @@ class BrokerClientProfile:
             arguments=arguments,
         )
 
-    def test_queue_status(self, *, repository: str) -> dict[str, Any]:
-        configured = self.repository_by_id(repository)
-        return self._test_call(
-            repository=configured,
-            operation=BrokerOperation.TEST_QUEUE_STATUS,
-            arguments={"expected_repository_id": str(repository)},
-        )
-
     def test_run_summary(self, *, repository: str, run_id: str) -> dict[str, Any]:
         result = self._test_run_call(
             repository=repository,
@@ -905,29 +879,6 @@ class BrokerClientProfile:
             arguments={"run_id": str(run_id), "artifact_id": str(artifact_id)},
         )
 
-    def test_run_cases(
-        self, *, repository: str, run_id: str, after: int = 0, limit: int = 25
-    ) -> dict[str, Any]:
-        return self._test_run_call(
-            repository=repository,
-            operation=BrokerOperation.TEST_RUN_CASES,
-            arguments={"run_id": str(run_id), "after": after, "limit": limit},
-        )
-
-    def test_events(
-        self,
-        *,
-        repository: str,
-        after_event_id: int = 0,
-        limit: int = 200,
-    ) -> dict[str, Any]:
-        configured = self.repository_by_id(repository)
-        return self._test_call(
-            repository=configured,
-            operation=BrokerOperation.TEST_EVENTS_READ,
-            arguments={"after_event_id": after_event_id, "limit": limit},
-        )
-
     def test_repository_setup(self, *, repository: str) -> dict[str, Any]:
         configured = self.repository_by_id(repository)
         return self._test_call(
@@ -953,27 +904,6 @@ class BrokerClientProfile:
         return self._test_run_call(
             repository=repository,
             operation=BrokerOperation.TEST_RUN_CANCEL,
-            arguments=arguments,
-            operation_id=str(operation_id),
-        )
-
-    def retry_test_run(
-        self,
-        *,
-        repository: str,
-        run_id: str,
-        failed_only: bool,
-        operation_id: str,
-        actor: str,
-    ) -> dict[str, Any]:
-        arguments = {
-            "run_id": str(run_id),
-            "failed_only": failed_only,
-            "actor": str(actor),
-        }
-        return self._test_run_call(
-            repository=repository,
-            operation=BrokerOperation.TEST_RUN_RETRY,
             arguments=arguments,
             operation_id=str(operation_id),
         )
@@ -1052,38 +982,6 @@ class BrokerClientProfile:
             if remaining <= 0:
                 return timed_out()
             time.sleep(min(0.25, remaining))
-
-    def check_test_evidence(
-        self, *, repository: str, policy: str, snapshot: str
-    ) -> dict[str, Any]:
-        configured = self.repository(repository)
-        return self._test_call(
-            repository=configured,
-            operation=BrokerOperation.TEST_EVIDENCE_CHECK,
-            arguments={
-                "snapshot_id": str(snapshot),
-                "policy_name": str(policy),
-            },
-        )
-
-    def consume_test_evidence(
-        self,
-        *,
-        repository: str,
-        policy: str,
-        snapshot: str,
-        operation_id: str,
-    ) -> dict[str, Any]:
-        configured = self.repository(repository)
-        return self._test_call(
-            repository=configured,
-            operation=BrokerOperation.TEST_EVIDENCE_CONSUME,
-            arguments={
-                "snapshot_id": str(snapshot),
-                "policy_name": str(policy),
-            },
-            operation_id=str(operation_id),
-        )
 
 
 def call_broker(

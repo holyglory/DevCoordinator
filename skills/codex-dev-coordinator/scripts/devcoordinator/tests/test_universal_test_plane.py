@@ -45,7 +45,6 @@ from devcoordinator.universal_test_store import (
     CaseResult,
     FailureClassification,
     FailureRecord,
-    LiveRetryReplanRequired,
     MAX_EXPIRED_ATTEMPTS_PER_REAP,
     RunnableTarget,
     TargetResources,
@@ -292,32 +291,8 @@ class UniversalTestStoreTests(StoreFixture):
         ):
             _attempt_progress_document({**legacy, "unexpected": True})
 
-    def test_queue_status_needs_no_run_handle_and_reports_typed_blockers(self) -> None:
-        submitted = self.submit()
-
-        queued = self.store.queue_status(repository_id="repo-tests")
-
-        self.assertEqual(queued["phase"], "scheduler")
-        self.assertEqual(queued["global_targets"]["queued"], 2)
-        self.assertEqual(queued["repository_targets"]["queued"], 2)
-        self.assertEqual(queued["repository_runnable_targets"], 1)
-        self.assertEqual(queued["approximate_first_position"], 1)
-        self.assertEqual(
-            queued["blockers"],
-            [{"code": "dependency_wave", "target_count": 1}],
-        )
-        self.assertEqual(queued["worker_capacity"]["limit"], None)
-
-        grant = self.lease_lint(submitted.run_id)
-        self.store.acknowledge_launch(
-            grant.attempt_id,
-            generation=grant.generation,
-            launch_ack_id="launch-" + grant.attempt_id,
-            operation_id=operation_id(),
-        )
-        running = self.store.queue_status(repository_id="repo-tests")
-        self.assertEqual(running["phase"], "execution")
-        self.assertEqual(running["repository_targets"]["running"], 1)
+    def test_queue_status_is_not_a_store_surface(self) -> None:
+        self.assertFalse(hasattr(self.store, "queue_status"))
 
     def test_schema_preparation_attests_fresh_v5_and_replays(self) -> None:
         mutation = operation_id()
@@ -332,7 +307,7 @@ class UniversalTestStoreTests(StoreFixture):
         self.assertEqual(first, replay)
         self.assertEqual(first["action"], "attested-fresh")
         self.assertEqual(first["journal_kind"], "schema_readiness")
-        self.assertEqual(first["store"]["schema_version"], 6)
+        self.assertEqual(first["store"]["schema_version"], 7)
 
     def test_schema_preparation_fresh_v5_interruption_rolls_back(self) -> None:
         mutation = operation_id()
@@ -891,6 +866,7 @@ class UniversalTestStoreTests(StoreFixture):
         self.assertEqual(result["classification"], "incomplete_reporting")
         self.assertEqual(self.store.get_run(submitted.run_id)["state"], "incomplete")
 
+    @unittest.skip("retired test history rollups")
     def test_rollups_preserve_parallel_test_time_above_one_hour(self) -> None:
         resources = {
             "lint": TargetResources(worktree_key="/tmp/lint"),
@@ -922,6 +898,7 @@ class UniversalTestStoreTests(StoreFixture):
         self.assertEqual(rollup["passed_count"], 2)
         self.assertEqual(self.store.get_run(first.run_id)["state"], "succeeded")
 
+    @unittest.skip("retired history-based sharding")
     def test_history_sharding_requires_complete_history_and_clamps_to_ceiling(self) -> None:
         self.assertEqual(
             self.store.recommend_shard_count(
@@ -996,6 +973,7 @@ class UniversalTestStoreTests(StoreFixture):
         self.assertTrue(all(target["shard_count"] == 3 for target in unit_targets))
         self.assertTrue(all(target["estimated_seconds"] == 30 for target in unit_targets))
 
+    @unittest.skip("retired test history rollups")
     def test_rollups_separate_run_wall_queue_and_avoided_work(self) -> None:
         selected = self.submit(
             selected_plan=plan(fingerprint="c" * 64),
@@ -1085,6 +1063,7 @@ class UniversalTestStoreTests(StoreFixture):
         self.assertEqual(detail["efficiency"]["parallelism_ratio"], 10)
         self.assertEqual(detail["efficiency"]["selection_savings_ratio"], 0.5)
 
+    @unittest.skip("retired rollup rebuild")
     def test_rollup_rebuild_is_cursor_bounded_and_resumes_after_interruption(self) -> None:
         def complete_run(fingerprint: str) -> None:
             submitted = self.submit(
@@ -1166,6 +1145,7 @@ class UniversalTestStoreTests(StoreFixture):
             {"lint": "test_failed", "unit": "cancelled"},
         )
 
+    @unittest.skip("manual rerun replaced failed-only retry")
     def test_failed_only_retry_is_idempotent_and_preserves_exact_plan(self) -> None:
         submitted = self.submit()
         grant = self.lease_lint(submitted.run_id)
@@ -1200,6 +1180,7 @@ class UniversalTestStoreTests(StoreFixture):
         self.assertTrue(deduplicated.deduplicated)
         self.assertEqual(deduplicated.run_id, retry.run_id)
 
+    @unittest.skip("manual rerun replaced failed-only retry")
     def test_live_failed_only_retry_requires_fresh_plan_without_new_run(self) -> None:
         submitted = self.submit(selected_plan=plan(mode=SourceMode.LIVE))
         grant = self.lease_lint(submitted.run_id)
@@ -1226,6 +1207,7 @@ class UniversalTestStoreTests(StoreFixture):
         )
         self.assertEqual(after, before)
 
+    @unittest.skip("manual rerun replaced failed-only retry")
     def test_failed_only_retry_densifies_wave_after_succeeded_dependency(self) -> None:
         submitted = self.submit()
         lint = self.lease_lint(submitted.run_id)
@@ -1271,6 +1253,7 @@ class UniversalTestStoreTests(StoreFixture):
             any(blocker["code"] == "dependency_wave" for blocker in queue["blockers"])
         )
 
+    @unittest.skip("retired cross-run evidence reuse")
     def test_evidence_policy_is_exact_snapshot_bounded_and_expiring(self) -> None:
         selected = plan()
 
@@ -1412,6 +1395,7 @@ class UniversalTestStoreTests(StoreFixture):
         finally:
             connection.close()
 
+    @unittest.skip("retired cross-run evidence reuse")
     def test_reusable_evidence_remains_read_only_and_cannot_be_consumed(self) -> None:
         document = manifest_document()
         document["intents"]["handoff"] = {
@@ -1533,17 +1517,7 @@ class UniversalTestStoreTests(StoreFixture):
         self.assertEqual(
             status["lease_expiry_evidence"], run["lease_expiry_evidence"]
         )
-        expiry_events = [
-            event
-            for event in self.store.events(repository_id="repo-tests")
-            if event["event_type"] == "test.attempt_lease_expired"
-        ]
-        self.assertEqual(
-            [event["detail"]["reason"] for event in expiry_events],
-            ["lease_expired_before_launch", "running_heartbeat_lost"],
-        )
-        self.assertIsNone(expiry_events[0]["detail"]["last_heartbeat_at"])
-        self.assertIsNotNone(expiry_events[1]["detail"]["last_heartbeat_at"])
+        self.assertFalse(hasattr(self.store, "events"))
         with self.assertRaisesRegex(TestStoreConflict, "no longer active"):
             self.store.terminalize_attempt(
                 replacement.attempt_id,
@@ -1829,21 +1803,11 @@ class TestPlaneServiceBoundaryTests(StoreFixture):
                 repository_id="repo-other",
                 artifact_id="artifact-other",
             ),
-            lambda: adapter.cases(
-                run_id=submitted["run_id"], repository_id="repo-other"
-            ),
             lambda: adapter.cancel(
                 run_id=submitted["run_id"],
                 repository_id="repo-other",
                 actor="codex:adapter",
                 reason="test",
-                operation_id=operation_id(),
-            ),
-            lambda: adapter.retry(
-                run_id=submitted["run_id"],
-                repository_id="repo-other",
-                actor="codex:adapter",
-                failed_only=True,
                 operation_id=operation_id(),
             ),
         )
@@ -1887,6 +1851,7 @@ class TestPlaneServiceBoundaryTests(StoreFixture):
             self.store,
             "recommend_shard_count",
             side_effect=lambda *, repository_id, target_name, ceiling: ceiling,
+            create=True,
         ):
             first.register_plan(
                 selected.to_document(),
@@ -2006,7 +1971,7 @@ class TestPlaneServiceBoundaryTests(StoreFixture):
             )
         self.assertEqual(captured.exception.code, "test_plan_preview_unavailable")
 
-    def test_agent_summary_and_rollup_views_are_bounded_materialized_projections(self) -> None:
+    def test_agent_summary_is_a_bounded_current_run_projection(self) -> None:
         adapter = StoreTestPlaneAdapter(self.store)
         selected = plan()
         adapter.register_plan(selected.to_document())
@@ -2035,14 +2000,6 @@ class TestPlaneServiceBoundaryTests(StoreFixture):
             8 * 1024,
         )
         self.assertEqual(summary["counts"]["attempts"], 2)
-        fleet = adapter.fleet_overview(grain="hourly", since=0)
-        self.assertEqual(fleet["repositories"][0]["repository_id"], "repo-tests")
-        self.assertGreater(fleet["repositories"][0]["aggregate_test_seconds"], 3_600)
-        self.assertTrue(fleet["cells"])
-        detail = adapter.repository_detail(
-            repository_id="repo-tests", grain="hourly", since=0
-        )
-        self.assertGreater(detail["totals"]["aggregate_test_seconds"], 3_600)
 
 
 def candidate(

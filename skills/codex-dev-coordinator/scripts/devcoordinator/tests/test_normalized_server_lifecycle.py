@@ -1221,34 +1221,26 @@ class NormalizedPortLifecycleTests(unittest.TestCase):
             ],
         )
 
-    def test_async_test_queries_are_bounded_and_repository_scoped(self) -> None:
+    def test_current_test_queries_are_bounded_and_repository_scoped(self) -> None:
         self.assertEqual(
             dev_coordinator.parse_test_run_list_query(
-                "repo_id=repo-a&limit=25&after=run-a&state=failed"
+                "repo_id=repo-a&limit=25&after=run-a&state=running"
             ),
             {
                 "repository_id": "repo-a",
                 "limit": 25,
                 "after": "run-a",
-                "state": "failed",
+                "state": "running",
             },
         )
         self.assertEqual(
-            dev_coordinator.parse_test_events_query(
-                "repo_id=repo-a&after=41&limit=200"
-            ),
-            {"repository_id": "repo-a", "after_event_id": 41, "limit": 200},
-        )
-        self.assertEqual(
             dev_coordinator.parse_test_evidence_query(
-                "repo_id=repo-a&after=17&limit=3", cases=True
+                "repo_id=repo-a&after=failure-17&limit=3"
             ),
-            {"repository_id": "repo-a", "after": 17, "limit": 3},
+            {"repository_id": "repo-a", "after": "failure-17", "limit": 3},
         )
         with self.assertRaisesRegex(ValueError, "query parameters"):
-            dev_coordinator.parse_test_evidence_query(
-                "after=17&limit=3", cases=True
-            )
+            dev_coordinator.parse_test_evidence_query("after=failure-17&limit=3")
         for query in (
             "repo_id=repo-a&limit=0",
             "repo_id=repo-a&state=invented",
@@ -1263,11 +1255,6 @@ class NormalizedPortLifecycleTests(unittest.TestCase):
             "runs": [{"run_id": "run-a"}],
             "next_cursor": None,
         }
-        profile.test_events.return_value = {
-            "repository_id": "repo-a",
-            "events": [{"event_id": 42}],
-            "next_cursor": 42,
-        }
         with mock.patch.object(
             dev_coordinator, "configured_broker_profile", return_value=profile
         ):
@@ -1277,17 +1264,8 @@ class NormalizedPortLifecycleTests(unittest.TestCase):
                 )["runs"][0]["run_id"],
                 "run-a",
             )
-            self.assertEqual(
-                dev_coordinator.coordinated_test_events_read(
-                    repository_id="repo-a", after_event_id=41
-                )["events"][0]["event_id"],
-                42,
-            )
         profile.test_runs.assert_called_once_with(
             repository="repo-a", after=None, limit=25, state=None
-        )
-        profile.test_events.assert_called_once_with(
-            repository="repo-a", after_event_id=41, limit=200
         )
 
     def test_console_manual_plan_forwards_only_bounded_target_names(self) -> None:
@@ -1436,13 +1414,8 @@ class NormalizedPortLifecycleTests(unittest.TestCase):
             "repository_id": "repo-a",
             "run_id": "run-a",
         }
-        profile.retry_test_run.return_value = {
-            "repository_id": "repo-a",
-            "run_id": "run-a-retry",
-        }
         submit_operation = "11111111-1111-4111-8111-111111111111"
         cancel_operation = "22222222-2222-4222-8222-222222222222"
-        retry_operation = "33333333-3333-4333-8333-333333333333"
         with mock.patch.object(
             dev_coordinator, "configured_broker_profile", return_value=profile
         ):
@@ -1463,16 +1436,6 @@ class NormalizedPortLifecycleTests(unittest.TestCase):
                     "actor": "google:user@example.com",
                 },
             )
-            retry = dev_coordinator.coordinated_test_run_retry(
-                run_id="run-a",
-                payload={
-                    "repo_id": "repo-a",
-                    "failed_only": True,
-                    "operation_id": retry_operation,
-                    "actor": "google:user@example.com",
-                },
-            )
-        self.assertEqual(retry["run_id"], "run-a-retry")
 
         profile.submit_test_plan.assert_called_once_with(
             repository="repo-a",
@@ -1485,13 +1448,6 @@ class NormalizedPortLifecycleTests(unittest.TestCase):
             run_id="run-a",
             reason="user requested",
             operation_id=cancel_operation,
-            actor="google:user@example.com",
-        )
-        profile.retry_test_run.assert_called_once_with(
-            repository="repo-a",
-            run_id="run-a",
-            failed_only=True,
-            operation_id=retry_operation,
             actor="google:user@example.com",
         )
         with self.assertRaisesRegex(ValueError, "mutation fields"):
@@ -1667,11 +1623,8 @@ class NormalizedPortLifecycleTests(unittest.TestCase):
                 "/v1/servers",
                 "/v1/archives",
                 "/v1/events",
-                "/v1/tests",
-                "/v1/test-fleet",
                 "/v1/test-repositories",
                 "/v1/test-runs",
-                "/v1/test-events",
             },
         )
         self.assertEqual(set(dev_coordinator.API_POST_ROUTES), expected_post_routes)
@@ -1772,16 +1725,6 @@ class NormalizedPortLifecycleTests(unittest.TestCase):
                 dev_coordinator, "locked_state", side_effect=poisoned_legacy
             ),
             mock.patch.object(
-                AccountStore,
-                "load_legacy_state_projection",
-                side_effect=poisoned_legacy,
-            ),
-            mock.patch.object(
-                AccountStore,
-                "replace_legacy_state_projection",
-                side_effect=poisoned_legacy,
-            ),
-            mock.patch.object(
                 dev_coordinator, "docker_available_command", side_effect=docker_probe
             ),
         ):
@@ -1792,8 +1735,6 @@ class NormalizedPortLifecycleTests(unittest.TestCase):
                 "--project",
                 str(self.project),
                 "--no-docker",
-                "--legacy-home",
-                str(self.root / "missing-legacy-home"),
             )
             self.assertEqual(observed["status"], "completed")
             self.assertTrue(observed["observed"])
@@ -3095,16 +3036,6 @@ class NormalizedPortLifecycleTests(unittest.TestCase):
             ),
             mock.patch.object(
                 dev_coordinator, "locked_state", side_effect=poisoned_locked_state
-            ),
-            mock.patch.object(
-                AccountStore,
-                "load_legacy_state_projection",
-                side_effect=poisoned_locked_state,
-            ),
-            mock.patch.object(
-                AccountStore,
-                "replace_legacy_state_projection",
-                side_effect=poisoned_locked_state,
             ),
             mock.patch.object(
                 dev_coordinator,

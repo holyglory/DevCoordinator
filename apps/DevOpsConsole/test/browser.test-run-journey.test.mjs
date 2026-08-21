@@ -109,110 +109,6 @@ else:
 `, { encoding: 'utf8', mode: 0o755 });
 }
 
-function hourStarts() {
-  return Array.from({ length: 24 }, (_, index) => {
-    const date = new Date();
-    date.setUTCMinutes(0, 0, 0);
-    date.setUTCHours(date.getUTCHours() - (23 - index));
-    return date.toISOString();
-  });
-}
-
-function repository(repoId, displayName, state, hours) {
-  return {
-    repo_id: repoId,
-    display_name: displayName,
-    state,
-    last_activity_at: new Date().toISOString(),
-    summary: {
-      test_count: 42,
-      test_seconds: 7_200,
-      wall_seconds: 1_800,
-      parallel_efficiency_ratio: 4,
-      pass_rate: state === 'failing' ? .8 : 1,
-      p95_queue_wait_seconds: 12,
-    },
-    hourly: hours.map((hour_start, index) => ({
-      hour_start,
-      test_seconds: index % 3 === 0 ? 1_800 : 0,
-      test_count: index % 3 === 0 ? 6 : 0,
-      failure_count: 0,
-    })),
-  };
-}
-
-function fleetFixture() {
-  const hours = hourStarts();
-  return {
-    schema_version: 2,
-    window: { hours: 24, start: hours[0], end: hours.at(-1), timezone: 'UTC' },
-    snapshot: {
-      generated_at: new Date().toISOString(),
-      observed_through: new Date().toISOString(),
-      source: 'rendered-run-fixture',
-    },
-    summary: {
-      repository_count: 2,
-      repositories_with_activity: 2,
-      run_count: 2,
-      running_count: 0,
-      test_count: 84,
-      test_seconds: 14_400,
-      wall_seconds: 3_600,
-      parallel_efficiency_ratio: 4,
-      p95_queue_wait_seconds: 12,
-      passed_count: 84,
-      failure_count: 0,
-      pass_rate: 1,
-      flaky_test_count: 0,
-      flake_rate: 0,
-      avoided_work: { available: true, test_count: 8, test_seconds: 300 },
-    },
-    hours,
-    repositories: [
-      repository(PRIMARY_REPO, 'Rendered Run Repository', 'healthy', hours),
-      repository(BLOCKED_REPO, 'Blocked Planner Repository', 'healthy', hours),
-    ],
-    capacity: hours.map((hour_start, index) => ({
-      hour_start,
-      test_seconds: index % 3 === 0 ? 3_600 : 0,
-      test_count: index % 3 === 0 ? 12 : 0,
-      failure_count: 0,
-      active_repository_count: 2,
-      p95_queue_wait_seconds: 12,
-    })),
-    attention: [],
-  };
-}
-
-function statsFixture(repoId) {
-  return {
-    schema_version: 1,
-    repo_id: repoId,
-    days: 30,
-    summary: {
-      test_count: 42,
-      run_count: 1,
-      run_seconds: 1_800,
-      test_seconds: 7_200,
-      passed_count: 42,
-      failed_count: 0,
-      error_count: 0,
-      running_count: 1,
-      failed_run_count: 0,
-      p95_queue_wait_seconds: 12,
-    },
-    comparison_summary: { test_seconds: 6_000 },
-    hourly: [],
-    daily: [],
-    previous_daily: [],
-    dynamics: [],
-    health: { pass_rate: 1, flake_rate: 0 },
-    efficiency: { parallel_efficiency_ratio: 4, p95_queue_wait_seconds: 12 },
-    avoided_work: { available: true, test_count: 8 },
-  };
-}
-
 function setupFixture(repoId) {
   return {
     schema_version: 1,
@@ -225,7 +121,6 @@ function setupFixture(repoId) {
       { name: 'lint', depends_on: [], network: 'none', fixtures: [] },
       { name: 'unit', depends_on: [], network: 'none', fixtures: [] },
     ],
-    evidence_policies: {},
     fixtures: {},
   };
 }
@@ -252,7 +147,7 @@ async function assertDialogInsideViewport(page, label) {
     `${label} Run tests journey must not cause document overflow: ${JSON.stringify(geometry)}`);
 }
 
-test('Run tests previews and submits exact plans on desktop and mobile, then renders a blocked planner',
+test('Current repositories run tests on desktop and mobile, then render a blocked planner',
   { timeout: 120_000 }, async () => {
     const { chromium } = loadLockedPlaywright();
     const fakeDockerDir = await canonicalTempDir('devops-console-browser-test-run-');
@@ -360,10 +255,6 @@ test('Run tests previews and submits exact plans on desktop and mobile, then ren
               },
             ],
           };
-        } else if (method === 'GET' && pathname === '/api/tests/fleet') {
-          body = fleetFixture();
-        } else if (method === 'GET' && pathname === '/api/tests') {
-          body = statsFixture(requestUrl.searchParams.get('project'));
         } else {
           const sourcesMatch = pathname.match(/^\/api\/tests\/repositories\/([^/]+)\/sources$/);
           const setupMatch = pathname.match(/^\/api\/tests\/repositories\/([^/]+)\/setup$/);
@@ -460,10 +351,9 @@ test('Run tests previews and submits exact plans on desktop and mobile, then ren
                 available_mib: 9_216,
                 reserve_mib: 2_048,
                 observed_at: new Date().toISOString(),
-                source: 'learned_peak',
+                source: 'fixed_default',
               },
               can_cancel: true,
-              can_retry: false,
             };
             runs.unshift(run);
             status = 202;
@@ -515,9 +405,8 @@ test('Run tests previews and submits exact plans on desktop and mobile, then ren
 
       const origin = `https://${stack.consoleHost}:${stack.httpsPort}`;
       await page.goto(`${origin}/#/tests`, { waitUntil: 'networkidle' });
-      await page.getByRole('heading', { name: 'Testing time by repository' }).waitFor();
-      await page.locator('#tests-search').fill('rendered');
-      await page.locator('#tests-run').click();
+      await page.locator('.test-current-repositories').waitFor();
+      await page.getByRole('button', { name: /Rendered Run Repository/ }).click();
       await page.locator('#test-run-targets input').first().waitFor();
       await page.locator('#test-run-source').waitFor({ state: 'visible' });
       assert.equal(await page.locator('#test-run-dialog').getAttribute('open'), '');
@@ -560,7 +449,6 @@ test('Run tests previews and submits exact plans on desktop and mobile, then ren
       assert.notEqual(submittedRequests[0].operation_id, planRequests[0].operation_id,
         'submission must carry its own idempotency operation while retaining the exact previewed plan');
       assert.match(await page.locator('#test-detail-h').textContent(), /Rendered Run Repository/);
-      await page.locator('#test-detail-tab-runs').click();
       await page.locator('.test-run-history-card').first().waitFor();
       assert.match(await page.locator('.test-run-history-card').first().textContent(), /Queued/);
       assert.match(await page.locator('.test-run-history-card').first().textContent(), /0\/2 targets/);
@@ -570,8 +458,8 @@ test('Run tests previews and submits exact plans on desktop and mobile, then ren
       );
       assert.doesNotMatch(await page.locator('#banner-slot').textContent(), /Waiting for memory/,
         'ordinary scheduler waits must never become a global Console banner');
-      assert.doesNotMatch(await page.locator('#tests-body').locator('.test-fleet-matrix-panel').textContent(), /Waiting for memory/,
-        'ordinary scheduler waits must never decorate the fleet heatmap');
+      assert.doesNotMatch(await page.locator('#tests-body').textContent(), /Waiting for memory/,
+        'ordinary scheduler waits must stay inside the current-run surface');
       await page.locator('.test-run-history-evidence summary').first().click();
       await page.getByText('fixture-run-1', { exact: true }).waitFor();
       const expandedEvidence = page.locator('.test-run-history-evidence-body').first();
@@ -602,7 +490,7 @@ test('Run tests previews and submits exact plans on desktop and mobile, then ren
 
       await page.setViewportSize({ width: 390, height: 844 });
       await page.waitForFunction(() => window.innerWidth === 390);
-      await page.locator('#tests-run').click();
+      await page.getByRole('button', { name: /Rendered Run Repository/ }).click();
       await page.locator('#test-run-targets input').first().waitFor();
       await assertDialogInsideViewport(page, '390px');
       assert.equal(
@@ -610,8 +498,6 @@ test('Run tests previews and submits exact plans on desktop and mobile, then ren
         `temporary:${PRIMARY_TEMPORARY_SOURCE.repository_id}:${PRIMARY_TEMPORARY_SOURCE.repository_generation}`,
         'the server-authorized source choice must survive dialog close/reopen',
       );
-      assert.equal(await page.locator('#tests-search').inputValue(), 'rendered',
-        'opening and refreshing the planner must retain the fleet filter');
       await page.locator('#test-run-targets input[value="lint"]').uncheck();
       await page.locator('#test-run-preview-button').click();
       await page.waitForFunction(() => document.querySelector('#test-run-submit')?.disabled === false);
@@ -627,7 +513,6 @@ test('Run tests previews and submits exact plans on desktop and mobile, then ren
       assert.equal(submittedRequests[1].plan_id, 'fixture-plan-2');
       assert.equal(submittedRequests[1].repo_id, PRIMARY_REPO);
       assert.equal(submittedRequests[1].operation_id, OPERATION_IDS.mobileSubmit);
-      await page.locator('#test-detail-tab-runs').click();
       await page.locator('.test-run-history-card').first().waitFor();
       assert.equal(await page.locator('.test-run-history-card').count(), 2);
       assert.match(await page.locator('.test-run-history-card').first().textContent(), /Queued/);
@@ -643,9 +528,8 @@ test('Run tests previews and submits exact plans on desktop and mobile, then ren
       );
       await page.locator('#test-detail-close').click();
 
-      await page.locator('#tests-run').click();
+      await page.getByRole('button', { name: /Blocked Planner Repository/ }).click();
       await page.locator('#test-run-targets input').first().waitFor();
-      await page.locator('#test-run-project').selectOption(BLOCKED_REPO);
       await page.waitForFunction((repoId) => (
         document.querySelector('#test-run-project')?.value === repoId
         && document.querySelectorAll('#test-run-targets input').length === 3

@@ -39,13 +39,7 @@ SERVICE_CONTRACTS = {
     "devcoordinator-edge.service": ServiceContract(
         "devcoordinator-edge", "devcoordinator-control.slice"
     ),
-    "devcoordinator-edge-handoff.service": ServiceContract(
-        "devcoordinator-edge", "devcoordinator-control.slice"
-    ),
     "devcoordinator-api.service": ServiceContract(
-        "devcoordinator-api", "devcoordinator-control.slice"
-    ),
-    "devcoordinator-api-handoff.service": ServiceContract(
         "devcoordinator-api", "devcoordinator-control.slice"
     ),
     "devcoordinator-authority.service": ServiceContract(
@@ -88,16 +82,6 @@ SOCKET_CONTRACTS = {
         "443",
         "https",
     ),
-    "devcoordinator-edge-handoff-http.socket": (
-        "devcoordinator-edge-handoff.service",
-        "DEVCOORDINATOR_HANDOFF_HTTP_PORT",
-        "http",
-    ),
-    "devcoordinator-edge-handoff-https.socket": (
-        "devcoordinator-edge-handoff.service",
-        "DEVCOORDINATOR_HANDOFF_HTTPS_PORT",
-        "https",
-    ),
     "devcoordinator-edge-publication.socket": (
         "devcoordinator-edge.service",
         "/run/devcoordinator-edge-publication/publish.sock",
@@ -106,11 +90,6 @@ SOCKET_CONTRACTS = {
     "devcoordinator-api.socket": (
         "devcoordinator-api.service",
         "127.0.0.1:29876",
-        "api",
-    ),
-    "devcoordinator-api-handoff.socket": (
-        "devcoordinator-api-handoff.service",
-        "127.0.0.1:DEVCOORDINATOR_HANDOFF_API_PORT",
         "api",
     ),
     "devcoordinator-authority.socket": (
@@ -208,7 +187,6 @@ CALL_JOURNAL_ENVIRONMENT = {
 }
 CALL_JOURNAL_ENV_SERVICES = {
     "devcoordinator-api.service",
-    "devcoordinator-api-handoff.service",
     "devcoordinator-testd.service",
     "devcoordinator-test-snapshotd.service",
 }
@@ -499,7 +477,7 @@ def validate_service(
                 )
             )
 
-    if path.name in {"devcoordinator-edge.service", "devcoordinator-edge-handoff.service"}:
+    if path.name == "devcoordinator-edge.service":
         if values(unit, "Service", "SystemCallFilter") != [
             "@system-service pkey_alloc pkey_free pkey_mprotect"
         ]:
@@ -562,7 +540,6 @@ def validate_service(
                 )
     if path.name in {
         "devcoordinator-api.service",
-        "devcoordinator-api-handoff.service",
         "devcoordinator-authority.service",
     }:
         command = one(unit, "Service", "ExecStart") or ""
@@ -703,10 +680,7 @@ def validate_service(
                     "authority must create and write the verified test artifact store",
                 )
             )
-    if path.name in {
-        "devcoordinator-authority.service",
-        "devcoordinator-broker.service",
-    }:
+    if path.name == "devcoordinator-authority.service":
         if one(unit, "Service", "StateDirectoryMode") != "0711":
             findings.append(
                 violation(
@@ -728,7 +702,7 @@ def validate_service(
                     "the socket unit owns /run/devcoordinator; no service may lifecycle-manage the same directory",
                 )
             )
-    if path.name in {"devcoordinator-api.service", "devcoordinator-api-handoff.service"}:
+    if path.name == "devcoordinator-api.service":
         if one(unit, "Service", "ProtectHome") != "read-only":
             findings.append(
                 violation(
@@ -756,11 +730,7 @@ def validate_service(
                         f"API ExecStart must include {flag}",
                     )
                 )
-        expected_profile = (
-            "/etc/devcoordinator/api-handoff-profile.json"
-            if path.name == "devcoordinator-api-handoff.service"
-            else "/etc/devcoordinator/client-profiles.json"
-        )
+        expected_profile = "/etc/devcoordinator/client-profiles.json"
         preflight = one(unit, "Service", "ExecStartPre") or ""
         if (
             f"--profile {expected_profile}" not in command
@@ -771,14 +741,10 @@ def validate_service(
                 violation(
                     "api_profile_contract_invalid",
                     path,
-                    "stable and handoff APIs must use their exact profiles at the current schema",
+                    "the stable API must use the current protected profile schema",
                 )
             )
-        expected_role = (
-            "DEVCOORDINATOR_ROLE=api-handoff"
-            if path.name == "devcoordinator-api-handoff.service"
-            else "DEVCOORDINATOR_ROLE=api"
-        )
+        expected_role = "DEVCOORDINATOR_ROLE=api"
         if values(unit, "Service", "Environment") != [
             expected_role,
             "DEVCOORDINATOR_INVENTORY_PUBLICATION=/var/lib/devcoordinator-observer/inventory.publication",
@@ -1335,7 +1301,6 @@ def validate_tmpfiles(path: Path) -> list[Violation]:
         "/etc/devcoordinator/edge": ("d", "0700", "root", "root"),
         "/etc/devcoordinator/console-slots": ("d", "0755", "root", "root"),
         "/etc/devcoordinator/client-profiles.json": ("z", "0644", "root", "root"),
-        "/etc/devcoordinator/api-handoff-profile.json": ("z", "0644", "root", "root"),
         "/etc/devcoordinator/browser-runtime-lock.json": ("z", "0644", "root", "root"),
         "/run/devcoordinator": ("d", "0755", "root", "root"),
         "/run/devcoordinator-maintenance": ("d", "0755", "root", "root"),
@@ -1444,22 +1409,6 @@ def validate_topology(
             findings.extend(
                 validate_service(path, contract, release_digest=release_digest)
             )
-    legacy_broker = unit_dir / "devcoordinator-broker.service"
-    if legacy_broker.is_file() and not legacy_broker.is_symlink():
-        legacy_unit = parse_unit(legacy_broker)
-        legacy_runtime_directories = {
-            item
-            for declaration in values(legacy_unit, "Service", "RuntimeDirectory")
-            for item in declaration.split()
-        }
-        if "devcoordinator" in legacy_runtime_directories:
-            findings.append(
-                violation(
-                    "authority_runtime_directory_socket_conflict",
-                    legacy_broker,
-                    "the retired broker must not lifecycle-manage the stable authority socket directory",
-                )
-            )
     for name, contract in SOCKET_CONTRACTS.items():
         path = unit_dir / name
         if path.is_file() and not path.is_symlink():
@@ -1501,27 +1450,6 @@ def validate_topology(
                 validate_slice(path, weight, rendered=release_digest is not None)
             )
     if release_digest is not None:
-        handoff_ports = []
-        for name in (
-            "devcoordinator-edge-handoff-http.socket",
-            "devcoordinator-edge-handoff-https.socket",
-            "devcoordinator-api-handoff.socket",
-        ):
-            path = unit_dir / name
-            if path.is_file() and not path.is_symlink():
-                listener = one(parse_unit(path), "Socket", "ListenStream")
-                if listener:
-                    port = listener.rsplit(":", 1)[-1]
-                    if port.isdigit():
-                        handoff_ports.append(int(port))
-        if len(handoff_ports) != 3 or len(set(handoff_ports)) != 3:
-            findings.append(
-                Violation(
-                    "handoff_socket_collision",
-                    "<contract>",
-                    "temporary HTTP, HTTPS, and API sockets require distinct high ports",
-                )
-            )
         parsed_slices = {
             name: parse_unit(unit_dir / name)
             for name in SLICE_CONTRACTS

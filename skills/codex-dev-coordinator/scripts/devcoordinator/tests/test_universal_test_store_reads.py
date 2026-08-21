@@ -132,7 +132,7 @@ class UniversalTestStoreReadTests(unittest.TestCase):
                 "missing-run", repository_id="repo-tests"
             )
 
-    def test_case_pages_are_bounded_and_run_scoped(self) -> None:
+    def test_case_details_are_reduced_to_current_run_counts(self) -> None:
         submitted = self.submit()
         target = self.store.runnable_targets()[0]
         grant = self.store.lease_target(
@@ -168,14 +168,10 @@ class UniversalTestStoreReadTests(unittest.TestCase):
             operation_id=operation_id(),
         )
 
-        first = self.store.cases(run_id=submitted.run_id, limit=1)
-        self.assertEqual(first[0]["case_id"], "case-a")
-        second = self.store.cases(
-            run_id=submitted.run_id, after=int(first[0]["cursor"]), limit=1
-        )
-        self.assertEqual(second[0]["case_id"], "case-b")
-        with self.assertRaises(TestStoreNotFound):
-            self.store.cases(run_id="missing-run")
+        metrics = self.store.run_metrics(submitted.run_id)
+        self.assertEqual(metrics["passed_count"], 1)
+        self.assertEqual(metrics["failed_count"], 1)
+        self.assertFalse(hasattr(self.store, "cases"))
 
 
 if __name__ == "__main__":

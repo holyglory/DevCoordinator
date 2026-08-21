@@ -173,14 +173,6 @@ def _launch_timeout(raw: str) -> int:
     return _bounded_positive(raw, name="launch timeout", maximum=3_600)
 
 
-def _stats_days(raw: str) -> int:
-    return _bounded_positive(raw, name="statistics period", maximum=3_650)
-
-
-def _stats_limit(raw: str) -> int:
-    return _bounded_positive(raw, name="statistics limit", maximum=500)
-
-
 def _operation_id(raw: str) -> str:
     try:
         parsed = uuid.UUID(raw)
@@ -363,32 +355,11 @@ def add_universal_test_cli_parser(subparsers: Any) -> argparse.ArgumentParser:
     cancel.add_argument("--reason", required=True, type=_reason)
     cancel.add_argument("--operation-id", required=True, type=_operation_id)
 
-    retry = actions.add_parser("retry", help="retry only failed work idempotently")
-    _add_run_repository(retry)
-    retry.add_argument("--run-id", required=True, type=_opaque_id)
-    retry.add_argument("--failed-only", action="store_true", required=True)
-    retry.add_argument("--operation-id", required=True, type=_operation_id)
-
-    policy = actions.add_parser("policy", help="inspect named evidence policy state")
-    policy_actions = policy.add_subparsers(dest="policy_action", required=True)
-    policy_check = policy_actions.add_parser(
-        "check", help="check one immutable snapshot against a named policy"
-    )
-    policy_check.add_argument("--root-repo", required=True)
-    policy_check.add_argument("--policy", required=True, type=_opaque_id)
-    policy_check.add_argument("--snapshot", required=True, type=_opaque_id)
-    policy_check.add_argument("--operation-id", type=_operation_id)
-
     catalog = actions.add_parser(
         "catalog", help="report ready, missing, and invalid repository manifests"
     )
     catalog.add_argument("--root-repo")
     catalog.set_defaults(compact_json=True)
-
-    stats = actions.add_parser("stats", help="read bounded repository test rollups")
-    stats.add_argument("--project", "--root-repo", dest="project", required=True)
-    stats.add_argument("--days", type=_stats_days, default=30)
-    stats.add_argument("--limit", type=_stats_limit, default=25)
 
     wait = actions.add_parser(
         "wait", help="explicitly wait for one run for at most 86400 seconds"
@@ -1668,7 +1639,6 @@ def handle_universal_test_cli(
     *,
     canonical_project: Callable[[str], str],
     broker_profile_loader: Callable[[], object | None],
-    statistics_reader: Callable[..., dict[str, Any]],
 ) -> dict[str, Any]:
     """Execute one test CLI action without bypassing broker-owned state."""
 
@@ -1724,49 +1694,6 @@ def handle_universal_test_cli(
         if broker_profile_error is not None:
             result["broker_profile_error"] = _BROKER_PROFILE_ERROR
         return _bounded_catalog_envelope(result)
-    if action == "stats":
-        if not 1 <= args.days <= 3650 or not 1 <= args.limit <= 500:
-            raise UniversalTestCliError("test stats require days 1-3650 and limit 1-500")
-        return statistics_reader(
-            project=canonical_project(args.project), days=args.days, limit=args.limit
-        )
-    if action == "policy":
-        root = Path(canonical_project(args.root_repo))
-        manifest = load_test_manifest(root)
-        if args.policy not in manifest.evidence_policies:
-            raise UniversalTestCliError(f"unknown evidence policy: {args.policy}")
-        policy = manifest.evidence_policies[args.policy]
-        if policy.allow_reuse and args.operation_id is not None:
-            raise UniversalTestCliError(
-                "reusable evidence checks do not accept an operation ID"
-            )
-        if not policy.allow_reuse and args.operation_id is None:
-            raise UniversalTestCliError(
-                "non-reusable evidence requires --operation-id for exact consumption"
-            )
-        broker_profile, broker_profile_error = _optional_broker_profile(
-            broker_profile_loader
-        )
-        return _scheduler_result_or_pending(
-            broker_profile=broker_profile,
-            broker_profile_error=broker_profile_error,
-            method_name=(
-                "check_test_evidence"
-                if policy.allow_reuse
-                else "consume_test_evidence"
-            ),
-            action=("policy.check" if policy.allow_reuse else "policy.consume"),
-            arguments={
-                "repository": str(root),
-                "policy": args.policy,
-                "snapshot": args.snapshot,
-                **(
-                    {}
-                    if policy.allow_reuse
-                    else {"operation_id": args.operation_id}
-                ),
-            },
-        )
     context = {
         key: value
         for key, value in vars(args).items()
@@ -1785,7 +1712,7 @@ def handle_universal_test_cli(
         }
         and value is not None
     }
-    if action in {"submit", "cancel", "retry"}:
+    if action in {"submit", "cancel"}:
         try:
             context["actor"] = calling_codex_test_actor()
         except TestActorContractError as error:
@@ -1799,7 +1726,6 @@ def handle_universal_test_cli(
         "failures": "test_run_failures",
         "artifact": "test_artifact",
         "cancel": "cancel_test_run",
-        "retry": "retry_test_run",
         "wait": "wait_test_run",
     }
     broker_profile, broker_profile_error = _optional_broker_profile(

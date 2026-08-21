@@ -92,7 +92,7 @@ def _compact_plan(plan: Any) -> dict[str, Any]:
     }
 
 
-def enqueue_test(
+def run_test(
     *,
     profile: Any,
     repository: Any,
@@ -104,7 +104,7 @@ def enqueue_test(
     actor: str,
     operation_id: str,
 ) -> dict[str, Any]:
-    """Register and, for routine intents, submit one replay-safe test plan."""
+    """Validate and submit one replay-safe test run."""
 
     if intent not in TEST_INTENTS:
         raise AgentTestError("test_intent_invalid", "test intent is unsupported")
@@ -182,24 +182,6 @@ def enqueue_test(
     else:
         raise AgentTestError("test_reply_invalid", "test preview omitted its plan")
 
-    if intent in {"handoff", "release"}:
-        plan_handle = continuation_handle("plan", plan_id)
-        return require_agent_result(
-            {
-                "schema_version": 1,
-                "ok": True,
-                "classification": "test_plan_ready",
-                "repository_id": repository.repo_id,
-                "operation_id": operation_id,
-                "continuation": plan_handle,
-                "plan": plan_projection,
-                "submission_performed": False,
-                "next_command": f"devcoordinator test submit {plan_handle}",
-            },
-            surface="test enqueue",
-            maximum_bytes=MAX_TEST_RESULT_BYTES,
-        )
-
     submit_operation_id = child_operation_id(operation_id, "submit")
     submitted = profile.submit_test_plan(
         repository=repository.repo_id,
@@ -224,7 +206,7 @@ def enqueue_test(
         {
             "schema_version": 1,
             "ok": True,
-            "classification": "test_enqueued",
+            "classification": "test_run_started",
             "repository_id": repository.repo_id,
             "operation_id": operation_id,
             "submission_operation_id": submit_operation_id,
@@ -234,134 +216,7 @@ def enqueue_test(
             "submission_performed": True,
             "next_command": f"devcoordinator test follow {run_handle}",
         },
-        surface="test enqueue",
-        maximum_bytes=MAX_TEST_RESULT_BYTES,
-    )
-
-
-def submit_test_plan(
-    *,
-    profile: Any,
-    repository: Any,
-    plan_id: str,
-    actor: str,
-    operation_id: str,
-) -> dict[str, Any]:
-    submitted = profile.submit_test_plan(
-        repository=repository.repo_id,
-        plan_id=_opaque(plan_id, field="plan_id"),
-        operation_id=operation_id,
-        actor=actor,
-    )
-    if not isinstance(submitted, Mapping):
-        raise AgentTestError("test_reply_invalid", "test submission reply is not an object")
-    run_id = _opaque(submitted.get("run_id"), field="run_id")
-    if submitted.get("repository_id") != repository.repo_id:
-        raise AgentTestError(
-            "test_reply_invalid", "test submission contradicted repository identity"
-        )
-    run_handle = continuation_handle("run", run_id)
-    return require_agent_result(
-        {
-            "schema_version": 1,
-            "ok": True,
-            "classification": "test_enqueued",
-            "repository_id": repository.repo_id,
-            "operation_id": operation_id,
-            "continuation": run_handle,
-            "plan_id": plan_id,
-            "run": {
-                "id": run_id,
-                "state": bounded_text(submitted.get("state", "queued"), maximum_bytes=64),
-            },
-            "submission_performed": True,
-            "next_command": f"devcoordinator test follow {run_handle}",
-        },
-        surface="reviewed test submission",
-        maximum_bytes=MAX_TEST_RESULT_BYTES,
-    )
-
-
-def project_queue_status(
-    status: Mapping[str, Any], *, repository_id: str
-) -> dict[str, Any]:
-    """Validate and bound repository queue evidence for agent callers."""
-
-    if status.get("repository_id") != repository_id:
-        raise AgentTestError(
-            "test_reply_invalid", "queue status contradicted repository identity"
-        )
-    result = {
-        "schema_version": 1,
-        "ok": True,
-        "classification": "test_queue_status",
-        "repository_id": repository_id,
-        "sampled_at": status.get("sampled_at"),
-        "phase": bounded_text(status.get("phase", "unknown"), maximum_bytes=64),
-        "global_targets": _small_mapping(status.get("global_targets"), limit=3),
-        "repository_targets": _small_mapping(
-            status.get("repository_targets"), limit=3
-        ),
-        "repository_runnable_targets": status.get("repository_runnable_targets"),
-        "approximate_first_position": status.get("approximate_first_position"),
-        "position_population_truncated": bool(
-            status.get("position_population_truncated")
-        ),
-        "blockers": [
-            {
-                "code": bounded_text(item.get("code", "unknown"), maximum_bytes=64),
-                "target_count": item.get("target_count"),
-            }
-            for item in status.get("blockers", [])[:16]
-            if isinstance(item, Mapping)
-        ],
-        "representative_targets": [
-            {
-                "run_id": _opaque(item.get("run_id"), field="run_id"),
-                "target_name": _opaque(
-                    item.get("target_name"), field="target_name"
-                ),
-                "state": bounded_text(
-                    item.get("state", "unknown"), maximum_bytes=64
-                ),
-                "attempt_id": (
-                    None
-                    if item.get("attempt_id") is None
-                    else _opaque(item.get("attempt_id"), field="attempt_id")
-                ),
-                "wait_code": (
-                    None
-                    if item.get("wait_code") is None
-                    else bounded_text(item.get("wait_code"), maximum_bytes=64)
-                ),
-            }
-            for item in status.get("representative_targets", [])[:16]
-            if isinstance(item, Mapping)
-        ],
-        "worker_capacity": {
-            "model": bounded_text(
-                (
-                    status.get("worker_capacity", {}).get("model", "unknown")
-                    if isinstance(status.get("worker_capacity"), Mapping)
-                    else "unknown"
-                ),
-                maximum_bytes=64,
-            ),
-            "limit": (
-                status.get("worker_capacity", {}).get("limit")
-                if isinstance(status.get("worker_capacity"), Mapping)
-                else None
-            ),
-            "available": (
-                status.get("worker_capacity", {}).get("available")
-                if isinstance(status.get("worker_capacity"), Mapping)
-                else None
-            ),
-        },
-    }
-    return require_agent_result(
-        result,
-        surface="test queue status",
+        surface="test run",
         maximum_bytes=MAX_TEST_RESULT_BYTES,
     )
 
@@ -582,9 +437,7 @@ def project_test_follow(
         "failure_count": failed_cases,
         "failure_record_count": source_failure_count,
         "next_command": (
-            f"devcoordinator test failures {run_handle}"
-            if terminal and source_failure_count > 0
-            else None
+            None
             if terminal
             else f"devcoordinator test follow {run_handle} --wait-seconds 30"
         ),
@@ -612,8 +465,6 @@ __all__ = [
     "TERMINAL_STATES",
     "TEST_INTENTS",
     "child_operation_id",
-    "enqueue_test",
-    "project_queue_status",
+    "run_test",
     "project_test_follow",
-    "submit_test_plan",
 ]

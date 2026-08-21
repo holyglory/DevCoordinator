@@ -17,8 +17,7 @@ const MAX_OUTPUT_BYTES = 256 * 1024;
 const MAX_TIMEOUT_MS = 30_000;
 const REQUIRED_WIDTHS = [320, 390, 768, 981, 1440];
 const TESTS_REPOSITORY_CONTROL_SELECTOR = [
-  '#tests-body .test-repository-button:visible',
-  '#tests-body .test-fleet-mobile-row:visible',
+  '#tests-body .test-current-repository:visible',
 ].join(', ');
 const EXACT_REQUEST_FIELDS = new Set([
   'schema_version',
@@ -248,21 +247,18 @@ async function newContext(browser, request, viewport) {
   return context;
 }
 
-async function warmRetainedTests(browser, request) {
+async function warmCurrentTests(browser, request) {
   const context = await newContext(browser, request, request.viewports[0]);
   const page = await context.newPage();
   page.setDefaultTimeout(request.navigation_timeout_ms);
   try {
-    const fleetResponse = page.waitForResponse(
-      (response) => new URL(response.url()).pathname === '/api/tests/fleet',
+    const catalogResponse = page.waitForResponse(
+      (response) => new URL(response.url()).pathname === '/api/tests/repositories',
       { timeout: request.navigation_timeout_ms },
     );
     await page.goto(request.tests_url, { waitUntil: 'domcontentloaded', timeout: request.navigation_timeout_ms });
-    const response = await fleetResponse;
-    if (response.status() !== 200 || !(await authenticated(page))) fail('retained Tests warm-up was not authenticated');
-    const payload = await response.json();
-    const state = payload?.snapshot?.delivery?.state;
-    if (state !== 'retained') await page.waitForTimeout(request.retained_warm_delay_ms);
+    const response = await catalogResponse;
+    if (response.status() !== 200 || !(await authenticated(page))) fail('Tests warm-up was not authenticated');
   } finally {
     await context.close();
   }
@@ -274,10 +270,10 @@ async function measure(browser, request, viewport, journey) {
   page.setDefaultTimeout(request.navigation_timeout_ms);
   await installLcpObserver(page);
   try {
-    let fleetResponse = null;
+    let catalogResponse = null;
     if (journey === 'tests') {
-      fleetResponse = page.waitForResponse(
-        (response) => new URL(response.url()).pathname === '/api/tests/fleet',
+      catalogResponse = page.waitForResponse(
+        (response) => new URL(response.url()).pathname === '/api/tests/repositories',
         { timeout: request.navigation_timeout_ms },
       );
     }
@@ -294,31 +290,30 @@ async function measure(browser, request, viewport, journey) {
       fail('browser navigation is not authenticated');
     }
 
-    let fleetDeliveryState = null;
-    let retainedTests = false;
+    let testDeliveryState = null;
+    let currentTests = false;
     let state;
     let apiStatus = null;
     if (journey === 'tests') {
-      const response = await fleetResponse;
+      const response = await catalogResponse;
       apiStatus = response.status();
-      if (apiStatus !== 200) fail('retained Tests projection was unavailable');
+      if (apiStatus !== 200) fail('current Tests catalog was unavailable');
       const contentLength = Number(response.headers()['content-length'] || 0);
-      if (contentLength > 8 * 1024 * 1024) fail('retained Tests projection exceeded its byte bound');
-      const fleet = await response.json();
-      fleetDeliveryState = fleet?.snapshot?.delivery?.state ?? null;
+      if (contentLength > 1024 * 1024) fail('current Tests catalog exceeded its byte bound');
+      const catalog = await response.json();
+      testDeliveryState = 'current';
       if (
-        fleet?.schema_version !== 2
-        || !Array.isArray(fleet?.repositories)
-        || fleet.repositories.length < 1
-        || fleetDeliveryState !== 'retained'
-      ) fail('Tests did not render from the retained authenticated projection');
+        catalog?.schema_version !== 1
+        || !Array.isArray(catalog?.repositories)
+        || catalog.repositories.length < 1
+      ) fail('Tests did not render from the current authenticated catalog');
       await page.waitForSelector('#sec-tests:not([hidden])', { state: 'visible' });
-      await page.waitForSelector('#tests-body .test-fleet-summary', { state: 'visible' });
+      await page.waitForSelector('#tests-body .test-current-repositories', { state: 'visible' });
       await page.waitForSelector(TESTS_REPOSITORY_CONTROL_SELECTOR, { state: 'visible' });
       const invalidState = await page.locator('#tests-body .skel, #tests-body .test-local-failure').count();
       if (invalidState !== 0) fail('Tests retained state still contains loading or failure content');
-      retainedTests = true;
-      state = 'authenticated_retained_tests';
+      currentTests = true;
+      state = 'authenticated_current_tests';
     } else {
       await page.waitForSelector('header', { state: 'visible' });
       await page.waitForSelector('main', { state: 'visible' });
@@ -333,8 +328,8 @@ async function measure(browser, request, viewport, journey) {
       navigation_status: navigation.status(),
       api_status: apiStatus,
       authenticated: true,
-      retained_tests: retainedTests,
-      fleet_delivery_state: fleetDeliveryState,
+      current_tests: currentTests,
+      test_delivery_state: testDeliveryState,
       state,
       ...lcp,
       observed_at: new Date().toISOString(),
@@ -353,7 +348,7 @@ async function run(request) {
   });
   try {
     if (browser.version() !== request.browser_product_version) fail('launched browser version differs from the runtime lock');
-    await warmRetainedTests(browser, request);
+    await warmCurrentTests(browser, request);
     // Tests samples start together so all five consume the retained projection
     // before its one background refresh can replace the cache generation.
     const testSamples = await Promise.all(request.viewports.map((viewport) => measure(browser, request, viewport, 'tests')));

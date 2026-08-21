@@ -117,20 +117,8 @@ def broker_capabilities(
             "empty_proof": "populated=0",
         },
         "tests": {
-            "actions": [
-                "artifact",
-                "cancel",
-                "enqueue",
-                "failures",
-                "follow",
-                "queue-status",
-                "retry",
-                "status",
-                "submit",
-                "summary",
-                "wait",
-            ],
-            "enqueue_intents": [
+            "actions": ["artifact", "cancel", "follow", "run"],
+            "run_intents": [
                 "change",
                 "checkpoint",
                 "handoff",

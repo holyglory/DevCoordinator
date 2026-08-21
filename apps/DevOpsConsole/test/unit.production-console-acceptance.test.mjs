@@ -99,14 +99,12 @@ test('production lifecycle journey distinguishes absent, unavailable and interac
     'the journey must recheck availability immediately before interaction');
 });
 
-test('production test journey proves every supported live statistics window', () => {
+test('production test journey proves the current repository catalog', () => {
   const source = fs.readFileSync(TOOL, 'utf8');
-  assert.match(source, /for \(const days of \['7', '30', '90'\]\)/,
-    'the authenticated journey must request every supported statistics window');
-  assert.match(source, /requestUrl\.searchParams\.get\('days'\) === days/,
-    'each selection must be bound to its exact successful API response');
-  assert.match(source, /period === `Last \$\{expected\} days`/,
-    'the exact live period must become visible in the repository throughput surface');
+  assert.match(source, /#sec-tests \.test-current-repository/,
+    'the authenticated journey must require one current repository row');
+  assert.match(source, /authenticated current repository catalog rendered without history/,
+    'the journey must verify current catalog semantics without historical projections');
 });
 
 test('production acceptance source retains fail-closed health, loading, geometry and journey gates', () => {

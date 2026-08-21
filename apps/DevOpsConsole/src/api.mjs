@@ -38,7 +38,7 @@ const TEST_REPO_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_.@-]{0,255}$/;
 const TEST_ENTITY_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_.:@/-]{0,255}$/;
 const TEST_INTENTS = new Set(['change', 'checkpoint', 'handoff', 'release', 'manual']);
 const TEST_WAIT_CODES = new Set(['host_memory']);
-const TEST_WAIT_SOURCES = new Set(['learned_peak', 'cold_start_default']);
+const TEST_WAIT_SOURCES = new Set(['fixed_default']);
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 class ApiError extends Error {
@@ -310,7 +310,7 @@ export function createConsoleApi({
         return item;
       });
     }
-    for (const field of ['intents', 'evidence_policies']) {
+    for (const field of ['intents']) {
       if (Array.isArray(setup?.[field])) view[field] = setup[field].map(String);
     }
     for (const field of ['issues', 'input_coverage_gaps']) {
@@ -2327,26 +2327,6 @@ export function createConsoleApi({
       if (method === 'GET' && pathname === '/api/overview') {
         return await handleOverview(res, { fresh: searchParams.get('fresh') === '1' });
       }
-      if (method === 'GET' && pathname === '/api/tests') {
-        const project = requireTestRepoId(searchParams.get('project'));
-        const days = boundedInteger(searchParams.get('days'), 30, 1, 3650, 'days');
-        const limit = boundedInteger(searchParams.get('limit'), 25, 1, 500, 'limit');
-        await requireKnownTestRepository(project);
-        return sendJson(res, 200, await coordinator.testStats({ project, days, limit }));
-      }
-      if (method === 'GET' && pathname === '/api/tests/fleet') {
-        const hours = boundedInteger(searchParams.get('hours'), 24, 1, 168, 'hours');
-        const [catalog, fleet] = await Promise.all([
-          coordinator.testRepositories(),
-          coordinator.testFleet({ hours }),
-        ]);
-        const configured = Array.isArray(catalog?.repositories) ? catalog.repositories : [];
-        const validConfigured = configured
-          .filter((repository) => repository && TEST_REPO_ID_RE.test(String(repository.repo_id || '')));
-        return sendJson(res, 200, filterTestFleet(fleet, validConfigured, {
-          preserveAggregateMetrics: true,
-        }));
-      }
       if (method === 'GET' && pathname === '/api/tests/repositories') {
         const catalog = await coordinator.testRepositories();
         const repositories = (catalog?.repositories || [])
@@ -2371,17 +2351,6 @@ export function createConsoleApi({
           throw new ApiError(502, 'coordinator returned contradictory test setup identity');
         }
         return sendJson(res, 200, testSetupView(setup, repoId));
-      }
-      if (method === 'GET' && pathname === '/api/tests/events') {
-        const repoId = requireTestRepoId(searchParams.get('repo_id'));
-        const after = boundedInteger(searchParams.get('after'), 0, 0, Number.MAX_SAFE_INTEGER, 'after');
-        const limit = boundedInteger(searchParams.get('limit'), 200, 1, 500, 'limit');
-        await requireKnownTestRepository(repoId);
-        const events = await coordinator.testEvents({ repoId, after, limit });
-        if ((events?.repository_id ?? events?.repo_id) !== repoId) {
-          throw new ApiError(502, 'coordinator returned contradictory test event identity');
-        }
-        return sendJson(res, 200, events);
       }
       if (method === 'POST' && pathname === '/api/tests/plan') {
         const body = await readJsonBody(req);
@@ -2448,37 +2417,21 @@ export function createConsoleApi({
       }
       if (method === 'GET' && pathname === '/api/tests/runs') {
         const repoId = requireTestRepoId(searchParams.get('repo_id'));
-        const after = searchParams.get('after');
-        const limit = boundedInteger(searchParams.get('limit'), 50, 1, 200, 'limit');
-        const runState = searchParams.get('state');
-        if (after !== null) requireTestEntityId(after, 'after');
-        if (runState !== null && ![
-          'queued', 'running', 'cancelling', 'superseding', 'succeeded', 'failed',
-          'timed_out', 'cancelled', 'incomplete', 'abandoned', 'superseded',
-        ].includes(runState)) {
-          throw new ApiError(400, 'state is invalid');
+        if ([...searchParams.keys()].some((name) => name !== 'repo_id')) {
+          throw new ApiError(400, 'current test runs accept only repo_id');
         }
         await requireKnownTestRepository(repoId);
-        const result = await coordinator.testRuns({
-          repoId, after, limit, state: runState,
-        });
+        const result = await coordinator.testRuns({ repoId });
         if ((result?.repository_id ?? result?.repo_id) !== repoId || !Array.isArray(result?.runs)) {
-          throw new ApiError(502, 'coordinator returned contradictory test run history');
-        }
-        const nextCursor = result.next_cursor ?? result.next ?? null;
-        if (nextCursor !== null && (
-          typeof nextCursor !== 'string' || !TEST_ENTITY_ID_RE.test(nextCursor)
-        )) {
-          throw new ApiError(502, 'coordinator returned an invalid test run history cursor');
+          throw new ApiError(502, 'coordinator returned contradictory current test runs');
         }
         const activeStates = new Set(['queued', 'running', 'cancelling', 'superseding']);
         const runs = result.runs.map((run) => {
           return testRunView(run, {
             can_cancel: activeStates.has(run.state),
-            can_retry: !activeStates.has(run.state) && run.state !== 'succeeded',
           });
         });
-        return sendJson(res, 200, { ...result, runs, next_cursor: nextCursor });
+        return sendJson(res, 200, { schema_version: 1, repo_id: repoId, runs });
       }
       if (method === 'POST' && pathname === '/api/tests/runs') {
         const body = await readJsonBody(req);
@@ -2501,7 +2454,7 @@ export function createConsoleApi({
         return sendJson(res, 202, result);
       }
       const testRunMatch = pathname.match(
-        /^\/api\/tests\/repositories\/([^/]+)\/runs\/([^/]+)(?:\/(summary|failures|artifacts|cases|cancel|retry))?$/,
+        /^\/api\/tests\/repositories\/([^/]+)\/runs\/([^/]+)(?:\/(summary|failures|artifacts|cancel))?$/,
       );
       if (testRunMatch) {
         const repoId = requireTestRepoId(safeDecode(testRunMatch[1]));
@@ -2529,17 +2482,14 @@ export function createConsoleApi({
           }
           return sendJson(res, 200, testRunSummaryView(summary));
         }
-        if (method === 'GET' && ['failures', 'artifacts', 'cases'].includes(action)) {
+        if (method === 'GET' && ['failures', 'artifacts'].includes(action)) {
           const rawAfter = searchParams.get('after');
           const limit = boundedInteger(searchParams.get('limit'), 50, 1, 50, 'limit');
-          const after = action === 'cases'
-            ? boundedInteger(rawAfter, 0, 0, Number.MAX_SAFE_INTEGER, 'after')
-            : rawAfter;
-          if (action !== 'cases' && after !== null) requireTestEntityId(after, 'after');
+          const after = rawAfter;
+          if (after !== null) requireTestEntityId(after, 'after');
           const operation = {
             failures: coordinator.testRunFailures,
             artifacts: coordinator.testRunArtifacts,
-            cases: coordinator.testRunCases,
           }[action];
           const evidence = await operation({ repoId, runId, after, limit });
           if ((evidence?.repository_id ?? evidence?.repo_id) !== repoId) {
@@ -2561,20 +2511,6 @@ export function createConsoleApi({
             throw new ApiError(502, 'coordinator returned contradictory cancellation identity');
           }
           return sendJson(res, 200, result);
-        }
-        if (method === 'POST' && action === 'retry') {
-          const body = await readJsonBody(req);
-          requireExactFields(body, ['failed_only', 'operation_id'], 'test retry');
-          if (typeof body.failed_only !== 'boolean') throw new ApiError(400, 'failed_only must be boolean');
-          const operationId = requireString(body.operation_id, 'operation_id');
-          if (!UUID_RE.test(operationId)) throw new ApiError(400, 'operation_id must be a UUID');
-          const result = await coordinator.retryTestRun({
-            repoId, runId, failedOnly: body.failed_only, operationId, actor: googleTestActor(session),
-          });
-          if ((result?.repository_id ?? result?.repo_id) !== repoId) {
-            throw new ApiError(502, 'coordinator returned contradictory retry identity');
-          }
-          return sendJson(res, 202, result);
         }
       }
       if (method === 'GET' && pathname === '/api/metrics/history') {

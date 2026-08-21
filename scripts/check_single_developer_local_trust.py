@@ -41,9 +41,7 @@ LOCAL_SOCKET_UNITS = {
 
 PRODUCTION_SERVICE_UNITS = (
     "deploy/devcoordinator-edge.service",
-    "deploy/devcoordinator-edge-handoff.service",
     "deploy/devcoordinator-api.service",
-    "deploy/devcoordinator-api-handoff.service",
     "deploy/devcoordinator-authority.service",
     "deploy/devcoordinator-console@.service",
     "deploy/devcoordinator-observer.service",
@@ -65,7 +63,6 @@ PYTHON_TRUST_SOURCES = (
     "skills/codex-dev-coordinator/scripts/devcoordinator/universal_test_credentials.py",
     "skills/codex-dev-coordinator/scripts/devcoordinator/broker_host.py",
     "skills/codex-dev-coordinator/scripts/devcoordinator/image_publication.py",
-    "skills/codex-dev-coordinator/scripts/devcoordinator/universal_test_adoption.py",
     "skills/codex-dev-coordinator/scripts/devcoordinator/universal_test_runner.py",
     "skills/codex-dev-coordinator/scripts/devcoordinator/universal_test_runtime.py",
     "skills/codex-dev-coordinator/scripts/devcoordinator/universal_test_spool.py",
@@ -87,7 +84,6 @@ METADATA_GUARD_SOURCES = frozenset(
         "skills/codex-dev-coordinator/scripts/devcoordinator/universal_test_credentials.py",
         "skills/codex-dev-coordinator/scripts/devcoordinator/broker_host.py",
         "skills/codex-dev-coordinator/scripts/devcoordinator/image_publication.py",
-        "skills/codex-dev-coordinator/scripts/devcoordinator/universal_test_adoption.py",
         "skills/codex-dev-coordinator/scripts/devcoordinator/universal_test_runner.py",
         "skills/codex-dev-coordinator/scripts/devcoordinator/universal_test_runtime.py",
         "skills/codex-dev-coordinator/scripts/devcoordinator/universal_test_spool.py",

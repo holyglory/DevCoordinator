@@ -108,7 +108,6 @@ class RecordingSchedulerProfile:
             "test_run_artifacts",
             "test_artifact",
             "cancel_test_run",
-            "retry_test_run",
             "wait_test_run",
             "check_test_evidence",
             "consume_test_evidence",
@@ -478,10 +477,7 @@ class UniversalTestCliTests(unittest.TestCase):
             "failures",
             "artifact",
             "cancel",
-            "retry",
-            "policy",
             "catalog",
-            "stats",
             "wait",
         }
         choices = parser()._subparsers._group_actions[0].choices[  # type: ignore[union-attr]
@@ -621,7 +617,6 @@ class UniversalTestCliTests(unittest.TestCase):
             "failures",
             "artifact",
             "cancel",
-            "retry",
             "wait",
         ):
             with self.subTest(command=name):
@@ -868,7 +863,6 @@ class UniversalTestCliTests(unittest.TestCase):
             ),
             canonical_project=lambda value: value,
             broker_profile_loader=broken_profile,
-            statistics_reader=lambda **_kwargs: self.fail("statistics called"),
         )
 
         self.assertEqual(
@@ -1041,7 +1035,6 @@ class UniversalTestCliTests(unittest.TestCase):
             parsed,
             canonical_project=lambda value: value,
             broker_profile_loader=FakeSchedulerProfile,
-            statistics_reader=lambda **_kwargs: self.fail("statistics called"),
         )
         self.assertTrue(result["ok"])
         self.assertEqual(result["state"], "queued")
@@ -1069,7 +1062,6 @@ class UniversalTestCliTests(unittest.TestCase):
             parsed,
             canonical_project=lambda value: value,
             broker_profile_loader=FakeSchedulerProfile,
-            statistics_reader=lambda **_kwargs: self.fail("statistics called"),
         )
 
         self.assertTrue(result["ok"])
@@ -1097,7 +1089,6 @@ class UniversalTestCliTests(unittest.TestCase):
             parsed,
             canonical_project=lambda value: value,
             broker_profile_loader=lambda: profile,
-            statistics_reader=lambda **_kwargs: self.fail("statistics called"),
         )
 
         self.assertTrue(result["ok"])
@@ -1189,26 +1180,6 @@ class UniversalTestCliTests(unittest.TestCase):
             (
                 [
                     "test",
-                    "retry",
-                    *RUN_REPOSITORY_ARGS,
-                    "--run-id",
-                    "run-abc",
-                    "--failed-only",
-                    "--operation-id",
-                    operation_id,
-                ],
-                "retry_test_run",
-                {
-                    "run_id": "run-abc",
-                    "repository": REPOSITORY_ID,
-                    "failed_only": True,
-                    "operation_id": operation_id,
-                    "actor": "codex:test-cli-task",
-                },
-            ),
-            (
-                [
-                    "test",
                     "wait",
                     *RUN_REPOSITORY_ARGS,
                     "--run-id",
@@ -1234,9 +1205,6 @@ class UniversalTestCliTests(unittest.TestCase):
                         parser().parse_args(raw),
                         canonical_project=lambda value: value,
                         broker_profile_loader=lambda: profile,
-                        statistics_reader=lambda **_kwargs: self.fail(
-                            "statistics called"
-                        ),
                     )
                 self.assertTrue(result["ok"])
                 self.assertEqual(profile.calls, [(expected_method, expected_arguments)])
@@ -1250,7 +1218,6 @@ class UniversalTestCliTests(unittest.TestCase):
                 parsed,
                 canonical_project=lambda value: value,
                 broker_profile_loader=OversizedSummaryProfile,
-                statistics_reader=lambda **_kwargs: self.fail("statistics called"),
             )
 
     def test_default_plan_envelope_is_bounded_and_marks_truncation(self) -> None:
@@ -1439,7 +1406,6 @@ class UniversalTestCliTests(unittest.TestCase):
             parsed,
             canonical_project=lambda value: value,
             broker_profile_loader=lambda: None,
-            statistics_reader=lambda **_kwargs: self.fail("statistics called"),
         )
         self.assertEqual(result["classification"], "test_scheduler_pending")
         self.assertEqual(result["operation_id"], operation_id)
@@ -1519,188 +1485,13 @@ class UniversalTestCliTests(unittest.TestCase):
         self.assertNotIn("\x00", encoded.decode("utf-8"))
         self.assertNotIn("\n", catalog["repositories"][0]["issues"][0]["message"])
 
-    def test_stats_is_bounded_and_canonicalizes_repository_once(self) -> None:
-        calls: list[dict[str, object]] = []
-        parsed = parser().parse_args(
-            [
-                "test",
-                "stats",
-                "--root-repo",
-                "/repo-link",
-                "--days",
-                "90",
-                "--limit",
-                "40",
-            ]
-        )
-        result = handle_universal_test_cli(
-            parsed,
-            canonical_project=lambda value: "/canonical/repo" if value == "/repo-link" else value,
-            broker_profile_loader=lambda: self.fail("broker profile loaded"),
-            statistics_reader=lambda **values: calls.append(values) or {"ok": True},
-        )
-        self.assertTrue(result["ok"])
-        self.assertEqual(
-            calls,
-            [{"project": "/canonical/repo", "days": 90, "limit": 40}],
-        )
+    def test_stats_command_is_retired(self) -> None:
         with self.assertRaises(SystemExit):
-            parser().parse_args(
-                ["test", "stats", "--root-repo", "/repo", "--days", "3651"]
-            )
+            parser().parse_args(["test", "stats", "--root-repo", "/repo"])
 
-    def test_policy_check_validates_manifest_policy_before_pending(self) -> None:
-        initialize_manifest(self.root, force=False)
-        parsed = parser().parse_args(
-            [
-                "test",
-                "policy",
-                "check",
-                "--root-repo",
-                str(self.root),
-                "--policy",
-                "handoff",
-                "--snapshot",
-                "snapshot-1",
-            ]
-        )
-        result = handle_universal_test_cli(
-            parsed,
-            canonical_project=lambda value: value,
-            broker_profile_loader=lambda: None,
-            statistics_reader=lambda **_kwargs: self.fail("statistics called"),
-        )
-        self.assertEqual(result["action"], "policy.check")
-        self.assertEqual(result["policy"], "handoff")
-
-    def test_policy_check_dispatches_exact_manifest_bound_identity(self) -> None:
-        initialize_manifest(self.root, force=False)
-        profile = RecordingSchedulerProfile()
-        parsed = parser().parse_args(
-            [
-                "test",
-                "policy",
-                "check",
-                "--root-repo",
-                str(self.root),
-                "--policy",
-                "handoff",
-                "--snapshot",
-                "snapshot-abc",
-            ]
-        )
-        result = handle_universal_test_cli(
-            parsed,
-            canonical_project=lambda value: value,
-            broker_profile_loader=lambda: profile,
-            statistics_reader=lambda **_kwargs: self.fail("statistics called"),
-        )
-        self.assertTrue(result["ok"])
-        self.assertEqual(
-            profile.calls,
-            [
-                (
-                    "check_test_evidence",
-                    {
-                        "repository": str(self.root),
-                        "policy": "handoff",
-                        "snapshot": "snapshot-abc",
-                    },
-                )
-            ],
-        )
-
-    def test_non_reusable_policy_requires_and_dispatches_exact_consumption(self) -> None:
-        initialize_manifest(self.root, force=False)
-        without_operation = parser().parse_args(
-            [
-                "test",
-                "policy",
-                "check",
-                "--root-repo",
-                str(self.root),
-                "--policy",
-                "release",
-                "--snapshot",
-                "snapshot-release",
-            ]
-        )
-        with self.assertRaisesRegex(
-            UniversalTestCliError, "requires --operation-id"
-        ):
-            handle_universal_test_cli(
-                without_operation,
-                canonical_project=lambda value: value,
-                broker_profile_loader=lambda: self.fail("broker profile loaded"),
-                statistics_reader=lambda **_kwargs: self.fail("statistics called"),
-            )
-
-        operation_id = "00000000-0000-4000-8000-000000000021"
-        profile = RecordingSchedulerProfile()
-        parsed = parser().parse_args(
-            [
-                "test",
-                "policy",
-                "check",
-                "--root-repo",
-                str(self.root),
-                "--policy",
-                "release",
-                "--snapshot",
-                "snapshot-release",
-                "--operation-id",
-                operation_id,
-            ]
-        )
-        result = handle_universal_test_cli(
-            parsed,
-            canonical_project=lambda value: value,
-            broker_profile_loader=lambda: profile,
-            statistics_reader=lambda **_kwargs: self.fail("statistics called"),
-        )
-        self.assertTrue(result["ok"])
-        self.assertEqual(result["action"], "policy.consume")
-        self.assertEqual(
-            profile.calls,
-            [
-                (
-                    "consume_test_evidence",
-                    {
-                        "repository": str(self.root),
-                        "policy": "release",
-                        "snapshot": "snapshot-release",
-                        "operation_id": operation_id,
-                    },
-                )
-            ],
-        )
-
-    def test_reusable_policy_rejects_consumption_operation_id(self) -> None:
-        initialize_manifest(self.root, force=False)
-        parsed = parser().parse_args(
-            [
-                "test",
-                "policy",
-                "check",
-                "--root-repo",
-                str(self.root),
-                "--policy",
-                "handoff",
-                "--snapshot",
-                "snapshot-handoff",
-                "--operation-id",
-                "00000000-0000-4000-8000-000000000022",
-            ]
-        )
-        with self.assertRaisesRegex(
-            UniversalTestCliError, "do not accept an operation ID"
-        ):
-            handle_universal_test_cli(
-                parsed,
-                canonical_project=lambda value: value,
-                broker_profile_loader=lambda: self.fail("broker profile loaded"),
-                statistics_reader=lambda **_kwargs: self.fail("statistics called"),
-            )
+    def test_policy_command_is_retired(self) -> None:
+        with self.assertRaises(SystemExit):
+            parser().parse_args(["test", "policy", "check"])
 
 
 if __name__ == "__main__":

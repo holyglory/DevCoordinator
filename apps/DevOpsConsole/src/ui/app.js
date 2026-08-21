@@ -42,35 +42,15 @@
     efficiencyError: null,
     efficiencyLoading: false,
     archives: null,      // owner-only GET /api/lifecycle/list ({ archives })
-    tests: null,         // selected repository's Coordinator-owned test statistics
-    testsFleet: null,    // retained fleet-wide test projection
     testsRepositories: null, // lightweight configured repository catalog
     testsProject: null,
-    testsDays: 30,
-    testsHours: 24,
-    testsSearch: '',
     testsLoading: false,
-    testsDetailLoading: false,
-    testsDetailLoadingKey: null,
-    testsDetailRequest: 0,
-    testsRepositoriesLoading: false,
-    testsQueryKey: null,
-    testsLoadedAt: 0,
-    testsFleetQueryKey: null,
-    testsFleetLoadedAt: 0,
-    testsFleetStale: false,
     testsRenderSignature: null,
     testsError: null,
-    testsDetailError: null,
-    testsDetailTab: 'overview',
     testsRuns: null,
     testsRunsLoading: false,
     testsRunsError: null,
     testsRunEvidence: new Map(),
-    testsSetup: null,
-    testsSetupLoading: false,
-    testsSetupError: null,
-    testsCatalogError: null,
     testsPlan: null,
     testsPlanOperationId: null,
     testsRunTargetSetup: null,
@@ -703,7 +683,6 @@
     // The performance page charts use a longer history window than sparklines.
     if (page === 'performance') refreshMetrics();
     if (page === 'tests') {
-      loadTestRepositories();
       loadTests({ force: true });
     }
     if (page === 'bugs') loadBugs();
@@ -715,21 +694,6 @@
 
   function wireNav() {
     $('#nav-toggle').addEventListener('click', () => setNavOpen(!navOpen()));
-    $('#tests-search').addEventListener('input', (event) => {
-      state.testsSearch = event.currentTarget.value;
-      renderTests();
-    });
-    $('#tests-hours').addEventListener('change', (event) => {
-      state.testsHours = Number(event.currentTarget.value);
-      state.testsFleetQueryKey = null;
-      loadTests({ force: true });
-    });
-    $('#tests-days').addEventListener('change', (event) => {
-      state.testsDays = Number(event.currentTarget.value);
-      state.tests = null;
-      state.testsQueryKey = null;
-      loadTestDetail({ force: true });
-    });
     $('#tests-run').addEventListener('click', () => openTestRunDialog());
     $('#bugs-refresh').addEventListener('click', () => loadBugs({ force: true }));
     $('#efficiency-refresh').addEventListener('click', () => loadEfficiency({ force: true }));
@@ -781,22 +745,6 @@
       closeTestDetail();
     });
     $('#test-detail-run').addEventListener('click', () => openTestRunDialog(state.testsProject));
-    $('#test-detail-runs').addEventListener('click', () => selectTestDetailTab('runs'));
-    for (const tab of document.querySelectorAll('[data-test-detail-tab]')) {
-      tab.addEventListener('click', () => selectTestDetailTab(tab.dataset.testDetailTab));
-      tab.addEventListener('keydown', (event) => {
-        if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
-        event.preventDefault();
-        const tabs = [...document.querySelectorAll('[data-test-detail-tab]')];
-        const current = tabs.indexOf(event.currentTarget);
-        const index = event.key === 'Home' ? 0
-          : event.key === 'End' ? tabs.length - 1
-            : (current + (event.key === 'ArrowRight' ? 1 : -1) + tabs.length) % tabs.length;
-        const next = tabs[index];
-        selectTestDetailTab(next.dataset.testDetailTab);
-        next.focus();
-      });
-    }
     $('#test-run-close').append(icon('x'));
     $('#test-run-close').addEventListener('click', closeTestRunDialog);
     $('#test-run-cancel').addEventListener('click', closeTestRunDialog);
@@ -4090,165 +4038,35 @@
     }
   }
 
-  // ---------------------------------------------------------------- test statistics
-
-  function metricTestRepositories() {
-    const repositories = new Map();
-    for (const entity of state.metrics?.entities || []) {
-      if (entity?.kind !== 'project' || typeof entity.project !== 'string' || !entity.project) continue;
-      const project = entity.project;
-      if (!repositories.has(project)) {
-        repositories.set(project, {
-          project,
-          repo_id: null,
-          canonical_root: project,
-          display_name: entity.name || projectTail(project),
-        });
-      }
-    }
-    return [...repositories.values()];
-  }
+  // ---------------------------------------------------------------- current tests
 
   function testRepositories() {
-    let repositories;
-    if (state.testsRepositories) {
-      repositories = state.testsRepositories.repositories || [];
-    } else if (state.overview?.inventory?.repositories) {
-      repositories = state.overview.inventory.repositories;
-    } else {
-      repositories = metricTestRepositories();
-    }
-    return repositories
-      .filter((repository) => repository && (repository.canonical_root || repository.repo_id || repository.project))
+    return (state.testsRepositories?.repositories || [])
+      .filter((repository) => repository && typeof repository.repo_id === 'string' && repository.repo_id)
       .map((repository) => ({
         ...repository,
-        project: repository.canonical_root || repository.project || repository.repo_id,
+        project: repository.canonical_root || repository.repo_id,
       }))
       .slice()
       .sort((a, b) => String(a.display_name || a.canonical_root || a.repo_id)
         .localeCompare(String(b.display_name || b.canonical_root || b.repo_id)));
   }
 
-  async function loadTestRepositories({ force = false } = {}) {
-    if (state.testsRepositoriesLoading) return;
-    if (!force && state.testsRepositories) return;
-    state.testsRepositoriesLoading = true;
+  async function loadTests({ force = false } = {}) {
+    if (!force && state.testsRepositories) return renderTests();
+    if (state.testsLoading) return;
+    state.testsLoading = true;
+    renderTests();
     try {
       const catalog = await api('/api/tests/repositories');
       if (!catalog || catalog.schema_version !== 1 || !Array.isArray(catalog.repositories)) {
         throw new Error('test repository catalog is invalid');
       }
       state.testsRepositories = catalog;
-      state.testsCatalogError = null;
-    } catch (err) {
-      // During a rolling deployment an older Console process has no catalog
-      // endpoint. Retained metrics still provide canonical repository roots,
-      // so test data need not wait for heavyweight inventory.
-      if (err.status !== 401 && err.status !== 404) state.testsCatalogError = err;
-    } finally {
-      state.testsRepositoriesLoading = false;
-      loadTests();
-    }
-  }
-
-  function boundedTestCount(...values) {
-    return values.reduce((highest, value) => {
-      const count = Number(value || 0);
-      return Number.isFinite(count) && count > highest ? count : highest;
-    }, 0);
-  }
-
-  function normalizeTestFleetSemantics(fleet) {
-    if (!fleet || fleet.schema_version !== 2 || !Array.isArray(fleet.repositories)) return fleet;
-    const correctedRepositories = new Set();
-    let changed = false;
-    const repositories = fleet.repositories.map((repository) => {
-      if (!repository || repository.state !== 'failing') return repository;
-      const summary = repository.summary && typeof repository.summary === 'object'
-        ? repository.summary : {};
-      const testFailures = boundedTestCount(
-        summary.test_failure_count,
-        summary.failed_run_count,
-        summary.failure_count,
-        Number(summary.failed_count || 0) + Number(summary.error_count || 0),
-      );
-      const infrastructureFailures = boundedTestCount(
-        summary.infrastructure_failure_count,
-        summary.infrastructure_count,
-      );
-      if (testFailures > 0 || infrastructureFailures <= 0) return repository;
-      changed = true;
-      correctedRepositories.add(repository.repo_id);
-      return {
-        ...repository,
-        state: 'infrastructure',
-        state_detail: {
-          code: 'recent_infrastructure_failures',
-          title: 'Recent test infrastructure failures',
-          detail: `${fmtTestCount(infrastructureFailures)} infrastructure ${infrastructureFailures === 1 ? 'failure prevented' : 'failures prevented'} tests from completing; no test assertion failures were recorded`,
-          scope: repository.state_scope || 'selected_window',
-          test_failure_count: 0,
-          infrastructure_failure_count: infrastructureFailures,
-        },
-        summary: {
-          ...summary,
-          test_failure_count: 0,
-          infrastructure_failure_count: infrastructureFailures,
-        },
-      };
-    });
-    if (!changed) return fleet;
-    const attention = Array.isArray(fleet.attention) ? fleet.attention.map((item) => {
-      if (!correctedRepositories.has(item?.repo_id)) return item;
-      const repository = repositories.find((candidate) => candidate?.repo_id === item.repo_id);
-      const infrastructureFailures = Number(
-        repository?.summary?.infrastructure_failure_count || 0,
-      );
-      return {
-        ...item,
-        severity: 'warning',
-        code: 'recent_infrastructure_failures',
-        title: 'Recent test infrastructure failures',
-        detail: `${fmtTestCount(infrastructureFailures)} infrastructure ${infrastructureFailures === 1 ? 'failure prevented' : 'failures prevented'} tests from completing; no test assertion failures were recorded`,
-        test_failure_count: 0,
-        infrastructure_failure_count: infrastructureFailures,
-      };
-    }) : fleet.attention;
-    return { ...fleet, repositories, attention };
-  }
-
-  async function loadTests({ force = false } = {}) {
-    const hours = Math.max(1, Math.min(168, Number(state.testsHours || 24)));
-    $('#tests-hours').value = String(hours);
-    const queryKey = String(hours);
-    const age = Date.now() - Number(state.testsFleetLoadedAt || 0);
-    if (!force && state.testsFleet && state.testsFleetQueryKey === queryKey && age < 15_000) {
-      renderTests();
-      return;
-    }
-    if (state.testsLoading) return;
-    state.testsLoading = true;
-    renderTests();
-    try {
-      const fleet = await api(`/api/tests/fleet?hours=${hours}`);
-      if (!fleet || fleet.schema_version !== 2 || !Array.isArray(fleet.repositories) || !Array.isArray(fleet.hours)) {
-        throw new Error('fleet test statistics are invalid');
-      }
-      state.testsFleet = normalizeTestFleetSemantics(fleet);
-      state.testsFleetQueryKey = queryKey;
-      state.testsFleetLoadedAt = Date.now();
-      // A warm retained response is the normal fast delivery path, not a
-      // failure or an operator decision. Reserve the stale notice for a real
-      // refresh request failure while prior fleet data remains available.
-      state.testsFleetStale = false;
       state.testsError = null;
       clearBanner('tests');
     } catch (err) {
-      state.testsFleetStale = Boolean(state.testsFleet);
-      // A retained fleet projection is still the correct operational view.
-      // Project/test-store refresh failures stay local to Tests and never
-      // replace useful data with a global banner or a blinking skeleton.
-      if (!state.testsFleet && err.status !== 401 && err.classification !== 'maintenance') {
+      if (!state.testsRepositories && err.status !== 401 && err.classification !== 'maintenance') {
         state.testsError = err;
       }
     } finally {
@@ -4259,111 +4077,27 @@
 
   function refreshTestsInPlace() {
     if (document.hidden || currentPage() !== 'tests') return;
-    // An existing fleet projection remains mounted while this request is in
-    // flight. renderTests() uses a content signature and restores focus/open
-    // disclosures, so unchanged polling is a no-op and changed data is
-    // replaced without a loading flash or a scroll jump.
+    // Keep the current catalog mounted during refresh; unchanged content is a no-op.
     loadTests({ force: true });
   }
 
-  async function loadTestDetail({ force = false } = {}) {
-    if (!state.testsProject) return;
-    $('#tests-days').value = String(state.testsDays);
-    const project = state.testsProject;
-    const days = state.testsDays;
-    const queryKey = `${project}\u0000${days}`;
-    if (!force && state.tests && state.testsQueryKey === queryKey) {
-      renderTestDetail();
-      return;
-    }
-    if (state.testsDetailLoading && state.testsDetailLoadingKey === queryKey) return;
-    const request = state.testsDetailRequest + 1;
-    state.testsDetailRequest = request;
-    state.testsDetailLoading = true;
-    state.testsDetailLoadingKey = queryKey;
-    renderTestDetail();
-    try {
-      const result = await api(`/api/tests?project=${encodeURIComponent(project)}&days=${days}&limit=50`);
-      if (request !== state.testsDetailRequest || project !== state.testsProject || days !== state.testsDays) return;
-      if (result?.repo_id && result.repo_id !== project) {
-        throw new ApiError('repository test statistics identity is invalid', 502);
-      }
-      state.tests = result;
-      state.testsQueryKey = queryKey;
-      state.testsLoadedAt = Date.now();
-      state.testsDetailError = null;
-      clearBanner('tests');
-    } catch (err) {
-      if (request !== state.testsDetailRequest || project !== state.testsProject || days !== state.testsDays) return;
-      if (!state.tests && err.status !== 401 && err.classification !== 'maintenance') {
-        state.testsDetailError = err;
-      }
-    } finally {
-      if (request !== state.testsDetailRequest) return;
-      state.testsDetailLoading = false;
-      state.testsDetailLoadingKey = null;
-      renderTestDetail();
-    }
-  }
-
-  function selectTestDetailTab(tab) {
-    if (!['overview', 'runs', 'setup'].includes(tab)) return;
-    state.testsDetailTab = tab;
-    for (const button of document.querySelectorAll('[data-test-detail-tab]')) {
-      const selected = button.dataset.testDetailTab === tab;
-      button.setAttribute('aria-selected', String(selected));
-      button.tabIndex = selected ? 0 : -1;
-    }
-    $('#tests-days').hidden = tab !== 'overview';
-    $('#test-detail-runs').hidden = tab === 'runs';
-    $('#test-detail-body').setAttribute('aria-labelledby', `test-detail-tab-${tab}`);
-    renderTestDetail();
-    if (tab === 'runs') loadTestRuns();
-    if (tab === 'setup') loadTestSetup();
-  }
-
-  function testRunsNextCursor(page = state.testsRuns) {
-    const cursor = page?.next_cursor ?? page?.next ?? null;
-    return typeof cursor === 'string' && cursor ? cursor : null;
-  }
-
-  async function loadTestRuns({ force = false, append = false } = {}) {
+  async function loadTestRuns({ force = false } = {}) {
     const project = state.testsProject;
     const current = state.testsRuns?.repo_id === project ? state.testsRuns : null;
-    const after = append ? testRunsNextCursor(current) : null;
-    if (!project || state.testsRunsLoading || (append && !after)
-      || (!append && !force && current)) return;
+    if (!project || state.testsRunsLoading || (!force && current)) return;
     state.testsRunsLoading = true;
     state.testsRunsError = null;
-    if (!append) renderTestDetail();
-    else {
-      const loadMore = $('[data-test-runs-load-more]');
-      if (loadMore) {
-        loadMore.disabled = true;
-        loadMore.textContent = 'Loading…';
-      }
-    }
+    renderTestDetail();
     try {
-      const query = new URLSearchParams({ repo_id: project, limit: '50' });
-      if (after) query.set('after', after);
+      const query = new URLSearchParams({ repo_id: project });
       const result = await api(`/api/tests/runs?${query.toString()}`);
       if (project !== state.testsProject) return;
       if (!result || ((result.repo_id ?? result.repository_id) !== project) || !Array.isArray(result.runs)) {
-        throw new ApiError('repository test run history is invalid', 502);
+        throw new ApiError('current repository test runs are invalid', 502);
       }
-      const nextCursor = result.next_cursor ?? result.next ?? null;
-      if (nextCursor !== null && (typeof nextCursor !== 'string' || !nextCursor)) {
-        throw new ApiError('repository test run history cursor is invalid', 502);
-      }
-      const runs = append
-        ? [...new Map([...(current?.runs || []), ...result.runs]
-          .map((run) => [run.run_id, run])).values()]
-        : result.runs;
       state.testsRuns = {
         ...result,
         repo_id: project,
-        runs,
-        next_cursor: nextCursor,
       };
     } catch (err) {
       if (project === state.testsProject && err.status !== 401 && err.classification !== 'maintenance') {
@@ -4377,206 +4111,12 @@
     }
   }
 
-  async function loadTestSetup({ force = false } = {}) {
-    const project = state.testsProject;
-    if (!project || state.testsSetupLoading || (!force && state.testsSetup?.repo_id === project)) return;
-    state.testsSetupLoading = true;
-    state.testsSetupError = null;
-    renderTestDetail();
-    try {
-      const result = await api(`/api/tests/repositories/${encodeURIComponent(project)}/setup`);
-      if (project !== state.testsProject) return;
-      if (!result || (result.repo_id && result.repo_id !== project)) {
-        throw new ApiError('repository test setup identity is invalid', 502);
-      }
-      state.testsSetup = { ...result, repo_id: project };
-    } catch (err) {
-      if (project === state.testsProject && err.status !== 401 && err.classification !== 'maintenance') {
-        state.testsSetupError = err;
-      }
-    } finally {
-      if (project === state.testsProject) {
-        state.testsSetupLoading = false;
-        renderTestDetail();
-      }
-    }
-  }
-
-  function testFleetRepositories(fleet = state.testsFleet) {
-    const query = state.testsSearch.trim().toLocaleLowerCase();
-    return (fleet?.repositories || [])
-      .filter((repository) => repository && typeof repository.repo_id === 'string')
-      .filter((repository) => !query
-        || String(repository.display_name || repository.repo_id).toLocaleLowerCase().includes(query))
-      .slice()
-      .sort((a, b) => {
-        const rank = { failing: 0, infrastructure: 1, stale: 2, idle: 3, healthy: 4 };
-        const stateOrder = (rank[a.state] ?? 2) - (rank[b.state] ?? 2);
-        if (stateOrder !== 0) return stateOrder;
-        return String(a.display_name || a.repo_id).localeCompare(String(b.display_name || b.repo_id));
-      });
-  }
-
-  function testFleetRepository(repoId) {
-    return (state.testsFleet?.repositories || []).find((repository) => repository.repo_id === repoId) || null;
-  }
-
-  function testFleetHourKey(value) {
-    const date = new Date(value);
-    if (!Number.isFinite(date.getTime())) return String(value || '');
-    date.setUTCMinutes(0, 0, 0);
-    return date.toISOString();
-  }
-
-  function testFleetHours(fleet) {
-    const values = (fleet?.hours || []).map(testFleetHourKey).filter(Boolean);
-    return values.slice(Math.max(0, values.length - 24));
-  }
-
-  function testFleetLocalHourSlots(fleet) {
-    const hourStartsByLocalHour = Array.from({ length: 24 }, () => []);
-    for (const hourStart of testFleetHours(fleet)) {
-      const date = new Date(hourStart);
-      if (!Number.isFinite(date.getTime())) continue;
-      hourStartsByLocalHour[date.getHours()].push(hourStart);
-    }
-    return hourStartsByLocalHour.map((hourStarts, localHour) => ({ localHour, hourStarts }));
-  }
-
-  function testFleetLocalHourLabel(localHour) {
-    return `${String(localHour).padStart(2, '0')}:00`;
-  }
-
-  function testFleetLocalPeriod(slot) {
-    if (slot.hourStarts.length === 0) {
-      return `${testFleetLocalHourLabel(slot.localHour)} local time`;
-    }
-    return slot.hourStarts.map((hourStart) => new Date(hourStart).toLocaleString([], {
-      month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit',
-      hourCycle: 'h23', timeZoneName: 'short',
-    })).join(' and ');
-  }
-
-  function testFleetCellMap(repository) {
-    return new Map((repository?.hourly || []).map((cell) => [
-      testFleetHourKey(cell.hour_start ?? cell.timestamp ?? `${cell.day}T${String(cell.hour).padStart(2, '0')}:00:00Z`),
-      cell,
-    ]));
-  }
-
-  function testFleetLocalCell(cells, slot) {
-    return slot.hourStarts.reduce((combined, hourStart) => {
-      const cell = cells.get(hourStart);
-      if (!cell) return combined;
-      combined.test_seconds += Number(cell.test_seconds || 0);
-      combined.test_count += Number(cell.test_count || 0);
-      combined.failure_count += Number(cell.failure_count || 0);
-      combined.infrastructure_count += Number(cell.infrastructure_count || 0);
-      return combined;
-    }, { test_seconds: 0, test_count: 0, failure_count: 0, infrastructure_count: 0 });
-  }
-
-  function testRate(value, fallbackSummary = null) {
-    if (value !== null && value !== undefined && value !== '') {
-      const explicit = Number(value);
-      if (Number.isFinite(explicit)) return explicit > 1 ? explicit : explicit * 100;
-    }
-    return testPassRate(fallbackSummary);
-  }
-
   function fmtTestCount(value) {
     const count = Number(value || 0);
     if (!Number.isFinite(count)) return '—';
     if (count >= 1_000_000) return `${(count / 1_000_000).toFixed(count >= 10_000_000 ? 0 : 1)}m`;
     if (count >= 1_000) return `${(count / 1_000).toFixed(count >= 10_000 ? 0 : 1)}k`;
     return String(Math.round(count));
-  }
-
-  function fmtTestMinutes(seconds) {
-    const minutes = Number(seconds || 0) / 60;
-    if (minutes >= 10_000) return `${(minutes / 1_000).toFixed(1)}k min`;
-    if (minutes >= 100) return `${Math.round(minutes)} min`;
-    if (minutes >= 10) return `${minutes.toFixed(1)} min`;
-    return `${minutes.toFixed(1)} min`;
-  }
-
-  function testRepositoryState(repository) {
-    const summary = repository?.summary || {};
-    const rawState = String(repository?.state || 'idle');
-    const infrastructureFailures = boundedTestCount(
-      summary.infrastructure_failure_count,
-      summary.infrastructure_count,
-    );
-    const testFailedAttempts = boundedTestCount(
-      summary.test_failure_count,
-      summary.failed_run_count,
-    );
-    const testFailures = boundedTestCount(
-      testFailedAttempts,
-      summary.failure_count,
-      Number(summary.failed_count || 0) + Number(summary.error_count || 0),
-    );
-    const legacyInfrastructureOnly = rawState === 'failing'
-      && testFailures === 0
-      && infrastructureFailures > 0;
-    const attempts = boundedTestCount(
-      summary.attempt_count,
-      testFailedAttempts + infrastructureFailures,
-    );
-    const tests = Number(summary.test_count || 0);
-    const detail = !legacyInfrastructureOnly
-      && repository?.state_detail && typeof repository.state_detail === 'object'
-      ? repository.state_detail : {};
-    const infrastructure = rawState === 'infrastructure'
-      || rawState === 'infrastructure_failed'
-      || rawState === 'setup_failed'
-      || legacyInfrastructureOnly;
-    let state = rawState;
-    let label = 'Healthy';
-    let fallbackDetail = tests > 0 ? `${fmtTestCount(tests)} tests completed` : 'Recent test runs completed';
-    if (infrastructure) {
-      state = 'infrastructure';
-      label = 'Could not run';
-      fallbackDetail = `${fmtTestCount(infrastructureFailures)} infrastructure ${infrastructureFailures === 1 ? 'failure' : 'failures'} across ${fmtTestCount(attempts)} ${attempts === 1 ? 'attempt' : 'attempts'}; ${tests > 0 ? `${fmtTestCount(tests)} tests reported` : 'no tests started'}`;
-    } else if (rawState === 'failing') {
-      label = 'Tests failed';
-      fallbackDetail = `${fmtTestCount(testFailures)} test ${testFailures === 1 ? 'failure' : 'failures'} across ${fmtTestCount(attempts)} ${attempts === 1 ? 'attempt' : 'attempts'}`;
-    } else if (rawState === 'stale') {
-      label = 'Delayed';
-      fallbackDetail = 'Recent test evidence is delayed';
-    } else if (rawState === 'idle') {
-      label = 'No recent activity';
-      fallbackDetail = 'No test attempts were recorded in this period';
-    }
-    const reason = String(detail.detail || fallbackDetail);
-    const heading = String(detail.title || label);
-    return {
-      state,
-      label,
-      title: heading === label ? `${label}: ${reason}` : `${label} — ${heading}: ${reason}`,
-      attempts,
-      tests,
-      testFailures,
-      infrastructureFailures,
-    };
-  }
-
-  function testStatePill(repository) {
-    const status = testRepositoryState(repository);
-    return h('span', {
-      class: `test-state is-${status.state}`,
-      title: status.title,
-      'aria-label': status.title,
-    }, status.label);
-  }
-
-  function testRepositoryWorkLabel(repository) {
-    const summary = repository?.summary || {};
-    const seconds = Number(summary.test_seconds || 0);
-    if (seconds > 0) return seconds < 60 ? fmtSeconds(seconds) : fmtTestMinutes(seconds);
-    const attempts = testRepositoryState(repository).attempts;
-    if (attempts > 0) return `${fmtTestCount(attempts)} ${attempts === 1 ? 'attempt' : 'attempts'}`;
-    return 'No tests';
   }
 
   function testLocalFailure(title, error, retry) {
@@ -4586,224 +4126,6 @@
         error?.message ? h('p', null, String(error.message)) : null),
       h('button', { class: 'btn small', type: 'button', onclick: retry }, 'Try again'));
   }
-
-  function testFleetSummary(fleet) {
-    const summary = fleet.summary || {};
-    const repositories = Number(summary.repository_count || fleet.repositories?.length || 0);
-    const active = Number(summary.repositories_with_activity || 0);
-    const efficiency = Number(summary.parallel_efficiency_ratio || 0);
-    const passRate = testRate(summary.pass_rate, summary);
-    const flakeRate = testRate(summary.flake_rate);
-    const avoided = summary.avoided_work || {};
-    const metrics = [
-      ['Repositories tested', `${active} of ${repositories}`, active < repositories ? 'is-attention' : 'is-good'],
-      ['Test time / wall time', efficiency > 0 ? `${efficiency.toFixed(1)}×` : '—', efficiency >= 1 ? 'is-good' : ''],
-      ['Queue wait (P95)', Number.isFinite(Number(summary.p95_queue_wait_seconds)) ? fmtSeconds(summary.p95_queue_wait_seconds) : '—', Number(summary.p95_queue_wait_seconds || 0) > 300 ? 'is-attention' : ''],
-      ['Pass rate', Number.isFinite(passRate) ? `${passRate.toFixed(1)}%` : '—', Number.isFinite(passRate) && passRate < 98 ? 'is-attention' : 'is-good'],
-      ['Flake rate', Number.isFinite(flakeRate) ? `${flakeRate.toFixed(1)}%` : '—', Number.isFinite(flakeRate) && flakeRate > 2 ? 'is-attention' : ''],
-      ['Avoided work', avoided.available ? `${fmtTestCount(avoided.test_count)} tests` : 'Not measured', avoided.available ? 'is-good' : ''],
-    ];
-    return h('dl', { class: 'test-fleet-summary', 'aria-label': 'Fleet test health summary' },
-      metrics.map(([label, value, className]) => h('div', { class: className },
-        h('dt', null, label), h('dd', null, value))));
-  }
-
-  function testFleetMatrix(fleet, repositories) {
-    const slots = testFleetLocalHourSlots(fleet);
-    const head = h('tr', null, h('th', { scope: 'col', class: 'test-fleet-repository-head' }, 'Repository'));
-    for (const slot of slots) {
-      const label = testFleetLocalHourLabel(slot.localHour);
-      head.append(h('th', {
-        scope: 'col',
-        class: `test-fleet-hour${slot.localHour % 2 === 0 ? ' is-even' : ''}${slot.localHour % 6 === 0 ? ' is-six' : ''}`,
-        title: `${label} local time`,
-        'aria-label': `${label} local time`,
-        'data-test-local-hour': label,
-      }, label));
-    }
-    head.append(h('th', { scope: 'col', class: 'test-fleet-total-head' }, '24h'));
-    const body = h('tbody');
-    for (const repository of repositories) {
-      const cells = testFleetCellMap(repository);
-      const summary = repository.summary || {};
-      const status = testRepositoryState(repository);
-      const row = h('tr', { class: `test-fleet-row is-${status.state}`, title: status.title },
-        h('th', { scope: 'row', class: 'test-fleet-repository' },
-          h('button', {
-            type: 'button', class: 'test-repository-button',
-            onclick: () => openTestRepository(repository.repo_id),
-            'data-test-focus-key': `repo:${repository.repo_id}`,
-            'aria-label': `Open ${repository.display_name || repository.repo_id} test details. ${status.title}`,
-          },
-          h('span', { class: 'test-state-dot', 'aria-hidden': 'true' }),
-          h('span', null, repository.display_name || repository.repo_id))));
-      for (const slot of slots) {
-        const cell = testFleetLocalCell(cells, slot);
-        const failures = Number(cell.failure_count || 0);
-        const infrastructureFailures = Number(cell.infrastructure_count || 0);
-        const period = testFleetLocalPeriod(slot);
-        const localHour = testFleetLocalHourLabel(slot.localHour);
-        const node = h('td', {
-          class: 'test-heat-cell test-fleet-cell',
-          style: `background-color:${testHeatColor(cell.test_seconds)}`,
-          tabindex: Number(cell.test_seconds || 0) > 0 || Number(cell.test_count || 0) > 0 || failures || infrastructureFailures ? '0' : null,
-          title: `${repository.display_name || repository.repo_id} · ${period} — ${(Number(cell.test_seconds || 0) / 60).toFixed(1)} aggregate test-minutes; ${failures} test failures; ${infrastructureFailures} infrastructure failures`,
-          'aria-label': `${repository.display_name || repository.repo_id}, ${period}: ${(Number(cell.test_seconds || 0) / 60).toFixed(1)} aggregate test-minutes; ${Number(cell.test_count || 0)} tests; ${failures} test failures; ${infrastructureFailures} infrastructure failures`,
-          'data-test-period': `${repository.display_name || repository.repo_id} · ${period}`,
-          'data-test-focus-key': `cell:${repository.repo_id}:local:${localHour}`,
-          'data-test-local-hour': localHour,
-          'data-test-source-hours': slot.hourStarts.join(','),
-          'data-test-seconds': Number(cell.test_seconds || 0),
-          'data-test-count': Number(cell.test_count || 0),
-          'data-test-failures': failures,
-          'data-test-infrastructure': infrastructureFailures,
-          onpointerenter: (event) => showTestHeatTooltip(event.currentTarget),
-          onpointerleave: (event) => hideTestHeatTooltip(event.currentTarget),
-          onfocus: (event) => showTestHeatTooltip(event.currentTarget),
-          onblur: (event) => hideTestHeatTooltip(event.currentTarget),
-        });
-        row.append(node);
-      }
-      row.append(h('td', { class: 'test-fleet-total', title: status.title }, testRepositoryWorkLabel(repository)));
-      body.append(row);
-    }
-    return h('section', { class: 'test-fleet-matrix-panel' },
-      h('div', { class: 'test-panel-title' },
-        h('div', null,
-          h('h3', null, 'Testing time by repository'),
-          h('p', { class: 'meta-passive' }, 'Aggregate test-minutes by local hour. Select a repository for detail.')),
-        h('span', { class: 'test-matrix-now' }, 'Last 24 hours · local time')),
-      repositories.length === 0
-        ? h('p', { class: 'empty-inline' }, 'No repositories match this search.')
-        : h('div', { class: 'test-fleet-matrix-wrap' },
-          h('table', {
-            class: 'test-fleet-matrix',
-            'aria-label': 'Aggregate test-minutes by repository and local hour, from 00:00 through 23:00',
-          }, h('thead', null, head), body)),
-      h('div', { class: 'test-heat-legend test-fleet-legend', 'aria-label': 'Heat scale from no activity through 60, 120 and 180 or more aggregate test-minutes' },
-        h('div', { class: 'test-heat-scale', 'aria-hidden': 'true' }),
-        h('div', { class: 'test-heat-ticks' }, h('span', null, '0m'), h('span', null, '60m'), h('span', null, '120m'), h('span', null, '180m+')),
-        h('p', null, 'More than 60 test-minutes in one hour means tests ran in parallel. Hover, focus or tap a cell for reported tests and diagnostics.')));
-  }
-
-  function testFleetMobileList(repositories) {
-    return h('section', { class: 'test-fleet-mobile', 'aria-label': 'Repository test health' },
-      repositories.map((repository) => {
-        const summary = repository.summary || {};
-        const rate = testRate(summary.pass_rate, summary);
-        const status = testRepositoryState(repository);
-        const infrastructure = status.state === 'infrastructure';
-        return h('button', {
-          class: `test-fleet-mobile-row is-${status.state}`,
-          type: 'button', onclick: () => openTestRepository(repository.repo_id),
-          'data-test-focus-key': `repo:${repository.repo_id}`,
-          title: status.title,
-          'aria-label': `Open ${repository.display_name || repository.repo_id} test details. ${status.title}`,
-        },
-        h('span', { class: 'test-fleet-mobile-main' },
-          h('strong', null, repository.display_name || repository.repo_id),
-          h('span', null, repository.last_activity_at
-            ? `${infrastructure ? 'Last attempt' : 'Last tested'} ${timeAgo(Date.parse(repository.last_activity_at))}`
-            : 'No test activity')),
-        testStatePill(repository),
-        h('span', { class: 'test-fleet-mobile-metrics' },
-          h('span', null, testRepositoryWorkLabel(repository)),
-          h('span', null, infrastructure && status.tests === 0
-            ? 'No tests started'
-            : Number.isFinite(rate) ? `${rate.toFixed(1)}% pass` : '— pass'),
-          h('span', null, infrastructure
-            ? `${fmtTestCount(status.infrastructureFailures)} infrastructure ${status.infrastructureFailures === 1 ? 'failure' : 'failures'}`
-            : status.testFailures > 0
-              ? `${fmtTestCount(status.testFailures)} test ${status.testFailures === 1 ? 'failure' : 'failures'}`
-              : Number(summary.parallel_efficiency_ratio || 0) > 0 ? `${Number(summary.parallel_efficiency_ratio).toFixed(1)}× parallel` : '— parallel')));
-      }));
-  }
-
-  function testFleetCapacity(fleet) {
-    const hours = testFleetHours(fleet);
-    const byHour = new Map((fleet.capacity || []).map((cell) => [testFleetHourKey(cell.hour_start), cell]));
-    const rows = hours.map((hour) => byHour.get(hour) || { test_seconds: 0, p95_queue_wait_seconds: 0 });
-    const maxTests = Math.max(1, ...rows.map((row) => Number(row.test_seconds || 0)));
-    const maxQueue = Math.max(1, ...rows.map((row) => Number(row.p95_queue_wait_seconds || 0)));
-    const width = 1000;
-    const height = 110;
-    const plotBottom = 86;
-    const svg = svgEl('svg', {
-      class: 'test-capacity-chart', viewBox: `0 0 ${width} ${height}`, preserveAspectRatio: 'none',
-      role: 'img', 'aria-label': 'Fleet testing load and queue wait over the last 24 hours',
-    });
-    rows.forEach((row, index) => {
-      const step = width / Math.max(1, rows.length);
-      const barHeight = (Number(row.test_seconds || 0) / maxTests) * 58;
-      const hourStart = hours[index];
-      const period = testFleetLocalPeriod({ hourStarts: [hourStart] });
-      const testCount = Number(row.test_count || 0);
-      const failures = Number(row.failure_count || 0);
-      const infrastructureFailures = Number(row.infrastructure_count || 0);
-      const queueWait = Number(row.p95_queue_wait_seconds || 0);
-      const bar = svgEl('rect', {
-        class: 'test-capacity-bar', x: (index * step + 2).toFixed(1), y: (plotBottom - barHeight).toFixed(1),
-        width: Math.max(2, step - 5).toFixed(1), height: barHeight.toFixed(1), rx: 1,
-        tabindex: 0,
-        role: 'img',
-        'aria-label': `${period}: ${(Number(row.test_seconds || 0) / 60).toFixed(1)} aggregate test-minutes; ${testCount} tests; ${failures} test failures; ${infrastructureFailures} infrastructure failures; queue P95 ${fmtSeconds(queueWait)}`,
-      });
-      bar.dataset.testPeriod = `Fleet · ${period}`;
-      bar.dataset.testSourceHour = hourStart;
-      bar.dataset.testSeconds = Number(row.test_seconds || 0);
-      bar.dataset.testCount = testCount;
-      bar.dataset.testFailures = failures;
-      bar.dataset.testInfrastructure = infrastructureFailures;
-      bar.dataset.testTooltipDetail = `${testCount} ${testCount === 1 ? 'test' : 'tests'} · ${failures} test ${failures === 1 ? 'failure' : 'failures'} · ${infrastructureFailures} infrastructure ${infrastructureFailures === 1 ? 'failure' : 'failures'} · queue P95 ${fmtSeconds(queueWait)}`;
-      bar.addEventListener('pointerenter', () => showTestHeatTooltip(bar));
-      bar.addEventListener('pointerleave', () => hideTestHeatTooltip(bar));
-      bar.addEventListener('focus', () => showTestHeatTooltip(bar));
-      bar.addEventListener('blur', () => hideTestHeatTooltip(bar));
-      svg.append(bar);
-    });
-    const queuePoints = rows.map((row, index) => {
-      const x = ((index + .5) / Math.max(1, rows.length)) * width;
-      const y = plotBottom - (Number(row.p95_queue_wait_seconds || 0) / maxQueue) * 68;
-      return `${x.toFixed(1)},${y.toFixed(1)}`;
-    }).join(' ');
-    svg.append(svgEl('polyline', { class: 'test-capacity-queue', fill: 'none', points: queuePoints }));
-    return h('section', { class: 'test-fleet-capacity' },
-      h('div', { class: 'test-panel-title' },
-        h('h3', null, 'Fleet load & queue'),
-        h('div', { class: 'test-capacity-legend' }, h('span', { class: 'is-load' }, 'Test load'), h('span', { class: 'is-queue' }, 'Queue P95'))),
-      svg,
-      h('div', { class: 'test-capacity-hours' }, h('span', null, '24h ago'), h('span', null, '12h ago'), h('span', null, 'Now')),
-      testChartDataDisclosure('Hourly fleet data',
-        ['Hour (local)', 'Test time', 'Tests', 'Test failures', 'Infrastructure failures', 'Queue P95'],
-        rows.map((row, index) => [
-          testFleetLocalPeriod({ hourStarts: [hours[index]] }),
-          fmtTestMinutes(row.test_seconds),
-          fmtTestCount(row.test_count),
-          fmtTestCount(row.failure_count),
-          fmtTestCount(row.infrastructure_count),
-          fmtSeconds(row.p95_queue_wait_seconds || 0),
-        ])));
-  }
-
-  function testFleetAttention(fleet) {
-    const attention = fleet.attention || [];
-    const row = (item) => h('button', {
-      class: `test-attention-row is-${item.severity || 'warning'}`,
-      type: 'button', onclick: () => openTestRepository(item.repo_id),
-    },
-    h('span', { class: 'test-attention-project' }, testFleetRepository(item.repo_id)?.display_name || item.repo_id),
-    h('span', { class: 'test-attention-copy' }, h('strong', null, item.title || item.code), h('span', null, item.detail || 'Open repository details')),
-    h('span', { class: 'test-attention-time' }, item.observed_at ? timeAgo(Date.parse(item.observed_at)) : '—'));
-    const primary = attention.slice(0, 8).map(row);
-    const remaining = attention.slice(8).map(row);
-    return h('section', { class: 'test-fleet-attention' },
-      h('div', { class: 'test-panel-title' }, h('h3', null, 'Needs attention'), h('span', { class: 'meta-passive' }, `${attention.length} current`)),
-      primary.length ? h('div', { class: 'test-attention-list' }, primary) : h('p', { class: 'empty-inline' }, 'No repository needs intervention.'),
-      remaining.length ? h('details', { class: 'test-attention-more', 'data-test-disclosure': 'all-attention' },
-        h('summary', null, `Show ${remaining.length} more`),
-        h('div', { class: 'test-attention-list' }, remaining)) : null);
-  }
-
   const testDetailNarrowViewport = window.matchMedia('(max-width: 680px)');
 
   function positionTestDetail() {
@@ -4838,202 +4160,28 @@
     if (focusWasInside) $('#test-detail-close').focus({ preventScroll: true });
   }
 
-  function openTestRepository(repoId) {
-    const repository = testFleetRepository(repoId);
+  function openTestRuns(repoId) {
+    const repository = testRepositories().find((item) => item.repo_id === repoId);
     if (!repository) return;
     if (state.testsProject !== repoId) {
       state.testsProject = repoId;
-      state.tests = null;
-      state.testsQueryKey = null;
-      state.testsDetailError = null;
       state.testsRuns = null;
       state.testsRunsError = null;
       state.testsRunEvidence = new Map();
-      state.testsSetup = null;
-      state.testsSetupError = null;
     }
-    state.testsDetailTab = 'overview';
     $('#test-detail-h').textContent = repository.display_name || repository.repo_id;
-    $('#test-detail-status').replaceChildren(testStatePill(repository), document.createTextNode(
-      repository.last_activity_at ? ` · updated ${timeAgo(Date.parse(repository.last_activity_at))}` : ' · no recent activity',
-    ));
+    $('#test-detail-status').textContent = 'Current runs';
     showTestDetailSurface();
-    selectTestDetailTab('overview');
     renderTestDetail();
-    loadTestDetail();
+    loadTestRuns();
   }
 
   function closeTestDetail() {
-    hideTestHeatTooltip();
     const dialog = $('#test-detail-dialog');
     if (dialog.open) dialog.close();
     dialog.style.removeProperty('--test-detail-top');
     document.documentElement.classList.remove('test-detail-open');
   }
-
-  function testDetailFacts(stats) {
-    const summary = stats?.summary || {};
-    const efficiency = stats?.efficiency || {};
-    const health = stats?.health || {};
-    const passRate = testRate(health.pass_rate, summary);
-    const parallel = Number(efficiency.parallel_efficiency_ratio
-      ?? (Number(summary.run_seconds || 0) > 0 ? Number(summary.test_seconds || 0) / Number(summary.run_seconds) : 0));
-    const queue = Number(efficiency.p95_queue_wait_seconds ?? summary.p95_queue_wait_seconds);
-    return h('dl', { class: 'test-detail-facts' },
-      h('div', null, h('dt', null, 'Tests'), h('dd', null, fmtTestCount(summary.test_count))),
-      h('div', null, h('dt', null, 'Pass rate'), h('dd', null, Number.isFinite(passRate) ? `${passRate.toFixed(1)}%` : '—')),
-      h('div', null, h('dt', null, 'Test / wall time'), h('dd', null, parallel > 0 ? `${parallel.toFixed(1)}×` : '—')),
-      h('div', null, h('dt', null, 'Queue P95'), h('dd', null, Number.isFinite(queue) ? fmtSeconds(queue) : '—')));
-  }
-
-  function testRepositoryDayDetail(repository) {
-    if (!repository) return null;
-    const cells = testFleetCellMap(repository);
-    return h('section', { class: 'test-detail-day', 'aria-labelledby': 'test-detail-day-h' },
-      h('div', { class: 'test-panel-title' },
-        h('h3', { id: 'test-detail-day-h' }, 'Last 24 hours'),
-        h('span', { class: 'meta-passive' }, 'Tap an hour for the exact value')),
-      h('div', {
-        class: 'test-detail-day-grid',
-        'aria-label': 'Repository test activity by local hour, from 00:00 through 23:00',
-      }, testFleetLocalHourSlots(state.testsFleet).map((slot) => {
-        const cell = testFleetLocalCell(cells, slot);
-        const failures = Number(cell.failure_count || 0);
-        const infrastructureFailures = Number(cell.infrastructure_count || 0);
-        const localHour = testFleetLocalHourLabel(slot.localHour);
-        const period = `${repository.display_name || repository.repo_id} · ${testFleetLocalPeriod(slot)}`;
-        return h('button', {
-          type: 'button',
-          class: 'test-detail-day-cell',
-          style: `background-color:${testHeatColor(cell.test_seconds)}`,
-          title: `${period} — ${(Number(cell.test_seconds || 0) / 60).toFixed(1)} aggregate test-minutes; ${Number(cell.test_count || 0)} tests; ${failures} test failures; ${infrastructureFailures} infrastructure failures`,
-          'aria-label': `${period}: ${(Number(cell.test_seconds || 0) / 60).toFixed(1)} aggregate test-minutes; ${Number(cell.test_count || 0)} tests; ${failures} test failures; ${infrastructureFailures} infrastructure failures`,
-          'data-test-period': period,
-          'data-test-local-hour': localHour,
-          'data-test-source-hours': slot.hourStarts.join(','),
-          'data-test-seconds': Number(cell.test_seconds || 0),
-          'data-test-count': Number(cell.test_count || 0),
-          'data-test-failures': failures,
-          'data-test-infrastructure': infrastructureFailures,
-          'aria-describedby': 'test-heat-tooltip',
-          'aria-pressed': 'false',
-          onpointerenter: (event) => showTestHeatTooltip(event.currentTarget),
-          onpointerleave: (event) => hideTestHeatTooltip(event.currentTarget),
-          onfocus: (event) => showTestHeatTooltip(event.currentTarget),
-          onblur: (event) => hideTestHeatTooltip(event.currentTarget),
-          onclick: (event) => togglePinnedTestHeatTooltip(event.currentTarget),
-        }, h('span', null, localHour));
-      })));
-  }
-
-  function testDetailEfficiency(stats) {
-    const summary = stats.summary || {};
-    const efficiency = stats.efficiency || {};
-    const avoided = stats.avoided_work || {};
-    const parallel = Number(efficiency.parallel_efficiency_ratio
-      ?? (Number(summary.run_seconds || 0) > 0 ? Number(summary.test_seconds || 0) / Number(summary.run_seconds) : 0));
-    const flakeRate = testRate(stats.health?.flake_rate);
-    return h('section', { class: 'test-detail-efficiency' },
-      h('div', null, h('span', null, 'Aggregate test time'), h('strong', null, fmtSeconds(summary.test_seconds || 0))),
-      h('div', null, h('span', null, 'Wall time'), h('strong', null, fmtSeconds(summary.run_seconds || efficiency.wall_seconds || 0))),
-      h('div', null, h('span', null, 'Parallelism'), h('strong', null, parallel > 0 ? `${parallel.toFixed(1)}×` : '—')),
-      h('div', null, h('span', null, 'Avoided work'), h('strong', null, avoided.available ? `${fmtTestCount(avoided.test_count)} tests` : 'Not measured')),
-      h('div', null, h('span', null, 'Flake rate'), h('strong', null, Number.isFinite(flakeRate) ? `${flakeRate.toFixed(1)}%` : '—')));
-  }
-
-  function testDetailHealthSpark(values, label, className) {
-    const series = values.map(Number).filter(Number.isFinite);
-    const width = 240;
-    const height = 44;
-    const pad = 3;
-    const max = Math.max(1, ...series);
-    const points = series.map((value, index) => {
-      const x = pad + (index / Math.max(1, series.length - 1)) * (width - pad * 2);
-      const y = height - pad - (value / max) * (height - pad * 2);
-      return `${x.toFixed(1)},${y.toFixed(1)}`;
-    }).join(' ');
-    const svg = svgEl('svg', {
-      class: `test-detail-health-spark ${className}`,
-      viewBox: `0 0 ${width} ${height}`,
-      preserveAspectRatio: 'none',
-      role: 'img',
-      'aria-label': label,
-    });
-    if (points) svg.append(svgEl('polyline', { points, fill: 'none' }));
-    return svg;
-  }
-
-  function testDetailHealthTrends(stats) {
-    const rows = [...(stats.daily || [])]
-      .filter((row) => typeof row?.day === 'string')
-      .sort((a, b) => a.day.localeCompare(b.day))
-      .slice(-14);
-    const failureRates = rows.map((row) => {
-      const passed = Number(row.passed_count || 0);
-      const failed = Number(row.failure_count || 0);
-      return passed + failed > 0 ? (100 * failed) / (passed + failed) : 0;
-    });
-    const flakeRates = rows.map((row) => {
-      const rate = Number(row.flake_rate);
-      return Number.isFinite(rate) ? (rate > 1 ? rate : rate * 100) : 0;
-    });
-    const latestFailure = failureRates.at(-1);
-    const latestFlake = flakeRates.at(-1);
-    return h('section', { class: 'test-detail-health-trends', 'aria-labelledby': 'test-detail-health-h' },
-      h('div', { class: 'test-panel-title' },
-        h('h3', { id: 'test-detail-health-h' }, 'Failure & flake trend'),
-        h('span', { class: 'meta-passive' }, rows.length ? `Last ${rows.length} recorded days` : 'No recorded days')),
-      h('div', { class: 'test-detail-health-grid' },
-        h('div', null,
-          h('span', null, 'Failure rate'),
-          h('strong', null, Number.isFinite(latestFailure) ? `${latestFailure.toFixed(1)}%` : '—'),
-          testDetailHealthSpark(failureRates, 'Daily failure-rate trend', 'is-failure')),
-        h('div', null,
-          h('span', null, 'Flake rate'),
-          h('strong', null, Number.isFinite(latestFlake) ? `${latestFlake.toFixed(1)}%` : '—'),
-          testDetailHealthSpark(flakeRates, 'Daily flake-rate trend', 'is-flake'))),
-      testChartDataDisclosure(
-        'Daily failure and flake data',
-        ['Day', 'Passed', 'Failed', 'Failure rate', 'Flake rate'],
-        rows.map((row, index) => [
-          row.day,
-          fmtTestCount(row.passed_count),
-          fmtTestCount(row.failure_count),
-          `${failureRates[index].toFixed(1)}%`,
-          `${flakeRates[index].toFixed(1)}%`,
-        ]),
-      ));
-  }
-
-  function testTopRegression(stats) {
-    const top = stats.top_actionable_regression || (stats.dynamics || [])
-      .filter((item) => Number(item.failure_count || 0) > 0)
-      .sort((a, b) => Number(b.failure_count || 0) - Number(a.failure_count || 0))[0];
-    if (!top) return h('section', { class: 'test-detail-regression is-clear' },
-      h('div', { class: 'test-panel-title' }, h('h3', null, 'Top actionable regression')),
-      h('p', { class: 'empty-inline' }, 'No actionable regression in this period.'));
-    const currentFailures = Number(top.current_failure_count ?? top.failure_count);
-    const previousFailures = Number(top.previous_failure_count);
-    const durationChange = Number(top.duration_change_percent ?? top.change_percent);
-    const kind = top.kind === 'duration_regression' || (!currentFailures && Number.isFinite(durationChange))
-      ? 'Duration regression' : 'Test failure';
-    const impact = currentFailures > 0
-      ? `${fmtTestCount(currentFailures)} current ${currentFailures === 1 ? 'failure' : 'failures'}`
-      : Number.isFinite(durationChange) ? `${testDeltaText(durationChange)} average duration` : 'Needs review';
-    const comparison = Number.isFinite(previousFailures)
-      ? `${fmtTestCount(previousFailures)} → ${fmtTestCount(currentFailures)} failures`
-      : Number.isFinite(durationChange) ? `${testDeltaText(durationChange)} vs previous period` : 'No comparable baseline';
-    return h('section', { class: 'test-detail-regression' },
-      h('div', { class: 'test-panel-title' }, h('h3', null, 'Top actionable regression')),
-      h('strong', { class: 'mono' }, top.name || top.suite || top.title || 'Failing test'),
-      h('p', null, top.detail || `${Number(top.failure_count || 0)} failures · ${top.last_run ? `last seen ${fmtWhen(top.last_run)}` : 'open runs for evidence'}`),
-      h('dl', { class: 'test-detail-regression-facts' },
-        h('div', null, h('dt', null, 'Evidence'), h('dd', null, kind)),
-        h('div', null, h('dt', null, 'Impact'), h('dd', null, impact)),
-        h('div', null, h('dt', null, 'Change'), h('dd', null, comparison)),
-        h('div', null, h('dt', null, 'Last observed'), h('dd', null, top.last_run ? fmtWhen(top.last_run) : 'Not recorded'))));
-  }
-
   function testRunStateLabel(value) {
     return ({
       queued: 'Queued', running: 'Running', cancelling: 'Cancelling', superseding: 'Superseding',
@@ -5045,9 +4193,7 @@
   async function operateTestRun(run, action) {
     const repoId = run.repo_id || run.repository_id || state.testsProject;
     const endpoint = `/api/tests/repositories/${encodeURIComponent(repoId)}/runs/${encodeURIComponent(run.run_id)}/${action}`;
-    const body = action === 'cancel'
-      ? { reason: 'Cancelled from DevOps Console', operation_id: crypto.randomUUID() }
-      : { failed_only: true, operation_id: crypto.randomUUID() };
+    const body = { reason: 'Cancelled from DevOps Console', operation_id: crypto.randomUUID() };
     try {
       await api(endpoint, { method: 'POST', body });
       state.testsRunEvidence.delete(run.run_id);
@@ -5148,9 +4294,6 @@
       run.can_cancel ? h('button', {
         class: 'btn small', type: 'button', onclick: () => operateTestRun(run, 'cancel'),
       }, 'Cancel run') : null,
-      run.can_retry ? h('button', {
-        class: 'btn small', type: 'button', onclick: () => operateTestRun(run, 'retry'),
-      }, 'Retry failed') : null,
     ].filter(Boolean);
   }
 
@@ -5222,161 +4365,43 @@
       evidence);
   }
 
-  function renderTestRunsTab() {
+  function renderCurrentTestRuns() {
     if (state.testsRunsLoading && !state.testsRuns) {
-      return [h('div', { class: 'skel', 'aria-hidden': 'true' }), h('div', { class: 'skel', 'aria-hidden': 'true' })];
+      return [h('div', { class: 'skel', 'aria-hidden': 'true' })];
     }
     if (!state.testsRuns) {
-      return [testLocalFailure('Run history is unavailable', state.testsRunsError, () => loadTestRuns({ force: true }))];
+      return [testLocalFailure('Current runs are unavailable', state.testsRunsError,
+        () => loadTestRuns({ force: true }))];
     }
     const rows = state.testsRuns.runs || [];
-    if (!rows.length) return [h('p', { class: 'empty-inline' }, 'No Coordinator test runs have been recorded for this repository.')];
-    const nextCursor = testRunsNextCursor();
-    return [
-      h('section', {
-        class: 'test-run-history',
-        'aria-label': 'Repository test run history',
-        'aria-busy': String(state.testsRunsLoading),
-      }, rows.map(testRunHistoryCard)),
-      state.testsRunsError ? testLocalFailure(
-        'More run history is unavailable',
-        state.testsRunsError,
-        () => loadTestRuns({ append: true }),
-      ) : null,
-      nextCursor && !state.testsRunsError ? h('div', { class: 'test-runs-pager' },
-        h('button', {
-          class: 'btn',
-          type: 'button',
-          disabled: state.testsRunsLoading,
-          'data-test-runs-load-more': true,
-          'data-test-focus-key': 'runs:load-more',
-          onclick: () => loadTestRuns({ append: true }),
-        }, state.testsRunsLoading ? 'Loading…' : 'Load more runs')) : null,
-    ];
-  }
-
-  function setupEntries(value) {
-    if (Array.isArray(value)) return value.map((item) => [String(item), '']);
-    if (!value || typeof value !== 'object') return [];
-    return Object.entries(value).map(([name, detail]) => [name, Array.isArray(detail) ? detail.join(', ') : String(detail ?? '')]);
-  }
-
-  function setupCard(title, description, entries, empty) {
-    return h('section', { class: 'test-setup-card' },
-      h('h3', null, title),
-      description ? h('p', null, description) : null,
-      entries.length ? h('ul', { class: 'test-setup-list' }, entries.map(([name, detail]) => h('li', null,
-        h('strong', null, name), h('span', null, detail)))) : h('p', { class: 'empty-inline' }, empty));
-  }
-
-  function testSetupTargetEntries(setup) {
-    if (!Array.isArray(setup.targets)) return setupEntries(setup.target_graph);
-    return setup.targets.map((target) => {
-      if (typeof target === 'string') return [target, ''];
-      const requirements = [];
-      if (target.network && target.network !== 'none') requirements.push(`network.${target.network}`);
-      for (const fixture of target.fixtures || []) requirements.push(`fixture.${fixture}`);
-      const detail = [];
-      if ((target.depends_on || []).length) detail.push(`after ${target.depends_on.join(', ')}`);
-      if (requirements.length) detail.push(requirements.join(', '));
-      return [target.name || 'Unnamed target', detail.join(' · ')];
-    });
-  }
-
-  function renderTestSetupTab() {
-    if (state.testsSetupLoading && !state.testsSetup) {
-      return [h('div', { class: 'skel', 'aria-hidden': 'true' }), h('div', { class: 'skel', 'aria-hidden': 'true' })];
+    if (!rows.length) {
+      return [h('p', { class: 'empty-inline' }, 'No tests are currently running for this repository.')];
     }
-    if (!state.testsSetup) {
-      return [testLocalFailure('Repository setup is unavailable', state.testsSetupError, () => loadTestSetup({ force: true }))];
-    }
-    const setup = state.testsSetup;
-    const issues = (setup.issues || setup.input_coverage_gaps || []).map((item) => [
-      item.code || item.path || 'Coverage gap', item.message || item.detail || String(item),
-    ]);
-    const targets = testSetupTargetEntries(setup);
-    const policies = setupEntries(setup.evidence_policies || setup.policies);
-    const fixtures = setupEntries(setup.fixtures);
-    const isolation = setupEntries(setup.isolation || setup.capabilities || setup.network_requirements);
-    return [h('div', { class: 'test-setup-grid' },
-      setupCard(
-        `Manifest · ${setup.status || 'unknown'}`,
-        setup.manifest_fingerprint ? `Schema ${setup.manifest_schema || '—'} · ${String(setup.manifest_fingerprint).slice(0, 12)}` : 'The repository manifest has not produced a verified fingerprint.',
-        issues,
-        setup.status === 'ready' ? 'No manifest or input-coverage gaps detected.' : 'No structured issue details were returned.',
-      ),
-      setupCard('Target graph', 'Dependency-aware targets selected by repository inputs and intent.', targets, 'No targets are declared.'),
-      setupCard('Evidence policies', 'Named policies are evaluated against exact immutable provenance.', policies, 'No evidence policies are declared.'),
-      setupCard('Capabilities & fixtures', 'Network and fixture requirements for these targets.', [...isolation, ...fixtures], 'No additional capabilities or fixtures are required.'),
-    )];
+    return [h('section', {
+      class: 'test-run-history',
+      'aria-label': 'Current repository test runs',
+      'aria-busy': String(state.testsRunsLoading),
+    }, rows.map(testRunHistoryCard))];
   }
 
   function renderTestDetail() {
     const host = $('#test-detail-body');
     if (!host || !$('#test-detail-dialog').open) return;
-    if (state.testsDetailTab === 'runs') {
-      const focusKey = document.activeElement?.dataset?.testFocusKey || null;
-      const openRuns = new Set([...host.querySelectorAll('details[open][data-test-run-id]')]
-        .map((node) => node.dataset.testRunId));
-      host.replaceChildren(...renderTestRunsTab());
-      for (const disclosure of host.querySelectorAll('details[data-test-run-id]')) {
-        if (openRuns.has(disclosure.dataset.testRunId)) disclosure.open = true;
-      }
-      if (focusKey) {
-        const restore = [...host.querySelectorAll('[data-test-focus-key]')]
-          .find((node) => node.dataset.testFocusKey === focusKey);
-        restore?.focus({ preventScroll: true });
-      }
-      return;
+    const focusKey = document.activeElement?.dataset?.testFocusKey || null;
+    const openRuns = new Set([...host.querySelectorAll('details[open][data-test-run-id]')]
+      .map((node) => node.dataset.testRunId));
+    host.replaceChildren(...renderCurrentTestRuns());
+    for (const disclosure of host.querySelectorAll('details[data-test-run-id]')) {
+      if (openRuns.has(disclosure.dataset.testRunId)) disclosure.open = true;
     }
-    if (state.testsDetailTab === 'setup') {
-      host.replaceChildren(...renderTestSetupTab());
-      return;
-    }
-    if (state.testsDetailLoading && !state.tests) {
-      host.replaceChildren(h('div', { class: 'skel', 'aria-hidden': 'true' }), h('div', { class: 'skel', 'aria-hidden': 'true' }));
-      return;
-    }
-    const stats = state.tests;
-    if (!stats) {
-      host.replaceChildren(testLocalFailure(
-        'Repository statistics are unavailable',
-        state.testsDetailError,
-        () => loadTestDetail({ force: true }),
-      ));
-      return;
-    }
-    const dynamicsRows = (stats.dynamics || []).slice(0, 12).map((row) => {
-      const change = row.change_percent === null || row.change_percent === undefined ? Number.NaN : Number(row.change_percent);
-      return h('tr', null,
-        h('td', { class: 'mono test-name' }, row.suite),
-        h('td', null, fmtSeconds(row.current_seconds)),
-        h('td', { class: `test-dynamic-change ${Number.isFinite(change) && change > 0 ? 'is-worse' : 'is-better'}` }, testDeltaText(change)),
-        h('td', null, row.failure_count),
-        h('td', null, row.last_run ? fmtWhen(row.last_run) : '—'));
-    });
-    const openDisclosures = new Set([...host.querySelectorAll('details[open][data-test-disclosure]')]
-      .map((node) => node.dataset.testDisclosure));
-    host.replaceChildren(
-      testDetailFacts(stats),
-      testRepositoryDayDetail(testFleetRepository(state.testsProject)),
-      h('section', { class: 'test-detail-throughput' },
-        h('div', { class: 'test-panel-title' }, h('h3', null, 'Throughput & efficiency'), h('span', { class: 'meta-passive' }, `Last ${state.testsDays} days`)),
-        testTrendChart(stats),
-        testDetailEfficiency(stats),
-        testDetailHealthTrends(stats)),
-      testTopRegression(stats),
-      h('details', { class: 'test-detail-dynamics', 'data-test-disclosure': 'largest-dynamics' },
-        h('summary', null, 'Largest dynamics'),
-        testTable('Dynamics evidence', ['Suite / test set', 'Current time', 'Change', 'Failures', 'Last run'], dynamicsRows)),
-    );
-    for (const disclosure of host.querySelectorAll('details[data-test-disclosure]')) {
-      if (openDisclosures.has(disclosure.dataset.testDisclosure)) disclosure.open = true;
+    if (focusKey) {
+      const restore = [...host.querySelectorAll('[data-test-focus-key]')]
+        .find((node) => node.dataset.testFocusKey === focusKey);
+      restore?.focus({ preventScroll: true });
     }
   }
-
   function fillTestRunRepositories(selected = null) {
-    const repositories = state.testsFleet?.repositories || [];
+    const repositories = testRepositories();
     const select = $('#test-run-project');
     select.replaceChildren(...repositories.map((repository) => h('option', {
       value: repository.repo_id,
@@ -5663,15 +4688,11 @@
       await loadTests({ force: true });
       const submittedRepoId = result.repo_id ?? result.repository_id;
       if (submittedRepoId === state.testsProject) {
-        // The same repository may already have a mounted/cached Runs tab.
-        // An accepted submission changes that collection even though the
-        // selected repository identity did not change, so make its next
-        // disclosure read fresh Coordinator history instead of preserving a
-        // pre-submission snapshot.
+        // An accepted submission changes the current-run collection.
         state.testsRuns = null;
         state.testsRunsError = null;
       }
-      if (submittedRepoId) openTestRepository(submittedRepoId);
+      if (submittedRepoId) openTestRuns(submittedRepoId);
     } catch (err) {
       error.textContent = err.message;
       error.hidden = false;
@@ -5679,534 +4700,51 @@
     }
   }
 
-  function testTable(title, headers, rows) {
-    for (const row of rows) {
-      [...row.children].forEach((cell, index) => {
-        cell.dataset.label = headers[index] || '';
-        cell.setAttribute('aria-label', `${headers[index] || 'Value'}: ${cell.textContent}`);
-      });
-    }
-    return h('section', { class: 'test-panel' },
-      h('h3', null, title),
-      rows.length === 0
-        ? h('p', { class: 'empty-inline' }, 'No recorded data in this period.')
-        : h('div', { class: 'test-table-wrap' },
-          h('table', { class: 'test-table' },
-            h('thead', null, h('tr', null, headers.map((label) => h('th', { scope: 'col' }, label)))),
-            h('tbody', null, rows))));
-  }
-
-  function testChartDataDisclosure(title, headers, values) {
-    const rows = values.map((valuesRow) => h('tr', null,
-      valuesRow.map((value, index) => h('td', {
-        'data-label': headers[index],
-        'aria-label': `${headers[index]}: ${value}`,
-      }, value))));
-    return h('details', { class: 'test-chart-data', 'data-test-disclosure': title },
-      h('summary', null, title),
-      h('div', { class: 'test-table-wrap' },
-        h('table', { class: 'test-table' },
-          h('thead', null, h('tr', null, headers.map((label) => h('th', { scope: 'col' }, label)))),
-          h('tbody', null, rows))));
-  }
-
-  function testRecentRuns(stats) {
-    const runs = (stats?.recent_runs || []).slice(0, 50);
-    const rows = runs.map((run) => {
-      const failures = Number(run.failed_count || 0) + Number(run.error_count || 0);
-      const started = run.client_started_at || run.admitted_at;
-      const finished = run.recorded_finished_at || run.client_finished_at;
-      return h('details', { class: 'test-run-row' },
-        h('summary', null,
-          h('span', { class: 'mono test-name' }, run.suite || run.run_kind || run.run_id),
-          h('span', { class: `test-run-status is-${run.status || 'unknown'}` }, run.status || 'unknown'),
-          h('span', null, fmtSeconds(run.duration_seconds || 0)),
-          h('span', null, `${fmtTestCount(run.case_count)} tests`),
-          h('span', { class: failures ? 'err' : '' }, `${fmtTestCount(failures)} failed`),
-          h('span', null, started ? fmtWhen(started) : '—')),
-        h('dl', { class: 'test-run-evidence' },
-          h('div', null, h('dt', null, 'Run ID'), h('dd', { class: 'mono' }, run.run_id)),
-          h('div', null, h('dt', null, 'Passed'), h('dd', null, fmtTestCount(run.passed_count))),
-          h('div', null, h('dt', null, 'Skipped'), h('dd', null, fmtTestCount(run.skipped_count))),
-          h('div', null, h('dt', null, 'Errors'), h('dd', null, fmtTestCount(run.error_count))),
-          h('div', null, h('dt', null, 'Exit code'), h('dd', null, run.exit_code ?? '—')),
-          h('div', null, h('dt', null, 'Finished'), h('dd', null, finished ? fmtWhen(finished) : 'In progress'))));
-    });
-    return h('details', {
-      class: 'test-panel test-runs-panel', id: 'test-detail-runs-panel',
-      'data-test-disclosure': 'recent-runs',
-    },
-      h('summary', null,
-        h('span', null, 'Recent runs'),
-        h('span', { class: 'meta-passive' }, runs.length ? `${runs.length} shown on demand` : 'No recorded runs')),
-      rows.length
-        ? h('div', { class: 'test-run-list' }, rows)
-        : h('p', { class: 'empty-inline' }, 'No recorded runs in this period.'));
-  }
-
-  function testPassRate(summary) {
-    const passed = Number(summary?.passed_count || 0);
-    const failed = Number(summary?.failed_count || 0) + Number(summary?.error_count || 0);
-    const decided = passed + failed;
-    return decided > 0 ? (100 * passed) / decided : null;
-  }
-
-  function testDelta(current, previous) {
-    const before = Number(previous || 0);
-    return before > 0 ? (100 * (Number(current || 0) - before)) / before : null;
-  }
-
-  function testDeltaText(value) {
-    if (!Number.isFinite(value)) return 'new';
-    const rounded = Math.abs(value) >= 10 ? Math.round(value) : Number(value.toFixed(1));
-    return `${value > 0 ? '+' : ''}${rounded}%`;
-  }
-
-  function testMixRgb(from, to, amount) {
-    const ratio = Math.max(0, Math.min(1, amount));
-    const channels = from.map((value, index) => Math.round(value + (to[index] - value) * ratio));
-    return `rgb(${channels.join(' ')})`;
-  }
-
-  // Three-stop heat scale: blue through 60 aggregate test-minutes, amber
-  // through 120, and red above it. Parallel test intervals add together, so
-  // a single wall-clock hour can truthfully exceed 60 minutes.
-  function testHeatColor(seconds) {
-    const minutes = Math.max(0, Number(seconds || 0) / 60);
-    if (minutes === 0) return '#142234';
-    if (minutes <= 60) return testMixRgb([20, 43, 75], [47, 140, 255], minutes / 60);
-    if (minutes <= 120) return testMixRgb([47, 140, 255], [255, 176, 32], (minutes - 60) / 60);
-    return testMixRgb([255, 176, 32], [236, 95, 103], Math.min(1, (minutes - 120) / 60));
-  }
-
-  function testDayLabel(day) {
-    const date = new Date(`${day}T00:00:00Z`);
-    if (!Number.isFinite(date.getTime())) return day;
-    return date.toLocaleDateString([], {
-      weekday: 'short', month: 'short', day: 'numeric', timeZone: 'UTC',
-    });
-  }
-
-  function testDayShortLabel(day) {
-    const date = new Date(`${day}T00:00:00Z`);
-    if (!Number.isFinite(date.getTime())) return day;
-    return date.toLocaleDateString([], {
-      weekday: 'short', day: 'numeric', timeZone: 'UTC',
-    });
-  }
-
-  function testSummaryDetails(stats) {
-    const summary = stats.summary || {};
-    const comparison = stats.comparison_summary || {};
-    const change = testDelta(summary.test_seconds, comparison.test_seconds);
-    const hourlyTotals = new Map();
-    const dailyTotals = new Map();
-    for (const cell of stats.hourly || []) {
-      hourlyTotals.set(Number(cell.hour), (hourlyTotals.get(Number(cell.hour)) || 0) + Number(cell.test_seconds || 0));
-      dailyTotals.set(String(cell.day), (dailyTotals.get(String(cell.day)) || 0) + Number(cell.test_seconds || 0));
-    }
-    const peakHour = [...hourlyTotals].sort((a, b) => b[1] - a[1])[0]?.[0];
-    const busiestDay = [...dailyTotals].sort((a, b) => b[1] - a[1])[0]?.[0];
-    return {
-      summary,
-      change,
-      peakHour,
-      busiestDay,
-      deltaClass: Number.isFinite(change) ? (change > 0 ? 'is-worse' : 'is-better') : '',
-    };
-  }
-
-  function testCompactSummary(stats) {
-    const { summary, peakHour, busiestDay } = testSummaryDetails(stats);
-    return h('dl', { class: 'test-summary-compact', 'aria-label': 'Testing summary' },
-      h('div', null, h('dt', null, 'Total time'), h('dd', null, fmtSeconds(summary.test_seconds || 0))),
-      h('div', null, h('dt', null, 'Peak hour'), h('dd', null, Number.isInteger(peakHour) ? `${String(peakHour).padStart(2, '0')}:00` : '—')),
-      h('div', null, h('dt', null, 'Busiest day'), h('dd', null, busiestDay ? testDayShortLabel(busiestDay) : '—')));
-  }
-
-  let activeTestHeatTooltipTarget = null;
-  let pinnedTestHeatTooltipTarget = null;
-
-  function testHeatTooltipFact(label, value) {
-    return h('div', null, h('dt', null, label), h('dd', null, value));
-  }
-
-  function testHeatTooltipNode() {
-    let tooltip = $('#test-heat-tooltip');
-    if (tooltip) return tooltip;
-    tooltip = h('div', {
-      id: 'test-heat-tooltip',
-      class: 'test-heat-tooltip',
-      role: 'tooltip',
-      hidden: true,
-    });
-    document.body.append(tooltip);
-    window.addEventListener('resize', () => {
-      if (activeTestHeatTooltipTarget?.isConnected) {
-        showTestHeatTooltip(activeTestHeatTooltipTarget);
-      } else {
-        hideTestHeatTooltip();
-      }
-    });
-    document.addEventListener('scroll', () => hideTestHeatTooltip(), true);
-    document.addEventListener('pointerdown', (event) => {
-      if (!pinnedTestHeatTooltipTarget) return;
-      if (pinnedTestHeatTooltipTarget.contains(event.target)
-        || tooltip.contains(event.target)) return;
-      hideTestHeatTooltip();
-    }, true);
-    document.addEventListener('keydown', (event) => {
-      if (event.key === 'Escape' && pinnedTestHeatTooltipTarget) {
-        event.preventDefault();
-        hideTestHeatTooltip();
-      }
-    });
-    return tooltip;
-  }
-
-  function hideTestHeatTooltip(target = null) {
-    if (target && activeTestHeatTooltipTarget !== target) return;
-    if (target && pinnedTestHeatTooltipTarget === target) return;
-    if (!target && pinnedTestHeatTooltipTarget) {
-      pinnedTestHeatTooltipTarget.setAttribute('aria-pressed', 'false');
-      pinnedTestHeatTooltipTarget = null;
-    }
-    activeTestHeatTooltipTarget = null;
-    const tooltip = $('#test-heat-tooltip');
-    if (tooltip) tooltip.hidden = true;
-  }
-
-  function showTestHeatTooltip(target) {
-    if (pinnedTestHeatTooltipTarget && pinnedTestHeatTooltipTarget !== target) return;
-    const tooltip = testHeatTooltipNode();
-    const seconds = Number(target.dataset.testSeconds || 0);
-    const minutes = seconds / 60;
-    const hasTests = target.dataset.testCount !== undefined;
-    const hasFailures = target.dataset.testFailures !== undefined;
-    const hasInfrastructureFailures = target.dataset.testInfrastructure !== undefined;
-    const tests = Number(target.dataset.testCount || 0);
-    const failures = Number(target.dataset.testFailures || 0);
-    const infrastructureFailures = Number(target.dataset.testInfrastructure || 0);
-    activeTestHeatTooltipTarget = target;
-    tooltip.replaceChildren(
-      h('span', { class: 'test-heat-tooltip-period' }, target.dataset.testPeriod || ''),
-      h('strong', null, target.dataset.testTooltipValue || `${minutes.toFixed(1)} test-min`),
-      h('dl', { class: 'test-heat-tooltip-facts' },
-        testHeatTooltipFact('Tests', hasTests ? fmtTestCount(tests) : 'Not reported'),
-        testHeatTooltipFact('Test failures', hasFailures ? fmtTestCount(failures) : 'Not reported'),
-        testHeatTooltipFact('Infrastructure', hasInfrastructureFailures ? fmtTestCount(infrastructureFailures) : 'Not reported')),
-      h('span', { class: 'test-heat-tooltip-detail' },
-        target.dataset.testTooltipDetail || `${String(seconds)} aggregate seconds`),
-    );
-    tooltip.hidden = false;
-    tooltip.style.left = '0px';
-    tooltip.style.top = '0px';
-    const targetRect = target.getBoundingClientRect();
-    const tooltipRect = tooltip.getBoundingClientRect();
-    const margin = 8;
-    const gap = 7;
-    const left = Math.min(
-      window.innerWidth - tooltipRect.width - margin,
-      Math.max(margin, targetRect.left + (targetRect.width / 2) - (tooltipRect.width / 2)),
-    );
-    let top = targetRect.top - tooltipRect.height - gap;
-    if (top < margin) top = targetRect.bottom + gap;
-    top = Math.min(window.innerHeight - tooltipRect.height - margin, Math.max(margin, top));
-    tooltip.style.left = `${Math.round(left)}px`;
-    tooltip.style.top = `${Math.round(top)}px`;
-  }
-
-  function togglePinnedTestHeatTooltip(target) {
-    if (pinnedTestHeatTooltipTarget === target) {
-      pinnedTestHeatTooltipTarget = null;
-      target.setAttribute('aria-pressed', 'false');
-      hideTestHeatTooltip(target);
-      return;
-    }
-    if (pinnedTestHeatTooltipTarget) {
-      pinnedTestHeatTooltipTarget.setAttribute('aria-pressed', 'false');
-    }
-    pinnedTestHeatTooltipTarget = target;
-    target.setAttribute('aria-pressed', 'true');
-    showTestHeatTooltip(target);
-  }
-
-  function testHeatmap(stats) {
-    hideTestHeatTooltip();
-    const cells = Array.isArray(stats.hourly) ? stats.hourly : [];
-    const byDay = new Map();
-    for (const cell of cells) {
-      const day = String(cell.day || '');
-      const hour = Number(cell.hour);
-      if (!day || !Number.isInteger(hour) || hour < 0 || hour > 23) continue;
-      if (!byDay.has(day)) byDay.set(day, new Map());
-      byDay.get(day).set(hour, cell);
-    }
-    const days = [...byDay.keys()].sort();
-    const head = h('tr', null, h('th', { scope: 'col', class: 'test-heat-day' }, 'UTC'));
-    for (let hour = 0; hour < 24; hour += 1) {
-      head.append(h('th', {
-        scope: 'col',
-        class: `test-heat-hour${hour % 2 === 0 ? ' is-even' : ''}${hour % 6 === 0 ? ' is-six' : ''}`,
-      }, String(hour).padStart(2, '0')));
-    }
-    const body = h('tbody');
-    for (const day of days) {
-      const row = h('tr', null, h('th', { scope: 'row', class: 'test-heat-day' },
-        h('span', { class: 'test-heat-day-full' }, testDayLabel(day)),
-        h('span', { class: 'test-heat-day-short' }, testDayShortLabel(day))));
-      for (let hour = 0; hour < 24; hour += 1) {
-        const cell = byDay.get(day).get(hour) || { test_seconds: 0, failure_count: 0 };
-        const minutes = Number(cell.test_seconds || 0) / 60;
-        const failures = Number(cell.failure_count || 0);
-        const period = `${testDayLabel(day)} · ${String(hour).padStart(2, '0')}:00 UTC`;
-        const node = h('td', {
-          class: 'test-heat-cell',
-          style: `background-color:${testHeatColor(cell.test_seconds)}`,
-          title: `${period} — ${minutes.toFixed(1)} aggregate test-minutes${failures ? `, ${failures} failed ${failures === 1 ? 'test' : 'tests'}` : ''}`,
-          'aria-label': `${testDayLabel(day)}, ${String(hour).padStart(2, '0')}:00 UTC: ${minutes.toFixed(1)} aggregate test-minutes${failures ? `; ${failures} failures` : ''}`,
-          tabindex: Number(cell.test_seconds || 0) > 0 || failures > 0 ? '0' : null,
-          'data-test-period': period,
-          'data-test-seconds': Number(cell.test_seconds || 0),
-          'data-test-failures': failures,
-          onpointerenter: (event) => showTestHeatTooltip(event.currentTarget),
-          onpointerleave: (event) => hideTestHeatTooltip(event.currentTarget),
-          onfocus: (event) => showTestHeatTooltip(event.currentTarget),
-          onblur: (event) => hideTestHeatTooltip(event.currentTarget),
-          onkeydown: (event) => {
-            if (event.key === 'Escape') hideTestHeatTooltip(event.currentTarget);
-          },
-        });
-        row.append(node);
-      }
-      body.append(row);
-    }
-    const table = h('table', { class: 'test-heatmap' }, h('thead', null, head), body);
-    return h('section', { class: 'test-heat-panel' },
-      h('div', { class: 'test-panel-title' },
-        h('h3', null, 'Testing time by hour'),
-        h('span', { class: 'meta-passive' }, 'aggregate test-minutes · UTC')),
-      testCompactSummary(stats),
-      days.length === 0
-        ? h('p', { class: 'empty-inline' }, 'No hourly test timing is recorded for the last seven days.')
-        : h('div', { class: 'test-heat-scroll' }, table),
-      h('div', { class: 'test-heat-legend', 'aria-label': 'Heatmap scale: blue zero to 60 minutes, amber 60 to 120 minutes, red above 120 minutes' },
-        h('div', { class: 'test-heat-scale', 'aria-hidden': 'true' }),
-        h('div', { class: 'test-heat-ticks' }, h('span', null, '0m'), h('span', null, '60m'), h('span', null, '120m'), h('span', null, '180m+')),
-        h('p', null, 'Aggregate test time may exceed 60m when tests run in parallel.')));
-  }
-
-  function testSeries(rows, days, offsetDays = 0) {
-    const values = new Map((rows || []).map((row) => [String(row.day), Number(row.test_seconds || 0)]));
-    const result = [];
-    const end = new Date();
-    end.setUTCHours(0, 0, 0, 0);
-    end.setUTCDate(end.getUTCDate() - offsetDays);
-    for (let index = days - 1; index >= 0; index -= 1) {
-      const date = new Date(end);
-      date.setUTCDate(date.getUTCDate() - index);
-      const day = date.toISOString().slice(0, 10);
-      result.push({ day, seconds: values.get(day) || 0 });
-    }
-    return result;
-  }
-
-  function testTrendPoint(point, series, index, count) {
-    const label = series === 'current' ? 'Current period' : 'Previous period';
-    const node = svgEl('circle', {
-      class: `test-trend-point is-${series}`,
-      cx: point.x,
-      cy: point.y,
-      r: 7,
-      tabindex: index === count - 1 ? 0 : -1,
-      role: 'img',
-      'aria-label': `${point.day}, ${label}: ${point.seconds} aggregate test-seconds`,
-      'aria-pressed': 'false',
-      'data-test-trend-series': series,
-    });
-    node.dataset.testPeriod = `${point.day} · ${label}`;
-    node.dataset.testSeconds = point.seconds;
-    node.dataset.testTooltipValue = `${point.seconds} aggregate seconds`;
-    node.dataset.testTooltipDetail = fmtSeconds(point.seconds);
-    node.addEventListener('pointerenter', () => showTestHeatTooltip(node));
-    node.addEventListener('pointerleave', () => hideTestHeatTooltip(node));
-    node.addEventListener('focus', () => showTestHeatTooltip(node));
-    node.addEventListener('blur', () => hideTestHeatTooltip(node));
-    node.addEventListener('click', () => togglePinnedTestHeatTooltip(node));
-    node.addEventListener('keydown', (event) => {
-      if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
-      event.preventDefault();
-      const peers = [...node.ownerSVGElement.querySelectorAll(
-        `[data-test-trend-series="${series}"]`,
-      )];
-      const current = peers.indexOf(node);
-      const nextIndex = event.key === 'Home' ? 0
-        : event.key === 'End' ? peers.length - 1
-          : Math.max(0, Math.min(peers.length - 1,
-            current + (event.key === 'ArrowRight' ? 1 : -1)));
-      if (nextIndex === current) return;
-      node.setAttribute('tabindex', '-1');
-      peers[nextIndex].setAttribute('tabindex', '0');
-      peers[nextIndex].focus({ preventScroll: true });
-    });
-    return node;
-  }
-
-  function testTrendChart(stats) {
-    const days = Math.max(1, Math.min(365, Number(stats.days || state.testsDays || 30)));
-    const current = testSeries(stats.daily, days, 0);
-    const previous = testSeries(stats.previous_daily, days, days);
-    const values = [...current, ...previous].map((item) => item.seconds);
-    const maxValue = Math.max(1, ...values);
-    const width = 1000;
-    const height = 190;
-    const padX = 8;
-    const padY = 12;
-    const points = (series) => series.map((item, index) => {
-      const x = padX + (index / Math.max(1, series.length - 1)) * (width - padX * 2);
-      const y = height - padY - (item.seconds / maxValue) * (height - padY * 2);
-      return { ...item, x, y };
-    });
-    const currentPoints = points(current);
-    const previousPoints = points(previous);
-    const svg = svgEl('svg', {
-      class: 'test-trend-chart', viewBox: `0 0 ${width} ${height}`,
-      preserveAspectRatio: 'none', role: 'img',
-      'aria-label': 'Daily aggregate testing time compared with the previous period',
-    });
-    for (const ratio of [0, .5, 1]) {
-      const y = padY + ratio * (height - padY * 2);
-      svg.append(svgEl('line', { class: 'test-trend-grid', x1: padX, y1: y, x2: width - padX, y2: y }));
-    }
-    const currentLine = currentPoints.map((point) => `${point.x.toFixed(1)},${point.y.toFixed(1)}`).join(' ');
-    const previousLine = previousPoints.map((point) => `${point.x.toFixed(1)},${point.y.toFixed(1)}`).join(' ');
-    svg.append(
-      svgEl('polygon', {
-        class: 'test-trend-area',
-        points: `${padX},${height - padY} ${currentLine} ${width - padX},${height - padY}`,
-      }),
-      svgEl('polyline', { class: 'test-trend-previous', fill: 'none', points: previousLine }),
-      svgEl('polyline', { class: 'test-trend-current', fill: 'none', points: currentLine }),
-    );
-    const differences = currentPoints.map((point, index) => point.seconds - previousPoints[index].seconds);
-    const riseIndex = differences.indexOf(Math.max(...differences));
-    const fallIndex = differences.indexOf(Math.min(...differences));
-    for (const [index, kind] of [[riseIndex, 'rise'], [fallIndex, 'fall']]) {
-      const point = currentPoints[index];
-      if (!point || Math.abs(differences[index]) < 1) continue;
-      svg.append(
-        svgEl('line', { class: `test-trend-marker is-${kind}`, x1: point.x, y1: padY, x2: point.x, y2: height - padY }),
-        svgEl('circle', { class: `test-trend-dot is-${kind}`, cx: point.x, cy: point.y, r: 4 }),
-      );
-    }
-    currentPoints.forEach((point, index) => {
-      svg.append(testTrendPoint(point, 'current', index, currentPoints.length));
-    });
-    previousPoints.forEach((point, index) => {
-      svg.append(testTrendPoint(point, 'previous', index, previousPoints.length));
-    });
-    const first = current[0]?.day || '';
-    const middle = current[Math.floor(current.length / 2)]?.day || '';
-    const last = current.at(-1)?.day || '';
-    return h('section', { class: 'test-trend-panel' },
-      h('div', { class: 'test-panel-title' },
-        h('h3', null, 'Testing time trend'),
-        h('div', { class: 'test-trend-legend' },
-          h('span', { class: 'is-current' }, 'Current period'),
-          h('span', { class: 'is-previous' }, 'Previous period'))),
-      h('div', { class: 'test-trend-wrap' },
-        h('div', { class: 'test-trend-y' }, h('span', null, fmtSeconds(maxValue)), h('span', null, fmtSeconds(maxValue / 2)), h('span', null, '0s')),
-        svg),
-      h('div', { class: 'test-trend-x' }, h('span', null, first), h('span', null, middle), h('span', null, last)),
-      testChartDataDisclosure('Daily trend data', ['Day', 'Current period', 'Previous period'],
-        current.map((item, index) => [item.day, fmtSeconds(item.seconds), fmtSeconds(previous[index]?.seconds || 0)])));
-  }
-
-  function testSummary(stats) {
-    const { summary, change, peakHour, busiestDay, deltaClass } = testSummaryDetails(stats);
-    return h('aside', { class: 'test-summary' },
-      h('h3', null, `${stats.days || state.testsDays}-day summary`),
-      h('strong', { class: 'test-summary-total' }, fmtSeconds(summary.test_seconds || 0)),
-      h('span', { class: 'test-summary-label' }, 'Total testing time'),
-      h('div', { class: `test-summary-delta ${deltaClass}` },
-        h('strong', null, testDeltaText(change)), h('span', null, `vs previous ${stats.days || state.testsDays} days`)),
-      h('dl', { class: 'test-summary-facts' },
-        h('div', null, h('dt', null, 'Peak hour'), h('dd', null, Number.isInteger(peakHour) ? `${String(peakHour).padStart(2, '0')}:00 UTC` : '—')),
-        h('div', null, h('dt', null, 'Busiest day'), h('dd', null, busiestDay ? testDayLabel(busiestDay) : '—'))));
-  }
-
-  function renderTestHeader(fleet) {
-    const generatedAt = fleet?.snapshot?.generated_at || fleet?.snapshot?.observed_through;
-    const updated = $('#tests-updated');
-    updated.textContent = generatedAt
-      ? `Updated ${fmtWhen(generatedAt)}`
-      : state.testsFleetLoadedAt ? `Updated ${timeAgo(state.testsFleetLoadedAt)}` : '';
-    const retained = $('#tests-retained');
-    retained.hidden = !state.testsFleetStale;
-    updated.closest('.test-refresh-line').hidden = !updated.textContent && retained.hidden;
-    $('#tests-run').disabled = !(fleet?.repositories || []).length;
-  }
-
-  function testAttentionCount(fleet = state.testsFleet) {
-    if (!fleet) return null;
-    // Thousands of healthy runs can be active in a normal day. The navigation
-    // badge is reserved for fleet conditions that may require a decision, not
-    // for raw activity volume or individual-test progress.
-    const count = (fleet.attention || []).filter((item) => (
-      item.severity === 'critical' || item.severity === 'error'
-    )).length;
-    return count > 0 ? count : null;
+  function testRepositoryCount() {
+    return state.testsRepositories ? testRepositories().length : null;
   }
 
   function renderTests() {
     if (currentPage() !== 'tests') return;
     const host = $('#tests-body');
-    renderTestHeader(state.testsFleet);
-    if (state.testsLoading && !state.testsFleet) {
+    const repositoryCount = testRepositoryCount();
+    setCount('tests-count', repositoryCount);
+    $('#tests-run').disabled = !repositoryCount;
+    if (state.testsLoading && !state.testsRepositories) {
       if (state.testsRenderSignature === 'loading') return;
-      host.replaceChildren(h('div', { class: 'skel', 'aria-hidden': 'true' }), h('div', { class: 'skel', 'aria-hidden': 'true' }));
+      host.replaceChildren(h('div', { class: 'skel', 'aria-hidden': 'true' }));
       state.testsRenderSignature = 'loading';
       return;
     }
-    const fleet = state.testsFleet;
-    if (!fleet) {
+    if (!state.testsRepositories) {
       const failureSignature = `failure:${state.testsError?.message || ''}`;
       if (state.testsRenderSignature === failureSignature) return;
       host.replaceChildren(testLocalFailure(
-        'Fleet statistics are unavailable',
+        'Test repositories are unavailable',
         state.testsError,
         () => loadTests({ force: true }),
       ));
       state.testsRenderSignature = failureSignature;
       return;
     }
-    renderTestHeader(fleet);
-    const repositories = testFleetRepositories(fleet);
-    const revision = fleet.snapshot?.source_revision || JSON.stringify([
-      fleet.summary, fleet.repositories, fleet.capacity, fleet.attention,
-    ]);
-    const renderSignature = JSON.stringify([
-      revision, state.testsSearch, state.testsHours,
-    ]);
+    const repositories = testRepositories();
+    const renderSignature = JSON.stringify(repositories);
     if (state.testsRenderSignature === renderSignature && host.childElementCount) return;
-    const focusKey = document.activeElement?.dataset?.testFocusKey || null;
-    const openDisclosures = new Set([...host.querySelectorAll('details[open][data-test-disclosure]')]
-      .map((node) => node.dataset.testDisclosure));
     host.replaceChildren(
-      testFleetSummary(fleet),
-      testFleetMatrix(fleet, repositories),
-      testFleetMobileList(repositories),
-      h('div', { class: 'test-fleet-lower' }, testFleetCapacity(fleet), testFleetAttention(fleet)),
+      h('section', { class: 'test-current-repositories', 'aria-label': 'Test repositories' },
+        repositories.length
+          ? repositories.map((repository) => h('button', {
+            class: 'test-current-repository test-repository-button',
+            type: 'button',
+            onclick: () => openTestRunDialog(repository.repo_id),
+          },
+            h('strong', null, repository.display_name || repository.name || 'Repository'),
+            h('span', null, repository.status || repository.setup_status || 'Configured'),
+          ))
+          : h('p', { class: 'empty' }, 'No test repositories are configured'),
+      ),
     );
-    for (const disclosure of host.querySelectorAll('details[data-test-disclosure]')) {
-      if (openDisclosures.has(disclosure.dataset.testDisclosure)) disclosure.open = true;
-    }
     state.testsRenderSignature = renderSignature;
-    if (focusKey) {
-      const restore = [...host.querySelectorAll('[data-test-focus-key]')]
-        .find((node) => node.dataset.testFocusKey === focusKey);
-      restore?.focus({ preventScroll: true });
-    }
   }
 
   // ---------------------------------------------------------------- render root
@@ -6334,7 +4872,7 @@
       : 0;
     setCount('projects-count', ui.lifecycleViews.projects === 'archived'
       ? (archivesCurrent ? archivesForPage('projects').length : null) : projectGroups);
-    setCount('tests-count', testAttentionCount());
+    setCount('tests-count', testRepositoryCount());
     setCount('routes-count', (o.routes || []).length);
     setCount('servers-count', ui.lifecycleViews.servers === 'archived'
       ? (archivesCurrent ? archivesForPage('servers').length : null)
@@ -6353,7 +4891,7 @@
     syncLifecycleFilters();
 
     setNavCount('projects', projectGroups);
-    setNavCount('tests', testAttentionCount());
+    setNavCount('tests', testRepositoryCount());
     setNavCount('servers', o.inventory ? (o.inventory.servers || []).length + webContainerCount : null);
     setNavCount('routes', (o.routes || []).length);
     setNavCount('docker', o.inventory?.docker?.available

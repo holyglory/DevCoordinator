@@ -588,6 +588,41 @@ class DurableAttemptSpool:
         finally:
             os.close(active_fd)
 
+    def discard_all(self) -> int:
+        """Delete only isolated disposable spool entries after restart cleanup."""
+
+        removed = 0
+        for directory in (
+            self.pending,
+            self.processed,
+            self.terminal_conflicts,
+            self.result_pending,
+            self.result_processed,
+            self.active,
+        ):
+            directory_fd = self._open_directory(directory)
+            try:
+                for entry in os.scandir(directory):
+                    if entry.name.startswith(".tmp-"):
+                        allowed = True
+                    else:
+                        allowed = entry.name.endswith(".json")
+                    metadata = os.stat(
+                        entry.name,
+                        dir_fd=directory_fd,
+                        follow_symlinks=False,
+                    )
+                    if not allowed or not stat.S_ISREG(metadata.st_mode):
+                        raise TestStoreContractError(
+                            "test spool contains an unsupported entry"
+                        )
+                    os.unlink(entry.name, dir_fd=directory_fd)
+                    removed += 1
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        return removed
+
     def _append_document(
         self,
         envelope_id: str,

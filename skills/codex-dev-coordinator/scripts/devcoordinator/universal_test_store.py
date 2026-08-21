@@ -1,7 +1,7 @@
 """Separated durable state for the universal asynchronous test harness.
 
 The authority store deliberately does not import this module.  Test plans,
-high-volume result chunks, attempt journals, and rollups live in their own
+current plans, runs, bounded results, and attempt journals live in their own
 SQLite/WAL database so test ingestion cannot extend an authority transaction.
 
 Schema creation is explicit through :meth:`UniversalTestStore.create`.  Normal
@@ -30,29 +30,24 @@ from typing import Any, Callable, Generator, Iterable, Mapping, Sequence
 import uuid
 
 from .universal_test_contract import (
-    EvidencePolicy,
     SourceMode,
     deterministic_fingerprint,
-    evidence_policy_fingerprint,
 )
 from .universal_test_planner import TestPlan
 from .store import refuse_symlink_components
 
 
-TEST_STORE_SCHEMA_VERSION = 6
+TEST_STORE_SCHEMA_VERSION = 7
 DEFAULT_BUSY_TIMEOUT_MS = 5_000
 DEFAULT_LEASE_SECONDS = 30
 # Pending launch reconciliation may use the caller's full one-hour launch
-# deadline.  The lease covers that deadline plus one ordinary heartbeat so a
-# lost reply or testd restart cannot make the reaper abandon an attempt that
-# the broker may already have started.
+# deadline. The lease covers that deadline plus one ordinary heartbeat.
 MAX_LEASE_SECONDS = 3_630
 MAX_RESULT_CHUNK_BYTES = 256 * 1024
 MAX_CASES_PER_CHUNK = 500
 MAX_FAILURES_PER_CHUNK = 64
 MAX_ARTIFACTS_PER_CHUNK = 64
 MAX_EVENT_DETAIL_BYTES = 16 * 1024
-MAX_ROLLUP_REBUILD_BATCH = 1_000
 MAX_RUN_LEASE_EXPIRY_EVIDENCE = 64
 MAX_EXPIRED_ATTEMPTS_PER_REAP = 128
 MAX_NONTERMINAL_RUNS_PER_RECONCILE = 10_000
@@ -98,12 +93,6 @@ class TestStoreContractError(TestStoreError):
 
 class TestStoreConflict(TestStoreError):
     """A request conflicts with immutable or generation-fenced state."""
-
-
-class LiveRetryReplanRequired(TestStoreConflict):
-    """A live-source run cannot be replayed as an exact retained-plan retry."""
-
-    code = "live_retry_replan_required"
 
 
 class TestStoreSecurityError(TestStoreConflict):
@@ -345,7 +334,7 @@ class RunnableTarget:
     source_mode: str
     exclusive_resources: tuple[str, ...]
     memory_estimate_mib: int = 512
-    memory_estimate_source: str = "cold_start_default"
+    memory_estimate_source: str = "fixed_default"
     memory_sample_count: int = 0
 
 
@@ -496,18 +485,6 @@ CREATE TABLE test_target_attempts (
 CREATE INDEX test_target_attempts_lease
 ON test_target_attempts(state, lease_expires_at, attempt_id);
 
-CREATE TABLE test_target_resource_profiles (
-    repository_id TEXT NOT NULL,
-    target_name TEXT NOT NULL,
-    sample_count INTEGER NOT NULL CHECK(sample_count > 0),
-    recent_peak_memory_bytes INTEGER NOT NULL CHECK(recent_peak_memory_bytes >= 0),
-    last_peak_memory_bytes INTEGER NOT NULL CHECK(last_peak_memory_bytes >= 0),
-    last_cpu_seconds REAL,
-    updated_at REAL NOT NULL,
-    PRIMARY KEY(repository_id, target_name),
-    CHECK(last_cpu_seconds IS NULL OR last_cpu_seconds >= 0)
-) STRICT;
-
 CREATE TABLE test_result_chunks (
     attempt_id TEXT NOT NULL REFERENCES test_target_attempts(attempt_id) ON DELETE CASCADE,
     chunk_id TEXT NOT NULL,
@@ -521,21 +498,6 @@ CREATE TABLE test_result_chunks (
     created_at REAL NOT NULL,
     PRIMARY KEY(attempt_id, chunk_id),
     UNIQUE(attempt_id, chunk_index)
-) STRICT;
-
-CREATE TABLE test_case_results (
-    attempt_id TEXT NOT NULL REFERENCES test_target_attempts(attempt_id) ON DELETE CASCADE,
-    chunk_id TEXT NOT NULL,
-    ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
-    case_id TEXT NOT NULL,
-    display_name TEXT NOT NULL,
-    status TEXT NOT NULL CHECK(status IN ('passed', 'failed', 'skipped', 'error')),
-    duration_seconds REAL NOT NULL CHECK(duration_seconds >= 0),
-    location TEXT,
-    PRIMARY KEY(attempt_id, chunk_id, ordinal),
-    UNIQUE(attempt_id, case_id),
-    FOREIGN KEY(attempt_id, chunk_id)
-      REFERENCES test_result_chunks(attempt_id, chunk_id) ON DELETE CASCADE
 ) STRICT;
 
 CREATE TABLE test_failures (
@@ -568,33 +530,6 @@ CREATE TABLE test_artifacts (
 ) STRICT;
 CREATE INDEX test_artifacts_attempt ON test_artifacts(attempt_id, created_at, artifact_id);
 
-CREATE TABLE test_evidence_attestations (
-    attestation_id TEXT PRIMARY KEY,
-    repository_id TEXT NOT NULL,
-    policy_name TEXT NOT NULL,
-    snapshot_id TEXT NOT NULL REFERENCES test_snapshots(snapshot_id),
-    run_id TEXT NOT NULL REFERENCES test_runs(run_id),
-    policy_fingerprint TEXT NOT NULL,
-    conclusion TEXT NOT NULL,
-    issued_at REAL NOT NULL,
-    expires_at REAL NOT NULL,
-    UNIQUE(run_id, policy_name, policy_fingerprint)
-) STRICT;
-CREATE INDEX test_evidence_attestations_lookup
-ON test_evidence_attestations(
-  repository_id, snapshot_id, policy_name, issued_at DESC, attestation_id
-);
-
-CREATE TABLE test_evidence_consumptions (
-    consumption_id TEXT PRIMARY KEY,
-    attestation_id TEXT NOT NULL UNIQUE
-      REFERENCES test_evidence_attestations(attestation_id) ON DELETE RESTRICT,
-    operation_id TEXT NOT NULL UNIQUE,
-    consumed_at REAL NOT NULL
-) STRICT;
-CREATE INDEX test_evidence_consumptions_attestation
-ON test_evidence_consumptions(attestation_id, consumed_at);
-
 CREATE TABLE test_events (
     event_id INTEGER PRIMARY KEY AUTOINCREMENT,
     event_type TEXT NOT NULL,
@@ -606,20 +541,6 @@ CREATE TABLE test_events (
 ) STRICT;
 CREATE INDEX test_events_cursor ON test_events(repository_id, event_id);
 
-CREATE TABLE test_repository_setup_projections (
-    repository_id TEXT PRIMARY KEY,
-    status TEXT NOT NULL CHECK(status IN ('ready', 'missing', 'invalid')),
-    manifest_fingerprint TEXT,
-    projection_fingerprint TEXT NOT NULL,
-    projection_json TEXT NOT NULL,
-    observed_at REAL NOT NULL,
-    updated_at REAL NOT NULL,
-    CHECK(
-      (status = 'ready' AND manifest_fingerprint IS NOT NULL)
-      OR (status != 'ready' AND manifest_fingerprint IS NULL)
-    )
-) STRICT;
-
 CREATE TABLE test_mutation_journal (
     operation_id TEXT PRIMARY KEY,
     operation_kind TEXT NOT NULL,
@@ -628,63 +549,6 @@ CREATE TABLE test_mutation_journal (
     created_at REAL NOT NULL
 ) STRICT;
 
-CREATE TABLE test_rollup_hourly (
-    repository_id TEXT NOT NULL,
-    bucket_start REAL NOT NULL,
-    run_count INTEGER NOT NULL,
-    attempt_count INTEGER NOT NULL,
-    selected_target_count INTEGER NOT NULL,
-    eligible_target_count INTEGER NOT NULL,
-    avoided_target_count INTEGER NOT NULL,
-    case_count INTEGER NOT NULL,
-    passed_count INTEGER NOT NULL,
-    failed_count INTEGER NOT NULL,
-    skipped_count INTEGER NOT NULL,
-    error_count INTEGER NOT NULL,
-    queue_seconds REAL NOT NULL,
-    attempt_queue_seconds REAL NOT NULL,
-    aggregate_test_seconds REAL NOT NULL,
-    attempt_wall_seconds REAL NOT NULL,
-    wall_seconds REAL NOT NULL,
-    retry_attempt_count INTEGER NOT NULL,
-    flake_count INTEGER NOT NULL,
-    slow_count INTEGER NOT NULL,
-    regression_count INTEGER NOT NULL,
-    max_attempt_seconds REAL NOT NULL,
-    success_count INTEGER NOT NULL,
-    failure_count INTEGER NOT NULL,
-    infrastructure_count INTEGER NOT NULL,
-    PRIMARY KEY(repository_id, bucket_start)
-) STRICT;
-
-CREATE TABLE test_rollup_daily (
-    repository_id TEXT NOT NULL,
-    bucket_start REAL NOT NULL,
-    run_count INTEGER NOT NULL,
-    attempt_count INTEGER NOT NULL,
-    selected_target_count INTEGER NOT NULL,
-    eligible_target_count INTEGER NOT NULL,
-    avoided_target_count INTEGER NOT NULL,
-    case_count INTEGER NOT NULL,
-    passed_count INTEGER NOT NULL,
-    failed_count INTEGER NOT NULL,
-    skipped_count INTEGER NOT NULL,
-    error_count INTEGER NOT NULL,
-    queue_seconds REAL NOT NULL,
-    attempt_queue_seconds REAL NOT NULL,
-    aggregate_test_seconds REAL NOT NULL,
-    attempt_wall_seconds REAL NOT NULL,
-    wall_seconds REAL NOT NULL,
-    retry_attempt_count INTEGER NOT NULL,
-    flake_count INTEGER NOT NULL,
-    slow_count INTEGER NOT NULL,
-    regression_count INTEGER NOT NULL,
-    max_attempt_seconds REAL NOT NULL,
-    success_count INTEGER NOT NULL,
-    failure_count INTEGER NOT NULL,
-    infrastructure_count INTEGER NOT NULL,
-    PRIMARY KEY(repository_id, bucket_start)
-) STRICT;
 """
 
 def _canonical_json(value: object) -> str:
@@ -872,97 +736,6 @@ def _target_dependencies_succeeded(
     )
 
 
-def _retry_plan_projection(
-    plan_json: object,
-    *,
-    selected_targets: Sequence[str],
-) -> tuple[str, str, str, str]:
-    """Derive one dense exact-dependency plan for a retained-run retry."""
-
-    try:
-        source, _resources = _stored_plan_parts(plan_json)
-    except TestStoreContractError as error:
-        raise TestStoreContractError("stored retry source plan is invalid") from error
-    selected = tuple(sorted(set(selected_targets)))
-    if not selected:
-        raise TestStoreContractError("retry plan requires selected targets")
-    dependencies = _stored_plan_dependencies(plan_json)
-    if not set(selected).issubset(dependencies):
-        raise TestStoreContractError("retry targets exceed the stored plan")
-    selected_set = set(selected)
-    projected_dependencies = {
-        target: tuple(
-            dependency
-            for dependency in dependencies[target]
-            if dependency in selected_set
-        )
-        for target in selected
-    }
-    unresolved = set(selected)
-    resolved: set[str] = set()
-    waves: list[list[str]] = []
-    while unresolved:
-        wave = sorted(
-            target
-            for target in unresolved
-            if set(projected_dependencies[target]).issubset(resolved)
-        )
-        if not wave:
-            raise TestStoreContractError("retry plan dependencies contain a cycle")
-        waves.append(wave)
-        unresolved.difference_update(wave)
-        resolved.update(wave)
-    selection = source.get("selection")
-    if not isinstance(selection, dict) or not selected_set.issubset(selection):
-        raise TestStoreContractError("stored retry plan selection is invalid")
-    document = dict(source)
-    document["selected_targets"] = list(selected)
-    document["dependency_waves"] = waves
-    document["dependencies"] = {
-        target: list(projected_dependencies[target]) for target in selected
-    }
-    document["selection"] = {target: selection[target] for target in selected}
-    try:
-        fingerprint_document = {
-            "schema_version": 3,
-            "manifest_fingerprint": document["manifest_fingerprint"],
-            "repository_id": document["repository_id"],
-            "intent": document["intent"],
-            "timeouts": document["timeouts"],
-            "source": document["source"],
-            "changes": document["changes"],
-            "eligible_targets": document["eligible_targets"],
-            "selected_targets": document["selected_targets"],
-            "dependency_waves": document["dependency_waves"],
-            "dependencies": document["dependencies"],
-            "selection": document["selection"],
-            "complete_intent_fallback": document["complete_intent_fallback"],
-            "reusable": document["reusable"],
-        }
-        execution_document = {
-            "schema_version": 3,
-            "manifest_fingerprint": document["manifest_fingerprint"],
-            "repository_id": document["repository_id"],
-            "source_mode": document["source"]["mode"],
-            "content_fingerprint": document["source"]["content_fingerprint"],
-            "intent": document["intent"],
-            "timeouts": document["timeouts"],
-            "eligible_targets": document["eligible_targets"],
-            "selected_targets": document["selected_targets"],
-            "dependency_waves": document["dependency_waves"],
-            "dependencies": document["dependencies"],
-        }
-    except (KeyError, TypeError) as error:
-        raise TestStoreContractError("stored retry source plan is invalid") from error
-    fingerprint = deterministic_fingerprint(fingerprint_document)
-    execution_fingerprint = deterministic_fingerprint(execution_document)
-    plan_id = "plan-" + fingerprint[:32]
-    document["plan_id"] = plan_id
-    document["fingerprint"] = fingerprint
-    document["execution_fingerprint"] = execution_fingerprint
-    return plan_id, fingerprint, execution_fingerprint, _canonical_json(document)
-
-
 def _bounded_text(
     field: str,
     value: object,
@@ -1024,10 +797,6 @@ def _now(clock: Callable[[], float]) -> float:
     return _finite_nonnegative("clock", clock())
 
 
-def _bucket_start(timestamp: float, seconds: int) -> float:
-    return float(int(timestamp) // seconds * seconds)
-
-
 class UniversalTestStore:
     """Transactional test-plane persistence with exact attempt fencing."""
 
@@ -1045,6 +814,11 @@ class UniversalTestStore:
         self.busy_timeout_ms = _positive_int(
             "busy_timeout_ms", busy_timeout_ms, maximum=60_000
         )
+
+    def current_time(self) -> float:
+        """Return the store's validated clock value for bounded live reads."""
+
+        return _now(self._clock)
 
     @classmethod
     def create(
@@ -1551,12 +1325,6 @@ class UniversalTestStore:
                 },
                 created_at=timestamp,
             )
-            if initial_finished_at is not None:
-                self._refresh_rollups(
-                    connection,
-                    repository_id=plan.repository_id,
-                    finished_at=initial_finished_at,
-                )
             return result
 
     def register_plan(
@@ -1769,15 +1537,10 @@ class UniversalTestStore:
                 """
                 SELECT target.*, run.repository_id, run.owner_uid, run.priority,
                        run.state AS run_state, run.source_mode,
-                       plan.plan_json,
-                       profile.sample_count AS memory_sample_count,
-                       profile.recent_peak_memory_bytes
+                       plan.plan_json
                 FROM test_run_targets AS target
                 JOIN test_runs AS run ON run.run_id = target.run_id
                 JOIN test_plans AS plan ON plan.plan_id = run.plan_id
-                LEFT JOIN test_target_resource_profiles AS profile
-                  ON profile.repository_id = run.repository_id
-                 AND profile.target_name = target.target_name
                 WHERE target.state = 'queued'
                   AND run.state IN ('queued', 'running')
                 ORDER BY run.priority DESC, target.queued_at, target.target_id
@@ -1820,8 +1583,6 @@ class UniversalTestStore:
 
     @staticmethod
     def _runnable_target(row: sqlite3.Row) -> RunnableTarget:
-        recent_peak = row["recent_peak_memory_bytes"]
-        sample_count = row["memory_sample_count"]
         return RunnableTarget(
             target_id=str(row["target_id"]),
             run_id=str(row["run_id"]),
@@ -1837,15 +1598,9 @@ class UniversalTestStore:
             worktree_key=str(row["worktree_key"]),
             exclusive_resources=tuple(json.loads(row["exclusive_resources_json"])),
             source_mode=str(row["source_mode"]),
-            memory_estimate_mib=(
-                DEFAULT_MEMORY_BOOTSTRAP_MIB
-                if recent_peak is None
-                else max(1, (int(recent_peak) + (1024 * 1024) - 1) // (1024 * 1024))
-            ),
-            memory_estimate_source=(
-                "cold_start_default" if recent_peak is None else "learned_peak"
-            ),
-            memory_sample_count=0 if sample_count is None else int(sample_count),
+            memory_estimate_mib=DEFAULT_MEMORY_BOOTSTRAP_MIB,
+            memory_estimate_source="fixed_default",
+            memory_sample_count=0,
         )
 
     def active_allocations(self) -> tuple[dict[str, object], ...]:
@@ -1882,121 +1637,94 @@ class UniversalTestStore:
         finally:
             connection.close()
 
-    def queue_status(self, *, repository_id: str) -> dict[str, object]:
-        """Return bounded current queue evidence without requiring a run ID."""
+    def cancel_interrupted_runs(
+        self, *, reason: str = "testd restarted", now: float | None = None
+    ) -> dict[str, object]:
+        """Cancel all unfinished disposable work after daemon replacement."""
 
-        repository_id = _safe_id("repository_id", repository_id)
-        connection = self._connect(readonly=True)
-        try:
-            rows = connection.execute(
+        reason = _bounded_text("reason", reason, maximum=500)
+        timestamp = _now(self._clock) if now is None else float(now)
+        with self._transaction() as connection:
+            runs = connection.execute(
                 """
-                SELECT run.repository_id, target.state, COUNT(*) AS count
-                FROM test_run_targets AS target
-                JOIN test_runs AS run ON run.run_id = target.run_id
-                WHERE target.state IN ('queued', 'leased', 'running')
-                  AND run.state IN ('queued', 'running', 'cancelling', 'superseding')
-                GROUP BY run.repository_id, target.state
+                SELECT run_id, repository_id
+                FROM test_runs
+                WHERE state IN ('queued', 'running', 'cancelling', 'superseding')
+                ORDER BY queued_at, run_id
                 """
             ).fetchall()
-            global_counts = {"queued": 0, "leased": 0, "running": 0}
-            repository_counts = {"queued": 0, "leased": 0, "running": 0}
-            for row in rows:
-                state = str(row["state"])
-                count = int(row["count"])
-                global_counts[state] += count
-                if str(row["repository_id"]) == repository_id:
-                    repository_counts[state] += count
-            blockers = [
-                {"code": str(row["wait_code"]), "target_count": int(row["count"])}
-                for row in connection.execute(
-                    """
-                    SELECT target.wait_code, COUNT(*) AS count
-                    FROM test_run_targets AS target
-                    JOIN test_runs AS run ON run.run_id = target.run_id
-                    WHERE run.repository_id = ?
-                      AND target.state = 'queued'
-                      AND target.wait_code IS NOT NULL
-                    GROUP BY target.wait_code
-                    ORDER BY target.wait_code
-                    LIMIT 16
+            run_ids = [str(row["run_id"]) for row in runs]
+            if run_ids:
+                placeholders = ",".join("?" for _ in run_ids)
+                connection.execute(
+                    f"""
+                    DELETE FROM test_result_chunks
+                    WHERE attempt_id IN (
+                      SELECT attempt_id FROM test_target_attempts
+                      WHERE run_id IN ({placeholders})
+                        AND state IN ('leased', 'running')
+                    )
                     """,
-                    (repository_id,),
-                ).fetchall()
-            ]
-            representative_targets = [
-                {
-                    "run_id": str(row["run_id"]),
-                    "target_name": str(row["target_name"]),
-                    "state": str(row["state"]),
-                    "attempt_id": (
-                        None
-                        if row["current_attempt_id"] is None
-                        else str(row["current_attempt_id"])
-                    ),
-                    "wait_code": (
-                        None if row["wait_code"] is None else str(row["wait_code"])
-                    ),
-                }
-                for row in connection.execute(
-                    """
-                    SELECT target.run_id, target.target_name, target.state,
-                           target.current_attempt_id, target.wait_code
-                    FROM test_run_targets AS target
-                    JOIN test_runs AS run ON run.run_id = target.run_id
-                    WHERE run.repository_id = ?
-                      AND target.state IN ('queued', 'leased', 'running')
-                      AND run.state IN ('queued', 'running', 'cancelling', 'superseding')
-                    ORDER BY target.queued_at, target.target_id
-                    LIMIT 16
+                    run_ids,
+                )
+                connection.execute(
+                    f"""
+                    UPDATE test_target_attempts
+                    SET state = 'cancelled', conclusion = 'cancelled',
+                        failure_classification = ?, reporter_complete = 0,
+                        passed_count = 0, failed_count = 0,
+                        skipped_count = 0, error_count = 0,
+                        lease_expires_at = ?, heartbeat_at = ?,
+                        finished_at = ?, updated_at = ?
+                    WHERE run_id IN ({placeholders})
+                      AND state IN ('leased', 'running')
                     """,
-                    (repository_id,),
-                ).fetchall()
-            ]
-        finally:
-            connection.close()
-
-        runnable = self.runnable_targets(limit=10_000)
-        repository_positions = [
-            index
-            for index, candidate in enumerate(runnable, start=1)
-            if candidate.repository_id == repository_id
-        ]
-        runnable_count = len(repository_positions)
-        dependency_blocked = max(0, repository_counts["queued"] - runnable_count)
-        if dependency_blocked:
-            blockers.append(
-                {"code": "dependency_wave", "target_count": dependency_blocked}
-            )
-        phase = (
-            "execution"
-            if repository_counts["running"]
-            else "launch"
-            if repository_counts["leased"]
-            else "scheduler"
-            if repository_counts["queued"]
-            else "idle"
-        )
-        return {
-            "repository_id": repository_id,
-            "sampled_at": _now(self._clock),
-            "phase": phase,
-            "global_targets": global_counts,
-            "repository_targets": repository_counts,
-            "repository_runnable_targets": runnable_count,
-            "approximate_first_position": (
-                min(repository_positions) if repository_positions else None
-            ),
-            "position_population_truncated": len(runnable) == 10_000,
-            "blockers": blockers[:16],
-            "representative_targets": representative_targets,
-            # Admission is dynamic and memory-based; there is deliberately no
-            # invented fixed worker count or unobserved available capacity.
-            "worker_capacity": {
-                "model": "dynamic_memory_admission",
-                "limit": None,
-                "available": None,
-            },
-        }
+                    (
+                        FailureClassification.CANCELLATION.value,
+                        timestamp,
+                        timestamp,
+                        timestamp,
+                        timestamp,
+                        *run_ids,
+                    ),
+                )
+                connection.execute(
+                    f"""
+                    UPDATE test_run_targets
+                    SET state = 'cancelled', wait_code = NULL,
+                        finished_at = ?
+                    WHERE run_id IN ({placeholders})
+                      AND state IN ('queued', 'leased', 'running')
+                    """,
+                    (timestamp, *run_ids),
+                )
+                connection.execute(
+                    f"""
+                    UPDATE test_runs
+                    SET state = 'cancelled', conclusion = 'cancelled',
+                        failure_classification = ?, cancel_reason = ?,
+                        finished_at = ?, updated_at = ?
+                    WHERE run_id IN ({placeholders})
+                    """,
+                    (
+                        FailureClassification.CANCELLATION.value,
+                        reason,
+                        timestamp,
+                        timestamp,
+                        *run_ids,
+                    ),
+                )
+                for row in runs:
+                    self._event(
+                        connection,
+                        event_type="test.run_cancelled_on_restart",
+                        repository_id=str(row["repository_id"]),
+                        run_id=str(row["run_id"]),
+                        attempt_id=None,
+                        detail={"reason": reason},
+                        created_at=timestamp,
+                    )
+        return {"cancelled_run_ids": run_ids, "cancelled_run_count": len(run_ids)}
 
     def record_schedule_decision(
         self,
@@ -2496,86 +2224,6 @@ class UniversalTestStore:
             )
             return detail
 
-    def recover_attempt_lease(
-        self,
-        attempt_id: str,
-        *,
-        generation: int,
-        lease_owner: str,
-        lease_seconds: int = DEFAULT_LEASE_SECONDS,
-        operation_id: str,
-    ) -> dict[str, object]:
-        """Grant one bounded lease to an exact durably recovered attempt.
-
-        A testd replacement can be absent longer than the ordinary heartbeat
-        lease while the independently supervised native runner remains alive.
-        Recovery is therefore allowed to cross the prior deadline, but only
-        while the attempt is still active and its generation and lease owner
-        match the private durable spool binding.  A reaped or terminal attempt
-        can never be resurrected through this path.
-        """
-
-        attempt_id = _safe_id("attempt_id", attempt_id)
-        lease_owner = _safe_id("lease_owner", lease_owner)
-        lease_seconds = _positive_int(
-            "lease_seconds", lease_seconds, maximum=MAX_LEASE_SECONDS
-        )
-        operation_id = _operation_id(operation_id)
-        request_fingerprint = deterministic_fingerprint(
-            {
-                "attempt_id": attempt_id,
-                "generation": generation,
-                "lease_owner": lease_owner,
-                "lease_seconds": lease_seconds,
-            }
-        )
-        timestamp = _now(self._clock)
-        with self._transaction() as connection:
-            replay = self._mutation_replay(
-                connection,
-                operation_id=operation_id,
-                operation_kind="lease_recovery",
-                request_fingerprint=request_fingerprint,
-            )
-            if replay is not None:
-                return replay
-            attempt = self._attempt(connection, attempt_id)
-            self._require_lease(attempt, generation=generation)
-            if str(attempt["lease_owner"]) != lease_owner:
-                raise TestStoreConflict("attempt lease owner changed before recovery")
-            expires = timestamp + lease_seconds
-            connection.execute(
-                """
-                UPDATE test_target_attempts
-                SET heartbeat_at = ?, lease_expires_at = ?, updated_at = ?
-                WHERE attempt_id = ? AND state IN ('leased', 'running')
-                  AND generation = ? AND lease_owner = ?
-                """,
-                (
-                    timestamp,
-                    expires,
-                    timestamp,
-                    attempt_id,
-                    generation,
-                    lease_owner,
-                ),
-            )
-            result = {
-                "attempt_id": attempt_id,
-                "state": str(attempt["state"]),
-                "lease_expires_at": expires,
-                "recovered": True,
-            }
-            self._record_mutation(
-                connection,
-                operation_id=operation_id,
-                operation_kind="lease_recovery",
-                request_fingerprint=request_fingerprint,
-                result=result,
-                created_at=timestamp,
-            )
-            return result
-
     def append_result_chunk(
         self,
         attempt_id: str,
@@ -2646,26 +2294,8 @@ class UniversalTestStore:
             except sqlite3.IntegrityError as error:
                 raise TestStoreConflict("result chunk index or identity already exists") from error
             counts = {"passed": 0, "failed": 0, "skipped": 0, "error": 0}
-            for ordinal, case in enumerate(chunk.cases):
+            for case in chunk.cases:
                 counts[case.status] += 1
-                connection.execute(
-                    """
-                    INSERT INTO test_case_results(
-                        attempt_id, chunk_id, ordinal, case_id, display_name,
-                        status, duration_seconds, location
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        attempt_id,
-                        chunk.chunk_id,
-                        ordinal,
-                        case.case_id,
-                        case.display_name,
-                        case.status,
-                        case.duration_seconds,
-                        case.location,
-                    ),
-                )
             for failure in chunk.failures:
                 connection.execute(
                     """
@@ -2969,68 +2599,17 @@ class UniversalTestStore:
                 (conclusion.value, timestamp, attempt["target_id"], attempt_id),
             )
             run = connection.execute(
-                """
-                SELECT run.repository_id, target.target_name
-                FROM test_runs AS run
-                JOIN test_run_targets AS target ON target.run_id = run.run_id
-                WHERE run.run_id = ? AND target.target_id = ?
-                """,
-                (attempt["run_id"], attempt["target_id"]),
+                "SELECT repository_id FROM test_runs WHERE run_id = ?",
+                (attempt["run_id"],),
             ).fetchone()
-            if peak_memory_bytes is not None:
-                recent = connection.execute(
-                    """
-                    SELECT measured.peak_memory_bytes
-                    FROM test_target_attempts AS measured
-                    JOIN test_run_targets AS measured_target
-                      ON measured_target.target_id = measured.target_id
-                    JOIN test_runs AS measured_run
-                      ON measured_run.run_id = measured.run_id
-                    WHERE measured_run.repository_id = ?
-                      AND measured_target.target_name = ?
-                      AND measured.peak_memory_bytes IS NOT NULL
-                    ORDER BY measured.finished_at DESC, measured.attempt_id DESC
-                    LIMIT 20
-                    """,
-                    (run["repository_id"], run["target_name"]),
-                ).fetchall()
-                recent_peak = max(int(row[0]) for row in recent)
-                connection.execute(
-                    """
-                    INSERT INTO test_target_resource_profiles(
-                        repository_id, target_name, sample_count,
-                        recent_peak_memory_bytes, last_peak_memory_bytes,
-                        last_cpu_seconds, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(repository_id, target_name) DO UPDATE SET
-                        sample_count = excluded.sample_count,
-                        recent_peak_memory_bytes = excluded.recent_peak_memory_bytes,
-                        last_peak_memory_bytes = excluded.last_peak_memory_bytes,
-                        last_cpu_seconds = excluded.last_cpu_seconds,
-                        updated_at = excluded.updated_at
-                    """,
-                    (
-                        run["repository_id"], run["target_name"], len(recent),
-                        recent_peak, peak_memory_bytes, cpu_seconds, timestamp,
-                    ),
-                )
+            if run is None:
+                raise TestStoreContractError("attempt run disappeared during terminalization")
             self._reconcile_run(connection, str(attempt["run_id"]), timestamp)
-            issued_attestations = self._issue_plan_evidence_attestations(
-                connection,
-                run_id=str(attempt["run_id"]),
-                issued_at=timestamp,
-            )
-            self._refresh_rollups(
-                connection,
-                repository_id=str(run["repository_id"]),
-                finished_at=timestamp,
-            )
             result = {
                 "attempt_id": attempt_id,
                 "run_id": str(attempt["run_id"]),
                 "state": conclusion.value,
                 "classification": None if classification is None else classification.value,
-                "evidence_attestation_ids": list(issued_attestations),
                 "usage": {
                     "available": peak_memory_bytes is not None or cpu_seconds is not None,
                     "peak_memory_bytes": peak_memory_bytes,
@@ -3077,756 +2656,6 @@ class UniversalTestStore:
             state="cancelling",
             target_state="cancelled",
         )
-
-    def retry_run(
-        self,
-        run_id: str,
-        *,
-        actor: str,
-        failed_only: bool,
-        operation_id: str,
-    ) -> SubmissionResult:
-        """Create a new exact-provenance run from terminal retained evidence."""
-
-        run_id = _safe_id("run_id", run_id)
-        actor = _single_line("actor", actor, maximum=256)
-        if type(failed_only) is not bool:
-            raise TestStoreContractError("failed_only must be boolean")
-        operation_id = _operation_id(operation_id)
-        request_fingerprint = deterministic_fingerprint(
-            {"run_id": run_id, "actor": actor, "failed_only": failed_only}
-        )
-        timestamp = _now(self._clock)
-        with self._transaction() as connection:
-            replay = self._mutation_replay(
-                connection,
-                operation_id=operation_id,
-                operation_kind="retry",
-                request_fingerprint=request_fingerprint,
-            )
-            if replay is not None:
-                return SubmissionResult(**replay)
-            source_run = connection.execute(
-                "SELECT * FROM test_runs WHERE run_id = ?", (run_id,)
-            ).fetchone()
-            if source_run is None:
-                raise TestStoreNotFound("test run does not exist")
-            if str(source_run["state"]) in _ACTIVE_RUN_STATES:
-                raise TestStoreConflict("an active run cannot be retried")
-            source_plan = connection.execute(
-                "SELECT * FROM test_plans WHERE plan_id = ?",
-                (source_run["plan_id"],),
-            ).fetchone()
-            if source_plan is None:
-                raise TestStoreContractError("retry source plan does not exist")
-            if str(source_run["source_mode"]) == SourceMode.LIVE.value:
-                raise LiveRetryReplanRequired(
-                    "Live-source retries require a fresh current-source plan; "
-                    "no retry run was created."
-                )
-            source_targets = connection.execute(
-                """
-                SELECT * FROM test_run_targets
-                WHERE run_id = ? ORDER BY wave_index, target_name, shard_index
-                """,
-                (run_id,),
-            ).fetchall()
-            selected = [
-                row
-                for row in source_targets
-                if not failed_only or str(row["state"]) != "succeeded"
-            ]
-            if not selected:
-                raise TestStoreConflict("the run has no failed targets to retry")
-            (
-                retry_plan_id,
-                retry_plan_fingerprint,
-                retry_execution_fingerprint,
-                retry_plan_json,
-            ) = _retry_plan_projection(
-                source_plan["plan_json"],
-                selected_targets=[str(row["target_name"]) for row in selected],
-            )
-            retry_plan_document = json.loads(retry_plan_json)
-            retry_wave_by_target = {
-                str(target): wave_index
-                for wave_index, wave in enumerate(
-                    retry_plan_document["dependency_waves"]
-                )
-                for target in wave
-            }
-            active = None
-            if str(source_run["source_mode"]) == SourceMode.IMMUTABLE.value:
-                active = connection.execute(
-                    f"""
-                    SELECT run_id, state FROM test_runs
-                    WHERE execution_fingerprint = ? AND source_mode = 'immutable'
-                      AND state IN ({','.join('?' for _ in _ACTIVE_RUN_STATES)})
-                    ORDER BY created_at, run_id LIMIT 1
-                    """,
-                    (retry_execution_fingerprint, *_ACTIVE_RUN_STATES),
-                ).fetchone()
-            if active is not None:
-                result = SubmissionResult(
-                    run_id=str(active["run_id"]),
-                    state=str(active["state"]),
-                    deduplicated=True,
-                    deduplicated_run_id=str(active["run_id"]),
-                    console_path=f"/#/tests/runs/{active['run_id']}",
-                )
-                self._record_mutation(
-                    connection,
-                    operation_id=operation_id,
-                    operation_kind="retry",
-                    request_fingerprint=request_fingerprint,
-                    result=result.__dict__,
-                    created_at=timestamp,
-                )
-                return result
-            existing_retry_plan = connection.execute(
-                "SELECT fingerprint, plan_json FROM test_plans WHERE plan_id = ?",
-                (retry_plan_id,),
-            ).fetchone()
-            if existing_retry_plan is None:
-                connection.execute(
-                    """
-                    INSERT INTO test_plans(
-                        plan_id, fingerprint, execution_fingerprint,
-                        manifest_fingerprint, repository_id, intent, snapshot_id,
-                        source_mode, source_fingerprint, reusable, plan_json,
-                        created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        retry_plan_id,
-                        retry_plan_fingerprint,
-                        retry_execution_fingerprint,
-                        source_plan["manifest_fingerprint"],
-                        source_plan["repository_id"],
-                        source_plan["intent"],
-                        source_plan["snapshot_id"],
-                        source_plan["source_mode"],
-                        source_plan["source_fingerprint"],
-                        source_plan["reusable"],
-                        retry_plan_json,
-                        timestamp,
-                    ),
-                )
-            else:
-                existing_retry_document, _resources = _stored_plan_parts(
-                    existing_retry_plan["plan_json"]
-                )
-                if (
-                    str(existing_retry_plan["fingerprint"])
-                    != retry_plan_fingerprint
-                    or existing_retry_document != retry_plan_document
-                ):
-                    raise TestStoreConflict("retry plan identity is already bound")
-            retry_id = "run-" + hashlib.sha256(
-                f"retry\0{operation_id}\0{request_fingerprint}".encode("utf-8")
-            ).hexdigest()[:32]
-            connection.execute(
-                """
-                INSERT INTO test_runs(
-                    run_id, plan_id, repository_id, owner_uid, actor, intent,
-                    source_mode, source_fingerprint, execution_fingerprint,
-                    eligible_target_count, selected_target_count,
-                    state, priority, queued_at, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?)
-                """,
-                (
-                    retry_id,
-                    retry_plan_id,
-                    source_run["repository_id"],
-                    source_run["owner_uid"],
-                    actor,
-                    source_run["intent"],
-                    source_run["source_mode"],
-                    source_run["source_fingerprint"],
-                    retry_execution_fingerprint,
-                    source_run["eligible_target_count"],
-                    len({str(row["target_name"]) for row in selected}),
-                    source_run["priority"],
-                    timestamp,
-                    timestamp,
-                    timestamp,
-                ),
-            )
-            for row in selected:
-                target_id = "target-" + hashlib.sha256(
-                    f"{retry_id}\0{row['target_name']}\0{row['shard_index']}".encode(
-                        "utf-8"
-                    )
-                ).hexdigest()[:32]
-                connection.execute(
-                    """
-                    INSERT INTO test_run_targets(
-                        target_id, run_id, target_name, wave_index,
-                        shard_index, shard_count, state,
-                        estimated_seconds, max_attempts,
-                        worktree_key, exclusive_resources_json, queued_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        target_id,
-                        retry_id,
-                        row["target_name"],
-                        retry_wave_by_target[str(row["target_name"])],
-                        row["shard_index"],
-                        row["shard_count"],
-                        row["estimated_seconds"],
-                        row["max_attempts"],
-                        row["worktree_key"],
-                        row["exclusive_resources_json"],
-                        timestamp,
-                    ),
-                )
-            result = SubmissionResult(
-                run_id=retry_id,
-                state="queued",
-                deduplicated=False,
-                deduplicated_run_id=None,
-                console_path=f"/#/tests/runs/{retry_id}",
-            )
-            self._record_mutation(
-                connection,
-                operation_id=operation_id,
-                operation_kind="retry",
-                request_fingerprint=request_fingerprint,
-                result=result.__dict__,
-                created_at=timestamp,
-            )
-            self._event(
-                connection,
-                event_type="test.run_retried",
-                repository_id=str(source_run["repository_id"]),
-                run_id=retry_id,
-                attempt_id=None,
-                detail={
-                    "source_run_id": run_id,
-                    "failed_only": failed_only,
-                    "target_count": len(selected),
-                },
-                created_at=timestamp,
-            )
-            return result
-
-    @staticmethod
-    def _plan_evidence_policies(plan_json: str) -> dict[str, EvidencePolicy]:
-        try:
-            document = json.loads(plan_json)
-            raw = document["evidence_policies"]
-        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
-            raise TestStoreContractError(
-                "retained plan evidence policies are invalid"
-            ) from error
-        if not isinstance(raw, dict) or len(raw) > 64:
-            raise TestStoreContractError("retained plan evidence policies are invalid")
-        policies: dict[str, EvidencePolicy] = {}
-        expected = {
-            "intent",
-            "required_targets",
-            "max_age_seconds",
-            "allow_reuse",
-            "fingerprint",
-        }
-        for name, value in sorted(raw.items()):
-            if (
-                not isinstance(name, str)
-                or re.fullmatch(r"[a-z][a-z0-9_.-]{0,63}", name) is None
-                or not isinstance(value, dict)
-                or set(value) != expected
-                or not isinstance(value["required_targets"], list)
-            ):
-                raise TestStoreContractError(
-                    "retained plan evidence policy is invalid"
-                )
-            required_targets = tuple(value["required_targets"])
-            if (
-                not required_targets
-                or any(not isinstance(item, str) for item in required_targets)
-                or tuple(sorted(set(required_targets))) != required_targets
-                or not isinstance(value["intent"], str)
-                or type(value["max_age_seconds"]) is not int
-                or not 1 <= value["max_age_seconds"] <= 31_536_000
-                or type(value["allow_reuse"]) is not bool
-            ):
-                raise TestStoreContractError(
-                    "retained plan evidence policy is invalid"
-                )
-            policy = EvidencePolicy(
-                name=name,
-                intent=value["intent"],
-                required_targets=required_targets,
-                max_age_seconds=value["max_age_seconds"],
-                allow_reuse=value["allow_reuse"],
-            )
-            if value["fingerprint"] != evidence_policy_fingerprint(policy):
-                raise TestStoreContractError(
-                    "retained plan evidence policy fingerprint is invalid"
-                )
-            policies[name] = policy
-        return policies
-
-    def _issue_plan_evidence_attestations(
-        self,
-        connection: sqlite3.Connection,
-        *,
-        run_id: str,
-        issued_at: float,
-    ) -> tuple[str, ...]:
-        run = connection.execute(
-            """
-            SELECT run.*, plan.snapshot_id, plan.plan_json
-            FROM test_runs AS run
-            JOIN test_plans AS plan ON plan.plan_id = run.plan_id
-            WHERE run.run_id = ?
-            """,
-            (run_id,),
-        ).fetchone()
-        if (
-            run is None
-            or str(run["source_mode"]) != SourceMode.IMMUTABLE.value
-            or str(run["state"]) != "succeeded"
-            or run["finished_at"] is None
-        ):
-            return ()
-        executed = {
-            str(row[0])
-            for row in connection.execute(
-                """
-                SELECT DISTINCT target_name FROM test_run_targets
-                WHERE run_id = ? AND state = 'succeeded'
-                """,
-                (run_id,),
-            )
-        }
-        issued: list[str] = []
-        for policy in self._plan_evidence_policies(str(run["plan_json"])).values():
-            if not set(policy.required_targets) <= executed:
-                continue
-            policy_fingerprint = evidence_policy_fingerprint(policy)
-            attestation_id = "attestation-" + hashlib.sha256(
-                f"{run_id}\0{policy.name}\0{policy_fingerprint}".encode("utf-8")
-            ).hexdigest()[:32]
-            connection.execute(
-                """
-                INSERT INTO test_evidence_attestations(
-                    attestation_id, repository_id, policy_name, snapshot_id,
-                    run_id, policy_fingerprint, conclusion, issued_at, expires_at
-                ) VALUES (?, ?, ?, ?, ?, ?, 'satisfied', ?, ?)
-                ON CONFLICT(attestation_id) DO NOTHING
-                """,
-                (
-                    attestation_id,
-                    run["repository_id"],
-                    policy.name,
-                    run["snapshot_id"],
-                    run_id,
-                    policy_fingerprint,
-                    issued_at,
-                    float(run["finished_at"]) + policy.max_age_seconds,
-                ),
-            )
-            retained = connection.execute(
-                "SELECT run_id FROM test_evidence_attestations WHERE attestation_id = ?",
-                (attestation_id,),
-            ).fetchone()
-            if retained is None or str(retained["run_id"]) != run_id:
-                raise TestStoreConflict(
-                    "automatic evidence attestation identity is contradictory"
-                )
-            issued.append(attestation_id)
-        return tuple(issued)
-
-    def issue_evidence_attestation(
-        self,
-        run_id: str,
-        *,
-        policy_name: str,
-        policy_fingerprint: str,
-        required_targets: Sequence[str],
-        max_age_seconds: int,
-        operation_id: str,
-    ) -> dict[str, object]:
-        """Bind an explicit named policy to one successful immutable run."""
-
-        run_id = _safe_id("run_id", run_id)
-        policy_name = _safe_id("policy_name", policy_name)
-        policy_fingerprint = _sha256("policy_fingerprint", policy_fingerprint)
-        targets = tuple(sorted({_safe_id("required_target", item) for item in required_targets}))
-        if not targets:
-            raise TestStoreContractError("required_targets must not be empty")
-        max_age_seconds = _positive_int(
-            "max_age_seconds", max_age_seconds, maximum=31_536_000
-        )
-        operation_id = _operation_id(operation_id)
-        request_fingerprint = deterministic_fingerprint(
-            {
-                "run_id": run_id,
-                "policy_name": policy_name,
-                "policy_fingerprint": policy_fingerprint,
-                "required_targets": list(targets),
-                "max_age_seconds": max_age_seconds,
-            }
-        )
-        timestamp = _now(self._clock)
-        with self._transaction() as connection:
-            replay = self._mutation_replay(
-                connection,
-                operation_id=operation_id,
-                operation_kind="evidence_attestation",
-                request_fingerprint=request_fingerprint,
-            )
-            if replay is not None:
-                return replay
-            run = connection.execute(
-                """
-                SELECT run.*, plan.snapshot_id, plan.plan_json FROM test_runs AS run
-                JOIN test_plans AS plan ON plan.plan_id = run.plan_id
-                WHERE run.run_id = ?
-                """,
-                (run_id,),
-            ).fetchone()
-            if run is None:
-                raise TestStoreNotFound("test run does not exist")
-            if (
-                str(run["source_mode"]) != SourceMode.IMMUTABLE.value
-                or str(run["state"]) != "succeeded"
-                or run["finished_at"] is None
-            ):
-                raise TestStoreConflict(
-                    "evidence requires a successful immutable terminal run"
-                )
-            policy = self._plan_evidence_policies(str(run["plan_json"])).get(
-                policy_name
-            )
-            if (
-                policy is None
-                or evidence_policy_fingerprint(policy) != policy_fingerprint
-                or policy.required_targets != targets
-                or policy.max_age_seconds != max_age_seconds
-            ):
-                raise TestStoreConflict(
-                    "evidence policy does not match the retained exact plan"
-                )
-            expires_at = float(run["finished_at"]) + max_age_seconds
-            if expires_at < timestamp:
-                raise TestStoreConflict("test evidence is already stale")
-            executed = {
-                str(row[0])
-                for row in connection.execute(
-                    """
-                    SELECT DISTINCT target_name FROM test_run_targets
-                    WHERE run_id = ? AND state = 'succeeded'
-                    """,
-                    (run_id,),
-                ).fetchall()
-            }
-            missing = sorted(set(targets) - executed)
-            if missing:
-                raise TestStoreConflict(
-                    "run does not satisfy required target(s): " + ", ".join(missing)
-                )
-            attestation_id = "attestation-" + hashlib.sha256(
-                f"{run_id}\0{policy_name}\0{policy_fingerprint}".encode("utf-8")
-            ).hexdigest()[:32]
-            try:
-                connection.execute(
-                    """
-                    INSERT INTO test_evidence_attestations(
-                        attestation_id, repository_id, policy_name, snapshot_id,
-                        run_id, policy_fingerprint, conclusion, issued_at, expires_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, 'satisfied', ?, ?)
-                    """,
-                    (
-                        attestation_id,
-                        run["repository_id"],
-                        policy_name,
-                        run["snapshot_id"],
-                        run_id,
-                        policy_fingerprint,
-                        timestamp,
-                        expires_at,
-                    ),
-                )
-            except sqlite3.IntegrityError as error:
-                existing = connection.execute(
-                    "SELECT * FROM test_evidence_attestations WHERE attestation_id = ?",
-                    (attestation_id,),
-                ).fetchone()
-                if existing is None or str(existing["run_id"]) != run_id:
-                    raise TestStoreConflict(
-                        "run already has contradictory evidence identity"
-                    ) from error
-                expires_at = float(existing["expires_at"])
-            result = {
-                "satisfied": True,
-                "attestation_id": attestation_id,
-                "repository_id": str(run["repository_id"]),
-                "snapshot_id": str(run["snapshot_id"]),
-                "run_id": run_id,
-                "policy_name": policy_name,
-                "expires_at": expires_at,
-            }
-            self._record_mutation(
-                connection,
-                operation_id=operation_id,
-                operation_kind="evidence_attestation",
-                request_fingerprint=request_fingerprint,
-                result=result,
-                created_at=timestamp,
-            )
-            return result
-
-    def _retained_attestation_policy(
-        self, row: Mapping[str, object]
-    ) -> EvidencePolicy:
-        policy_name = str(row["policy_name"])
-        policy = self._plan_evidence_policies(str(row["plan_json"])).get(
-            policy_name
-        )
-        if (
-            policy is None
-            or evidence_policy_fingerprint(policy)
-            != str(row["policy_fingerprint"])
-        ):
-            raise TestStoreConflict(
-                "retained evidence policy contradicts its exact plan"
-            )
-        return policy
-
-    def check_evidence_policy(
-        self,
-        *,
-        repository_id: str,
-        snapshot_id: str,
-        policy_name: str,
-        now: float | None = None,
-    ) -> dict[str, object]:
-        repository_id = _safe_id("repository_id", repository_id)
-        snapshot_id = _safe_id("snapshot_id", snapshot_id)
-        policy_name = _safe_id("policy_name", policy_name)
-        timestamp = _now(self._clock) if now is None else _finite_nonnegative("now", now)
-        connection = self._connect(readonly=True)
-        try:
-            row = connection.execute(
-                """
-                SELECT attestation.*, plan.plan_json,
-                       consumption.consumption_id
-                FROM test_evidence_attestations AS attestation
-                JOIN test_runs AS run ON run.run_id = attestation.run_id
-                JOIN test_plans AS plan ON plan.plan_id = run.plan_id
-                LEFT JOIN test_evidence_consumptions AS consumption
-                  ON consumption.attestation_id = attestation.attestation_id
-                WHERE attestation.repository_id = ?
-                  AND attestation.snapshot_id = ?
-                  AND attestation.policy_name = ?
-                  AND attestation.conclusion = 'satisfied'
-                ORDER BY (attestation.expires_at >= ?) DESC,
-                         attestation.issued_at DESC,
-                         attestation.attestation_id DESC
-                LIMIT 1
-                """,
-                (
-                    repository_id,
-                    snapshot_id,
-                    policy_name,
-                    timestamp,
-                ),
-            ).fetchone()
-            if row is None:
-                return {
-                    "satisfied": False,
-                    "reusable": None,
-                    "requires_consumption": False,
-                    "consumable": False,
-                    "repository_id": repository_id,
-                    "snapshot_id": snapshot_id,
-                    "policy_name": policy_name,
-                }
-            policy = self._retained_attestation_policy(row)
-            unexpired = float(row["expires_at"]) >= timestamp
-            if not policy.allow_reuse:
-                consumable = connection.execute(
-                    """
-                    SELECT 1
-                    FROM test_evidence_attestations AS attestation
-                    LEFT JOIN test_evidence_consumptions AS consumption
-                      ON consumption.attestation_id = attestation.attestation_id
-                    WHERE attestation.repository_id = ?
-                      AND attestation.snapshot_id = ?
-                      AND attestation.policy_name = ?
-                      AND attestation.policy_fingerprint = ?
-                      AND attestation.conclusion = 'satisfied'
-                      AND attestation.expires_at >= ?
-                      AND consumption.attestation_id IS NULL
-                    LIMIT 1
-                    """,
-                    (
-                        repository_id,
-                        snapshot_id,
-                        policy_name,
-                        evidence_policy_fingerprint(policy),
-                        timestamp,
-                    ),
-                ).fetchone()
-                return {
-                    "satisfied": False,
-                    "reusable": False,
-                    "requires_consumption": True,
-                    "consumable": consumable is not None,
-                    "repository_id": repository_id,
-                    "snapshot_id": snapshot_id,
-                    "policy_name": policy_name,
-                    "policy_fingerprint": str(row["policy_fingerprint"]),
-                    "expires_at": float(row["expires_at"]),
-                }
-            if not unexpired:
-                return {
-                    "satisfied": False,
-                    "reusable": True,
-                    "requires_consumption": False,
-                    "consumable": False,
-                    "repository_id": repository_id,
-                    "snapshot_id": snapshot_id,
-                    "policy_name": policy_name,
-                    "policy_fingerprint": str(row["policy_fingerprint"]),
-                    "expires_at": float(row["expires_at"]),
-                }
-            return {
-                "satisfied": True,
-                "reusable": True,
-                "requires_consumption": False,
-                "consumable": False,
-                "attestation_id": str(row["attestation_id"]),
-                "repository_id": repository_id,
-                "snapshot_id": snapshot_id,
-                "run_id": str(row["run_id"]),
-                "policy_name": policy_name,
-                "policy_fingerprint": str(row["policy_fingerprint"]),
-                "expires_at": float(row["expires_at"]),
-            }
-        finally:
-            connection.close()
-
-    def consume_evidence_policy(
-        self,
-        *,
-        repository_id: str,
-        snapshot_id: str,
-        policy_name: str,
-        operation_id: str,
-    ) -> dict[str, object]:
-        """Consume one exact non-reusable attestation idempotently."""
-
-        repository_id = _safe_id("repository_id", repository_id)
-        snapshot_id = _safe_id("snapshot_id", snapshot_id)
-        policy_name = _safe_id("policy_name", policy_name)
-        operation_id = _operation_id(operation_id)
-        request_fingerprint = deterministic_fingerprint(
-            {
-                "repository_id": repository_id,
-                "snapshot_id": snapshot_id,
-                "policy_name": policy_name,
-            }
-        )
-        timestamp = _now(self._clock)
-        with self._transaction() as connection:
-            replay = self._mutation_replay(
-                connection,
-                operation_id=operation_id,
-                operation_kind="evidence_consume",
-                request_fingerprint=request_fingerprint,
-            )
-            if replay is not None:
-                return replay
-            row = connection.execute(
-                """
-                SELECT attestation.*, plan.plan_json
-                FROM test_evidence_attestations AS attestation
-                JOIN test_runs AS run ON run.run_id = attestation.run_id
-                JOIN test_plans AS plan ON plan.plan_id = run.plan_id
-                LEFT JOIN test_evidence_consumptions AS consumption
-                  ON consumption.attestation_id = attestation.attestation_id
-                WHERE attestation.repository_id = ?
-                  AND attestation.snapshot_id = ?
-                  AND attestation.policy_name = ?
-                  AND attestation.conclusion = 'satisfied'
-                  AND attestation.expires_at >= ?
-                  AND consumption.attestation_id IS NULL
-                ORDER BY attestation.issued_at DESC,
-                         attestation.attestation_id DESC
-                LIMIT 1
-                """,
-                (repository_id, snapshot_id, policy_name, timestamp),
-            ).fetchone()
-            if row is None:
-                raise TestStoreConflict(
-                    "no unconsumed exact-snapshot evidence is available"
-                )
-            policy = self._retained_attestation_policy(row)
-            if policy.allow_reuse:
-                raise TestStoreConflict(
-                    "reusable evidence must be checked rather than consumed"
-                )
-            attestation_id = str(row["attestation_id"])
-            consumption_id = "evidence-use-" + hashlib.sha256(
-                f"{attestation_id}\0{operation_id}".encode("utf-8")
-            ).hexdigest()[:32]
-            try:
-                connection.execute(
-                    """
-                    INSERT INTO test_evidence_consumptions(
-                        consumption_id, attestation_id, operation_id, consumed_at
-                    ) VALUES (?, ?, ?, ?)
-                    """,
-                    (consumption_id, attestation_id, operation_id, timestamp),
-                )
-            except sqlite3.IntegrityError as error:
-                raise TestStoreConflict(
-                    "evidence attestation was consumed concurrently"
-                ) from error
-            result = {
-                "satisfied": True,
-                "consumed": True,
-                "reusable": False,
-                "requires_consumption": True,
-                "consumption_id": consumption_id,
-                "attestation_id": attestation_id,
-                "repository_id": repository_id,
-                "snapshot_id": snapshot_id,
-                "run_id": str(row["run_id"]),
-                "policy_name": policy_name,
-                "policy_fingerprint": str(row["policy_fingerprint"]),
-                "operation_id": operation_id,
-                "consumed_at": timestamp,
-                "expires_at": float(row["expires_at"]),
-            }
-            self._record_mutation(
-                connection,
-                operation_id=operation_id,
-                operation_kind="evidence_consume",
-                request_fingerprint=request_fingerprint,
-                result=result,
-                created_at=timestamp,
-            )
-            self._event(
-                connection,
-                event_type="test.evidence_consumed",
-                repository_id=repository_id,
-                run_id=str(row["run_id"]),
-                attempt_id=None,
-                detail={
-                    "schema_version": 1,
-                    "consumption_id": consumption_id,
-                    "attestation_id": attestation_id,
-                    "policy_name": policy_name,
-                    "snapshot_id": snapshot_id,
-                },
-                created_at=timestamp,
-            )
-            return result
 
     def mark_superseded(
         self,
@@ -4096,12 +2925,6 @@ class UniversalTestStore:
                 )
             for run_id in sorted(affected_runs):
                 self._reconcile_run(connection, run_id, timestamp)
-            for repository_id in sorted(affected_repositories):
-                self._refresh_rollups(
-                    connection,
-                    repository_id=repository_id,
-                    finished_at=timestamp,
-                )
         return {
             "processed_attempt_count": len(selected_rows),
             "batch_limit": MAX_EXPIRED_ATTEMPTS_PER_REAP,
@@ -4315,930 +3138,6 @@ class UniversalTestStore:
             if state in states:
                 return run_state, classification.value
         raise AssertionError("terminal failure state was not classified")
-
-    def _refresh_rollups(
-        self,
-        connection: sqlite3.Connection,
-        *,
-        repository_id: str,
-        finished_at: float,
-    ) -> None:
-        for table, seconds in (
-            ("test_rollup_hourly", 3_600),
-            ("test_rollup_daily", 86_400),
-        ):
-            bucket = _bucket_start(finished_at, seconds)
-            end = bucket + seconds
-            attempts = connection.execute(
-                """
-                SELECT
-                  COUNT(*) AS attempt_count,
-                  COALESCE(SUM(passed_count + failed_count + skipped_count + error_count), 0) AS case_count,
-                  COALESCE(SUM(passed_count), 0) AS passed_count,
-                  COALESCE(SUM(failed_count), 0) AS failed_count,
-                  COALESCE(SUM(skipped_count), 0) AS skipped_count,
-                  COALESCE(SUM(error_count), 0) AS error_count,
-                  COALESCE(SUM(CASE WHEN EXISTS (
-                    SELECT 1 FROM test_case_results AS observed_case
-                    WHERE observed_case.attempt_id = attempt.attempt_id
-                  ) THEN (
-                    SELECT COALESCE(SUM(result.duration_seconds), 0.0)
-                    FROM test_case_results AS result
-                    WHERE result.attempt_id = attempt.attempt_id
-                  ) ELSE attempt.duration_seconds END), 0.0) AS aggregate_test_seconds,
-                  COALESCE(SUM(attempt.duration_seconds), 0.0) AS attempt_wall_seconds,
-                  COALESCE(SUM(CASE
-                    WHEN attempt.started_at IS NOT NULL
-                    THEN MAX(0.0, attempt.started_at - attempt.queued_at)
-                    ELSE 0.0 END), 0.0) AS attempt_queue_seconds,
-                  COALESCE(SUM(CASE WHEN attempt.attempt_number > 1 THEN 1 ELSE 0 END), 0) AS retry_attempt_count,
-                  COALESCE(SUM(CASE
-                    WHEN attempt.duration_seconds > target.estimated_seconds * 1.25
-                    THEN 1 ELSE 0 END), 0) AS slow_count,
-                  COALESCE(MAX(attempt.duration_seconds), 0.0) AS max_attempt_seconds,
-                  COALESCE(SUM(CASE
-                    WHEN attempt.state = 'succeeded' AND EXISTS (
-                      SELECT 1
-                      FROM test_target_attempts AS prior_attempt
-                      JOIN test_run_targets AS prior_target
-                        ON prior_target.target_id = prior_attempt.target_id
-                      JOIN test_runs AS prior_run
-                        ON prior_run.run_id = prior_attempt.run_id
-                      WHERE prior_run.repository_id = run.repository_id
-                        AND prior_run.source_fingerprint = run.source_fingerprint
-                        AND prior_target.target_name = target.target_name
-                        AND prior_attempt.state = 'test_failed'
-                        AND prior_attempt.finished_at < attempt.finished_at
-                    ) THEN 1 ELSE 0 END), 0) AS flake_count,
-                  COALESCE(SUM(CASE
-                    WHEN attempt.state = 'succeeded'
-                     AND (
-                       SELECT COUNT(*)
-                       FROM test_target_attempts AS prior_attempt
-                       JOIN test_run_targets AS prior_target
-                         ON prior_target.target_id = prior_attempt.target_id
-                       JOIN test_runs AS prior_run
-                         ON prior_run.run_id = prior_attempt.run_id
-                       WHERE prior_run.repository_id = run.repository_id
-                         AND prior_target.target_name = target.target_name
-                         AND prior_attempt.state = 'succeeded'
-                         AND prior_attempt.finished_at < attempt.finished_at
-                     ) >= 3
-                     AND attempt.duration_seconds > 1.25 * (
-                       SELECT AVG(prior_attempt.duration_seconds)
-                       FROM test_target_attempts AS prior_attempt
-                       JOIN test_run_targets AS prior_target
-                         ON prior_target.target_id = prior_attempt.target_id
-                       JOIN test_runs AS prior_run
-                         ON prior_run.run_id = prior_attempt.run_id
-                       WHERE prior_run.repository_id = run.repository_id
-                         AND prior_target.target_name = target.target_name
-                         AND prior_attempt.state = 'succeeded'
-                         AND prior_attempt.finished_at < attempt.finished_at
-                     )
-                    THEN 1 ELSE 0 END), 0) AS regression_count,
-                  COALESCE(SUM(CASE WHEN attempt.state = 'succeeded' THEN 1 ELSE 0 END), 0) AS success_count,
-                  COALESCE(SUM(CASE WHEN attempt.state = 'test_failed' THEN 1 ELSE 0 END), 0) AS failure_count,
-                  COALESCE(SUM(CASE WHEN attempt.state IN ('infrastructure_failed', 'timed_out', 'incomplete', 'abandoned') THEN 1 ELSE 0 END), 0) AS infrastructure_count
-                FROM test_target_attempts AS attempt
-                JOIN test_runs AS run ON run.run_id = attempt.run_id
-                JOIN test_run_targets AS target ON target.target_id = attempt.target_id
-                WHERE run.repository_id = ?
-                  AND attempt.finished_at >= ? AND attempt.finished_at < ?
-                """,
-                (repository_id, bucket, end),
-            ).fetchone()
-            runs = connection.execute(
-                """
-                SELECT
-                  COUNT(*) AS run_count,
-                  COALESCE(SUM(selected_target_count), 0) AS selected_target_count,
-                  COALESCE(SUM(eligible_target_count), 0) AS eligible_target_count,
-                  COALESCE(SUM(eligible_target_count - selected_target_count), 0) AS avoided_target_count,
-                  COALESCE(SUM(CASE WHEN started_at IS NOT NULL
-                    THEN MAX(0.0, started_at - queued_at) ELSE 0.0 END), 0.0) AS queue_seconds,
-                  COALESCE(SUM(CASE WHEN started_at IS NOT NULL
-                    THEN MAX(0.0, finished_at - started_at) ELSE 0.0 END), 0.0) AS wall_seconds
-                FROM test_runs
-                WHERE repository_id = ?
-                  AND finished_at >= ? AND finished_at < ?
-                """,
-                (repository_id, bucket, end),
-            ).fetchone()
-            connection.execute(
-                f"""
-                INSERT INTO {table}(
-                    repository_id, bucket_start, run_count, attempt_count,
-                    selected_target_count, eligible_target_count,
-                    avoided_target_count, case_count,
-                    passed_count, failed_count, skipped_count, error_count,
-                    queue_seconds, attempt_queue_seconds,
-                    aggregate_test_seconds, attempt_wall_seconds, wall_seconds,
-                    retry_attempt_count, flake_count, slow_count,
-                    regression_count, max_attempt_seconds, success_count,
-                    failure_count, infrastructure_count
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(repository_id, bucket_start) DO UPDATE SET
-                    run_count = excluded.run_count,
-                    attempt_count = excluded.attempt_count,
-                    selected_target_count = excluded.selected_target_count,
-                    eligible_target_count = excluded.eligible_target_count,
-                    avoided_target_count = excluded.avoided_target_count,
-                    case_count = excluded.case_count,
-                    passed_count = excluded.passed_count,
-                    failed_count = excluded.failed_count,
-                    skipped_count = excluded.skipped_count,
-                    error_count = excluded.error_count,
-                    queue_seconds = excluded.queue_seconds,
-                    attempt_queue_seconds = excluded.attempt_queue_seconds,
-                    aggregate_test_seconds = excluded.aggregate_test_seconds,
-                    attempt_wall_seconds = excluded.attempt_wall_seconds,
-                    wall_seconds = excluded.wall_seconds,
-                    retry_attempt_count = excluded.retry_attempt_count,
-                    flake_count = excluded.flake_count,
-                    slow_count = excluded.slow_count,
-                    regression_count = excluded.regression_count,
-                    max_attempt_seconds = excluded.max_attempt_seconds,
-                    success_count = excluded.success_count,
-                    failure_count = excluded.failure_count,
-                    infrastructure_count = excluded.infrastructure_count
-                """,
-                (
-                    repository_id,
-                    bucket,
-                    int(runs["run_count"]),
-                    int(attempts["attempt_count"]),
-                    int(runs["selected_target_count"]),
-                    int(runs["eligible_target_count"]),
-                    int(runs["avoided_target_count"]),
-                    int(attempts["case_count"]),
-                    int(attempts["passed_count"]),
-                    int(attempts["failed_count"]),
-                    int(attempts["skipped_count"]),
-                    int(attempts["error_count"]),
-                    float(runs["queue_seconds"]),
-                    float(attempts["attempt_queue_seconds"]),
-                    float(attempts["aggregate_test_seconds"]),
-                    float(attempts["attempt_wall_seconds"]),
-                    float(runs["wall_seconds"]),
-                    int(attempts["retry_attempt_count"]),
-                    int(attempts["flake_count"]),
-                    int(attempts["slow_count"]),
-                    int(attempts["regression_count"]),
-                    float(attempts["max_attempt_seconds"]),
-                    int(attempts["success_count"]),
-                    int(attempts["failure_count"]),
-                    int(attempts["infrastructure_count"]),
-                ),
-            )
-
-    def begin_rollup_rebuild(self) -> dict[str, object]:
-        """Freeze a bounded source watermark for a resumable rollup rebuild.
-
-        Source test history is append-only.  Capturing rowid high-watermarks
-        therefore gives the caller a stable set of buckets without clearing
-        the retained materialized projection.  Ordinary terminalization keeps
-        refreshing buckets created after this watermark while an offline
-        migration or repair walks the frozen prefix.
-        """
-
-        connection = self._connect(readonly=True)
-        try:
-            connection.execute("BEGIN")
-            generation = self._generation(connection)
-            attempt_upper = int(
-                connection.execute(
-                    "SELECT COALESCE(MAX(rowid), 0) FROM test_target_attempts"
-                ).fetchone()[0]
-            )
-            run_upper = int(
-                connection.execute(
-                    "SELECT COALESCE(MAX(rowid), 0) FROM test_runs"
-                ).fetchone()[0]
-            )
-            connection.execute("COMMIT")
-        except BaseException:
-            if connection.in_transaction:
-                connection.execute("ROLLBACK")
-            raise
-        finally:
-            connection.close()
-        return {
-            "schema_version": 1,
-            "store_generation": generation,
-            "attempt_rowid_upper": attempt_upper,
-            "run_rowid_upper": run_upper,
-            "after_repository_id": "",
-            "after_bucket_start": -1,
-        }
-
-    @staticmethod
-    def _rollup_rebuild_cursor(
-        value: Mapping[str, object],
-    ) -> dict[str, object]:
-        expected = {
-            "schema_version",
-            "store_generation",
-            "attempt_rowid_upper",
-            "run_rowid_upper",
-            "after_repository_id",
-            "after_bucket_start",
-        }
-        if set(value) != expected or value.get("schema_version") != 1:
-            raise TestStoreContractError("rollup rebuild cursor is invalid")
-        generation = value.get("store_generation")
-        repository_id = value.get("after_repository_id")
-        if not isinstance(generation, str) or not generation:
-            raise TestStoreContractError("rollup rebuild generation is invalid")
-        if not isinstance(repository_id, str):
-            raise TestStoreContractError("rollup rebuild repository cursor is invalid")
-        if repository_id:
-            _safe_id("after_repository_id", repository_id)
-        integers: dict[str, int] = {}
-        for field in (
-            "attempt_rowid_upper",
-            "run_rowid_upper",
-            "after_bucket_start",
-        ):
-            raw = value.get(field)
-            if type(raw) is not int:
-                raise TestStoreContractError(f"{field} must be an integer")
-            integers[field] = int(raw)
-        if integers["attempt_rowid_upper"] < 0 or integers["run_rowid_upper"] < 0:
-            raise TestStoreContractError("rollup rebuild rowid bound is invalid")
-        if integers["after_bucket_start"] < -1:
-            raise TestStoreContractError("rollup rebuild bucket cursor is invalid")
-        return {
-            "schema_version": 1,
-            "store_generation": generation,
-            "attempt_rowid_upper": integers["attempt_rowid_upper"],
-            "run_rowid_upper": integers["run_rowid_upper"],
-            "after_repository_id": repository_id,
-            "after_bucket_start": integers["after_bucket_start"],
-        }
-
-    def rebuild_rollup_batch(
-        self,
-        cursor: Mapping[str, object],
-        *,
-        batch_size: int = 64,
-    ) -> dict[str, object]:
-        """Refresh at most ``batch_size`` repository/hour buckets.
-
-        The returned cursor is safe to persist and replay after interruption.
-        Each call owns one bounded write transaction; no caller has to hold a
-        lock while the complete test history is scanned.
-        """
-
-        state = self._rollup_rebuild_cursor(cursor)
-        batch_size = _positive_int(
-            "batch_size", batch_size, maximum=MAX_ROLLUP_REBUILD_BATCH
-        )
-        with self._transaction() as connection:
-            if not hmac.compare_digest(
-                str(state["store_generation"]), self._generation(connection)
-            ):
-                raise TestStoreConflict("rollup rebuild store generation changed")
-            rows = connection.execute(
-                """
-                WITH source_buckets(repository_id, bucket_start) AS (
-                    SELECT run.repository_id,
-                           CAST(attempt.finished_at / 3600 AS INTEGER) * 3600
-                    FROM test_target_attempts AS attempt
-                    JOIN test_runs AS run ON run.run_id = attempt.run_id
-                    WHERE attempt.rowid <= ? AND attempt.finished_at IS NOT NULL
-                    UNION
-                    SELECT repository_id,
-                           CAST(finished_at / 3600 AS INTEGER) * 3600
-                    FROM test_runs
-                    WHERE rowid <= ? AND finished_at IS NOT NULL
-                )
-                SELECT repository_id, bucket_start
-                FROM source_buckets
-                WHERE repository_id > ?
-                   OR (repository_id = ? AND bucket_start > ?)
-                ORDER BY repository_id, bucket_start
-                LIMIT ?
-                """,
-                (
-                    state["attempt_rowid_upper"],
-                    state["run_rowid_upper"],
-                    state["after_repository_id"],
-                    state["after_repository_id"],
-                    state["after_bucket_start"],
-                    batch_size + 1,
-                ),
-            ).fetchall()
-            selected = rows[:batch_size]
-            for row in selected:
-                self._refresh_rollups(
-                    connection,
-                    repository_id=str(row["repository_id"]),
-                    finished_at=float(row["bucket_start"]),
-                )
-            next_cursor = dict(state)
-            if selected:
-                next_cursor["after_repository_id"] = str(
-                    selected[-1]["repository_id"]
-                )
-                next_cursor["after_bucket_start"] = int(
-                    selected[-1]["bucket_start"]
-                )
-            return {
-                "cursor": next_cursor,
-                "processed": len(selected),
-                "complete": len(rows) <= batch_size,
-            }
-
-    def rebuild_rollups(self, *, batch_size: int = 64) -> dict[str, int]:
-        """Rebuild rollups through bounded, independently committed batches."""
-
-        cursor = self.begin_rollup_rebuild()
-        while True:
-            result = self.rebuild_rollup_batch(cursor, batch_size=batch_size)
-            cursor = result["cursor"]  # type: ignore[assignment]
-            if bool(result["complete"]):
-                break
-        connection = self._connect(readonly=True)
-        try:
-            return {
-                "hourly": int(
-                    connection.execute(
-                        "SELECT COUNT(*) FROM test_rollup_hourly"
-                    ).fetchone()[0]
-                ),
-                "daily": int(
-                    connection.execute(
-                        "SELECT COUNT(*) FROM test_rollup_daily"
-                    ).fetchone()[0]
-                ),
-            }
-        finally:
-            connection.close()
-
-    def rollups(
-        self,
-        *,
-        repository_id: str,
-        grain: str,
-        since: float = 0,
-        limit: int = 1_000,
-    ) -> tuple[dict[str, object], ...]:
-        repository_id = _safe_id("repository_id", repository_id)
-        if grain not in {"hourly", "daily"}:
-            raise TestStoreContractError("grain must be hourly or daily")
-        since = _finite_nonnegative("since", since)
-        limit = _positive_int("limit", limit, maximum=10_000)
-        table = "test_rollup_hourly" if grain == "hourly" else "test_rollup_daily"
-        connection = self._connect(readonly=True)
-        try:
-            return tuple(
-                dict(row)
-                for row in connection.execute(
-                    f"""
-                    SELECT * FROM {table}
-                    WHERE repository_id = ? AND bucket_start >= ?
-                    ORDER BY bucket_start LIMIT ?
-                    """,
-                    (repository_id, since, limit),
-                ).fetchall()
-            )
-        finally:
-            connection.close()
-
-    def current_time(self) -> float:
-        """Return the store's validated clock for deterministic projections."""
-
-        return _now(self._clock)
-
-    def rollup_totals(
-        self,
-        *,
-        repository_id: str,
-        grain: str,
-        since: float,
-        before: float,
-    ) -> dict[str, int | float | None]:
-        """Aggregate one materialized-rollup range without result-table scans."""
-
-        repository_id = _safe_id("repository_id", repository_id)
-        if grain not in {"hourly", "daily"}:
-            raise TestStoreContractError("grain must be hourly or daily")
-        since = _finite_nonnegative("since", since)
-        before = _finite_nonnegative("before", before)
-        if before <= since:
-            raise TestStoreContractError("rollup range must be positive")
-        table = "test_rollup_hourly" if grain == "hourly" else "test_rollup_daily"
-        additive = (
-            "run_count", "attempt_count", "selected_target_count",
-            "eligible_target_count", "avoided_target_count", "case_count",
-            "passed_count", "failed_count", "skipped_count", "error_count",
-            "queue_seconds", "attempt_queue_seconds",
-            "aggregate_test_seconds", "attempt_wall_seconds", "wall_seconds",
-            "retry_attempt_count", "flake_count", "slow_count",
-            "regression_count", "success_count", "failure_count",
-            "infrastructure_count",
-        )
-        columns = ", ".join(f"COALESCE(SUM({field}), 0) AS {field}" for field in additive)
-        connection = self._connect(readonly=True)
-        try:
-            row = connection.execute(
-                f"""
-                SELECT {columns},
-                       COALESCE(MAX(max_attempt_seconds), 0.0) AS max_attempt_seconds,
-                       MAX(bucket_start) AS latest_bucket
-                FROM {table}
-                WHERE repository_id = ? AND bucket_start >= ? AND bucket_start < ?
-                """,
-                (repository_id, since, before),
-            ).fetchone()
-            if row is None:
-                raise AssertionError("aggregate rollup query returned no row")
-            return dict(row)
-        finally:
-            connection.close()
-
-    def retain_repository_setup_projection(
-        self,
-        projection: Mapping[str, object],
-        *,
-        observed_at: float | None = None,
-    ) -> dict[str, object]:
-        """Retain one already-sanitized snapshotd setup projection.
-
-        The service boundary performs the structural revalidation.  The store
-        persists only bounded JSON plus exact repository/status identity, so
-        catalog reads never need to enter another UID's worktree.
-        """
-
-        if not isinstance(projection, Mapping):
-            raise TestStoreContractError("repository setup projection must be a mapping")
-        repository_id = _safe_id("repository_id", projection.get("repository_id"))
-        status = projection.get("status")
-        if status not in {"ready", "missing", "invalid"}:
-            raise TestStoreContractError("repository setup projection status is invalid")
-        manifest_fingerprint = projection.get("manifest_fingerprint")
-        if status == "ready":
-            manifest_fingerprint = _sha256(
-                "manifest_fingerprint", manifest_fingerprint
-            )
-        elif manifest_fingerprint is not None:
-            raise TestStoreContractError(
-                "unready repository setup projection has a manifest fingerprint"
-            )
-        try:
-            encoded = json.dumps(
-                dict(projection),
-                sort_keys=True,
-                separators=(",", ":"),
-                ensure_ascii=False,
-                allow_nan=False,
-            )
-        except (TypeError, ValueError, RecursionError) as error:
-            raise TestStoreContractError(
-                "repository setup projection must be bounded JSON"
-            ) from error
-        if len(encoded.encode("utf-8")) > 256 * 1024:
-            raise TestStoreContractError("repository setup projection is too large")
-        fingerprint = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
-        timestamp = _now(self._clock) if observed_at is None else _finite_nonnegative(
-            "observed_at", observed_at
-        )
-        connection = self._connect()
-        try:
-            with connection:
-                connection.execute(
-                    """
-                    INSERT INTO test_repository_setup_projections(
-                        repository_id, status, manifest_fingerprint,
-                        projection_fingerprint, projection_json,
-                        observed_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(repository_id) DO UPDATE SET
-                        status = excluded.status,
-                        manifest_fingerprint = excluded.manifest_fingerprint,
-                        projection_fingerprint = excluded.projection_fingerprint,
-                        projection_json = excluded.projection_json,
-                        observed_at = excluded.observed_at,
-                        updated_at = excluded.updated_at
-                    WHERE excluded.observed_at >= test_repository_setup_projections.observed_at
-                    """,
-                    (
-                        repository_id,
-                        status,
-                        manifest_fingerprint,
-                        fingerprint,
-                        encoded,
-                        timestamp,
-                        timestamp,
-                    ),
-                )
-        finally:
-            connection.close()
-        return {
-            "repository_id": repository_id,
-            "setup_status": status,
-            "manifest_fingerprint": manifest_fingerprint,
-            "projection_fingerprint": fingerprint,
-            "setup_observed_at": timestamp,
-            "retained": True,
-        }
-
-    def repository_setup_catalog(
-        self, repository_ids: Sequence[str]
-    ) -> tuple[dict[str, object], ...]:
-        """Read retained setup state for an exact bounded repository set.
-
-        A repository with no completed setup observation is conservatively
-        reported as missing setup and explicitly marked ``retained=False``.
-        This is not a worktree read and cannot leak paths or manifest content.
-        """
-
-        if (
-            isinstance(repository_ids, (str, bytes))
-            or not isinstance(repository_ids, Sequence)
-            or len(repository_ids) > 500
-        ):
-            raise TestStoreContractError("repository setup catalog scope is invalid")
-        normalized = tuple(
-            _safe_id(f"repository_ids[{index}]", value)
-            for index, value in enumerate(repository_ids)
-        )
-        if len(set(normalized)) != len(normalized):
-            raise TestStoreContractError("repository setup catalog IDs must be unique")
-        connection = self._connect(readonly=True)
-        try:
-            rows: dict[str, sqlite3.Row] = {}
-            if normalized:
-                placeholders = ",".join("?" for _ in normalized)
-                rows = {
-                    str(row["repository_id"]): row
-                    for row in connection.execute(
-                        f"""
-                        SELECT repository_id, status, manifest_fingerprint,
-                               projection_fingerprint, observed_at
-                        FROM test_repository_setup_projections
-                        WHERE repository_id IN ({placeholders})
-                        """,
-                        normalized,
-                    ).fetchall()
-                }
-            result: list[dict[str, object]] = []
-            for repository_id in normalized:
-                row = rows.get(repository_id)
-                result.append(
-                    {
-                        "repository_id": repository_id,
-                        "setup_status": (
-                            "missing" if row is None else str(row["status"])
-                        ),
-                        "manifest_fingerprint": (
-                            None if row is None else row["manifest_fingerprint"]
-                        ),
-                        "projection_fingerprint": (
-                            None if row is None else str(row["projection_fingerprint"])
-                        ),
-                        "setup_observed_at": (
-                            None if row is None else float(row["observed_at"])
-                        ),
-                        "retained": row is not None,
-                    }
-                )
-            return tuple(result)
-        finally:
-            connection.close()
-
-    def fleet_rollup_projection(
-        self,
-        *,
-        grain: str,
-        since: float,
-        repository_limit: int = 50,
-        bucket_limit: int = 48,
-        repository_ids: Sequence[str] | None = None,
-    ) -> dict[str, object]:
-        """Return a compact fleet matrix using only materialized rollups."""
-
-        if grain not in {"hourly", "daily"}:
-            raise TestStoreContractError("grain must be hourly or daily")
-        since = _finite_nonnegative("since", since)
-        repository_limit = _positive_int(
-            "repository_limit", repository_limit, maximum=50
-        )
-        bucket_limit = _positive_int("bucket_limit", bucket_limit, maximum=168)
-        scoped_ids: tuple[str, ...] | None = None
-        if repository_ids is not None:
-            if (
-                isinstance(repository_ids, (str, bytes))
-                or not isinstance(repository_ids, Sequence)
-                or len(repository_ids) > 50
-            ):
-                raise TestStoreContractError("fleet repository scope is invalid")
-            scoped_ids = tuple(
-                _safe_id(f"repository_ids[{index}]", value)
-                for index, value in enumerate(repository_ids)
-            )
-            if len(set(scoped_ids)) != len(scoped_ids):
-                raise TestStoreContractError("fleet repository IDs must be unique")
-        seconds = 3_600 if grain == "hourly" else 86_400
-        observed_at = _now(self._clock)
-        latest = _bucket_start(observed_at, seconds)
-        requested_first = min(latest, _bucket_start(since, seconds))
-        actual_bucket_count = min(
-            bucket_limit, int((latest - requested_first) // seconds) + 1
-        )
-        first = latest - (actual_bucket_count - 1) * seconds
-        buckets = tuple(
-            first + index * seconds for index in range(actual_bucket_count)
-        )
-        table = "test_rollup_hourly" if grain == "hourly" else "test_rollup_daily"
-        connection = self._connect(readonly=True)
-        try:
-            scope_clause = ""
-            scope_arguments: tuple[object, ...] = ()
-            if scoped_ids is not None:
-                if scoped_ids:
-                    placeholders = ",".join("?" for _ in scoped_ids)
-                    scope_clause = f" AND repository_id IN ({placeholders})"
-                    scope_arguments = tuple(scoped_ids)
-                else:
-                    scope_clause = " AND 0 = 1"
-            summaries = connection.execute(
-                f"""
-                SELECT repository_id,
-                       SUM(run_count) AS run_count,
-                       SUM(attempt_count) AS attempt_count,
-                       SUM(selected_target_count) AS selected_target_count,
-                       SUM(eligible_target_count) AS eligible_target_count,
-                       SUM(avoided_target_count) AS avoided_target_count,
-                       SUM(case_count) AS case_count,
-                       SUM(passed_count) AS passed_count,
-                       SUM(failed_count) AS failed_count,
-                       SUM(error_count) AS error_count,
-                       SUM(queue_seconds) AS queue_seconds,
-                       SUM(attempt_queue_seconds) AS attempt_queue_seconds,
-                       SUM(aggregate_test_seconds) AS aggregate_test_seconds,
-                       SUM(attempt_wall_seconds) AS attempt_wall_seconds,
-                       SUM(wall_seconds) AS wall_seconds,
-                       SUM(retry_attempt_count) AS retry_attempt_count,
-                       SUM(flake_count) AS flake_count,
-                       SUM(slow_count) AS slow_count,
-                       SUM(regression_count) AS regression_count,
-                       MAX(max_attempt_seconds) AS max_attempt_seconds,
-                       SUM(success_count) AS success_count,
-                       SUM(failure_count) AS failure_count,
-                       SUM(infrastructure_count) AS infrastructure_count,
-                       MAX(bucket_start) AS latest_bucket
-                FROM {table}
-                WHERE bucket_start >= ? AND bucket_start <= ?
-                      {scope_clause}
-                GROUP BY repository_id
-                ORDER BY infrastructure_count DESC, failure_count DESC,
-                         aggregate_test_seconds DESC, repository_id
-                LIMIT ?
-                """,
-                (first, latest, *scope_arguments, repository_limit),
-            ).fetchall()
-            repository_ids = [str(row["repository_id"]) for row in summaries]
-            active_by_repository: dict[str, dict[str, int]] = {}
-            terminal_by_repository: dict[str, dict[str, object]] = {}
-            if repository_ids:
-                placeholders = ",".join("?" for _ in repository_ids)
-                for row in connection.execute(
-                    f"""
-                    SELECT repository_id, state, COUNT(*) AS count
-                    FROM test_runs
-                    WHERE repository_id IN ({placeholders})
-                      AND state IN ('queued', 'running', 'cancelling', 'superseding')
-                    GROUP BY repository_id, state
-                    """,
-                    repository_ids,
-                ).fetchall():
-                    active_by_repository.setdefault(
-                        str(row["repository_id"]), {}
-                    )[str(row["state"])] = int(row["count"])
-                terminal_rows = connection.execute(
-                    f"""
-                    WITH terminal_run_facts AS (
-                        SELECT run.repository_id,
-                               run.run_id,
-                               run.state,
-                               run.finished_at,
-                               MAX(CASE
-                                   WHEN run.failure_classification =
-                                            'infrastructure_failure'
-                                     OR run.state IN (
-                                            'timed_out', 'incomplete', 'abandoned'
-                                        )
-                                     OR attempt.state IN (
-                                            'infrastructure_failed', 'timed_out',
-                                            'incomplete', 'abandoned'
-                                        )
-                                   THEN 1 ELSE 0
-                               END) AS has_infrastructure_failure,
-                               MAX(CASE WHEN attempt.peak_memory_bytes IS NOT NULL
-                                            OR attempt.cpu_seconds IS NOT NULL
-                                   THEN 1 ELSE 0 END) AS has_measurement
-                        FROM test_runs AS run
-                        LEFT JOIN test_target_attempts AS attempt
-                               ON attempt.run_id = run.run_id
-                        WHERE run.repository_id IN ({placeholders})
-                          AND run.finished_at IS NOT NULL
-                          AND run.finished_at >= ?
-                          AND run.finished_at <= ?
-                          AND run.state IN (
-                              'succeeded', 'failed', 'timed_out', 'cancelled',
-                              'incomplete', 'abandoned', 'superseded'
-                          )
-                        GROUP BY run.repository_id, run.run_id,
-                                 run.state, run.finished_at
-                    )
-                    SELECT repository_id,
-                           MAX(CASE WHEN has_infrastructure_failure = 1
-                               THEN finished_at END) AS latest_infrastructure_run_at,
-                           MAX(CASE WHEN state = 'succeeded'
-                                         AND has_measurement = 1
-                                         AND has_infrastructure_failure = 0
-                               THEN finished_at END) AS latest_clean_measured_run_at
-                    FROM terminal_run_facts
-                    GROUP BY repository_id
-                    """,
-                    (*repository_ids, first, observed_at),
-                ).fetchall()
-                terminal_by_repository = {
-                    str(row["repository_id"]): dict(row) for row in terminal_rows
-                }
-                cells = connection.execute(
-                    f"""
-                    SELECT repository_id, bucket_start, aggregate_test_seconds,
-                           attempt_count, case_count, failed_count, error_count,
-                           failure_count, infrastructure_count,
-                           wall_seconds, queue_seconds, avoided_target_count,
-                           flake_count, slow_count, regression_count
-                    FROM {table}
-                    WHERE repository_id IN ({placeholders})
-                      AND bucket_start >= ? AND bucket_start <= ?
-                    ORDER BY repository_id, bucket_start
-                    """,
-                    (*repository_ids, first, latest),
-                ).fetchall()
-            else:
-                cells = []
-            return {
-                "grain": grain,
-                "bucket_seconds": seconds,
-                "bucket_starts": list(buckets),
-                "repositories": [
-                    {
-                        **dict(row),
-                        "efficiency": self._rollup_efficiency(dict(row)),
-                        "active": active_by_repository.get(
-                            str(row["repository_id"]), {}
-                        ),
-                        **terminal_by_repository.get(
-                            str(row["repository_id"]), {}
-                        ),
-                    }
-                    for row in summaries
-                ],
-                "cell_fields": [
-                    "repository_id", "bucket_start", "aggregate_test_seconds",
-                    "attempt_count", "case_count", "failed_count", "error_count",
-                    "failure_count", "infrastructure_count",
-                    "wall_seconds", "queue_seconds", "avoided_target_count",
-                    "flake_count", "slow_count", "regression_count",
-                ],
-                "cells": [
-                    [
-                        str(row["repository_id"]),
-                        float(row["bucket_start"]),
-                        float(row["aggregate_test_seconds"]),
-                        int(row["attempt_count"]),
-                        int(row["case_count"]),
-                        int(row["failed_count"]),
-                        int(row["error_count"]),
-                        int(row["failure_count"]),
-                        int(row["infrastructure_count"]),
-                        float(row["wall_seconds"]),
-                        float(row["queue_seconds"]),
-                        int(row["avoided_target_count"]),
-                        int(row["flake_count"]),
-                        int(row["slow_count"]),
-                        int(row["regression_count"]),
-                    ]
-                    for row in cells
-                ],
-            }
-        finally:
-            connection.close()
-
-    def repository_rollup_detail(
-        self,
-        *,
-        repository_id: str,
-        grain: str,
-        since: float,
-        limit: int = 500,
-    ) -> dict[str, object]:
-        """Return one repository trend without touching case/result tables."""
-
-        rows = self.rollups(
-            repository_id=repository_id,
-            grain=grain,
-            since=since,
-            limit=limit,
-        )
-        numeric = (
-            "run_count",
-            "attempt_count",
-            "selected_target_count",
-            "eligible_target_count",
-            "avoided_target_count",
-            "case_count",
-            "passed_count",
-            "failed_count",
-            "skipped_count",
-            "error_count",
-            "queue_seconds",
-            "attempt_queue_seconds",
-            "aggregate_test_seconds",
-            "attempt_wall_seconds",
-            "wall_seconds",
-            "retry_attempt_count",
-            "flake_count",
-            "slow_count",
-            "regression_count",
-            "success_count",
-            "failure_count",
-            "infrastructure_count",
-        )
-        totals: dict[str, int | float] = {
-            field: (0.0 if field.endswith("seconds") else 0) for field in numeric
-        }
-        for row in rows:
-            for field in numeric:
-                totals[field] += row[field]  # type: ignore[operator]
-        totals["max_attempt_seconds"] = max(
-            (float(row["max_attempt_seconds"]) for row in rows), default=0.0
-        )
-        return {
-            "repository_id": repository_id,
-            "grain": grain,
-            "totals": totals,
-            "efficiency": self._rollup_efficiency(totals),
-            "series": list(rows),
-        }
-
-    @staticmethod
-    def _rollup_efficiency(values: Mapping[str, object]) -> dict[str, float | None]:
-        def ratio(numerator: str, denominator: str) -> float | None:
-            bottom = float(values.get(denominator, 0) or 0)
-            return None if bottom <= 0 else float(values.get(numerator, 0) or 0) / bottom
-
-        terminal_attempts = (
-            float(values.get("success_count", 0) or 0)
-            + float(values.get("failure_count", 0) or 0)
-            + float(values.get("infrastructure_count", 0) or 0)
-        )
-        attempts = float(values.get("attempt_count", 0) or 0)
-        runs = float(values.get("run_count", 0) or 0)
-        eligible = float(values.get("eligible_target_count", 0) or 0)
-        return {
-            "parallelism_ratio": ratio("aggregate_test_seconds", "wall_seconds"),
-            "average_run_queue_seconds": (
-                None if runs <= 0 else float(values.get("queue_seconds", 0) or 0) / runs
-            ),
-            "selection_savings_ratio": (
-                None
-                if eligible <= 0
-                else float(values.get("avoided_target_count", 0) or 0) / eligible
-            ),
-            "flake_rate": (
-                None
-                if terminal_attempts <= 0
-                else float(values.get("flake_count", 0) or 0) / terminal_attempts
-            ),
-            "failure_rate": (
-                None
-                if terminal_attempts <= 0
-                else float(values.get("failure_count", 0) or 0)
-                / terminal_attempts
-            ),
-            "infrastructure_rate": (
-                None
-                if terminal_attempts <= 0
-                else float(values.get("infrastructure_count", 0) or 0)
-                / terminal_attempts
-            ),
-            "slow_rate": (
-                None if attempts <= 0 else float(values.get("slow_count", 0) or 0) / attempts
-            ),
-            "regression_rate": (
-                None
-                if attempts <= 0
-                else float(values.get("regression_count", 0) or 0) / attempts
-            ),
-        }
 
     def get_run(
         self, run_id: str, *, repository_id: str | None = None
@@ -5496,75 +3395,6 @@ class UniversalTestStore:
             "events": events,
         }
 
-    def recommend_shard_count(
-        self,
-        *,
-        repository_id: str,
-        target_name: str,
-        ceiling: int,
-        history_limit: int = 20,
-    ) -> int:
-        """Choose a conservative shard count from complete recent attempts.
-
-        Fewer than three comparable attempts never enable parallel shards.
-        Both runtime and case volume influence the recommendation, and every
-        shard must retain enough historical work to outweigh process startup.
-        This method is read-only; the manifest/typed adapter ceiling remains
-        authoritative even if history is malformed or sparse.
-        """
-
-        repository_id = _safe_id("repository_id", repository_id)
-        target_name = _single_line("target_name", target_name, maximum=256)
-        ceiling = _positive_int("shard ceiling", ceiling, maximum=64)
-        history_limit = _positive_int(
-            "shard history limit", history_limit, maximum=100
-        )
-        if ceiling == 1:
-            return 1
-        connection = self._connect(readonly=True)
-        try:
-            rows = connection.execute(
-                """
-                SELECT attempt.duration_seconds,
-                       attempt.passed_count + attempt.failed_count
-                         + attempt.skipped_count + attempt.error_count AS case_count
-                FROM test_target_attempts AS attempt
-                JOIN test_run_targets AS target USING(target_id)
-                JOIN test_runs AS run USING(run_id)
-                WHERE run.repository_id = ?
-                  AND target.target_name = ?
-                  AND attempt.state IN ('succeeded', 'test_failed')
-                  AND attempt.reporter_complete = 1
-                  AND attempt.duration_seconds IS NOT NULL
-                  AND attempt.finished_at IS NOT NULL
-                ORDER BY attempt.finished_at DESC, attempt.attempt_id DESC
-                LIMIT ?
-                """,
-                (repository_id, target_name, history_limit),
-            ).fetchall()
-        finally:
-            connection.close()
-        if len(rows) < 3:
-            return 1
-        durations = sorted(max(0.0, float(row["duration_seconds"])) for row in rows)
-        cases = sorted(max(0, int(row["case_count"])) for row in rows)
-        middle = len(rows) // 2
-        if len(rows) % 2:
-            median_duration = durations[middle]
-            median_cases = float(cases[middle])
-        else:
-            median_duration = (durations[middle - 1] + durations[middle]) / 2.0
-            median_cases = (cases[middle - 1] + cases[middle]) / 2.0
-        if median_duration < 15.0 and median_cases < 1_000:
-            return 1
-        runtime_shards = max(1, math.ceil(median_duration / 30.0))
-        case_shards = max(1, math.ceil(median_cases / 500.0))
-        enough_cases = max(1, int(median_cases // 32))
-        return max(
-            1,
-            min(ceiling, max(runtime_shards, case_shards), enough_cases),
-        )
-
     def runs(
         self,
         *,
@@ -5573,7 +3403,7 @@ class UniversalTestStore:
         limit: int = 50,
         state: str | None = None,
     ) -> tuple[dict[str, object], ...]:
-        """Return deterministic, repository-scoped run history.
+        """Return only deterministic, repository-scoped unfinished runs.
 
         ``after`` is an opaque run-id cursor from the previous page.  The
         cursor is resolved to the stored timestamp before selecting the next
@@ -5585,8 +3415,8 @@ class UniversalTestStore:
         limit = _positive_int("limit", limit, maximum=200)
         if state is not None:
             state = _safe_id("state", state)
-            if state not in _RUN_STATES:
-                raise TestStoreContractError("test run state filter is invalid")
+            if state not in _ACTIVE_RUN_STATES:
+                raise TestStoreContractError("only active test run states are listable")
         connection = self._connect(readonly=True)
         try:
             cursor: sqlite3.Row | None = None
@@ -5602,7 +3432,10 @@ class UniversalTestStore:
                     raise TestStoreNotFound(
                         "test run history cursor does not exist in this repository"
                     )
-            clauses = ["run.repository_id = ?"]
+            clauses = [
+                "run.repository_id = ?",
+                "run.state IN ('queued', 'running', 'cancelling', 'superseding')",
+            ]
             parameters: list[object] = [repository_id]
             if state is not None:
                 clauses.append("run.state = ?")
@@ -5979,71 +3812,6 @@ class UniversalTestStore:
         finally:
             connection.close()
 
-    def cases(
-        self, *, run_id: str, after: int = 0, limit: int = 100
-    ) -> tuple[dict[str, object], ...]:
-        """Return a bounded case page without loading reporter chunks."""
-
-        run_id = _safe_id("run_id", run_id)
-        if type(after) is not int or after < 0:
-            raise TestStoreContractError("case cursor must be non-negative")
-        limit = _positive_int("limit", limit, maximum=500)
-        connection = self._connect(readonly=True)
-        try:
-            if connection.execute(
-                "SELECT 1 FROM test_runs WHERE run_id = ?", (run_id,)
-            ).fetchone() is None:
-                raise TestStoreNotFound("test run does not exist")
-            return tuple(
-                dict(row)
-                for row in connection.execute(
-                    """
-                    SELECT result.rowid AS cursor, result.*, target.target_name,
-                           attempt.attempt_id, attempt.attempt_number
-                    FROM test_case_results AS result
-                    JOIN test_target_attempts AS attempt
-                      ON attempt.attempt_id = result.attempt_id
-                    JOIN test_run_targets AS target
-                      ON target.target_id = attempt.target_id
-                    WHERE attempt.run_id = ? AND result.rowid > ?
-                    ORDER BY result.rowid LIMIT ?
-                    """,
-                    (run_id, after, limit),
-                ).fetchall()
-            )
-        finally:
-            connection.close()
-
-    def events(
-        self,
-        *,
-        repository_id: str,
-        after_event_id: int = 0,
-        limit: int = 200,
-    ) -> tuple[dict[str, object], ...]:
-        repository_id = _safe_id("repository_id", repository_id)
-        if type(after_event_id) is not int or after_event_id < 0:
-            raise TestStoreContractError("after_event_id must be non-negative")
-        limit = _positive_int("limit", limit, maximum=1_000)
-        connection = self._connect(readonly=True)
-        try:
-            result = []
-            for row in connection.execute(
-                """
-                SELECT * FROM test_events
-                WHERE repository_id = ? AND event_id > ?
-                ORDER BY event_id LIMIT ?
-                """,
-                (repository_id, after_event_id, limit),
-            ).fetchall():
-                item = dict(row)
-                item["detail"] = json.loads(str(item.pop("detail_json")))
-                result.append(item)
-            return tuple(result)
-        finally:
-            connection.close()
-
-
 def prepare_test_store_schema(
     path: Path,
     *,
@@ -6192,7 +3960,6 @@ __all__ = [
     "FailureClassification",
     "FailureRecord",
     "LeaseGrant",
-    "LiveRetryReplanRequired",
     "RunnableTarget",
     "SubmissionResult",
     "TargetResources",

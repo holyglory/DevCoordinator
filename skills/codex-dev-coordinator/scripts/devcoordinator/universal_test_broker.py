@@ -24,7 +24,7 @@ from .universal_test_store import (
 from .universal_testd import (
     BrokerLaunchTicket,
     BrokerLaunchTicketIssuer,
-    RunnerRecoveryContext,
+    RunnerCleanupContext,
     RuntimeRequestSubmitter,
 )
 
@@ -1338,16 +1338,14 @@ class CoordinatorRuntimeRequestSubmitter(RuntimeRequestSubmitter):
             "launch_confirmed": True,
         }
 
-    def recover(
-        self, runtime_id: str, *, context: RunnerRecoveryContext
+    def attach_for_cleanup(
+        self, runtime_id: str, *, context: RunnerCleanupContext
     ) -> None:
-        if not isinstance(context, RunnerRecoveryContext):
-            raise TestStoreContractError("runtime recovery context is invalid")
+        if not isinstance(context, RunnerCleanupContext):
+            raise TestStoreContractError("runtime cleanup context is invalid")
         if (
             context.repository_generation < 0
             or context.generation <= 0
-            or context.next_chunk_index != len(context.result_chunk_ids)
-            or len(set(context.result_chunk_ids)) != len(context.result_chunk_ids)
             or type(context.launch_timeout_seconds) is not int
             or not 1 <= context.launch_timeout_seconds <= 3_600
             or type(context.launch_confirmed) is not bool
@@ -1359,12 +1357,12 @@ class CoordinatorRuntimeRequestSubmitter(RuntimeRequestSubmitter):
                 )
             )
         ):
-            raise TestStoreContractError("runtime recovery context is invalid")
+            raise TestStoreContractError("runtime cleanup context is invalid")
         expected_runtime_id = "devcoordinator-test-" + hashlib.sha256(
             context.attempt_id.encode("utf-8")
         ).hexdigest()[:32]
         if runtime_id != expected_runtime_id:
-            raise TestStoreConflict("runtime recovery identity is contradictory")
+            raise TestStoreConflict("runtime cleanup identity is contradictory")
         if context.launch_ticket_id is not None:
             expected_operation_id = self._launch_operation_id(
                 {
@@ -1377,7 +1375,7 @@ class CoordinatorRuntimeRequestSubmitter(RuntimeRequestSubmitter):
             )
             if context.launch_operation_id != expected_operation_id:
                 raise TestStoreConflict(
-                    "runtime recovery launch operation is contradictory"
+                    "runtime cleanup launch operation is contradictory"
                 )
         recovered = _RuntimeContext(
             repository_id=context.repository_id,
@@ -1390,12 +1388,12 @@ class CoordinatorRuntimeRequestSubmitter(RuntimeRequestSubmitter):
             launch_timeout_seconds=context.launch_timeout_seconds,
             launch_request_timeout_seconds=self.launch_request_timeout_seconds,
             launch_confirmed=context.launch_confirmed,
-            next_chunk_index=context.next_chunk_index,
-            result_chunk_ids=list(context.result_chunk_ids),
+            next_chunk_index=0,
+            result_chunk_ids=[],
         )
         existing = self._runtimes.get(runtime_id)
         if existing is not None and existing != recovered:
-            raise TestStoreConflict("runtime recovery context conflicts")
+            raise TestStoreConflict("runtime cleanup context conflicts")
         self._runtimes[runtime_id] = recovered
 
     def cancel(self, runtime_id: str, *, reason: str) -> Mapping[str, object]:

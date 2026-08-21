@@ -220,14 +220,6 @@ function archiveFixture() {
   }));
 }
 
-function testHourStarts() {
-  const end = new Date();
-  end.setUTCMinutes(0, 0, 0);
-  return Array.from({ length: 24 }, (_, index) => (
-    new Date(end.getTime() - ((23 - index) * 3_600_000)).toISOString()
-  ));
-}
-
 function testRepositoriesFixture() {
   return [
     {
@@ -243,107 +235,6 @@ function testRepositoriesFixture() {
   ];
 }
 
-function testFleetFixture() {
-  const hours = testHourStarts();
-  const repositories = testRepositoriesFixture().map((repository, repositoryIndex) => ({
-    ...repository,
-    state: 'healthy',
-    last_activity_at: new Date().toISOString(),
-    summary: {
-      test_count: 1_280 - (repositoryIndex * 320),
-      test_seconds: 21_600 - (repositoryIndex * 7_200),
-      wall_seconds: 3_600,
-      parallel_efficiency_ratio: repositoryIndex === 0 ? 6 : 4,
-      pass_rate: 1,
-      p95_queue_wait_seconds: 4 + repositoryIndex,
-    },
-    hourly: hours.map((hour_start, index) => ({
-      hour_start,
-      test_seconds: index % (repositoryIndex + 3) === 0 ? 2_700 : 180,
-      test_count: index % (repositoryIndex + 3) === 0 ? 160 : 12,
-      failure_count: 0,
-    })),
-  }));
-  return {
-    schema_version: 2,
-    window: { hours: 24, start: hours[0], end: hours.at(-1), timezone: 'UTC' },
-    snapshot: {
-      generated_at: new Date().toISOString(),
-      observed_through: new Date().toISOString(),
-      source: 'console-route-smoke-fixture',
-    },
-    summary: {
-      repository_count: repositories.length,
-      repositories_with_activity: repositories.length,
-      run_count: 36,
-      running_count: 2,
-      test_count: 2_240,
-      test_seconds: 36_000,
-      wall_seconds: 7_200,
-      parallel_efficiency_ratio: 5,
-      p95_queue_wait_seconds: 5,
-      passed_count: 2_240,
-      failure_count: 0,
-      pass_rate: 1,
-      flaky_test_count: 0,
-      flake_rate: 0,
-      avoided_work: { available: true, test_count: 420, test_seconds: 1_800 },
-    },
-    hours,
-    repositories,
-    capacity: hours.map((hour_start, index) => ({
-      hour_start,
-      test_seconds: index % 3 === 0 ? 5_400 : 360,
-      test_count: index % 3 === 0 ? 320 : 24,
-      failure_count: 0,
-      active_repository_count: 2,
-      p95_queue_wait_seconds: 5,
-    })),
-    attention: [],
-  };
-}
-
-function testStatsFixture(repoId) {
-  const today = new Date();
-  today.setUTCHours(0, 0, 0, 0);
-  const daily = Array.from({ length: 7 }, (_, index) => ({
-    day: new Date(today.getTime() - ((6 - index) * 86_400_000)).toISOString().slice(0, 10),
-    test_seconds: 3_600 + (index * 180),
-    run_seconds: 900,
-    passed_count: 180 + index,
-    failure_count: 0,
-    flaky_test_count: 0,
-  }));
-  return {
-    schema_version: 1,
-    repo_id: repoId,
-    days: 30,
-    summary: {
-      test_count: 1_280,
-      run_count: 18,
-      run_seconds: 7_200,
-      test_seconds: 36_000,
-      passed_count: 1_280,
-      failed_count: 0,
-      error_count: 0,
-      running_count: 1,
-      failed_run_count: 0,
-      p95_queue_wait_seconds: 5,
-    },
-    comparison_summary: { test_seconds: 31_000 },
-    hourly: [],
-    daily,
-    previous_daily: daily.map((row) => ({ ...row, test_seconds: row.test_seconds - 240 })),
-    dynamics: [{
-      suite: 'API integration', current_seconds: 1_240, previous_seconds: 1_160,
-      change_percent: 6.9, failure_count: 0, last_run: new Date().toISOString(),
-    }],
-    health: { pass_rate: 1, flake_rate: 0 },
-    efficiency: { parallel_efficiency_ratio: 5, p95_queue_wait_seconds: 5 },
-    avoided_work: { available: true, test_count: 420 },
-  };
-}
-
 function testSetupFixture(repoId) {
   return {
     schema_version: 1,
@@ -355,7 +246,6 @@ function testSetupFixture(repoId) {
       { name: 'unit', depends_on: [], network: 'none', fixtures: [] },
       { name: 'integration', depends_on: ['unit'], network: 'loopback', fixtures: [] },
     ],
-    evidence_policies: { handoff: 'Exact immutable source and all required targets pass.' },
     fixtures: {},
   };
 }
@@ -430,7 +320,6 @@ function adminState() {
     accessCreateFailures: 1,
     inviteDecisionFailures: 1,
     telegramWebhookFailures: 1,
-    testFleet: testFleetFixture(),
   };
 }
 
@@ -554,10 +443,6 @@ async function installAdminRoutes(page, fixture, stack) {
       body = populatedMetrics();
     } else if (method === 'GET' && pathname === '/api/tests/repositories') {
       body = { schema_version: 1, repositories: testRepositoriesFixture() };
-    } else if (method === 'GET' && pathname === '/api/tests/fleet') {
-      body = fixture.testFleet;
-    } else if (method === 'GET' && pathname === '/api/tests') {
-      body = testStatsFixture(new URL(request.url()).searchParams.get('project'));
     } else if (method === 'GET' && pathname === '/api/tests/runs') {
       const repoId = new URL(request.url()).searchParams.get('repo_id');
       body = {
@@ -576,7 +461,6 @@ async function installAdminRoutes(page, fixture, stack) {
           completed_target_count: 2,
           wall_seconds: 60,
           can_cancel: false,
-          can_retry: false,
         }],
       };
     } else {
@@ -786,28 +670,10 @@ async function exercisePrimaryConsoleRoutes(page, mobile, label, deferredFailure
   await assertHealthyRoute(page, '#sec-projects', `${label} Projects`, deferredFailures);
 
   section = await navigateTo(page, 'tests', mobile);
-  await section.locator('.test-fleet-summary').waitFor();
-  assert.equal(await section.locator('.test-fleet-mobile-row, .test-fleet-row').count() > 0, true);
-  await page.locator('#tests-search').fill('Sample API');
-  await page.waitForFunction(() => (
-    [...document.querySelectorAll('.test-fleet-mobile-row, .test-fleet-row')]
-      .some((node) => getComputedStyle(node).display !== 'none')
-  ));
-  await page.locator('#tests-search').fill('');
-  const repositoryButton = mobile
-    ? section.locator('.test-fleet-mobile-row').first()
-    : section.locator('.test-repository-button').first();
+  await section.locator('.test-current-repositories').waitFor();
+  assert.equal(await section.locator('.test-current-repository').count() > 0, true);
+  const repositoryButton = section.locator('.test-current-repository').first();
   await repositoryButton.click();
-  const detail = page.locator('#test-detail-dialog');
-  await detail.waitFor({ state: 'visible' });
-  await detail.getByRole('heading', { name: 'Throughput & efficiency' }).waitFor();
-  await detail.getByRole('tab', { name: 'Runs' }).click();
-  await detail.locator('.test-run-history-card').waitFor();
-  await detail.getByRole('tab', { name: 'Setup' }).click();
-  await detail.getByRole('heading', { name: 'Manifest · ready' }).waitFor();
-  await page.locator('#test-detail-close').click();
-  await detail.waitFor({ state: 'hidden' });
-  await page.locator('#tests-run').click();
   const runDialog = page.locator('#test-run-dialog');
   await runDialog.waitFor({ state: 'visible' });
   await runDialog.locator('#test-run-source option').first().waitFor({ state: 'attached' });
@@ -820,16 +686,10 @@ async function exercisePrimaryConsoleRoutes(page, mobile, label, deferredFailure
   }
   await page.locator('#test-run-cancel').click();
   await runDialog.waitFor({ state: 'hidden' });
-  assert.deepEqual(
-    await section.locator('.test-fleet-hour').allTextContents(),
-    Array.from({ length: 24 }, (_, hour) => `${String(hour).padStart(2, '0')}:00`),
-    `${label} Tests must keep a local 00:00 through 23:00 data order`,
-  );
-  assert.equal(
-    await section.locator('.test-fleet-matrix-wrap').isHidden(),
-    mobile,
-    `${label} Tests must replace the dense heatmap with repository cards only on mobile`,
-  );
+  await page.locator('#tests-run').click();
+  await runDialog.waitFor({ state: 'visible' });
+  await page.locator('#test-run-cancel').click();
+  await runDialog.waitFor({ state: 'hidden' });
   await assertHealthyRoute(page, '#sec-tests', `${label} Tests`, deferredFailures);
 
   section = await navigateTo(page, 'servers', mobile);

@@ -13,10 +13,6 @@ from typing import TYPE_CHECKING, Any
 
 
 _LAZY_EXPORTS = {
-    "ImportConflict": (".legacy_import", "ImportConflict"),
-    "ImportReport": (".legacy_import", "ImportReport"),
-    "LegacyImportError": (".legacy_import", "LegacyImportError"),
-    "LegacySourceChanged": (".legacy_import", "LegacySourceChanged"),
     "AccountStore": (".store", "AccountStore"),
     "CoordinatorStore": (".store", "CoordinatorStore"),
     "StoreInvariantError": (".store", "StoreInvariantError"),
@@ -54,10 +50,6 @@ __all__ = [
     "BrokerRequest",
     "BrokerService",
     "CoordinatorStore",
-    "ImportConflict",
-    "ImportReport",
-    "LegacyImportError",
-    "LegacySourceChanged",
     "PeerCredentials",
     "SerializedMutationWriter",
     "TrustedLocalRequestAcceptor",
@@ -107,10 +99,4 @@ if TYPE_CHECKING:  # pragma: no cover - imported only by static analyzers
         build_store_backed_broker_runtime,
     )
     from .broker_persistence import BrokerPersistence, StoreBackedRequestAcceptor
-    from .legacy_import import (
-        ImportConflict,
-        ImportReport,
-        LegacyImportError,
-        LegacySourceChanged,
-    )
     from .store import AccountStore, CoordinatorStore, StoreInvariantError

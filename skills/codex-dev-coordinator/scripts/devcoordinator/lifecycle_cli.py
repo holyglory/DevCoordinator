@@ -162,7 +162,6 @@ def handle_lifecycle_cli(
     *,
     coordinator_home: Path,
     canonical_project: Callable[[str], str],
-    bootstrap_legacy_import: Callable[[AccountStore], Mapping[str, Any]],
     observe_before_plan: Callable[[str, str], Mapping[str, Any]] | None = None,
     observe_before_apply: Callable[[str, str], Mapping[str, Any]] | None = None,
     adapter_factory: Callable[[], CoordinatorHostLifecycleAdapter] = CoordinatorHostLifecycleAdapter,
@@ -291,16 +290,6 @@ def handle_lifecycle_cli(
         )
 
     with AccountStore.open_default(coordinator_home) as store:
-        import_result = dict(bootstrap_legacy_import(store))
-        if import_result.get("attempted") and not import_result.get("committed"):
-            raise RuntimeError(
-                "same-UID legacy coordinator import did not commit; no lifecycle action was attempted"
-            )
-        late_writers = list(import_result.get("late_writer_sources") or [])
-        if late_writers:
-            raise RuntimeError(
-                "a retired same-UID coordinator source changed after import; observe and reconcile before lifecycle mutation"
-            )
         persistence = SQLiteLifecyclePersistence(store)
         lifecycle = RepositoryLifecycle(persistence, adapter_factory())
 

@@ -28,7 +28,7 @@ class _Context:
 
 
 class AgentCliTests(unittest.TestCase):
-    def test_enqueue_emits_prompt_replay_safe_progress_before_execution(self) -> None:
+    def test_run_emits_prompt_replay_safe_progress_before_execution(self) -> None:
         stdout = mock.Mock()
         stdout.buffer = io.BytesIO()
         stdout.flush = mock.Mock()
@@ -52,7 +52,7 @@ class AgentCliTests(unittest.TestCase):
             returncode = agent_cli.main(
                 [
                     "test",
-                    "enqueue",
+                    "run",
                     "--intent",
                     "manual",
                     "--target",
@@ -65,11 +65,10 @@ class AgentCliTests(unittest.TestCase):
         self.assertEqual(returncode, 0)
         execute.assert_called_once()
         progress = json.loads(stderr.buffer.getvalue())
-        self.assertEqual(progress["classification"], "test_enqueue_started")
+        self.assertEqual(progress["classification"], "test_run_started")
         self.assertEqual(progress["status"], "snapshot_planning")
         self.assertEqual(progress["operation_id"], operation_id)
         self.assertIn(operation_id, progress["replay_command"])
-        self.assertIn("queue-status", progress["queue_status_command"])
 
     def test_repository_context_uses_authority_published_immutable_route(self) -> None:
         namespace = mock.Mock(project="/snapshots/snapshot-a/root/subdirectory")
@@ -161,11 +160,10 @@ class AgentCliTests(unittest.TestCase):
                 "--project",
                 "/repo",
             ],
-            ["test", "enqueue", "--project", "/repo"],
-            ["test", "submit", "plan-1", "--project", "/repo"],
+            ["test", "run", "--project", "/repo"],
             ["test", "follow", "run-1", "--project", "/repo"],
-            ["test", "failures", "run-1", "--project", "/repo"],
             ["test", "artifact", "run-1", "artifact-1", "--project", "/repo"],
+            ["test", "cancel", "run-1", "--reason", "stop", "--project", "/repo"],
         )
         for argv in cases:
             with self.subTest(argv=argv):
@@ -965,17 +963,17 @@ class AgentCliTests(unittest.TestCase):
         self.assertNotEqual(completed["code"], "mutation_failed")
 
     def test_test_mutations_receive_an_id_before_execution(self) -> None:
-        namespace = agent_cli._parser().parse_args(["test", "enqueue"])
+        namespace = agent_cli._parser().parse_args(["test", "run"])
         self.assertIsNone(namespace.operation_id)
         namespace.operation_id = agent_cli._canonical_operation_id(
             namespace.operation_id, mutate=True
         )
         self.assertEqual(str(__import__("uuid").UUID(namespace.operation_id)), namespace.operation_id)
 
-    def test_enqueue_reconciles_current_repository_catalog_before_preview(self) -> None:
+    def test_run_reconciles_current_repository_catalog_before_preview(self) -> None:
         operation_id = "00000000-0000-4000-8000-000000000041"
         namespace = agent_cli._parser().parse_args(
-            ["test", "enqueue", "--operation-id", operation_id]
+            ["test", "run", "--operation-id", operation_id]
         )
         repository = mock.Mock(repo_id="repo-1", canonical_root="/repo")
         profile = mock.Mock()
@@ -985,16 +983,16 @@ class AgentCliTests(unittest.TestCase):
         with (
             mock.patch.object(agent_cli, "_attribution", return_value="codex:thread"),
             mock.patch(
-                "devcoordinator.agent_test.enqueue_test",
+                "devcoordinator.agent_test.run_test",
                 return_value={"schema_version": 1, "ok": True},
-            ) as enqueue,
+            ) as run_test,
         ):
             result = agent_cli._test(
                 namespace,
                 profile=profile,
                 capabilities={
                     "tests": {
-                        "enqueue_intents": [
+                        "run_intents": [
                             "change",
                             "checkpoint",
                             "handoff",
@@ -1018,7 +1016,7 @@ class AgentCliTests(unittest.TestCase):
             ),
             reconcile_scope="test",
         )
-        enqueue.assert_called_once()
+        run_test.assert_called_once()
         self.assertTrue(result["ok"])
 
     def test_failure_page_preserves_a_cursor_while_enforcing_agent_bound(self) -> None:
@@ -1051,41 +1049,6 @@ class AgentCliTests(unittest.TestCase):
         self.assertEqual(result["next_cursor"], None)
         self.assertEqual(len(result["failures"]), 10)
 
-    def test_successful_retry_without_broker_ok_still_exits_successfully(self) -> None:
-        operation_id = "00000000-0000-4000-8000-000000000001"
-        repository = mock.Mock(repo_id="repo-1")
-        profile = mock.Mock()
-        profile.resolve_repository.return_value = repository
-        profile.retry_test_run.return_value = {
-            "schema_version": 1,
-            "repository_id": "repo-1",
-            "run_id": "run-2",
-            "state": "queued",
-        }
-        namespace = agent_cli._parser().parse_args(
-            [
-                "test",
-                "retry",
-                "run-1",
-                "--failed-only",
-                "--operation-id",
-                operation_id,
-            ]
-        )
-
-        with mock.patch.object(
-            agent_cli, "_attribution", return_value="codex:thread"
-        ):
-            result = agent_cli._test(
-                namespace,
-                profile=profile,
-                capabilities={"tests": {}},
-                context=_Context(),
-            )
-
-        self.assertTrue(result["ok"])
-        self.assertEqual(result["operation_id"], operation_id)
-
     def test_test_parser_exposes_every_advertised_agent_action(self) -> None:
         test_parser = agent_cli._parser()._subparsers._group_actions[0].choices["test"]
         actions = test_parser._subparsers._group_actions[0].choices
@@ -1094,27 +1057,19 @@ class AgentCliTests(unittest.TestCase):
             {
                 "artifact",
                 "cancel",
-                "enqueue",
-                "failures",
                 "follow",
-                "queue-status",
-                "retry",
-                "submit",
+                "run",
             },
         )
 
     def test_only_read_only_test_continuations_allow_compatible_release(self) -> None:
         allowed = (
             ["test", "artifact", "run-1", "artifact-1"],
-            ["test", "failures", "run-1"],
             ["test", "follow", "run-1"],
-            ["test", "queue-status"],
         )
         strict = (
             ["test", "cancel", "run-1", "--reason", "stop"],
-            ["test", "enqueue"],
-            ["test", "retry", "run-1", "--failed-only"],
-            ["test", "submit", "plan-1"],
+            ["test", "run"],
             ["runtime", "status", "service-1"],
             ["capabilities"],
         )
@@ -1146,7 +1101,7 @@ class AgentCliTests(unittest.TestCase):
             ),
             mock.patch.object(agent_cli, "_execute", side_effect=failure),
         ):
-            returncode = agent_cli.main(["test", "enqueue"])
+            returncode = agent_cli.main(["test", "run"])
 
         self.assertEqual(returncode, 1)
         result = json.loads(stream.buffer.getvalue())

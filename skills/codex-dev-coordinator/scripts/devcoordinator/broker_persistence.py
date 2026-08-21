@@ -234,36 +234,25 @@ _HOST_READ_OPERATIONS = frozenset(
         BrokerOperation.OPERATION_FOLLOW,
         BrokerOperation.INVENTORY_READ,
         BrokerOperation.EVENTS_READ,
-        BrokerOperation.TEST_FLEET_STATS_READ,
         BrokerOperation.TEST_REPOSITORY_CATALOG,
     }
 )
 _HOST_OBSERVE_OPERATIONS = frozenset({BrokerOperation.HOST_OBSERVE})
 _TEST_OPERATIONS = frozenset(
     {
-        BrokerOperation.TEST_RUN_START,
-        BrokerOperation.TEST_RUN_FINISH,
         BrokerOperation.TEST_HEALTH,
-        BrokerOperation.TEST_STATS_READ,
-        BrokerOperation.TEST_FLEET_STATS_READ,
         BrokerOperation.TEST_PLAN_PREVIEW,
         BrokerOperation.TEST_PLAN_REGISTER,
         BrokerOperation.TEST_RUN_SUBMIT,
         BrokerOperation.TEST_RUN_LIST,
-        BrokerOperation.TEST_QUEUE_STATUS,
         BrokerOperation.TEST_RUN_STATUS,
         BrokerOperation.TEST_RUN_SUMMARY,
         BrokerOperation.TEST_RUN_FAILURES,
         BrokerOperation.TEST_RUN_ARTIFACTS,
         BrokerOperation.TEST_ARTIFACT_RESOLVE,
-        BrokerOperation.TEST_RUN_CASES,
         BrokerOperation.TEST_RUN_CANCEL,
-        BrokerOperation.TEST_RUN_RETRY,
-        BrokerOperation.TEST_EVENTS_READ,
         BrokerOperation.TEST_REPOSITORY_SETUP,
         BrokerOperation.TEST_REPOSITORY_CATALOG,
-        BrokerOperation.TEST_EVIDENCE_CHECK,
-        BrokerOperation.TEST_EVIDENCE_CONSUME,
     }
 )
 
@@ -9310,23 +9299,6 @@ class BrokerPersistence:
                     compose_project_owners.setdefault(
                         str(row["project_name"]), []
                     ).append(str(row["repo_id"]))
-        # Test statistics are repository-owned, bounded projections over the
-        # same service database. Keep them beside (not inside) runtime
-        # resources so the Board cannot confuse test activity with host state.
-        from .test_records import CoordinatorTestRecords
-
-        records = CoordinatorTestRecords(
-            self.database_path,
-            expected_uid=self.expected_uid,
-            busy_timeout_ms=self.busy_timeout_ms,
-        )
-        graph["test_statistics"] = [
-            records.stats_for_repository(
-                repo_id=str(repository["repo_id"]), days=30, limit=25
-            )
-            for repository in graph["repositories"]
-            if repository.get("installation_status") != "disabled"
-        ]
         # Physical Docker accounting is deliberately a cached authority-owned
         # observer.  The first read schedules collection without delaying the
         # inventory response; later reads receive one disjoint, project-aware

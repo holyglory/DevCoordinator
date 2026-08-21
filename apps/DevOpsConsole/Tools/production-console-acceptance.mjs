@@ -659,51 +659,20 @@ async function exerciseLifecycleTabs(page, route, journeys) {
 }
 
 async function exerciseTestTabs(page, journeys) {
-  const repository = page.locator('#sec-tests .test-repository-button, #sec-tests .test-fleet-mobile-row')
+  const repository = page.locator('#sec-tests .test-current-repository')
     .filter({ visible: true }).first();
   if (await repository.count() === 0) {
-    journeys.push({ name: 'repository test tabs', status: 'failed', detail: 'no repository detail control' });
+    journeys.push({ name: 'current test repositories', status: 'failed', detail: 'no repository catalog row' });
     return;
   }
   try {
-    await repository.click();
-    await page.locator('#test-detail-dialog').waitFor({ state: 'visible', timeout: 5_000 });
-    const daysSelect = page.locator('#tests-days');
-    for (const days of ['7', '30', '90']) {
-      const response = page.waitForResponse((candidate) => {
-        const requestUrl = new URL(candidate.url());
-        return requestUrl.pathname === '/api/tests'
-          && requestUrl.searchParams.get('days') === days
-          && candidate.status() === 200;
-      }, { timeout: 5_000 });
-      await daysSelect.selectOption(days);
-      await response;
-      await page.waitForFunction((expected) => {
-        const selected = document.querySelector('#tests-days')?.value;
-        const period = document.querySelector(
-          '#test-detail-body > .test-detail-throughput > .test-panel-title > .meta-passive',
-        )?.textContent || '';
-        return selected === expected && period === `Last ${expected} days`;
-      }, days, { timeout: 5_000 });
-    }
     journeys.push({
-      name: 'repository test windows',
+      name: 'current test repositories',
       status: 'passed',
-      detail: 'authenticated 7/30/90-day projections returned and rendered',
+      detail: 'authenticated current repository catalog rendered without history',
     });
-    const selector = '#test-detail-dialog [data-test-detail-tab]';
-    const count = await page.locator(selector).count();
-    if (count < 3) fail('repository detail tab set is incomplete');
-    for (let index = 0; index < count; index += 1) {
-      await page.locator(selector).nth(index).click();
-      await page.waitForTimeout(100);
-    }
-    await page.locator('#test-detail-close').click();
-    await page.waitForFunction(() => !document.querySelector('#test-detail-dialog')?.open, null, { timeout: 5_000 });
-    journeys.push({ name: 'repository test tabs', status: 'passed' });
   } catch (error) {
-    journeys.push({ name: 'repository test tabs', status: 'failed', detail: text(error.message) });
-    await page.keyboard.press('Escape').catch(() => {});
+    journeys.push({ name: 'current test repositories', status: 'failed', detail: text(error.message) });
   }
 }
 

@@ -172,7 +172,6 @@ from .store import (
     StoreError,
     StoreInvariantError,
 )
-from .test_records import CoordinatorTestRecords
 from .universal_test_contract import (
     ManifestContractError,
     SourceMode,
@@ -262,27 +261,19 @@ _EPHEMERAL_OPERATIONS = frozenset(
 _FULL_DOCKER_OBSERVER_DOMAIN = FULL_DOCKER_OBSERVER_DOMAIN
 _ASYNC_TEST_OPERATIONS = frozenset(
     {
-        BrokerOperation.TEST_STATS_READ,
         BrokerOperation.TEST_HEALTH,
-        BrokerOperation.TEST_FLEET_STATS_READ,
         BrokerOperation.TEST_PLAN_PREVIEW,
         BrokerOperation.TEST_PLAN_REGISTER,
         BrokerOperation.TEST_RUN_SUBMIT,
         BrokerOperation.TEST_RUN_LIST,
-        BrokerOperation.TEST_QUEUE_STATUS,
         BrokerOperation.TEST_RUN_STATUS,
         BrokerOperation.TEST_RUN_SUMMARY,
         BrokerOperation.TEST_RUN_FAILURES,
         BrokerOperation.TEST_RUN_ARTIFACTS,
         BrokerOperation.TEST_ARTIFACT_RESOLVE,
-        BrokerOperation.TEST_RUN_CASES,
         BrokerOperation.TEST_RUN_CANCEL,
-        BrokerOperation.TEST_RUN_RETRY,
-        BrokerOperation.TEST_EVENTS_READ,
         BrokerOperation.TEST_REPOSITORY_SETUP,
         BrokerOperation.TEST_REPOSITORY_CATALOG,
-        BrokerOperation.TEST_EVIDENCE_CHECK,
-        BrokerOperation.TEST_EVIDENCE_CONSUME,
     }
 )
 _LOGGER = logging.getLogger(__name__)
@@ -336,7 +327,6 @@ def _test_run_actor(accepted: AcceptedBrokerRequest) -> str:
     if request.operation not in {
         BrokerOperation.TEST_RUN_SUBMIT,
         BrokerOperation.TEST_RUN_CANCEL,
-        BrokerOperation.TEST_RUN_RETRY,
     }:
         return broker_actor
     requested = request.arguments.get("actor")
@@ -602,11 +592,6 @@ class StoreBackedMutationBackend:
         self._runtime_log_root = _private_runtime_log_root(
             persistence.database_path, expected_uid=persistence.expected_uid
         )
-        self._test_records = CoordinatorTestRecords(
-            persistence.database_path,
-            expected_uid=persistence.expected_uid,
-            busy_timeout_ms=persistence.busy_timeout_ms,
-        )
 
     def _retire_database_backup_files(
         self, backup: RegisteredDatabaseBackup
@@ -747,77 +732,6 @@ class StoreBackedMutationBackend:
                         "testd health returned contradictory store identity"
                     )
                 result["repository_id"] = request.project_id
-                return result
-
-            if request.operation is BrokerOperation.TEST_STATS_READ:
-                result = dict(
-                    plane.dashboard_stats(
-                        repository_id=request.project_id,
-                        days=int(request.arguments["days"]),
-                        limit=int(request.arguments["limit"]),
-                    )
-                )
-                self._require_test_repository(result, request.project_id)
-                return result
-
-            if request.operation is BrokerOperation.TEST_FLEET_STATS_READ:
-                authority_rows = self._persistence.current_test_repositories(
-                    accepted
-                )
-                if not authority_rows:
-                    raise TestStoreContractError(
-                        "test fleet requires at least one current repository"
-                    )
-                if len(authority_rows) > 50:
-                    raise BrokerBackendError(
-                        "test_fleet_scope_too_large",
-                        "The current test fleet exceeds the bounded dashboard scope.",
-                        operation_id=request.operation_id,
-                    )
-                repository_ids = tuple(
-                    str(row["repo_id"]) for row in authority_rows
-                )
-                result = dict(
-                    plane.dashboard_fleet(
-                        repository_ids=repository_ids,
-                        hours=int(request.arguments["hours"]),
-                    )
-                )
-                raw_repositories = result.get("repositories")
-                if not isinstance(raw_repositories, list):
-                    raise TestStoreContractError(
-                        "testd fleet projection is malformed"
-                    )
-                by_id: dict[str, dict[str, object]] = {}
-                for item in raw_repositories:
-                    if not isinstance(item, Mapping):
-                        raise TestStoreContractError(
-                            "testd fleet repository is malformed"
-                        )
-                    repository_id = str(
-                        item.get("repo_id") or item.get("repository_id") or ""
-                    )
-                    if repository_id not in repository_ids or repository_id in by_id:
-                        raise TestStoreContractError(
-                            "testd fleet repository identity is contradictory"
-                        )
-                    by_id[repository_id] = dict(item)
-                if set(by_id) != set(repository_ids):
-                    raise TestStoreContractError(
-                        "testd fleet projection does not cover the authority scope"
-                    )
-                enriched = []
-                for authority in authority_rows:
-                    repository_id = str(authority["repo_id"])
-                    enriched.append(
-                        {
-                            **by_id[repository_id],
-                            "repo_id": repository_id,
-                            "repository_id": repository_id,
-                            "display_name": authority["display_name"],
-                        }
-                    )
-                result["repositories"] = enriched
                 return result
 
             if request.operation is BrokerOperation.TEST_PLAN_PREVIEW:
@@ -1073,95 +987,43 @@ class StoreBackedMutationBackend:
                 )
                 return result
 
-            if request.operation is BrokerOperation.TEST_QUEUE_STATUS:
-                expected_repository_id = str(
-                    request.arguments.get("expected_repository_id")
-                    or request.project_id
-                )
-                if expected_repository_id != request.project_id:
-                    raise BrokerBackendError(
-                        "test_repository_mismatch",
-                        "The queue status repository is contradictory.",
-                        operation_id=request.operation_id,
-                    )
-                result = dict(
-                    plane.queue_status(repository_id=request.project_id)
-                )
-                self._require_test_repository(result, request.project_id)
-                return result
-
-            if request.operation is BrokerOperation.TEST_EVENTS_READ:
-                result = dict(
-                    plane.events(
-                        repository_id=request.project_id,
-                        after_event_id=int(request.arguments["after_event_id"]),
-                        limit=int(request.arguments["limit"]),
-                    )
-                )
-                self._require_test_repository(result, request.project_id)
-                self._require_test_event_page(
-                    result,
-                    expected_repo_id=request.project_id,
-                    after_event_id=int(request.arguments["after_event_id"]),
-                    maximum_items=int(request.arguments["limit"]),
-                )
-                return result
-
             if request.operation is BrokerOperation.TEST_REPOSITORY_CATALOG:
                 authority_rows = self._persistence.current_test_repositories(
                     accepted
                 )
-                repository_ids = tuple(
-                    str(row["repo_id"]) for row in authority_rows
-                )
-                retained = dict(
-                    plane.repository_catalog(
-                        repository_ids=repository_ids,
-                        timeout_seconds=TEST_CATALOG_READ_TIMEOUT_SECONDS,
-                    )
-                )
-                raw_rows = retained.get("repositories")
-                if not isinstance(raw_rows, list):
-                    raise TestStoreContractError(
-                        "testd repository catalog is malformed"
-                    )
-                by_id: dict[str, Mapping[str, object]] = {}
-                for item in raw_rows:
-                    if not isinstance(item, Mapping):
-                        raise TestStoreContractError(
-                            "testd repository catalog entry is malformed"
+                setup_by_id: dict[str, Mapping[str, object]] = {}
+                for row in authority_rows:
+                    repository_id = str(row["repo_id"])
+                    execution_context = (
+                        self._persistence.test_repository_execution_context(
+                            repo_id=repository_id,
+                            execution_uid=accepted.attribution_uid,
+                            operation_id=request.operation_id,
                         )
-                    repository_id = str(item.get("repository_id") or "")
-                    if (
-                        repository_id not in repository_ids
-                        or repository_id in by_id
-                        or item.get("setup_status")
-                        not in {"ready", "missing", "invalid"}
-                    ):
-                        raise TestStoreContractError(
-                            "testd repository catalog identity is contradictory"
-                        )
-                    by_id[repository_id] = item
-                if set(by_id) != set(repository_ids):
-                    raise TestStoreContractError(
-                        "testd repository catalog does not cover the authority scope"
                     )
+                    setup = dict(
+                        plane.setup(
+                            repository_id=repository_id,
+                            owner_uid=execution_context.execution_uid,
+                            timeout_seconds=TEST_CATALOG_READ_TIMEOUT_SECONDS,
+                        )
+                    )
+                    self._require_test_repository(setup, repository_id)
+                    setup_by_id[repository_id] = setup
                 return {
                     "schema_version": 1,
                     "repositories": [
                         {
                             "repo_id": row["repo_id"],
                             "display_name": row["display_name"],
-                            "setup_status": by_id[str(row["repo_id"])][
+                            "setup_status": setup_by_id[str(row["repo_id"])][
                                 "setup_status"
                             ],
-                            "setup_observed_at": by_id[str(row["repo_id"])].get(
+                            "setup_observed_at": setup_by_id[str(row["repo_id"])].get(
                                 "setup_observed_at"
                             ),
-                            "setup_retained": bool(
-                                by_id[str(row["repo_id"])].get("retained")
-                            ),
-                            "manifest_fingerprint": by_id[
+                            "setup_retained": False,
+                            "manifest_fingerprint": setup_by_id[
                                 str(row["repo_id"])
                             ].get("manifest_fingerprint"),
                         }
@@ -1307,21 +1169,6 @@ class StoreBackedMutationBackend:
                         "testd returned contradictory artifact content evidence"
                     )
                 return result
-            if request.operation is BrokerOperation.TEST_RUN_CASES:
-                result = dict(
-                    plane.cases(
-                        run_id=run_id,
-                        repository_id=repository_id,
-                        after=int(request.arguments["after"]),
-                        limit=int(request.arguments["limit"]),
-                    )
-                )
-                self._require_test_run_result(
-                    result,
-                    expected_run_id=run_id,
-                    expected_repo_id=repository_id,
-                )
-                return result
             if request.operation is BrokerOperation.TEST_RUN_CANCEL:
                 result = dict(
                     plane.cancel(
@@ -1337,83 +1184,6 @@ class StoreBackedMutationBackend:
                     expected_run_id=run_id,
                     expected_repo_id=repository_id,
                 )
-                return result
-            if request.operation is BrokerOperation.TEST_RUN_RETRY:
-                result = dict(
-                    plane.retry(
-                        run_id=run_id,
-                        repository_id=repository_id,
-                        actor=actor,
-                        failed_only=bool(request.arguments["failed_only"]),
-                        operation_id=request.operation_id,
-                    )
-                )
-                retry_run_id = str(result.get("run_id") or "")
-                if not retry_run_id:
-                    raise BrokerBackendError(
-                        "test_run_mismatch",
-                        "The test-plane retry result omitted its exact run identity.",
-                        operation_id=request.operation_id,
-                    )
-                retry_status = dict(
-                    plane.status(
-                        run_id=retry_run_id,
-                        repository_id=repository_id,
-                    )
-                )
-                self._require_test_run_result(
-                    retry_status,
-                    expected_run_id=retry_run_id,
-                    expected_repo_id=repository_id,
-                )
-                self._require_test_run_result(
-                    result,
-                    expected_run_id=retry_run_id,
-                    expected_repo_id=repository_id,
-                )
-                return result
-            if request.operation is BrokerOperation.TEST_EVIDENCE_CHECK:
-                result = dict(
-                    plane.policy_check(
-                        repository_id=request.project_id,
-                        snapshot_id=str(request.arguments["snapshot_id"]),
-                        policy_name=str(request.arguments["policy_name"]),
-                    )
-                )
-                self._require_test_repository(result, request.project_id)
-                return result
-            if request.operation is BrokerOperation.TEST_EVIDENCE_CONSUME:
-                snapshot_id = str(request.arguments["snapshot_id"])
-                policy_name = str(request.arguments["policy_name"])
-                result = dict(
-                    plane.policy_consume(
-                        repository_id=request.project_id,
-                        snapshot_id=snapshot_id,
-                        policy_name=policy_name,
-                        operation_id=request.operation_id,
-                    )
-                )
-                self._require_test_repository(result, request.project_id)
-                if (
-                    result.get("operation_id") != request.operation_id
-                    or result.get("snapshot_id") != snapshot_id
-                    or result.get("policy_name") != policy_name
-                    or result.get("satisfied") is not True
-                    or result.get("consumed") is not True
-                    or result.get("reusable") is not False
-                    or result.get("requires_consumption") is not True
-                    or not isinstance(result.get("attestation_id"), str)
-                    or not result["attestation_id"]
-                    or not isinstance(result.get("consumption_id"), str)
-                    or not result["consumption_id"]
-                    or not isinstance(result.get("run_id"), str)
-                    or not result["run_id"]
-                ):
-                    raise BrokerBackendError(
-                        "test_evidence_consumption_mismatch",
-                        "The test plane returned contradictory evidence-consumption identity.",
-                        operation_id=request.operation_id,
-                    )
                 return result
         except TestPlanPreviewUnavailable as error:
             unavailable_code = getattr(error, "code", "test_plan_preview_unavailable")
@@ -2459,11 +2229,7 @@ class StoreBackedMutationBackend:
                 )
 
         try:
-            if request.operation == BrokerOperation.TEST_RUN_START:
-                result = self._test_records.start(accepted)
-            elif request.operation == BrokerOperation.TEST_RUN_FINISH:
-                result = self._test_records.finish(accepted)
-            elif request.operation is BrokerOperation.CONTAINER_REMOVE:
+            if request.operation is BrokerOperation.CONTAINER_REMOVE:
                 target = self._persistence.direct_container_removal_target(
                     accepted
                 )

@@ -25,7 +25,7 @@ from devcoordinator.universal_test_transport import (
 )
 
 
-class SlowCatalogAdapter(StoreTestPlaneAdapter):
+class SlowSetupAdapter(StoreTestPlaneAdapter):
     def __init__(self, store: UniversalTestStore) -> None:
         super().__init__(store)
         self.first_started = threading.Event()
@@ -33,7 +33,8 @@ class SlowCatalogAdapter(StoreTestPlaneAdapter):
         self._calls_lock = threading.Lock()
         self._calls = 0
 
-    def repository_catalog(self, *, repository_ids):
+    def setup(self, *, repository_id, owner_uid, timeout_seconds=None):
+        del owner_uid, timeout_seconds
         with self._calls_lock:
             self._calls += 1
             call = self._calls
@@ -43,14 +44,8 @@ class SlowCatalogAdapter(StoreTestPlaneAdapter):
                 raise TimeoutError("slow catalog fixture was not released")
         return {
             "schema_version": 1,
-            "repositories": [
-                {
-                    "repository_id": repository_id,
-                    "setup_status": "ready",
-                    "retained": True,
-                }
-                for repository_id in repository_ids
-            ],
+            "repository_id": repository_id,
+            "status": "ready",
         }
 
 
@@ -118,23 +113,8 @@ class InMemoryUnixListener:
 
 
 class UniversalTestTransportIsolationTests(unittest.TestCase):
-    def test_catalog_forwards_explicit_nested_read_deadline(self) -> None:
-        client = UnixTestPlaneClient(self.root / "testd.sock")
-        with mock.patch.object(
-            client,
-            "_call",
-            return_value={"schema_version": 1, "repositories": []},
-        ) as call:
-            client.repository_catalog(
-                repository_ids=("repo-ready",),
-                timeout_seconds=transport.TEST_CATALOG_READ_TIMEOUT_SECONDS,
-            )
-
-        call.assert_called_once_with(
-            transport.TEST_REPOSITORY_CATALOG,
-            {"repository_ids": ("repo-ready",)},
-            timeout_seconds=transport.TEST_CATALOG_READ_TIMEOUT_SECONDS,
-        )
+    def test_catalog_transport_was_removed(self) -> None:
+        self.assertFalse(hasattr(UnixTestPlaneClient(self.root / "testd.sock"), "repository_catalog"))
 
     def test_setup_forwards_explicit_nested_read_deadline(self) -> None:
         client = UnixTestPlaneClient(self.root / "testd.sock")
@@ -288,13 +268,13 @@ class UniversalTestTransportIsolationTests(unittest.TestCase):
         chmod.assert_called_once_with(socket_path, 0o666)
 
     def test_slow_handler_does_not_block_an_independent_request(self) -> None:
-        adapter = SlowCatalogAdapter(self.store)
+        adapter = SlowSetupAdapter(self.store)
         _server, _thread, client = self.start_server(adapter, concurrency=2)
         first_result: list[object] = []
 
         def slow_request() -> None:
             first_result.append(
-                client.repository_catalog(repository_ids=("repo-slow",))
+                client.setup(repository_id="repo-slow", owner_uid=os.geteuid())
             )
 
         slow = threading.Thread(target=slow_request)
@@ -304,7 +284,7 @@ class UniversalTestTransportIsolationTests(unittest.TestCase):
         second_result: list[object] = []
         fast = threading.Thread(
             target=lambda: second_result.append(
-                client.repository_catalog(repository_ids=("repo-fast",))
+                client.setup(repository_id="repo-fast", owner_uid=os.geteuid())
             )
         )
         fast.start()
@@ -314,7 +294,7 @@ class UniversalTestTransportIsolationTests(unittest.TestCase):
             "an unrelated test-plane read waited behind one slow repository handler",
         )
         self.assertEqual(
-            second_result[0]["repositories"][0]["repository_id"],  # type: ignore[index]
+            second_result[0]["repository_id"],  # type: ignore[index]
             "repo-fast",
         )
 
@@ -322,7 +302,7 @@ class UniversalTestTransportIsolationTests(unittest.TestCase):
         slow.join(1)
         self.assertFalse(slow.is_alive())
         self.assertEqual(
-            first_result[0]["repositories"][0]["repository_id"],  # type: ignore[index]
+            first_result[0]["repository_id"],  # type: ignore[index]
             "repo-slow",
         )
 
@@ -364,16 +344,16 @@ class UniversalTestTransportIsolationTests(unittest.TestCase):
         self.assertEqual(adapter.calls, [("run-opaque", "repo-resolved")])
 
     def test_capacity_is_rejected_immediately_instead_of_queued(self) -> None:
-        adapter = SlowCatalogAdapter(self.store)
+        adapter = SlowSetupAdapter(self.store)
         _server, _thread, client = self.start_server(adapter, concurrency=1)
         slow = threading.Thread(
-            target=lambda: client.repository_catalog(repository_ids=("repo-slow",))
+            target=lambda: client.setup(repository_id="repo-slow", owner_uid=os.geteuid())
         )
         slow.start()
         self.assertTrue(adapter.first_started.wait(1))
 
         with self.assertRaises(TestPlaneTransportError) as raised:
-            client.repository_catalog(repository_ids=("repo-busy",))
+            client.setup(repository_id="repo-busy", owner_uid=os.geteuid())
         self.assertEqual(raised.exception.code, "server_busy")
 
         adapter.release_first.set()
@@ -381,10 +361,10 @@ class UniversalTestTransportIsolationTests(unittest.TestCase):
         self.assertFalse(slow.is_alive())
 
     def test_silent_saturated_peer_cannot_stall_the_accept_loop(self) -> None:
-        adapter = SlowCatalogAdapter(self.store)
+        adapter = SlowSetupAdapter(self.store)
         server, _thread, client = self.start_server(adapter, concurrency=1)
         slow = threading.Thread(
-            target=lambda: client.repository_catalog(repository_ids=("repo-slow",))
+            target=lambda: client.setup(repository_id="repo-slow", owner_uid=os.geteuid())
         )
         slow.start()
         self.assertTrue(adapter.first_started.wait(1))
@@ -402,7 +382,7 @@ class UniversalTestTransportIsolationTests(unittest.TestCase):
         # A later saturated client still receives backpressure immediately;
         # the silent peer above consumed no accept-loop wait budget.
         with self.assertRaises(TestPlaneTransportError) as raised:
-            client.repository_catalog(repository_ids=("repo-still-busy",))
+            client.setup(repository_id="repo-still-busy", owner_uid=os.geteuid())
         self.assertEqual(raised.exception.code, "server_busy")
 
         adapter.release_first.set()
@@ -410,7 +390,7 @@ class UniversalTestTransportIsolationTests(unittest.TestCase):
         self.assertFalse(slow.is_alive())
 
     def test_concurrency_contract_is_strictly_bounded(self) -> None:
-        adapter = SlowCatalogAdapter(self.store)
+        adapter = SlowSetupAdapter(self.store)
         listener = InMemoryUnixListener()
         self.addCleanup(listener.close)
         for value in (0, 129, True):

@@ -32,7 +32,6 @@ for path in (ROOT / "scripts", ROOT / "skills/codex-dev-coordinator/scripts"):
 
 import activate_availability_release as activation  # noqa: E402
 import dev_coordinator  # noqa: E402
-import manage_universal_test_adoption as adoption_cli  # noqa: E402
 import orchestrate_availability_cutover as cutover  # noqa: E402
 import self_test_orchestrate_availability_cutover as fixtures  # noqa: E402
 from devcoordinator.inventory_projection import (  # noqa: E402
@@ -3052,47 +3051,6 @@ class ActivationTests(unittest.TestCase):
             activation.FIRST_ADOPTION_FLEET_SETUP_CATALOG_MODE,
         )
         self.assertEqual(runner.actions, ["catalog"])
-
-    def test_fleet_request_output_replays_only_for_exact_content(
-        self,
-    ) -> None:
-        root = private_dir(self.root / "fleet-request-replay")
-        output = root / "request.json"
-        request = {
-            "schema_version": 1,
-            "operation_id": str(uuid.uuid4()),
-            "excluded_repositories": [],
-            "repositories": [],
-        }
-        first = adoption_cli._write_private_once(
-            output, request, expected_uid=self.uid
-        )
-        replay = adoption_cli._write_private_once(
-            output, request, expected_uid=self.uid
-        )
-        self.assertEqual(first, replay)
-        with self.assertRaisesRegex(
-            adoption_cli.TestStoreContractError,
-            "belongs to another request",
-        ):
-            adoption_cli._write_private_once(
-                output,
-                {**request, "repositories": [{"repository_id": "other"}]},
-                expected_uid=self.uid,
-            )
-        output.unlink()
-        output.write_text(
-            json.dumps(request, indent=2), encoding="utf-8"
-        )
-        output.chmod(0o600)
-        with self.assertRaisesRegex(
-            adoption_cli.TestStoreContractError,
-            "belongs to another request",
-        ):
-            adoption_cli._write_private_once(
-                output, request, expected_uid=self.uid
-            )
-
 
     def test_manifest_template_builder_is_sealed_and_replay_safe(
         self,

@@ -3219,15 +3219,10 @@ class RuntimeApiTests(unittest.TestCase):
                 material_fingerprint="f" * 64,
                 completed_at=timestamp,
             )
-            with (
-                mock.patch.object(
-                    dev_coordinator, "bootstrap_legacy_import", return_value={}
-                ),
-                mock.patch.object(
-                    dev_coordinator.SingleFlightObserver,
-                    "observe",
-                    return_value=outcome,
-                ),
+            with mock.patch.object(
+                dev_coordinator.SingleFlightObserver,
+                "observe",
+                return_value=outcome,
             ):
                 result = dev_coordinator.coordinated_observe_host(
                     {

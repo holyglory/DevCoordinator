@@ -87,7 +87,7 @@ class HistoryRunner(FakeRunner):
                 "attestation": attestation,
                 "attestation_fingerprint": "c" * 64,
                 "store_generation": "forward-generation",
-                "schema_version": 6,
+                "schema_version": 7,
                 "discarded_existing": True,
                 "replayed": False,
             }
@@ -261,7 +261,7 @@ def exercise_local_path_materialization() -> None:
             mock.patch.object(switch, "BROWSER_LIFECYCLE_STATE", lifecycle_state),
             mock.patch.object(switch, "BROWSER_LIFECYCLE_LOCK", lifecycle_lock),
             mock.patch.object(
-                switch.activation.browser_lcp,
+                switch.browser_lcp,
                 "verify_runtime_lock_document",
                 return_value=runtime_document,
             ),
@@ -608,7 +608,7 @@ def exercise_browser_cleanup_activation_order() -> None:
         source.index("retire_legacy_control_plane("),
         source.index("install_rendered_destinations("),
         source.index("perform_headless_browser_cleanup("),
-        source.index("migrate_trusted_local_authority("),
+        source.index("require_current_authority_schema("),
         source.index("restart_services("),
         source.index("candidate Console start"),
     ]
@@ -618,9 +618,9 @@ def exercise_browser_cleanup_activation_order() -> None:
     )
     rollback_source = inspect.getsource(switch.rollback)
     expect(
-        rollback_source.index("restore_authority_migration(")
-        < rollback_source.index("restore_rollback_control_plane("),
-        "rollback can start the prior release before restoring its authority schema",
+        "restore_authority_migration(" not in rollback_source
+        and "restore_rollback_control_plane(" in rollback_source,
+        "same-schema rollback must restore only the current-format release graph",
     )
 
 
@@ -846,7 +846,7 @@ def exercise_release_packaging_contract() -> None:
         switch.installer.WRAPPERS.get("devcoordinator-test")
         == (
             "python",
-            "skills/codex-dev-coordinator/scripts/dev_coordinator.py",
+            "skills/codex-dev-coordinator/scripts/devcoordinator/agent_cli.py",
             ("test",),
         ),
         "immutable test lifecycle wrapper is missing or too broad",
@@ -870,7 +870,7 @@ def exercise_release_packaging_contract() -> None:
         *switch.installer.WRAPPERS["devcoordinator-test"],
     )
     expect(
-        b"dev_coordinator.py\" 'test' \"$@\"" in wrapper,
+        b"'devcoordinator.agent_cli' 'test' \"$@\"" in wrapper,
         "immutable test lifecycle wrapper does not fix the test command",
     )
     expect(
@@ -982,7 +982,7 @@ def exercise_stable_client_destination_transaction() -> None:
 
         with (
             mock.patch.object(switch, "STABLE_LAUNCHERS", stable),
-            mock.patch.object(switch.activation, "TOPOLOGY_FILES", ()),
+            mock.patch.object(switch, "TOPOLOGY_FILES", ()),
             mock.patch.object(switch, "SYSUSERS_ROOT", sysusers),
             mock.patch.object(switch, "TMPFILES_ROOT", tmpfiles),
             mock.patch.object(switch, "READ_ONLY_RULE", read_only_rule),
@@ -1291,8 +1291,8 @@ def exercise_opt_in_test_history_reset_and_previous_release_rollback() -> None:
                 "forward test-history reset was not journaled",
             )
             expect(
-                reset["forward_evidence"]["schema_version"] == 6,
-                "forward reset did not attest schema 6",
+                reset["forward_evidence"]["schema_version"] == 7,
+                "forward reset did not attest schema 7",
             )
             expect(
                 reset["forward_evidence"]["spool"]["fresh"] is True,
