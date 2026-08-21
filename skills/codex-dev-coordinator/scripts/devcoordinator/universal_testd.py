@@ -1,18 +1,17 @@
-"""Bounded execution loop for the isolated asynchronous test scheduler.
+"""Deterministic testd scheduling over the schema-v8 execution state machine.
 
-The scheduler never invokes systemd, Docker, or a process API directly.  It
-leases exact target generations from :mod:`universal_test_store`, asks the
-broker for a sealed launch ticket, and passes one normalized request to an
-injected launcher.  The production launcher can translate that request into a
-Coordinator transient-runtime operation; tests use an in-memory submitter.
+Testd is the sole semantic authority. The privileged launcher performs only
+prepare, start, observe, stop, package resolution, and collection against exact
+persisted systemd identities. Testd never uses leases, a spool, result chunks,
+live-source supersession, or an in-run retry chain.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 import hashlib
+import json
 import math
-import logging
 from pathlib import PurePosixPath
 import re
 import threading
@@ -20,28 +19,20 @@ import time
 from typing import Callable, Mapping, Protocol, Sequence, runtime_checkable
 import uuid
 
-from .universal_test_contract import SourceMode
+from .universal_test_contract import deterministic_fingerprint
 from .universal_test_scheduler import (
     ActiveAllocation,
-    ScheduleDecision,
     WeightedFairScheduler,
 )
 from .universal_test_service import decode_test_plan_document
-from .universal_test_spool import (
-    ActiveAttemptEnvelope,
-    AttemptExitEnvelope,
-    AttemptResultChunkEnvelope,
-    DurableAttemptSpool,
-)
 from .universal_test_store import (
     ArtifactMetadata,
     AttemptConclusion,
-    AttemptResultChunk,
     CaseResult,
+    ExecutionGrant,
+    ExecutionResultPackage,
     FailureClassification,
     FailureRecord,
-    LeaseGrant,
-    MAX_LEASE_SECONDS,
     RunnableTarget,
     TestStoreConflict,
     TestStoreContractError,
@@ -49,50 +40,14 @@ from .universal_test_store import (
 )
 
 
-TESTD_RUNNER_SCHEMA_VERSION = 1
-MAX_RUNNER_TTL_SECONDS = 7 * 24 * 60 * 60
-MAX_LAUNCH_TIMEOUT_SECONDS = 3_600
-PENDING_LAUNCH_LEASE_MARGIN_SECONDS = 30
-MAX_PENDING_LAUNCH_LEASE_SECONDS = (
-    MAX_LAUNCH_TIMEOUT_SECONDS + PENDING_LAUNCH_LEASE_MARGIN_SECONDS
-)
-MAX_RUNNER_ENVIRONMENT = 128
-MAX_RUNNER_ARGV = 256
-MAX_RUNNER_ARGV_BYTES = 32 * 1024
-_ENVIRONMENT_NAME = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
-_SECRET_ENVIRONMENT_NAME = re.compile(
-    r"(?:^|_)(?:SECRET|TOKEN|PASSWORD|PASSWD|PRIVATE_KEY|API_KEY|CREDENTIAL)(?:_|$)"
-)
+TESTD_RUNNER_SCHEMA_VERSION = 2
+MAX_RESULT_PACKAGE_BYTES = 1024 * 1024 * 1024
+MAX_PROGRESS_RETAINED_BYTES = 4 * 1024 * 1024
 _SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:@/-]{0,255}$")
-_FORBIDDEN_EXECUTABLES = frozenset(
-    {
-        "sh",
-        "bash",
-        "dash",
-        "zsh",
-        "ksh",
-        "fish",
-        "cmd",
-        "cmd.exe",
-        "powershell",
-        "powershell.exe",
-        "pwsh",
-        "pwsh.exe",
-        "env",
-    }
+_SYSTEMD_UNIT = re.compile(
+    r"^devcoordinator-test-[A-Za-z0-9][A-Za-z0-9_.@:-]{0,199}\.service$"
 )
-_LOGGER = logging.getLogger(__name__)
-MAX_RESULT_CHUNKS_PER_HEARTBEAT = 64
-
-
-class LiveSourceChanged(TestStoreConflict):
-    """The exact live worktree fingerprint changed after plan creation."""
-
-    def __init__(self, observed_source_fingerprint: str) -> None:
-        if re.fullmatch(r"[0-9a-f]{64}", observed_source_fingerprint) is None:
-            raise TestStoreContractError("observed live source fingerprint is invalid")
-        self.observed_source_fingerprint = observed_source_fingerprint
-        super().__init__("live source changed after plan creation")
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 
 def _safe_id(field: str, value: object) -> str:
@@ -101,12 +56,26 @@ def _safe_id(field: str, value: object) -> str:
     return value
 
 
+def _systemd_unit(value: object) -> str:
+    if not isinstance(value, str) or _SYSTEMD_UNIT.fullmatch(value) is None:
+        raise TestStoreContractError("systemd_unit is invalid")
+    return value
+
+
+def _operation_id(value: object) -> str:
+    try:
+        normalized = str(uuid.UUID(str(value)))
+    except (TypeError, ValueError, AttributeError) as error:
+        raise TestStoreContractError("operation identity is invalid") from error
+    return normalized
+
+
 def _bounded_text(field: str, value: object, *, maximum: int) -> str:
     if (
         not isinstance(value, str)
         or not value
         or len(value) > maximum
-        or any(character in value for character in "\x00\r\n")
+        or "\x00" in value
     ):
         raise TestStoreContractError(f"{field} is invalid")
     return value
@@ -118,66 +87,56 @@ def _absolute_path(field: str, value: object) -> str:
     if (
         not path.is_absolute()
         or any(part in {".", ".."} for part in path.parts)
-        or str(path) != (text.rstrip("/") or "/")
+        or str(path) != text.rstrip("/")
     ):
-        raise TestStoreContractError(f"{field} must be one normalized absolute path")
+        raise TestStoreContractError(f"{field} must be an absolute normalized path")
     return str(path)
 
 
 def _relative_path(field: str, value: object) -> str:
     text = _bounded_text(field, value, maximum=4096)
     path = PurePosixPath(text)
-    if path.is_absolute() or any(part in {".", ".."} for part in path.parts):
-        raise TestStoreContractError(f"{field} must be repository-relative")
-    normalized = str(path)
-    if normalized != text or normalized in {"", "."}:
-        if text == ".":
-            return "."
-        raise TestStoreContractError(f"{field} must be normalized")
-    return normalized
+    if path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
+        raise TestStoreContractError(f"{field} must be a contained relative path")
+    return str(path)
 
 
 def _argv(value: Sequence[object]) -> tuple[str, ...]:
     if (
         isinstance(value, (str, bytes))
         or not isinstance(value, Sequence)
-        or not value
-        or len(value) > MAX_RUNNER_ARGV
+        or not 1 <= len(value) <= 256
     ):
         raise TestStoreContractError("runner argv is invalid")
-    result = tuple(
-        _bounded_text("runner argv item", item, maximum=8192) for item in value
-    )
-    if sum(len(item.encode("utf-8")) for item in result) > MAX_RUNNER_ARGV_BYTES:
+    result = tuple(_bounded_text("runner argument", item, maximum=4096) for item in value)
+    if sum(len(item.encode("utf-8")) for item in result) > 64 * 1024:
         raise TestStoreContractError("runner argv exceeds its byte bound")
-    if PurePosixPath(result[0]).name.lower() in _FORBIDDEN_EXECUTABLES:
-        raise TestStoreContractError("runner argv cannot invoke a shell or env trampoline")
-    if any(item.startswith("{") and item.endswith("}") for item in result):
-        raise TestStoreContractError("runner argv contains an unresolved placeholder")
     return result
 
 
-def _environment(value: Mapping[object, object]) -> dict[str, str]:
-    if not isinstance(value, Mapping) or len(value) > MAX_RUNNER_ENVIRONMENT:
+def _environment(value: Mapping[object, object]) -> Mapping[str, str]:
+    if not isinstance(value, Mapping) or len(value) > 128:
         raise TestStoreContractError("runner environment is invalid")
     result: dict[str, str] = {}
     for raw_name, raw_value in value.items():
-        if (
-            not isinstance(raw_name, str)
-            or _ENVIRONMENT_NAME.fullmatch(raw_name) is None
-            or _SECRET_ENVIRONMENT_NAME.search(raw_name)
-        ):
-            raise TestStoreContractError("runner environment name is unsafe")
-        result[raw_name] = _bounded_text(
-            f"runner environment {raw_name}", raw_value, maximum=4096
+        name = _bounded_text("environment name", raw_name, maximum=128)
+        if re.fullmatch(r"[A-Z_][A-Z0-9_]*", name) is None:
+            raise TestStoreContractError("runner environment name is invalid")
+        result[name] = _bounded_text(
+            "environment value", raw_value, maximum=4096
         )
+    if sum(len(key) + len(item) for key, item in result.items()) > 64 * 1024:
+        raise TestStoreContractError("runner environment exceeds its byte bound")
     return dict(sorted(result.items()))
 
 
-def _positive_int(field: str, value: object, *, maximum: int) -> int:
-    if type(value) is not int or not 1 <= value <= maximum:
-        raise TestStoreContractError(f"{field} must be from 1 through {maximum}")
-    return value
+def _finite_nonnegative(field: str, value: object) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TestStoreContractError(f"{field} is invalid")
+    number = float(value)
+    if not math.isfinite(number) or number < 0:
+        raise TestStoreContractError(f"{field} is invalid")
+    return number
 
 
 def _stable_operation_id(kind: str, *values: object) -> str:
@@ -187,108 +146,103 @@ def _stable_operation_id(kind: str, *values: object) -> str:
 
 @dataclass(frozen=True)
 class BrokerLaunchTicket:
-    """OS-peer-accepted, generation-fenced launch material.
-
-    This is a bounded descriptor, not a bearer capability.  The broker and
-    testd communicate over a Unix socket authenticated by ``SO_PEERCRED``;
-    attempt, repository, and generation IDs provide stale-work fencing.
-    """
+    """Bounded immutable launch facts resolved before native reservation."""
 
     ticket_id: str
-    attempt_id: str = ""
-    target_id: str = ""
-    run_id: str = ""
-    repository_id: str = ""
-    repository_generation: int = 0
-    owner_uid: int = 0
-    generation: int = 0
-    root_repo: str = ""
-    temporary_repo: str | None = None
-    execution_root: str = ""
-    argv: tuple[str, ...] = ()
-    cwd: str = "."
-    environment: Mapping[str, str] = field(default_factory=dict)
-    intent: str = "change"
-    driver: str = "automation"
-    reporter: str = "jsonl"
-    artifacts: tuple[Mapping[str, object], ...] = ()
-    fixtures: tuple[str, ...] = ()
-    credentials: tuple[str, ...] = ()
-    network: str = "none"
-    ttl_seconds: int = 0
-    kill_after_run: bool = True
-    worktree_key: str = ""
-    issued_at: float = 0.0
-    expires_at: float = 0.0
+    target_id: str
+    run_id: str
+    repository_id: str
+    repository_generation: int
+    owner_uid: int
+    root_repo: str
+    temporary_repo: str | None
+    execution_root: str
+    argv: tuple[str, ...]
+    cwd: str
+    environment: Mapping[str, str]
+    intent: str
+    driver: str
+    reporter: str
+    artifacts: tuple[Mapping[str, object], ...]
+    fixtures: tuple[str, ...]
+    credentials: tuple[str, ...]
+    network: str
+    ttl_seconds: int
+    worktree_key: str
+    issued_at: float
+    expires_at: float
+
+    def __post_init__(self) -> None:
+        for field_name in ("ticket_id", "target_id", "run_id", "repository_id"):
+            object.__setattr__(
+                self, field_name, _safe_id(field_name, getattr(self, field_name))
+            )
+        if (
+            type(self.repository_generation) is not int
+            or self.repository_generation < 0
+            or type(self.owner_uid) is not int
+            or self.owner_uid < 0
+            or type(self.ttl_seconds) is not int
+            or not 1 <= self.ttl_seconds <= 31_536_000
+        ):
+            raise TestStoreContractError("launch ticket generation, UID, or TTL is invalid")
+        object.__setattr__(self, "root_repo", _absolute_path("root_repo", self.root_repo))
+        if self.temporary_repo is not None:
+            object.__setattr__(
+                self,
+                "temporary_repo",
+                _absolute_path("temporary_repo", self.temporary_repo),
+            )
+        object.__setattr__(
+            self,
+            "execution_root",
+            _absolute_path("execution_root", self.execution_root),
+        )
+        object.__setattr__(
+            self, "worktree_key", _absolute_path("worktree_key", self.worktree_key)
+        )
+        object.__setattr__(self, "argv", _argv(self.argv))
+        object.__setattr__(self, "cwd", _relative_path("cwd", self.cwd))
+        object.__setattr__(self, "environment", _environment(self.environment))
+        if self.intent not in {"change", "checkpoint", "handoff", "release", "manual"}:
+            raise TestStoreContractError("launch ticket intent is invalid")
+        if self.network not in {"none", "loopback", "host-loopback", "external"}:
+            raise TestStoreContractError("launch ticket network is invalid")
+        object.__setattr__(
+            self,
+            "fixtures",
+            tuple(_safe_id("fixture", value) for value in self.fixtures),
+        )
+        object.__setattr__(
+            self,
+            "credentials",
+            tuple(
+                _bounded_text("credential alias", value, maximum=128)
+                for value in self.credentials
+            ),
+        )
+        issued = _finite_nonnegative("issued_at", self.issued_at)
+        expires = _finite_nonnegative("expires_at", self.expires_at)
+        if expires < issued:
+            raise TestStoreContractError("launch ticket expiry is invalid")
+        object.__setattr__(self, "issued_at", issued)
+        object.__setattr__(self, "expires_at", expires)
+        object.__setattr__(
+            self, "artifacts", tuple(dict(item) for item in self.artifacts)
+        )
 
     @classmethod
-    def issue(
-        cls,
-        *,
-        ticket_id: str,
-        attempt_id: str,
-        target_id: str,
-        run_id: str,
-        repository_id: str,
-        owner_uid: int,
-        generation: int,
-        root_repo: str,
-        temporary_repo: str | None,
-        argv: Sequence[str],
-        cwd: str,
-        environment: Mapping[str, str],
-        network: str,
-        ttl_seconds: int,
-        worktree_key: str,
-        issued_at: float,
-        expires_at: float,
-        repository_generation: int = 0,
-        execution_root: str = "",
-        intent: str = "change",
-        driver: str = "automation",
-        reporter: str = "jsonl",
-        artifacts: Sequence[Mapping[str, object]] = (),
-        fixtures: Sequence[str] = (),
-        credentials: Sequence[str] = (),
-    ) -> "BrokerLaunchTicket":
-        return cls(
-            ticket_id=ticket_id,
-            attempt_id=attempt_id,
-            target_id=target_id,
-            run_id=run_id,
-            repository_id=repository_id,
-            repository_generation=repository_generation,
-            owner_uid=owner_uid,
-            generation=generation,
-            root_repo=root_repo,
-            temporary_repo=temporary_repo,
-            execution_root=execution_root or root_repo,
-            argv=tuple(argv),
-            cwd=cwd,
-            environment=dict(environment),
-            intent=intent,
-            driver=driver,
-            reporter=reporter,
-            artifacts=tuple(dict(item) for item in artifacts),
-            fixtures=tuple(fixtures),
-            credentials=tuple(credentials),
-            network=network,
-            ttl_seconds=ttl_seconds,
-            kill_after_run=True,
-            worktree_key=worktree_key,
-            issued_at=float(issued_at),
-            expires_at=float(expires_at),
-        )
+    def issue(cls, **values: object) -> "BrokerLaunchTicket":
+        return cls(**values)  # type: ignore[arg-type]
+
     def public_document(self) -> dict[str, object]:
         return {
             "ticket_id": self.ticket_id,
-            "attempt_id": self.attempt_id,
             "target_id": self.target_id,
             "run_id": self.run_id,
             "repository_id": self.repository_id,
             "repository_generation": self.repository_generation,
             "owner_uid": self.owner_uid,
-            "generation": self.generation,
             "root_repo": self.root_repo,
             "temporary_repo": self.temporary_repo,
             "execution_root": self.execution_root,
@@ -303,7 +257,7 @@ class BrokerLaunchTicket:
             "credentials": list(self.credentials),
             "network": self.network,
             "ttl_seconds": self.ttl_seconds,
-            "kill_after_run": self.kill_after_run,
+            "kill_after_run": True,
             "worktree_key": self.worktree_key,
             "issued_at": self.issued_at,
             "expires_at": self.expires_at,
@@ -313,27 +267,55 @@ class BrokerLaunchTicket:
 @dataclass(frozen=True)
 class TransientRunnerRequest:
     ticket: BrokerLaunchTicket
+    execution: ExecutionGrant
     target_name: str
-    shard_index: int
-    shard_count: int
-    launch_timeout_seconds: int = 300
+    descriptor_fingerprint: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.ticket, BrokerLaunchTicket):
+            raise TestStoreContractError("runner ticket is invalid")
+        if not isinstance(self.execution, ExecutionGrant):
+            raise TestStoreContractError("runner execution grant is invalid")
+        object.__setattr__(
+            self,
+            "target_name",
+            _bounded_text("target_name", self.target_name, maximum=256),
+        )
+        if (
+            not isinstance(self.descriptor_fingerprint, str)
+            or _SHA256.fullmatch(self.descriptor_fingerprint) is None
+        ):
+            raise TestStoreContractError("descriptor_fingerprint is invalid")
+        if (
+            self.ticket.target_id != self.execution.target_id
+            or self.ticket.run_id != self.execution.run_id
+        ):
+            raise TestStoreConflict("runner request identity is contradictory")
 
     def to_document(self) -> dict[str, object]:
         ticket = self.ticket
+        execution = self.execution
         return {
             "schema_version": TESTD_RUNNER_SCHEMA_VERSION,
             "ticket": ticket.public_document(),
+            "execution": {
+                "execution_id": execution.execution_id,
+                "attempt_id": execution.execution_id,
+                "generation": execution.generation,
+                "systemd_unit": execution.systemd_unit,
+                "launch_operation_id": execution.launch_operation_id,
+                "descriptor_fingerprint": self.descriptor_fingerprint,
+            },
             "target": {
-                "kind": "test_attempt",
-                "id": ticket.target_id,
+                "kind": "test_execution",
+                "id": execution.target_id,
                 "name": self.target_name,
-                "shard_index": self.shard_index,
-                "shard_count": self.shard_count,
+                "shard_index": execution.shard_index,
+                "shard_count": execution.shard_count,
             },
             "lifecycle": {
                 "purpose": "test",
                 "ttl_seconds": ticket.ttl_seconds,
-                "launch_timeout_seconds": self.launch_timeout_seconds,
                 "kill_after_run": True,
             },
             "isolation": {
@@ -356,71 +338,247 @@ class TransientRunnerRequest:
             },
         }
 
+
 @dataclass(frozen=True)
 class RunnerHandle:
-    runtime_id: str
-    launch_ack_id: str
-    launch_ticket_id: str | None = None
-    launch_operation_id: str | None = None
-    launch_timeout_seconds: int = 300
-    launch_confirmed: bool = True
+    execution_id: str
+    generation: int
+    systemd_unit: str
+    launch_operation_id: str
+    launch_ack_id: str | None = None
+    launch_confirmed: bool = False
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "execution_id", _safe_id("execution_id", self.execution_id)
+        )
+        if type(self.generation) is not int or self.generation != 1:
+            raise TestStoreContractError("execution generation is invalid")
+        object.__setattr__(self, "systemd_unit", _systemd_unit(self.systemd_unit))
+        object.__setattr__(
+            self,
+            "launch_operation_id",
+            _operation_id(self.launch_operation_id),
+        )
+        if self.launch_ack_id is not None:
+            object.__setattr__(
+                self,
+                "launch_ack_id",
+                _safe_id("launch_ack_id", self.launch_ack_id),
+            )
+        if type(self.launch_confirmed) is not bool:
+            raise TestStoreContractError("launch confirmation is invalid")
+
+    @property
+    def runtime_id(self) -> str:
+        return self.systemd_unit.removesuffix(".service")
+
+    @property
+    def attempt_id(self) -> str:
+        return self.execution_id
+
+
+@dataclass(frozen=True)
+class RunnerResultPackage:
+    package_id: str
+    sha256: str
+    size_bytes: int
+    manifest: Mapping[str, object]
+    outcome: Mapping[str, object]
+    counts: Mapping[str, int]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "package_id", _safe_id("package_id", self.package_id))
+        if not isinstance(self.sha256, str) or _SHA256.fullmatch(self.sha256) is None:
+            raise TestStoreContractError("result package digest is invalid")
+        if (
+            type(self.size_bytes) is not int
+            or not 0 <= self.size_bytes <= MAX_RESULT_PACKAGE_BYTES
+            or not isinstance(self.manifest, Mapping)
+            or not isinstance(self.outcome, Mapping)
+            or not isinstance(self.counts, Mapping)
+        ):
+            raise TestStoreContractError("result package metadata is invalid")
+        expected_counts = {
+            "passed", "failed", "skipped", "error", "failures", "artifacts"
+        }
+        if set(self.counts) != expected_counts or any(
+            type(value) is not int or value < 0 for value in self.counts.values()
+        ):
+            raise TestStoreContractError("result package counts are invalid")
+        reporter_complete = self.manifest.get("reporter_complete")
+        if type(reporter_complete) is not bool:
+            raise TestStoreContractError("result package manifest is invalid")
+        returncode = self.outcome.get("returncode")
+        infrastructure_error = self.outcome.get("infrastructure_error")
+        test_failed = self.outcome.get("test_failed", False)
+        if (
+            returncode is not None and type(returncode) is not int
+        ) or (
+            infrastructure_error is not None
+            and (
+                not isinstance(infrastructure_error, str)
+                or len(infrastructure_error) > 1024
+            )
+        ) or type(test_failed) is not bool:
+            raise TestStoreContractError("result package outcome is invalid")
+        object.__setattr__(self, "manifest", dict(self.manifest))
+        object.__setattr__(self, "outcome", dict(self.outcome))
+        object.__setattr__(
+            self,
+            "counts",
+            {str(key): int(value) for key, value in self.counts.items()},
+        )
+
+    def to_document(self) -> dict[str, object]:
+        return {
+            "package_id": self.package_id,
+            "sha256": self.sha256,
+            "size_bytes": self.size_bytes,
+            "manifest": dict(self.manifest),
+            "outcome": dict(self.outcome),
+            "counts": dict(self.counts),
+        }
 
 
 @dataclass(frozen=True)
 class RunnerObservation:
     state: str
-    exit_envelope: AttemptExitEnvelope | None = None
-    result_chunk: Mapping[str, object] | None = None
+    unit_inactive: bool
+    cgroup_empty: bool
+    launch_confirmed: bool = True
+    started_at: float | None = None
+    result_package: RunnerResultPackage | None = None
     current_memory_bytes: int | None = None
     output_progress: Mapping[str, object] | None = None
-    launch_confirmed: bool = True
+    peak_memory_bytes: int | None = None
+    cpu_seconds: float | None = None
+    exit_status: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.state not in {"starting", "running", "exited", "stopped", "absent"}:
+            raise TestStoreContractError("runner observation state is invalid")
+        if (
+            type(self.unit_inactive) is not bool
+            or type(self.cgroup_empty) is not bool
+            or type(self.launch_confirmed) is not bool
+            or (
+                self.cgroup_empty and not self.unit_inactive
+            )
+        ):
+            raise TestStoreContractError("runner cleanup facts are invalid")
+        if self.started_at is not None:
+            object.__setattr__(
+                self, "started_at", _finite_nonnegative("started_at", self.started_at)
+            )
+        if self.result_package is not None and not isinstance(
+            self.result_package, RunnerResultPackage
+        ):
+            raise TestStoreContractError("runner result package is invalid")
+        if self.current_memory_bytes is not None and (
+            type(self.current_memory_bytes) is not int
+            or self.current_memory_bytes < 0
+        ):
+            raise TestStoreContractError("runner current memory is invalid")
+        if self.peak_memory_bytes is not None and (
+            type(self.peak_memory_bytes) is not int
+            or self.peak_memory_bytes < 0
+        ):
+            raise TestStoreContractError("runner peak memory is invalid")
+        if self.cpu_seconds is not None:
+            object.__setattr__(
+                self, "cpu_seconds", _finite_nonnegative("cpu_seconds", self.cpu_seconds)
+            )
+        if self.exit_status is not None and type(self.exit_status) is not int:
+            raise TestStoreContractError("runner exit status is invalid")
+        if self.output_progress is not None:
+            object.__setattr__(
+                self,
+                "output_progress",
+                _validated_progress(self.output_progress),
+            )
 
 
-@dataclass(frozen=True)
-class RunnerCleanupContext:
-    """Exact interrupted-runtime identity used only for cancellation."""
-
-    repository_id: str
-    repository_generation: int
-    attempt_id: str
-    generation: int
-    started_at: float
-    launch_ticket_id: str | None = None
-    launch_operation_id: str | None = None
-    launch_timeout_seconds: int = 300
-    launch_confirmed: bool = True
+def _validated_progress(value: Mapping[str, object]) -> Mapping[str, object]:
+    expected = {
+        "stdout_bytes",
+        "stderr_bytes",
+        "stdout_retained_bytes",
+        "stderr_retained_bytes",
+        "stdout_truncated",
+        "stderr_truncated",
+        "last_output_at",
+        "observed_at",
+    }
+    if not isinstance(value, Mapping) or set(value) != expected:
+        raise TestStoreContractError("runner output progress is invalid")
+    numeric = (
+        value["stdout_bytes"],
+        value["stderr_bytes"],
+        value["stdout_retained_bytes"],
+        value["stderr_retained_bytes"],
+    )
+    if (
+        any(type(item) is not int or item < 0 for item in numeric)
+        or int(value["stdout_retained_bytes"]) > MAX_PROGRESS_RETAINED_BYTES
+        or int(value["stderr_retained_bytes"]) > MAX_PROGRESS_RETAINED_BYTES
+        or int(value["stdout_retained_bytes"]) > int(value["stdout_bytes"])
+        or int(value["stderr_retained_bytes"]) > int(value["stderr_bytes"])
+        or type(value["stdout_truncated"]) is not bool
+        or type(value["stderr_truncated"]) is not bool
+        or bool(value["stdout_truncated"])
+        != (int(value["stdout_bytes"]) > int(value["stdout_retained_bytes"]))
+        or bool(value["stderr_truncated"])
+        != (int(value["stderr_bytes"]) > int(value["stderr_retained_bytes"]))
+    ):
+        raise TestStoreContractError("runner output progress is invalid")
+    last_output = value["last_output_at"]
+    observed = _finite_nonnegative("progress observed_at", value["observed_at"])
+    if last_output is not None:
+        last_output = _finite_nonnegative("last_output_at", last_output)
+    return {
+        **dict(value),
+        "last_output_at": last_output,
+        "observed_at": observed,
+    }
 
 
 @runtime_checkable
 class RuntimeRequestSubmitter(Protocol):
     def prepare(self, document: Mapping[str, object]) -> Mapping[str, object]: ...
 
-    def launch_prepared(self, runtime_id: str) -> Mapping[str, object]: ...
+    def start_prepared(self, systemd_unit: str) -> Mapping[str, object]: ...
 
-    def submit(self, document: Mapping[str, object]) -> Mapping[str, object]: ...
+    def observe(self, systemd_unit: str) -> Mapping[str, object]: ...
 
-    def observe(self, runtime_id: str) -> Mapping[str, object]: ...
+    def attach(self, binding: Mapping[str, object]) -> Mapping[str, object]: ...
 
-    def attach_for_cleanup(
-        self, runtime_id: str, *, context: RunnerCleanupContext
-    ) -> None: ...
+    def stop(self, systemd_unit: str, *, reason: str) -> Mapping[str, object]: ...
 
-    def cancel(self, runtime_id: str, *, reason: str) -> Mapping[str, object]: ...
+    def resolve_package(
+        self, systemd_unit: str, metadata: Mapping[str, object]
+    ) -> Mapping[str, object]: ...
 
-    def collect(self, runtime_id: str) -> Mapping[str, object]: ...
+    def collect(self, systemd_unit: str) -> Mapping[str, object]: ...
 
 
 @runtime_checkable
 class RunnerLauncher(Protocol):
-    def launch(self, request: TransientRunnerRequest) -> RunnerHandle: ...
+    def prepare(self, request: TransientRunnerRequest) -> RunnerHandle: ...
+
+    def start(
+        self, request: TransientRunnerRequest, handle: RunnerHandle
+    ) -> RunnerHandle: ...
 
     def observe(self, handle: RunnerHandle) -> RunnerObservation: ...
 
-    def attach_for_cleanup(
-        self, handle: RunnerHandle, *, context: RunnerCleanupContext
-    ) -> None: ...
+    def attach(self, binding: Mapping[str, object]) -> RunnerHandle: ...
 
-    def cancel(self, handle: RunnerHandle, *, reason: str) -> bool: ...
+    def stop(self, handle: RunnerHandle, *, reason: str) -> RunnerObservation: ...
+
+    def resolve_package(
+        self, handle: RunnerHandle, metadata: RunnerResultPackage
+    ) -> ExecutionResultPackage: ...
 
     def collect(self, handle: RunnerHandle) -> bool: ...
 
@@ -431,385 +589,212 @@ class BrokerLaunchTicketIssuer(Protocol):
         self,
         *,
         candidate: RunnableTarget,
-        lease: LeaseGrant,
         plan_document: Mapping[str, object],
         launch_deadline: float,
     ) -> BrokerLaunchTicket: ...
 
-    def observe_live_source(
-        self,
-        *,
-        repository_id: str,
-        owner_uid: int,
-        plan_document: Mapping[str, object],
-    ) -> str: ...
+
+def _runner_handle(value: Mapping[str, object]) -> RunnerHandle:
+    expected = {
+        "execution_id",
+        "generation",
+        "systemd_unit",
+        "launch_operation_id",
+        "launch_ack_id",
+        "launch_confirmed",
+    }
+    if not isinstance(value, Mapping) or set(value) != expected:
+        raise TestStoreContractError("runner handle fields are invalid")
+    return RunnerHandle(**dict(value))  # type: ignore[arg-type]
+
+
+def _result_metadata(value: object) -> RunnerResultPackage | None:
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        raise TestStoreContractError("runner result package metadata is invalid")
+    return RunnerResultPackage(
+        package_id=value.get("package_id"),  # type: ignore[arg-type]
+        sha256=value.get("sha256"),  # type: ignore[arg-type]
+        size_bytes=value.get("size_bytes"),  # type: ignore[arg-type]
+        manifest=value.get("manifest"),  # type: ignore[arg-type]
+        outcome=value.get("outcome"),  # type: ignore[arg-type]
+        counts=value.get("counts"),  # type: ignore[arg-type]
+    )
+
+
+def _runner_observation(value: Mapping[str, object]) -> RunnerObservation:
+    expected = {
+        "state",
+        "unit_inactive",
+        "cgroup_empty",
+        "launch_confirmed",
+        "started_at",
+        "result_package",
+        "current_memory_bytes",
+        "output_progress",
+        "peak_memory_bytes",
+        "cpu_seconds",
+        "exit_status",
+    }
+    if not isinstance(value, Mapping) or set(value) != expected:
+        raise TestStoreContractError("runner observation fields are invalid")
+    return RunnerObservation(
+        state=str(value["state"]),
+        unit_inactive=value["unit_inactive"],  # type: ignore[arg-type]
+        cgroup_empty=value["cgroup_empty"],  # type: ignore[arg-type]
+        launch_confirmed=value["launch_confirmed"],  # type: ignore[arg-type]
+        started_at=value["started_at"],  # type: ignore[arg-type]
+        result_package=_result_metadata(value["result_package"]),
+        current_memory_bytes=value["current_memory_bytes"],  # type: ignore[arg-type]
+        output_progress=value["output_progress"],  # type: ignore[arg-type]
+        peak_memory_bytes=value["peak_memory_bytes"],  # type: ignore[arg-type]
+        cpu_seconds=value["cpu_seconds"],  # type: ignore[arg-type]
+        exit_status=value["exit_status"],  # type: ignore[arg-type]
+    )
+
+
+def _case_result(value: Mapping[str, object]) -> CaseResult:
+    expected = {"case_id", "display_name", "status", "duration_seconds", "location"}
+    if set(value) != expected:
+        raise TestStoreContractError("result package case fields are invalid")
+    return CaseResult(
+        case_id=value["case_id"],  # type: ignore[arg-type]
+        display_name=value["display_name"],  # type: ignore[arg-type]
+        status=value["status"],  # type: ignore[arg-type]
+        duration_seconds=value["duration_seconds"],  # type: ignore[arg-type]
+        location=value["location"],  # type: ignore[arg-type]
+    )
+
+
+def _failure_record(value: Mapping[str, object]) -> FailureRecord:
+    expected = {
+        "failure_id", "classification", "message", "case_id", "location", "artifact_id"
+    }
+    if set(value) != expected:
+        raise TestStoreContractError("result package failure fields are invalid")
+    try:
+        classification = FailureClassification(str(value["classification"]))
+    except ValueError as error:
+        raise TestStoreContractError("result package failure classification is invalid") from error
+    return FailureRecord(
+        failure_id=value["failure_id"],  # type: ignore[arg-type]
+        classification=classification,
+        message=value["message"],  # type: ignore[arg-type]
+        case_id=value["case_id"],  # type: ignore[arg-type]
+        location=value["location"],  # type: ignore[arg-type]
+        artifact_id=value["artifact_id"],  # type: ignore[arg-type]
+    )
+
+
+def _artifact_metadata(value: Mapping[str, object]) -> ArtifactMetadata:
+    expected = {
+        "artifact_id", "kind", "storage_handle", "sha256", "size_bytes", "verified"
+    }
+    if set(value) != expected:
+        raise TestStoreContractError("result package artifact fields are invalid")
+    return ArtifactMetadata(
+        artifact_id=value["artifact_id"],  # type: ignore[arg-type]
+        kind=value["kind"],  # type: ignore[arg-type]
+        storage_handle=value["storage_handle"],  # type: ignore[arg-type]
+        sha256=value["sha256"],  # type: ignore[arg-type]
+        size_bytes=value["size_bytes"],  # type: ignore[arg-type]
+        verified=value["verified"],  # type: ignore[arg-type]
+    )
+
+
+def _execution_result_package(value: Mapping[str, object]) -> ExecutionResultPackage:
+    expected = {"package_id", "cases", "failures", "artifacts", "reporter_complete"}
+    if not isinstance(value, Mapping) or set(value) != expected:
+        raise TestStoreContractError("resolved result package fields are invalid")
+    for field_name in ("cases", "failures", "artifacts"):
+        if not isinstance(value[field_name], list):
+            raise TestStoreContractError("resolved result package collection is invalid")
+    return ExecutionResultPackage(
+        package_id=value["package_id"],  # type: ignore[arg-type]
+        cases=tuple(_case_result(item) for item in value["cases"]),  # type: ignore[arg-type]
+        failures=tuple(
+            _failure_record(item) for item in value["failures"]  # type: ignore[arg-type]
+        ),
+        artifacts=tuple(
+            _artifact_metadata(item) for item in value["artifacts"]  # type: ignore[arg-type]
+        ),
+        reporter_complete=value["reporter_complete"],  # type: ignore[arg-type]
+    )
 
 
 class TestdLaunchAdapter:
-    """Translate normalized requests into an injected runtime submitter."""
+    """Validate the mapping transport without assigning lifecycle meaning."""
 
     def __init__(self, submitter: RuntimeRequestSubmitter) -> None:
         if not isinstance(submitter, RuntimeRequestSubmitter):
             raise TestStoreContractError("runtime submitter is invalid")
         self._submitter = submitter
 
-    @staticmethod
-    def _handle(
-        reply: Mapping[str, object], *, request: TransientRunnerRequest
-    ) -> RunnerHandle:
-        base_fields = {"runtime_id", "launch_ack_id"}
-        recovery_fields = {
-            "launch_ticket_id",
-            "launch_operation_id",
-            "launch_timeout_seconds",
-            "launch_confirmed",
-        }
-        if not isinstance(reply, Mapping) or set(reply) not in {
-            frozenset(base_fields),
-            frozenset(base_fields | recovery_fields),
-        }:
-            raise TestStoreContractError("runtime launch reply fields are invalid")
-        launch_confirmed = reply.get("launch_confirmed", True)
-        launch_timeout_seconds = reply.get(
-            "launch_timeout_seconds", request.launch_timeout_seconds
-        )
-        if (
-            type(launch_confirmed) is not bool
-            or type(launch_timeout_seconds) is not int
-            or not 1 <= launch_timeout_seconds <= 3_600
-        ):
-            raise TestStoreContractError("runtime launch recovery fields are invalid")
-        launch_ticket_id = reply.get("launch_ticket_id")
-        launch_operation_id = reply.get("launch_operation_id")
-        if not launch_confirmed and (
-            launch_ticket_id is None or launch_operation_id is None
-        ):
-            raise TestStoreContractError("pending runtime launch identity is incomplete")
-        return RunnerHandle(
-            runtime_id=_safe_id("runtime_id", reply["runtime_id"]),
-            launch_ack_id=_safe_id("launch_ack_id", reply["launch_ack_id"]),
-            launch_ticket_id=(
-                None
-                if launch_ticket_id is None
-                else _safe_id("launch_ticket_id", launch_ticket_id)
-            ),
-            launch_operation_id=(
-                None
-                if launch_operation_id is None
-                else _safe_id("launch_operation_id", launch_operation_id)
-            ),
-            launch_timeout_seconds=launch_timeout_seconds,
-            launch_confirmed=launch_confirmed,
-        )
-
     def prepare(self, request: TransientRunnerRequest) -> RunnerHandle:
-        """Publish deterministic pending identity without starting the host job."""
+        return _runner_handle(self._submitter.prepare(request.to_document()))
 
-        if not isinstance(request, TransientRunnerRequest):
-            raise TestStoreContractError("runner request is invalid")
-        reply = self._submitter.prepare(request.to_document())
-        handle = self._handle(reply, request=request)
-        if handle.launch_confirmed:
-            raise TestStoreConflict("prepared runtime was already launch-confirmed")
-        return handle
-
-    def launch_prepared(
+    def start(
         self, request: TransientRunnerRequest, handle: RunnerHandle
     ) -> RunnerHandle:
-        """Start/reconcile only the exact identity already retained by testd."""
-
-        if not isinstance(request, TransientRunnerRequest) or not isinstance(
-            handle, RunnerHandle
-        ):
-            raise TestStoreContractError("prepared runner request is invalid")
-        launched = self._handle(
-            self._submitter.launch_prepared(handle.runtime_id), request=request
+        started = _runner_handle(
+            self._submitter.start_prepared(handle.systemd_unit)
         )
-        if (
-            launched.runtime_id != handle.runtime_id
-            or launched.launch_ack_id != handle.launch_ack_id
-            or launched.launch_ticket_id != handle.launch_ticket_id
-            or launched.launch_operation_id != handle.launch_operation_id
-            or launched.launch_timeout_seconds != handle.launch_timeout_seconds
-        ):
-            raise TestStoreConflict("prepared runtime launch identity changed")
-        return launched
-
-    def launch(self, request: TransientRunnerRequest) -> RunnerHandle:
-        """Compatibility wrapper for direct adapter callers."""
-
-        prepared = self.prepare(request)
-        return self.launch_prepared(request, prepared)
+        _require_same_handle(handle, started)
+        return started
 
     def observe(self, handle: RunnerHandle) -> RunnerObservation:
-        reply = self._submitter.observe(handle.runtime_id)
-        base_fields = {
-            "state", "exit_envelope", "result_chunk", "current_memory_bytes"
-        }
-        if not isinstance(reply, Mapping) or set(reply) not in {
-            frozenset(base_fields),
-            frozenset(base_fields | {"launch_confirmed"}),
-            frozenset(base_fields | {"output_progress"}),
-            frozenset(base_fields | {"launch_confirmed", "output_progress"}),
-        }:
-            raise TestStoreContractError("runtime observation fields are invalid")
-        state = str(reply["state"])
-        launch_confirmed = reply.get("launch_confirmed", True)
-        if type(launch_confirmed) is not bool:
-            raise TestStoreContractError("runtime launch confirmation is invalid")
-        current_memory_bytes = reply["current_memory_bytes"]
-        if current_memory_bytes is not None and (
-            type(current_memory_bytes) is not int or current_memory_bytes < 0
-        ):
-            raise TestStoreContractError("runtime current memory is invalid")
-        output_progress = reply.get("output_progress")
-        if output_progress is not None:
-            if not isinstance(output_progress, Mapping) or set(output_progress) != {
-                "stdout_bytes",
-                "stderr_bytes",
-                "stdout_retained_bytes",
-                "stderr_retained_bytes",
-                "stdout_truncated",
-                "stderr_truncated",
-                "last_output_at",
-                "observed_at",
-            }:
-                raise TestStoreContractError("runtime output progress is invalid")
-            stdout_bytes = output_progress["stdout_bytes"]
-            stderr_bytes = output_progress["stderr_bytes"]
-            stdout_retained_bytes = output_progress["stdout_retained_bytes"]
-            stderr_retained_bytes = output_progress["stderr_retained_bytes"]
-            stdout_truncated = output_progress["stdout_truncated"]
-            stderr_truncated = output_progress["stderr_truncated"]
-            last_output_at = output_progress["last_output_at"]
-            observed_at = output_progress["observed_at"]
-            if (
-                type(stdout_bytes) is not int
-                or type(stderr_bytes) is not int
-                or not 0 <= stdout_bytes <= (1 << 63) - 1
-                or not 0 <= stderr_bytes <= (1 << 63) - 1
-                or type(stdout_retained_bytes) is not int
-                or type(stderr_retained_bytes) is not int
-                or not 0 <= stdout_retained_bytes <= 4 * 1024 * 1024
-                or not 0 <= stderr_retained_bytes <= 4 * 1024 * 1024
-                or type(stdout_truncated) is not bool
-                or type(stderr_truncated) is not bool
-                or stdout_retained_bytes > stdout_bytes
-                or stderr_retained_bytes > stderr_bytes
-                or stdout_truncated != (stdout_bytes > stdout_retained_bytes)
-                or stderr_truncated != (stderr_bytes > stderr_retained_bytes)
-                or isinstance(observed_at, bool)
-                or not isinstance(observed_at, (int, float))
-                or not math.isfinite(float(observed_at))
-                or float(observed_at) < 0
-                or (
-                    last_output_at is not None
-                    and (
-                        isinstance(last_output_at, bool)
-                        or not isinstance(last_output_at, (int, float))
-                        or not math.isfinite(float(last_output_at))
-                        or float(last_output_at) < 0
-                    )
-                )
-            ):
-                raise TestStoreContractError("runtime output progress is invalid")
-            output_progress = {
-                "stdout_bytes": stdout_bytes,
-                "stderr_bytes": stderr_bytes,
-                "stdout_retained_bytes": stdout_retained_bytes,
-                "stderr_retained_bytes": stderr_retained_bytes,
-                "stdout_truncated": stdout_truncated,
-                "stderr_truncated": stderr_truncated,
-                "last_output_at": (
-                    None if last_output_at is None else float(last_output_at)
-                ),
-                "observed_at": float(observed_at),
-            }
-        if (
-            state == "running"
-            and reply["exit_envelope"] is None
-            and reply["result_chunk"] is None
-        ):
-            return RunnerObservation(
-                state="running",
-                current_memory_bytes=current_memory_bytes,
-                output_progress=output_progress,
-                launch_confirmed=launch_confirmed,
-            )
-        if (
-            state == "result"
-            and reply["exit_envelope"] is None
-            and isinstance(reply["result_chunk"], Mapping)
-        ):
-            return RunnerObservation(
-                state="result",
-                result_chunk=dict(reply["result_chunk"]),
-                launch_confirmed=launch_confirmed,
-            )
-        if (
-            state != "exited"
-            or not isinstance(reply["exit_envelope"], Mapping)
-            or (
-                reply["result_chunk"] is not None
-                and not isinstance(reply["result_chunk"], Mapping)
-            )
-        ):
-            raise TestStoreContractError("runtime observation state is invalid")
-        return RunnerObservation(
-            state="exited",
-            exit_envelope=AttemptExitEnvelope.from_document(reply["exit_envelope"]),
-            result_chunk=(
-                None
-                if reply["result_chunk"] is None
-                else dict(reply["result_chunk"])
-            ),
-            launch_confirmed=launch_confirmed,
+        return _runner_observation(self._submitter.observe(handle.systemd_unit))
+
+    def attach(self, binding: Mapping[str, object]) -> RunnerHandle:
+        return _runner_handle(self._submitter.attach(binding))
+
+    def stop(self, handle: RunnerHandle, *, reason: str) -> RunnerObservation:
+        reason = _bounded_text("stop reason", reason, maximum=1024)
+        return _runner_observation(
+            self._submitter.stop(handle.systemd_unit, reason=reason)
         )
 
-    def attach_for_cleanup(
-        self, handle: RunnerHandle, *, context: RunnerCleanupContext
-    ) -> None:
-        if not isinstance(handle, RunnerHandle) or not isinstance(
-            context, RunnerCleanupContext
-        ):
-            raise TestStoreContractError("runtime cleanup binding is invalid")
-        self._submitter.attach_for_cleanup(handle.runtime_id, context=context)
-
-    def cancel(self, handle: RunnerHandle, *, reason: str) -> bool:
-        reason = _bounded_text("cancel reason", reason, maximum=1024)
-        reply = self._submitter.cancel(handle.runtime_id, reason=reason)
-        if not isinstance(reply, Mapping) or set(reply) != {"cancelled"}:
-            raise TestStoreContractError("runtime cancellation reply fields are invalid")
-        if type(reply["cancelled"]) is not bool:
-            raise TestStoreContractError("runtime cancellation result is invalid")
-        return bool(reply["cancelled"])
+    def resolve_package(
+        self, handle: RunnerHandle, metadata: RunnerResultPackage
+    ) -> ExecutionResultPackage:
+        return _execution_result_package(
+            self._submitter.resolve_package(
+                handle.systemd_unit, metadata.to_document()
+            )
+        )
 
     def collect(self, handle: RunnerHandle) -> bool:
-        reply = self._submitter.collect(handle.runtime_id)
+        reply = self._submitter.collect(handle.systemd_unit)
         if not isinstance(reply, Mapping) or set(reply) != {"collected"}:
-            raise TestStoreContractError("runtime collection reply fields are invalid")
+            raise TestStoreContractError("runner collection result is invalid")
         if type(reply["collected"]) is not bool:
-            raise TestStoreContractError("runtime collection result is invalid")
+            raise TestStoreContractError("runner collection result is invalid")
         return bool(reply["collected"])
 
 
-def _attempt_result_chunk(value: Mapping[str, object]) -> AttemptResultChunk:
-    expected = {
-        "chunk_id", "chunk_index", "cases", "failures", "artifacts",
-        "reporter_complete",
-    }
-    if not isinstance(value, Mapping) or set(value) != expected:
-        raise TestStoreContractError("runner result chunk fields are invalid")
-    for field_name in ("cases", "failures", "artifacts"):
-        if not isinstance(value[field_name], Sequence) or isinstance(
-            value[field_name], (str, bytes)
-        ):
-            raise TestStoreContractError("runner result chunk collection is invalid")
-    cases: list[CaseResult] = []
-    for raw in value["cases"]:
-        if not isinstance(raw, Mapping) or set(raw) != {
-            "case_id", "display_name", "status", "duration_seconds", "location"
-        }:
-            raise TestStoreContractError("runner case result fields are invalid")
-        cases.append(
-            CaseResult(
-                case_id=raw["case_id"],
-                display_name=raw["display_name"],
-                status=raw["status"],
-                duration_seconds=raw["duration_seconds"],
-                location=raw["location"],
-            )
-        )
-    failures: list[FailureRecord] = []
-    for raw in value["failures"]:
-        if not isinstance(raw, Mapping) or set(raw) != {
-            "failure_id", "classification", "message", "case_id", "location",
-            "artifact_id",
-        }:
-            raise TestStoreContractError("runner failure fields are invalid")
-        try:
-            classification = FailureClassification(raw["classification"])
-        except (TypeError, ValueError) as error:
-            raise TestStoreContractError("runner failure classification is invalid") from error
-        failures.append(
-            FailureRecord(
-                failure_id=raw["failure_id"],
-                classification=classification,
-                message=raw["message"],
-                case_id=raw["case_id"],
-                location=raw["location"],
-                artifact_id=raw["artifact_id"],
-            )
-        )
-    artifacts: list[ArtifactMetadata] = []
-    for raw in value["artifacts"]:
-        if not isinstance(raw, Mapping) or set(raw) != {
-            "artifact_id", "kind", "storage_handle", "sha256", "size_bytes",
-            "verified",
-        }:
-            raise TestStoreContractError("runner artifact fields are invalid")
-        artifacts.append(
-            ArtifactMetadata(
-                artifact_id=raw["artifact_id"],
-                kind=raw["kind"],
-                storage_handle=raw["storage_handle"],
-                sha256=raw["sha256"],
-                size_bytes=raw["size_bytes"],
-                verified=raw["verified"],
-            )
-        )
-    return AttemptResultChunk(
-        chunk_id=value["chunk_id"],
-        chunk_index=value["chunk_index"],
-        cases=tuple(cases),
-        failures=tuple(failures),
-        artifacts=tuple(artifacts),
-        reporter_complete=value["reporter_complete"],
-    )
-
-
-def _attempt_scoped_result_chunk(
-    attempt_id: str, value: Mapping[str, object]
-) -> AttemptResultChunk:
-    """Bind reporter-local failure identities to one durable attempt."""
-
-    attempt_id = _safe_id("attempt_id", attempt_id)
-    chunk = _attempt_result_chunk(value)
-    failures = tuple(
-        replace(
-            failure,
-            failure_id=(
-                "failure-"
-                + hashlib.sha256(
-                    (
-                        attempt_id
-                        + "\0"
-                        + _safe_id("failure_id", failure.failure_id)
-                    ).encode("utf-8")
-                ).hexdigest()[:32]
-            ),
-        )
-        for failure in chunk.failures
-    )
-    return replace(chunk, failures=failures)
+def _require_same_handle(expected: RunnerHandle, observed: RunnerHandle) -> None:
+    if (
+        expected.execution_id != observed.execution_id
+        or expected.generation != observed.generation
+        or expected.systemd_unit != observed.systemd_unit
+        or expected.launch_operation_id != observed.launch_operation_id
+    ):
+        raise TestStoreConflict("runner handle identity changed")
 
 
 @dataclass
-class _ActiveAttempt:
-    candidate: RunnableTarget
-    lease: LeaseGrant
+class _ActiveExecution:
+    execution: ExecutionGrant
     handle: RunnerHandle
-    launched_at: float
-    next_source_check_at: float
-    repository_generation: int
-    result_chunk_ids: list[str] = field(default_factory=list)
-    current_memory_bytes: int | None = None
-    runtime_active: bool = True
-    terminal_envelope: AttemptExitEnvelope | None = None
+    run_id: str
+    target_id: str
+    target_name: str
+    terminal_committed: bool = False
 
 
 class TestdEngine:
-    """One deterministic scheduler/reconciliation owner for test attempts."""
+    """One deterministic scheduler and reconciler for schema-v8 executions."""
 
     def __init__(
         self,
@@ -818,10 +803,6 @@ class TestdEngine:
         scheduler: WeightedFairScheduler,
         ticket_issuer: BrokerLaunchTicketIssuer,
         launcher: RunnerLauncher,
-        spool: DurableAttemptSpool,
-        lease_owner: str = "devcoordinator-testd",
-        lease_seconds: int = 30,
-        live_source_check_seconds: float = 5.0,
         clock: Callable[[], float],
     ) -> None:
         if not isinstance(store, UniversalTestStore):
@@ -832,199 +813,155 @@ class TestdEngine:
             raise TestStoreContractError("ticket issuer is invalid")
         if not isinstance(launcher, RunnerLauncher):
             raise TestStoreContractError("launcher is invalid")
-        if not isinstance(spool, DurableAttemptSpool):
-            raise TestStoreContractError("spool is invalid")
         if not callable(clock):
             raise TestStoreContractError("clock is invalid")
         self.store = store
         self.scheduler = scheduler
         self.ticket_issuer = ticket_issuer
         self.launcher = launcher
-        self.spool = spool
-        self.lease_owner = _safe_id("lease_owner", lease_owner)
-        self.lease_seconds = _positive_int(
-            "lease_seconds", lease_seconds, maximum=300
-        )
-        if (
-            isinstance(live_source_check_seconds, bool)
-            or not isinstance(live_source_check_seconds, (int, float))
-            or not math.isfinite(float(live_source_check_seconds))
-            or not 1 <= float(live_source_check_seconds) <= 300
-        ):
-            raise TestStoreContractError(
-                "live_source_check_seconds must be from 1 through 300"
-            )
-        self.live_source_check_seconds = float(live_source_check_seconds)
         self.clock = clock
-        self._active: dict[str, _ActiveAttempt] = {}
-        self._cancel_interrupted_attempts()
+        self._active: dict[str, _ActiveExecution] = {}
+        self._restart_cleanup()
+        self.store.reconcile_nonterminal_runs(now=float(self.clock()))
 
-    def _cancel_interrupted_attempts(self) -> None:
-        """Stop and discard unfinished work instead of recovering it."""
-
-        for envelope in self.spool.active_envelopes():
-            handle = RunnerHandle(
-                runtime_id=envelope.runtime_id,
-                launch_ack_id=envelope.launch_ack_id,
-                launch_ticket_id=envelope.launch_ticket_id,
-                launch_operation_id=envelope.launch_operation_id,
-                launch_timeout_seconds=envelope.launch_timeout_seconds,
-                launch_confirmed=envelope.launch_confirmed,
-            )
-            self.launcher.attach_for_cleanup(
-                handle,
-                context=RunnerCleanupContext(
-                    repository_id=str(envelope.candidate["repository_id"]),
-                    repository_generation=envelope.repository_generation,
-                    attempt_id=envelope.attempt_id,
-                    generation=envelope.generation,
-                    started_at=envelope.launched_at,
-                    launch_ticket_id=envelope.launch_ticket_id,
-                    launch_operation_id=envelope.launch_operation_id,
-                    launch_timeout_seconds=envelope.launch_timeout_seconds,
-                    launch_confirmed=envelope.launch_confirmed,
-                ),
-            )
-            cancelled = self.launcher.cancel(handle, reason="testd restarted")
-            if not cancelled:
-                observation = self.launcher.observe(handle)
-                if observation.state not in {"exited", "result"}:
-                    raise TestStoreConflict(
-                        "interrupted test runtime could not be stopped"
-                    )
-        self.store.cancel_interrupted_runs(
-            reason="testd restarted", now=float(self.clock())
+    @staticmethod
+    def _unit_for_target(target_id: str) -> str:
+        target_id = _safe_id("target_id", target_id)
+        return (
+            "devcoordinator-test-"
+            + hashlib.sha256(target_id.encode("utf-8")).hexdigest()[:32]
+            + ".service"
         )
-        self.spool.discard_all()
 
-    def _active_envelope(self, active: _ActiveAttempt) -> ActiveAttemptEnvelope:
-        return ActiveAttemptEnvelope(
-            attempt_id=active.lease.attempt_id,
-            generation=active.lease.generation,
-            candidate=dict(active.candidate.__dict__),
-            lease=dict(active.lease.__dict__),
-            runtime_id=active.handle.runtime_id,
-            launch_ack_id=active.handle.launch_ack_id,
-            repository_generation=active.repository_generation,
-            launched_at=active.launched_at,
-            next_source_check_at=active.next_source_check_at,
-            result_chunk_ids=tuple(active.result_chunk_ids),
-            launch_ticket_id=active.handle.launch_ticket_id,
-            launch_operation_id=active.handle.launch_operation_id,
-            launch_timeout_seconds=active.handle.launch_timeout_seconds,
-            launch_confirmed=active.handle.launch_confirmed,
-            terminal_envelope=(
-                None
-                if active.terminal_envelope is None
-                else active.terminal_envelope.to_document()
+    @staticmethod
+    def _launch_operation_for_target(target_id: str) -> str:
+        return _stable_operation_id("launch", target_id)
+
+    @staticmethod
+    def _descriptor_fingerprint(
+        candidate: RunnableTarget, ticket: BrokerLaunchTicket
+    ) -> str:
+        return deterministic_fingerprint(
+            {
+                "ticket": ticket.public_document(),
+                "target_id": candidate.target_id,
+                "run_id": candidate.run_id,
+                "target_name": candidate.target_name,
+                "shard_index": candidate.shard_index,
+                "shard_count": candidate.shard_count,
+            }
+        )
+
+    @staticmethod
+    def _handle_for_grant(grant: ExecutionGrant) -> RunnerHandle:
+        return RunnerHandle(
+            execution_id=grant.execution_id,
+            generation=grant.generation,
+            systemd_unit=grant.systemd_unit,
+            launch_operation_id=grant.launch_operation_id,
+        )
+
+    def _active_from_binding(
+        self, binding: Mapping[str, object], handle: RunnerHandle
+    ) -> _ActiveExecution:
+        return _ActiveExecution(
+            execution=ExecutionGrant(
+                execution_id=str(binding["execution_id"]),
+                target_id=str(binding["target_id"]),
+                run_id=str(binding["run_id"]),
+                target_name=str(binding.get("target_name") or binding["target_id"]),
+                shard_index=int(binding.get("shard_index", 0)),
+                shard_count=int(binding.get("shard_count", 1)),
+                generation=int(binding["generation"]),
+                systemd_unit=str(binding["systemd_unit"]),
+                launch_operation_id=str(binding["launch_operation_id"]),
             ),
+            handle=handle,
+            run_id=str(binding["run_id"]),
+            target_id=str(binding["target_id"]),
+            target_name=str(binding.get("target_name") or binding["target_id"]),
         )
 
-    def _retain_active(self, active: _ActiveAttempt) -> None:
-        self.spool.retain_active(self._active_envelope(active))
+    def _restart_cleanup(self) -> None:
+        """Converge every exact retained binding before new admission."""
 
-    def _acknowledge_active(self, active: _ActiveAttempt) -> None:
-        if not active.handle.launch_confirmed:
-            self.store.heartbeat_attempt(
-                active.lease.attempt_id,
-                generation=active.lease.generation,
-                lease_seconds=self._pending_launch_lease_seconds(active),
-                operation_id=str(uuid.uuid4()),
+        for binding in self.store.restart_cleanup():
+            handle = self.launcher.attach(binding)
+            if (
+                handle.execution_id != binding["execution_id"]
+                or handle.generation != binding["generation"]
+                or handle.systemd_unit != binding["systemd_unit"]
+                or handle.launch_operation_id != binding["launch_operation_id"]
+            ):
+                raise TestStoreConflict("restart cleanup attached a different execution")
+            active = self._active_from_binding(binding, handle)
+            self._active[handle.execution_id] = active
+            observation = self.launcher.observe(handle)
+            fallback = (
+                AttemptConclusion.TIMED_OUT
+                if binding.get("deadline_at") is not None
+                and float(self.clock()) >= float(binding["deadline_at"])
+                else AttemptConclusion.CANCELLED
             )
-            return
-        self.store.acknowledge_launch(
-            active.lease.attempt_id,
-            generation=active.lease.generation,
-            launch_ack_id=active.handle.launch_ack_id,
-            operation_id=_stable_operation_id(
-                "launch-ack",
-                active.lease.attempt_id,
-                active.lease.generation,
-                active.handle.launch_ack_id,
-            ),
-        )
-
-    def _pending_launch_lease_seconds(self, active: _ActiveAttempt) -> int:
-        deadline = (
-            active.launched_at
-            + active.handle.launch_timeout_seconds
-            + PENDING_LAUNCH_LEASE_MARGIN_SECONDS
-        )
-        remaining = math.ceil(deadline - float(self.clock()))
-        return min(
-            MAX_PENDING_LAUNCH_LEASE_SECONDS,
-            max(self.lease_seconds, remaining),
-        )
-
-    def _collect_terminal_attempts(self) -> None:
-        for envelope in self.spool.active_envelopes():
-            state = str(self.store.get_attempt(envelope.attempt_id)["state"])
-            if state not in {"leased", "running"}:
-                active = self._active.get(envelope.attempt_id)
-                if active is not None and active.result_chunk_ids:
-                    if not self.launcher.collect(active.handle):
-                        raise TestStoreConflict(
-                            "terminal test attempt runtime was not collected"
-                        )
-                self.spool.discard_active(envelope.attempt_id)
-                self._active.pop(envelope.attempt_id, None)
+            self._settle(
+                active,
+                observation,
+                fallback=fallback,
+                stop_reason="testd restart cleanup",
+            )
+        if self.store.restart_cleanup():
+            raise TestStoreConflict("restart cleanup left active executions")
 
     def schedule(self, *, launch_batch: int = 64) -> dict[str, object]:
-        launch_batch = _positive_int("launch_batch", launch_batch, maximum=1_000)
-        replay = self.replay_spool()
+        if type(launch_batch) is not int or not 1 <= launch_batch <= 1_000:
+            raise TestStoreContractError("launch_batch is invalid")
         reconciled = self.store.reconcile_nonterminal_runs(now=float(self.clock()))
         candidates = self.store.runnable_targets(limit=10_000)
-        active = tuple(self._allocation(value) for value in self.store.active_allocations())
-        decision = self.scheduler.select(
-            candidates, active=active, launch_batch=launch_batch
+        allocations = tuple(
+            ActiveAllocation(
+                attempt_id=str(value["execution_id"]),
+                target_id=str(value["target_id"]),
+                repository_id=str(value["repository_id"]),
+                owner_uid=int(value["owner_uid"]),
+                worktree_key=str(value["worktree_key"]),
+                source_mode="immutable",
+                exclusive_resources=tuple(value["exclusive_resources"]),
+                memory_commitment_mib=int(value["memory_commitment_mib"]),
+                current_memory_bytes=(
+                    None
+                    if value["current_memory_bytes"] is None
+                    else int(value["current_memory_bytes"])
+                ),
+                runtime_active=bool(value["runtime_active"]),
+            )
+            for value in self.store.active_allocations()
         )
-        serialized_rejections = [value.__dict__ for value in decision.rejected]
+        decision = self.scheduler.select(
+            candidates, active=allocations, launch_batch=launch_batch
+        )
+        rejected = [dict(value.__dict__) for value in decision.rejected]
         self.store.record_schedule_decision(
             selected_target_ids=[value.target_id for value in decision.selected],
-            rejected=serialized_rejections,
+            rejected=rejected,
         )
         launched: list[str] = []
-        failed: list[dict[str, str]] = []
+        failures: list[dict[str, str]] = []
         for candidate in decision.selected:
-            # Runtime submission is intentionally serialized and may consume
-            # most of its bounded launch deadline. Protect every already
-            # supervised attempt before that blocking call so a later reaper
-            # cannot mistake scheduler latency for a lost testd heartbeat.
-            self._renew_active_leases(lease_seconds=MAX_LEASE_SECONDS)
             try:
                 self._launch(candidate)
                 launched.append(candidate.target_id)
             except Exception as error:
-                raw_error_code = getattr(error, "code", None)
-                error_code = (
-                    raw_error_code
-                    if isinstance(raw_error_code, str)
-                    and _SAFE_ID.fullmatch(raw_error_code) is not None
-                    else type(error).__name__
-                )
-                _LOGGER.exception(
-                    "test attempt launch failed repository_id=%s run_id=%s "
-                    "target_id=%s target_name=%s error_code=%s",
-                    candidate.repository_id,
-                    candidate.run_id,
-                    candidate.target_id,
-                    candidate.target_name,
-                    error_code,
-                )
-                failed.append(
+                failures.append(
                     {
                         "target_id": candidate.target_id,
                         "error_type": type(error).__name__,
-                        "error_code": error_code,
                         "stage": "launch",
                     }
                 )
-            finally:
-                self._renew_active_leases(lease_seconds=self.lease_seconds)
         return {
             "launched_target_ids": launched,
-            "launch_failures": failed,
-            "rejected": serialized_rejections,
+            "launch_failures": failures,
+            "rejected": rejected,
             "memory": {
                 "total_mib": decision.memory.total_mib,
                 "available_mib": decision.memory.available_mib,
@@ -1034,850 +971,392 @@ class TestdEngine:
                 ),
                 "observed_at": decision.memory.observed_at,
             },
-            "spool": replay,
             "reconciled": reconciled,
         }
-
-    def _renew_active_leases(self, *, lease_seconds: int) -> None:
-        for active in tuple(self._active.values()):
-            effective_lease_seconds = (
-                self._pending_launch_lease_seconds(active)
-                if lease_seconds == self.lease_seconds
-                and not active.handle.launch_confirmed
-                else lease_seconds
-            )
-            self.store.heartbeat_attempt(
-                active.lease.attempt_id,
-                generation=active.lease.generation,
-                lease_seconds=effective_lease_seconds,
-                operation_id=str(uuid.uuid4()),
-            )
-
-    def _allocation(self, value: Mapping[str, object]) -> ActiveAllocation:
-        retained = self._active.get(str(value["attempt_id"]))
-        return ActiveAllocation(
-            attempt_id=str(value["attempt_id"]),
-            target_id=str(value["target_id"]),
-            repository_id=str(value["repository_id"]),
-            owner_uid=int(value["owner_uid"]),
-            worktree_key=str(value["worktree_key"]),
-            exclusive_resources=tuple(value["exclusive_resources"]),
-            source_mode=str(value["source_mode"]),
-            memory_commitment_mib=int(value["memory_commitment_mib"]),
-            current_memory_bytes=(
-                None if retained is None else retained.current_memory_bytes
-            ),
-            runtime_active=True if retained is None else retained.runtime_active,
-        )
 
     def _launch(self, candidate: RunnableTarget) -> None:
         run = self.store.get_run(candidate.run_id)
         plan_document = self.store.get_plan_document(str(run["plan_id"]))
         plan = decode_test_plan_document(plan_document)
-        operation = str(uuid.uuid4())
-        lease = self.store.lease_target(
-            candidate.target_id,
-            lease_owner=self.lease_owner,
-            lease_seconds=(
-                plan.timeouts.launch_seconds
-                + PENDING_LAUNCH_LEASE_MARGIN_SECONDS
-            ),
-            memory_commitment_mib=candidate.memory_estimate_mib,
-            operation_id=operation,
+        launch_deadline = float(self.clock()) + plan.timeouts.launch_seconds
+        ticket = self.ticket_issuer.issue(
+            candidate=candidate,
+            plan_document=plan_document,
+            launch_deadline=launch_deadline,
         )
-        active: _ActiveAttempt | None = None
-        stage = "ticket"
-        try:
-            launch_deadline = float(self.clock()) + plan.timeouts.launch_seconds
-            ticket = self.ticket_issuer.issue(
-                candidate=candidate,
-                lease=lease,
-                plan_document=plan_document,
-                launch_deadline=launch_deadline,
-            )
-            launch_started_at = float(self.clock())
-            remaining_launch_seconds = min(
-                plan.timeouts.launch_seconds,
-                math.ceil(launch_deadline - launch_started_at),
-            )
-            if remaining_launch_seconds <= 0:
-                raise TestStoreConflict(
-                    "caller launch deadline expired before runtime submission"
-                )
-            stage = "descriptor"
-            request = self._request(
-                candidate,
-                lease,
-                plan_document,
-                ticket,
-                launch_timeout_seconds=remaining_launch_seconds,
-            )
-            prepare = getattr(self.launcher, "prepare", None)
-            launch_prepared = getattr(self.launcher, "launch_prepared", None)
-            if callable(prepare) and callable(launch_prepared):
-                # Persist the deterministic pending identity before the first
-                # broker RPC.  A testd crash at any point after this fsync can
-                # recover and replay the exact operation without orphaning or
-                # duplicating a host runtime.
-                stage = "prepare"
-                handle = prepare(request)
-                active = _ActiveAttempt(
-                    candidate=candidate,
-                    lease=lease,
-                    handle=handle,
-                    launched_at=launch_started_at,
-                    next_source_check_at=(
-                        launch_started_at + self.live_source_check_seconds
-                    ),
-                    repository_generation=ticket.repository_generation,
-                )
-                self._retain_active(active)
-                self._active[lease.attempt_id] = active
-                stage = "runtime"
-                active.handle = launch_prepared(request, handle)
-                self._retain_active(active)
-            else:
-                # Non-production injected launchers retain the narrow legacy
-                # interface. They do not cross a process boundary and are used
-                # only by isolated unit tests.
-                stage = "launcher"
-                handle = self.launcher.launch(request)
-                active = _ActiveAttempt(
-                    candidate=candidate,
-                    lease=lease,
-                    handle=handle,
-                    launched_at=launch_started_at,
-                    next_source_check_at=(
-                        launch_started_at + self.live_source_check_seconds
-                    ),
-                    repository_generation=ticket.repository_generation,
-                )
-                self._retain_active(active)
-                self._active[lease.attempt_id] = active
-            self._acknowledge_active(active)
-            if active.handle.launch_confirmed:
-                # A pending launch begins with a lease covering its semantic
-                # launch deadline. The first confirmed launch shortens that
-                # lease immediately. Later supervision renews only after a
-                # successful native observation, so a missing/overdue runtime
-                # cannot be blindly heartbeated before its deadline check.
-                self.store.heartbeat_attempt(
-                    active.lease.attempt_id,
-                    generation=active.lease.generation,
-                    lease_seconds=self.lease_seconds,
-                    operation_id=str(uuid.uuid4()),
-                )
-        except LiveSourceChanged as error:
-            self.store.mark_superseded(
-                candidate.run_id,
-                observed_source_fingerprint=error.observed_source_fingerprint,
-                operation_id=str(uuid.uuid4()),
-            )
-            try:
-                self.store.terminalize_attempt(
-                    lease.attempt_id,
-                    generation=lease.generation,
-                    conclusion=AttemptConclusion.SUPERSEDED,
-                    duration_seconds=0,
-                    operation_id=str(uuid.uuid4()),
-                )
-            except (TestStoreConflict, TestStoreContractError):
-                pass
-            raise
-        except Exception as error:
-            if active is not None:
-                # Launch ownership is durable. The next reconciliation pass
-                # must observe the exact runtime instead of terminalizing a
-                # possibly still-running process or launching a duplicate.
-                raise
-            try:
-                self._spool_prelaunch_failure(
-                    lease=lease,
-                    stage=stage,
-                    error=error,
-                )
-            except Exception:
-                # Never replace the original launch cause. Both envelopes are
-                # written before replay, so a transient store failure remains
-                # recoverable on the next testd pass rather than committing a
-                # zero-evidence infrastructure terminal.
-                _LOGGER.exception(
-                    "test prelaunch failure evidence could not be retained "
-                    "attempt_id=%s stage=%s",
-                    lease.attempt_id,
-                    stage,
-                )
-            raise
-
-    def _spool_prelaunch_failure(
-        self,
-        *,
-        lease: LeaseGrant,
-        stage: str,
-        error: Exception,
-    ) -> None:
-        """Persist one actionable failure before a definitive pre-handle exit."""
-
-        stage = _safe_id("prelaunch failure stage", stage)
-        raw_code = getattr(error, "code", None)
-        error_code = (
-            raw_code
-            if isinstance(raw_code, str) and _SAFE_ID.fullmatch(raw_code) is not None
-            else type(error).__name__
-        )
-        detail = (" ".join(str(error).split()) or type(error).__name__)[:4096]
-        identity = hashlib.sha256(
-            (
-                lease.attempt_id
-                + "\0"
-                + str(lease.generation)
-                + "\0"
-                + stage
-                + "\0"
-                + error_code
-                + "\0"
-                + detail
-            ).encode("utf-8")
-        ).hexdigest()
-        chunk_id = "chunk-prelaunch-" + identity[:32]
-        failure_id = "failure-prelaunch-" + identity[32:]
-        chunk = {
-            "chunk_id": chunk_id,
-            "chunk_index": 0,
-            "cases": [],
-            "failures": [
-                {
-                    "failure_id": failure_id,
-                    "classification": FailureClassification.INFRASTRUCTURE_FAILURE.value,
-                    "message": (
-                        f"Test launch failed during {stage} ({error_code}): {detail}"
-                    )[:8192],
-                    "case_id": None,
-                    "location": f"launch/{stage}",
-                    "artifact_id": None,
-                }
-            ],
-            "artifacts": [],
-            "reporter_complete": True,
-        }
-        self.spool.append_result_chunk(
-            AttemptResultChunkEnvelope(
-                envelope_id="result-prelaunch-" + identity[:32],
-                attempt_id=lease.attempt_id,
-                generation=lease.generation,
-                chunk=chunk,
-            )
-        )
-        self.spool.append(
-            AttemptExitEnvelope(
-                envelope_id="exit-prelaunch-" + identity[:32],
-                attempt_id=lease.attempt_id,
-                generation=lease.generation,
-                operation_id=_stable_operation_id(
-                    "prelaunch-terminal",
-                    lease.attempt_id,
-                    lease.generation,
-                    identity,
-                ),
-                conclusion=AttemptConclusion.INFRASTRUCTURE_FAILED,
-                duration_seconds=0,
-                result_chunk_ids=(chunk_id,),
-            )
-        )
-        self.replay_spool()
-
-    def _request(
-        self,
-        candidate: RunnableTarget,
-        lease: LeaseGrant,
-        plan_document: Mapping[str, object],
-        ticket: BrokerLaunchTicket,
-        *,
-        launch_timeout_seconds: int | None = None,
-    ) -> TransientRunnerRequest:
-        if not isinstance(ticket, BrokerLaunchTicket):
-            raise TestStoreContractError("broker launch ticket is invalid")
-        plan = decode_test_plan_document(plan_document)
-        if launch_timeout_seconds is None:
-            launch_timeout_seconds = plan.timeouts.launch_seconds
-        _positive_int(
-            "launch_timeout_seconds",
-            launch_timeout_seconds,
-            maximum=plan.timeouts.launch_seconds,
-        )
-        if ticket.intent != plan.intent:
-            raise TestStoreConflict("launch ticket intent does not match the plan")
-        expected = {
-            "attempt_id": lease.attempt_id,
-            "target_id": candidate.target_id,
-            "run_id": candidate.run_id,
-            "repository_id": candidate.repository_id,
-            "owner_uid": candidate.owner_uid,
-            "generation": lease.generation,
-            "worktree_key": candidate.worktree_key,
-        }
-        for field_name, expected_value in expected.items():
-            if getattr(ticket, field_name) != expected_value:
-                raise TestStoreConflict(f"launch ticket {field_name} is stale or mismatched")
-        _safe_id("ticket_id", ticket.ticket_id)
-        now = float(self.clock())
         if (
-            isinstance(ticket.issued_at, bool)
-            or isinstance(ticket.expires_at, bool)
-            or not math.isfinite(ticket.issued_at)
-            or not math.isfinite(ticket.expires_at)
-            or ticket.issued_at > now
-            or ticket.expires_at <= now
+            ticket.target_id != candidate.target_id
+            or ticket.run_id != candidate.run_id
+            or ticket.repository_id != candidate.repository_id
+            or ticket.owner_uid != candidate.owner_uid
+            or ticket.ttl_seconds <= 0
         ):
-            raise TestStoreConflict("launch ticket is expired or not yet valid")
-        if ticket.kill_after_run is not True:
-            raise TestStoreContractError("test runners require kill_after_run=true")
-        _positive_int("ttl_seconds", ticket.ttl_seconds, maximum=MAX_RUNNER_TTL_SECONDS)
-        # Legacy manifest resource declarations remain in the ticket only as
-        # descriptive compatibility metadata. They never authorize, reject,
-        # throttle, or limit an attempt; host MemAvailable plus learned peak
-        # memory is the sole capacity input to scheduling.
-        if ticket.network not in {
-            "none",
-            "loopback",
-            "host-loopback",
-            "external",
-        }:
-            raise TestStoreContractError("launch ticket network is invalid")
-        if ticket.network == "host-loopback" and (
-            plan.intent != "manual" or bool(ticket.fixtures)
-        ):
-            raise TestStoreContractError(
-                "host-loopback launch tickets require manual intent without fixtures"
-            )
-        root = _absolute_path("root_repo", ticket.root_repo)
-        temporary = (
-            None
-            if ticket.temporary_repo is None
-            else _absolute_path("temporary_repo", ticket.temporary_repo)
+            raise TestStoreConflict("launch ticket contradicts the selected target")
+        systemd_unit = self._unit_for_target(candidate.target_id)
+        launch_operation_id = self._launch_operation_for_target(candidate.target_id)
+        descriptor_fingerprint = self._descriptor_fingerprint(candidate, ticket)
+        grant = self.store.begin_execution(
+            candidate.target_id,
+            repository_generation=ticket.repository_generation,
+            systemd_unit=systemd_unit,
+            launch_operation_id=launch_operation_id,
+            descriptor_fingerprint=descriptor_fingerprint,
+            launch_deadline_at=launch_deadline,
+            memory_commitment_mib=candidate.memory_estimate_mib,
+            operation_id=_stable_operation_id("begin", candidate.target_id),
         )
-        if root != plan.source.original_root or temporary != plan.source.temporary_root:
-            raise TestStoreConflict("launch ticket source does not match the plan")
-        execution_root = _absolute_path("execution_root", ticket.execution_root)
-        if plan.source.mode is SourceMode.LIVE and execution_root not in {root, temporary}:
-            raise TestStoreConflict("live launch ticket execution root is not authoritative")
-        if type(ticket.repository_generation) is not int or ticket.repository_generation < 0:
-            raise TestStoreContractError("launch ticket repository generation is invalid")
-        if plan.source.mode is SourceMode.LIVE and candidate.worktree_key not in {
-            root,
-            temporary,
-        }:
-            raise TestStoreConflict("live launch ticket does not own the exact worktree")
-        normalized_argv = _argv(ticket.argv)
-        normalized_environment = _environment(ticket.environment)
-        normalized_cwd = _relative_path("runner cwd", ticket.cwd)
-        normalized_ticket = BrokerLaunchTicket(
-            **{
-                **ticket.__dict__,
-                "argv": normalized_argv,
-                "cwd": normalized_cwd,
-                "environment": normalized_environment,
-            }
+        active = _ActiveExecution(
+            execution=grant,
+            handle=self._handle_for_grant(grant),
+            run_id=grant.run_id,
+            target_id=grant.target_id,
+            target_name=grant.target_name,
         )
-        return TransientRunnerRequest(
-            ticket=normalized_ticket,
+        self._active[grant.execution_id] = active
+        request = TransientRunnerRequest(
+            ticket=ticket,
+            execution=grant,
             target_name=candidate.target_name,
-            shard_index=candidate.shard_index,
-            shard_count=candidate.shard_count,
-            launch_timeout_seconds=launch_timeout_seconds,
+            descriptor_fingerprint=descriptor_fingerprint,
         )
+        prepared = self.launcher.prepare(request)
+        _require_same_handle(active.handle, prepared)
+        active.handle = prepared
+        started = self.launcher.start(request, prepared)
+        _require_same_handle(prepared, started)
+        active.handle = started
 
-    def _retain_result_observation(
-        self,
-        active: _ActiveAttempt,
-        observation: RunnerObservation,
+    def _record_start_if_observed(
+        self, active: _ActiveExecution, observation: RunnerObservation
     ) -> None:
-        """Persist one exact runner chunk while retaining active ownership."""
-
-        if observation.state != "result" or observation.result_chunk is None:
-            raise TestStoreContractError("runner result observation is incomplete")
-        attempt_id = active.lease.attempt_id
-        active.current_memory_bytes = None
-        active.runtime_active = False
-        chunk = _attempt_result_chunk(observation.result_chunk)
-        if chunk.chunk_id in active.result_chunk_ids:
-            raise TestStoreConflict("runner result chunk is duplicated")
-        self.spool.append_result_chunk(
-            AttemptResultChunkEnvelope(
-                envelope_id=(
-                    f"result-{chunk.chunk_index:06d}-"
-                    + hashlib.sha256(
-                        (
-                            attempt_id
-                            + "\0"
-                            + str(active.lease.generation)
-                            + "\0"
-                            + chunk.chunk_id
-                        ).encode("utf-8")
-                    ).hexdigest()[:32]
-                ),
-                attempt_id=attempt_id,
-                generation=active.lease.generation,
-                chunk=dict(observation.result_chunk),
+        if not observation.launch_confirmed:
+            return
+        retained = self.store.get_attempt(active.execution.execution_id)
+        if str(retained["state"]) != "starting":
+            return
+        if observation.started_at is None:
+            raise TestStoreConflict(
+                "confirmed running execution omitted durable start evidence"
             )
+        launch_ack_id = active.handle.launch_ack_id
+        if launch_ack_id is None:
+            launch_ack_id = "launch-" + active.execution.execution_id
+            active.handle = replace(
+                active.handle,
+                launch_ack_id=launch_ack_id,
+                launch_confirmed=True,
+            )
+        self.store.record_started(
+            active.execution.execution_id,
+            generation=active.execution.generation,
+            systemd_unit=active.execution.systemd_unit,
+            launch_ack_id=launch_ack_id,
+            started_at=observation.started_at,
+            systemd_invocation_id=None,
+            operation_id=_stable_operation_id(
+                "started",
+                active.execution.execution_id,
+                observation.started_at,
+                launch_ack_id,
+            ),
         )
-        active.result_chunk_ids.append(chunk.chunk_id)
-        self._retain_active(active)
-        self.replay_result_spool()
+
+    def _record_progress(
+        self, active: _ActiveExecution, observation: RunnerObservation
+    ) -> None:
+        if observation.output_progress is None:
+            return
+        progress = observation.output_progress
+        self.store.record_progress(
+            active.execution.execution_id,
+            generation=active.execution.generation,
+            stdout_bytes=int(progress["stdout_bytes"]),
+            stderr_bytes=int(progress["stderr_bytes"]),
+            stdout_retained_bytes=int(progress["stdout_retained_bytes"]),
+            stderr_retained_bytes=int(progress["stderr_retained_bytes"]),
+            stdout_truncated=bool(progress["stdout_truncated"]),
+            stderr_truncated=bool(progress["stderr_truncated"]),
+            current_memory_bytes=observation.current_memory_bytes,
+            last_output_at=progress["last_output_at"],  # type: ignore[arg-type]
+            observed_at=float(progress["observed_at"]),
+        )
+
+    @staticmethod
+    def _package_conclusion(
+        metadata: RunnerResultPackage,
+        *,
+        fallback: AttemptConclusion,
+    ) -> AttemptConclusion:
+        complete = bool(metadata.manifest["reporter_complete"])
+        if not complete:
+            return (
+                fallback
+                if fallback in {
+                    AttemptConclusion.TIMED_OUT,
+                    AttemptConclusion.CANCELLED,
+                }
+                else AttemptConclusion.INCOMPLETE
+            )
+        if int(metadata.counts["failed"]) or int(metadata.counts["error"]):
+            return AttemptConclusion.TEST_FAILED
+        if metadata.outcome.get("test_failed") is True:
+            return AttemptConclusion.TEST_FAILED
+        if metadata.outcome.get("infrastructure_error") is not None:
+            return AttemptConclusion.INFRASTRUCTURE_FAILED
+        returncode = metadata.outcome.get("returncode")
+        if returncode not in {None, 0}:
+            return AttemptConclusion.INFRASTRUCTURE_FAILED
+        return AttemptConclusion.SUCCEEDED
+
+    @staticmethod
+    def _synthetic_package(
+        execution_id: str, conclusion: AttemptConclusion, reason: str
+    ) -> ExecutionResultPackage:
+        classification = {
+            AttemptConclusion.TIMED_OUT: FailureClassification.TIMEOUT,
+            AttemptConclusion.CANCELLED: FailureClassification.CANCELLATION,
+            AttemptConclusion.INCOMPLETE: FailureClassification.INCOMPLETE_REPORTING,
+            AttemptConclusion.INFRASTRUCTURE_FAILED:
+                FailureClassification.INFRASTRUCTURE_FAILURE,
+        }.get(conclusion)
+        failures: tuple[FailureRecord, ...] = ()
+        if classification is not None:
+            identity = hashlib.sha256(
+                f"{execution_id}\0{conclusion.value}\0{reason}".encode("utf-8")
+            ).hexdigest()[:32]
+            failures = (
+                FailureRecord(
+                    failure_id="failure-" + identity,
+                    classification=classification,
+                    message=reason[:8192],
+                    location="execution",
+                ),
+            )
+        return ExecutionResultPackage(
+            package_id=(
+                "package-"
+                + hashlib.sha256(
+                    f"{execution_id}\0{conclusion.value}".encode("utf-8")
+                ).hexdigest()[:32]
+            ),
+            failures=failures,
+            reporter_complete=False,
+        )
+
+    def _resolved_package(
+        self,
+        active: _ActiveExecution,
+        metadata: RunnerResultPackage,
+    ) -> ExecutionResultPackage:
+        package = self.launcher.resolve_package(active.handle, metadata)
+        if package.package_id != metadata.package_id:
+            raise TestStoreConflict("resolved result package identity changed")
+        counts = {
+            "passed": sum(case.status == "passed" for case in package.cases),
+            "failed": sum(case.status == "failed" for case in package.cases),
+            "skipped": sum(case.status == "skipped" for case in package.cases),
+            "error": sum(case.status == "error" for case in package.cases),
+            "failures": len(package.failures),
+            "artifacts": len(package.artifacts),
+        }
+        if counts != dict(metadata.counts):
+            raise TestStoreConflict("resolved result package counts changed")
+        if bool(package.reporter_complete) != bool(
+            metadata.manifest["reporter_complete"]
+        ):
+            raise TestStoreConflict("resolved result package manifest changed")
+        return package
+
+    def _settle(
+        self,
+        active: _ActiveExecution,
+        observation: RunnerObservation,
+        *,
+        fallback: AttemptConclusion,
+        stop_reason: str,
+    ) -> None:
+        metadata = observation.result_package
+        package = (
+            None
+            if metadata is None
+            else self._resolved_package(active, metadata)
+        )
+        if not observation.unit_inactive or not observation.cgroup_empty:
+            observation = self.launcher.stop(active.handle, reason=stop_reason)
+            if metadata is None and observation.result_package is not None:
+                metadata = observation.result_package
+                package = self._resolved_package(active, metadata)
+        if not observation.unit_inactive or not observation.cgroup_empty:
+            raise TestStoreConflict(
+                "exact execution did not reach inactive empty-cgroup proof"
+            )
+        if package is None:
+            package = self._synthetic_package(
+                active.execution.execution_id,
+                fallback,
+                stop_reason,
+            )
+            conclusion = fallback
+        else:
+            assert metadata is not None
+            conclusion = self._package_conclusion(metadata, fallback=fallback)
+        retained = self.store.get_attempt(active.execution.execution_id)
+        started_at = retained.get("started_at")
+        duration = (
+            0.0
+            if started_at is None
+            else max(0.0, float(self.clock()) - float(started_at))
+        )
+        self.store.complete_from_package(
+            active.execution.execution_id,
+            generation=active.execution.generation,
+            systemd_unit=active.execution.systemd_unit,
+            package=package,
+            conclusion=conclusion,
+            duration_seconds=duration,
+            operation_id=_stable_operation_id(
+                "complete",
+                active.execution.execution_id,
+                package.package_id,
+                conclusion.value,
+            ),
+            unit_inactive=True,
+            cgroup_empty=True,
+            peak_memory_bytes=observation.peak_memory_bytes,
+            cpu_seconds=observation.cpu_seconds,
+        )
+        active.terminal_committed = True
+        if self.launcher.collect(active.handle):
+            self._active.pop(active.execution.execution_id, None)
 
     def heartbeat(self) -> dict[str, object]:
         running: list[str] = []
         completed: list[str] = []
-        failed: list[dict[str, str]] = []
-        for attempt_id, active in tuple(self._active.items()):
+        failures: list[dict[str, str]] = []
+        for execution_id, active in tuple(self._active.items()):
             try:
-                self._acknowledge_active(active)
-                run = self.store.get_run(active.candidate.run_id)
-                state = str(run["state"])
-                plan_document = self.store.get_plan_document(str(run["plan_id"]))
-                plan = decode_test_plan_document(plan_document)
-                now = float(self.clock())
-                if (
-                    state in {"queued", "running"}
-                    and plan.source.mode is SourceMode.LIVE
-                    and now >= active.next_source_check_at
-                ):
-                    # A slow/unavailable source observer must not starve the
-                    # attempt lease.  Record the project-local observation
-                    # failure and continue supervising the already-running job.
-                    active.next_source_check_at = (
-                        now + self.live_source_check_seconds
-                    )
-                    self._retain_active(active)
-                    try:
-                        observed = self.ticket_issuer.observe_live_source(
-                            repository_id=active.candidate.repository_id,
-                            owner_uid=active.candidate.owner_uid,
-                            plan_document=plan_document,
-                        )
-                        if re.fullmatch(r"[0-9a-f]{64}", observed) is None:
-                            raise TestStoreContractError(
-                                "live source observer fingerprint is invalid"
-                            )
-                        if observed != plan.source.content_fingerprint:
-                            changed = self.store.mark_superseded(
-                                active.candidate.run_id,
-                                observed_source_fingerprint=observed,
-                                operation_id=str(uuid.uuid4()),
-                            )
-                            state = str(changed["state"])
-                    except Exception as source_error:
-                        failed.append(
-                            {
-                                "attempt_id": attempt_id,
-                                "error_type": type(source_error).__name__,
-                                "stage": "source_observation",
-                            }
-                        )
-                observation: RunnerObservation | None = None
-                if state in {"cancelling", "superseding"}:
-                    # A result can publish immediately before cancellation or
-                    # during release recovery. Observe first so measured
-                    # terminal evidence wins. Once its atomic manifest is
-                    # visible, stopping the exact cgroup cannot remove the
-                    # already-published chunk files; do not leave a large
-                    # result stream running beyond the unit stop bound merely
-                    # because testd still has chunks to import.
-                    observation = self.launcher.observe(active.handle)
-                    if observation.state == "running":
-                        reason = (
-                            "run cancellation requested"
-                            if state == "cancelling"
-                            else "run superseded"
-                        )
-                        if self.launcher.cancel(active.handle, reason=reason):
-                            conclusion = (
-                                AttemptConclusion.CANCELLED
-                                if state == "cancelling"
-                                else AttemptConclusion.SUPERSEDED
-                            )
-                            if self._spool_terminal(active, conclusion):
-                                completed.append(attempt_id)
-                            else:
-                                failed.append({
-                                    "attempt_id": attempt_id,
-                                    "error_type": "TestStoreConflict",
-                                    "stage": "terminal_replay",
-                                })
-                            continue
-                    elif observation.state == "result":
-                        reason = (
-                            "run cancellation requested after result publication"
-                            if state == "cancelling"
-                            else "run superseded after result publication"
-                        )
-                        if not self.launcher.cancel(active.handle, reason=reason):
-                            failed.append({
-                                "attempt_id": attempt_id,
-                                "error_type": "TestStoreConflict",
-                                "stage": "result_stream_native_stop",
-                            })
-                if observation is None:
-                    observation = self.launcher.observe(active.handle)
-                if observation.launch_confirmed and not active.handle.launch_confirmed:
-                    active.handle = replace(active.handle, launch_confirmed=True)
-                    self._retain_active(active)
-                    self._acknowledge_active(active)
-                elif not observation.launch_confirmed and active.handle.launch_confirmed:
-                    raise TestStoreConflict(
-                        "confirmed runtime regressed to an uncertain launch"
-                    )
-                drained_chunks = 0
-                while (
-                    observation.state == "result"
-                    and observation.result_chunk is not None
-                    and drained_chunks < MAX_RESULT_CHUNKS_PER_HEARTBEAT
-                ):
-                    self._retain_result_observation(active, observation)
-                    drained_chunks += 1
-                    if drained_chunks == MAX_RESULT_CHUNKS_PER_HEARTBEAT:
-                        self.store.heartbeat_attempt(
-                            attempt_id,
-                            generation=active.lease.generation,
-                            lease_seconds=self.lease_seconds,
-                            operation_id=str(uuid.uuid4()),
-                        )
-                        running.append(attempt_id)
-                        observation = None
-                        break
-                    observation = self.launcher.observe(active.handle)
-                    if (
-                        observation.launch_confirmed
-                        != active.handle.launch_confirmed
-                    ):
-                        raise TestStoreConflict(
-                            "runner launch confirmation changed while draining results"
-                        )
-                if observation is None:
+                if active.terminal_committed:
+                    if self.launcher.collect(active.handle):
+                        self._active.pop(execution_id, None)
+                        completed.append(execution_id)
                     continue
-                if observation.state == "running":
-                    active.current_memory_bytes = observation.current_memory_bytes
-                    active.runtime_active = True
-                    if observation.output_progress is not None:
-                        self.store.record_attempt_progress(
-                            attempt_id,
-                            generation=active.lease.generation,
-                            stdout_bytes=int(
-                                observation.output_progress["stdout_bytes"]
-                            ),
-                            stderr_bytes=int(
-                                observation.output_progress["stderr_bytes"]
-                            ),
-                            stdout_retained_bytes=int(
-                                observation.output_progress[
-                                    "stdout_retained_bytes"
-                                ]
-                            ),
-                            stderr_retained_bytes=int(
-                                observation.output_progress[
-                                    "stderr_retained_bytes"
-                                ]
-                            ),
-                            stdout_truncated=bool(
-                                observation.output_progress["stdout_truncated"]
-                            ),
-                            stderr_truncated=bool(
-                                observation.output_progress["stderr_truncated"]
-                            ),
-                            current_memory_bytes=observation.current_memory_bytes,
-                            last_output_at=observation.output_progress[
-                                "last_output_at"
-                            ],  # type: ignore[arg-type]
-                            observed_at=float(
-                                observation.output_progress["observed_at"]
-                            ),
-                        )
-                    self.store.heartbeat_attempt(
-                        attempt_id,
-                        generation=active.lease.generation,
-                        lease_seconds=self.lease_seconds,
-                        operation_id=str(uuid.uuid4()),
+                observation = self.launcher.observe(active.handle)
+                self._record_start_if_observed(active, observation)
+                self._record_progress(active, observation)
+                retained = self.store.get_attempt(execution_id)
+                run = self.store.get_run(active.run_id)
+                target_projection = next(
+                    target
+                    for target in run["targets"]
+                    if target.get("execution_id") == execution_id
+                )
+                deadline_at = target_projection.get("deadline_at")
+                timed_out = (
+                    deadline_at is not None
+                    and float(self.clock()) >= float(deadline_at)
+                )
+                cancelling = (
+                    str(run["state"]) == "cancelling"
+                    or str(retained["state"]) == "stopping"
+                )
+                if observation.result_package is not None:
+                    self._settle(
+                        active,
+                        observation,
+                        fallback=(
+                            AttemptConclusion.TIMED_OUT
+                            if timed_out
+                            else AttemptConclusion.CANCELLED
+                            if cancelling
+                            else AttemptConclusion.INCOMPLETE
+                        ),
+                        stop_reason=(
+                            "execution deadline reached"
+                            if timed_out
+                            else "run cancellation requested"
+                            if cancelling
+                            else "result package published"
+                        ),
                     )
-                    running.append(attempt_id)
-                elif observation.state == "exited" and observation.exit_envelope is not None:
-                    if plan.source.mode is SourceMode.LIVE:
-                        # A short-lived runner can exit before the periodic
-                        # source check is due.  Never accept its terminal
-                        # envelope until the exact live source is observed one
-                        # final time; otherwise a mutation immediately after
-                        # launch could be reported against stale provenance.
-                        try:
-                            observed = self.ticket_issuer.observe_live_source(
-                                repository_id=active.candidate.repository_id,
-                                owner_uid=active.candidate.owner_uid,
-                                plan_document=plan_document,
-                            )
-                            if re.fullmatch(r"[0-9a-f]{64}", observed) is None:
-                                raise TestStoreContractError(
-                                    "live source observer fingerprint is invalid"
-                                )
-                        except Exception:
-                            # The exited runner is retained until provenance can
-                            # be verified.  Renewing the lease prevents the
-                            # reaper from converting a temporary observer outage
-                            # into an unrelated abandonment conclusion.
-                            self.store.heartbeat_attempt(
-                                attempt_id,
-                                generation=active.lease.generation,
-                                lease_seconds=self.lease_seconds,
-                                operation_id=str(uuid.uuid4()),
-                            )
-                            raise
-                        if observed != plan.source.content_fingerprint:
-                            self.store.mark_superseded(
-                                active.candidate.run_id,
-                                observed_source_fingerprint=observed,
-                                operation_id=str(uuid.uuid4()),
-                            )
-                            terminalized = self._spool_terminal(
-                                active,
-                                AttemptConclusion.SUPERSEDED,
-                                peak_memory_bytes=(
-                                    observation.exit_envelope.peak_memory_bytes
-                                ),
-                                cpu_seconds=observation.exit_envelope.cpu_seconds,
-                            )
-                            if terminalized:
-                                completed.append(attempt_id)
-                            else:
-                                failed.append({
-                                    "attempt_id": attempt_id,
-                                    "error_type": "TestStoreConflict",
-                                    "stage": "terminal_replay",
-                                })
-                            continue
-                    self._validate_exit(active, observation.exit_envelope)
-                    if observation.result_chunk is not None:
-                        raise TestStoreContractError(
-                            "terminal runner observation contains an undrained result chunk"
-                        )
-                    if observation.exit_envelope.result_chunk_ids != tuple(
-                        active.result_chunk_ids
-                    ):
-                        raise TestStoreConflict(
-                            "runner exit references contradictory result chunks"
-                        )
-                    terminal_path = self.spool.append(observation.exit_envelope)
-                    self.replay_spool(priority_exit_names=(terminal_path.name,))
-                    attempt = self.store.get_attempt(attempt_id)
-                    if str(attempt["state"]) in {"leased", "running"}:
-                        self.store.heartbeat_attempt(
-                            attempt_id,
-                            generation=active.lease.generation,
-                            lease_seconds=self.lease_seconds,
-                            operation_id=str(uuid.uuid4()),
-                        )
-                        failed.append({
-                            "attempt_id": attempt_id,
-                            "error_type": "TestStoreConflict",
-                            "stage": "terminal_replay",
-                        })
-                    else:
-                        completed.append(attempt_id)
+                    if execution_id not in self._active:
+                        completed.append(execution_id)
+                elif cancelling or timed_out:
+                    self._settle(
+                        active,
+                        observation,
+                        fallback=(
+                            AttemptConclusion.TIMED_OUT
+                            if timed_out
+                            else AttemptConclusion.CANCELLED
+                        ),
+                        stop_reason=(
+                            "execution deadline reached"
+                            if timed_out
+                            else "run cancellation requested"
+                        ),
+                    )
+                    if execution_id not in self._active:
+                        completed.append(execution_id)
+                elif observation.state in {"exited", "stopped", "absent"}:
+                    self._settle(
+                        active,
+                        observation,
+                        fallback=AttemptConclusion.INFRASTRUCTURE_FAILED,
+                        stop_reason="execution exited without a complete package",
+                    )
+                    if execution_id not in self._active:
+                        completed.append(execution_id)
                 else:
-                    raise TestStoreContractError("runner observation is incomplete")
+                    running.append(execution_id)
             except Exception as error:
-                failed.append({"attempt_id": attempt_id, "error_type": type(error).__name__})
-        return {"running_attempt_ids": running, "completed_attempt_ids": completed, "failures": failed}
+                failures.append(
+                    {
+                        "attempt_id": execution_id,
+                        "execution_id": execution_id,
+                        "error_type": type(error).__name__,
+                    }
+                )
+        return {
+            "running_attempt_ids": running,
+            "running_execution_ids": running,
+            "completed_attempt_ids": completed,
+            "completed_execution_ids": completed,
+            "failures": failures,
+        }
 
     def cancel_run(
         self, *, run_id: str, actor: str, reason: str, operation_id: str
     ) -> dict[str, object]:
-        # A native runner can publish its terminal envelope immediately before
-        # a replacement testd receives cancellation.  Import durable terminal
-        # evidence (and expire any already-dead lease) before changing run
-        # state so cancellation never strands an attempt that has in fact
-        # finished and no longer has an in-memory worker binding.
-        self.replay_spool()
-        # Drain an already-published bounded chunk stream before changing run
-        # state. A running attempt with no result makes no progress and exits
-        # this loop after one observation; a complete result needs at most its
-        # 4096 chunks plus one terminal observation.
-        for _ in range(4_097):
-            before = {
-                attempt_id: len(active.result_chunk_ids)
-                for attempt_id, active in self._active.items()
-            }
-            self.heartbeat()
-            if not any(
-                attempt_id in self._active
-                and len(self._active[attempt_id].result_chunk_ids) > count
-                for attempt_id, count in before.items()
-            ):
-                break
-        else:  # pragma: no cover - the result contract caps chunks at 4096.
-            raise TestStoreConflict("runner result stream exceeded its drain bound")
-        self.reap()
         result = self.store.request_cancel(
-            run_id, actor=actor, reason=reason, operation_id=operation_id
+            run_id,
+            actor=actor,
+            reason=reason,
+            operation_id=operation_id,
         )
-        cancelled: list[str] = []
-        unresolved: list[str] = []
-        for attempt_id in result["active_attempt_ids"]:
-            active = self._active.get(str(attempt_id))
-            if active is None:
-                unresolved.append(str(attempt_id))
-                continue
-            if self.launcher.cancel(active.handle, reason=reason):
-                if self._spool_terminal(active, AttemptConclusion.CANCELLED):
-                    cancelled.append(str(attempt_id))
-                else:
-                    unresolved.append(str(attempt_id))
-            else:
-                unresolved.append(str(attempt_id))
-        return {**result, "cancelled_attempt_ids": cancelled, "unresolved_attempt_ids": unresolved}
-
-    def _spool_terminal(
-        self,
-        active: _ActiveAttempt,
-        conclusion: AttemptConclusion,
-        *,
-        peak_memory_bytes: int | None = None,
-        cpu_seconds: float | None = None,
-    ) -> bool:
-        envelope = active.terminal_envelope
-        if envelope is None:
-            duration = max(0.0, float(self.clock()) - active.launched_at)
-            identity = hashlib.sha256(
-                (
-                    active.lease.attempt_id
-                    + "\0"
-                    + str(active.lease.generation)
-                    + "\0"
-                    + conclusion.value
-                    + "\0"
-                    + ",".join(active.result_chunk_ids)
-                ).encode("utf-8")
-            ).hexdigest()
-            envelope = AttemptExitEnvelope(
-                envelope_id="exit-" + identity[:32],
-                attempt_id=active.lease.attempt_id,
-                generation=active.lease.generation,
-                operation_id=_stable_operation_id(
-                    "terminal",
-                    active.lease.attempt_id,
-                    active.lease.generation,
-                    conclusion.value,
-                    identity,
-                ),
-                conclusion=conclusion,
-                duration_seconds=duration,
-                result_chunk_ids=tuple(active.result_chunk_ids),
-                peak_memory_bytes=peak_memory_bytes,
-                cpu_seconds=cpu_seconds,
-            )
-            active.terminal_envelope = envelope
-            self._retain_active(active)
-        elif envelope.conclusion is not conclusion:
-            raise TestStoreConflict(
-                "active attempt terminal conclusion changed during replay"
-            )
-        terminal_path = self.spool.append(envelope)
-        self.replay_spool(priority_exit_names=(terminal_path.name,))
-        attempt = self.store.get_attempt(active.lease.attempt_id)
-        if str(attempt["state"]) in {"leased", "running"}:
-            self.store.heartbeat_attempt(
-                active.lease.attempt_id,
-                generation=active.lease.generation,
-                lease_seconds=self.lease_seconds,
-                operation_id=str(uuid.uuid4()),
-            )
-            return False
-        return True
-
-    @staticmethod
-    def _validate_exit(active: _ActiveAttempt, envelope: AttemptExitEnvelope) -> None:
-        if (
-            envelope.attempt_id != active.lease.attempt_id
-            or envelope.generation != active.lease.generation
-        ):
-            raise TestStoreConflict("runner exit envelope is stale or mismatched")
-
-    def replay_spool(
-        self,
-        *,
-        limit: int = 1_000,
-        priority_exit_names: tuple[str, ...] = (),
-    ) -> dict[str, object]:
-        chunks = self.replay_result_spool(limit=limit)
-        exits = self.spool.replay(
-            self._import_terminal_envelope,
-            limit=limit,
-            priority_names=priority_exit_names,
-        )
-        self._collect_terminal_attempts()
-        return {**exits, "result_chunks": chunks}
-
-    def _import_terminal_envelope(
-        self, envelope: AttemptExitEnvelope
-    ) -> dict[str, object]:
-        try:
-            return self.store.terminalize_attempt(
-                envelope.attempt_id,
-                generation=envelope.generation,
-                conclusion=envelope.conclusion,
-                duration_seconds=envelope.duration_seconds,
-                operation_id=envelope.operation_id,
-                expected_result_chunk_ids=envelope.result_chunk_ids,
-                peak_memory_bytes=envelope.peak_memory_bytes,
-                cpu_seconds=envelope.cpu_seconds,
-            )
-        except TestStoreConflict:
-            attempt = self.store.get_attempt(envelope.attempt_id)
-            if (
-                int(attempt["generation"]) == envelope.generation
-                and str(attempt["state"]) not in {"leased", "running"}
-                and attempt["terminal_operation_id"] is not None
-            ):
-                return {
-                    "attempt_id": envelope.attempt_id,
-                    "state": str(attempt["state"]),
-                    "replayed_terminal_transport": True,
-                }
-            raise
-
-    def replay_result_spool(self, *, limit: int = 1_000) -> dict[str, object]:
-        return self.spool.replay_result_chunks(
-            self._import_result_envelope,
-            limit=limit,
-        )
-
-    def _import_result_envelope(
-        self, envelope: AttemptResultChunkEnvelope
-    ) -> dict[str, object]:
-        try:
-            return self.store.append_result_chunk(
-                envelope.attempt_id,
-                generation=envelope.generation,
-                chunk=_attempt_scoped_result_chunk(
-                    envelope.attempt_id, envelope.chunk
-                ),
-            )
-        except TestStoreConflict:
-            attempt = self.store.get_attempt(envelope.attempt_id)
-            if (
-                int(attempt["generation"]) == envelope.generation
-                and str(attempt["state"]) not in {"leased", "running"}
-                and attempt["terminal_operation_id"] is not None
-            ):
-                return {
-                    "attempt_id": envelope.attempt_id,
-                    "state": str(attempt["state"]),
-                    "replayed_result_transport": True,
-                }
-            raise
-
-    def reap(self) -> dict[str, object]:
-        return self.store.reap_expired_attempts(now=float(self.clock()))
+        before = set(self._active)
+        heartbeat = self.heartbeat()
+        completed = [
+            execution_id
+            for execution_id in result.get("active_execution_ids", ())
+            if execution_id in before and execution_id not in self._active
+        ]
+        unresolved = [
+            execution_id
+            for execution_id in result.get("active_execution_ids", ())
+            if execution_id in self._active
+        ]
+        return {
+            **result,
+            "cancelled_attempt_ids": completed,
+            "cancelled_execution_ids": completed,
+            "unresolved_attempt_ids": unresolved,
+            "unresolved_execution_ids": unresolved,
+            "supervision_failures": heartbeat["failures"],
+        }
 
 
 class TestdEngineLoop:
-    """Supervise scheduling, heartbeats, spool replay, and lease reaping."""
+    """Periodic schema-v8 supervision with no lease or replay turns."""
 
     def __init__(
         self,
@@ -1887,83 +1366,74 @@ class TestdEngineLoop:
         launch_batch: int = 64,
     ) -> None:
         if not isinstance(engine, TestdEngine):
-            raise TestStoreContractError("testd engine loop requires TestdEngine")
-        if not 0.05 <= float(interval_seconds) <= 60:
-            raise TestStoreContractError("testd engine interval is invalid")
+            raise TestStoreContractError("engine is invalid")
+        if (
+            isinstance(interval_seconds, bool)
+            or not isinstance(interval_seconds, (int, float))
+            or not 0.05 <= float(interval_seconds) <= 60
+        ):
+            raise TestStoreContractError("interval_seconds is invalid")
+        if type(launch_batch) is not int or not 1 <= launch_batch <= 1_000:
+            raise TestStoreContractError("launch_batch is invalid")
         self.engine = engine
         self.interval_seconds = float(interval_seconds)
-        self.launch_batch = _positive_int(
-            "launch_batch", launch_batch, maximum=1_000
-        )
+        self.launch_batch = launch_batch
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        self.last_result: Mapping[str, object] | None = None
+        self.last_error: Exception | None = None
 
     def run_once(self) -> Mapping[str, object]:
-        # Reconcile launched work before admitting more, then reap only after
-        # current leases have had a chance to heartbeat.
         heartbeat = self.engine.heartbeat()
-        heartbeat_failures = heartbeat.get("failures")
-        if isinstance(heartbeat_failures, list) and heartbeat_failures:
-            # A retiring testd can briefly lose the matching authority release
-            # while its native attempts and durable spool remain valid. Never
-            # let that failed supervision turn into lease abandonment or new
-            # launches. The replacement recovers the exact spool binding and
-            # performs the next clean heartbeat before reaping.
-            return {
-                "heartbeat": heartbeat,
-                # Scheduling remains independently fail-closed at ticket and
-                # launch boundaries. Let unrelated repositories make progress
-                # while one active attempt needs supervision recovery; only
-                # lease destruction is unsafe without a clean heartbeat.
-                "schedule": self.engine.schedule(
-                    launch_batch=self.launch_batch
-                ),
-                "reaped": {
-                    "skipped": True,
-                    "reason": "heartbeat_failures",
-                },
-            }
         schedule = self.engine.schedule(launch_batch=self.launch_batch)
-        reaped = self.engine.reap()
-        return {"heartbeat": heartbeat, "schedule": schedule, "reaped": reaped}
+        result = {"heartbeat": heartbeat, "schedule": schedule}
+        self.last_result = result
+        self.last_error = None
+        return result
 
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
-            raise TestStoreConflict("testd engine loop is already running")
+            return
         self._stop.clear()
+
+        def run() -> None:
+            while not self._stop.wait(self.interval_seconds):
+                try:
+                    self.run_once()
+                except Exception as error:  # pragma: no cover - defensive daemon loop.
+                    self.last_error = error
+
         self._thread = threading.Thread(
-            target=self.serve_forever,
-            name="devcoordinator-testd-engine",
+            target=run,
+            name="devcoordinator-testd",
             daemon=True,
         )
         self._thread.start()
 
     def serve_forever(self) -> None:
-        while not self._stop.is_set():
-            try:
-                self.run_once()
-            except Exception:
-                _LOGGER.exception("testd scheduler iteration failed")
-            self._stop.wait(self.interval_seconds)
+        self.start()
+        while not self._stop.wait(self.interval_seconds):
+            pass
 
     def close(self, *, timeout: float = 10.0) -> None:
         self._stop.set()
         thread = self._thread
-        if thread is not None and thread is not threading.current_thread():
-            thread.join(timeout=max(0.0, timeout))
+        if thread is not None:
+            thread.join(timeout)
             if thread.is_alive():
-                raise TestStoreConflict("testd engine loop did not stop")
+                raise TestStoreConflict("testd loop did not stop within its bound")
         self._thread = None
 
 
 __all__ = [
     "BrokerLaunchTicket",
     "BrokerLaunchTicketIssuer",
-    "LiveSourceChanged",
     "RunnerHandle",
     "RunnerLauncher",
     "RunnerObservation",
+    "RunnerResultPackage",
     "RuntimeRequestSubmitter",
+    "TESTD_RUNNER_SCHEMA_VERSION",
     "TestdEngine",
     "TestdEngineLoop",
     "TestdLaunchAdapter",
