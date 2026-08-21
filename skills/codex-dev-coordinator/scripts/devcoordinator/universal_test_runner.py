@@ -42,12 +42,16 @@ from devcoordinator.universal_test_drivers import (  # type: ignore[import-not-f
 )
 from devcoordinator.universal_test_store import TestStoreContractError  # type: ignore[import-not-found]
 from devcoordinator.universal_test_reporters import ReporterDrivers  # type: ignore[import-not-found]
+from devcoordinator.universal_test_result_package import (  # type: ignore[import-not-found]
+    RESULT_PACKAGE_FILE_NAME,
+    ResultPackageArtifact,
+    ResultPackageError,
+    publish_result_package,
+)
 
 
 MAX_LAUNCH_BYTES = 256 * 1024
 MAX_RESULT_BYTES = 2 * 1024 * 1024
-MAX_RESULT_CHUNK_BYTES = 240 * 1024
-MAX_RESULT_CHUNKS = 4_096
 MAX_CAPTURE_BYTES = 4 * 1024 * 1024
 MAX_REPORT_BYTES = 32 * 1024 * 1024
 MAX_TRX_INPUT_BYTES = 512 * 1024 * 1024
@@ -55,8 +59,8 @@ MAX_TRX_DETAIL_CHARACTERS = 16 * 1024
 MAX_TRX_XML_DEPTH = 128
 MAX_CASES = 100_000
 # A detailed failure is part of each failed/error case's result, not a sample.
-# The chunk stream already bounds transport and storage independently.
-MAX_FAILURES = MAX_CASES
+# The atomic package bounds record bytes and artifact bytes independently.
+MAX_FAILURES = MAX_CASES + 256
 MAX_ARTIFACTS = 64
 MAX_FAILURE_DIAGNOSTIC_BYTES = 256 * 1024
 MAX_FAILURE_DIAGNOSTIC_FILE_BYTES = 64 * 1024
@@ -593,7 +597,7 @@ def _load(path: Path) -> tuple[TestAttemptDescriptor, Path, Path]:
         or not stat.S_ISDIR(output_metadata.st_mode)
         or stat.S_ISLNK(output_metadata.st_mode)
         or result_path.parent != output_root
-        or result_path.name != "result.json"
+        or result_path.name != RESULT_PACKAGE_FILE_NAME
     ):
         raise TestStoreContractError("runner output boundary is unsafe")
     return descriptor, output_root, result_path
@@ -1033,62 +1037,6 @@ def _directory_failure_diagnostic(
         kind="log",
         name="failure-diagnostics",
     )
-
-
-def _artifact_sources(
-    artifacts: Sequence[Mapping[str, object]],
-    *,
-    output: Path,
-    execution_root: Path,
-) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
-    """Separate private collection paths from public exact-ID metadata."""
-
-    public: list[dict[str, object]] = []
-    sources: list[dict[str, object]] = []
-    for raw in artifacts:
-        value = dict(raw)
-        source_text = value.pop("_source_path", None)
-        packaged_from_text = value.pop("_packaged_from_path", None)
-        if not isinstance(source_text, str):
-            raise TestStoreContractError("runner artifact source is missing")
-        source = Path(source_text)
-        try:
-            relative = source.relative_to(output)
-            scope = "output"
-        except ValueError:
-            try:
-                relative = source.relative_to(execution_root)
-                scope = "execution"
-            except ValueError as error:
-                raise TestStoreContractError(
-                    "runner artifact source escapes trusted roots"
-                ) from error
-        if not relative.parts or any(part in {".", ".."} for part in relative.parts):
-            raise TestStoreContractError("runner artifact relative path is invalid")
-        public.append(value)
-        packaged_from: str | None = None
-        if packaged_from_text is not None:
-            if value.get("kind") != "directory" or not isinstance(packaged_from_text, str):
-                raise TestStoreContractError("runner directory artifact source is invalid")
-            try:
-                packaged_from = Path(packaged_from_text).relative_to(execution_root).as_posix()
-            except ValueError as error:
-                raise TestStoreContractError(
-                    "runner directory artifact source escapes execution root"
-                ) from error
-        sources.append(
-            {
-                "artifact_id": value["artifact_id"],
-                "storage_handle": value["storage_handle"],
-                "kind": value["kind"],
-                "scope": scope,
-                "relative_path": relative.as_posix(),
-                "packaged_from": packaged_from,
-                "sha256": value["sha256"],
-                "size_bytes": value["size_bytes"],
-            }
-        )
-    return public, sources
 
 
 class DotnetReadinessFailure(NamedTuple):
@@ -2102,129 +2050,113 @@ def _junit_cases(path: Path) -> tuple[list[dict[str, object]], list[dict[str, ob
     return cases, failures
 
 
-def _result_chunks(
+def _private_result_paths(
+    descriptor: TestAttemptDescriptor, output: Path
+) -> tuple[tuple[str, str], ...]:
+    replacements: dict[str, str] = {
+        str(Path(descriptor.original_root)): "<repository>",
+        str(Path(descriptor.execution_root)): "<execution-root>",
+        str(Path(descriptor.worktree_key)): "<worktree>",
+        str(output): "<attempt-output>",
+    }
+    if descriptor.temporary_root is not None:
+        replacements[str(Path(descriptor.temporary_root))] = "<temporary-repository>"
+    return tuple(
+        sorted(replacements.items(), key=lambda item: len(item[0]), reverse=True)
+    )
+
+
+def _sanitize_result_text(value: object, replacements: Sequence[tuple[str, str]]) -> object:
+    if not isinstance(value, str):
+        return value
+    sanitized = value
+    for private, public in replacements:
+        sanitized = sanitized.replace(private, public)
+    return sanitized
+
+
+def _sanitize_result_records(
+    values: Sequence[Mapping[str, object]],
+    *,
+    replacements: Sequence[tuple[str, str]],
+) -> list[dict[str, object]]:
+    return [
+        {
+            name: _sanitize_result_text(value, replacements)
+            for name, value in item.items()
+        }
+        for item in values
+    ]
+
+
+def _ensure_failed_case_evidence(
     descriptor: TestAttemptDescriptor,
     *,
     cases: Sequence[Mapping[str, object]],
-    failures: Sequence[Mapping[str, object]],
-    artifacts: Sequence[Mapping[str, object]],
-    reporter_complete: bool,
-) -> tuple[dict[str, object], ...]:
-    """Partition reporter output into independently bounded store chunks."""
+    failures: list[dict[str, object]],
+) -> None:
+    """Retain one detailed failure for every failed/error case."""
 
-    limits = {"cases": 500, "failures": 64, "artifacts": 64}
-    chunks: list[dict[str, object]] = []
-    current: dict[str, object] = {
-        "cases": [],
-        "failures": [],
-        "artifacts": [],
+    retained = {
+        str(item["case_id"])
+        for item in failures
+        if item.get("case_id") is not None
     }
-
-    def encoded_size(value: Mapping[str, object]) -> int:
-        probe = {
-            "chunk_id": "chunk-" + "0" * 32,
-            "chunk_index": len(chunks),
-            "cases": value["cases"],
-            "failures": value["failures"],
-            "artifacts": value["artifacts"],
-            "reporter_complete": False,
-        }
-        return len(_json_bytes(probe, maximum=MAX_RESULT_CHUNK_BYTES + 1))
-
-    def flush() -> None:
-        nonlocal current
-        if not any(current[name] for name in ("cases", "failures", "artifacts")):
-            return
-        if len(chunks) >= MAX_RESULT_CHUNKS:
-            raise TestStoreContractError("runner produced too many result chunks")
-        chunks.append(current)
-        current = {"cases": [], "failures": [], "artifacts": []}
-
-    for field, values in (
-        ("artifacts", artifacts),
-        ("failures", failures),
-        ("cases", cases),
-    ):
-        for raw in values:
-            collection = current[field]
-            if not isinstance(collection, list):
-                raise TestStoreContractError("runner result chunk accumulator is invalid")
-            collection.append(dict(raw))
-            try:
-                excessive = len(collection) > limits[field] or encoded_size(current) > MAX_RESULT_CHUNK_BYTES
-            except TestStoreContractError:
-                excessive = True
-            if excessive:
-                collection.pop()
-                flush()
-                replacement = current[field]
-                if not isinstance(replacement, list):
-                    raise TestStoreContractError(
-                        "runner result chunk accumulator is invalid"
-                    )
-                replacement.append(dict(raw))
-                if encoded_size(current) > MAX_RESULT_CHUNK_BYTES:
-                    raise TestStoreContractError(
-                        f"single runner {field[:-1]} exceeds the result chunk bound"
-                    )
-    flush()
-    if not chunks:
-        chunks.append({"cases": [], "failures": [], "artifacts": []})
-    normalized: list[dict[str, object]] = []
-    for index, values in enumerate(chunks):
-        identity = hashlib.sha256(
-            (
-                descriptor.attempt_id
-                + "\0"
-                + str(descriptor.generation)
-                + "\0"
-                + str(index)
-            ).encode("utf-8")
-        ).hexdigest()[:32]
-        normalized.append(
+    for case in cases:
+        if case.get("status") not in {"failed", "error"}:
+            continue
+        case_id = str(case["case_id"])
+        if case_id in retained:
+            continue
+        if len(failures) >= MAX_FAILURES:
+            raise TestStoreContractError(
+                "runner failures exceed the complete evidence bound"
+            )
+        failures.append(
             {
-                "chunk_id": "chunk-" + identity,
-                "chunk_index": index,
-                "cases": values["cases"],
-                "failures": values["failures"],
-                "artifacts": values["artifacts"],
-                "reporter_complete": reporter_complete and index == len(chunks) - 1,
+                "failure_id": "failure-"
+                + hashlib.sha256(
+                    (
+                        descriptor.attempt_id
+                        + "\0missing-case-detail\0"
+                        + case_id
+                    ).encode("utf-8")
+                ).hexdigest()[:32],
+                "classification": "test_failure",
+                "message": (
+                    f"{case.get('display_name') or case_id} reported "
+                    f"{case.get('status')} without a reporter diagnostic"
+                )[:8192],
+                "case_id": case_id,
+                "location": case.get("location"),
+                "artifact_id": None,
             }
         )
-    return tuple(normalized)
+        retained.add(case_id)
 
 
-def _write_result_chunks(
-    output: Path, chunks: Sequence[Mapping[str, object]]
-) -> list[dict[str, object]]:
-    manifest: list[dict[str, object]] = []
-    for index, chunk in enumerate(chunks):
-        if chunk.get("chunk_index") != index:
-            raise TestStoreContractError("runner result chunk ordering is invalid")
-        payload = _json_bytes(chunk, maximum=MAX_RESULT_CHUNK_BYTES)
-        name = f"result-chunk-{index:06d}.json"
-        path = output / name
-        descriptor_fd = os.open(
-            path,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
-            0o600,
+def _result_package_artifacts(
+    values: Sequence[Mapping[str, object]],
+) -> tuple[ResultPackageArtifact, ...]:
+    result: list[ResultPackageArtifact] = []
+    for raw in values:
+        value = dict(raw)
+        source = value.pop("_source_path", None)
+        value.pop("_packaged_from_path", None)
+        if not isinstance(source, str):
+            raise TestStoreContractError("runner artifact source is missing")
+        result.append(
+            ResultPackageArtifact(
+                artifact_id=str(value["artifact_id"]),
+                kind=str(value["kind"]),
+                storage_handle=str(value["storage_handle"]),
+                sha256=str(value["sha256"]),
+                size_bytes=int(value["size_bytes"]),
+                verified=value["verified"] is True,
+                source_path=Path(source),
+            )
         )
-        try:
-            _write_all(descriptor_fd, payload)
-            os.fsync(descriptor_fd)
-        finally:
-            os.close(descriptor_fd)
-        manifest.append(
-            {
-                "chunk_id": chunk["chunk_id"],
-                "chunk_index": index,
-                "file_name": name,
-                "sha256": hashlib.sha256(payload).hexdigest(),
-                "size_bytes": len(payload),
-                "reporter_complete": chunk["reporter_complete"],
-            }
-        )
-    return manifest
+    return tuple(result)
 
 
 def _terminal_outcome(
@@ -2256,9 +2188,11 @@ def run(
     cwd = (root / descriptor.cwd).resolve(strict=True)
     if root != cwd and root not in cwd.parents:
         raise TestStoreContractError("runner cwd escapes attempt root")
+    if result_path != output / RESULT_PACKAGE_FILE_NAME:
+        raise TestStoreContractError("runner result package boundary is invalid")
     stdout_path = output / f"{descriptor.attempt_id}-stdout.log"
     stderr_path = output / f"{descriptor.attempt_id}-stderr.log"
-    for path in (stdout_path, stderr_path, result_path):
+    for path in (stdout_path, stderr_path):
         path.unlink(missing_ok=True)
     adapted_argv, adapted_environment, generated_reporter, generated_kind = (
         adapt_driver_invocation(descriptor, output)
@@ -2890,25 +2824,19 @@ def run(
             }
         )
     artifacts = artifacts[:MAX_ARTIFACTS]
-    artifacts, artifact_sources = _artifact_sources(
-        artifacts,
-        output=output,
-        execution_root=root,
-    )
-    chunks = _result_chunks(
+    package_artifacts = _result_package_artifacts(artifacts)
+    replacements = _private_result_paths(descriptor, output)
+    cases = _sanitize_result_records(cases, replacements=replacements)
+    failures = _sanitize_result_records(failures, replacements=replacements)
+    _ensure_failed_case_evidence(
         descriptor,
         cases=cases,
         failures=failures,
-        artifacts=artifacts,
-        reporter_complete=not incomplete,
     )
-    chunk_manifest = _write_result_chunks(output, chunks)
-    public_stdout_state = {
-        key: value for key, value in stdout_state.items() if not key.startswith("_")
-    }
-    public_stderr_state = {
-        key: value for key, value in stderr_state.items() if not key.startswith("_")
-    }
+    if len(failures) > MAX_FAILURES:
+        raise TestStoreContractError(
+            "runner failures exceed the complete evidence bound"
+        )
     for state in (stdout_state, stderr_state):
         descriptor_fd = state.pop("_descriptor", None)
         if type(descriptor_fd) is int:
@@ -2918,42 +2846,61 @@ def run(
         incomplete_reporting=incomplete,
         failures=failures,
     )
-    result = {
-        "schema_version": 3,
-        "attempt_id": descriptor.attempt_id,
-        "generation": descriptor.generation,
-        "returncode": returncode,
-        "duration_seconds": duration,
-        "peak_memory_bytes": peak_memory_bytes,
-        "cpu_seconds": cpu_seconds,
-        "incomplete_reporting": incomplete,
-        "terminal_outcome": terminal_outcome,
-        "captures": {
-            "stdout": {
-                "path": str(stdout_path),
-                "artifact_id": stdout_artifact["artifact_id"],
-                **public_stdout_state,
-            },
-            "stderr": {
-                "path": str(stderr_path),
-                "artifact_id": stderr_artifact["artifact_id"],
-                **public_stderr_state,
-            },
-        },
-        "artifact_sources": artifact_sources,
-        "chunk_manifest": chunk_manifest,
-    }
-    payload = _json_bytes(result)
-    descriptor_fd = os.open(
-        result_path,
-        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
-        0o600,
-    )
+
+    def capture_document(
+        state: Mapping[str, object], artifact: Mapping[str, object]
+    ) -> dict[str, object]:
+        secret_redacted = state.get("secret_redacted") is True
+        retained_sha256 = str(state["retained_sha256"])
+        return {
+            "artifact_id": artifact["artifact_id"],
+            "sha256": (
+                retained_sha256 if secret_redacted else str(state["sha256"])
+            ),
+            "retained_sha256": retained_sha256,
+            "size_bytes": int(state["size_bytes"]),
+            "observed_bytes": int(state["observed_bytes"]),
+            "truncated": bool(state["truncated"]),
+            "secret_redacted": secret_redacted,
+        }
+
     try:
-        _write_all(descriptor_fd, payload)
-        os.fsync(descriptor_fd)
-    finally:
-        os.close(descriptor_fd)
+        publish_result_package(
+            result_path,
+            identity={
+                "attempt_id": descriptor.attempt_id,
+                "target_id": descriptor.target_id,
+                "run_id": descriptor.run_id,
+                "repository_id": descriptor.repository_id,
+                "repository_generation": descriptor.repository_generation,
+                "generation": descriptor.generation,
+                "descriptor_sha256": descriptor.fingerprint,
+            },
+            outcome={
+                "returncode": returncode,
+                "duration_seconds": duration,
+                "incomplete_reporting": incomplete,
+                "reporter_complete": not incomplete,
+                "terminal_outcome": terminal_outcome,
+            },
+            resource_usage={
+                "peak_memory_bytes": peak_memory_bytes,
+                "cpu_seconds": cpu_seconds,
+            },
+            captures={
+                "stdout": capture_document(stdout_state, stdout_artifact),
+                "stderr": capture_document(stderr_state, stderr_artifact),
+            },
+            cases=cases,
+            failures=failures,
+            artifacts=package_artifacts,
+            prohibited_sequences=_EXACT_SECRET_VARIANTS,
+            prohibited_metadata_sequences=tuple(
+                os.fsencode(private) for private, _public in replacements
+            ),
+        )
+    except ResultPackageError as error:
+        raise TestStoreContractError(str(error)) from error
     return 0 if returncode == 0 and not incomplete else 1
 
 

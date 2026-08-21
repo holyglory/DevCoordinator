@@ -24,11 +24,16 @@ from devcoordinator.universal_test_runner import (
     _dotnet_restore_project,
     _dotnet_restore_semantic_options,
     _load,
-    _result_chunks,
     _run_dotnet_probe,
     _trx_cases,
     adapt_driver_invocation,
     run,
+)
+from devcoordinator.universal_test_result_package import (
+    RESULT_PACKAGE_FILE_NAME,
+    copy_result_package_artifact,
+    iter_result_package_records,
+    validate_result_package,
 )
 from devcoordinator.universal_test_runtime import (
     SystemdTestAttemptManager,
@@ -79,26 +84,25 @@ class UniversalTestRunnerTests(unittest.TestCase):
         )
 
     def result_cases(self, result_path: Path) -> list[dict[str, object]]:
-        result = json.loads(result_path.read_text(encoding="utf-8"))
-        return [
-            case
-            for item in result["chunk_manifest"]
-            for case in json.loads(
-                (result_path.parent / item["file_name"]).read_text(
-                    encoding="utf-8"
-                )
-            )["cases"]
-        ]
+        return list(
+            iter_result_package_records(
+                validate_result_package(result_path), "cases"
+            )
+        )
 
     def result_chunks(self, result_path: Path) -> list[dict[str, object]]:
-        result = json.loads(result_path.read_text(encoding="utf-8"))
+        package = validate_result_package(result_path)
         return [
-            json.loads(
-                (result_path.parent / item["file_name"]).read_text(
-                    encoding="utf-8"
-                )
-            )
-            for item in result["chunk_manifest"]
+            {
+                "cases": list(iter_result_package_records(package, "cases")),
+                "failures": list(
+                    iter_result_package_records(package, "failures")
+                ),
+                "artifacts": list(package.manifest["artifacts"]),
+                "reporter_complete": package.manifest["outcome"][
+                    "reporter_complete"
+                ],
+            }
         ]
 
     def result_failures(self, result_path: Path) -> list[dict[str, object]]:
@@ -107,6 +111,26 @@ class UniversalTestRunnerTests(unittest.TestCase):
             for chunk in self.result_chunks(result_path)
             for failure in chunk["failures"]
         ]
+
+    def result_document(self, result_path: Path) -> dict[str, object]:
+        package = validate_result_package(result_path)
+        manifest = package.manifest
+        return {
+            "schema_version": manifest["schema_version"],
+            **dict(manifest["identity"]),
+            **dict(manifest["outcome"]),
+            **dict(manifest["resource_usage"]),
+            "counts": dict(manifest["counts"]),
+            "captures": dict(manifest["captures"]),
+            "artifacts": list(manifest["artifacts"]),
+            "package_sha256": package.evidence.sha256,
+        }
+
+    def result_artifact_bytes(self, result_path: Path, artifact_id: str) -> bytes:
+        package = validate_result_package(result_path)
+        destination = io.BytesIO()
+        copy_result_package_artifact(package, artifact_id, destination)
+        return destination.getvalue()
 
     def fake_dotnet(self, source: str) -> Path:
         executable = self.root / "fake-dotnet"
@@ -184,7 +208,6 @@ class UniversalTestRunnerTests(unittest.TestCase):
         self, descriptor: TestAttemptDescriptor, result_path: Path
     ) -> str:
         paths = (
-            result_path,
             self.output / f"{descriptor.attempt_id}-stdout.log",
             self.output / f"{descriptor.attempt_id}-stderr.log",
         )
@@ -195,13 +218,14 @@ class UniversalTestRunnerTests(unittest.TestCase):
                     encoding="utf-8", errors="replace"
                 )[-8000:]
         if result_path.is_file():
-            result = json.loads(result_path.read_text(encoding="utf-8"))
-            for item in result.get("chunk_manifest", []):
-                path = result_path.parent / item["file_name"]
-                if path.is_file():
-                    values[path.name] = path.read_text(
-                        encoding="utf-8", errors="replace"
-                    )[-8000:]
+            package = validate_result_package(result_path)
+            values["manifest.json"] = json.dumps(
+                package.manifest, sort_keys=True, default=dict
+            )[-8000:]
+            values["failures.ndjson"] = json.dumps(
+                list(iter_result_package_records(package, "failures")),
+                sort_keys=True,
+            )[-8000:]
         return json.dumps(values, indent=2, sort_keys=True)
 
     def test_systemd_manager_ticketed_launch_loads_exact_runner_contract(self) -> None:
@@ -327,21 +351,17 @@ class UniversalTestRunnerTests(unittest.TestCase):
                 "import sys;sys.stdout.write('out');sys.stderr.write('err');sys.exit(7)",
             )
         )
-        result_path = self.output / "result.json"
+        result_path = self.output / RESULT_PACKAGE_FILE_NAME
 
         self.assertEqual(run(descriptor, self.output, result_path), 1)
 
-        result = json.loads(result_path.read_text(encoding="utf-8"))
-        self.assertEqual(result["schema_version"], 3)
+        result = self.result_document(result_path)
+        self.assertEqual(result["schema_version"], 1)
         self.assertIsInstance(result["peak_memory_bytes"], int)
         self.assertGreater(result["peak_memory_bytes"], 0)
         self.assertIsInstance(result["cpu_seconds"], float)
         self.assertGreaterEqual(result["cpu_seconds"], 0.0)
-        chunks = [
-            json.loads((self.output / item["file_name"]).read_text(encoding="utf-8"))
-            for item in result["chunk_manifest"]
-        ]
-        artifacts = [item for chunk in chunks for item in chunk["artifacts"]]
+        artifacts = result["artifacts"]
         self.assertEqual({item["kind"] for item in artifacts}, {"log", "trace"})
         self.assertEqual(len(artifacts), 3)
         self.assertTrue(
@@ -361,8 +381,7 @@ class UniversalTestRunnerTests(unittest.TestCase):
         self.assertEqual(stderr["retained_sha256"], hashlib.sha256(b"err").hexdigest())
         failure = next(
             item
-            for chunk in chunks
-            for item in chunk["failures"]
+            for item in self.result_failures(result_path)
             if item["classification"] == "test_failure"
         )
         self.assertIn("status 7", failure["message"])
@@ -379,54 +398,10 @@ class UniversalTestRunnerTests(unittest.TestCase):
         self.assertEqual(len(provenance["executable"]["sha256"]), 64)
         self.assertNotIn(str(self.root), json.dumps(provenance))
 
-        attempt_root = Path(self.temporary.name) / "attempts"
-        runtime_id = "devcoordinator-test-artifact-resolution"
-        state = attempt_root / runtime_id
-        state.mkdir(parents=True)
-        shutil.copytree(self.output, state / "output", copy_function=shutil.copy2)
-        launch_path = state / "launch.json"
-        launch_path.write_text(
-            json.dumps({"descriptor": descriptor.to_document()}), encoding="utf-8"
-        )
-        launch_path.chmod(0o400)
-        manager = SystemdTestAttemptManager(
-            attempt_root=attempt_root,
-            artifact_root=Path(self.temporary.name) / "artifacts",
-        )
-        copied_result = json.loads(
-            (state / "output" / "result.json").read_text(encoding="utf-8")
-        )
-        manager._collect_result_artifacts(runtime_id, copied_result)
         for item in artifacts:
-            resolved = manager.resolve_artifact(
-                item["storage_handle"], expected_size=item["size_bytes"]
-            )
-            self.assertTrue(resolved.is_file())
-        first = artifacts[0]
-        resolved = manager.resolve_artifact(first["storage_handle"])
-        original = resolved.read_bytes()
-        resolved.write_bytes(original + b"tampered")
-        resolved.chmod(0o600)
-        with self.assertRaisesRegex(TestStoreConflict, "invalid"):
-            manager.resolve_artifact(first["storage_handle"])
-        resolved.unlink()
-        resolved.symlink_to(self.root / "unrelated-secret")
-        (self.root / "unrelated-secret").write_text("private", encoding="utf-8")
-        with self.assertRaisesRegex(TestStoreConflict, "invalid"):
-            manager.resolve_artifact(first["storage_handle"])
-        with self.assertRaisesRegex(TestStoreConflict, "unavailable"):
-            manager.resolve_artifact(
-                first["storage_handle"][:-1]
-                + ("0" if first["storage_handle"][-1] != "0" else "1")
-            )
-        escaped = json.loads(json.dumps(copied_result))
-        escaped["artifact_sources"][0]["relative_path"] = "../unrelated-secret"
-        second_manager = SystemdTestAttemptManager(
-            attempt_root=attempt_root,
-            artifact_root=Path(self.temporary.name) / "escaped-artifacts",
-        )
-        with self.assertRaisesRegex(TestStoreConflict, "identity"):
-            second_manager._collect_result_artifacts(runtime_id, escaped)
+            payload = self.result_artifact_bytes(result_path, item["artifact_id"])
+            self.assertEqual(hashlib.sha256(payload).hexdigest(), item["sha256"])
+            self.assertEqual(len(payload), item["size_bytes"])
 
     def test_capture_progress_advances_after_retained_artifact_cap(self) -> None:
         destination = self.output / "bounded.log"
@@ -475,32 +450,25 @@ class UniversalTestRunnerTests(unittest.TestCase):
                 },
             ),
         )
-        result_path = self.output / "result.json"
+        result_path = self.output / RESULT_PACKAGE_FILE_NAME
 
         self.assertEqual(run(descriptor, self.output, result_path), 1)
 
-        result = json.loads(result_path.read_text(encoding="utf-8"))
-        chunks = [
-            json.loads((self.output / item["file_name"]).read_text(encoding="utf-8"))
-            for item in result["chunk_manifest"]
-        ]
-        artifacts = [item for chunk in chunks for item in chunk["artifacts"]]
+        result = self.result_document(result_path)
+        artifacts = result["artifacts"]
+        failures = self.result_failures(result_path)
         failure = next(
             item
-            for chunk in chunks
-            for item in chunk["failures"]
+            for item in failures
             if item["classification"] == "test_failure"
         )
         diagnostic = next(
             item for item in artifacts if item["artifact_id"] == failure["artifact_id"]
         )
         self.assertEqual(diagnostic["kind"], "log")
-        source = next(
-            item
-            for item in result["artifact_sources"]
-            if item["artifact_id"] == diagnostic["artifact_id"]
-        )
-        payload = (self.output / source["relative_path"]).read_text(encoding="utf-8")
+        payload = self.result_artifact_bytes(
+            result_path, diagnostic["artifact_id"]
+        ).decode("utf-8")
         self.assertIn("== database.log ==", payload)
         self.assertIn("connection refused", payload)
         self.assertIn("<repository>/data", payload)
@@ -510,16 +478,12 @@ class UniversalTestRunnerTests(unittest.TestCase):
     def test_missing_declared_executable_publishes_bounded_infrastructure_result(self) -> None:
         missing = self.root / ".venv-v2" / "bin" / "python"
         descriptor = self.descriptor((str(missing.relative_to(self.root)), "-V"))
-        result_path = self.output / "result.json"
+        result_path = self.output / RESULT_PACKAGE_FILE_NAME
 
         self.assertEqual(run(descriptor, self.output, result_path), 1)
 
-        result = json.loads(result_path.read_text(encoding="utf-8"))
-        chunks = [
-            json.loads((self.output / item["file_name"]).read_text(encoding="utf-8"))
-            for item in result["chunk_manifest"]
-        ]
-        failures = [item for chunk in chunks for item in chunk["failures"]]
+        result = self.result_document(result_path)
+        failures = self.result_failures(result_path)
         failure = self.assert_single_infrastructure_failure(failures)
         self.assertEqual(failure["location"], "runner/bootstrap")
         self.assertIsInstance(failure["artifact_id"], str)
@@ -568,33 +532,23 @@ class UniversalTestRunnerTests(unittest.TestCase):
                 },
             ),
         )
-        result_path = self.output / "result.json"
+        result_path = self.output / RESULT_PACKAGE_FILE_NAME
         self.assertEqual(run(descriptor, self.output, result_path), 1)
-        result = json.loads(result_path.read_text(encoding="utf-8"))
+        result = self.result_document(result_path)
         self.assertNotIn(secret, json.dumps(result))
-        self.assertFalse(
-            any(
-                source["relative_path"] == "trace.log"
-                for source in result["artifact_sources"]
-            )
-        )
-        chunks = [
-            json.loads((self.output / item["file_name"]).read_text(encoding="utf-8"))
-            for item in result["chunk_manifest"]
-        ]
+        self.assertFalse(any(item["sha256"] == hashlib.sha256(artifact.read_bytes()).hexdigest() for item in result["artifacts"]))
         self.assertTrue(
             any(
                 "suspected secret material" in failure["message"]
-                for chunk in chunks
-                for failure in chunk["failures"]
+                for failure in self.result_failures(result_path)
             )
         )
 
     def test_collected_unit_uses_durable_runner_resource_measurements(self) -> None:
         descriptor = self.descriptor(("/usr/bin/python3", "-c", "pass"))
-        result_path = self.output / "result.json"
+        result_path = self.output / RESULT_PACKAGE_FILE_NAME
         self.assertEqual(run(descriptor, self.output, result_path), 0)
-        expected = json.loads(result_path.read_text(encoding="utf-8"))
+        expected = self.result_document(result_path)
 
         runtime_id = "devcoordinator-test-collected-usage"
         attempt_root = Path(self.temporary.name) / "collected-attempts"
@@ -625,9 +579,9 @@ class UniversalTestRunnerTests(unittest.TestCase):
 
     def test_successful_not_found_observation_drains_durable_result(self) -> None:
         descriptor = self.descriptor(("/usr/bin/python3", "-c", "pass"))
-        result_path = self.output / "result.json"
+        result_path = self.output / RESULT_PACKAGE_FILE_NAME
         self.assertEqual(run(descriptor, self.output, result_path), 0)
-        expected = json.loads(result_path.read_text(encoding="utf-8"))
+        expected = self.result_document(result_path)
 
         runtime_id = "devcoordinator-test-collected-not-found"
         attempt_root = Path(self.temporary.name) / "not-found-attempts"
@@ -665,20 +619,14 @@ class UniversalTestRunnerTests(unittest.TestCase):
 
     def test_loaded_unit_prefers_cgroup_usage_over_runner_fallback(self) -> None:
         descriptor = self.descriptor(("/usr/bin/python3", "-c", "pass"))
-        result_path = self.output / "result.json"
+        result_path = self.output / RESULT_PACKAGE_FILE_NAME
         self.assertEqual(run(descriptor, self.output, result_path), 0)
-        fallback = json.loads(result_path.read_text(encoding="utf-8"))
-        fallback["peak_memory_bytes"] = 16 * 1024 * 1024
-        fallback["cpu_seconds"] = 0.25
 
         runtime_id = "devcoordinator-test-cgroup-usage"
         attempt_root = Path(self.temporary.name) / "cgroup-attempts"
         state_root = attempt_root / runtime_id
         state_root.mkdir(parents=True)
         shutil.copytree(self.output, state_root / "output", copy_function=shutil.copy2)
-        (state_root / "output" / "result.json").write_text(
-            json.dumps(fallback), encoding="utf-8"
-        )
         (state_root / "launch.json").write_text(
             json.dumps({"descriptor": descriptor.to_document()}),
             encoding="utf-8",
@@ -712,9 +660,9 @@ class UniversalTestRunnerTests(unittest.TestCase):
 
     def test_active_unit_exposes_atomic_runner_result_for_terminal_convergence(self) -> None:
         descriptor = self.descriptor(("/usr/bin/python3", "-c", "pass"))
-        result_path = self.output / "result.json"
+        result_path = self.output / RESULT_PACKAGE_FILE_NAME
         self.assertEqual(run(descriptor, self.output, result_path), 0)
-        expected = json.loads(result_path.read_text(encoding="utf-8"))
+        expected = self.result_document(result_path)
         runtime_id = "devcoordinator-test-active-result"
         attempt_root = Path(self.temporary.name) / "active-result-attempts"
         state_root = attempt_root / runtime_id
@@ -881,7 +829,10 @@ class UniversalTestRunnerTests(unittest.TestCase):
         with mock.patch.dict(
             os.environ, {"CREDENTIALS_DIRECTORY": str(credentials)}
         ):
-            self.assertEqual(run(descriptor, self.output, self.output / "result.json"), 0)
+            self.assertEqual(
+                run(descriptor, self.output, self.output / RESULT_PACKAGE_FILE_NAME),
+                0,
+            )
         provenance = json.loads(
             (self.output / "execution-provenance.json").read_text(encoding="utf-8")
         )
@@ -909,20 +860,24 @@ class UniversalTestRunnerTests(unittest.TestCase):
                 },
             ),
         )
-        result_path = self.output / "result.json"
+        result_path = self.output / RESULT_PACKAGE_FILE_NAME
 
         self.assertEqual(run(descriptor, self.output, result_path), 0)
 
-        result = json.loads(result_path.read_text(encoding="utf-8"))
-        self.assertTrue(
-            any(
-                source["relative_path"] == "trace.log"
-                for source in result["artifact_sources"]
-            )
+        result = self.result_document(result_path)
+        expected_digest = hashlib.sha256(b"must remain private\n").hexdigest()
+        trace = next(
+            item
+            for item in result["artifacts"]
+            if item["kind"] == "trace" and item["sha256"] == expected_digest
+        )
+        self.assertEqual(
+            self.result_artifact_bytes(result_path, trace["artifact_id"]),
+            b"must remain private\n",
         )
         self.assertEqual(unrelated.read_text(encoding="utf-8"), "must remain private\n")
 
-    def test_directory_artifact_is_deterministic_and_root_repackaged(self) -> None:
+    def test_directory_artifact_is_deterministic_and_embedded(self) -> None:
         directory = self.root / "reports"
         (directory / "nested").mkdir(parents=True)
         (directory / "z.txt").write_text("zeta\n", encoding="utf-8")
@@ -939,55 +894,29 @@ class UniversalTestRunnerTests(unittest.TestCase):
                 },
             ),
         )
-        result_path = self.output / "result.json"
+        result_path = self.output / RESULT_PACKAGE_FILE_NAME
         outcome = run(descriptor, self.output, result_path)
         self.assertEqual(
             outcome,
             0,
-            json.dumps(
-                [
-                    json.loads((self.output / item["file_name"]).read_text(encoding="utf-8"))
-                    for item in json.loads(result_path.read_text(encoding="utf-8"))["chunk_manifest"]
-                ],
-                indent=2,
-            ),
+            self.result_diagnostic(descriptor, result_path),
         )
-        result = json.loads(result_path.read_text(encoding="utf-8"))
+        result = self.result_document(result_path)
         directory_source = next(
-            item for item in result["artifact_sources"] if item["kind"] == "directory"
+            item for item in result["artifacts"] if item["kind"] == "directory"
         )
-        untrusted_archive = self.output / directory_source["relative_path"]
-        original_archive = untrusted_archive.read_bytes()
-        untrusted_archive.write_bytes(b"x" * len(original_archive))
-
-        runtime_id = "devcoordinator-test-directory-artifact"
-        attempt_root = Path(self.temporary.name) / "directory-attempts"
-        state = attempt_root / runtime_id
-        state.mkdir(parents=True)
-        shutil.copytree(self.output, state / "output", copy_function=shutil.copy2)
-        launch_path = state / "launch.json"
-        launch_path.write_text(
-            json.dumps({"descriptor": descriptor.to_document()}), encoding="utf-8"
+        original_archive = self.result_artifact_bytes(
+            result_path, directory_source["artifact_id"]
         )
-        launch_path.chmod(0o400)
-        manager = SystemdTestAttemptManager(
-            attempt_root=attempt_root,
-            artifact_root=Path(self.temporary.name) / "directory-artifacts",
-        )
-        manager._collect_result_artifacts(runtime_id, result)
-        resolved = manager.resolve_artifact(
-            directory_source["storage_handle"],
-            expected_size=directory_source["size_bytes"],
-        )
-        self.assertEqual(resolved.read_bytes(), original_archive)
+        self.assertEqual(hashlib.sha256(original_archive).hexdigest(), directory_source["sha256"])
 
         second = Path(self.temporary.name) / "second-output"
         second.mkdir(mode=0o700)
-        self.assertEqual(run(descriptor, second, second / "result.json"), 0)
-        second_result = json.loads((second / "result.json").read_text(encoding="utf-8"))
+        self.assertEqual(run(descriptor, second, second / RESULT_PACKAGE_FILE_NAME), 0)
+        second_result = validate_result_package(second / RESULT_PACKAGE_FILE_NAME).manifest
         second_source = next(
             item
-            for item in second_result["artifact_sources"]
+            for item in second_result["artifacts"]
             if item["kind"] == "directory"
         )
         self.assertEqual(directory_source["sha256"], second_source["sha256"])
@@ -1011,9 +940,13 @@ class UniversalTestRunnerTests(unittest.TestCase):
                 },
             ),
         )
-        self.assertEqual(run(descriptor, self.output, self.output / "result.json"), 1)
-        result = json.loads((self.output / "result.json").read_text(encoding="utf-8"))
-        self.assertFalse(any(item["kind"] == "directory" for item in result["artifact_sources"]))
+        self.assertEqual(
+            run(descriptor, self.output, self.output / RESULT_PACKAGE_FILE_NAME), 1
+        )
+        result = validate_result_package(
+            self.output / RESULT_PACKAGE_FILE_NAME
+        ).manifest
+        self.assertFalse(any(item["kind"] == "directory" for item in result["artifacts"]))
 
         (directory / "link").unlink()
         (directory / "secret.txt").write_text(
@@ -1021,35 +954,11 @@ class UniversalTestRunnerTests(unittest.TestCase):
         )
         second = Path(self.temporary.name) / "secret-output"
         second.mkdir(mode=0o700)
-        self.assertEqual(run(descriptor, second, second / "result.json"), 1)
-        second_result = json.loads((second / "result.json").read_text(encoding="utf-8"))
+        self.assertEqual(run(descriptor, second, second / RESULT_PACKAGE_FILE_NAME), 1)
+        second_result = validate_result_package(second / RESULT_PACKAGE_FILE_NAME).manifest
         self.assertFalse(
-            any(item["kind"] == "directory" for item in second_result["artifact_sources"])
+            any(item["kind"] == "directory" for item in second_result["artifacts"])
         )
-
-    def test_large_case_stream_is_partitioned_into_contiguous_bounded_chunks(self) -> None:
-        descriptor = self.descriptor(("/usr/bin/python3", "-c", "pass"))
-        cases = [
-            {
-                "case_id": f"case-{index}",
-                "display_name": f"case {index}",
-                "status": "passed",
-                "duration_seconds": 0.01,
-                "location": None,
-            }
-            for index in range(1_001)
-        ]
-        chunks = _result_chunks(
-            descriptor,
-            cases=cases,
-            failures=(),
-            artifacts=(),
-            reporter_complete=True,
-        )
-        self.assertEqual([chunk["chunk_index"] for chunk in chunks], [0, 1, 2])
-        self.assertEqual(sum(len(chunk["cases"]) for chunk in chunks), 1_001)
-        self.assertFalse(chunks[0]["reporter_complete"])
-        self.assertTrue(chunks[-1]["reporter_complete"])
 
     def test_runner_retains_failure_details_beyond_legacy_sample_cap(self) -> None:
         executable = self.root / "many-failures"
@@ -1075,7 +984,7 @@ raise SystemExit(1)
             reporter="pytest-events",
             target_name="many-failures",
         )
-        result_path = self.output / "many-failures-result.json"
+        result_path = self.output / RESULT_PACKAGE_FILE_NAME
 
         self.assertEqual(run(descriptor, self.output, result_path), 1)
 
@@ -1087,7 +996,8 @@ raise SystemExit(1)
             {failure["case_id"] for failure in failures},
             {case["case_id"] for case in cases},
         )
-        self.assertGreater(len(self.result_chunks(result_path)), 2)
+        self.assertEqual(len(self.result_chunks(result_path)), 1)
+        self.assertEqual(self.result_document(result_path)["counts"]["failures"], 130)
 
     def test_typed_drivers_receive_fixed_reporter_adapters(self) -> None:
         base = self.descriptor(("/usr/bin/python3", "-m", "pytest", "tests"))
@@ -1210,7 +1120,7 @@ raise SystemExit(1)
             },
             ttl_seconds=300,
         )
-        result_path = self.output / "dotnet-clean-home-result.json"
+        result_path = self.output / RESULT_PACKAGE_FILE_NAME
         self.assertFalse((self.output / "home").exists())
         self.assertFalse((self.output / "dotnet-cli-home").exists())
 
@@ -1236,7 +1146,7 @@ raise SystemExit(1)
                 for item in observed_environment["readiness"]
             )
         )
-        result = json.loads(result_path.read_text(encoding="utf-8"))
+        result = self.result_document(result_path)
         self.assertFalse(result["incomplete_reporting"])
         self.assertEqual(result["terminal_outcome"], "succeeded")
         self.assertEqual(self.result_cases(result_path)[0]["status"], "passed")
@@ -1331,7 +1241,7 @@ raise SystemExit(1)
             ),
             cwd="src/tests",
         )
-        result_path = self.output / "dotnet-offline-result.json"
+        result_path = self.output / RESULT_PACKAGE_FILE_NAME
 
         self.assertEqual(
             run(descriptor, self.output, result_path),
@@ -1369,7 +1279,7 @@ raise SystemExit(1)
                 for item in evidence["calls"][:3]
             )
         )
-        result = json.loads(result_path.read_text(encoding="utf-8"))
+        result = self.result_document(result_path)
         self.assertFalse(result["incomplete_reporting"])
         self.assertEqual(self.result_cases(result_path)[0]["status"], "passed")
 
@@ -1434,7 +1344,7 @@ raise SystemExit(1)
                 reporter="automation-events",
                 target_name="dotnet-automation-build",
             )
-        result_path = self.output / "dotnet-automation-build-result.json"
+        result_path = self.output / RESULT_PACKAGE_FILE_NAME
 
         self.assertEqual(
             run(descriptor, self.output, result_path),
@@ -1605,12 +1515,12 @@ raise SystemExit(1)
         descriptor = self.immutable_dotnet_descriptor(
             (str(executable), "test", "src/App.Tests.csproj")
         )
-        result_path = self.output / "dotnet-offline-failure-result.json"
+        result_path = self.output / RESULT_PACKAGE_FILE_NAME
 
         self.assertEqual(run(descriptor, self.output, result_path), 1)
 
         self.assertFalse(project_started.exists())
-        result = json.loads(result_path.read_text(encoding="utf-8"))
+        result = self.result_document(result_path)
         self.assertEqual(result["returncode"], 42)
         self.assertFalse(result["incomplete_reporting"])
         self.assertEqual(result["terminal_outcome"], "infrastructure_failed")
@@ -1656,12 +1566,12 @@ raise SystemExit(1)
         descriptor = self.immutable_dotnet_descriptor(
             (str(executable), "test", "src/App.Tests.csproj")
         )
-        result_path = self.output / "dotnet-lock-mismatch-result.json"
+        result_path = self.output / RESULT_PACKAGE_FILE_NAME
 
         self.assertEqual(run(descriptor, self.output, result_path), 1)
 
         self.assertFalse(project_started.exists())
-        result = json.loads(result_path.read_text(encoding="utf-8"))
+        result = self.result_document(result_path)
         self.assertFalse(result["incomplete_reporting"])
         self.assertEqual(result["terminal_outcome"], "test_failed")
         failures = self.result_failures(result_path)
@@ -1678,7 +1588,7 @@ raise SystemExit(1)
         descriptor = self.immutable_dotnet_descriptor(
             (str(executable), "test", "src/App.Tests.csproj")
         )
-        result_path = self.output / "dotnet-bootstrap-timeout-result.json"
+        result_path = self.output / RESULT_PACKAGE_FILE_NAME
         probes = (
             DotnetProbeResult(0, b"10.0.100\n", b"", False),
             DotnetProbeResult(124, b"", b"restore timed out\n", True),
@@ -1690,7 +1600,7 @@ raise SystemExit(1)
         ):
             self.assertEqual(run(descriptor, self.output, result_path), 1)
 
-        result = json.loads(result_path.read_text(encoding="utf-8"))
+        result = self.result_document(result_path)
         self.assertFalse(result["incomplete_reporting"])
         self.assertEqual(result["terminal_outcome"], "timed_out")
         failures = self.result_failures(result_path)
@@ -1813,13 +1723,13 @@ raise SystemExit(1)
             target_name="dotnet-shared-deadline",
             ttl_seconds=1,
         )
-        result_path = self.output / "dotnet-shared-deadline-result.json"
+        result_path = self.output / RESULT_PACKAGE_FILE_NAME
         started = time.monotonic()
 
         self.assertEqual(run(descriptor, self.output, result_path), 1)
 
         self.assertLess(time.monotonic() - started, 3.0)
-        result = json.loads(result_path.read_text(encoding="utf-8"))
+        result = self.result_document(result_path)
         self.assertEqual(result["returncode"], 124)
         self.assertFalse(result["incomplete_reporting"])
         self.assertEqual(result["terminal_outcome"], "timed_out")
@@ -1848,12 +1758,12 @@ raise SystemExit(1)
             reporter="trx",
             target_name="dotnet-sdk-readiness",
         )
-        result_path = self.output / "dotnet-workload-result.json"
+        result_path = self.output / RESULT_PACKAGE_FILE_NAME
 
         self.assertEqual(run(descriptor, self.output, result_path), 1)
 
         self.assertFalse(project_started.exists())
-        result = json.loads(result_path.read_text(encoding="utf-8"))
+        result = self.result_document(result_path)
         self.assertEqual(result["returncode"], 42)
         self.assertFalse(result["incomplete_reporting"])
         self.assertEqual(result["terminal_outcome"], "infrastructure_failed")
@@ -1908,7 +1818,7 @@ raise SystemExit(1)
             reporter="trx",
             target_name="dotnet-global-json",
         )
-        result_path = self.output / "dotnet-global-json-result.json"
+        result_path = self.output / RESULT_PACKAGE_FILE_NAME
 
         self.assertEqual(run(descriptor, self.output, result_path), 1)
 
@@ -1939,11 +1849,11 @@ raise SystemExit(1)
             reporter="trx",
             target_name="dotnet-missing-trx",
         )
-        result_path = self.output / "dotnet-missing-trx-result.json"
+        result_path = self.output / RESULT_PACKAGE_FILE_NAME
 
         self.assertEqual(run(descriptor, self.output, result_path), 1)
 
-        result = json.loads(result_path.read_text(encoding="utf-8"))
+        result = self.result_document(result_path)
         self.assertEqual(result["returncode"], 23)
         self.assertTrue(result["incomplete_reporting"])
         failures = self.result_failures(result_path)
@@ -1981,11 +1891,11 @@ raise SystemExit(1)
             reporter="trx",
             target_name="dotnet-real-failure",
         )
-        result_path = self.output / "dotnet-failing-trx-result.json"
+        result_path = self.output / RESULT_PACKAGE_FILE_NAME
 
         self.assertEqual(run(descriptor, self.output, result_path), 1)
 
-        result = json.loads(result_path.read_text(encoding="utf-8"))
+        result = self.result_document(result_path)
         self.assertFalse(result["incomplete_reporting"])
         failures = self.result_failures(result_path)
         self.assertEqual(len(failures), 1)
@@ -2026,7 +1936,7 @@ raise SystemExit(1)
             reporter="trx",
             target_name="dotnet-solution-failure",
         )
-        result_path = self.output / "dotnet-solution-failure-result.json"
+        result_path = self.output / RESULT_PACKAGE_FILE_NAME
 
         self.assertEqual(run(descriptor, self.output, result_path), 1)
 
@@ -2038,10 +1948,10 @@ raise SystemExit(1)
         self.assertIn("Expected 2 but found 1", failures[0]["message"])
         self.assertIn("Alpha.cs:line 42", failures[0]["location"])
         self.assertIsInstance(failures[0]["artifact_id"], str)
-        result = json.loads(result_path.read_text(encoding="utf-8"))
+        result = self.result_document(result_path)
         reporter_artifacts = [
             artifact
-            for artifact in result["artifact_sources"]
+            for artifact in result["artifacts"]
             if artifact["kind"] == "trx"
         ]
         self.assertEqual(len(reporter_artifacts), 2)
@@ -2082,11 +1992,11 @@ raise SystemExit(1)
             reporter="trx",
             target_name="dotnet-oversized-trx",
         )
-        result_path = self.output / "dotnet-oversized-trx-result.json"
+        result_path = self.output / RESULT_PACKAGE_FILE_NAME
 
         self.assertEqual(run(descriptor, self.output, result_path), 1)
 
-        result = json.loads(result_path.read_text(encoding="utf-8"))
+        result = self.result_document(result_path)
         self.assertFalse(result["incomplete_reporting"])
         cases = self.result_cases(result_path)
         failures = self.result_failures(result_path)
@@ -2097,17 +2007,11 @@ raise SystemExit(1)
         self.assertIsInstance(failures[0]["artifact_id"], str)
         reporter_artifacts = [
             artifact
-            for artifact in result["artifact_sources"]
+            for artifact in result["artifacts"]
             if artifact["kind"] in {"trace", "trx"}
-            and "reporter" in artifact["relative_path"]
         ]
         self.assertEqual({artifact["kind"] for artifact in reporter_artifacts}, {"trace", "trx"})
-        self.assertFalse(
-            any(
-                artifact["relative_path"].endswith("reporter_alpha.trx")
-                for artifact in reporter_artifacts
-            )
-        )
+        self.assertIn(failures[0]["artifact_id"], {item["artifact_id"] for item in reporter_artifacts})
 
     def test_dotnet_invalid_trx_does_not_suppress_independent_report(self) -> None:
         executable = self.fake_dotnet(
@@ -2134,11 +2038,11 @@ raise SystemExit(1)
             reporter="trx",
             target_name="dotnet-invalid-trx",
         )
-        result_path = self.output / "dotnet-invalid-trx-result.json"
+        result_path = self.output / RESULT_PACKAGE_FILE_NAME
 
         self.assertEqual(run(descriptor, self.output, result_path), 1)
 
-        result = json.loads(result_path.read_text(encoding="utf-8"))
+        result = self.result_document(result_path)
         self.assertTrue(result["incomplete_reporting"])
         self.assertEqual(
             [case["display_name"] for case in self.result_cases(result_path)],
@@ -2188,7 +2092,7 @@ raise SystemExit(1)
             reporter="automation-events",
             target_name="python-unittest-integration",
         )
-        result_path = self.output / "python-result.json"
+        result_path = self.output / RESULT_PACKAGE_FILE_NAME
 
         outcome = run(descriptor, self.output, result_path)
         self.assertEqual(
@@ -2222,7 +2126,7 @@ raise SystemExit(1)
             reporter="jsonl",
             target_name="node-test-integration",
         )
-        result_path = self.output / "node-result.json"
+        result_path = self.output / RESULT_PACKAGE_FILE_NAME
 
         outcome = run(descriptor, self.output, result_path)
         self.assertEqual(
@@ -2364,7 +2268,7 @@ raise SystemExit(1)
             0,
             (built.stdout + "\n" + built.stderr)[-4000:],
         )
-        result_path = self.output / "dotnet-result.json"
+        result_path = self.output / RESULT_PACKAGE_FILE_NAME
 
         outcome = run(descriptor, self.output, result_path)
         self.assertEqual(
@@ -2490,13 +2394,13 @@ raise SystemExit(1)
         descriptor = self.descriptor(
             ("/usr/bin/python3", "-c", f"print({secret!r})")
         )
-        result_path = self.output / "result.json"
+        result_path = self.output / RESULT_PACKAGE_FILE_NAME
         self.assertEqual(run(descriptor, self.output, result_path), 1)
-        payload = result_path.read_text(encoding="utf-8")
+        payload = result_path.read_bytes()
         capture = (self.output / f"{descriptor.attempt_id}-stdout.log").read_text(
             encoding="utf-8"
         )
-        self.assertNotIn(secret, payload)
+        self.assertNotIn(secret.encode("utf-8"), payload)
         self.assertNotIn(secret, capture)
         self.assertIn("redacted", capture)
         self.assertFalse(
@@ -2505,7 +2409,7 @@ raise SystemExit(1)
                 / f"{descriptor.attempt_id}-stdout.log.progress.json"
             ).exists()
         )
-        result = json.loads(payload)
+        result = self.result_document(result_path)
         self.assertTrue(result["captures"]["stdout"]["secret_redacted"])
         self.assertTrue(result["incomplete_reporting"])
 
