@@ -1691,7 +1691,7 @@ class StoreTestPlaneAdapter:
         document["sampled_at"] = self._store.current_time()
         document["failure_count"] = int(metrics["failure_record_count"])
         document["counts"] = {
-            "attempts": int(metrics["attempt_count"]),
+            "executions": int(metrics["execution_count"]),
             "passed": int(metrics["passed_count"]),
             "failed": int(metrics["failed_count"]),
             "skipped": int(metrics["skipped_count"]),
@@ -1754,7 +1754,7 @@ class StoreTestPlaneAdapter:
                 "total_targets": int(metrics["target_count"]),
             },
             counts={
-                "attempts": int(metrics["attempt_count"]),
+                "executions": int(metrics["execution_count"]),
                 "passed": int(metrics["passed_count"]),
                 "failed": int(metrics["failed_count"]),
                 "skipped": int(metrics["skipped_count"]),
@@ -2043,26 +2043,8 @@ class StoreTestPlaneAdapter:
                     "wait": target.get("wait"),
                     "execution": (
                         None
-                        if target.get("execution_id") is None
-                        else {
-                            "execution_id": target["execution_id"],
-                            "generation": target["generation"],
-                            "repository_generation": target[
-                                "repository_generation"
-                            ],
-                            "systemd_unit": target["systemd_unit"],
-                            "systemd_invocation_id": target[
-                                "systemd_invocation_id"
-                            ],
-                            "launch_operation_id": target[
-                                "launch_operation_id"
-                            ],
-                            "launch_confirmed": target["launch_ack_id"] is not None,
-                            "launch_deadline_at": target["launch_deadline_at"],
-                            "started_at": target["started_at"],
-                            "deadline_at": target["deadline_at"],
-                            "last_observed_at": target["last_observed_at"],
-                        }
+                        if target.get("execution") is None
+                        else dict(target["execution"])
                     ),
                     "usage": target.get("usage"),
                 }

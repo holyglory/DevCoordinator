@@ -15,7 +15,7 @@ from devcoordinator.universal_test_planner import (
 )
 from devcoordinator.universal_test_store import (
     ArtifactMetadata,
-    AttemptConclusion,
+    ExecutionConclusion,
     CaseResult,
     ExecutionResultPackage,
     FailureClassification,
@@ -171,7 +171,7 @@ class TestStoreV8Tests(unittest.TestCase):
         self,
         grant,
         *,
-        conclusion: AttemptConclusion = AttemptConclusion.SUCCEEDED,
+        conclusion: ExecutionConclusion = ExecutionConclusion.SUCCEEDED,
         package: ExecutionResultPackage | None = None,
     ) -> dict[str, object]:
         return self.store.complete_from_package(
@@ -205,6 +205,10 @@ class TestStoreV8Tests(unittest.TestCase):
                 str(row[1])
                 for row in connection.execute("PRAGMA table_info(test_run_targets)")
             }
+            event_columns = {
+                str(row[1])
+                for row in connection.execute("PRAGMA table_info(test_events)")
+            }
         finally:
             connection.close()
         self.assertEqual(self.store.verify()["schema_version"], 8)
@@ -214,6 +218,8 @@ class TestStoreV8Tests(unittest.TestCase):
         self.assertNotIn("test_rollup_daily", tables)
         self.assertNotIn("lease_expires_at", columns)
         self.assertNotIn("max_attempts", columns)
+        self.assertIn("execution_id", event_columns)
+        self.assertNotIn("attempt_id", event_columns)
         self.assertTrue(
             {
                 "execution_id",
@@ -288,7 +294,7 @@ class TestStoreV8Tests(unittest.TestCase):
         self.submit()
         _target, grant = self.begin()
         started = self.start(grant)
-        self.assertEqual(started["deadline_at"], self.clock.value + 20)
+        self.assertEqual(started["execution_deadline_at"], self.clock.value + 20)
         progress = self.store.record_progress(
             grant.execution_id,
             generation=1,
@@ -304,7 +310,24 @@ class TestStoreV8Tests(unittest.TestCase):
         )
         self.assertTrue(progress["stdout_truncated"])
         retained = self.store.restart_cleanup()[0]
-        self.assertEqual(retained["deadline_at"], self.clock.value + 20)
+        self.assertEqual(
+            retained["execution_deadline_at"], self.clock.value + 20
+        )
+        run_target = self.store.get_run(grant.run_id)["targets"][0]
+        execution = run_target["execution"]
+        self.assertEqual(execution["execution_id"], grant.execution_id)
+        self.assertEqual(execution["state"], "running")
+        self.assertTrue(execution["launch_confirmed"])
+        self.assertEqual(execution["last_observed_at"], self.clock.value)
+        self.assertEqual(
+            execution["launch_deadline_at"], self.clock.value + 30
+        )
+        self.assertEqual(
+            execution["execution_deadline_at"], self.clock.value + 20
+        )
+        self.assertEqual(execution["output_progress"]["stdout_bytes"], 5 * 1024 * 1024)
+        self.assertNotIn("current_attempt_id", run_target)
+        self.assertNotIn("active_attempt", run_target)
         with self.assertRaisesRegex(TestStoreConflict, "regressed"):
             self.store.record_progress(
                 grant.execution_id,
@@ -370,7 +393,7 @@ class TestStoreV8Tests(unittest.TestCase):
             "generation": 1,
             "systemd_unit": grant.systemd_unit,
             "package": package,
-            "conclusion": AttemptConclusion.TEST_FAILED,
+            "conclusion": ExecutionConclusion.TEST_FAILED,
             "duration_seconds": 2,
             "operation_id": mutation,
             "unit_inactive": True,
@@ -388,7 +411,7 @@ class TestStoreV8Tests(unittest.TestCase):
                 grant.execution_id,
                 **{
                     **arguments,
-                    "conclusion": AttemptConclusion.TIMED_OUT,
+                    "conclusion": ExecutionConclusion.TIMED_OUT,
                     "operation_id": operation_id(),
                 },
             )
@@ -400,7 +423,16 @@ class TestStoreV8Tests(unittest.TestCase):
         self.assertEqual(len(self.store.cases(run_id=submitted.run_id)), 2)
         self.assertEqual(len(self.store.failures(run_id=submitted.run_id)), 1)
         self.assertEqual(len(self.store.artifacts(run_id=submitted.run_id)), 1)
-        self.assertEqual(self.store.get_attempt(grant.execution_id)["attempt_number"], 1)
+        retained_execution = self.store.get_execution(grant.execution_id)
+        self.assertEqual(retained_execution["execution_id"], grant.execution_id)
+        self.assertNotIn("attempt_id", retained_execution)
+        self.assertNotIn("attempt_number", retained_execution)
+        self.assertNotIn("heartbeat_at", retained_execution)
+        self.assertNotIn("lease_expires_at", retained_execution)
+        self.assertEqual(
+            self.store.cases(run_id=submitted.run_id)[0]["execution_id"],
+            grant.execution_id,
+        )
 
     def test_incomplete_failure_index_rolls_back_without_partial_cases(self) -> None:
         submitted = self.submit()
@@ -414,7 +446,7 @@ class TestStoreV8Tests(unittest.TestCase):
         with self.assertRaisesRegex(TestStoreContractError, "failure record"):
             self.complete(
                 grant,
-                conclusion=AttemptConclusion.TEST_FAILED,
+                conclusion=ExecutionConclusion.TEST_FAILED,
                 package=invalid,
             )
         self.assertEqual(self.store.cases(run_id=submitted.run_id), ())
@@ -441,7 +473,7 @@ class TestStoreV8Tests(unittest.TestCase):
         )
         self.complete(
             lint,
-            conclusion=AttemptConclusion.TEST_FAILED,
+            conclusion=ExecutionConclusion.TEST_FAILED,
             package=failed,
         )
         interim = self.store.get_run(submitted.run_id)
@@ -492,7 +524,7 @@ class TestStoreV8Tests(unittest.TestCase):
         )
         self.complete(
             grant,
-            conclusion=AttemptConclusion.TEST_FAILED,
+            conclusion=ExecutionConclusion.TEST_FAILED,
             package=package,
         )
         mutation = operation_id()
@@ -510,7 +542,9 @@ class TestStoreV8Tests(unittest.TestCase):
         )
         self.assertEqual(retry, replay)
         self.assertNotEqual(retry.run_id, submitted.run_id)
-        self.assertEqual(self.store.get_attempt(grant.execution_id)["run_id"], submitted.run_id)
+        self.assertEqual(
+            self.store.get_execution(grant.execution_id)["run_id"], submitted.run_id
+        )
         retry_target = self.store.get_run(retry.run_id)["targets"][0]
         self.assertIsNone(retry_target["execution_id"])
 

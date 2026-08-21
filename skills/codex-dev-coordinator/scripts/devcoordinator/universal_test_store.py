@@ -2,7 +2,7 @@
 
 The authority store deliberately does not import this module. Testd owns one
 immutable run state machine. Each run-target has at most one execution slot;
-there are no scheduler leases, attempt chains, or incrementally committed
+there are no scheduler leases, retry chains, or incrementally committed
 result chunks.
 
 Schema creation is explicit through :meth:`UniversalTestStore.create`.  Normal
@@ -104,7 +104,7 @@ class FailureClassification(str, Enum):
     INCOMPLETE_REPORTING = "incomplete_reporting"
 
 
-class AttemptConclusion(str, Enum):
+class ExecutionConclusion(str, Enum):
     SUCCEEDED = "succeeded"
     TEST_FAILED = "test_failed"
     INFRASTRUCTURE_FAILED = "infrastructure_failed"
@@ -113,13 +113,13 @@ class AttemptConclusion(str, Enum):
     INCOMPLETE = "incomplete"
 
 
-_CONCLUSION_CLASSIFICATION: Mapping[AttemptConclusion, FailureClassification | None] = {
-    AttemptConclusion.SUCCEEDED: None,
-    AttemptConclusion.TEST_FAILED: FailureClassification.TEST_FAILURE,
-    AttemptConclusion.INFRASTRUCTURE_FAILED: FailureClassification.INFRASTRUCTURE_FAILURE,
-    AttemptConclusion.TIMED_OUT: FailureClassification.TIMEOUT,
-    AttemptConclusion.CANCELLED: FailureClassification.CANCELLATION,
-    AttemptConclusion.INCOMPLETE: FailureClassification.INCOMPLETE_REPORTING,
+_CONCLUSION_CLASSIFICATION: Mapping[ExecutionConclusion, FailureClassification | None] = {
+    ExecutionConclusion.SUCCEEDED: None,
+    ExecutionConclusion.TEST_FAILED: FailureClassification.TEST_FAILURE,
+    ExecutionConclusion.INFRASTRUCTURE_FAILED: FailureClassification.INFRASTRUCTURE_FAILURE,
+    ExecutionConclusion.TIMED_OUT: FailureClassification.TIMEOUT,
+    ExecutionConclusion.CANCELLED: FailureClassification.CANCELLATION,
+    ExecutionConclusion.INCOMPLETE: FailureClassification.INCOMPLETE_REPORTING,
 }
 
 
@@ -256,12 +256,6 @@ class ExecutionGrant:
     generation: int
     systemd_unit: str
     launch_operation_id: str
-
-    @property
-    def attempt_id(self) -> str:
-        """Stable read compatibility for clients that still label executions attempts."""
-
-        return self.execution_id
 
 
 @dataclass(frozen=True)
@@ -584,7 +578,7 @@ CREATE TABLE test_events (
     event_type TEXT NOT NULL,
     repository_id TEXT NOT NULL,
     run_id TEXT,
-    attempt_id TEXT,
+    execution_id TEXT,
     detail_json TEXT NOT NULL,
     created_at REAL NOT NULL
 ) STRICT;
@@ -625,93 +619,6 @@ def _canonical_json(value: object) -> str:
 
 
 _STORED_PLAN_RESOURCES_FIELD = "_coordinator_target_resources"
-
-
-def _attempt_progress_document(value: object) -> dict[str, object]:
-    """Normalize retained progress across the initial and expanded schemas."""
-
-    if not isinstance(value, Mapping):
-        raise TestStoreContractError("retained attempt output progress is invalid")
-    legacy_fields = {
-        "stdout_bytes",
-        "stderr_bytes",
-        "current_memory_bytes",
-        "last_output_at",
-        "observed_at",
-    }
-    current_fields = legacy_fields | {
-        "stdout_retained_bytes",
-        "stderr_retained_bytes",
-        "stdout_truncated",
-        "stderr_truncated",
-    }
-    if set(value) == legacy_fields:
-        stdout_bytes = value["stdout_bytes"]
-        stderr_bytes = value["stderr_bytes"]
-        if type(stdout_bytes) is not int or type(stderr_bytes) is not int:
-            raise TestStoreContractError(
-                "retained attempt output progress is invalid"
-            )
-        normalized = {
-            **dict(value),
-            "stdout_retained_bytes": min(stdout_bytes, 4 * 1024 * 1024),
-            "stderr_retained_bytes": min(stderr_bytes, 4 * 1024 * 1024),
-            # The initial schema measured retained files only, so reaching the
-            # cap did not prove whether additional bytes were observed.
-            "stdout_truncated": False,
-            "stderr_truncated": False,
-        }
-    elif set(value) == current_fields:
-        normalized = dict(value)
-    else:
-        raise TestStoreContractError("retained attempt output progress is invalid")
-    stdout_bytes = normalized["stdout_bytes"]
-    stderr_bytes = normalized["stderr_bytes"]
-    stdout_retained = normalized["stdout_retained_bytes"]
-    stderr_retained = normalized["stderr_retained_bytes"]
-    stdout_truncated = normalized["stdout_truncated"]
-    stderr_truncated = normalized["stderr_truncated"]
-    current_memory = normalized["current_memory_bytes"]
-    last_output_at = normalized["last_output_at"]
-    observed_at = normalized["observed_at"]
-    if (
-        type(stdout_bytes) is not int
-        or type(stderr_bytes) is not int
-        or not 0 <= stdout_bytes <= (1 << 63) - 1
-        or not 0 <= stderr_bytes <= (1 << 63) - 1
-        or type(stdout_retained) is not int
-        or type(stderr_retained) is not int
-        or not 0 <= stdout_retained <= 4 * 1024 * 1024
-        or not 0 <= stderr_retained <= 4 * 1024 * 1024
-        or stdout_retained > stdout_bytes
-        or stderr_retained > stderr_bytes
-        or type(stdout_truncated) is not bool
-        or type(stderr_truncated) is not bool
-        or stdout_truncated != (stdout_bytes > stdout_retained)
-        or stderr_truncated != (stderr_bytes > stderr_retained)
-        or (
-            current_memory is not None
-            and (
-                type(current_memory) is not int
-                or not 0 <= current_memory <= (1 << 63) - 1
-            )
-        )
-        or isinstance(observed_at, bool)
-        or not isinstance(observed_at, (int, float))
-        or not math.isfinite(float(observed_at))
-        or float(observed_at) < 0
-        or (
-            last_output_at is not None
-            and (
-                isinstance(last_output_at, bool)
-                or not isinstance(last_output_at, (int, float))
-                or not math.isfinite(float(last_output_at))
-                or float(last_output_at) < 0
-            )
-        )
-    ):
-        raise TestStoreContractError("retained attempt output progress is invalid")
-    return normalized
 
 
 def _stored_plan_parts(
@@ -1287,7 +1194,7 @@ class UniversalTestStore:
         event_type: str,
         repository_id: str,
         run_id: str | None,
-        attempt_id: str | None,
+        execution_id: str | None,
         detail: Mapping[str, object],
         created_at: float,
     ) -> None:
@@ -1297,11 +1204,11 @@ class UniversalTestStore:
         connection.execute(
             """
             INSERT INTO test_events(
-                event_type, repository_id, run_id, attempt_id,
+                event_type, repository_id, run_id, execution_id,
                 detail_json, created_at
             ) VALUES (?, ?, ?, ?, ?, ?)
             """,
-            (event_type, repository_id, run_id, attempt_id, encoded, created_at),
+            (event_type, repository_id, run_id, execution_id, encoded, created_at),
         )
 
     def submit_plan(
@@ -1481,7 +1388,7 @@ class UniversalTestStore:
                 event_type="test.run_submitted",
                 repository_id=plan.repository_id,
                 run_id=run_id,
-                attempt_id=None,
+                execution_id=None,
                 detail={
                     "intent": plan.intent,
                     "source_mode": "immutable",
@@ -1794,7 +1701,6 @@ class UniversalTestStore:
             ).fetchall()
             return tuple(
                 {
-                    "attempt_id": str(row["execution_id"]),
                     "execution_id": str(row["execution_id"]),
                     "target_id": str(row["target_id"]),
                     "repository_id": str(row["repository_id"]),
@@ -1864,9 +1770,6 @@ class UniversalTestStore:
                     "run_id": str(row["run_id"]),
                     "target_name": str(row["target_name"]),
                     "state": str(row["state"]),
-                    "attempt_id": (
-                        None if row["execution_id"] is None else str(row["execution_id"])
-                    ),
                     "execution_id": (
                         None if row["execution_id"] is None else str(row["execution_id"])
                     ),
@@ -1912,21 +1815,12 @@ class UniversalTestStore:
             if repository_counts["queued"]
             else "idle"
         )
-        # Keep the old count names as a read-only compatibility projection.
-        global_projection = {
-            **global_counts,
-            "leased": global_counts["starting"],
-        }
-        repository_projection = {
-            **repository_counts,
-            "leased": repository_counts["starting"],
-        }
         return {
             "repository_id": repository_id,
             "sampled_at": _now(self._clock),
             "phase": phase,
-            "global_targets": global_projection,
-            "repository_targets": repository_projection,
+            "global_targets": global_counts,
+            "repository_targets": repository_counts,
             "repository_runnable_targets": runnable_count,
             "approximate_first_position": (
                 min(repository_positions) if repository_positions else None
@@ -2158,7 +2052,7 @@ class UniversalTestStore:
                 event_type="test.execution_reserved",
                 repository_id=str(target["repository_id"]),
                 run_id=str(target["run_id"]),
-                attempt_id=execution_id,
+                execution_id=execution_id,
                 detail={
                     "target_id": target_id,
                     "generation": 1,
@@ -2172,7 +2066,7 @@ class UniversalTestStore:
         """Return the exact execution ID that ``begin_execution`` will reserve.
 
         This read-only preview lets protected descriptor resolution bind the
-        final attempt identity before any native start.  The subsequent
+        final execution identity before any native start. The subsequent
         mutation revalidates that the target is still queued and recomputes the
         same store-generation-bound value transactionally.
         """
@@ -2305,11 +2199,10 @@ class UniversalTestStore:
                 if changed != 1:
                     raise TestStoreConflict("execution changed during start acknowledgement")
             result = {
-                "attempt_id": execution_id,
                 "execution_id": execution_id,
                 "state": "running",
                 "started_at": started,
-                "deadline_at": started + int(target["ttl_seconds"]),
+                "execution_deadline_at": started + int(target["ttl_seconds"]),
             }
             self._record_mutation(
                 connection,
@@ -2439,7 +2332,7 @@ class UniversalTestStore:
                     event_type="test.execution.progress",
                     repository_id=str(run["repository_id"]),
                     run_id=str(target["run_id"]),
-                    attempt_id=execution_id,
+                    execution_id=execution_id,
                     detail=detail,
                     created_at=_now(self._clock),
                 )
@@ -2589,7 +2482,7 @@ class UniversalTestStore:
         generation: int,
         systemd_unit: str,
         package: ExecutionResultPackage,
-        conclusion: AttemptConclusion,
+        conclusion: ExecutionConclusion,
         duration_seconds: float,
         operation_id: str,
         unit_inactive: bool,
@@ -2609,9 +2502,9 @@ class UniversalTestStore:
             raise TestStoreConflict(
                 "execution cannot terminalize before its exact cgroup is empty"
             )
-        if not isinstance(conclusion, AttemptConclusion):
+        if not isinstance(conclusion, ExecutionConclusion):
             try:
-                conclusion = AttemptConclusion(conclusion)
+                conclusion = ExecutionConclusion(conclusion)
             except ValueError as error:
                 raise TestStoreContractError("unsupported execution conclusion") from error
         duration = _finite_nonnegative("duration_seconds", duration_seconds)
@@ -2637,15 +2530,15 @@ class UniversalTestStore:
                 for failure in document["failures"]
             )
         )
-        if complete_test_failure and conclusion is not AttemptConclusion.TEST_FAILED:
+        if complete_test_failure and conclusion is not ExecutionConclusion.TEST_FAILED:
             raise TestStoreConflict(
                 "a complete measured test failure must win a competing conclusion"
             )
-        if conclusion is AttemptConclusion.SUCCEEDED and (
+        if conclusion is ExecutionConclusion.SUCCEEDED and (
             not reporter_complete or counts["failed"] or counts["error"]
         ):
-            conclusion = AttemptConclusion.INCOMPLETE
-        if conclusion is AttemptConclusion.TEST_FAILED and not (
+            conclusion = ExecutionConclusion.INCOMPLETE
+        if conclusion is ExecutionConclusion.TEST_FAILED and not (
             counts["failed"]
             or counts["error"]
             or any(
@@ -2841,7 +2734,6 @@ class UniversalTestStore:
                 issued_at=timestamp,
             )
             result = {
-                "attempt_id": execution_id,
                 "execution_id": execution_id,
                 "run_id": str(target["run_id"]),
                 "state": conclusion.value,
@@ -2868,7 +2760,7 @@ class UniversalTestStore:
                 event_type="test.execution_terminal",
                 repository_id=str(run["repository_id"]),
                 run_id=str(target["run_id"]),
-                attempt_id=execution_id,
+                execution_id=execution_id,
                 detail={
                     "conclusion": conclusion.value,
                     "classification": result["classification"],
@@ -2908,7 +2800,6 @@ class UniversalTestStore:
                     )
                 result.append(
                     {
-                        "attempt_id": str(row["execution_id"]),
                         "execution_id": str(row["execution_id"]),
                         "generation": int(row["generation"]),
                         "target_id": str(row["target_id"]),
@@ -2928,7 +2819,7 @@ class UniversalTestStore:
                         "started_at": (
                             None if row["started_at"] is None else float(row["started_at"])
                         ),
-                        "deadline_at": (
+                        "execution_deadline_at": (
                             None if row["deadline_at"] is None else float(row["deadline_at"])
                         ),
                         "state": str(row["state"]),
@@ -2972,7 +2863,6 @@ class UniversalTestStore:
                 result = {
                     "run_id": run_id,
                     "state": str(run["state"]),
-                    "active_attempt_ids": [],
                     "active_execution_ids": [],
                     "already_terminal": True,
                 }
@@ -3025,7 +2915,6 @@ class UniversalTestStore:
                 result = {
                     "run_id": run_id,
                     "state": str(current["state"]),
-                    "active_attempt_ids": active,
                     "active_execution_ids": active,
                     "already_terminal": False,
                 }
@@ -3249,7 +3138,7 @@ class UniversalTestStore:
                 event_type="test.run_retried",
                 repository_id=str(source_run["repository_id"]),
                 run_id=retry_id,
-                attempt_id=None,
+                execution_id=None,
                 detail={
                     "source_run_id": run_id,
                     "failed_only": failed_only,
@@ -3764,7 +3653,7 @@ class UniversalTestStore:
                 event_type="test.evidence_consumed",
                 repository_id=repository_id,
                 run_id=str(row["run_id"]),
-                attempt_id=None,
+                execution_id=None,
                 detail={
                     "schema_version": 1,
                     "consumption_id": consumption_id,
@@ -4596,19 +4485,26 @@ class UniversalTestStore:
                         "last_output_at": target["last_output_at"],
                         "observed_at": target["progress_observed_at"],
                     }
-                target["current_attempt_id"] = execution_id
-                target["active_attempt"] = (
+                target["execution"] = (
                     None
                     if execution_id is None
-                    or str(target["state"]) not in _ACTIVE_TARGET_STATES
                     else {
-                        "attempt_id": str(execution_id),
                         "execution_id": str(execution_id),
                         "state": str(target["state"]),
+                        "generation": int(target["generation"]),
+                        "repository_generation": int(
+                            target["repository_generation"]
+                        ),
+                        "systemd_unit": str(target["systemd_unit"]),
+                        "systemd_invocation_id": target["systemd_invocation_id"],
+                        "launch_operation_id": str(
+                            target["launch_operation_id"]
+                        ),
+                        "launch_confirmed": target["launch_ack_id"] is not None,
+                        "launch_deadline_at": target["launch_deadline_at"],
                         "started_at": target["started_at"],
-                        "heartbeat_at": target["last_observed_at"],
-                        "lease_expires_at": None,
-                        "deadline_at": target["deadline_at"],
+                        "execution_deadline_at": target["deadline_at"],
+                        "last_observed_at": target["last_observed_at"],
                         "output_progress": progress,
                     }
                 )
@@ -4628,8 +4524,8 @@ class UniversalTestStore:
                         if target["cpu_seconds"] is None
                         else float(target["cpu_seconds"])
                     ),
-                    "measured_attempts": int(measured),
-                    "total_attempts": 1 if execution_id is not None else 0,
+                    "measured_executions": int(measured),
+                    "total_executions": 1 if execution_id is not None else 0,
                 }
                 targets.append(target)
             result["targets"] = targets
@@ -4644,24 +4540,19 @@ class UniversalTestStore:
                 if target["usage"]["cpu_seconds"] is not None  # type: ignore[index]
             ]
             measured = sum(
-                int(target["usage"]["measured_attempts"])  # type: ignore[index]
+                int(target["usage"]["measured_executions"])  # type: ignore[index]
                 for target in targets
             )
             total = sum(
-                int(target["usage"]["total_attempts"])  # type: ignore[index]
+                int(target["usage"]["total_executions"])  # type: ignore[index]
                 for target in targets
             )
             result["usage"] = {
                 "available": measured > 0,
                 "peak_memory_mib": None if not peaks else max(peaks),
                 "cpu_seconds": None if not cpu else sum(cpu),
-                "measured_attempts": measured,
-                "total_attempts": total,
-            }
-            result["lease_expiry_evidence"] = {
-                "visible_count": 0,
-                "truncated": False,
-                "events": [],
+                "measured_executions": measured,
+                "total_executions": total,
             }
             return result
         finally:
@@ -4732,10 +4623,10 @@ class UniversalTestStore:
                          THEN target.wait_source END) AS memory_wait_source,
                        MAX(target.peak_memory_bytes) AS peak_memory_bytes,
                        SUM(target.cpu_seconds) AS cpu_seconds,
-                       COUNT(target.execution_id) AS total_attempts,
+                       COUNT(target.execution_id) AS total_executions,
                        COUNT(CASE WHEN target.peak_memory_bytes IS NOT NULL
                                       OR target.cpu_seconds IS NOT NULL
-                                  THEN 1 END) AS measured_attempts
+                                  THEN 1 END) AS measured_executions
                 FROM test_runs AS run
                 LEFT JOIN test_run_targets AS target ON target.run_id = run.run_id
                 WHERE {' AND '.join(clauses)}
@@ -4775,16 +4666,16 @@ class UniversalTestStore:
                 )
                 peak = item.pop("peak_memory_bytes")
                 cpu = item.pop("cpu_seconds")
-                measured = int(item.pop("measured_attempts"))
-                total = int(item.pop("total_attempts"))
+                measured = int(item.pop("measured_executions"))
+                total = int(item.pop("total_executions"))
                 item["usage"] = {
                     "available": measured > 0,
                     "peak_memory_mib": (
                         None if peak is None else int(peak) / (1024 * 1024)
                     ),
                     "cpu_seconds": None if cpu is None else float(cpu),
-                    "measured_attempts": measured,
-                    "total_attempts": total,
+                    "measured_executions": measured,
+                    "total_executions": total,
                 }
                 result.append(item)
             return tuple(result)
@@ -4882,7 +4773,7 @@ class UniversalTestStore:
             counts = connection.execute(
                 """
                 SELECT
-                  COUNT(execution_id) AS attempt_count,
+                  COUNT(execution_id) AS execution_count,
                   COALESCE(SUM(passed_count), 0) AS passed_count,
                   COALESCE(SUM(failed_count), 0) AS failed_count,
                   COALESCE(SUM(skipped_count), 0) AS skipped_count,
@@ -4932,7 +4823,7 @@ class UniversalTestStore:
                     if state not in {"queued", *_ACTIVE_TARGET_STATES}
                 ),
                 "target_states": target_states,
-                "attempt_count": int(counts["attempt_count"]),
+                "execution_count": int(counts["execution_count"]),
                 "passed_count": int(counts["passed_count"]),
                 "failed_count": int(counts["failed_count"]),
                 "skipped_count": int(counts["skipped_count"]),
@@ -4958,26 +4849,39 @@ class UniversalTestStore:
         finally:
             connection.close()
 
-    def get_attempt(self, attempt_id: str) -> dict[str, object]:
-        """Return the one execution slot through the stable attempt read name."""
+    def get_execution(self, execution_id: str) -> dict[str, object]:
+        """Return the exact persisted execution and its bounded factual evidence."""
 
-        execution_id = _safe_id("attempt_id", attempt_id)
+        execution_id = _safe_id("execution_id", execution_id)
         connection = self._connect(readonly=True)
         try:
             row = self._execution(connection, execution_id)
             return {
-                "attempt_id": execution_id,
                 "execution_id": execution_id,
                 "target_id": str(row["target_id"]),
                 "run_id": str(row["run_id"]),
-                "attempt_number": 1,
                 "state": str(row["state"]),
                 "generation": int(row["generation"]),
+                "repository_generation": int(row["repository_generation"]),
+                "systemd_unit": str(row["systemd_unit"]),
+                "systemd_invocation_id": row["systemd_invocation_id"],
+                "launch_operation_id": str(row["launch_operation_id"]),
+                "launch_confirmed": row["launch_ack_id"] is not None,
+                "launch_deadline_at": row["launch_deadline_at"],
+                "execution_deadline_at": row["deadline_at"],
+                "last_observed_at": row["last_observed_at"],
                 "memory_commitment_mib": int(row["memory_commitment_mib"]),
-                "heartbeat_at": row["last_observed_at"],
-                "lease_expires_at": None,
-                "launched_at": row["started_at"],
-                "launch_ack_id": row["launch_ack_id"],
+                "output_progress": {
+                    "stdout_bytes": int(row["stdout_bytes"]),
+                    "stderr_bytes": int(row["stderr_bytes"]),
+                    "stdout_retained_bytes": int(row["stdout_retained_bytes"]),
+                    "stderr_retained_bytes": int(row["stderr_retained_bytes"]),
+                    "stdout_truncated": bool(row["stdout_truncated"]),
+                    "stderr_truncated": bool(row["stderr_truncated"]),
+                    "current_memory_bytes": row["current_memory_bytes"],
+                    "last_output_at": row["last_output_at"],
+                    "observed_at": row["progress_observed_at"],
+                },
                 "terminal_operation_id": row["terminal_operation_id"],
                 "terminal_fingerprint": row["terminal_fingerprint"],
                 "conclusion": row["conclusion"],
@@ -5011,7 +4915,7 @@ class UniversalTestStore:
                 for row in connection.execute(
                     """
                     SELECT failure.*, target.target_name,
-                           target.execution_id AS attempt_id
+                           target.execution_id AS execution_id
                     FROM test_failures AS failure
                     JOIN test_run_targets AS target
                       ON target.target_id = failure.target_id
@@ -5037,7 +4941,7 @@ class UniversalTestStore:
                 for row in connection.execute(
                     """
                     SELECT artifact.*, target.target_name,
-                           target.execution_id AS attempt_id
+                           target.execution_id AS execution_id
                     FROM test_artifacts AS artifact
                     JOIN test_run_targets AS target
                       ON target.target_id = artifact.target_id
@@ -5058,7 +4962,7 @@ class UniversalTestStore:
             row = connection.execute(
                 """
                 SELECT artifact.*, target.target_name,
-                       target.execution_id AS attempt_id
+                       target.execution_id AS execution_id
                 FROM test_artifacts AS artifact
                 JOIN test_run_targets AS target
                   ON target.target_id = artifact.target_id
@@ -5098,7 +5002,7 @@ class UniversalTestStore:
                 for row in connection.execute(
                     """
                     SELECT result.rowid AS cursor, result.*, target.target_name,
-                           target.execution_id AS attempt_id, 1 AS attempt_number
+                           target.execution_id AS execution_id
                     FROM test_case_results AS result
                     JOIN test_run_targets AS target
                       ON target.target_id = result.target_id
@@ -5283,7 +5187,7 @@ def prepare_test_store_schema(
 
 __all__ = [
     "ArtifactMetadata",
-    "AttemptConclusion",
+    "ExecutionConclusion",
     "CaseResult",
     "ExecutionGrant",
     "ExecutionResultPackage",

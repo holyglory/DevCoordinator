@@ -17,7 +17,7 @@ from devcoordinator.universal_test_result_package import (
     publish_result_package,
     validate_result_package,
 )
-from devcoordinator.universal_test_store import ExecutionGrant
+from devcoordinator.universal_test_store import ExecutionGrant, TestStoreConflict
 from devcoordinator.universal_testd import (
     BrokerLaunchTicket,
     TestdLaunchAdapter,
@@ -35,10 +35,11 @@ class FakeCalls:
         operation = values["operation"]
         arguments = values["arguments"]
         if operation is BrokerOperation.TEST_ATTEMPT_LAUNCH:
-            execution_id = str(arguments["attempt_id"])
+            execution_id = str(arguments["execution_id"])
             return {
-                "runtime_id": "devcoordinator-test-"
-                + hashlib.sha256(execution_id.encode()).hexdigest()[:32],
+                "execution_id": execution_id,
+                "generation": arguments["generation"],
+                "systemd_unit": arguments["systemd_unit"],
                 "launch_ack_id": "launch-" + execution_id,
             }
         if operation is BrokerOperation.TEST_ATTEMPT_STATUS:
@@ -46,12 +47,19 @@ class FakeCalls:
             return dict(self.status)
         if operation is BrokerOperation.TEST_ATTEMPT_CANCEL:
             return {
-                "runtime_id": str(arguments["runtime_id"]),
+                "execution_id": arguments["execution_id"],
+                "generation": arguments["generation"],
+                "systemd_unit": arguments["systemd_unit"],
                 "cancelled": True,
                 "absent": False,
             }
         if operation is BrokerOperation.TEST_ATTEMPT_COLLECT:
-            return {"runtime_id": str(arguments["runtime_id"]), "collected": True}
+            return {
+                "execution_id": arguments["execution_id"],
+                "generation": arguments["generation"],
+                "systemd_unit": arguments["systemd_unit"],
+                "collected": True,
+            }
         raise AssertionError(operation)
 
 
@@ -78,6 +86,7 @@ class BrokerV8AdapterTests(unittest.TestCase):
         )
         self.ticket = BrokerLaunchTicket(
             ticket_id="test-ticket-broker-v8",
+            execution_id=self.execution.execution_id,
             target_id=self.execution.target_id,
             run_id=self.execution.run_id,
             repository_id="repo-broker-v8",
@@ -116,16 +125,13 @@ class BrokerV8AdapterTests(unittest.TestCase):
         self.adapter = TestdLaunchAdapter(submitter)
 
     def running_status(self) -> dict[str, object]:
-        runtime_id = self.execution.systemd_unit.removesuffix(".service")
         return {
             "execution_id": self.execution.execution_id,
-            "runtime_id": runtime_id,
-            "attempt_id": self.execution.execution_id,
             "generation": 1,
             "repository_id": self.ticket.repository_id,
             "repository_generation": self.ticket.repository_generation,
             "systemd_unit": self.execution.systemd_unit,
-            "invocation_id": "invocation-v8",
+            "systemd_invocation_id": "invocation-v8",
             "state": "running",
             "unit_inactive": False,
             "cgroup_empty": False,
@@ -149,6 +155,7 @@ class BrokerV8AdapterTests(unittest.TestCase):
 
     def test_prepare_start_and_running_observation_preserve_exact_identity(self) -> None:
         prepared = self.adapter.prepare(self.request)
+        self.assertNotIn("attempt_id", self.request.to_document()["execution"])
         self.assertFalse(prepared.launch_confirmed)
         started = self.adapter.start(self.request, prepared)
         self.assertTrue(started.launch_confirmed)
@@ -156,12 +163,22 @@ class BrokerV8AdapterTests(unittest.TestCase):
         observed = self.adapter.observe(started)
         self.assertEqual(observed.state, "running")
         self.assertEqual(observed.current_memory_bytes, 4096)
+        self.assertEqual(observed.systemd_invocation_id, "invocation-v8")
         launch = next(
             call for call in self.calls.calls
             if call["operation"] is BrokerOperation.TEST_ATTEMPT_LAUNCH
         )
         self.assertEqual(launch["operation_id"], self.execution.launch_operation_id)
         self.assertEqual(launch["resource_id"], self.execution.execution_id)
+        self.assertEqual(
+            set(launch["arguments"]),
+            {"ticket_id", "execution_id", "generation", "systemd_unit"},
+        )
+        for alias in ("attempt_id", "runtime_id", "invocation_id"):
+            with self.subTest(alias=alias):
+                self.calls.status = {**self.running_status(), alias: "legacy"}
+                with self.assertRaises(TestStoreConflict):
+                    self.adapter.observe(started)
 
     def test_attach_stop_and_collect_use_the_retained_execution_binding(self) -> None:
         handle = self.adapter.attach(
@@ -212,7 +229,7 @@ class BrokerV8AdapterTests(unittest.TestCase):
             source_path=capture,
         )
         identity = {
-            "attempt_id": self.execution.execution_id,
+            "execution_id": self.execution.execution_id,
             "target_id": self.execution.target_id,
             "run_id": self.execution.run_id,
             "repository_id": self.ticket.repository_id,

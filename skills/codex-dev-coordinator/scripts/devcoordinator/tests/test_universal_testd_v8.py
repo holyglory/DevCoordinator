@@ -13,7 +13,6 @@ from devcoordinator.universal_test_contract import parse_test_manifest, SourceMo
 from devcoordinator.universal_test_planner import SourceIdentity, create_test_plan
 from devcoordinator.universal_test_store import (
     ArtifactMetadata,
-    AttemptConclusion,
     CaseResult,
     ExecutionResultPackage,
     FailureClassification,
@@ -143,6 +142,7 @@ class FakeIssuer:
         )
         return BrokerLaunchTicket(
             ticket_id="ticket-" + candidate.target_id,
+            execution_id=execution.execution_id,
             target_id=candidate.target_id,
             run_id=candidate.run_id,
             repository_id=candidate.repository_id,
@@ -184,7 +184,7 @@ class FakeLauncher:
         self.package_on_stop: dict[str, RunnerResultPackage] = {}
 
     def prepare(self, request):
-        retained = self.store.get_attempt(request.execution.execution_id)
+        retained = self.store.get_execution(request.execution.execution_id)
         if retained["state"] != "starting":
             raise AssertionError("store reservation was not committed before prepare")
         self.prepare_calls.append(request)
@@ -294,6 +294,7 @@ class TestdV8Tests(unittest.TestCase):
         scheduled = self.engine.schedule(launch_batch=1)
         self.assertEqual(len(scheduled["launched_target_ids"]), 1)
         request = self.launcher.prepare_calls[-1]
+        self.assertNotIn("attempt_id", request.to_document()["execution"])
         return submitted, request.execution
 
     def start_one(self):
@@ -319,13 +320,16 @@ class TestdV8Tests(unittest.TestCase):
 
     def test_schedule_commits_execution_before_prepare_and_never_duplicates(self) -> None:
         submitted, execution = self.launch_one()
-        retained = self.store.get_attempt(execution.execution_id)
+        retained = self.store.get_execution(execution.execution_id)
         self.assertEqual(retained["state"], "starting")
         self.assertEqual(len(self.launcher.prepare_calls), 1)
         second = self.engine.schedule(launch_batch=1)
         self.assertEqual(second["launched_target_ids"], [])
         self.assertEqual(len(self.launcher.prepare_calls), 1)
-        self.assertEqual(self.store.get_run(submitted.run_id)["usage"]["total_attempts"], 1)
+        self.assertEqual(
+            self.store.get_run(submitted.run_id)["usage"]["total_executions"],
+            1,
+        )
 
     def test_lost_launch_reply_observes_same_execution_without_relaunch(self) -> None:
         self.launcher.confirm_start = False
@@ -347,6 +351,7 @@ class TestdV8Tests(unittest.TestCase):
         ]
         first = self.engine.heartbeat()
         self.assertEqual(first["running_execution_ids"], [execution.execution_id])
+        self.assertNotIn("running_attempt_ids", first)
         second = self.engine.heartbeat()
         self.assertEqual(second["running_execution_ids"], [execution.execution_id])
         self.assertEqual(len(self.launcher.start_calls), 1)

@@ -27,7 +27,7 @@ from .universal_test_scheduler import (
 from .universal_test_service import decode_test_plan_document
 from .universal_test_store import (
     ArtifactMetadata,
-    AttemptConclusion,
+    ExecutionConclusion,
     CaseResult,
     ExecutionGrant,
     ExecutionResultPackage,
@@ -149,6 +149,7 @@ class BrokerLaunchTicket:
     """Bounded immutable launch facts resolved before native reservation."""
 
     ticket_id: str
+    execution_id: str
     target_id: str
     run_id: str
     repository_id: str
@@ -173,7 +174,13 @@ class BrokerLaunchTicket:
     expires_at: float
 
     def __post_init__(self) -> None:
-        for field_name in ("ticket_id", "target_id", "run_id", "repository_id"):
+        for field_name in (
+            "ticket_id",
+            "execution_id",
+            "target_id",
+            "run_id",
+            "repository_id",
+        ):
             object.__setattr__(
                 self, field_name, _safe_id(field_name, getattr(self, field_name))
             )
@@ -238,6 +245,7 @@ class BrokerLaunchTicket:
     def public_document(self) -> dict[str, object]:
         return {
             "ticket_id": self.ticket_id,
+            "execution_id": self.execution_id,
             "target_id": self.target_id,
             "run_id": self.run_id,
             "repository_id": self.repository_id,
@@ -287,7 +295,8 @@ class TransientRunnerRequest:
         ):
             raise TestStoreContractError("descriptor_fingerprint is invalid")
         if (
-            self.ticket.target_id != self.execution.target_id
+            self.ticket.execution_id != self.execution.execution_id
+            or self.ticket.target_id != self.execution.target_id
             or self.ticket.run_id != self.execution.run_id
         ):
             raise TestStoreConflict("runner request identity is contradictory")
@@ -300,7 +309,6 @@ class TransientRunnerRequest:
             "ticket": ticket.public_document(),
             "execution": {
                 "execution_id": execution.execution_id,
-                "attempt_id": execution.execution_id,
                 "generation": execution.generation,
                 "systemd_unit": execution.systemd_unit,
                 "launch_operation_id": execution.launch_operation_id,
@@ -373,11 +381,6 @@ class RunnerHandle:
     def runtime_id(self) -> str:
         return self.systemd_unit.removesuffix(".service")
 
-    @property
-    def attempt_id(self) -> str:
-        return self.execution_id
-
-
 @dataclass(frozen=True)
 class RunnerResultPackage:
     package_id: str
@@ -448,6 +451,7 @@ class RunnerObservation:
     cgroup_empty: bool
     launch_confirmed: bool = True
     started_at: float | None = None
+    systemd_invocation_id: str | None = None
     result_package: RunnerResultPackage | None = None
     current_memory_bytes: int | None = None
     output_progress: Mapping[str, object] | None = None
@@ -470,6 +474,12 @@ class RunnerObservation:
         if self.started_at is not None:
             object.__setattr__(
                 self, "started_at", _finite_nonnegative("started_at", self.started_at)
+            )
+        if self.systemd_invocation_id is not None:
+            object.__setattr__(
+                self,
+                "systemd_invocation_id",
+                _safe_id("systemd_invocation_id", self.systemd_invocation_id),
             )
         if self.result_package is not None and not isinstance(
             self.result_package, RunnerResultPackage
@@ -631,6 +641,7 @@ def _runner_observation(value: Mapping[str, object]) -> RunnerObservation:
         "cgroup_empty",
         "launch_confirmed",
         "started_at",
+        "systemd_invocation_id",
         "result_package",
         "current_memory_bytes",
         "output_progress",
@@ -646,6 +657,7 @@ def _runner_observation(value: Mapping[str, object]) -> RunnerObservation:
         cgroup_empty=value["cgroup_empty"],  # type: ignore[arg-type]
         launch_confirmed=value["launch_confirmed"],  # type: ignore[arg-type]
         started_at=value["started_at"],  # type: ignore[arg-type]
+        systemd_invocation_id=value["systemd_invocation_id"],  # type: ignore[arg-type]
         result_package=_result_metadata(value["result_package"]),
         current_memory_bytes=value["current_memory_bytes"],  # type: ignore[arg-type]
         output_progress=value["output_progress"],  # type: ignore[arg-type]
@@ -899,10 +911,10 @@ class TestdEngine:
             self._active[handle.execution_id] = active
             observation = self.launcher.observe(handle)
             fallback = (
-                AttemptConclusion.TIMED_OUT
-                if binding.get("deadline_at") is not None
-                and float(self.clock()) >= float(binding["deadline_at"])
-                else AttemptConclusion.CANCELLED
+                ExecutionConclusion.TIMED_OUT
+                if binding.get("execution_deadline_at") is not None
+                and float(self.clock()) >= float(binding["execution_deadline_at"])
+                else ExecutionConclusion.CANCELLED
             )
             self._settle(
                 active,
@@ -920,7 +932,7 @@ class TestdEngine:
         candidates = self.store.runnable_targets(limit=10_000)
         allocations = tuple(
             ActiveAllocation(
-                attempt_id=str(value["execution_id"]),
+                execution_id=str(value["execution_id"]),
                 target_id=str(value["target_id"]),
                 repository_id=str(value["repository_id"]),
                 owner_uid=int(value["owner_uid"]),
@@ -1049,7 +1061,7 @@ class TestdEngine:
     ) -> None:
         if not observation.launch_confirmed:
             return
-        retained = self.store.get_attempt(active.execution.execution_id)
+        retained = self.store.get_execution(active.execution.execution_id)
         if str(retained["state"]) != "starting":
             return
         if observation.started_at is None:
@@ -1070,7 +1082,7 @@ class TestdEngine:
             systemd_unit=active.execution.systemd_unit,
             launch_ack_id=launch_ack_id,
             started_at=observation.started_at,
-            systemd_invocation_id=None,
+            systemd_invocation_id=observation.systemd_invocation_id,
             operation_id=_stable_operation_id(
                 "started",
                 active.execution.execution_id,
@@ -1103,45 +1115,45 @@ class TestdEngine:
     def _package_conclusion(
         metadata: RunnerResultPackage,
         *,
-        fallback: AttemptConclusion,
-    ) -> AttemptConclusion:
+        fallback: ExecutionConclusion,
+    ) -> ExecutionConclusion:
         complete = bool(metadata.manifest["reporter_complete"])
         terminal_outcome = metadata.outcome.get("terminal_outcome")
         if not complete:
             return (
                 fallback
                 if fallback in {
-                    AttemptConclusion.TIMED_OUT,
-                    AttemptConclusion.CANCELLED,
+                    ExecutionConclusion.TIMED_OUT,
+                    ExecutionConclusion.CANCELLED,
                 }
-                else AttemptConclusion.INCOMPLETE
+                else ExecutionConclusion.INCOMPLETE
             )
         if terminal_outcome == "timed_out":
-            return AttemptConclusion.TIMED_OUT
+            return ExecutionConclusion.TIMED_OUT
         if terminal_outcome == "incomplete":
-            return AttemptConclusion.INCOMPLETE
+            return ExecutionConclusion.INCOMPLETE
         if terminal_outcome == "infrastructure_failed":
-            return AttemptConclusion.INFRASTRUCTURE_FAILED
+            return ExecutionConclusion.INFRASTRUCTURE_FAILED
         if int(metadata.counts["failed"]) or int(metadata.counts["error"]):
-            return AttemptConclusion.TEST_FAILED
+            return ExecutionConclusion.TEST_FAILED
         if metadata.outcome.get("test_failed") is True:
-            return AttemptConclusion.TEST_FAILED
+            return ExecutionConclusion.TEST_FAILED
         if metadata.outcome.get("infrastructure_error") is not None:
-            return AttemptConclusion.INFRASTRUCTURE_FAILED
+            return ExecutionConclusion.INFRASTRUCTURE_FAILED
         returncode = metadata.outcome.get("returncode")
         if returncode not in {None, 0}:
-            return AttemptConclusion.INFRASTRUCTURE_FAILED
-        return AttemptConclusion.SUCCEEDED
+            return ExecutionConclusion.INFRASTRUCTURE_FAILED
+        return ExecutionConclusion.SUCCEEDED
 
     @staticmethod
     def _synthetic_package(
-        execution_id: str, conclusion: AttemptConclusion, reason: str
+        execution_id: str, conclusion: ExecutionConclusion, reason: str
     ) -> ExecutionResultPackage:
         classification = {
-            AttemptConclusion.TIMED_OUT: FailureClassification.TIMEOUT,
-            AttemptConclusion.CANCELLED: FailureClassification.CANCELLATION,
-            AttemptConclusion.INCOMPLETE: FailureClassification.INCOMPLETE_REPORTING,
-            AttemptConclusion.INFRASTRUCTURE_FAILED:
+            ExecutionConclusion.TIMED_OUT: FailureClassification.TIMEOUT,
+            ExecutionConclusion.CANCELLED: FailureClassification.CANCELLATION,
+            ExecutionConclusion.INCOMPLETE: FailureClassification.INCOMPLETE_REPORTING,
+            ExecutionConclusion.INFRASTRUCTURE_FAILED:
                 FailureClassification.INFRASTRUCTURE_FAILURE,
         }.get(conclusion)
         failures: tuple[FailureRecord, ...] = ()
@@ -1197,7 +1209,7 @@ class TestdEngine:
         active: _ActiveExecution,
         observation: RunnerObservation,
         *,
-        fallback: AttemptConclusion,
+        fallback: ExecutionConclusion,
         stop_reason: str,
     ) -> None:
         metadata = observation.result_package
@@ -1225,7 +1237,7 @@ class TestdEngine:
         else:
             assert metadata is not None
             conclusion = self._package_conclusion(metadata, fallback=fallback)
-        retained = self.store.get_attempt(active.execution.execution_id)
+        retained = self.store.get_execution(active.execution.execution_id)
         started_at = retained.get("started_at")
         duration = (
             0.0
@@ -1268,7 +1280,7 @@ class TestdEngine:
                 observation = self.launcher.observe(active.handle)
                 self._record_start_if_observed(active, observation)
                 self._record_progress(active, observation)
-                retained = self.store.get_attempt(execution_id)
+                retained = self.store.get_execution(execution_id)
                 run = self.store.get_run(active.run_id)
                 target_projection = next(
                     target
@@ -1289,11 +1301,11 @@ class TestdEngine:
                         active,
                         observation,
                         fallback=(
-                            AttemptConclusion.TIMED_OUT
+                            ExecutionConclusion.TIMED_OUT
                             if timed_out
-                            else AttemptConclusion.CANCELLED
+                            else ExecutionConclusion.CANCELLED
                             if cancelling
-                            else AttemptConclusion.INCOMPLETE
+                            else ExecutionConclusion.INCOMPLETE
                         ),
                         stop_reason=(
                             "execution deadline reached"
@@ -1310,9 +1322,9 @@ class TestdEngine:
                         active,
                         observation,
                         fallback=(
-                            AttemptConclusion.TIMED_OUT
+                            ExecutionConclusion.TIMED_OUT
                             if timed_out
-                            else AttemptConclusion.CANCELLED
+                            else ExecutionConclusion.CANCELLED
                         ),
                         stop_reason=(
                             "execution deadline reached"
@@ -1326,7 +1338,7 @@ class TestdEngine:
                     self._settle(
                         active,
                         observation,
-                        fallback=AttemptConclusion.INFRASTRUCTURE_FAILED,
+                        fallback=ExecutionConclusion.INFRASTRUCTURE_FAILED,
                         stop_reason="execution exited without a complete package",
                     )
                     if execution_id not in self._active:
@@ -1336,15 +1348,12 @@ class TestdEngine:
             except Exception as error:
                 failures.append(
                     {
-                        "attempt_id": execution_id,
                         "execution_id": execution_id,
                         "error_type": type(error).__name__,
                     }
                 )
         return {
-            "running_attempt_ids": running,
             "running_execution_ids": running,
-            "completed_attempt_ids": completed,
             "completed_execution_ids": completed,
             "failures": failures,
         }
@@ -1372,9 +1381,7 @@ class TestdEngine:
         ]
         return {
             **result,
-            "cancelled_attempt_ids": completed,
             "cancelled_execution_ids": completed,
-            "unresolved_attempt_ids": unresolved,
             "unresolved_execution_ids": unresolved,
             "supervision_failures": heartbeat["failures"],
         }

@@ -97,8 +97,8 @@ class AgentTestTests(unittest.TestCase):
                 "repository_id": "repo-1",
                 "sampled_at": 123.0,
                 "phase": "scheduler",
-                "global_targets": {"queued": 4, "leased": 1, "running": 2},
-                "repository_targets": {"queued": 2, "leased": 0, "running": 0},
+                "global_targets": {"queued": 4, "starting": 1, "running": 2},
+                "repository_targets": {"queued": 2, "starting": 0, "running": 0},
                 "repository_runnable_targets": 1,
                 "approximate_first_position": 3,
                 "position_population_truncated": False,
@@ -108,7 +108,7 @@ class AgentTestTests(unittest.TestCase):
                         "run_id": "run-1",
                         "target_name": "server-tests",
                         "state": "queued",
-                        "attempt_id": None,
+                        "execution_id": None,
                         "wait_code": "exact_dependency_pending",
                     }
                 ],
@@ -283,7 +283,7 @@ class AgentTestTests(unittest.TestCase):
             "exact_worktree_busy",
         )
 
-    def test_follow_exposes_bounded_active_attempt_heartbeats(self) -> None:
+    def test_follow_exposes_bounded_active_execution_facts(self) -> None:
         status = {
             "run_id": "run-1",
             "state": "running",
@@ -291,12 +291,16 @@ class AgentTestTests(unittest.TestCase):
             "targets": [
                 {
                     "target_name": f"target-{index}",
-                    "active_attempt": {
-                        "attempt_id": f"attempt-{index}",
+                    "execution": {
+                        "execution_id": f"execution-{index}",
                         "state": "running",
+                        "generation": 1,
+                        "systemd_unit": f"devcoordinator-test-{index}.service",
+                        "launch_confirmed": True,
                         "started_at": 100.0,
-                        "heartbeat_at": 200.0 + index,
-                        "lease_expires_at": 230.0 + index,
+                        "last_observed_at": 200.0 + index,
+                        "launch_deadline_at": 230.0 + index,
+                        "execution_deadline_at": 300.0 + index,
                         "output_progress": {
                             "stdout_bytes": 5 * 1024 * 1024 + index,
                             "stderr_bytes": 128,
@@ -316,36 +320,43 @@ class AgentTestTests(unittest.TestCase):
 
         result = project_test_follow(status, run_id="run-1")
 
-        self.assertEqual(len(result["active_attempts"]), 4)
-        self.assertTrue(result["active_attempts_truncated"])
+        self.assertEqual(len(result["active_executions"]), 4)
+        self.assertTrue(result["active_executions_truncated"])
         self.assertEqual(
-            result["active_attempts"][0]["attempt_id"], "attempt-0"
+            result["active_executions"][0]["execution_id"], "execution-0"
         )
-        self.assertEqual(result["active_attempts"][0]["heartbeat_at"], 200.0)
-        self.assertEqual(result["active_attempts"][0]["phase"], "executing")
-        self.assertEqual(result["active_attempts"][0]["elapsed_seconds"], 160.0)
+        self.assertEqual(result["active_executions"][0]["last_observed_at"], 200.0)
+        self.assertEqual(result["active_executions"][0]["launch_deadline_at"], 230.0)
         self.assertEqual(
-            result["active_attempts"][0]["output_progress"]["stdout_bytes"],
+            result["active_executions"][0]["execution_deadline_at"], 300.0
+        )
+        self.assertTrue(result["active_executions"][0]["launch_confirmed"])
+        self.assertEqual(result["active_executions"][0]["elapsed_seconds"], 160.0)
+        self.assertEqual(
+            result["active_executions"][0]["output_progress"]["stdout_bytes"],
             5 * 1024 * 1024,
         )
         self.assertEqual(
-            result["active_attempts"][0]["output_progress"][
+            result["active_executions"][0]["output_progress"][
                 "stdout_retained_bytes"
             ],
             4 * 1024 * 1024,
         )
         self.assertTrue(
-            result["active_attempts"][0]["output_progress"][
+            result["active_executions"][0]["output_progress"][
                 "stdout_truncated"
             ]
         )
         self.assertEqual(
-            result["active_attempts"][0]["output_progress"][
+            result["active_executions"][0]["output_progress"][
                 "current_memory_bytes"
             ],
             8 * 1024 * 1024,
         )
         self.assertNotIn("progress\n", json.dumps(result))
+        self.assertNotIn("active_attempts", result)
+        self.assertNotIn("heartbeat_at", json.dumps(result))
+        self.assertNotIn("lease_expires_at", json.dumps(result))
         self.assertLessEqual(
             len(json.dumps(result, separators=(",", ":"), sort_keys=True).encode()),
             MAX_TEST_RESULT_BYTES,

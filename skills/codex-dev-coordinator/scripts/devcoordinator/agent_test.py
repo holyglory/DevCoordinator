@@ -298,9 +298,9 @@ def project_queue_status(
         "repository_id": repository_id,
         "sampled_at": status.get("sampled_at"),
         "phase": bounded_text(status.get("phase", "unknown"), maximum_bytes=64),
-        "global_targets": _small_mapping(status.get("global_targets"), limit=3),
+        "global_targets": _small_mapping(status.get("global_targets"), limit=4),
         "repository_targets": _small_mapping(
-            status.get("repository_targets"), limit=3
+            status.get("repository_targets"), limit=4
         ),
         "repository_runnable_targets": status.get("repository_runnable_targets"),
         "approximate_first_position": status.get("approximate_first_position"),
@@ -324,10 +324,10 @@ def project_queue_status(
                 "state": bounded_text(
                     item.get("state", "unknown"), maximum_bytes=64
                 ),
-                "attempt_id": (
+                "execution_id": (
                     None
-                    if item.get("attempt_id") is None
-                    else _opaque(item.get("attempt_id"), field="attempt_id")
+                    if item.get("execution_id") is None
+                    else _opaque(item.get("execution_id"), field="execution_id")
                 ),
                 "wait_code": (
                     None
@@ -461,31 +461,55 @@ def project_test_follow(
         else declared_failure_records
     )
     source_failure_count = max(declared_failure_records, len(failures))
-    active_attempts: list[dict[str, Any]] = []
+    active_executions: list[dict[str, Any]] = []
     raw_targets = status.get("targets")
     if isinstance(raw_targets, list):
         for raw_target in raw_targets:
             if not isinstance(raw_target, Mapping):
                 continue
-            raw_attempt = raw_target.get("active_attempt")
-            if not isinstance(raw_attempt, Mapping):
+            raw_execution = raw_target.get("execution")
+            if not isinstance(raw_execution, Mapping):
                 continue
-            attempt_id = raw_attempt.get("attempt_id")
-            attempt_state = raw_attempt.get("state")
+            execution_id = raw_execution.get("execution_id")
+            execution_state = raw_execution.get("state")
+            generation = raw_execution.get("generation")
+            systemd_unit = raw_execution.get("systemd_unit")
+            launch_confirmed = raw_execution.get("launch_confirmed")
             target_name = raw_target.get("target_name")
             if not all(
                 isinstance(value, str) and value
-                for value in (attempt_id, attempt_state, target_name)
+                for value in (execution_id, execution_state, target_name)
+            ):
+                continue
+            if execution_state not in {"starting", "running", "stopping"}:
+                continue
+            if (
+                type(generation) is not int
+                or generation <= 0
+                or not isinstance(systemd_unit, str)
+                or not systemd_unit
+                or type(launch_confirmed) is not bool
             ):
                 continue
             active = {
-                "attempt_id": bounded_text(attempt_id, maximum_bytes=128),
+                "execution_id": bounded_text(execution_id, maximum_bytes=128),
                 "target": bounded_text(target_name, maximum_bytes=128),
-                "state": bounded_text(attempt_state, maximum_bytes=64),
-                "phase": "executing",
+                "state": bounded_text(execution_state, maximum_bytes=64),
+                "generation": generation,
+                "systemd_unit": bounded_text(systemd_unit, maximum_bytes=256),
+                "launch_confirmed": launch_confirmed,
+                "output_progress": None,
             }
-            for key in ("started_at", "heartbeat_at", "lease_expires_at"):
-                value = raw_attempt.get(key)
+            for key in (
+                "started_at",
+                "last_observed_at",
+                "launch_deadline_at",
+                "execution_deadline_at",
+            ):
+                value = raw_execution.get(key)
+                if value is None:
+                    active[key] = None
+                    continue
                 if (
                     not isinstance(value, bool)
                     and isinstance(value, (int, float))
@@ -494,7 +518,7 @@ def project_test_follow(
                 ):
                     active[key] = float(value)
             sampled_at = status.get("sampled_at")
-            started_at = raw_attempt.get("started_at")
+            started_at = raw_execution.get("started_at")
             if (
                 not isinstance(sampled_at, bool)
                 and isinstance(sampled_at, (int, float))
@@ -504,7 +528,7 @@ def project_test_follow(
                 active["elapsed_seconds"] = max(
                     0.0, float(sampled_at) - float(started_at)
                 )
-            raw_progress = raw_attempt.get("output_progress")
+            raw_progress = raw_execution.get("output_progress")
             if isinstance(raw_progress, Mapping):
                 stdout_bytes = raw_progress.get("stdout_bytes")
                 stderr_bytes = raw_progress.get("stderr_bytes")
@@ -555,7 +579,7 @@ def project_test_follow(
                         ),
                         "observed_at": float(observed_at),
                     }
-            active_attempts.append(active)
+            active_executions.append(active)
     document: dict[str, Any] = {
         "schema_version": 1,
         "ok": True,
@@ -572,8 +596,8 @@ def project_test_follow(
         "counts": counts,
         "timing": _small_mapping(source.get("timing"), limit=12),
         "scheduler_wait": _scheduler_wait_projection(status),
-        "active_attempts": active_attempts[:4],
-        "active_attempts_truncated": len(active_attempts) > 4,
+        "active_executions": active_executions[:4],
+        "active_executions_truncated": len(active_executions) > 4,
         "failures": failures,
         # ``counts.failed`` counts failed test cases, while the summary's
         # ``failure_count`` counts independently retained failure records.

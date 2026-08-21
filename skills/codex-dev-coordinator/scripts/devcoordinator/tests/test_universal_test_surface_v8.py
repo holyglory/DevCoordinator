@@ -10,7 +10,7 @@ from devcoordinator.universal_test_contract import SourceMode, parse_test_manife
 from devcoordinator.universal_test_planner import SourceIdentity, create_test_plan
 from devcoordinator.universal_test_service import StoreTestPlaneAdapter
 from devcoordinator.universal_test_store import (
-    AttemptConclusion,
+    ExecutionConclusion,
     CaseResult,
     ExecutionResultPackage,
     FailureClassification,
@@ -33,7 +33,13 @@ class V8TestPlaneSurfaceTests(unittest.TestCase):
         )
         self.adapter = StoreTestPlaneAdapter(self.store)
 
-    def complete_run(self, *, evidence: bool = False, failed: bool = False):
+    def complete_run(
+        self,
+        *,
+        evidence: bool = False,
+        failed: bool = False,
+        terminal: bool = True,
+    ):
         manifest = {
             "schema_version": 4,
             "defaults": {"timeout_seconds": 20, "network": "none", "environment": {}},
@@ -115,9 +121,25 @@ class V8TestPlaneSurfaceTests(unittest.TestCase):
             generation=1,
             systemd_unit=unit,
             launch_ack_id="launch-" + execution.execution_id,
+            systemd_invocation_id="invocation-surface-v8",
             started_at=self.store.current_time(),
             operation_id=operation_id(),
         )
+        self.store.record_progress(
+            execution.execution_id,
+            generation=1,
+            stdout_bytes=1024,
+            stderr_bytes=32,
+            stdout_retained_bytes=1024,
+            stderr_retained_bytes=32,
+            stdout_truncated=False,
+            stderr_truncated=False,
+            current_memory_bytes=8 * 1024 * 1024,
+            last_output_at=self.store.current_time(),
+            observed_at=self.store.current_time(),
+        )
+        if not terminal:
+            return plan, submitted
         case = CaseResult(
             case_id="case-v8",
             display_name="case v8",
@@ -143,9 +165,9 @@ class V8TestPlaneSurfaceTests(unittest.TestCase):
                 reporter_complete=True,
             ),
             conclusion=(
-                AttemptConclusion.TEST_FAILED
+                ExecutionConclusion.TEST_FAILED
                 if failed
-                else AttemptConclusion.SUCCEEDED
+                else ExecutionConclusion.SUCCEEDED
             ),
             duration_seconds=0.1,
             operation_id=operation_id(),
@@ -153,6 +175,26 @@ class V8TestPlaneSurfaceTests(unittest.TestCase):
             cgroup_empty=True,
         )
         return plan, submitted
+
+    def test_active_status_exposes_only_factual_execution_evidence(self) -> None:
+        plan, submitted = self.complete_run(terminal=False)
+        status = self.adapter.status(
+            run_id=submitted["run_id"], repository_id=plan.repository_id
+        )
+        execution = status["targets"][0]["execution"]
+        self.assertEqual(execution["state"], "running")
+        self.assertEqual(execution["generation"], 1)
+        self.assertEqual(
+            execution["systemd_invocation_id"], "invocation-surface-v8"
+        )
+        self.assertTrue(execution["launch_confirmed"])
+        self.assertIsNotNone(execution["last_observed_at"])
+        self.assertIsNotNone(execution["launch_deadline_at"])
+        self.assertIsNotNone(execution["execution_deadline_at"])
+        self.assertEqual(execution["output_progress"]["stdout_bytes"], 1024)
+        self.assertNotIn("attempt_id", execution)
+        self.assertNotIn("heartbeat_at", execution)
+        self.assertNotIn("lease_expires_at", execution)
 
     def test_cases_and_failures_are_cursor_bounded(self) -> None:
         plan, submitted = self.complete_run(failed=True)
@@ -163,16 +205,31 @@ class V8TestPlaneSurfaceTests(unittest.TestCase):
             run_id=submitted["run_id"], repository_id=plan.repository_id, limit=1
         )
         self.assertEqual(cases["cases"][0]["case_id"], "case-v8")
+        self.assertIn("execution_id", cases["cases"][0])
+        self.assertNotIn("attempt_id", cases["cases"][0])
+        self.assertNotIn("attempt_number", cases["cases"][0])
         self.assertEqual(failures["failures"][0]["failure_id"], "failure-v8")
+        self.assertIn("execution_id", failures["failures"][0])
+        self.assertNotIn("attempt_id", failures["failures"][0])
         status = self.adapter.status(
             run_id=submitted["run_id"], repository_id=plan.repository_id
         )
         self.assertNotIn("lease_expiry_evidence", status)
         self.assertNotIn("active_attempt", status["targets"][0])
+        self.assertNotIn("current_attempt_id", status["targets"][0])
+        self.assertEqual(status["counts"]["executions"], 1)
+        self.assertNotIn("attempts", status["counts"])
         self.assertEqual(
             status["targets"][0]["execution"]["execution_id"],
             self.store.get_run(submitted["run_id"])["targets"][0]["execution_id"],
         )
+        self.assertIn("launch_confirmed", status["targets"][0]["execution"])
+        self.assertIn("last_observed_at", status["targets"][0]["execution"])
+        self.assertIn("launch_deadline_at", status["targets"][0]["execution"])
+        self.assertIn(
+            "execution_deadline_at", status["targets"][0]["execution"]
+        )
+        self.assertIn("output_progress", status["targets"][0]["execution"])
 
     def test_retry_creates_a_new_immutable_run(self) -> None:
         plan, submitted = self.complete_run(failed=True)
