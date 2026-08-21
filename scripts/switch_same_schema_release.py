@@ -46,6 +46,14 @@ import browser_lcp_acceptance as browser_lcp  # noqa: E402
 import install_availability_release as installer  # noqa: E402
 from devcoordinator.schema import SCHEMA_VERSION as COORDINATOR_SCHEMA_VERSION  # noqa: E402
 from devcoordinator import retained_control  # noqa: E402
+from devcoordinator.server_credentials import (  # noqa: E402
+    MAX_SERVER_CREDENTIAL_BYTES,
+    SERVER_CREDENTIAL_FILE_SUFFIX,
+    SERVER_CREDENTIAL_MATERIAL_ROOT,
+    ServerCredentialError,
+    staged_material_path,
+    validate_server_credential_binding,
+)
 
 
 KIND = "devcoordinator-same-schema-release-switch"
@@ -148,6 +156,10 @@ SLOT_ROOT = Path("/etc/devcoordinator/console-slots")
 CLIENT_PROFILE = Path("/etc/devcoordinator/client-profiles.json")
 AUTHORITY_DATABASE = Path("/var/lib/devcoordinator/authority.sqlite3")
 CONSOLE_STATE_ROOT = Path("/var/lib/devcoordinator-console")
+WORKER_UNIT = re.compile(
+    r"^devcoordinator-worker-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
+    r"[0-9a-f]{4}-[0-9a-f]{12})\.service$"
+)
 AUTHORITY_WRITER_UNITS = (
     "devcoordinator-testd.socket",
     "devcoordinator-test-snapshotd.socket",
@@ -431,6 +443,183 @@ def exact_file_identity(path: Path) -> dict[str, object]:
         "mtime_ns": before.st_mtime_ns,
         "parent": parent,
     }
+
+
+def _private_owned_directory(path: Path, *, field: str) -> dict[str, int | str]:
+    if not path.is_absolute() or Path(os.path.abspath(path)) != path:
+        raise SwitchError(f"{field} is not canonical")
+    try:
+        info = path.lstat()
+        resolved = path.resolve(strict=True)
+    except OSError as error:
+        raise SwitchError(f"{field} is unavailable") from error
+    if (
+        resolved != path
+        or stat.S_ISLNK(info.st_mode)
+        or not stat.S_ISDIR(info.st_mode)
+        or info.st_uid != os.geteuid()
+        or info.st_gid != os.getegid()
+        or stat.S_IMODE(info.st_mode) != 0o700
+    ):
+        raise SwitchError(f"{field} is not mutation-owner mode 0700")
+    return {
+        "path": str(path),
+        "device": info.st_dev,
+        "inode": info.st_ino,
+        "uid": info.st_uid,
+        "gid": info.st_gid,
+        "mode": stat.S_IMODE(info.st_mode),
+    }
+
+
+def _server_credential_destination(credential_id: str) -> Path:
+    try:
+        return staged_material_path(SERVER_CREDENTIAL_MATERIAL_ROOT, credential_id)
+    except ServerCredentialError as error:
+        raise SwitchError("retained server credential identity is invalid") from error
+
+
+def _server_credential_id_from_destination(destination: object) -> str:
+    path = Path(str(destination))
+    if path.parent != SERVER_CREDENTIAL_MATERIAL_ROOT or not path.name.endswith(
+        SERVER_CREDENTIAL_FILE_SUFFIX
+    ):
+        raise SwitchError("retained server credential destination is invalid")
+    credential_id = path.name[: -len(SERVER_CREDENTIAL_FILE_SUFFIX)]
+    try:
+        expected = staged_material_path(SERVER_CREDENTIAL_MATERIAL_ROOT, credential_id)
+    except ServerCredentialError as error:
+        raise SwitchError("retained server credential destination is invalid") from error
+    if path != expected:
+        raise SwitchError("retained server credential destination is invalid")
+    return credential_id
+
+
+def _server_credential_backup_path(
+    transaction_root: Path, credential_id: str
+) -> Path:
+    root = transaction_root / "retained-control-backups/server-credentials"
+    try:
+        return staged_material_path(root, credential_id)
+    except ServerCredentialError as error:
+        raise SwitchError("retained server credential backup identity is invalid") from error
+
+
+def _server_credentials_from_manifest(
+    manifest: Mapping[str, object], transaction_root: Path
+) -> dict[str, dict[str, object]]:
+    raw_credentials = manifest.get("server_credentials")
+    if (
+        not isinstance(raw_credentials, list)
+        or len(raw_credentials) > retained_control.MAX_ROWS_PER_COLLECTION
+    ):
+        raise SwitchError("retained server credential manifest is invalid")
+    staged_root = transaction_root / "retained-control/server-credentials"
+    if raw_credentials:
+        _private_owned_directory(
+            staged_root, field="retained server credential staging root"
+        )
+    elif not staged_root.exists() and not staged_root.is_symlink():
+        return {}
+    else:
+        _private_owned_directory(
+            staged_root, field="retained server credential staging root"
+        )
+
+    result: dict[str, dict[str, object]] = {}
+    expected_names: set[str] = set()
+    ordering: list[tuple[str, str, str]] = []
+    for raw in raw_credentials:
+        if not isinstance(raw, Mapping) or set(raw) != {
+            "server_definition_id",
+            "name",
+            "credential_id",
+            "material",
+        }:
+            raise SwitchError("retained server credential fields are invalid")
+        server_definition_id = raw.get("server_definition_id")
+        material = raw.get("material")
+        try:
+            binding = validate_server_credential_binding(
+                server_definition_id,
+                {
+                    "name": raw.get("name"),
+                    "credential_id": raw.get("credential_id"),
+                },
+            )
+        except ServerCredentialError as error:
+            raise SwitchError("retained server credential binding is invalid") from error
+        credential_id = binding.credential_id
+        if not isinstance(material, Mapping):
+            raise SwitchError("retained server credential binding is invalid")
+        try:
+            staged = staged_material_path(staged_root, credential_id)
+        except ServerCredentialError as error:
+            raise SwitchError("retained server credential material path is invalid") from error
+        expected_names.add(staged.name)
+        observed = exact_file_identity(staged)
+        if (
+            observed != dict(material)
+            or observed.get("path") != str(staged)
+            or observed.get("mode") != 0o600
+            or observed.get("uid") != os.geteuid()
+            or observed.get("gid") != os.getegid()
+            or type(observed.get("bytes")) is not int
+            or not 1 <= int(observed["bytes"]) <= MAX_SERVER_CREDENTIAL_BYTES
+        ):
+            raise SwitchError("retained server credential material changed")
+        if credential_id in result:
+            raise SwitchError("retained server credential evidence is duplicated")
+        ordering.append((str(server_definition_id), binding.name, credential_id))
+        result[credential_id] = {
+            "server_definition_id": str(server_definition_id),
+            "name": binding.name,
+            "material": dict(material),
+            "staged": staged,
+            "destination": _server_credential_destination(credential_id),
+        }
+    if ordering != sorted(ordering):
+        raise SwitchError("retained server credential evidence is not ordered")
+    staged_names: set[str] = set()
+    try:
+        for index, entry in enumerate(staged_root.iterdir()):
+            if index >= retained_control.MAX_ROWS_PER_COLLECTION:
+                raise SwitchError(
+                    "retained server credential staging root is excessive"
+                )
+            staged_names.add(entry.name)
+    except OSError as error:
+        raise SwitchError("retained server credential staging root is unavailable") from error
+    if staged_names != expected_names:
+        raise SwitchError("retained server credential staging contains extra material")
+    return result
+
+
+def _reject_server_credential_extras(
+    credentials: Mapping[str, Mapping[str, object]],
+) -> None:
+    if not credentials:
+        return
+    _private_owned_directory(
+        SERVER_CREDENTIAL_MATERIAL_ROOT, field="live server credential root"
+    )
+    affected = set(credentials)
+    seen = 0
+    try:
+        entries = SERVER_CREDENTIAL_MATERIAL_ROOT.iterdir()
+        for entry in entries:
+            seen += 1
+            if seen > retained_control.MAX_ROWS_PER_COLLECTION:
+                raise SwitchError("live server credential root is excessive")
+            matching = entry.name[:36] if entry.name[:36] in affected else None
+            if matching is not None and entry.name != (
+                f"{matching}{SERVER_CREDENTIAL_FILE_SUFFIX}"
+            ):
+                raise SwitchError(
+                    "live server credential root contains extra affected material"
+                )
+    except OSError as error:
+        raise SwitchError("live server credential root is unavailable") from error
 
 
 def require_parent_identity(path: Path, expected: object) -> None:
@@ -1639,7 +1828,7 @@ def validate_retained_rebaseline_paths(
     intent: Mapping[str, object],
     transaction_root: Path,
 ) -> None:
-    expected_backups = {
+    core_backups = {
         str(AUTHORITY_DATABASE): transaction_root
         / "retained-control-backups/authority.sqlite3",
         str(CLIENT_PROFILE): transaction_root
@@ -1653,8 +1842,16 @@ def validate_retained_rebaseline_paths(
     }
     backups = intent.get("backups")
     if backups is not None:
-        if not isinstance(backups, Mapping) or set(backups) != set(expected_backups):
+        if not isinstance(backups, Mapping) or not set(core_backups) <= set(backups):
             raise SwitchError("retained-control backup destinations are invalid")
+        expected_backups = dict(core_backups)
+        credential_destinations: set[str] = set()
+        for destination in set(backups) - set(core_backups):
+            credential_id = _server_credential_id_from_destination(destination)
+            expected_backups[str(destination)] = _server_credential_backup_path(
+                transaction_root, credential_id
+            )
+            credential_destinations.add(str(destination))
         for destination, expected_backup in expected_backups.items():
             evidence = backups[destination]
             if not isinstance(evidence, Mapping) or type(evidence.get("existed")) is not bool:
@@ -1698,6 +1895,15 @@ def validate_retained_rebaseline_paths(
                 "parent",
             }:
                 raise SwitchError("absent retained-control backup has extra evidence")
+            if destination in credential_destinations and evidence["existed"] is True:
+                if (
+                    source.get("uid") != os.geteuid()
+                    or source.get("gid") != os.getegid()
+                    or source.get("mode") != 0o600
+                ):
+                    raise SwitchError(
+                        "retained server credential predecessor is not owner mode 0600"
+                    )
     manifest = intent.get("manifest")
     if manifest is not None and Path(str(manifest)) != transaction_root / "retained-control/retained-control.json":
         raise SwitchError("retained-control manifest escaped its transaction")
@@ -1711,6 +1917,57 @@ def stop_authority_writers(runner: Runner) -> None:
     active = [unit for unit in AUTHORITY_WRITER_UNITS if unit_active(runner, unit)]
     if active:
         raise SwitchError("authority writers did not stop: " + ", ".join(active))
+
+
+def loaded_managed_worker_ids(runner: Runner) -> tuple[str, ...]:
+    """Enumerate only exact managed-worker registrations, without mutation."""
+
+    output = runner.require(
+        [
+            "/usr/bin/systemctl",
+            "list-units",
+            "--all",
+            "--type=service",
+            "--no-legend",
+            "--plain",
+            "devcoordinator-worker-*.service",
+        ],
+        "list managed worker units",
+    )
+    if len(output.encode("utf-8")) > 1024 * 1024:
+        raise SwitchError("managed worker unit inventory is excessive")
+    worker_ids: set[str] = set()
+    for index, line in enumerate(output.splitlines()):
+        if index >= 4096:
+            raise SwitchError("managed worker unit inventory is excessive")
+        fields = line.split()
+        if not fields:
+            continue
+        unit = fields[1] if fields[0] == "●" and len(fields) > 1 else fields[0]
+        if not unit.startswith("devcoordinator-worker-"):
+            continue
+        matched = WORKER_UNIT.fullmatch(unit)
+        if matched is None:
+            raise SwitchError(
+                "managed worker unit inventory contains an invalid identity"
+            )
+        try:
+            worker_id = str(uuid.UUID(matched.group(1)))
+        except ValueError as error:
+            raise SwitchError("managed worker unit identity is invalid") from error
+        if unit != f"devcoordinator-worker-{worker_id}.service":
+            raise SwitchError("managed worker unit identity is not canonical")
+        worker_ids.add(worker_id)
+    return tuple(sorted(worker_ids))
+
+
+def require_no_managed_worker_units(runner: Runner) -> None:
+    worker_ids = loaded_managed_worker_ids(runner)
+    if worker_ids:
+        raise SwitchError(
+            "schema rebaseline requires these managed workers to stop first: "
+            + ", ".join(worker_ids)
+        )
 
 
 def stop_console_writers(document: Mapping[str, object], runner: Runner) -> None:
@@ -1805,6 +2062,52 @@ def _retained_backup_destinations(transaction_root: Path) -> dict[str, dict[str,
         str(source): _backup_exact_file(source, backup, required=required)
         for source, (backup, required) in sources.items()
     }
+
+
+def _server_credential_backup_destinations(
+    credentials: Mapping[str, Mapping[str, object]],
+    transaction_root: Path,
+) -> dict[str, dict[str, object]]:
+    if not credentials:
+        return {}
+    _private_owned_directory(
+        SERVER_CREDENTIAL_MATERIAL_ROOT, field="live server credential root"
+    )
+    _reject_server_credential_extras(credentials)
+    backup_root = transaction_root / "retained-control-backups/server-credentials"
+    backup_root.mkdir(mode=0o700, exist_ok=True)
+    _private_owned_directory(
+        backup_root, field="retained server credential backup root"
+    )
+    result: dict[str, dict[str, object]] = {}
+    for credential_id in sorted(credentials):
+        destination = _server_credential_destination(credential_id)
+        backup_path = _server_credential_backup_path(
+            transaction_root, credential_id
+        )
+        evidence = _backup_exact_file(
+            destination,
+            backup_path,
+            required=False,
+        )
+        source = evidence.get("source")
+        if not isinstance(source, Mapping):
+            raise SwitchError("retained server credential backup identity is invalid")
+        if evidence.get("existed") is True and (
+            source.get("uid") != os.geteuid()
+            or source.get("gid") != os.getegid()
+            or source.get("mode") != 0o600
+        ):
+            raise SwitchError(
+                "retained server credential predecessor is not owner mode 0600"
+            )
+        if evidence.get("existed") is False:
+            unlink_regular_and_fsync(
+                backup_path,
+                parent_identity=path_parent_identity(backup_path),
+            )
+        result[str(destination)] = evidence
+    return result
 
 
 def _publish_owned_file(
@@ -1908,6 +2211,67 @@ def _restore_exact_file(destination: Path, evidence: Mapping[str, object]) -> No
     )
 
 
+def _restore_server_credentials(
+    credentials: Mapping[str, Mapping[str, object]],
+    backups: Mapping[str, object],
+) -> None:
+    if not credentials:
+        return
+    _private_owned_directory(
+        SERVER_CREDENTIAL_MATERIAL_ROOT, field="live server credential root"
+    )
+    for credential_id in sorted(credentials):
+        destination = _server_credential_destination(credential_id)
+        evidence = backups.get(str(destination))
+        if not isinstance(evidence, Mapping):
+            raise SwitchError(
+                "retained server credential rollback evidence is incomplete"
+            )
+        _restore_exact_file(destination, evidence)
+
+
+def _publish_server_credentials(
+    credentials: Mapping[str, Mapping[str, object]],
+    backups: Mapping[str, object],
+) -> None:
+    if not credentials:
+        return
+    _private_owned_directory(
+        SERVER_CREDENTIAL_MATERIAL_ROOT, field="live server credential root"
+    )
+    _reject_server_credential_extras(credentials)
+    for credential_id in sorted(credentials):
+        value = credentials[credential_id]
+        destination = _server_credential_destination(credential_id)
+        evidence = backups.get(str(destination))
+        material = value.get("material")
+        staged = value.get("staged")
+        if (
+            not isinstance(evidence, Mapping)
+            or not isinstance(material, Mapping)
+            or not isinstance(staged, Path)
+            or not isinstance(material.get("sha256"), str)
+        ):
+            raise SwitchError(
+                "retained server credential publication evidence is incomplete"
+            )
+        _publish_owned_copy(
+            destination,
+            staged,
+            evidence,
+            expected_sha256=str(material["sha256"]),
+        )
+        current = exact_file_identity(destination)
+        if (
+            current.get("uid") != os.geteuid()
+            or current.get("gid") != os.getegid()
+            or current.get("mode") != 0o600
+        ):
+            raise SwitchError(
+                "retained server credential publication ownership is invalid"
+            )
+
+
 def _unlink_authority_sidecars(database_evidence: Mapping[str, object]) -> None:
     source = database_evidence.get("source")
     if not isinstance(source, Mapping):
@@ -1917,10 +2281,14 @@ def _unlink_authority_sidecars(database_evidence: Mapping[str, object]) -> None:
         unlink_regular_and_fsync(sidecar, parent_identity=parent)
 
 
-def _restore_retained_files(backups: Mapping[str, object]) -> None:
+def _restore_retained_files(
+    backups: Mapping[str, object],
+    credentials: Mapping[str, Mapping[str, object]],
+) -> None:
     database = backups.get(str(AUTHORITY_DATABASE))
     if not isinstance(database, Mapping):
         raise SwitchError("retained-control database backup is unavailable")
+    _restore_server_credentials(credentials, backups)
     _unlink_authority_sidecars(database)
     for destination in (
         AUTHORITY_DATABASE,
@@ -1934,7 +2302,9 @@ def _restore_retained_files(backups: Mapping[str, object]) -> None:
 
 
 def _validate_manifest_backup_binding(
-    manifest: Mapping[str, object], backups: Mapping[str, object]
+    manifest: Mapping[str, object],
+    backups: Mapping[str, object],
+    credentials: Mapping[str, Mapping[str, object]],
 ) -> None:
     source = manifest.get("source")
     if (
@@ -1960,6 +2330,31 @@ def _validate_manifest_backup_binding(
         evidence = backups.get(str(CONSOLE_STATE_ROOT / name))
         if not isinstance(evidence, Mapping) or console_sources[name] != evidence.get("source"):
             raise SwitchError("retained Console source is not bound to its exact backup")
+    core_destinations = {
+        str(AUTHORITY_DATABASE),
+        str(CLIENT_PROFILE),
+        *(str(CONSOLE_STATE_ROOT / name) for name in retained_control.CONSOLE_FILES),
+    }
+    credential_destinations = {
+        str(value["destination"]) for value in credentials.values()
+    }
+    if set(backups) - core_destinations != credential_destinations:
+        raise SwitchError(
+            "retained server credential manifest is not bound to exact backups"
+        )
+    for credential_id, value in credentials.items():
+        destination = str(value["destination"])
+        evidence = backups.get(destination)
+        source = evidence.get("source") if isinstance(evidence, Mapping) else None
+        if (
+            not isinstance(evidence, Mapping)
+            or not isinstance(source, Mapping)
+            or source.get("path") != destination
+            or _server_credential_id_from_destination(destination) != credential_id
+        ):
+            raise SwitchError(
+                "retained server credential source is not bound to its exact backup"
+            )
 
 
 def _load_bound_retained_manifest(
@@ -2014,12 +2409,40 @@ def _load_bound_retained_manifest(
             or exact_file_identity(staged)["bytes"] != evidence.get("bytes")
         ):
             raise SwitchError("retained Console staged target changed")
-    _validate_manifest_backup_binding(manifest, backups)
+    credentials = _server_credentials_from_manifest(manifest, transaction_root)
+    _validate_manifest_backup_binding(manifest, backups, credentials)
     return manifest
 
 
+def _require_exact_live_server_credentials(
+    credentials: Mapping[str, Mapping[str, object]],
+) -> None:
+    if not credentials:
+        return
+    _private_owned_directory(
+        SERVER_CREDENTIAL_MATERIAL_ROOT, field="live server credential root"
+    )
+    _reject_server_credential_extras(credentials)
+    for value in credentials.values():
+        destination = Path(str(value["destination"]))
+        material = value.get("material")
+        if not isinstance(material, Mapping):
+            raise SwitchError("retained server credential target evidence is invalid")
+        current = exact_file_identity(destination)
+        if (
+            current.get("sha256") != material.get("sha256")
+            or current.get("bytes") != material.get("bytes")
+            or current.get("uid") != os.geteuid()
+            or current.get("gid") != os.getegid()
+            or current.get("mode") != 0o600
+        ):
+            raise SwitchError("retained server credential live target changed")
+
+
 def _require_exact_live_retained_target(
-    manifest: Mapping[str, object], backups: Mapping[str, object]
+    manifest: Mapping[str, object],
+    backups: Mapping[str, object],
+    transaction_root: Path,
 ) -> None:
     target = manifest.get("target")
     console_files = manifest.get("console_files")
@@ -2057,6 +2480,8 @@ def _require_exact_live_retained_target(
             != desired_owner
         ):
             raise SwitchError(f"retained-control live target changed: {destination}")
+    credentials = _server_credentials_from_manifest(manifest, transaction_root)
+    _require_exact_live_server_credentials(credentials)
     require_current_authority_schema()
 
 
@@ -2122,9 +2547,13 @@ def apply_retained_control_rebaseline(
         if not isinstance(backups, Mapping):
             raise SwitchError("applied retained-control transaction lost its backups")
         manifest = _load_bound_retained_manifest(intent, transaction_root, backups)
+        _require_exact_live_retained_target(
+            manifest, backups, transaction_root
+        )
         _require_live_retained_generation(manifest)
         return intent
 
+    require_no_managed_worker_units(runner)
     stop_authority_writers(runner)
     stop_console_writers(document, runner)
     if intent["status"] == "planned":
@@ -2150,9 +2579,19 @@ def apply_retained_control_rebaseline(
             )
         except retained_control.RetainedControlError as error:
             raise SwitchError(f"retained-control preparation failed: {error}") from error
+        credentials = _server_credentials_from_manifest(prepared, transaction_root)
+        credential_backups = _server_credential_backup_destinations(
+            credentials, transaction_root
+        )
+        full_backups = dict(backups)
+        if set(full_backups) & set(credential_backups):
+            raise SwitchError("retained server credential backup collides with control data")
+        full_backups.update(credential_backups)
+        backups = full_backups
         intent.update(
             {
                 "status": "prepared",
+                "backups": full_backups,
                 "manifest": str(output_root / "retained-control.json"),
                 "document_sha256": prepared["document_sha256"],
                 "target_database_generation": prepared["target"]["database_generation"],
@@ -2164,6 +2603,7 @@ def apply_retained_control_rebaseline(
         validate_retained_rebaseline_paths(intent, transaction_root)
 
     manifest = _load_bound_retained_manifest(intent, transaction_root, backups)
+    credentials = _server_credentials_from_manifest(manifest, transaction_root)
     target = manifest.get("target")
     if not isinstance(target, Mapping):
         raise SwitchError("retained-control target is invalid")
@@ -2186,7 +2626,8 @@ def apply_retained_control_rebaseline(
         # Always converge from the exact predecessor first.  This makes an
         # interrupted partial publish replayable even when the journal update
         # immediately after one os.replace never reached disk.
-        _restore_retained_files(backups)
+        _restore_retained_files(backups, credentials)
+        _publish_server_credentials(credentials, backups)
         _publish_owned_copy(
             AUTHORITY_DATABASE,
             target_database,
@@ -2214,10 +2655,12 @@ def apply_retained_control_rebaseline(
                 evidence,
                 expected_sha256=str(console_evidence[name]["sha256"]),
             )
-        _require_exact_live_retained_target(manifest, backups)
+        _require_exact_live_retained_target(
+            manifest, backups, transaction_root
+        )
     except BaseException as error:
         try:
-            _restore_retained_files(backups)
+            _restore_retained_files(backups, credentials)
             intent.update({"status": "prepared", "publication_recovered_at": now()})
             document["retained_control_rebaseline"] = intent
             save_phase(journal_path, document, "applying")
@@ -2249,6 +2692,7 @@ def complete_retained_control_rebaseline(
     if not isinstance(backups, Mapping):
         raise SwitchError("retained-control completion lost its exact backups")
     manifest = _load_bound_retained_manifest(intent, transaction_root, backups)
+    _require_exact_live_retained_target(manifest, backups, transaction_root)
     _require_live_retained_generation(manifest)
     if intent["status"] == "published":
         intent.update({"status": "applied", "applied_at": now()})
@@ -2270,9 +2714,15 @@ def restore_retained_control_rebaseline(
     backups = intent.get("backups")
     if not isinstance(backups, Mapping):
         raise SwitchError("retained-control rollback backups are unavailable")
+    require_no_managed_worker_units(runner)
     stop_authority_writers(runner)
     stop_console_writers(document, runner)
-    _restore_retained_files(backups)
+    if intent["status"] == "backed-up":
+        credentials: Mapping[str, Mapping[str, object]] = {}
+    else:
+        manifest = _load_bound_retained_manifest(intent, transaction_root, backups)
+        credentials = _server_credentials_from_manifest(manifest, transaction_root)
+    _restore_retained_files(backups, credentials)
     intent.update({"status": "rolled-back", "rolled_back_at": now()})
     document["retained_control_rebaseline"] = intent
     save_phase(journal_path, document, "rollback-retained-control-restored")
@@ -3129,6 +3579,11 @@ def apply(
         return document
     if document.get("phase") not in {"prepared", "applying"}:
         raise SwitchError("same-schema journal cannot be applied from this phase")
+    if rebaseline["required"] is True and rebaseline["status"] != "applied":
+        # Refuse before installing release destinations or running cleanup.
+        # Existing workers are not interrupted; the operator chooses the
+        # exact targeted restart that clears this one-time schema boundary.
+        require_no_managed_worker_units(runner)
 
     if document.get("already_active") is True:
         validate_headless_browser_cleanup_plan(document, release)
@@ -3319,6 +3774,9 @@ def verify(
             raise SwitchError("retained-control verification lost its exact backups")
         validate_retained_rebaseline_paths(rebaseline, transaction_root)
         manifest = _load_bound_retained_manifest(rebaseline, transaction_root, backups)
+        _require_exact_live_retained_target(
+            manifest, backups, transaction_root
+        )
         _require_live_retained_generation(manifest)
     authority_schema = require_current_authority_schema()
     units = [*SERVICE_ORDER, *REQUIRED_SOCKETS, str(document["candidate_console_unit"])]
@@ -3578,7 +4036,13 @@ def rollback(
 
     # Restore the schema-15 data before any previous binary or Console writer
     # is allowed to start.  This also converges a crash after any one of the
-    # five retained files was replaced.
+    # retained control or credential files was replaced.
+    rollback_rebaseline = retained_rebaseline_intent(document)
+    if (
+        rollback_rebaseline["required"] is True
+        and rollback_rebaseline["status"] not in {"planned", "rolled-back"}
+    ):
+        require_no_managed_worker_units(runner)
     stop_console_writers(document, runner)
     restore_retained_control_rebaseline(
         document, journal_path, transaction_root, runner

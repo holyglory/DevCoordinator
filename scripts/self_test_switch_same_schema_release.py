@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import inspect
+import io
 import json
 import os
 from pathlib import Path
@@ -12,6 +13,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+from contextlib import redirect_stdout
 from unittest import mock
 
 
@@ -19,6 +21,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import switch_same_schema_release as switch  # noqa: E402
+from devcoordinator.server_credentials import server_credential_id  # noqa: E402
 
 
 DIGEST = "a" * 64
@@ -1528,8 +1531,29 @@ def exercise_retained_control_transaction_boundary() -> None:
         "retained-control publication is not inside the stopped-writer switch window",
     )
     expect(
+        apply_source.index("require_no_managed_worker_units(runner)")
+        < apply_source.index("stop_authority_writers(runner)")
+        < apply_source.index("prepare_rebaseline("),
+        "schema rebaseline does not fail closed before interrupting control-plane writers",
+    )
+    expect(
+        switch_source.index("require_no_managed_worker_units(runner)")
+        < switch_source.index("install_rendered_destinations(rendered)")
+        and switch_source.index("require_no_managed_worker_units(runner)")
+        < switch_source.index("perform_headless_browser_cleanup("),
+        "managed-worker precondition runs after apply-time destination mutation",
+    )
+    expect(
+        "_server_credential_backup_destinations(" in apply_source
+        and apply_source.index("_server_credential_backup_destinations(")
+        < apply_source.index('"status": "prepared"')
+        and apply_source.index("_publish_server_credentials(")
+        < apply_source.index("_publish_owned_copy(\n            AUTHORITY_DATABASE,"),
+        "retained server credentials are not backup-bound before atomic publication",
+    )
+    expect(
         "stop_authority_writers(runner)" in rollback_source
-        and "_restore_retained_files(backups)" in rollback_source,
+        and "_restore_retained_files(backups, credentials)" in rollback_source,
         "retained-control rollback does not restore exact backups while writers are stopped",
     )
     expect(
@@ -1542,9 +1566,9 @@ def exercise_retained_control_transaction_boundary() -> None:
         "retained-control replacement leaves a direct authority reader or caller live",
     )
     expect(
-        "_restore_retained_files(backups)" in apply_source
-        and apply_source.index("_restore_retained_files(backups)")
-        < apply_source.index("_publish_owned_copy("),
+        "_restore_retained_files(backups, credentials)" in apply_source
+        and apply_source.index("_restore_retained_files(backups, credentials)")
+        < apply_source.index("_publish_server_credentials("),
         "partial retained-control publication does not converge from the exact backup",
     )
     expect(
@@ -1611,7 +1635,380 @@ def exercise_retained_control_transaction_boundary() -> None:
             switch.digest_file(source) == new_digest,
             "retained authority replay did not reproduce the staged database",
         )
-        expect(stat.S_IMODE(source.stat().st_mode) == 0o640, "exact rollback changed file mode")
+        expect(
+            stat.S_IMODE(source.stat().st_mode) == 0o640,
+            "exact rollback changed file mode",
+        )
+
+
+def exercise_retained_server_credential_transaction() -> None:
+    secret = "postgresql://synthetic:never-journal-this@database.invalid/app"
+    old_secret = b"predecessor-credential"
+    server_a = "server-a"
+    server_b = "server-b"
+    name_a = "DATABASE_URL"
+    name_b = "API_TOKEN"
+    credential_a = server_credential_id(server_a, name_a)
+    credential_b = server_credential_id(server_b, name_b)
+
+    with tempfile.TemporaryDirectory(prefix="retained-server-credentials-") as raw:
+        root = Path(raw)
+        transaction = root / "transaction"
+        transaction.mkdir(mode=0o700)
+        retained = transaction / "retained-control"
+        retained.mkdir(mode=0o700)
+        staged_root = retained / "server-credentials"
+        staged_root.mkdir(mode=0o700)
+        backup_parent = transaction / "retained-control-backups"
+        backup_parent.mkdir(mode=0o700)
+        live_root = root / "live-server-credentials"
+        live_root.mkdir(mode=0o700)
+
+        staged_values = {
+            credential_a: secret.encode("utf-8"),
+            credential_b: b"synthetic-api-token",
+        }
+        staged_paths: dict[str, Path] = {}
+        for credential_id, payload in staged_values.items():
+            path = staged_root / f"{credential_id}.credential"
+            path.write_bytes(payload)
+            path.chmod(0o600)
+            staged_paths[credential_id] = path
+
+        def manifest() -> dict[str, object]:
+            values = [
+                {
+                    "server_definition_id": server_a,
+                    "name": name_a,
+                    "credential_id": credential_a,
+                    "material": switch.exact_file_identity(
+                        staged_paths[credential_a]
+                    ),
+                },
+                {
+                    "server_definition_id": server_b,
+                    "name": name_b,
+                    "credential_id": credential_b,
+                    "material": switch.exact_file_identity(
+                        staged_paths[credential_b]
+                    ),
+                },
+            ]
+            return {"server_credentials": values}
+
+        failures: list[str] = []
+
+        def must_reject(callback, label: str) -> None:
+            try:
+                callback()
+            except switch.SwitchError as error:
+                failures.append(str(error))
+            else:
+                raise AssertionError(label)
+
+        baseline = manifest()
+        reversed_manifest = {
+            "server_credentials": list(
+                reversed(baseline["server_credentials"])
+            )
+        }
+        must_reject(
+            lambda: switch._server_credentials_from_manifest(
+                reversed_manifest, transaction
+            ),
+            "unordered staged server credential evidence was accepted",
+        )
+        noncanonical = manifest()
+        noncanonical["server_credentials"][0]["credential_id"] = (
+            "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA"
+        )
+        must_reject(
+            lambda: switch._server_credentials_from_manifest(
+                noncanonical, transaction
+            ),
+            "noncanonical staged server credential identity was accepted",
+        )
+
+        class ExcessiveCredentialList(list):
+            def __len__(self) -> int:
+                return switch.retained_control.MAX_ROWS_PER_COLLECTION + 1
+
+        must_reject(
+            lambda: switch._server_credentials_from_manifest(
+                {"server_credentials": ExcessiveCredentialList()}, transaction
+            ),
+            "excessive staged server credential evidence was accepted",
+        )
+
+        baseline = manifest()
+        staged_paths[credential_b].unlink()
+        must_reject(
+            lambda: switch._server_credentials_from_manifest(
+                baseline, transaction
+            ),
+            "missing staged server credential was accepted",
+        )
+        staged_paths[credential_b].write_bytes(staged_values[credential_b])
+        staged_paths[credential_b].chmod(0o600)
+
+        baseline = manifest()
+        staged_paths[credential_b].write_bytes(b"changed-staged-credential")
+        must_reject(
+            lambda: switch._server_credentials_from_manifest(
+                baseline, transaction
+            ),
+            "changed staged server credential was accepted",
+        )
+        staged_paths[credential_b].write_bytes(staged_values[credential_b])
+        staged_paths[credential_b].chmod(0o600)
+
+        external = root / "external-credential"
+        external.write_bytes(staged_values[credential_b])
+        external.chmod(0o600)
+        baseline = manifest()
+        staged_paths[credential_b].unlink()
+        staged_paths[credential_b].symlink_to(external)
+        must_reject(
+            lambda: switch._server_credentials_from_manifest(
+                baseline, transaction
+            ),
+            "symlinked staged server credential was accepted",
+        )
+        staged_paths[credential_b].unlink()
+        staged_paths[credential_b].write_bytes(staged_values[credential_b])
+        staged_paths[credential_b].chmod(0o600)
+
+        current_manifest = manifest()
+        expect(secret not in json.dumps(current_manifest), "manifest contains a credential value")
+        with mock.patch.object(
+            switch, "SERVER_CREDENTIAL_MATERIAL_ROOT", live_root
+        ):
+            credentials = switch._server_credentials_from_manifest(
+                current_manifest, transaction
+            )
+            live_a = live_root / f"{credential_a}.credential"
+            live_b = live_root / f"{credential_b}.credential"
+            live_a.write_bytes(old_secret)
+            live_a.chmod(0o600)
+            output = io.StringIO()
+            with redirect_stdout(output):
+                backups = switch._server_credential_backup_destinations(
+                    credentials, transaction
+                )
+                expect(
+                    secret not in json.dumps(backups),
+                    "credential backup evidence contains credential bytes",
+                )
+
+                authority_root = root / "authority"
+                profile_root = root / "profile"
+                console_root = root / "console"
+                for directory in (authority_root, profile_root, console_root):
+                    directory.mkdir(mode=0o700)
+                authority = authority_root / "authority.sqlite3"
+                profile = profile_root / "client-profiles.json"
+                authority.write_bytes(b"old-authority")
+                profile.write_bytes(b"old-profile")
+                console_paths = {
+                    name: console_root / name
+                    for name in switch.retained_control.CONSOLE_FILES
+                }
+                for name, path in console_paths.items():
+                    path.write_bytes(f"old-{name}".encode("utf-8"))
+                with (
+                    mock.patch.object(switch, "AUTHORITY_DATABASE", authority),
+                    mock.patch.object(switch, "CLIENT_PROFILE", profile),
+                    mock.patch.object(switch, "CONSOLE_STATE_ROOT", console_root),
+                ):
+                    core_backups = {
+                        str(authority): switch._backup_exact_file(
+                            authority,
+                            backup_parent / "authority.sqlite3",
+                            required=True,
+                        ),
+                        str(profile): switch._backup_exact_file(
+                            profile,
+                            backup_parent / "client-profiles.json",
+                            required=True,
+                        ),
+                        **{
+                            str(path): switch._backup_exact_file(
+                                path,
+                                backup_parent / f"console-{name}",
+                                required=False,
+                            )
+                            for name, path in console_paths.items()
+                        },
+                    }
+                    bound_backups = {**core_backups, **backups}
+                    intent = {
+                        "backups": bound_backups,
+                        "manifest": str(retained / "retained-control.json"),
+                    }
+                    expect(
+                        secret not in json.dumps(intent),
+                        "credential transaction journal contains credential bytes",
+                    )
+                    switch.validate_retained_rebaseline_paths(
+                        intent, transaction
+                    )
+                    binding_manifest = {
+                        **current_manifest,
+                        "source": {
+                            "schema_version": switch.retained_control.REBASELINE_SOURCE_SCHEMA,
+                            "database": core_backups[str(authority)]["source"],
+                            "profile": core_backups[str(profile)]["source"],
+                        },
+                        "console_sources": {
+                            name: core_backups[str(path)]["source"]
+                            for name, path in console_paths.items()
+                        },
+                    }
+                    switch._validate_manifest_backup_binding(
+                        binding_manifest, bound_backups, credentials
+                    )
+                    incomplete = dict(bound_backups)
+                    incomplete.pop(str(live_b))
+                    must_reject(
+                        lambda: switch._validate_manifest_backup_binding(
+                            binding_manifest, incomplete, credentials
+                        ),
+                        "credential manifest accepted an incomplete backup set",
+                    )
+
+                # Model a process loss after the first credential publication.
+                switch._publish_server_credentials(
+                    {credential_a: credentials[credential_a]}, backups
+                )
+                expect(
+                    live_a.read_bytes() == staged_values[credential_a],
+                    "partial credential publication did not publish the exact first file",
+                )
+                switch._restore_server_credentials(credentials, backups)
+                expect(
+                    live_a.read_bytes() == old_secret and not live_b.exists(),
+                    "partial credential recovery did not restore the exact predecessor",
+                )
+
+                # Exact restore followed by publication is replay-safe.
+                for _index in range(2):
+                    switch._restore_server_credentials(credentials, backups)
+                    switch._publish_server_credentials(credentials, backups)
+                    switch._require_exact_live_server_credentials(credentials)
+
+                live_b.unlink()
+                must_reject(
+                    lambda: switch._require_exact_live_server_credentials(
+                        credentials
+                    ),
+                    "missing live server credential was accepted",
+                )
+                switch._restore_server_credentials(credentials, backups)
+                switch._publish_server_credentials(credentials, backups)
+
+                live_b.write_bytes(b"changed-live-credential")
+                live_b.chmod(0o600)
+                must_reject(
+                    lambda: switch._require_exact_live_server_credentials(
+                        credentials
+                    ),
+                    "changed live server credential was accepted",
+                )
+                switch._restore_server_credentials(credentials, backups)
+                switch._publish_server_credentials(credentials, backups)
+
+                live_b.unlink()
+                live_b.symlink_to(live_a)
+                must_reject(
+                    lambda: switch._require_exact_live_server_credentials(
+                        credentials
+                    ),
+                    "symlinked live server credential was accepted",
+                )
+                live_b.unlink()
+                switch._restore_server_credentials(credentials, backups)
+                switch._publish_server_credentials(credentials, backups)
+
+                extra = live_root / f"{credential_a}.credential.partial"
+                extra.write_bytes(b"partial")
+                extra.chmod(0o600)
+                must_reject(
+                    lambda: switch._require_exact_live_server_credentials(
+                        credentials
+                    ),
+                    "extra affected server credential material was accepted",
+                )
+                extra.unlink()
+
+                switch._restore_server_credentials(credentials, backups)
+                expect(
+                    live_a.read_bytes() == old_secret and not live_b.exists(),
+                    "credential rollback did not restore/remove exact destinations",
+                )
+                expect(
+                    stat.S_IMODE(live_a.stat().st_mode) == 0o600,
+                    "credential rollback changed the predecessor mode",
+                )
+            expect(not output.getvalue(), "credential transaction wrote to stdout")
+
+        expect(
+            all(secret not in failure for failure in failures),
+            "credential validation error disclosed credential bytes",
+        )
+
+
+def exercise_rebaseline_refuses_managed_worker_interruption() -> None:
+    worker_a = "11111111-1111-4111-8111-111111111111"
+    worker_b = "22222222-2222-4222-8222-222222222222"
+
+    class InventoryRunner(FakeRunner):
+        def __init__(self, output: str) -> None:
+            super().__init__()
+            self.output = output
+
+        def require(self, argv: list[str], _label: str) -> str:
+            self.commands.append(list(argv))
+            return self.output
+
+    unrelated = InventoryRunner(
+        "postgresql.service loaded active running database\n"
+        "devcoordinator-authority.service loaded active running authority\n"
+    )
+    expect(
+        switch.loaded_managed_worker_ids(unrelated) == (),
+        "unrelated services became managed-worker rebaseline blockers",
+    )
+
+    active = InventoryRunner(
+        f"devcoordinator-worker-{worker_b}.service loaded active running worker\n"
+        f"● devcoordinator-worker-{worker_a}.service loaded failed failed worker\n"
+    )
+    expect(
+        switch.loaded_managed_worker_ids(active) == (worker_a, worker_b),
+        "managed-worker inventory lost exact canonical identities",
+    )
+    try:
+        switch.require_no_managed_worker_units(active)
+    except switch.SwitchError as error:
+        detail = str(error)
+        expect(worker_a in detail and worker_b in detail, "worker blocker omitted exact IDs")
+        expect(".service" not in detail, "worker blocker exposed native unit detail")
+    else:
+        raise AssertionError("active managed workers did not block schema rebaseline")
+    expect(
+        all("stop" not in command and "reset-failed" not in command for command in active.commands),
+        "rebaseline worker precondition interrupted a managed workload",
+    )
+
+    malformed = InventoryRunner(
+        "devcoordinator-worker-not-a-uuid.service loaded active running worker\n"
+    )
+    try:
+        switch.loaded_managed_worker_ids(malformed)
+    except switch.SwitchError:
+        pass
+    else:
+        raise AssertionError("malformed managed-worker identity was ignored")
 
 
 def exercise_verification_requires_boot_enablement() -> None:
@@ -1648,6 +2045,14 @@ def exercise_verification_requires_boot_enablement() -> None:
         "canonical server-wide tmpfiles policy still re-privatizes shared telemetry",
     )
     expect(
+        (ROOT / "deploy/devcoordinator.tmpfiles.conf")
+        .read_text(encoding="utf-8")
+        .splitlines()
+        .count("d /var/lib/devcoordinator/server-credentials 0700 root root -")
+        == 1,
+        "canonical server-wide tmpfiles policy omits the private credential root",
+    )
+    expect(
         "legacy_control_plane_retired = (" in source
         and "and legacy_control_plane_retired" in source
         and '"legacy_broker_retired": legacy_broker_retired' in source,
@@ -1660,6 +2065,8 @@ def exercise_verification_requires_boot_enablement() -> None:
     expect(
         rollback_source.index("restore_retained_control_rebaseline(")
         < rollback_source.index('"previous Console restore"')
+        and rollback_source.index("require_no_managed_worker_units(runner)")
+        < rollback_source.index("stop_console_writers(document, runner)")
         and rollback_source.index("stop_console_writers(document, runner)")
         < rollback_source.index('"previous Console restore"')
         and '["/usr/bin/systemctl", "disable", candidate]' in rollback_source,
@@ -1699,6 +2106,8 @@ def main() -> int:
     exercise_opt_in_test_history_reset_and_previous_release_rollback()
     exercise_reset_cli_is_explicit()
     exercise_retained_control_transaction_boundary()
+    exercise_retained_server_credential_transaction()
+    exercise_rebaseline_refuses_managed_worker_interruption()
     exercise_verification_requires_boot_enablement()
     print("same-schema release switch self-test ok")
     return 0

@@ -2288,9 +2288,17 @@ def main() -> int:
     tmpfiles = (INSTALLER.ROOT / "deploy/devcoordinator.tmpfiles.conf").read_text(
         encoding="utf-8"
     )
+    tmpfile_lines = tmpfiles.splitlines()
     expect(
         "d /var/lib/devcoordinator 0711 root root" in tmpfiles,
         "tmpfiles omits the traverse-only authority state parent",
+    )
+    expect(
+        tmpfile_lines.count(
+            "d /var/lib/devcoordinator/server-credentials 0700 root root -"
+        )
+        == 1,
+        "tmpfiles omits the root-private persistent server credential store",
     )
     expect(
         "d /var/lib/devcoordinator-clients 0711 root root" in tmpfiles,
