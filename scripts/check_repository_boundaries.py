@@ -331,7 +331,11 @@ def public_history_revisions(repo: Path) -> list[str]:
     Those tool-owned refs are neither branches nor publishable history, and
     including them makes a corrected working-tree fixture continue to fail on
     superseded editor checkpoints.  HEAD still covers a detached checkout;
-    branches, remotes, and tags preserve the fail-closed public-history scan.
+    inactive branches, remotes, and tags preserve the fail-closed public-history
+    scan. A branch currently checked out in another linked worktree is active,
+    incomplete source owned by that worktree; its own delivery scans it as
+    HEAD. Including it here lets unrelated concurrent edits block a verified
+    release before that branch is ready.
     """
     output = git(
         repo,
@@ -340,7 +344,27 @@ def public_history_revisions(repo: Path) -> list[str]:
         *PUBLIC_HISTORY_REF_PREFIXES,
     )
     assert isinstance(output, str)
-    return ["HEAD", *sorted({line.strip() for line in output.splitlines() if line.strip()})]
+    worktrees = git(repo, "worktree", "list", "--porcelain")
+    assert isinstance(worktrees, str)
+    current = subprocess.run(
+        ["git", "symbolic-ref", "-q", "HEAD"],
+        cwd=repo,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    ).stdout.strip()
+    active_other_branches = {
+        line.removeprefix("branch ").strip()
+        for line in worktrees.splitlines()
+        if line.startswith("branch ") and line.removeprefix("branch ").strip() != current
+    }
+    refs = {
+        line.strip()
+        for line in output.splitlines()
+        if line.strip() and line.strip() not in active_other_branches
+    }
+    return ["HEAD", *sorted(refs)]
 
 
 def history_paths(repo: Path) -> list[str]:

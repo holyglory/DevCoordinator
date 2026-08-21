@@ -806,8 +806,14 @@ export function createConsoleApi({
 
   async function handleLifecycleList(res, session) {
     requireLifecycleAdmin(session);
-    const result = await coordinator.lifecycleArchives();
-    sendJson(res, 200, { archives: archiveRows(result) });
+    try {
+      const result = await coordinator.lifecycleArchives();
+      sendJson(res, 200, { archives: archiveRows(result) });
+    } catch (error) {
+      if (error?.status !== 502) throw error;
+      const result = await coordinator.lifecycleArchives({ maxAgeMs: -1 });
+      sendJson(res, 200, { archives: archiveRows(result) });
+    }
   }
 
   async function handleLifecyclePlan(req, res, session) {

@@ -181,6 +181,27 @@ test('repository compatibility input and archive rows normalize to canonical pro
   });
 });
 
+test('lifecycle list retries one cold 502 with a forced fresh read', async (t) => {
+  const { archives, coordinator, request } = await fixture(t);
+  let attempts = 0;
+  const options = [];
+  coordinator.lifecycleArchives = async (value) => {
+    attempts += 1;
+    options.push(value);
+    if (attempts === 1) {
+      throw new CoordError('cold authority route is activating', { status: 502 });
+    }
+    return { archives };
+  };
+
+  const response = await request('/api/lifecycle/list');
+
+  assert.equal(response.status, 200);
+  assert.equal(response.json.archives.length, 1);
+  assert.equal(attempts, 2);
+  assert.deepEqual(options, [undefined, { maxAgeMs: -1 }]);
+});
+
 test('malformed archive identities fail closed instead of becoming lifecycle controls', async (t) => {
   const { archives, request } = await fixture(t);
   archives[0].target_kind = 'filesystem';

@@ -322,6 +322,29 @@ Environment=ROOT_STATE=%h/.local/state/root-app
         for public_ref in public_secret_refs:
             git(repo, "update-ref", "-d", public_ref)
 
+        linked_branch = "boundary-active-linked-worktree"
+        linked_ref = f"refs/heads/{linked_branch}"
+        linked_path = repo.parent / "boundary-active-linked-worktree"
+        git(repo, "update-ref", linked_ref, public_secret_commit)
+        git(repo, "worktree", "add", "--quiet", str(linked_path), linked_branch)
+        try:
+            check(
+                linked_ref not in module.public_history_revisions(repo),
+                "another active worktree branch entered this worktree's public-history gate",
+            )
+            linked_findings = module.scan_history(repo)
+            check(
+                not any(
+                    item.rule == "unsafe-history-secret"
+                    and private_turn_diff_blob in item.detail
+                    for item in linked_findings
+                ),
+                "another active worktree's provisional history blocked this worktree",
+            )
+        finally:
+            git(repo, "worktree", "remove", "--force", str(linked_path))
+            git(repo, "update-ref", "-d", linked_ref)
+
         private_turn_diff_ref = "refs/codex/turn-diffs/checkpoints/boundary-self-test"
         git(repo, "update-ref", private_turn_diff_ref, private_turn_diff_tree)
         check(

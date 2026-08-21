@@ -72,9 +72,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         uid, gid = _identity()
         if args.action == "activate":
-            before = load_maintenance_state(
-                expected_uid=uid, expected_gid=gid
-            )
+            before = load_maintenance_state()
             state = activate_maintenance(
                 expected_uid=uid,
                 expected_gid=gid,
@@ -96,9 +94,7 @@ def main(argv: list[str] | None = None) -> int:
             result = {"active": False, "changed": changed}
         else:
             result = _document(
-                load_maintenance_state(
-                    expected_uid=uid, expected_gid=gid
-                ),
+                load_maintenance_state(),
                 changed=False,
             )
     except Exception as error:

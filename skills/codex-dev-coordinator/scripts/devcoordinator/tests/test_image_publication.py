@@ -609,15 +609,18 @@ class ImagePublicationTests(unittest.TestCase):
 
     def test_apply_reuses_exact_built_image_without_rebuilding(self) -> None:
         build_commands: list[tuple[str, ...]] = []
+        previous_image = "sha256:" + "0" * 64
+        current_tag = [previous_image]
 
         def build_runner(
             command: tuple[str, ...], _timeout: float, _environment: dict[str, str]
         ) -> subprocess.CompletedProcess[str]:
             build_commands.append(command)
+            current_tag[0] = IMAGE_ID
             return subprocess.CompletedProcess(command, 0, stdout="built", stderr="")
 
         with mock.patch.object(
-            publication, "docker_image_id", return_value=IMAGE_ID
+            publication, "docker_image_id", side_effect=lambda *_args, **_kwargs: current_tag[0]
         ), mock.patch.object(publication, "_docker_environment", return_value={}):
             plan = publication.plan_publication(
                 specification=self.specification,
@@ -682,6 +685,7 @@ class ImagePublicationTests(unittest.TestCase):
                 )
 
         self.assertEqual(result["status"], "published")
+        self.assertEqual(plan["previous_image_id"], previous_image)
         self.assertEqual(len(build_commands), 1)
         rollout.assert_called_once()
 
@@ -749,6 +753,44 @@ class ImagePublicationTests(unittest.TestCase):
         self.assertEqual(diagnostic["failed_services"], ["migrate"])
         self.assertNotIn("do-not-leak-diagnostic", json.dumps(diagnostic))
         self.assertNotIn("do-not-leak-bearer", json.dumps(diagnostic))
+        status = publication.publication_status(
+            artifact_root=self.artifacts,
+            operation_id=plan["operation_id"],
+            service_uid=os.geteuid(),
+        )
+        self.assertEqual(status["reconciliation_action"], "apply")
+        with mock.patch.object(
+            publication, "docker_image_id", return_value=IMAGE_ID
+        ), mock.patch.object(
+            publication, "_docker_environment", return_value={}
+        ), mock.patch.object(
+            publication, "docker_image_evidence", return_value=image
+        ), mock.patch.object(
+            publication,
+            "installed_package_identity",
+            return_value="libgssapi-krb5-2=1.0:amd64",
+        ), mock.patch.object(
+            publication, "run_compose_rollout", return_value={"phases": []}
+        ), mock.patch.object(
+            publication,
+            "verify_published_runtime",
+            return_value={"status": "verified"},
+        ):
+            resumed = publication.apply_publication(
+                specification=self.specification,
+                artifact_root=self.artifacts,
+                operation_id=plan["operation_id"],
+                confirmation_fingerprint=plan["plan_fingerprint"],
+                service_uid=os.geteuid(),
+                broker_database_path=self.broker_database,
+                compose_renderer=rendered_model,
+                compose_configuration_verifier=self._configuration_verifier,
+                docker_runner=lambda *_args: self.fail(
+                    "rollout reconciliation must not rebuild"
+                ),
+            )
+        self.assertEqual(resumed["status"], "published")
+        self.assertIsNone(resumed["reconciliation_action"])
 
     def test_rollout_uses_only_sealed_no_build_force_recreate_commands(self) -> None:
         commands: list[tuple[str, ...]] = []

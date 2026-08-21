@@ -84,13 +84,6 @@ class UniversalTestRunnerTests(unittest.TestCase):
             ttl_seconds=30,
         )
 
-    def result_cases(self, result_path: Path) -> list[dict[str, object]]:
-        return list(
-            iter_result_package_records(
-                validate_result_package(result_path), "cases"
-            )
-        )
-
     def test_jsonl_reporter_accepts_blank_zero_case_stream(self) -> None:
         report = self.output / "reporter.events.jsonl"
         report.write_text("\n  \n", encoding="utf-8")
@@ -105,6 +98,13 @@ class UniversalTestRunnerTests(unittest.TestCase):
         report.write_text("\nnot-json\n", encoding="utf-8")
         with self.assertRaises(json.JSONDecodeError):
             _jsonl_cases(report)
+
+    def result_cases(self, result_path: Path) -> list[dict[str, object]]:
+        return list(
+            iter_result_package_records(
+                validate_result_package(result_path), "cases"
+            )
+        )
 
     def result_package_content(self, result_path: Path) -> dict[str, object]:
         package = validate_result_package(result_path)
