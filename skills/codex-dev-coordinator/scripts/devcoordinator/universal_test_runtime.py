@@ -3433,6 +3433,8 @@ class SystemdTestAttemptManager:
             "size_bytes": package.evidence.size_bytes,
             "manifest_sha256": package.evidence.manifest_sha256,
             "identity": dict(package.evidence.identity),
+            "manifest": dict(package.manifest),
+            "outcome": dict(package.manifest["outcome"]),
             "counts": dict(package.evidence.counts),
         }
 
@@ -4840,13 +4842,7 @@ class BrokerTestAttemptCoordinator:
         }
 
     # Package/fact projection consumed by the schema-v8 broker adapter.
-    def observe(
-        self, runtime_id: str, *, result_chunk_index: int | None = None
-    ) -> dict[str, object]:
-        if result_chunk_index is not None:
-            raise TestStoreContractError(
-                "result chunk observation is not supported by atomic packages"
-            )
+    def observe(self, runtime_id: str) -> dict[str, object]:
         runtime_id = _safe_id("runtime_id", runtime_id)
         state = self._require_exact_native_state(
             runtime_id, self.manager.status(runtime_id)
@@ -4863,7 +4859,7 @@ class BrokerTestAttemptCoordinator:
         else:
             lifecycle = "exited"
         return {
-            "execution_id": runtime_id,
+            "execution_id": descriptor.attempt_id,
             "runtime_id": runtime_id,
             "attempt_id": descriptor.attempt_id,
             "generation": descriptor.generation,

@@ -20,3 +20,5 @@ audit-outputs/
 full-repo-audit-run/
 tmp/
 .codex-db-backups/
+.product-delivery/
+.serena/

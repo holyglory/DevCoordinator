@@ -20,7 +20,6 @@ from typing import Sequence
 
 from .universal_test_service import RepositoryUIDPlanPreviewer, StoreTestPlaneAdapter
 from .universal_test_store import TestStoreContractError, UniversalTestStore
-from .universal_test_spool import DurableAttemptSpool
 from .universal_test_scheduler import WeightedFairScheduler
 from .universal_test_broker import (
     BrokerConnection,
@@ -45,7 +44,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--broker-socket", type=Path)
     parser.add_argument("--snapshot-socket", type=Path)
-    parser.add_argument("--spool", type=Path)
     parser.add_argument("--launch-batch", type=int, default=64)
     parser.add_argument("--interval-seconds", type=float, default=1.0)
     parser.add_argument("--check", action="store_true")
@@ -152,12 +150,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             arguments.database, verify_integrity=False
         )
         store.verify_writable()
-        if arguments.spool is not None:
-            DurableAttemptSpool.open(arguments.spool)
         return 0
-    if arguments.broker_socket is None or arguments.snapshot_socket is None or arguments.spool is None:
+    if arguments.broker_socket is None or arguments.snapshot_socket is None:
         raise TestStoreContractError(
-            "production testd requires broker, snapshot, and spool paths"
+            "production testd requires broker and snapshot paths"
         )
     store = UniversalTestStore.open(arguments.database)
     call_journal = configured_call_journal()
@@ -184,7 +180,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                 call_journal=call_journal,
             )
         ),
-        spool=DurableAttemptSpool.open(arguments.spool),
         clock=time.time,
     )
     return run(

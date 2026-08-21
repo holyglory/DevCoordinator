@@ -176,10 +176,8 @@ from .universal_test_contract import (
     ManifestContractError,
     SourceMode,
     manifest_to_document,
-    parse_test_manifest,
-    safe_history_shard_ceiling,
 )
-from .universal_test_planner import TestPlanError, create_test_plan
+from .universal_test_planner import TestPlanError
 from .universal_test_snapshot import public_snapshot_source_diagnostic
 from .universal_test_service import (
     TestPlanPreviewUnavailable,
@@ -214,9 +212,9 @@ def _test_target_resources(
         result[name] = TargetResources(
             estimated_seconds=raw["estimated_seconds"],
             shard_count=raw["shard_count"],
-            max_attempts=raw["max_attempts"],
             worktree_key=raw["worktree_key"],
             exclusive_resources=tuple(raw["exclusive_resources"]),
+            ttl_seconds=raw["ttl_seconds"],
         )
     return result
 
@@ -868,64 +866,11 @@ class StoreBackedMutationBackend:
                 return result
 
             if request.operation is BrokerOperation.TEST_PLAN_REGISTER:
-                plan = decode_test_plan_document(request.arguments["plan"])
-                manifest = parse_test_manifest(request.arguments["manifest"])
-                if manifest.fingerprint != plan.manifest_fingerprint:
-                    raise TestStoreContractError(
-                        "plan manifest fingerprint does not match the validated manifest"
-                    )
-                requested_targets = tuple(
-                    target
-                    for target, selection in plan.selection.items()
-                    if "requested" in selection.reasons
+                raise BrokerBackendError(
+                    "protected_test_preview_required",
+                    "Test plans must be selected and immutably captured through the protected preview operation.",
+                    operation_id=request.operation_id,
                 )
-                expected = create_test_plan(
-                    manifest,
-                    intent=plan.intent,
-                    source=plan.source,
-                    changes=plan.changes,
-                    requested_targets=requested_targets,
-                    execution_timeout_seconds=plan.timeouts.execution_seconds,
-                    launch_timeout_seconds=plan.timeouts.launch_seconds,
-                )
-                if expected.to_document() != plan.to_document():
-                    raise TestStoreContractError(
-                        "plan selection does not match the validated manifest"
-                    )
-                self._require_test_plan_source(accepted, plan.source.to_document())
-                if plan.source.mode is SourceMode.IMMUTABLE:
-                    raise TestStoreContractError(
-                        "immutable plans must be produced by repository-owned preview"
-                    )
-                worktree_key = plan.source.temporary_root or plan.source.original_root
-                resources = {
-                    name: TargetResources(
-                        estimated_seconds=float(
-                            manifest.targets[name].timeout_seconds
-                            if plan.timeouts.execution_seconds is None
-                            else plan.timeouts.execution_seconds
-                        ),
-                        shard_count=safe_history_shard_ceiling(
-                            manifest.targets[name]
-                        ),
-                        max_attempts=manifest.targets[name].retry.max_attempts,
-                        worktree_key=worktree_key,
-                        exclusive_resources=manifest.targets[
-                            name
-                        ].exclusive_resources,
-                    )
-                    for name in plan.selected_targets
-                }
-                result = dict(
-                    plane.register_plan(
-                        plan.to_document(), target_resources=resources
-                    )
-                )
-                self._require_test_repository(result, request.project_id)
-                # Client-supplied agent text is diagnostic only; the kernel UID
-                # and account remain the durable actor.
-                result["actor"] = actor
-                return result
 
             if request.operation is BrokerOperation.TEST_RUN_SUBMIT:
                 expected_repository_id = request.arguments.get(
@@ -1450,12 +1395,7 @@ class StoreBackedMutationBackend:
             )
             self._require_internal_attempt_binding(request, descriptor)
             if request.operation is BrokerOperation.TEST_ATTEMPT_STATUS:
-                return coordinator.observe(
-                    str(request.arguments["runtime_id"]),
-                    result_chunk_index=int(
-                        request.arguments["result_chunk_index"]
-                    ),
-                )
+                return coordinator.observe(str(request.arguments["runtime_id"]))
             raise TestStoreContractError("unsupported internal test attempt operation")
         except TestAttemptLaunchUncertain as error:
             raise BrokerBackendError(

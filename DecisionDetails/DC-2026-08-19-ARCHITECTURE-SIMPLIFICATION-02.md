@@ -13,21 +13,27 @@ work are disposable.
 
 ## Selected architecture
 
-- A DevCoordinator or testd restart cancels unfinished tests and cleans their
-  exact transient units. Callers rerun them. There is no recovery lease,
-  cross-process attempt resurrection, legacy progress projection, or replayable
-  result-chunk protocol.
-- Testd keeps only current execution state and a bounded short-lived terminal
-  result needed by `follow` and exact artifact retrieval. It publishes no
-  historical statistics, fleet heatmaps, rollups, evidence-consumption state,
-  or cross-run reuse decision.
-- The public testing journey is run, follow, cancel, and artifact retrieval.
-  Planning and launch validation remain implementation details of `run`.
-  Manual retry is a new run.
-- A repository test manifest declares current targets, no-shell command,
-  working directory, dependencies, timeout, artifacts, and sealed fixture or
-  credential references. It has no intent matrix, change-selection language,
-  reuse policy, evidence policy, shard history, or retry policy.
+- A DevCoordinator or testd restart first imports any complete atomic result,
+  then cancels unfinished tests and cleans their exact transient units. Callers
+  rerun them. There is no recovery lease, cross-process attempt resurrection,
+  legacy progress projection, or replayable result-chunk protocol.
+- Testd keeps one execution slot per selected target and is the only semantic
+  run authority. The root boundary persists and returns exact prepare, start,
+  observe, stop, cgroup-empty, result-package, and collection facts; it never
+  decides the test conclusion. Bounded aggregate statistics may be derived
+  from retained terminal rows, but no second lifecycle or rollup authority is
+  maintained.
+- Preserve the stable public testing contract: `enqueue`, reviewed `submit`,
+  `follow`, `queue-status`, cursor-bounded `failures` and `cases`, verified
+  `artifact` and `artifact-export`, `cancel`, and manual failed-only `retry`.
+  Retry creates a new immutable run. Advanced CLI and MCP commands are thin
+  mappings over the same testd operations and never construct a local plan or
+  independent conclusion.
+- A repository test manifest continues to declare inputs, intents, current
+  targets, no-shell commands, working directories, exact dependencies,
+  timeouts, artifacts, explicit sharding/retry policy, and sealed fixture,
+  credential, or typed state-handle references. Planning may inspect the live
+  worktree, but every governed execution uses one immutable captured source.
 - The completed pre-availability installation, legacy authority import,
   storage split, fleet adoption, temporary handoff listeners, and rollback to
   the pre-availability layout are unsupported and removed. Current releases
@@ -51,15 +57,18 @@ work are disposable.
 
 ## Supersession
 
-This decision supersedes the test-history, cross-run reuse, retry, active-test
-recovery, result-chunk replay, progress-schema compatibility, fleet analytics,
-legacy test journal, pre-availability cutover, legacy authority import, fleet
+This decision supersedes historical result-chunk replay, lease-based active-test
+recovery, progress-schema compatibility, materialized fleet rollup authority,
+legacy test journals, pre-availability cutover, legacy authority import, fleet
 manifest adoption, and old-layout rollback portions of earlier decisions and
-user-issue rows. It narrows same-schema continuity to retained control data and
-current-format release activation. Exact resource identity, generation and
-path checks, idempotent host mutation, public authorization, secret transport,
-non-root repository execution, transient cgroup isolation, TTL cleanup,
-bounded diagnostics, and repository-owned DevCoordinator delivery remain.
+user-issue rows. It does not supersede reviewed release/handoff submission,
+queue observability, complete cursor-bounded failures/cases, verified artifact
+export, manual retry as a new run, change-based target selection, typed state
+handles, or compatible same-schema reads. Exact resource identity, generation
+and path checks, idempotent host mutation, public authorization, secret
+transport, non-root repository execution, transient cgroup isolation, TTL
+cleanup, bounded diagnostics, and repository-owned DevCoordinator delivery
+remain.
 
 ## Alternatives and rationale
 

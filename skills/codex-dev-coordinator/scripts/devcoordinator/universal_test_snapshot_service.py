@@ -43,7 +43,6 @@ from .universal_test_runtime import (
     TestAttemptDescriptor,
 )
 from .universal_test_planner import TestPlanError, TestPlanTimeouts
-from .universal_testd import LiveSourceChanged
 from .universal_test_service import (
     RepositoryUIDPlanPreviewer,
     decode_repository_setup_document,
@@ -64,11 +63,19 @@ from .universal_test_snapshot import (
     snapshot_regular_file_digest,
 )
 from .universal_test_store import (
-    LeaseGrant,
+    ExecutionGrant,
     RunnableTarget,
     TestStoreConflict,
     TestStoreContractError,
 )
+
+
+class LiveSourceChanged(TestStoreConflict):
+    """Legacy planning signal retained only until live selection is captured."""
+
+    def __init__(self, observed_source_fingerprint: str) -> None:
+        self.observed_source_fingerprint = str(observed_source_fingerprint)
+        super().__init__("live source changed before immutable capture")
 
 
 SNAPSHOT_SERVICE_SCHEMA_VERSION = 1
@@ -217,7 +224,7 @@ def _snapshot_correlations(
     if not isinstance(arguments, Mapping):
         return None, None, None
     candidate = arguments.get("candidate")
-    lease = arguments.get("lease")
+    execution = arguments.get("execution")
     plan = arguments.get("plan")
     repository_id = arguments.get("repository_id")
     run_id = None
@@ -227,9 +234,9 @@ def _snapshot_correlations(
         run_id = candidate.get("run_id")
     if isinstance(plan, Mapping):
         repository_id = plan.get("repository_id", repository_id)
-    if isinstance(lease, Mapping):
-        run_id = lease.get("run_id", run_id)
-        attempt_id = lease.get("attempt_id")
+    if isinstance(execution, Mapping):
+        run_id = execution.get("run_id", run_id)
+        attempt_id = execution.get("execution_id")
     return (
         repository_id if isinstance(repository_id, str) else None,
         run_id if isinstance(run_id, str) else None,
@@ -858,9 +865,10 @@ class RootSnapshotService:
             or manifest["source_mode"] not in {"live", "immutable"}
         ):
             raise SnapshotMaterializationError("snapshot preview intent is invalid")
-        provenance = None
+        captured_changes: list[Mapping[str, object]] = []
+        live_plan = None
         if manifest["source_mode"] == "live":
-            planned = self.helper.call(
+            live_planned = self.helper.call(
                 "live_plan",
                 owner_uid=owner_uid,
                 arguments={
@@ -872,40 +880,59 @@ class RootSnapshotService:
                     "timeouts": timeouts.to_document(),
                 },
             )
-        else:
-            request = SnapshotMaterializationRequest(
-                repository_id=repository_id,
-                original_root=str(authority["canonical_root"]),
-                temporary_root=(execution_root if temporary_root is not None else None),
-                manifest_fingerprint=str(manifest["manifest_fingerprint"]),
-                intent=intent,
-                owner_uid=owner_uid,
-                access_uid=access_uid,
-            )
-            materialize_with_timeout = getattr(
-                self.materializer, "materialize_with_timeout", None
-            )
-            if callable(materialize_with_timeout):
-                provenance = materialize_with_timeout(
-                    request,
-                    timeout_seconds=_snapshot_preview_remaining(),
+            if set(live_planned) != {"plan", "target_resources", "launch_catalog"}:
+                raise SnapshotMaterializationError(
+                    "live selection result is invalid"
                 )
-            else:
-                # Kept only for injected test doubles.  The production
-                # FilesystemSnapshotMaterializer always exposes the bounded
-                # entrypoint above.
-                provenance = self.materializer.materialize(request)
-            planned = self.helper.call(
-                "plan",
-                owner_uid=owner_uid,
-                arguments={
-                    "snapshot_root": provenance.materialized_root,
-                    "source": provenance.source_identity().to_document(),
-                    "intent": intent,
-                    "requested_targets": list(requested_targets),
-                    "timeouts": timeouts.to_document(),
-                },
+            live_plan = decode_test_plan_document(live_planned["plan"])  # type: ignore[arg-type]
+            raw_changes = live_planned["plan"].get("changes")  # type: ignore[union-attr]
+            if not isinstance(raw_changes, list):
+                raise SnapshotMaterializationError(
+                    "live selection omitted its exact changes"
+                )
+            captured_changes = [dict(item) for item in raw_changes]
+        request = SnapshotMaterializationRequest(
+            repository_id=repository_id,
+            original_root=str(authority["canonical_root"]),
+            temporary_root=(execution_root if temporary_root is not None else None),
+            manifest_fingerprint=str(manifest["manifest_fingerprint"]),
+            intent=intent,
+            owner_uid=owner_uid,
+            access_uid=access_uid,
+        )
+        materialize_with_timeout = getattr(
+            self.materializer, "materialize_with_timeout", None
+        )
+        if callable(materialize_with_timeout):
+            provenance = materialize_with_timeout(
+                request,
+                timeout_seconds=_snapshot_preview_remaining(),
             )
+        else:
+            # Kept only for injected test doubles.  The production
+            # FilesystemSnapshotMaterializer always exposes the bounded
+            # entrypoint above.
+            provenance = self.materializer.materialize(request)
+        if (
+            live_plan is not None
+            and live_plan.source.content_fingerprint
+            != provenance.content_fingerprint
+        ):
+            raise SnapshotMaterializationError(
+                "source changed between live selection and immutable capture; retry from a fresh plan"
+            )
+        planned = self.helper.call(
+            "plan",
+            owner_uid=owner_uid,
+            arguments={
+                "snapshot_root": provenance.materialized_root,
+                "source": provenance.source_identity().to_document(),
+                "intent": intent,
+                "requested_targets": list(requested_targets),
+                "changes": captured_changes,
+                "timeouts": timeouts.to_document(),
+            },
+        )
         if set(planned) != {"plan", "target_resources", "launch_catalog"}:
             raise SnapshotMaterializationError("snapshot plan result is invalid")
         plan = decode_test_plan_document(planned["plan"])  # type: ignore[arg-type]
@@ -916,28 +943,19 @@ class RootSnapshotService:
             or plan.manifest_fingerprint != manifest["manifest_fingerprint"]
         ):
             raise SnapshotMaterializationError("snapshot plan identity is contradictory")
-        if manifest["source_mode"] == "immutable":
-            if provenance is None or plan.source != provenance.source_identity():
-                raise SnapshotMaterializationError(
-                    "snapshot plan source is contradictory"
-                )
-        elif (
-            plan.source.mode.value != "live"
-            or plan.source.original_root != authority["canonical_root"]
-            or plan.source.temporary_root
-            != (execution_root if temporary_root is not None else None)
-            or plan.source.snapshot_id is not None
-        ):
-            raise SnapshotMaterializationError("live plan source is contradictory")
+        if plan.source != provenance.source_identity():
+            raise SnapshotMaterializationError(
+                "snapshot plan source is contradictory"
+            )
         source_catalog_id = self._source_catalog_id(plan)
         source_provenance = {
-            "complete": provenance is not None,
+            "complete": True,
             "content_fingerprint": plan.source.content_fingerprint,
             "manifest_fingerprint": plan.manifest_fingerprint,
             "dependency_locks": (
-                {} if provenance is None else dict(provenance.dependency_locks)
+                dict(provenance.dependency_locks)
             ),
-            "toolchain": {} if provenance is None else dict(provenance.toolchain),
+            "toolchain": dict(provenance.toolchain),
         }
         raw_launch_catalog = planned.get("launch_catalog")
         if not isinstance(raw_launch_catalog, Mapping):
@@ -2266,15 +2284,15 @@ class RootSnapshotService:
         return tuple(result)
 
     def resolve(self, arguments: Mapping[str, object]) -> Mapping[str, object]:
-        if set(arguments) != {"candidate", "lease", "plan"}:
+        if set(arguments) != {"candidate", "execution", "plan"}:
             raise TestStoreContractError("snapshot resolve arguments are invalid")
-        candidate_raw, lease_raw, plan_raw = (
-            arguments["candidate"], arguments["lease"], arguments["plan"]
+        candidate_raw, execution_raw, plan_raw = (
+            arguments["candidate"], arguments["execution"], arguments["plan"]
         )
-        if not isinstance(candidate_raw, Mapping) or not isinstance(lease_raw, Mapping) or not isinstance(plan_raw, Mapping):
+        if not isinstance(candidate_raw, Mapping) or not isinstance(execution_raw, Mapping) or not isinstance(plan_raw, Mapping):
             raise TestStoreContractError("snapshot resolve documents are invalid")
         candidate = RunnableTarget(**candidate_raw)  # type: ignore[arg-type]
-        lease = LeaseGrant(**lease_raw)  # type: ignore[arg-type]
+        execution = ExecutionGrant(**execution_raw)  # type: ignore[arg-type]
         plan = decode_test_plan_document(plan_raw)
         catalog = None
         try:
@@ -2283,8 +2301,8 @@ class RootSnapshotService:
             if plan.source.mode.value != "live":
                 raise
         if (
-            candidate.run_id != lease.run_id
-            or candidate.target_id != lease.target_id
+            candidate.run_id != execution.run_id
+            or candidate.target_id != execution.target_id
             or candidate.target_name not in plan.selected_targets
             or candidate.repository_id != plan.repository_id
             or candidate.source_mode != plan.source.mode.value
@@ -2421,13 +2439,13 @@ class RootSnapshotService:
             )
         supplementary_gids = self._supplementary_developer_gids(account_uids)
         descriptor = TestAttemptDescriptor(
-            attempt_id=lease.attempt_id,
+            attempt_id=execution.attempt_id,
             target_id=candidate.target_id,
             run_id=candidate.run_id,
             repository_id=candidate.repository_id,
             repository_generation=int(authority["generation"]),
             owner_uid=candidate.owner_uid,
-            generation=lease.generation,
+            generation=execution.generation,
             source_mode=plan.source.mode.value,
             intent=plan.intent,
             snapshot_id=plan.source.snapshot_id,
@@ -2440,7 +2458,7 @@ class RootSnapshotService:
             shard_count=candidate.shard_count,
             argv=self._argv(
                 launch["argv"],  # type: ignore[arg-type]
-                attempt_id=lease.attempt_id,
+                attempt_id=execution.attempt_id,
                 shard_index=candidate.shard_index,
                 shard_count=candidate.shard_count,
                 python_executable=python_executable,
@@ -2766,7 +2784,7 @@ class UnixSnapshotServiceClient(RepositoryUIDPlanPreviewer, RepositoryLaunchDesc
         self,
         *,
         candidate,
-        lease,
+        execution,
         plan_document,
         timeout_seconds: float,
     ) -> Mapping[str, object]:
@@ -2774,7 +2792,7 @@ class UnixSnapshotServiceClient(RepositoryUIDPlanPreviewer, RepositoryLaunchDesc
             "resolve",
             {
                 "candidate": asdict(candidate),
-                "lease": asdict(lease),
+                "execution": asdict(execution),
                 "plan": dict(plan_document),
             },
             timeout_seconds=timeout_seconds,

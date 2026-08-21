@@ -540,7 +540,11 @@ def create_test_plan(
     if intent not in manifest.intents:
         raise TestPlanError(f"manifest does not declare intent {intent!r}")
     intent_contract = manifest.intents[intent]
-    if source.mode is not intent_contract.source_mode:
+    captured_live_source = (
+        source.mode is SourceMode.IMMUTABLE
+        and intent_contract.source_mode is SourceMode.LIVE
+    )
+    if source.mode is not intent_contract.source_mode and not captured_live_source:
         raise TestPlanError(
             f"intent {intent!r} requires {intent_contract.source_mode.value} source mode"
         )
@@ -553,9 +557,11 @@ def create_test_plan(
         )
     if normalized_requested and intent != "manual":
         raise TestPlanError("explicit target selection is allowed only for manual intent")
-    if normalized_changes and source.mode is SourceMode.IMMUTABLE:
+    if normalized_changes and not (
+        intent_contract.source_mode is SourceMode.LIVE
+        and source.mode is SourceMode.IMMUTABLE
+    ) and source.mode is SourceMode.IMMUTABLE:
         raise TestPlanError("immutable intent plans do not accept live change paths")
-
     intent_targets = {
         target.name
         for target in manifest.targets.values()
@@ -572,7 +578,7 @@ def create_test_plan(
     reasons: dict[str, set[str]] = {}
     fallback = False
     initial: set[str] = set()
-    if source.mode is SourceMode.IMMUTABLE:
+    if source.mode is SourceMode.IMMUTABLE and not captured_live_source:
         immutable_base = (
             set(normalized_requested)
             if intent == "manual" and normalized_requested

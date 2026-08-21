@@ -255,6 +255,7 @@ class TestStoreV8Tests(unittest.TestCase):
     def test_begin_execution_persists_exact_identity_before_return_and_replays(self) -> None:
         submitted = self.submit()
         target = self.store.runnable_targets()[0]
+        preview_execution_id = self.store.execution_identity(target.target_id)
         mutation = operation_id()
         launch = operation_id()
         arguments = {
@@ -266,6 +267,7 @@ class TestStoreV8Tests(unittest.TestCase):
             "operation_id": mutation,
         }
         first = self.store.begin_execution(target.target_id, **arguments)
+        self.assertEqual(first.execution_id, preview_execution_id)
         replay = self.store.begin_execution(target.target_id, **arguments)
         retained = self.store.restart_cleanup()
         self.assertEqual(first, replay)

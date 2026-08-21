@@ -189,8 +189,7 @@ class FakeRuntime:
             "exit_status": None if oom else (1 if malformed else 0),
             "systemd_result": "oom-kill" if oom else ("exit-code" if malformed else "success"),
             "oom_killed": oom,
-            "result_document_sha256": None if oom else "7" * 64,
-            "result_chunks_sha256": "8" * 64,
+            "result_package_sha256": None if oom else "7" * 64,
             "reporter_complete": False if oom or malformed else True,
         }
 
@@ -224,11 +223,11 @@ class FakeManager:
     def status(self, runtime_id):
         return NativeTestAttemptState(runtime_id, False, False, "not-found", 0, termination_reason="success")
 
-    def read_result_chunk(self, runtime_id, chunk_index):
-        return None
-
     def cancel(self, runtime_id):
         return self.status(runtime_id)
+
+    def resolve_result_package(self, _storage_handle):
+        raise AssertionError("fake runtime publishes no package")
 
     def collect(self, runtime_id):
         return None

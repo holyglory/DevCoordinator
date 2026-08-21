@@ -1745,10 +1745,14 @@ def _scheduler_result_or_pending(
                     "broker summary exceeds the 8 KiB agent output contract"
                 )
         return result
-    pending = scheduler_pending(action, **dict(arguments))
-    if broker_profile_error is not None:
-        pending["broker_profile_error"] = _BROKER_PROFILE_ERROR
-    return pending
+    detail = (
+        _BROKER_PROFILE_ERROR
+        if broker_profile_error is not None
+        else "test scheduler returned no result"
+    )
+    raise UniversalTestCliError(
+        f"broker-owned test {action} is unavailable: {detail}"
+    )
 
 
 def handle_universal_test_cli(
@@ -1777,40 +1781,52 @@ def handle_universal_test_cli(
             if args.temporary_repo is not None
             else None
         )
-        broker_profile, broker_profile_error = _optional_broker_profile(
-            broker_profile_loader
-        )
-        result = build_local_plan(
-            root=root,
-            temporary=temporary,
-            agent=args.agent,
-            intent=args.intent,
-            raw_changes=args.change,
-            requested_targets=args.target,
-            execution_timeout_seconds=args.execution_timeout_seconds,
-            launch_timeout_seconds=args.launch_timeout_seconds,
-            broker_profile=broker_profile,
-            operation_id=args.operation_id,
-            compact=not args.full,
-        )
-        if broker_profile_error is not None:
-            result["broker_profile_error"] = _BROKER_PROFILE_ERROR
+        if args.change:
+            raise UniversalTestCliError(
+                "protected planning discovers the complete current change set; "
+                "omit --change"
+            )
+        try:
+            broker_profile = broker_profile_loader()
+            if broker_profile is None:
+                raise UniversalTestCliError("test broker profile is unavailable")
+            repository = _resolved_broker_repository(root.resolve(), broker_profile)
+            preview = getattr(broker_profile, "preview_test_plan")
+            result = preview(
+                repository=repository.repo_id,
+                intent=args.intent,
+                temporary_root=(
+                    None if temporary is None else str(temporary.resolve())
+                ),
+                requested_targets=tuple(args.target),
+                execution_timeout_seconds=args.execution_timeout_seconds,
+                launch_timeout_seconds=args.launch_timeout_seconds,
+                operation_id=args.operation_id,
+            )
+        except UniversalTestCliError:
+            raise
+        except Exception as error:
+            raise UniversalTestCliError(
+                "protected test planning is unavailable"
+            ) from error
+        if not isinstance(result, Mapping):
+            raise UniversalTestCliError("protected test planning reply is invalid")
         if not args.full:
             result = _require_agent_envelope(result, surface="test plan")
-        return result
+        return dict(result)
     if action == "catalog":
         root = Path(canonical_project(args.root_repo)) if args.root_repo else None
-        broker_profile, broker_profile_error = _optional_broker_profile(
-            broker_profile_loader
-        )
-        if root is None and broker_profile_error is not None:
+        try:
+            broker_profile = broker_profile_loader()
+        except Exception as error:
             raise UniversalTestCliError(
-                "test catalog cannot enumerate repositories because the broker "
-                f"profile is invalid: {broker_profile_error}"
+                "broker-owned test catalog is unavailable"
+            ) from error
+        if broker_profile is None:
+            raise UniversalTestCliError(
+                "broker-owned test catalog is unavailable"
             )
         result = test_catalog(root, broker_profile)
-        if broker_profile_error is not None:
-            result["broker_profile_error"] = _BROKER_PROFILE_ERROR
         return _bounded_catalog_envelope(result)
     if action == "stats":
         if not 1 <= args.days <= 3650 or not 1 <= args.limit <= 500:

@@ -331,7 +331,7 @@ class UniversalTestRuntimeV8Tests(unittest.TestCase):
 
         observed = coordinator.observe(self.runtime_id)
 
-        self.assertEqual(observed["execution_id"], self.runtime_id)
+        self.assertEqual(observed["execution_id"], self.descriptor.attempt_id)
         self.assertEqual(observed["generation"], self.descriptor.generation)
         self.assertEqual(observed["state"], "exited")
         self.assertTrue(observed["unit_inactive"])

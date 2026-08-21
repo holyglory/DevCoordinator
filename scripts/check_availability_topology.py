@@ -680,6 +680,14 @@ def validate_service(
                     "authority must create and write the verified test artifact store",
                 )
             )
+        if "/var/lib/devcoordinator-test-results" not in writable_paths:
+            findings.append(
+                violation(
+                    "authority_result_package_storage_missing",
+                    path,
+                    "authority must write the root-verified immutable test result-package store",
+                )
+            )
     if path.name == "devcoordinator-authority.service":
         if one(unit, "Service", "StateDirectoryMode") != "0711":
             findings.append(
@@ -891,20 +899,18 @@ def validate_service(
         if (
             "--check" not in preflight
             or "--database" not in preflight
-            or "--spool /var/lib/devcoordinator-testd/spool" not in preflight
         ):
             findings.append(
                 violation(
                     "testd_preflight_invalid",
                     path,
-                    "testd must verify its existing database and initialize/verify its private attempt spool",
+                    "testd must verify its existing disposable Test Store before startup",
                 )
             )
         for flag in (
             "--database",
             "--broker-socket",
             "--snapshot-socket",
-            "--spool",
         ):
             if flag not in command:
                 findings.append(
@@ -914,6 +920,19 @@ def validate_service(
                         f"testd ExecStart must include {flag}",
                     )
                 )
+        readonly_paths = {
+            item
+            for declaration in values(unit, "Service", "ReadOnlyPaths")
+            for item in declaration.split()
+        }
+        if "/var/lib/devcoordinator-test-results" not in readonly_paths:
+            findings.append(
+                violation(
+                    "testd_result_package_read_missing",
+                    path,
+                    "testd must read only root-verified immutable result packages",
+                )
+            )
         try:
             argv = shlex.split(command)
             options = {
@@ -1316,10 +1335,10 @@ def validate_tmpfiles(path: Path) -> list[Violation]:
         "/var/lib/devcoordinator-observer": ("d", "0755", "devcoordinator-observer", "devcoordinator-observer"),
         "/var/lib/devcoordinator-observer/inventory.publication": ("z", "0644", "devcoordinator-observer", "devcoordinator-observer"),
         "/var/lib/devcoordinator-testd": ("d", "0700", "devcoordinator-testd", "devcoordinator-testd"),
-        "/var/lib/devcoordinator-testd/spool": ("d", "0700", "devcoordinator-testd", "devcoordinator-testd"),
         "/var/lib/devcoordinator-test-snapshots": ("d", "0711", "root", "root"),
         "/var/lib/devcoordinator-test-snapshot-catalog": ("d", "0700", "root", "root"),
         "/var/lib/devcoordinator-test-runs": ("d", "0711", "root", "root"),
+        "/var/lib/devcoordinator-test-results": ("d", "0750", "root", "devcoordinator-testd"),
         "/var/lib/devcoordinator-test-fixtures": ("d", "0700", "root", "root"),
         "/run/devcoordinator/test-fixture-credentials": ("d", "0700", "root", "root"),
         "/run/devcoordinator-test-snapshotd": ("d", "0755", "root", "root"),

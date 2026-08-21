@@ -2235,6 +2235,33 @@ class UniversalTestStore:
             )
             return grant
 
+    def execution_identity(self, target_id: str) -> str:
+        """Return the exact execution ID that ``begin_execution`` will reserve.
+
+        This read-only preview lets protected descriptor resolution bind the
+        final attempt identity before any native start.  The subsequent
+        mutation revalidates that the target is still queued and recomputes the
+        same store-generation-bound value transactionally.
+        """
+
+        target_id = _safe_id("target_id", target_id)
+        connection = self._connect(readonly=True)
+        try:
+            row = connection.execute(
+                "SELECT state FROM test_run_targets WHERE target_id = ?",
+                (target_id,),
+            ).fetchone()
+            if row is None:
+                raise TestStoreNotFound("test target does not exist")
+            if str(row["state"]) != "queued":
+                raise TestStoreConflict("test target is not awaiting execution")
+            store_generation = self._generation(connection)
+            return "execution-" + hashlib.sha256(
+                f"{store_generation}\0{target_id}".encode("utf-8")
+            ).hexdigest()[:32]
+        finally:
+            connection.close()
+
     @staticmethod
     def _require_execution(
         target: sqlite3.Row,

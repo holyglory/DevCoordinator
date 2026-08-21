@@ -14,6 +14,7 @@ from unittest import mock
 
 from devcoordinator.universal_test_contract import SourceMode, parse_test_manifest
 from devcoordinator.universal_test_planner import (
+    ChangedPath,
     ChangeStatus,
     SourceIdentity,
     create_test_plan,
@@ -176,6 +177,14 @@ class OwnerPreviewHelper(InProcessUIDHelper):
             manifest,
             intent=arguments["intent"],
             source=source,
+            changes=[
+                ChangedPath(
+                    path=item["path"],
+                    status=ChangeStatus(item["status"]),
+                    previous_path=item["previous_path"],
+                )
+                for item in arguments.get("changes", ())
+            ],
             requested_targets=arguments.get("requested_targets", ()),
         )
         resources = {}
@@ -185,9 +194,9 @@ class OwnerPreviewHelper(InProcessUIDHelper):
             resources[name] = {
                 "estimated_seconds": float(target.timeout_seconds),
                 "shard_count": 1,
-                "max_attempts": 2,
                 "worktree_key": str(root),
                 "exclusive_resources": list(target.exclusive_resources),
+                "ttl_seconds": target.timeout_seconds,
             }
             catalog[name] = {
                 "driver": target.driver,
@@ -1352,7 +1361,7 @@ class UniversalTestSnapshotTests(unittest.TestCase):
                         }
                     )
 
-    def test_registered_temporary_live_plan_is_authority_published_and_launchable(self) -> None:
+    def test_live_selection_is_immutably_captured_and_registered(self) -> None:
         temporary_root = Path(self.temporary.name) / "temporary-repo"
         completed = subprocess.run(
             ["git", "clone", "--quiet", str(self.root), str(temporary_root)],
@@ -1373,24 +1382,43 @@ class UniversalTestSnapshotTests(unittest.TestCase):
             json.dumps(manifest_value, sort_keys=True), encoding="utf-8"
         )
         owner_uid = os.geteuid()
-        helper = InProcessUIDHelper()
-        planned = helper.call(
-            "live_plan",
+        (temporary_root / "src.txt").write_text("changed\n", encoding="utf-8")
+        helper = OwnerPreviewHelper()
+        service = object.__new__(RootSnapshotService)
+        service.authority = LiveAuthority(
+            repository_id="repo-snapshot-tests",
+            canonical_root=str(self.root),
+            execution_root=str(temporary_root),
             owner_uid=owner_uid,
-            arguments={
-                "repository_id": "repo-snapshot-tests",
-                "original_root": str(self.root),
-                "execution_root": str(temporary_root),
-                "intent": "change",
-            },
         )
+        service.helper = helper
+        service.materializer = FilesystemSnapshotMaterializer(
+            Path(self.temporary.name) / "captured-live-preview-store",
+            allow_unprotected_test_store=True,
+        )
+        published: list[dict[str, object]] = []
+        service._publish_catalog = lambda **values: published.append(values)
+        planned = service.preview(
+            {
+                "repository_id": "repo-snapshot-tests",
+                "intent": "change",
+                "actor": "codex:captured-change",
+                "owner_uid": owner_uid,
+                "temporary_root": str(temporary_root),
+            }
+        )
+        self.assertEqual(planned["plan"]["source"]["mode"], "immutable")
+        self.assertTrue(
+            planned["plan"]["source"]["snapshot_id"].startswith("snapshot-")
+        )
+        self.assertTrue(planned["plan"]["changes"])
         resources = {
             name: TargetResources(
                 estimated_seconds=value["estimated_seconds"],
                 shard_count=value["shard_count"],
-                max_attempts=value["max_attempts"],
                 worktree_key=value["worktree_key"],
                 exclusive_resources=tuple(value["exclusive_resources"]),
+                ttl_seconds=value["ttl_seconds"],
             )
             for name, value in planned["target_resources"].items()
         }
@@ -1408,59 +1436,11 @@ class UniversalTestSnapshotTests(unittest.TestCase):
             actor="codex:temporary-integration",
             owner_uid=owner_uid,
         )
-        candidate = store.runnable_targets()[0]
-        lease = store.lease_target(
-            candidate.target_id,
-            lease_owner="testd",
-            operation_id="22222222-2222-4222-8222-222222222222",
-        )
-
-        service = object.__new__(RootSnapshotService)
-        service.authority = LiveAuthority(
-            repository_id="repo-snapshot-tests",
-            canonical_root=str(self.root),
-            execution_root=str(temporary_root),
-            owner_uid=owner_uid,
-        )
-        service.helper = helper
-        published: list[dict[str, object]] = []
-
-        def missing_catalog(_plan_document):
-            raise FileNotFoundError
-
-        service._load_catalog = missing_catalog
-        service._publish_catalog = lambda **values: published.append(values)
-        contradictory_candidate = asdict(candidate)
-        contradictory_candidate["source_mode"] = "immutable"
-        with self.assertRaisesRegex(
-            TestStoreContractError, "attempt selection identity is contradictory"
-        ):
-            service.resolve(
-                {
-                    "candidate": contradictory_candidate,
-                    "lease": asdict(lease),
-                    "plan": planned["plan"],
-                }
-            )
-        descriptor = service.resolve(
-            {
-                "candidate": asdict(candidate),
-                "lease": asdict(lease),
-                "plan": planned["plan"],
-            }
-        )
-        self.assertEqual(descriptor["run_id"], submitted["run_id"])
-        self.assertEqual(descriptor["source_mode"], "live")
-        self.assertEqual(descriptor["temporary_root"], str(temporary_root))
-        self.assertEqual(descriptor["execution_root"], str(temporary_root))
-        self.assertEqual(descriptor["argv"], ["./scripts/test"])
-        self.assertFalse({"cpu_millis", "memory_mib", "pids"} & set(descriptor))
-        self.assertEqual(len(published), 1)
-        published_value = published[0]["value"]
-        self.assertEqual(published_value["owner_uid"], owner_uid)
+        self.assertTrue(submitted["run_id"].startswith("run-"))
         self.assertEqual(
-            published_value["launch_catalog"], planned["launch_catalog"]
+            store.get_run(submitted["run_id"])["source_mode"], "immutable"
         )
+        self.assertEqual(len(published), 1)
 
     def test_immutable_temporary_manual_preview_materializes_and_selects_target(self) -> None:
         temporary_root = Path(self.temporary.name) / "temporary-immutable"

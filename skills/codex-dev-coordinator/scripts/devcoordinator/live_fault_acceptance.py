@@ -629,17 +629,16 @@ class NativeFaultRuntime:
                 state = self.manager.cancel(runtime_id)
                 break
             self.sleeper(0.05)
-        chunks: list[Mapping[str, object]] = []
-        result = state.result_document
-        manifest = result.get("chunk_manifest") if isinstance(result, Mapping) else None
-        if isinstance(manifest, list):
-            for index in range(min(len(manifest), 16)):
-                chunk = self.manager.read_result_chunk(runtime_id, index)
-                if chunk is None:
-                    raise FaultAcceptanceError("fault runtime result chunk disappeared")
-                chunks.append(dict(chunk))
+        result = state.result_package
+        package = (
+            None
+            if result is None
+            else self.manager.resolve_result_package(str(result["storage_handle"]))
+        )
+        outcome = None if package is None else package.manifest["outcome"]
         incomplete = bool(
-            isinstance(result, Mapping) and result.get("incomplete_reporting") is True
+            isinstance(outcome, Mapping)
+            and outcome.get("incomplete_reporting") is True
         )
         terminal = "incomplete_reporting" if incomplete else state.termination_reason
         return {
@@ -651,10 +650,10 @@ class NativeFaultRuntime:
             "exit_status": state.exit_status,
             "systemd_result": state.systemd_result,
             "oom_killed": state.oom_killed,
-            "result_document_sha256": None if result is None else _sha256(result),
-            "result_chunks_sha256": _sha256(chunks),
+            "result_package_sha256": None if result is None else result["sha256"],
             "reporter_complete": bool(
-                chunks and chunks[-1].get("reporter_complete") is True
+                isinstance(outcome, Mapping)
+                and outcome.get("reporter_complete") is True
             ),
         }
 
@@ -770,8 +769,7 @@ def _validate_runtime_result(
         "exit_status",
         "systemd_result",
         "oom_killed",
-        "result_document_sha256",
-        "result_chunks_sha256",
+        "result_package_sha256",
         "reporter_complete",
     }:
         raise FaultAcceptanceError("fault runtime terminal evidence is invalid")
@@ -798,21 +796,20 @@ def _validate_runtime_result(
         if (
             result["oom_killed"] is not True
             or result["systemd_result"] != "oom-kill"
-            or result["result_document_sha256"] is not None
+            or result["result_package_sha256"] is not None
             or result["reporter_complete"] is not False
         ):
             raise FaultAcceptanceError("OOM scenario was not classified by cgroup evidence")
     elif result["oom_killed"] is not False:
         raise FaultAcceptanceError("non-OOM scenario reported contradictory OOM evidence")
-    _digest(result["result_chunks_sha256"], "result.result_chunks")
-    if result["result_document_sha256"] is not None:
-        _digest(result["result_document_sha256"], "result.result_document")
+    if result["result_package_sha256"] is not None:
+        _digest(result["result_package_sha256"], "result.result_package")
     if scenario["scenario_id"] == "malformed_runner_output":
         if (
             result["reporter_complete"] is not False
             or result["exit_status"] != 1
             or result["systemd_result"] != "exit-code"
-            or result["result_document_sha256"] is None
+            or result["result_package_sha256"] is None
         ):
             raise FaultAcceptanceError("malformed reporter scenario was not contained")
     elif scenario["scenario_id"] != "cgroup_oom":
@@ -820,7 +817,7 @@ def _validate_runtime_result(
             result["reporter_complete"] is not True
             or result["exit_status"] != 0
             or result["systemd_result"] != "success"
-            or result["result_document_sha256"] is None
+            or result["result_package_sha256"] is None
         ):
             raise FaultAcceptanceError("fault scenario omitted complete structured evidence")
 

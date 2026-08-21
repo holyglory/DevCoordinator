@@ -13,10 +13,13 @@ import uuid
 from .broker import BrokerClient, BrokerError, BrokerOperation, BrokerRequest
 from .call_journal import RollingCallJournal, event_record
 from .universal_test_service import decode_test_plan_document
-from .universal_test_spool import AttemptExitEnvelope
+from .universal_test_result_package import (
+    ResultPackageError,
+    iter_result_package_records,
+    validate_result_package,
+)
 from .universal_test_store import (
-    AttemptConclusion,
-    LeaseGrant,
+    ExecutionGrant,
     RunnableTarget,
     TestStoreConflict,
     TestStoreContractError,
@@ -24,7 +27,6 @@ from .universal_test_store import (
 from .universal_testd import (
     BrokerLaunchTicket,
     BrokerLaunchTicketIssuer,
-    RunnerCleanupContext,
     RuntimeRequestSubmitter,
 )
 
@@ -151,7 +153,7 @@ class RepositoryLaunchDescriptorResolver(Protocol):
         self,
         *,
         candidate: RunnableTarget,
-        lease: LeaseGrant,
+        execution: ExecutionGrant,
         plan_document: Mapping[str, object],
         timeout_seconds: float,
     ) -> Mapping[str, object]: ...
@@ -358,16 +360,16 @@ class CoordinatorBrokerTicketIssuer(BrokerLaunchTicketIssuer):
         self.request_timeout_seconds = float(request_timeout_seconds)
 
     @staticmethod
-    def _operation_id(candidate: RunnableTarget, lease: LeaseGrant) -> str:
+    def _operation_id(candidate: RunnableTarget, execution: ExecutionGrant) -> str:
         return str(
             uuid.uuid5(
                 uuid.NAMESPACE_URL,
                 "devcoordinator-test-ticket:"
                 + candidate.repository_id
                 + ":"
-                + lease.attempt_id
+                + execution.attempt_id
                 + ":"
-                + str(lease.generation),
+                + str(execution.generation),
             )
         )
 
@@ -384,7 +386,7 @@ class CoordinatorBrokerTicketIssuer(BrokerLaunchTicketIssuer):
         self,
         *,
         candidate: RunnableTarget,
-        lease: LeaseGrant,
+        execution: ExecutionGrant,
         plan_document: Mapping[str, object],
         launch_deadline: float,
     ) -> BrokerLaunchTicket:
@@ -398,13 +400,13 @@ class CoordinatorBrokerTicketIssuer(BrokerLaunchTicketIssuer):
         deadline = float(launch_deadline)
         descriptor = self.resolver.resolve_as_owner(
             candidate=candidate,
-            lease=lease,
+            execution=execution,
             plan_document=plan_document,
             timeout_seconds=self._remaining(deadline),
         )
         if not isinstance(descriptor, Mapping):
             raise TestStoreContractError("repository helper descriptor is invalid")
-        operation_id = self._operation_id(candidate, lease)
+        operation_id = self._operation_id(candidate, execution)
         remaining = self._remaining(deadline)
         # The operation arguments are frozen before the first call because the
         # broker binds idempotency to the complete typed request.  Replays use
@@ -423,7 +425,7 @@ class CoordinatorBrokerTicketIssuer(BrokerLaunchTicketIssuer):
                 result = self.calls.call(
                     repository_id=candidate.repository_id,
                     repository_generation=0,
-                    resource_id=lease.attempt_id,
+                    resource_id=execution.attempt_id,
                     operation=BrokerOperation.TEST_ATTEMPT_TICKET,
                     arguments=arguments,
                     operation_id=operation_id,
@@ -469,13 +471,11 @@ class CoordinatorBrokerTicketIssuer(BrokerLaunchTicketIssuer):
             raise TestStoreContractError("broker launch ticket fields are invalid")
         return BrokerLaunchTicket(
             ticket_id=result["ticket_id"],
-            attempt_id=result["attempt_id"],
             target_id=result["target_id"],
             run_id=result["run_id"],
             repository_id=result["repository_id"],
             repository_generation=result["repository_generation"],
             owner_uid=result["owner_uid"],
-            generation=result["generation"],
             root_repo=result["root_repo"],
             temporary_repo=result["temporary_repo"],
             execution_root=result["execution_root"],
@@ -490,7 +490,6 @@ class CoordinatorBrokerTicketIssuer(BrokerLaunchTicketIssuer):
             credentials=tuple(result["credentials"]),
             network=result["network"],
             ttl_seconds=result["ttl_seconds"],
-            kill_after_run=True,
             worktree_key=result["worktree_key"],
             issued_at=result["issued_at"],
             expires_at=result["expires_at"],
@@ -538,6 +537,20 @@ class _RuntimeContext:
     terminal_duration_seconds: float | None = None
 
 
+@dataclass
+class _V8RuntimeContext:
+    repository_id: str
+    repository_generation: int
+    execution_id: str
+    generation: int
+    systemd_unit: str
+    launch_operation_id: str
+    ticket_id: str | None
+    launch_ack_id: str | None = None
+    launch_confirmed: bool = False
+    storage_handle: str | None = None
+
+
 class CoordinatorRuntimeRequestSubmitter(RuntimeRequestSubmitter):
     """Submit/observe/cancel attempts only through broker internal operations."""
 
@@ -551,6 +564,7 @@ class CoordinatorRuntimeRequestSubmitter(RuntimeRequestSubmitter):
         launch_request_timeout_seconds: float | None = (
             DEFAULT_LAUNCH_RPC_SLICE_SECONDS
         ),
+        result_package_root: Path = Path("/var/lib/devcoordinator-test-results"),
     ) -> None:
         self.calls = _InternalBrokerCalls(
             connection, client_factory=client_factory, call_journal=call_journal
@@ -573,6 +587,8 @@ class CoordinatorRuntimeRequestSubmitter(RuntimeRequestSubmitter):
             else float(launch_request_timeout_seconds)
         )
         self._runtimes: dict[str, _RuntimeContext] = {}
+        self.result_package_root = Path(result_package_root).absolute()
+        self._v8_runtimes: dict[str, _V8RuntimeContext] = {}
 
     @staticmethod
     def _launch_operation_id(ticket: Mapping[str, object]) -> str:
@@ -1465,6 +1481,323 @@ class CoordinatorRuntimeRequestSubmitter(RuntimeRequestSubmitter):
         ):
             raise TestStoreContractError("broker runtime collection result is invalid")
         self._runtimes.pop(runtime_id, None)
+        return {"collected": True}
+
+    # Schema-v8 adapter.  These definitions intentionally override the
+    # compatibility methods above while the old block is deleted in the final
+    # structural cleanup.  They carry only exact routing and native facts;
+    # testd remains the sole lifecycle and conclusion authority.
+
+    @staticmethod
+    def _v8_handle(context: _V8RuntimeContext) -> dict[str, object]:
+        return {
+            "execution_id": context.execution_id,
+            "generation": context.generation,
+            "systemd_unit": context.systemd_unit,
+            "launch_operation_id": context.launch_operation_id,
+            "launch_ack_id": context.launch_ack_id,
+            "launch_confirmed": context.launch_confirmed,
+        }
+
+    def _v8_context(self, systemd_unit: str) -> _V8RuntimeContext:
+        context = self._v8_runtimes.get(systemd_unit)
+        if context is None:
+            raise TestStoreConflict("test execution routing context is unavailable")
+        return context
+
+    @staticmethod
+    def _v8_runtime_id(context: _V8RuntimeContext) -> str:
+        return context.systemd_unit.removesuffix(".service")
+
+    def prepare(self, document: Mapping[str, object]) -> Mapping[str, object]:
+        if not isinstance(document, Mapping) or document.get("schema_version") != 2:
+            raise TestStoreContractError("runtime request schema is invalid")
+        ticket = document.get("ticket")
+        execution = document.get("execution")
+        if not isinstance(ticket, Mapping) or not isinstance(execution, Mapping):
+            raise TestStoreContractError("runtime request identity is incomplete")
+        required_execution = {
+            "execution_id",
+            "attempt_id",
+            "generation",
+            "systemd_unit",
+            "launch_operation_id",
+            "descriptor_fingerprint",
+        }
+        if set(execution) != required_execution:
+            raise TestStoreContractError("runtime execution fields are invalid")
+        execution_id = str(execution["execution_id"])
+        systemd_unit = str(execution["systemd_unit"])
+        if execution.get("attempt_id") != execution_id:
+            raise TestStoreConflict("runtime execution alias is contradictory")
+        expected_unit = (
+            "devcoordinator-test-"
+            + hashlib.sha256(execution_id.encode("utf-8")).hexdigest()[:32]
+            + ".service"
+        )
+        if systemd_unit != expected_unit:
+            raise TestStoreConflict("runtime systemd unit identity is contradictory")
+        try:
+            launch_operation_id = str(uuid.UUID(str(execution["launch_operation_id"])))
+        except (TypeError, ValueError, AttributeError) as error:
+            raise TestStoreContractError("runtime launch operation is invalid") from error
+        context = _V8RuntimeContext(
+            repository_id=str(ticket.get("repository_id")),
+            repository_generation=int(ticket.get("repository_generation", -1)),
+            execution_id=execution_id,
+            generation=int(execution.get("generation", 0)),
+            systemd_unit=systemd_unit,
+            launch_operation_id=launch_operation_id,
+            ticket_id=str(ticket.get("ticket_id")),
+        )
+        if context.repository_generation < 0 or context.generation != 1:
+            raise TestStoreContractError("runtime generation is invalid")
+        existing = self._v8_runtimes.get(systemd_unit)
+        if existing is not None and existing != context:
+            raise TestStoreConflict("prepared runtime identity conflicts")
+        self._v8_runtimes[systemd_unit] = context
+        return self._v8_handle(context)
+
+    def start_prepared(self, systemd_unit: str) -> Mapping[str, object]:
+        context = self._v8_context(systemd_unit)
+        if context.launch_confirmed:
+            return self._v8_handle(context)
+        result = self.calls.call(
+            repository_id=context.repository_id,
+            repository_generation=context.repository_generation,
+            resource_id=context.execution_id,
+            operation=BrokerOperation.TEST_ATTEMPT_LAUNCH,
+            arguments={
+                "ticket_id": context.ticket_id,
+                "attempt_id": context.execution_id,
+                "generation": context.generation,
+            },
+            operation_id=context.launch_operation_id,
+            timeout_seconds=self.launch_request_timeout_seconds,
+        )
+        runtime_id = self._v8_runtime_id(context)
+        if (
+            set(result) != {"runtime_id", "launch_ack_id"}
+            or result.get("runtime_id") != runtime_id
+            or not isinstance(result.get("launch_ack_id"), str)
+        ):
+            raise TestStoreConflict("broker launch result is contradictory")
+        context.launch_ack_id = str(result["launch_ack_id"])
+        context.launch_confirmed = True
+        return self._v8_handle(context)
+
+    @staticmethod
+    def _v8_package_projection(raw: object) -> tuple[dict[str, object] | None, str | None]:
+        if raw is None:
+            return None, None
+        if not isinstance(raw, Mapping):
+            raise TestStoreContractError("broker result package metadata is invalid")
+        required = {
+            "schema_version",
+            "package_id",
+            "storage_handle",
+            "sha256",
+            "size_bytes",
+            "manifest_sha256",
+            "identity",
+            "manifest",
+            "outcome",
+            "counts",
+        }
+        if set(raw) != required:
+            raise TestStoreContractError("broker result package metadata is invalid")
+        counts = raw["counts"]
+        outcome = raw["outcome"]
+        manifest = raw["manifest"]
+        if not isinstance(counts, Mapping) or not isinstance(outcome, Mapping) or not isinstance(manifest, Mapping):
+            raise TestStoreContractError("broker result package metadata is invalid")
+        reporter_complete = outcome.get("reporter_complete")
+        if type(reporter_complete) is not bool:
+            raise TestStoreContractError("broker result package completeness is invalid")
+        projected_manifest = dict(manifest)
+        projected_manifest["reporter_complete"] = reporter_complete
+        projected_counts = {
+            "passed": counts.get("passed", 0),
+            "failed": counts.get("failed", 0),
+            "skipped": counts.get("skipped", 0),
+            "error": counts.get("errors", counts.get("error", 0)),
+            "failures": counts.get("failures", 0),
+            "artifacts": counts.get("artifacts", 0),
+        }
+        if any(type(value) is not int or value < 0 for value in projected_counts.values()):
+            raise TestStoreContractError("broker result package counts are invalid")
+        return (
+            {
+                "package_id": raw["package_id"],
+                "sha256": raw["sha256"],
+                "size_bytes": raw["size_bytes"],
+                "manifest": projected_manifest,
+                "outcome": dict(outcome),
+                "counts": projected_counts,
+            },
+            str(raw["storage_handle"]),
+        )
+
+    def observe(self, systemd_unit: str) -> Mapping[str, object]:
+        context = self._v8_context(systemd_unit)
+        result = self.calls.call(
+            repository_id=context.repository_id,
+            repository_generation=context.repository_generation,
+            resource_id=context.execution_id,
+            operation=BrokerOperation.TEST_ATTEMPT_STATUS,
+            arguments={"runtime_id": self._v8_runtime_id(context)},
+        )
+        if (
+            result.get("execution_id") != context.execution_id
+            or result.get("attempt_id") != context.execution_id
+            or result.get("repository_id") != context.repository_id
+            or result.get("repository_generation") != context.repository_generation
+            or result.get("systemd_unit") != context.systemd_unit
+        ):
+            raise TestStoreConflict("broker runtime observation binding is contradictory")
+        package, storage_handle = self._v8_package_projection(
+            result.get("result_package")
+        )
+        if storage_handle is not None:
+            context.storage_handle = storage_handle
+        usage = result.get("resource_usage")
+        if not isinstance(usage, Mapping):
+            raise TestStoreContractError("broker runtime usage is invalid")
+        active = result.get("state") in {"starting", "running"}
+        exit_evidence = result.get("exit")
+        exit_status = (
+            None
+            if not isinstance(exit_evidence, Mapping)
+            else exit_evidence.get("status")
+        )
+        return {
+            "state": result.get("state"),
+            "unit_inactive": result.get("unit_inactive"),
+            "cgroup_empty": result.get("cgroup_empty"),
+            "launch_confirmed": result.get("launch_confirmed"),
+            "started_at": result.get("started_at"),
+            "result_package": package,
+            "current_memory_bytes": usage.get("current_memory_bytes") if active else None,
+            "output_progress": result.get("progress") if active else None,
+            "peak_memory_bytes": None if active else usage.get("peak_memory_bytes"),
+            "cpu_seconds": None if active else usage.get("cpu_seconds"),
+            "exit_status": exit_status,
+        }
+
+    def attach(self, binding: Mapping[str, object]) -> Mapping[str, object]:
+        if not isinstance(binding, Mapping):
+            raise TestStoreContractError("restart execution binding is invalid")
+        context = _V8RuntimeContext(
+            repository_id=str(binding["repository_id"]),
+            repository_generation=int(binding["repository_generation"]),
+            execution_id=str(binding["execution_id"]),
+            generation=int(binding["generation"]),
+            systemd_unit=str(binding["systemd_unit"]),
+            launch_operation_id=str(binding["launch_operation_id"]),
+            ticket_id=None,
+            launch_ack_id=(
+                None if binding.get("launch_ack_id") is None else str(binding["launch_ack_id"])
+            ),
+            launch_confirmed=binding.get("state") != "starting",
+        )
+        expected_unit = (
+            "devcoordinator-test-"
+            + hashlib.sha256(context.execution_id.encode("utf-8")).hexdigest()[:32]
+            + ".service"
+        )
+        if context.systemd_unit != expected_unit or context.generation != 1:
+            raise TestStoreConflict("restart execution binding is contradictory")
+        self._v8_runtimes[context.systemd_unit] = context
+        return self._v8_handle(context)
+
+    def stop(self, systemd_unit: str, *, reason: str) -> Mapping[str, object]:
+        context = self._v8_context(systemd_unit)
+        if not isinstance(reason, str) or not reason or len(reason.encode("utf-8")) > 1024:
+            raise TestStoreContractError("runtime stop reason is invalid")
+        operation_id = str(
+            uuid.uuid5(
+                uuid.NAMESPACE_URL,
+                "devcoordinator-test-stop:"
+                + context.execution_id
+                + ":"
+                + hashlib.sha256(reason.encode("utf-8")).hexdigest(),
+            )
+        )
+        self.calls.call(
+            repository_id=context.repository_id,
+            repository_generation=context.repository_generation,
+            resource_id=context.execution_id,
+            operation=BrokerOperation.TEST_ATTEMPT_CANCEL,
+            arguments={"runtime_id": self._v8_runtime_id(context), "reason": reason},
+            operation_id=operation_id,
+            timeout_seconds=self.launch_request_timeout_seconds,
+        )
+        return self.observe(systemd_unit)
+
+    def resolve_package(
+        self, systemd_unit: str, metadata: Mapping[str, object]
+    ) -> Mapping[str, object]:
+        context = self._v8_context(systemd_unit)
+        if not isinstance(metadata, Mapping):
+            raise TestStoreContractError("result package metadata is invalid")
+        package_id = str(metadata.get("package_id"))
+        digest = str(metadata.get("sha256"))
+        if context.storage_handle != f"test-result-package://{package_id}/{digest}":
+            raise TestStoreConflict("result package storage binding changed")
+        path = self.result_package_root / f"{package_id}-{digest}.tar"
+        try:
+            package = validate_result_package(path, expected_sha256=digest)
+            cases = [dict(item) for item in iter_result_package_records(package, "cases")]
+            failures = [
+                dict(item) for item in iter_result_package_records(package, "failures")
+            ]
+        except ResultPackageError as error:
+            raise TestStoreConflict("verified result package is unavailable") from error
+        artifacts: list[dict[str, object]] = []
+        for raw in package.manifest["artifacts"]:
+            if not isinstance(raw, Mapping):
+                raise TestStoreContractError("result package artifact metadata is invalid")
+            artifacts.append(
+                {
+                    "artifact_id": raw["artifact_id"],
+                    "kind": raw["kind"],
+                    "storage_handle": raw["storage_handle"],
+                    "sha256": raw["sha256"],
+                    "size_bytes": raw["size_bytes"],
+                    "verified": raw["verified"],
+                }
+            )
+        return {
+            "package_id": package.evidence.package_id,
+            "cases": cases,
+            "failures": failures,
+            "artifacts": artifacts,
+            "reporter_complete": bool(package.manifest["outcome"]["reporter_complete"]),
+        }
+
+    def collect(self, systemd_unit: str) -> Mapping[str, object]:
+        context = self._v8_context(systemd_unit)
+        operation_id = str(
+            uuid.uuid5(
+                uuid.NAMESPACE_URL,
+                "devcoordinator-test-collect:"
+                + context.execution_id
+                + ":"
+                + str(context.generation),
+            )
+        )
+        result = self.calls.call(
+            repository_id=context.repository_id,
+            repository_generation=context.repository_generation,
+            resource_id=context.execution_id,
+            operation=BrokerOperation.TEST_ATTEMPT_COLLECT,
+            arguments={"runtime_id": self._v8_runtime_id(context)},
+            operation_id=operation_id,
+            timeout_seconds=self.launch_request_timeout_seconds,
+        )
+        if result.get("runtime_id") != self._v8_runtime_id(context) or result.get("collected") is not True:
+            raise TestStoreContractError("broker runtime collection result is invalid")
+        self._v8_runtimes.pop(systemd_unit, None)
         return {"collected": True}
 
 

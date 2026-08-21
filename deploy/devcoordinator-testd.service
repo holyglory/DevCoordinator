@@ -14,8 +14,8 @@ Environment=DEVCOORDINATOR_ROLE=testd
 Environment=DEVCOORDINATOR_CALL_LOG=/var/log/devcoordinator/calls.jsonl
 Environment=DEVCOORDINATOR_CALL_LOG_MAX_BYTES=4194304
 Environment=DEVCOORDINATOR_CALL_LOG_BACKUPS=4
-ExecStartPre=/opt/devcoordinator/releases/RELEASE_DIGEST/bin/devcoordinator-testd --database /var/lib/devcoordinator-testd/tests.sqlite3 --spool /var/lib/devcoordinator-testd/spool --check
-ExecStart=/opt/devcoordinator/releases/RELEASE_DIGEST/bin/devcoordinator-testd --database /var/lib/devcoordinator-testd/tests.sqlite3 --broker-socket /run/devcoordinator-authority.sock --snapshot-socket /run/devcoordinator-test-snapshotd/snapshot.sock --spool /var/lib/devcoordinator-testd/spool
+ExecStartPre=/opt/devcoordinator/releases/RELEASE_DIGEST/bin/devcoordinator-testd --database /var/lib/devcoordinator-testd/tests.sqlite3 --check
+ExecStart=/opt/devcoordinator/releases/RELEASE_DIGEST/bin/devcoordinator-testd --database /var/lib/devcoordinator-testd/tests.sqlite3 --broker-socket /run/devcoordinator-authority.sock --snapshot-socket /run/devcoordinator-test-snapshotd/snapshot.sock
 Restart=always
 RestartSec=3
 TimeoutStopSec=30s
@@ -36,6 +36,7 @@ ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes
 RestrictAddressFamilies=AF_UNIX
+ReadOnlyPaths=/var/lib/devcoordinator-test-results
 ReadWritePaths=/var/lib/devcoordinator-testd /run/devcoordinator-testd
 
 [Install]

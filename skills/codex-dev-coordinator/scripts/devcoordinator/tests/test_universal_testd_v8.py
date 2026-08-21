@@ -141,8 +141,10 @@ class FakeIssuer:
         self.clock = clock
         self.calls = []
 
-    def issue(self, *, candidate, plan_document, launch_deadline):
-        self.calls.append((candidate.target_id, launch_deadline))
+    def issue(self, *, candidate, execution, plan_document, launch_deadline):
+        self.calls.append(
+            (candidate.target_id, execution.execution_id, launch_deadline)
+        )
         return BrokerLaunchTicket(
             ticket_id="ticket-" + candidate.target_id,
             target_id=candidate.target_id,

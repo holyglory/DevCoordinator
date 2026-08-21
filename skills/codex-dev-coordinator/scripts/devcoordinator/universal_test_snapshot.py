@@ -2340,10 +2340,14 @@ class FilesystemSnapshotMaterializer:
         _check_snapshot_deadline()
         if not isinstance(request, SnapshotMaterializationRequest):
             raise SnapshotMaterializationError("snapshot request must be typed")
-        if request.intent not in {"handoff", "release", "manual"}:
-            raise SnapshotMaterializationError(
-                "live test sources cannot be materialized as immutable snapshots"
-            )
+        if request.intent not in {
+            "change",
+            "checkpoint",
+            "handoff",
+            "release",
+            "manual",
+        }:
+            raise SnapshotMaterializationError("snapshot request intent is invalid")
         before = self._source.scan(request)
         if before.manifest_fingerprint != request.manifest_fingerprint:
             raise SnapshotMaterializationError("snapshot manifest fingerprint is contradictory")
@@ -2890,10 +2894,14 @@ class ImmutableSnapshotPlanPreviewer:
                     "shard_count": safe_history_shard_ceiling(
                         manifest.targets[name]
                     ),
-                    "max_attempts": manifest.targets[name].retry.max_attempts,
                     "worktree_key": provenance.materialized_root,
                     "exclusive_resources": list(
                         manifest.targets[name].exclusive_resources
+                    ),
+                    "ttl_seconds": (
+                        manifest.targets[name].timeout_seconds
+                        if plan.timeouts.execution_seconds is None
+                        else plan.timeouts.execution_seconds
                     ),
                 }
                 for name in plan.selected_targets

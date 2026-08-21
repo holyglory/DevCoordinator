@@ -41,7 +41,7 @@ ReadOnlyPaths=/var/lib/devcoordinator-test-snapshots
 # The fixed authority normalizer changes only the descriptor-validated service
 # working tree. /home is writable in this root-owned sandbox so repositories
 # created by any trusted local developer account need no host ACL repair.
-ReadWritePaths=/home /var/lib/devcoordinator /var/lib/devcoordinator-browser-lifecycle /var/lib/devcoordinator-test-runs /var/lib/devcoordinator-test-artifacts /var/lib/devcoordinator-test-fixtures -/run/devcoordinator -/run/devcoordinator/test-fixture-credentials
+ReadWritePaths=/home /var/lib/devcoordinator /var/lib/devcoordinator-browser-lifecycle /var/lib/devcoordinator-test-runs /var/lib/devcoordinator-test-results /var/lib/devcoordinator-test-artifacts /var/lib/devcoordinator-test-fixtures -/run/devcoordinator -/run/devcoordinator/test-fixture-credentials
 
 [Install]
 WantedBy=multi-user.target

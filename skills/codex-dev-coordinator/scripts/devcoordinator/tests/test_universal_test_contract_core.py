@@ -972,6 +972,17 @@ class TestPlannerTests(unittest.TestCase):
                 changes=[ChangedPath("src/a.py", ChangeStatus.MODIFIED)],
             )
 
+    def test_live_intent_selects_changes_from_an_immutable_capture(self) -> None:
+        plan = create_test_plan(
+            self.contract,
+            intent="change",
+            source=source(SourceMode.IMMUTABLE),
+            changes=[ChangedPath("src/a.py", ChangeStatus.MODIFIED)],
+        )
+        self.assertEqual(plan.source.mode, SourceMode.IMMUTABLE)
+        self.assertEqual(plan.selected_targets, ("integration", "lint", "unit"))
+        self.assertIn("input:src/a.py", plan.selection["unit"].reasons)
+
     def test_plan_fingerprint_is_deterministic(self) -> None:
         changes = [
             ChangedPath("tests/unit/b.py", ChangeStatus.MODIFIED),

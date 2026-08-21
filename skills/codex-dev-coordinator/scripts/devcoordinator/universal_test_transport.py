@@ -291,9 +291,9 @@ def _target_resources(value: object) -> Mapping[str, TargetResources] | None:
         result[name] = TargetResources(
             estimated_seconds=raw["estimated_seconds"],
             shard_count=raw["shard_count"],
-            max_attempts=raw["max_attempts"],
             worktree_key=raw["worktree_key"],
             exclusive_resources=tuple(raw["exclusive_resources"]),
+            ttl_seconds=raw["ttl_seconds"],
         )
     return result
 
@@ -307,9 +307,9 @@ def _resource_documents(
         name: {
             "estimated_seconds": value.estimated_seconds,
             "shard_count": value.shard_count,
-            "max_attempts": value.max_attempts,
             "worktree_key": value.worktree_key,
             "exclusive_resources": list(value.exclusive_resources),
+            "ttl_seconds": value.ttl_seconds,
         }
         for name, value in values.items()
     }

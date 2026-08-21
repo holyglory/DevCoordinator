@@ -52,10 +52,13 @@ from devcoordinator.universal_test_contract import (  # type: ignore[import-not-
     safe_history_shard_ceiling,
 )
 from devcoordinator.universal_test_planner import (  # type: ignore[import-not-found]
+    ChangedPath,
+    ChangeStatus,
     DEFAULT_LAUNCH_TIMEOUT_SECONDS,
     MAX_EXECUTION_TIMEOUT_SECONDS,
     MAX_LAUNCH_TIMEOUT_SECONDS,
     SourceIdentity,
+    TestPlanError,
     create_test_plan,
 )
 from devcoordinator.universal_test_snapshot import (  # type: ignore[import-not-found]
@@ -1042,9 +1045,9 @@ def _plan_documents(manifest, plan, execution_root: Path) -> Mapping[str, object
             # effective count before submission; one shard still covers all
             # selected cases.
             "shard_count": safe_history_shard_ceiling(target),
-            "max_attempts": target.retry.max_attempts,
             "worktree_key": str(execution_root),
             "exclusive_resources": list(target.exclusive_resources),
+            "ttl_seconds": execution_timeout,
         }
         catalog[name] = {
             "driver": target.driver,
@@ -1251,7 +1254,7 @@ def execute(request: Mapping[str, object]) -> Mapping[str, object]:
     if operation == "plan":
         required = {"snapshot_root", "source", "intent"}
         if not required <= set(arguments) or set(arguments) - (
-            required | {"requested_targets", "timeouts"}
+            required | {"requested_targets", "timeouts", "changes"}
         ):
             raise SnapshotMaterializationError("plan helper arguments are invalid")
         snapshot_root = _root(
@@ -1263,9 +1266,38 @@ def execute(request: Mapping[str, object]) -> Mapping[str, object]:
         if (
             not isinstance(intent, str)
             or intent not in manifest.intents
-            or manifest.intents[intent].source_mode is not SourceMode.IMMUTABLE
+            or source.mode is not SourceMode.IMMUTABLE
         ):
-            raise SnapshotMaterializationError("plan intent is not immutable")
+            raise SnapshotMaterializationError(
+                "captured test plan intent or source is invalid"
+            )
+        raw_changes = arguments.get("changes", ())
+        if (
+            not isinstance(raw_changes, Sequence)
+            or isinstance(raw_changes, (str, bytes))
+            or len(raw_changes) > 100_000
+        ):
+            raise SnapshotMaterializationError("captured test changes are invalid")
+        changes: list[ChangedPath] = []
+        for raw_change in raw_changes:
+            if not isinstance(raw_change, Mapping) or set(raw_change) != {
+                "path", "status", "previous_path"
+            }:
+                raise SnapshotMaterializationError(
+                    "captured test change is invalid"
+                )
+            try:
+                changes.append(
+                    ChangedPath(
+                        path=raw_change["path"],  # type: ignore[arg-type]
+                        status=ChangeStatus(str(raw_change["status"])),
+                        previous_path=raw_change["previous_path"],  # type: ignore[arg-type]
+                    )
+                )
+            except (TestPlanError, ValueError) as error:
+                raise SnapshotMaterializationError(
+                    "captured test change is invalid"
+                ) from error
         requested_targets = _requested_targets(
             arguments.get("requested_targets", ()), intent=intent
         )
@@ -1274,6 +1306,7 @@ def execute(request: Mapping[str, object]) -> Mapping[str, object]:
             manifest,
             intent=intent,
             source=source,
+            changes=changes,
             requested_targets=requested_targets,
             execution_timeout_seconds=execution_timeout,
             launch_timeout_seconds=launch_timeout,

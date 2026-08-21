@@ -589,6 +589,7 @@ class BrokerLaunchTicketIssuer(Protocol):
         self,
         *,
         candidate: RunnableTarget,
+        execution: ExecutionGrant,
         plan_document: Mapping[str, object],
         launch_deadline: float,
     ) -> BrokerLaunchTicket: ...
@@ -825,11 +826,11 @@ class TestdEngine:
         self.store.reconcile_nonterminal_runs(now=float(self.clock()))
 
     @staticmethod
-    def _unit_for_target(target_id: str) -> str:
-        target_id = _safe_id("target_id", target_id)
+    def _unit_for_execution(execution_id: str) -> str:
+        execution_id = _safe_id("execution_id", execution_id)
         return (
             "devcoordinator-test-"
-            + hashlib.sha256(target_id.encode("utf-8")).hexdigest()[:32]
+            + hashlib.sha256(execution_id.encode("utf-8")).hexdigest()[:32]
             + ".service"
         )
 
@@ -979,8 +980,23 @@ class TestdEngine:
         plan_document = self.store.get_plan_document(str(run["plan_id"]))
         plan = decode_test_plan_document(plan_document)
         launch_deadline = float(self.clock()) + plan.timeouts.launch_seconds
+        execution_id = self.store.execution_identity(candidate.target_id)
+        systemd_unit = self._unit_for_execution(execution_id)
+        launch_operation_id = self._launch_operation_for_target(candidate.target_id)
+        preview = ExecutionGrant(
+            execution_id=execution_id,
+            target_id=candidate.target_id,
+            run_id=candidate.run_id,
+            target_name=candidate.target_name,
+            shard_index=candidate.shard_index,
+            shard_count=candidate.shard_count,
+            generation=1,
+            systemd_unit=systemd_unit,
+            launch_operation_id=launch_operation_id,
+        )
         ticket = self.ticket_issuer.issue(
             candidate=candidate,
+            execution=preview,
             plan_document=plan_document,
             launch_deadline=launch_deadline,
         )
@@ -992,8 +1008,6 @@ class TestdEngine:
             or ticket.ttl_seconds <= 0
         ):
             raise TestStoreConflict("launch ticket contradicts the selected target")
-        systemd_unit = self._unit_for_target(candidate.target_id)
-        launch_operation_id = self._launch_operation_for_target(candidate.target_id)
         descriptor_fingerprint = self._descriptor_fingerprint(candidate, ticket)
         grant = self.store.begin_execution(
             candidate.target_id,
@@ -1005,6 +1019,10 @@ class TestdEngine:
             memory_commitment_mib=candidate.memory_estimate_mib,
             operation_id=_stable_operation_id("begin", candidate.target_id),
         )
+        if grant != preview:
+            raise TestStoreConflict(
+                "test execution identity changed after descriptor resolution"
+            )
         active = _ActiveExecution(
             execution=grant,
             handle=self._handle_for_grant(grant),
@@ -1088,6 +1106,7 @@ class TestdEngine:
         fallback: AttemptConclusion,
     ) -> AttemptConclusion:
         complete = bool(metadata.manifest["reporter_complete"])
+        terminal_outcome = metadata.outcome.get("terminal_outcome")
         if not complete:
             return (
                 fallback
@@ -1097,6 +1116,12 @@ class TestdEngine:
                 }
                 else AttemptConclusion.INCOMPLETE
             )
+        if terminal_outcome == "timed_out":
+            return AttemptConclusion.TIMED_OUT
+        if terminal_outcome == "incomplete":
+            return AttemptConclusion.INCOMPLETE
+        if terminal_outcome == "infrastructure_failed":
+            return AttemptConclusion.INFRASTRUCTURE_FAILED
         if int(metadata.counts["failed"]) or int(metadata.counts["error"]):
             return AttemptConclusion.TEST_FAILED
         if metadata.outcome.get("test_failed") is True:

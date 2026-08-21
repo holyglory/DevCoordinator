@@ -191,6 +191,19 @@ def main() -> int:
             "authority without artifact write access was not rejected",
         )
 
+        missing_result_write = Path(raw) / "missing-result-write"
+        shutil.copytree(clean, missing_result_write)
+        replace(
+            missing_result_write / "devcoordinator-authority.service",
+            " /var/lib/devcoordinator-test-results",
+            "",
+        )
+        expect(
+            "authority_result_package_storage_missing"
+            in codes(missing_result_write),
+            "authority without result-package write access was not rejected",
+        )
+
         missing_browser_lifecycle_write = Path(raw) / "missing-browser-lifecycle-write"
         shutil.copytree(clean, missing_browser_lifecycle_write)
         replace(
@@ -341,18 +354,6 @@ def main() -> int:
             "missing root-private fixture credential directory was not rejected",
         )
 
-        missing_testd_spool_tmpfiles = Path(raw) / "missing-testd-spool-tmpfiles"
-        shutil.copytree(clean, missing_testd_spool_tmpfiles)
-        replace(
-            missing_testd_spool_tmpfiles / "devcoordinator-availability.tmpfiles.conf",
-            "d /var/lib/devcoordinator-testd/spool 0700 devcoordinator-testd devcoordinator-testd -\n",
-            "",
-        )
-        expect(
-            "tmpfiles_contract_invalid" in codes(missing_testd_spool_tmpfiles),
-            "missing test scheduler attempt spool directory was not rejected",
-        )
-
         private_attempt_root = Path(raw) / "private-attempt-root"
         shutil.copytree(clean, private_attempt_root)
         replace(
@@ -363,6 +364,18 @@ def main() -> int:
         expect(
             "tmpfiles_contract_invalid" in codes(private_attempt_root),
             "attempt root that strands attributed repository-UID runners was not rejected",
+        )
+
+        missing_result_tmpfiles = Path(raw) / "missing-result-tmpfiles"
+        shutil.copytree(clean, missing_result_tmpfiles)
+        replace(
+            missing_result_tmpfiles / "devcoordinator-availability.tmpfiles.conf",
+            "d /var/lib/devcoordinator-test-results 0750 root devcoordinator-testd -\n",
+            "",
+        )
+        expect(
+            "tmpfiles_contract_invalid" in codes(missing_result_tmpfiles),
+            "missing root-verified result-package directory was not rejected",
         )
 
         missing_bug_tmpfiles = Path(raw) / "missing-bug-tmpfiles"
@@ -442,24 +455,24 @@ def main() -> int:
         shutil.copytree(clean, writable_check)
         replace(
             writable_check / "devcoordinator-testd.service",
-            "--spool /var/lib/devcoordinator-testd/spool --check",
-            "--spool /var/lib/devcoordinator-testd/spool --write",
+            "--database /var/lib/devcoordinator-testd/tests.sqlite3 --check",
+            "--database /var/lib/devcoordinator-testd/tests.sqlite3 --write",
         )
         expect(
             "testd_preflight_invalid" in codes(writable_check),
             "writable startup check was not rejected",
         )
 
-        missing_spool_check = Path(raw) / "missing-spool-check"
-        shutil.copytree(clean, missing_spool_check)
+        missing_result_read = Path(raw) / "missing-result-read"
+        shutil.copytree(clean, missing_result_read)
         replace(
-            missing_spool_check / "devcoordinator-testd.service",
-            " --spool /var/lib/devcoordinator-testd/spool",
+            missing_result_read / "devcoordinator-testd.service",
+            "ReadOnlyPaths=/var/lib/devcoordinator-test-results\n",
             "",
         )
         expect(
-            "testd_preflight_invalid" in codes(missing_spool_check),
-            "testd preflight without private spool validation was not rejected",
+            "testd_result_package_read_missing" in codes(missing_result_read),
+            "testd without result-package read access was not rejected",
         )
 
         wrong_testd_broker_mode = Path(raw) / "wrong-testd-broker-mode"

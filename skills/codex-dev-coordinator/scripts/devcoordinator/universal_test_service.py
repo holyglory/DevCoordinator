@@ -1359,9 +1359,9 @@ class StoreTestPlaneAdapter:
             result[target_name] = TargetResources(
                 estimated_seconds=raw["estimated_seconds"],
                 shard_count=raw["shard_count"],
-                max_attempts=raw["max_attempts"],
                 worktree_key=raw["worktree_key"],
                 exclusive_resources=tuple(raw["exclusive_resources"]),
+                ttl_seconds=raw["ttl_seconds"],
             )
         return MappingProxyType(result)
 

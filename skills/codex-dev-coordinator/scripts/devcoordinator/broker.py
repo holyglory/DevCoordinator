@@ -2563,27 +2563,16 @@ def _validate_arguments(
         }
 
     if operation == BrokerOperation.TEST_ATTEMPT_STATUS:
-        if set(value) != {"runtime_id", "result_chunk_index"}:
+        if set(value) != {"runtime_id"}:
             raise BrokerError(
                 "invalid_arguments",
-                "Internal test status requires runtime_id and result_chunk_index.",
-                operation_id=operation_id,
-            )
-        result_chunk_index = value["result_chunk_index"]
-        if (
-            not _is_exact_int(result_chunk_index)
-            or not 0 <= result_chunk_index < 4_096
-        ):
-            raise BrokerError(
-                "invalid_arguments",
-                "result_chunk_index must be an integer from 0 through 4095.",
+                "Internal test status requires one exact runtime_id.",
                 operation_id=operation_id,
             )
         return {
             "runtime_id": _opaque_argument(
                 value["runtime_id"], "runtime_id", operation_id
             ),
-            "result_chunk_index": result_chunk_index,
         }
 
     if operation in {
