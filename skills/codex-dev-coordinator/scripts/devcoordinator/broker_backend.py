@@ -313,6 +313,40 @@ def _test_contract_diagnostic(error: Exception) -> str:
 
     detail = " ".join(str(error).split()) or type(error).__name__
     return detail[:512]
+
+
+def _test_execution_systemd_unit(execution_id: str) -> str:
+    """Return the one native unit permitted for an execution identity."""
+
+    return (
+        "devcoordinator-test-"
+        + hashlib.sha256(execution_id.encode("utf-8")).hexdigest()[:32]
+        + ".service"
+    )
+
+
+def _internal_test_execution_identity(
+    request: BrokerRequest,
+) -> tuple[str, int, str, str]:
+    """Revalidate the complete v8 execution fence at the backend boundary."""
+
+    execution_id = str(request.arguments["execution_id"])
+    generation = int(request.arguments["generation"])
+    systemd_unit = str(request.arguments["systemd_unit"])
+    expected_systemd_unit = _test_execution_systemd_unit(execution_id)
+    if (
+        execution_id != request.resource_id
+        or generation < 1
+        or systemd_unit != expected_systemd_unit
+    ):
+        raise TestStoreConflict(
+            "test execution request has contradictory execution or systemd identity"
+        )
+    return execution_id, generation, systemd_unit, systemd_unit.removesuffix(
+        ".service"
+    )
+
+
 _TEST_ACTOR_DELEGATION_ACCOUNT = "devcoordinator-api"
 
 
@@ -1379,26 +1413,31 @@ class StoreBackedMutationBackend:
             if request.operation is BrokerOperation.TEST_ATTEMPT_TICKET:
                 raw = request.arguments["descriptor"]
                 if not isinstance(raw, Mapping):
-                    raise TestStoreContractError("test attempt descriptor is invalid")
+                    raise TestStoreContractError("test execution descriptor is invalid")
+                if "attempt_id" in raw or "execution_id" not in raw:
+                    raise TestStoreContractError(
+                        "test execution descriptor must use execution_id"
+                    )
                 owner_uid = raw.get("owner_uid")
                 if type(owner_uid) is not int:
-                    raise TestStoreContractError("test attempt owner UID is invalid")
+                    raise TestStoreContractError("test execution owner UID is invalid")
                 repository_context = self._persistence.test_attempt_repository_context(
                     repo_id=request.project_id,
                     execution_uid=owner_uid,
                     operation_id=request.operation_id,
                 )
                 descriptor = TestAttemptDescriptor.from_document(
-                    raw, repository_generation=repository_context.generation
+                    raw,
+                    repository_generation=repository_context.generation,
                 )
                 if (
                     descriptor.repository_id != request.project_id
-                    or descriptor.attempt_id != request.resource_id
+                    or descriptor.execution_id != request.resource_id
                     or descriptor.original_root != repository_context.canonical_root
                     or descriptor.owner_uid != repository_context.execution_uid
                 ):
                     raise TestStoreConflict(
-                        "test attempt descriptor contradicts broker repository authority"
+                        "test execution descriptor contradicts broker repository authority"
                     )
                 if descriptor.source_mode == "live":
                     if descriptor.temporary_root is not None:
@@ -1414,23 +1453,87 @@ class StoreBackedMutationBackend:
                     != descriptor.snapshot_id
                 ):
                     raise TestStoreConflict(
-                        "immutable test attempt does not target an exact snapshot root"
+                        "immutable test execution does not target an exact snapshot root"
                     )
-                return coordinator.issue(
-                    descriptor,
-                    launch_timeout_seconds=int(
-                        request.arguments["launch_timeout_seconds"]
-                    ),
+                result = dict(
+                    coordinator.issue(
+                        descriptor,
+                        launch_timeout_seconds=int(
+                            request.arguments["launch_timeout_seconds"]
+                        ),
+                    )
                 )
+                expected_ticket_fields = {
+                    "ticket_id",
+                    "execution_id",
+                    "systemd_unit",
+                    "target_id",
+                    "run_id",
+                    "repository_id",
+                    "repository_generation",
+                    "owner_uid",
+                    "generation",
+                    "intent",
+                    "root_repo",
+                    "temporary_repo",
+                    "execution_root",
+                    "argv",
+                    "cwd",
+                    "environment",
+                    "driver",
+                    "reporter",
+                    "artifacts",
+                    "fixtures",
+                    "credentials",
+                    "network",
+                    "ttl_seconds",
+                    "kill_after_run",
+                    "worktree_key",
+                    "issued_at",
+                    "expires_at",
+                }
+                if (
+                    set(result) != expected_ticket_fields
+                    or result.get("execution_id") != request.resource_id
+                    or result.get("generation") != descriptor.generation
+                    or result.get("repository_id") != request.project_id
+                    or result.get("repository_generation")
+                    != repository_context.generation
+                    or result.get("systemd_unit")
+                    != _test_execution_systemd_unit(request.resource_id)
+                ):
+                    raise TestStoreConflict(
+                        "test execution ticket identity is contradictory"
+                    )
+                return result
 
             if request.operation is BrokerOperation.TEST_ATTEMPT_LAUNCH:
-                return coordinator.launch(
-                    ticket_id=str(request.arguments["ticket_id"]),
-                    attempt_id=str(request.arguments["attempt_id"]),
-                    generation=int(request.arguments["generation"]),
-                    expected_repository_id=request.project_id,
-                    expected_repository_generation=request.repository_generation,
+                execution_id, generation, systemd_unit, runtime_id = (
+                    _internal_test_execution_identity(request)
                 )
+                result = dict(
+                    coordinator.launch(
+                        ticket_id=str(request.arguments["ticket_id"]),
+                        execution_id=execution_id,
+                        generation=generation,
+                        expected_repository_id=request.project_id,
+                        expected_repository_generation=request.repository_generation,
+                    )
+                )
+                if (
+                    set(result) != {"runtime_id", "launch_ack_id"}
+                    or result.get("runtime_id") != runtime_id
+                    or not isinstance(result.get("launch_ack_id"), str)
+                ):
+                    raise TestStoreConflict(
+                        "test execution launch result is contradictory"
+                    )
+                return {
+                    "execution_id": execution_id,
+                    "generation": generation,
+                    "systemd_unit": systemd_unit,
+                    "launch_ack_id": result["launch_ack_id"],
+                }
 
             if request.operation is BrokerOperation.TEST_ATTEMPT_CANCEL:
                 # Cancellation can race a lost launch reply. Bind the exact
@@ -1438,29 +1541,125 @@ class StoreBackedMutationBackend:
                 # the coordinator for either a stopped-runtime result or a
                 # typed native absence proof. Generic descriptor failures stay
                 # errors and can never be interpreted as successful cleanup.
-                return coordinator.cancel(
-                    str(request.arguments["runtime_id"]),
-                    reason=str(request.arguments["reason"]),
-                    expected_attempt_id=request.resource_id,
-                    expected_repository_id=request.project_id,
-                    expected_repository_generation=request.repository_generation,
+                execution_id, generation, systemd_unit, runtime_id = (
+                    _internal_test_execution_identity(request)
                 )
+                result = dict(
+                    coordinator.cancel(
+                        runtime_id,
+                        reason=str(request.arguments["reason"]),
+                        expected_execution_id=execution_id,
+                        expected_repository_id=request.project_id,
+                        expected_repository_generation=request.repository_generation,
+                    )
+                )
+                if (
+                    set(result) != {"runtime_id", "cancelled", "absent"}
+                    or result.get("runtime_id") != runtime_id
+                    or type(result.get("cancelled")) is not bool
+                    or type(result.get("absent")) is not bool
+                ):
+                    raise TestStoreConflict(
+                        "test execution cancellation result is contradictory"
+                    )
+                return {
+                    "execution_id": execution_id,
+                    "generation": generation,
+                    "systemd_unit": systemd_unit,
+                    "cancelled": result["cancelled"],
+                    "absent": result["absent"],
+                }
 
             if request.operation is BrokerOperation.TEST_ATTEMPT_COLLECT:
-                return coordinator.collect(
-                    str(request.arguments["runtime_id"]),
-                    expected_attempt_id=request.resource_id,
-                    expected_repository_id=request.project_id,
-                    expected_repository_generation=request.repository_generation,
+                execution_id, generation, systemd_unit, runtime_id = (
+                    _internal_test_execution_identity(request)
                 )
+                result = dict(
+                    coordinator.collect(
+                        runtime_id,
+                        expected_execution_id=execution_id,
+                        expected_repository_id=request.project_id,
+                        expected_repository_generation=request.repository_generation,
+                    )
+                )
+                if (
+                    set(result) != {"runtime_id", "collected"}
+                    or result.get("runtime_id") != runtime_id
+                    or result.get("collected") is not True
+                ):
+                    raise TestStoreConflict(
+                        "test execution collection result is contradictory"
+                    )
+                return {
+                    "execution_id": execution_id,
+                    "generation": generation,
+                    "systemd_unit": systemd_unit,
+                    "collected": True,
+                }
 
-            descriptor = coordinator.runtime_descriptor(
-                str(request.arguments["runtime_id"])
+            execution_id, generation, systemd_unit, runtime_id = (
+                _internal_test_execution_identity(request)
             )
-            self._require_internal_attempt_binding(request, descriptor)
+            descriptor = coordinator.runtime_descriptor(runtime_id)
+            self._require_internal_execution_binding(
+                request,
+                descriptor,
+                execution_id=execution_id,
+                generation=generation,
+            )
             if request.operation is BrokerOperation.TEST_ATTEMPT_STATUS:
-                return coordinator.observe(str(request.arguments["runtime_id"]))
-            raise TestStoreContractError("unsupported internal test attempt operation")
+                result = dict(coordinator.observe(runtime_id))
+                expected_fields = {
+                    "execution_id",
+                    "runtime_id",
+                    "generation",
+                    "repository_id",
+                    "repository_generation",
+                    "systemd_unit",
+                    "invocation_id",
+                    "state",
+                    "unit_inactive",
+                    "cgroup_empty",
+                    "launch_confirmed",
+                    "started_at",
+                    "finished_at",
+                    "result_package",
+                    "exit",
+                    "resource_usage",
+                    "progress",
+                }
+                if (
+                    set(result) != expected_fields
+                    or result.get("execution_id") != execution_id
+                    or result.get("generation") != generation
+                    or result.get("repository_id") != request.project_id
+                    or result.get("repository_generation")
+                    != request.repository_generation
+                    or result.get("systemd_unit") != systemd_unit
+                    or result.get("runtime_id") != runtime_id
+                    or result.get("state")
+                    not in {"starting", "running", "exited", "absent"}
+                    or type(result.get("unit_inactive")) is not bool
+                    or type(result.get("cgroup_empty")) is not bool
+                    or type(result.get("launch_confirmed")) is not bool
+                    or (
+                        result.get("invocation_id") is not None
+                        and (
+                            not isinstance(result.get("invocation_id"), str)
+                            or not 1
+                            <= len(str(result.get("invocation_id")))
+                            <= 128
+                        )
+                    )
+                ):
+                    raise TestStoreConflict(
+                        "test execution observation identity is contradictory"
+                    )
+                result.pop("runtime_id")
+                invocation_id = result.pop("invocation_id", None)
+                result["systemd_invocation_id"] = invocation_id
+                return result
+            raise TestStoreContractError("unsupported internal test execution operation")
         except TestAttemptLaunchUncertain as error:
             raise BrokerBackendError(
                 "test_attempt_launch_uncertain",
@@ -1482,16 +1681,21 @@ class StoreBackedMutationBackend:
             ) from error
 
     @staticmethod
-    def _require_internal_attempt_binding(
-        request: BrokerRequest, descriptor: TestAttemptDescriptor
+    def _require_internal_execution_binding(
+        request: BrokerRequest,
+        descriptor: TestAttemptDescriptor,
+        *,
+        execution_id: str,
+        generation: int,
     ) -> None:
         if (
             descriptor.repository_id != request.project_id
             or descriptor.repository_generation != request.repository_generation
-            or descriptor.attempt_id != request.resource_id
+            or descriptor.execution_id != execution_id
+            or descriptor.generation != generation
         ):
             raise TestStoreConflict(
-                "test attempt request does not belong to the exact ticketed resource"
+                "test execution request does not belong to the exact ticketed resource"
             )
 
     @staticmethod

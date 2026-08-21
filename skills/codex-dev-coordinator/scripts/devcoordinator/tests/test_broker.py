@@ -3470,6 +3470,11 @@ class StoreBackedBrokerTests(unittest.TestCase):
         with CanonicalTemporaryDirectory() as root:
             persistence, _unused = seed_store_backed_broker(root)
             caller_uid = os.geteuid() + 20_000
+            systemd_unit = (
+                "devcoordinator-test-"
+                + hashlib.sha256(PROJECT_ID.encode("utf-8")).hexdigest()[:32]
+                + ".service"
+            )
             request = BrokerRequest.create(
                 authority_generation=CURRENT_AUTHORITY_GENERATION,
                 account_id="devcoordinator-testd",
@@ -3477,7 +3482,11 @@ class StoreBackedBrokerTests(unittest.TestCase):
                 repository_generation=0,
                 resource_id=PROJECT_ID,
                 operation=BrokerOperation.TEST_ATTEMPT_STATUS,
-                arguments={"runtime_id": "runtime-alpha"},
+                arguments={
+                    "execution_id": PROJECT_ID,
+                    "generation": 1,
+                    "systemd_unit": systemd_unit,
+                },
             )
 
             acceptor = StoreBackedRequestAcceptor(
@@ -3489,20 +3498,26 @@ class StoreBackedBrokerTests(unittest.TestCase):
             self.assertEqual(accepted.peer.uid, caller_uid)
             self.assertEqual(accepted.request.project_id, PROJECT_ID)
 
-    def test_attempt_runtime_io_failure_is_typed_and_retriable(self) -> None:
+    def test_execution_runtime_io_failure_is_typed_and_retriable(self) -> None:
         with CanonicalTemporaryDirectory() as root:
             persistence, actions = seed_store_backed_broker(root)
             backend = StoreBackedMutationBackend(persistence, actions)
+            runtime_id = (
+                "devcoordinator-test-"
+                + hashlib.sha256(PROJECT_ID.encode("utf-8")).hexdigest()[:32]
+            )
+            systemd_unit = runtime_id + ".service"
 
-            class AttemptRuntime:
+            class ExecutionRuntime:
                 available = False
+                state = "running"
 
                 @staticmethod
                 def runtime_descriptor(_runtime_id: str) -> object:
                     class Descriptor:
                         repository_id = PROJECT_ID
                         repository_generation = 0
-                        attempt_id = PROJECT_ID
+                        execution_id = PROJECT_ID
                         generation = 1
 
                     return Descriptor()
@@ -3513,13 +3528,12 @@ class StoreBackedBrokerTests(unittest.TestCase):
                     return {
                         "execution_id": PROJECT_ID,
                         "runtime_id": runtime_id,
-                        "attempt_id": PROJECT_ID,
                         "generation": 1,
                         "repository_id": PROJECT_ID,
                         "repository_generation": 0,
-                        "systemd_unit": f"{runtime_id}.service",
+                        "systemd_unit": systemd_unit,
                         "invocation_id": "invocation-runtime-io",
-                        "state": "running",
+                        "state": self.state,
                         "unit_inactive": False,
                         "cgroup_empty": False,
                         "launch_confirmed": True,
@@ -3531,7 +3545,7 @@ class StoreBackedBrokerTests(unittest.TestCase):
                         "progress": None,
                     }
 
-            runtime = AttemptRuntime()
+            runtime = ExecutionRuntime()
             backend._test_attempts = runtime
             service = BrokerService(
                 StoreBackedRequestAcceptor(persistence),
@@ -3544,7 +3558,11 @@ class StoreBackedBrokerTests(unittest.TestCase):
                 repository_generation=0,
                 resource_id=PROJECT_ID,
                 operation=BrokerOperation.TEST_ATTEMPT_STATUS,
-                arguments={"runtime_id": "devcoordinator-test-runtime-io"},
+                arguments={
+                    "execution_id": PROJECT_ID,
+                    "generation": 1,
+                    "systemd_unit": systemd_unit,
+                },
             )
 
             with self.assertNoLogs("devcoordinator.broker", level="ERROR"):
@@ -3565,13 +3583,11 @@ class StoreBackedBrokerTests(unittest.TestCase):
                 recovered["result"],
                 {
                     "execution_id": PROJECT_ID,
-                    "runtime_id": "devcoordinator-test-runtime-io",
-                    "attempt_id": PROJECT_ID,
                     "generation": 1,
                     "repository_id": PROJECT_ID,
                     "repository_generation": 0,
-                    "systemd_unit": "devcoordinator-test-runtime-io.service",
-                    "invocation_id": "invocation-runtime-io",
+                    "systemd_unit": systemd_unit,
+                    "systemd_invocation_id": "invocation-runtime-io",
                     "state": "running",
                     "unit_inactive": False,
                     "cgroup_empty": False,
@@ -3583,6 +3599,124 @@ class StoreBackedBrokerTests(unittest.TestCase):
                     "resource_usage": {"current_memory_bytes": 4096},
                     "progress": None,
                 },
+            )
+
+            for obsolete_state in ("superseding", "abandoned"):
+                with self.subTest(obsolete_state=obsolete_state):
+                    runtime.state = obsolete_state
+                    rejected = service.reply_for_document(
+                        peer_for(), request.to_wire()
+                    )
+                    self.assertFalse(rejected["ok"], rejected)
+                    self.assertEqual(
+                        rejected["error"]["code"],
+                        "test_attempt_contract_invalid",
+                    )
+
+    def test_internal_execution_mutations_hide_runtime_aliases(self) -> None:
+        with CanonicalTemporaryDirectory() as root:
+            persistence, actions = seed_store_backed_broker(root)
+            backend = StoreBackedMutationBackend(persistence, actions)
+            runtime_id = (
+                "devcoordinator-test-"
+                + hashlib.sha256(PROJECT_ID.encode("utf-8")).hexdigest()[:32]
+            )
+            systemd_unit = runtime_id + ".service"
+
+            class ExecutionRuntime:
+                calls: list[tuple[str, Mapping[str, object]]] = []
+
+                def launch(self, **arguments: object) -> Mapping[str, object]:
+                    self.calls.append(("launch", dict(arguments)))
+                    return {
+                        "runtime_id": runtime_id,
+                        "launch_ack_id": "launch-ack-alpha",
+                    }
+
+                def cancel(
+                    self, supplied_runtime_id: str, **arguments: object
+                ) -> Mapping[str, object]:
+                    self.calls.append(
+                        (
+                            "cancel",
+                            {"runtime_id": supplied_runtime_id, **arguments},
+                        )
+                    )
+                    return {
+                        "runtime_id": supplied_runtime_id,
+                        "cancelled": True,
+                        "absent": False,
+                    }
+
+                def collect(
+                    self, supplied_runtime_id: str, **arguments: object
+                ) -> Mapping[str, object]:
+                    self.calls.append(
+                        (
+                            "collect",
+                            {"runtime_id": supplied_runtime_id, **arguments},
+                        )
+                    )
+                    return {"runtime_id": supplied_runtime_id, "collected": True}
+
+            runtime = ExecutionRuntime()
+            backend._test_attempts = runtime
+            identity = {
+                "execution_id": PROJECT_ID,
+                "generation": 1,
+                "systemd_unit": systemd_unit,
+            }
+
+            def execute(
+                operation: BrokerOperation, arguments: Mapping[str, object]
+            ) -> Mapping[str, object]:
+                broker_request = BrokerRequest.create(
+                    authority_generation=CURRENT_AUTHORITY_GENERATION,
+                    account_id="devcoordinator-testd",
+                    project_id=PROJECT_ID,
+                    repository_generation=0,
+                    resource_id=PROJECT_ID,
+                    operation=operation,
+                    arguments=arguments,
+                )
+                return backend._execute_test_attempt(
+                    AcceptedBrokerRequest(peer_for(), broker_request)
+                )
+
+            launched = execute(
+                BrokerOperation.TEST_ATTEMPT_LAUNCH,
+                {"ticket_id": "ticket-alpha", **identity},
+            )
+            cancelled = execute(
+                BrokerOperation.TEST_ATTEMPT_CANCEL,
+                {**identity, "reason": "caller cancelled"},
+            )
+            collected = execute(BrokerOperation.TEST_ATTEMPT_COLLECT, identity)
+
+            self.assertEqual(
+                launched,
+                {**identity, "launch_ack_id": "launch-ack-alpha"},
+            )
+            self.assertEqual(
+                cancelled,
+                {**identity, "cancelled": True, "absent": False},
+            )
+            self.assertEqual(collected, {**identity, "collected": True})
+            self.assertNotIn("runtime_id", launched)
+            self.assertNotIn("runtime_id", cancelled)
+            self.assertNotIn("runtime_id", collected)
+            self.assertEqual(
+                runtime.calls[0],
+                (
+                    "launch",
+                    {
+                        "ticket_id": "ticket-alpha",
+                        "execution_id": PROJECT_ID,
+                        "generation": 1,
+                        "expected_repository_id": PROJECT_ID,
+                        "expected_repository_generation": 0,
+                    },
+                ),
             )
 
     def test_postgres_host_failure_is_durable_and_never_registers_backup(self) -> None:

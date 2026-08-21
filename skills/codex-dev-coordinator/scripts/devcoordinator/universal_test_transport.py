@@ -292,12 +292,12 @@ def _request_correlations(
         return None, None, None, None
     repository_id = arguments.get("repository_id")
     run_id = arguments.get("run_id")
-    attempt_id = arguments.get("attempt_id")
+    execution_id = arguments.get("execution_id")
     operation_id = arguments.get("operation_id")
     return (
         repository_id if isinstance(repository_id, str) else None,
         run_id if isinstance(run_id, str) else None,
-        attempt_id if isinstance(attempt_id, str) else None,
+        execution_id if isinstance(execution_id, str) else None,
         operation_id if isinstance(operation_id, str) else None,
     )
 
@@ -375,10 +375,10 @@ class TestPlaneDispatcher:
     ) -> None:
         if self.call_journal is None:
             return
-        repository_id, run_id, attempt_id, operation_id = _request_correlations(
+        repository_id, run_id, execution_id, operation_id = _request_correlations(
             arguments
         )
-        result_repository, result_run, result_attempt, _ = _request_correlations(
+        result_repository, result_run, result_execution, _ = _request_correlations(
             result
         )
         self.call_journal.record(
@@ -402,7 +402,9 @@ class TestPlaneDispatcher:
                 message=message,
                 repository_id=repository_id or result_repository,
                 run_id=run_id or result_run,
-                attempt_id=attempt_id or result_attempt,
+                # The journal's historical correlation column is diagnostic
+                # storage only; the v8 transport exposes execution_id.
+                attempt_id=execution_id or result_execution,
                 diagnostic=diagnostic,
             )
         )
@@ -1057,10 +1059,10 @@ class UnixTestPlaneClient:
     ) -> None:
         if self.call_journal is None:
             return
-        repository_id, run_id, attempt_id, operation_id = _request_correlations(
+        repository_id, run_id, execution_id, operation_id = _request_correlations(
             arguments
         )
-        result_repository, result_run, result_attempt, _ = _request_correlations(
+        result_repository, result_run, result_execution, _ = _request_correlations(
             result
         )
         self.call_journal.record(
@@ -1082,7 +1084,9 @@ class UnixTestPlaneClient:
                 message=message,
                 repository_id=repository_id or result_repository,
                 run_id=run_id or result_run,
-                attempt_id=attempt_id or result_attempt,
+                # The journal's historical correlation column is diagnostic
+                # storage only; the v8 transport exposes execution_id.
+                attempt_id=execution_id or result_execution,
                 diagnostic=diagnostic,
             )
         )

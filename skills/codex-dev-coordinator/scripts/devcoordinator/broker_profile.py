@@ -897,6 +897,12 @@ class BrokerClientProfile:
         offset: int,
         length: int,
     ) -> dict[str, Any]:
+        """Read one bounded byte page from a verified artifact.
+
+        This is ordinary artifact transport paging. It is deliberately not a
+        semantic runner-result chunk or lifecycle/recovery protocol.
+        """
+
         return self._test_run_call(
             repository=repository,
             operation=BrokerOperation.TEST_ARTIFACT_RESOLVE,

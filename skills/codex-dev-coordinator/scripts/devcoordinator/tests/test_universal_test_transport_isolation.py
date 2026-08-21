@@ -113,6 +113,25 @@ class InMemoryUnixListener:
 
 
 class UniversalTestTransportIsolationTests(unittest.TestCase):
+    def test_call_correlation_accepts_execution_identity_only(self) -> None:
+        self.assertEqual(
+            transport._request_correlations(
+                {
+                    "repository_id": "repo-alpha",
+                    "run_id": "run-alpha",
+                    "execution_id": "execution-alpha",
+                    "operation_id": "operation-alpha",
+                    "attempt_id": "legacy-alias-must-be-ignored",
+                }
+            ),
+            (
+                "repo-alpha",
+                "run-alpha",
+                "execution-alpha",
+                "operation-alpha",
+            ),
+        )
+
     def test_catalog_transport_was_removed(self) -> None:
         self.assertFalse(hasattr(UnixTestPlaneClient(self.root / "testd.sock"), "repository_catalog"))
 

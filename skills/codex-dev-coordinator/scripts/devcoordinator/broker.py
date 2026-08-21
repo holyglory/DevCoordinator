@@ -360,6 +360,29 @@ class BrokerRequest:
                 "Ephemeral credential run_id must match the exact broker resource_id.",
                 operation_id=operation_id,
             )
+        if operation is BrokerOperation.TEST_ATTEMPT_TICKET:
+            descriptor = arguments["descriptor"]
+            if descriptor["execution_id"] != resource_id:
+                raise BrokerError(
+                    "invalid_arguments",
+                    "Test execution descriptor must match the exact broker resource_id.",
+                    operation_id=operation_id,
+                )
+        if (
+            operation
+            in {
+                BrokerOperation.TEST_ATTEMPT_LAUNCH,
+                BrokerOperation.TEST_ATTEMPT_STATUS,
+                BrokerOperation.TEST_ATTEMPT_CANCEL,
+                BrokerOperation.TEST_ATTEMPT_COLLECT,
+            }
+            and arguments["execution_id"] != resource_id
+        ):
+            raise BrokerError(
+                "invalid_arguments",
+                "Test execution identity must match the exact broker resource_id.",
+                operation_id=operation_id,
+            )
         return cls(
             operation_id=operation_id,
             authority_generation=authority_generation,
@@ -1209,7 +1232,11 @@ class BrokerService:
                 repository_generation=request.get("repository_generation"),
                 resource_id=request.get("resource_id"),
                 run_id=arguments.get("run_id"),
-                attempt_id=arguments.get("attempt_id"),
+                # Test execution identity is carried explicitly on the v8
+                # internal wire.  The call journal still names this generic
+                # correlation slot ``attempt_id``; it is not a request or
+                # response compatibility alias.
+                attempt_id=arguments.get("execution_id"),
             )
         )
 
@@ -2631,65 +2658,62 @@ def _validate_arguments(
                 "launch_timeout_seconds must be an integer from 1 through 3600.",
                 operation_id=operation_id,
             )
+        descriptor = _bounded_json_object(
+            value["descriptor"],
+            "descriptor",
+            operation_id,
+            maximum_bytes=128 * 1024,
+        )
+        if "attempt_id" in descriptor or "execution_id" not in descriptor:
+            raise BrokerError(
+                "invalid_arguments",
+                "Internal test descriptors must use execution_id.",
+                operation_id=operation_id,
+            )
+        descriptor["execution_id"] = _opaque_argument(
+            descriptor["execution_id"], "descriptor.execution_id", operation_id
+        )
         return {
-            "descriptor": _bounded_json_object(
-                value["descriptor"],
-                "descriptor",
-                operation_id,
-                maximum_bytes=128 * 1024,
-            ),
+            "descriptor": descriptor,
             "launch_timeout_seconds": launch_timeout,
         }
 
     if operation == BrokerOperation.TEST_ATTEMPT_LAUNCH:
         if set(value) != {
             "ticket_id",
-            "attempt_id",
+            "execution_id",
             "generation",
+            "systemd_unit",
         }:
             raise BrokerError(
                 "invalid_arguments",
-                "Internal test launch requires exact ticket identity.",
-                operation_id=operation_id,
-            )
-        generation = value["generation"]
-        if not _is_exact_int(generation) or not 1 <= generation <= 1_000_000:
-            raise BrokerError(
-                "invalid_arguments",
-                "generation must be an integer from 1 through 1000000.",
+                "Internal test launch requires exact ticket, execution, generation, and systemd identities.",
                 operation_id=operation_id,
             )
         return {
             "ticket_id": _opaque_argument(
                 value["ticket_id"], "ticket_id", operation_id
             ),
-            "attempt_id": _opaque_argument(
-                value["attempt_id"], "attempt_id", operation_id
-            ),
-            "generation": generation,
+            **_test_execution_identity_arguments(value, operation_id),
         }
 
     if operation == BrokerOperation.TEST_ATTEMPT_STATUS:
-        if set(value) != {"runtime_id"}:
+        if set(value) != {"execution_id", "generation", "systemd_unit"}:
             raise BrokerError(
                 "invalid_arguments",
-                "Internal test status requires one exact runtime_id.",
+                "Internal test status requires exact execution, generation, and systemd identities.",
                 operation_id=operation_id,
             )
-        return {
-            "runtime_id": _opaque_argument(
-                value["runtime_id"], "runtime_id", operation_id
-            ),
-        }
+        return _test_execution_identity_arguments(value, operation_id)
 
     if operation in {
         BrokerOperation.TEST_ATTEMPT_CANCEL,
         BrokerOperation.TEST_ATTEMPT_COLLECT,
     }:
         expected = (
-            {"runtime_id", "reason"}
+            {"execution_id", "generation", "systemd_unit", "reason"}
             if operation is BrokerOperation.TEST_ATTEMPT_CANCEL
-            else {"runtime_id"}
+            else {"execution_id", "generation", "systemd_unit"}
         )
         if set(value) != expected:
             raise BrokerError(
@@ -2697,11 +2721,7 @@ def _validate_arguments(
                 "Internal test cleanup arguments are invalid.",
                 operation_id=operation_id,
             )
-        normalized = {
-            "runtime_id": _opaque_argument(
-                value["runtime_id"], "runtime_id", operation_id
-            ),
-        }
+        normalized = _test_execution_identity_arguments(value, operation_id)
         if operation is BrokerOperation.TEST_ATTEMPT_CANCEL:
             normalized["reason"] = _bounded_reason(value["reason"], operation_id)
         return normalized
@@ -3965,6 +3985,40 @@ def _validate_arguments(
         "Requested broker operation is not allowed.",
         operation_id=operation_id,
     )
+
+
+def _test_execution_identity_arguments(
+    value: Mapping[str, Any], operation_id: str
+) -> dict[str, Any]:
+    execution_id = _opaque_argument(
+        value["execution_id"], "execution_id", operation_id
+    )
+    generation = value["generation"]
+    if not _is_exact_int(generation) or not 1 <= generation <= 1_000_000:
+        raise BrokerError(
+            "invalid_arguments",
+            "generation must be an integer from 1 through 1000000.",
+            operation_id=operation_id,
+        )
+    systemd_unit = _opaque_argument(
+        value["systemd_unit"], "systemd_unit", operation_id
+    )
+    expected_unit = (
+        "devcoordinator-test-"
+        + hashlib.sha256(execution_id.encode("utf-8")).hexdigest()[:32]
+        + ".service"
+    )
+    if systemd_unit != expected_unit:
+        raise BrokerError(
+            "invalid_arguments",
+            "systemd_unit does not match the exact execution identity.",
+            operation_id=operation_id,
+        )
+    return {
+        "execution_id": execution_id,
+        "generation": generation,
+        "systemd_unit": systemd_unit,
+    }
 
 
 def _bounded_reason(value: Any, operation_id: str) -> str:
