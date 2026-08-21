@@ -441,6 +441,41 @@ Environment=ROOT_STATE=%h/.local/state/root-app
                 "blob-bound historical repair unexpectedly exempted current HEAD",
             )
 
+        for oid, paths in module.KNOWN_HISTORICAL_SYNTHETIC_SECRET_BLOBS:
+            exact_paths = set(paths)
+            check(
+                module.known_historical_synthetic_secret_blob(
+                    oid=oid,
+                    paths=exact_paths,
+                    head_blob_oids=set(),
+                ),
+                "sealed historical synthetic-secret blob did not accept its exact tuple",
+            )
+            check(
+                not module.known_historical_synthetic_secret_blob(
+                    oid=f"changed-{oid}",
+                    paths=exact_paths,
+                    head_blob_oids=set(),
+                ),
+                "historical synthetic-secret repair was not exact for blob identity",
+            )
+            check(
+                not module.known_historical_synthetic_secret_blob(
+                    oid=oid,
+                    paths={f"changed-{path}" for path in exact_paths},
+                    head_blob_oids=set(),
+                ),
+                "historical synthetic-secret repair was not exact for path identity",
+            )
+            check(
+                not module.known_historical_synthetic_secret_blob(
+                    oid=oid,
+                    paths=exact_paths,
+                    head_blob_oids={oid},
+                ),
+                "historical synthetic-secret repair unexpectedly exempted current HEAD",
+            )
+
         missing_contract_findings = module.scan_tip(repo)
         check(
             any(item.rule == "required-contract-file" for item in missing_contract_findings)

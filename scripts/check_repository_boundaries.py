@@ -50,6 +50,25 @@ SECRET_CONTENT_PATTERNS = (
 GOOGLE_CLIENT_SECRET_ASSIGNMENT = re.compile(
     rb"(?m)^[ \t]*GOOGLE_CLIENT_SECRET[ \t]*=[ \t]*([^\s#]+)"
 )
+
+# Commit 5917728 added an intentionally incomplete private-key marker to a
+# credential-detector unit test.  The exact source blob contains no key
+# payload or provider credential, but its marker correctly trips the public
+# history scanner.  Public history is immutable, so seal the exception to the
+# one audited blob at its one historical path.  A current tip may never rely on
+# this exception; the successor test constructs the same detector input from
+# fragments at runtime.
+KNOWN_HISTORICAL_SYNTHETIC_SECRET_BLOBS = frozenset(
+    {
+        (
+            "9104f80a66b4b3f3bb2536c54bf7015f29f59739",
+            (
+                "skills/codex-dev-coordinator/scripts/devcoordinator/tests/"
+                "test_server_credentials.py",
+            ),
+        )
+    }
+)
 CROSS_DEPENDENCY_PATTERNS = (
     re.compile(r"\bHOLYSKILLS_ROOT\b"),
     re.compile(r"github\.com/holyglory/holyskills", re.IGNORECASE),
@@ -448,6 +467,17 @@ def known_historical_source_drift(
         source_blob,
         detail,
     ) in KNOWN_HISTORICAL_SOURCE_BLOB_DRIFT
+
+
+def known_historical_synthetic_secret_blob(
+    *,
+    oid: str,
+    paths: set[str],
+    head_blob_oids: set[str],
+) -> bool:
+    if oid in head_blob_oids:
+        return False
+    return (oid, tuple(sorted(paths))) in KNOWN_HISTORICAL_SYNTHETIC_SECRET_BLOBS
 
 
 def production_dependency_paths(paths: list[str]) -> list[str]:
@@ -901,6 +931,21 @@ def scan_history(repo: Path) -> list[Finding]:
     history_revisions = public_history_revisions(repo)
     objects = git(repo, "rev-list", "--objects", *history_revisions)
     assert isinstance(objects, str)
+    head_listing = git(repo, "ls-tree", "-r", "-z", "HEAD", text=False)
+    assert isinstance(head_listing, bytes)
+    head_blob_oids: set[str] = set()
+    for record in head_listing.split(b"\0"):
+        if not record:
+            continue
+        metadata, separator, _path = record.partition(b"\t")
+        if not separator:
+            raise RuntimeError("git ls-tree returned a malformed record")
+        fields = metadata.split(b" ")
+        if len(fields) != 3:
+            raise RuntimeError("git ls-tree returned malformed metadata")
+        _mode, kind, object_id = fields
+        if kind == b"blob":
+            head_blob_oids.add(object_id.decode("ascii"))
     object_paths: dict[str, set[str]] = {}
     for line in objects.splitlines():
         oid, separator, path = line.partition(" ")
@@ -924,7 +969,19 @@ def scan_history(repo: Path) -> list[Finding]:
             google_secret = bool(value) and not value.startswith(
                 (b"$", b"<", b"dummy-", b"example-", b"fixture-", b"placeholder-", b"test-")
             )
-        if google_secret or any(pattern.search(content) for pattern in SECRET_CONTENT_PATTERNS):
+        matched_patterns = tuple(pattern for pattern in SECRET_CONTENT_PATTERNS if pattern.search(content))
+        if google_secret or matched_patterns:
+            if (
+                not google_secret
+                and len(matched_patterns) == 1
+                and matched_patterns[0] is SECRET_CONTENT_PATTERNS[0]
+                and known_historical_synthetic_secret_blob(
+                    oid=oid,
+                    paths=paths,
+                    head_blob_oids=head_blob_oids,
+                )
+            ):
+                continue
             findings.append(
                 Finding("unsafe-history-secret", sorted(paths)[0], f"credential/private-key pattern in reachable blob {oid}")
             )

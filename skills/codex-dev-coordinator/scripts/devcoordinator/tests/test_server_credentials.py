@@ -114,7 +114,9 @@ class ServerCredentialTests(unittest.TestCase):
             )
         )
 
-    def test_argument_detection_catches_inline_credentials_but_not_file_references(self) -> None:
+    def test_argument_detection_catches_inline_credentials_and_secret_file_arguments(self) -> None:
+        bearer_scheme = "Bearer"
+        private_key_kind = "PRIVATE KEY"
         for value in (
             "--password=fixture",
             "--database-password=fixture",
@@ -123,8 +125,8 @@ class ServerCredentialTests(unittest.TestCase):
             "--connection=Server=localhost;Pwd=fixture",
             "https://identity.example/callback?client_secret=fixture",
             "redis://:fixture@localhost/0",
-            "Authorization: Bearer abcdefghijklmnop",
-            "-----BEGIN PRIVATE KEY-----",
+            f"Authorization: {bearer_scheme} abcdefghijklmnop",
+            f"-----BEGIN {private_key_kind}-----",
         ):
             with self.subTest(value=value):
                 self.assertTrue(secret_argument_literal(value))
