@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import os
 from pathlib import Path
 import shutil
 import stat
@@ -487,6 +488,63 @@ def exercise_retiring_release_ignores_generated_bytecode() -> None:
         )
 
 
+def exercise_previous_release_requires_current_format() -> None:
+    required_paths = (
+        "bin/devcoordinator-browser-accounting",
+        "skills/codex-dev-coordinator/scripts/devcoordinator/browser_lifecycle.py",
+        "bin/devcoordinator-same-schema-switch",
+        "scripts/switch_same_schema_release.py",
+        "deploy/devcoordinator-api.socket",
+        "deploy/devcoordinator-authority.socket",
+        "deploy/devcoordinator-edge.service",
+        "deploy/devcoordinator-console@.service",
+    )
+
+    def entry(path: str, index: int) -> dict[str, object]:
+        return {
+            "path": path,
+            "sha256": f"{index:064x}",
+            "size": index + 1,
+            "mode": "0555" if path.startswith("bin/") else "0444",
+            "kind": "wrapper" if path.startswith("bin/") else "source",
+        }
+
+    with tempfile.TemporaryDirectory(prefix="same-schema-current-format-") as raw:
+        root = Path(raw)
+        for selected, accepted in (
+            (required_paths, True),
+            (required_paths[:-1], False),
+        ):
+            entries = [entry(path, index) for index, path in enumerate(selected, 1)]
+            digest = switch.installer.release_digest(entries)
+            release = root / digest
+            release.mkdir()
+            manifest = {
+                "schema_version": switch.installer.RELEASE_SCHEMA,
+                "release_digest": digest,
+                "files": entries,
+                "capabilities": {
+                    switch.BROWSER_ACCOUNTING_CAPABILITY: True,
+                    "current_format_delivery": accepted,
+                },
+            }
+            (release / "release-manifest.json").write_text(
+                json.dumps(manifest), encoding="utf-8"
+            )
+            cache = release / "generated/__pycache__"
+            cache.mkdir(parents=True)
+            (cache / "residue.pyc").write_bytes(b"generated")
+            if accepted:
+                switch.require_previous_current_format_release(release)
+            else:
+                try:
+                    switch.require_previous_current_format_release(release)
+                except switch.SwitchError:
+                    pass
+                else:
+                    raise AssertionError("old-layout predecessor passed the current-format gate")
+
+
 def exercise_browser_cleanup_skip_failure_and_malformed_result() -> None:
     with tempfile.TemporaryDirectory(prefix="same-schema-browser-cases-") as raw:
         root = Path(raw)
@@ -635,6 +693,32 @@ def exercise_already_active_health_has_rendered_contract() -> None:
         source.count('"rendered_units": rendered["rendered_units"]') == 2
         and '"rendered_units": None' not in source,
         "already-active health can receive an absent rendered-unit contract",
+    )
+
+
+def exercise_current_transaction_durability() -> None:
+    with tempfile.TemporaryDirectory(prefix="same-schema-atomic-bytes-") as raw:
+        target = Path(raw) / "journal.json"
+        with mock.patch.object(switch.os, "fsync", wraps=os.fsync) as synced:
+            switch.atomic_bytes(target, b"{}\n", 0o600)
+        expect(target.read_bytes() == b"{}\n", "atomic write changed its payload")
+        expect(
+            stat.S_IMODE(target.stat().st_mode) == 0o600 and synced.call_count >= 2,
+            "atomic write did not fsync both file and parent directory",
+        )
+    source = inspect.getsource(switch.require_transaction_root)
+    prepare_source = inspect.getsource(switch.prepare)
+    expect(
+        "absolute.name != release_digest" in source
+        and "info.st_uid != 0" in source
+        and "stat.S_IMODE(info.st_mode) != 0o700" in source,
+        "same-schema journal is not bound to a root-private digest directory",
+    )
+    expect(
+        "plan_sha256" not in prepare_source
+        and prepare_source.index("require_previous_current_format_release(")
+        < prepare_source.index("current_slot ="),
+        "prepare retains a transaction self-hash or trusts an old-layout predecessor",
     )
 
 
@@ -883,6 +967,8 @@ def exercise_release_packaging_contract() -> None:
         and switch.SYSTEMD_UNIT_LAUNCHER
         == Path("/usr/local/bin/devcoordinator-systemd-unit")
         and switch.IMAGE_LAUNCHER == Path("/usr/local/bin/devcoordinator-image")
+        and switch.EDGE_CERT_REFRESH_LAUNCHER
+        == Path("/usr/local/bin/devcoordinator-edge-cert-refresh")
         and switch.READ_ONLY_RULE
         == Path("/etc/codex/rules/devcoordinator-read-only.rules")
         and switch.TEST_RULE == Path("/etc/codex/rules/devcoordinator-test.rules"),
@@ -909,6 +995,17 @@ def exercise_release_packaging_contract() -> None:
         switch.STABLE_LAUNCHERS.get(switch.IMAGE_LAUNCHER_RENDERED)
         == (switch.IMAGE_LAUNCHER, "devcoordinator-image"),
         "image publication launcher is absent from the stable activation transaction",
+    )
+    expect(
+        switch.STABLE_LAUNCHERS.get(
+            switch.EDGE_CERT_REFRESH_LAUNCHER_RENDERED
+        )
+        == (
+            switch.EDGE_CERT_REFRESH_LAUNCHER,
+            "devcoordinator-edge-cert-refresh",
+        )
+        and switch.destination_mode(switch.CERTBOT_HOOK_RENDERED) == 0o700,
+        "TLS renewal is not bound to the stable current-format transaction",
     )
     expect(
         all(
@@ -969,11 +1066,15 @@ def exercise_stable_client_destination_transaction() -> None:
         read_only_rule = root / "codex/rules/devcoordinator-read-only.rules"
         sysusers = root / "sysusers"
         tmpfiles = root / "tmpfiles"
+        hook_root = root / "certbot-hooks"
+        hook_root.mkdir(mode=0o755)
+        hook = hook_root / "devcoordinator-edge"
         rendered_names = (
             *stable,
             "devcoordinator-availability.sysusers.conf",
             "devcoordinator-availability.tmpfiles.conf",
             switch.MAIN_TMPFILES_RENDERED,
+            switch.CERTBOT_HOOK_RENDERED,
             switch.READ_ONLY_RULE_RENDERED,
             switch.TEST_RULE_RENDERED,
         )
@@ -985,6 +1086,8 @@ def exercise_stable_client_destination_transaction() -> None:
             mock.patch.object(switch, "TOPOLOGY_FILES", ()),
             mock.patch.object(switch, "SYSUSERS_ROOT", sysusers),
             mock.patch.object(switch, "TMPFILES_ROOT", tmpfiles),
+            mock.patch.object(switch, "CERTBOT_HOOK_ROOT", hook_root),
+            mock.patch.object(switch, "CERTBOT_HOOK", hook),
             mock.patch.object(switch, "READ_ONLY_RULE", read_only_rule),
             mock.patch.object(switch, "TEST_RULE", rule),
         ):
@@ -994,6 +1097,7 @@ def exercise_stable_client_destination_transaction() -> None:
                     *stable,
                     switch.MAIN_TMPFILES_RENDERED,
                     "devcoordinator-availability.tmpfiles.conf",
+                    switch.CERTBOT_HOOK_RENDERED,
                     switch.READ_ONLY_RULE_RENDERED,
                     switch.TEST_RULE_RENDERED,
                 }.issubset(mapping),
@@ -1351,12 +1455,8 @@ def exercise_opt_in_test_history_reset_and_previous_release_rollback() -> None:
             )
             create = next(command for command in runner.commands if "create" in command)
             expect(
-                (
-                    str(previous / "bin" / switch.TEST_HISTORY_WRAPPER) in create
-                    or str(previous / "bin" / switch.PREVIOUS_TEST_HISTORY_WRAPPER)
-                    in create
-                ),
-                "rollback did not use the previous release's test-history wrapper",
+                str(previous / "bin" / switch.TEST_HISTORY_WRAPPER) in create,
+                "rollback did not require the previous current-format test-store wrapper",
             )
             expect(
                 reset["rollback_evidence"]["schema_version"] == 5,
@@ -1443,9 +1543,11 @@ def main() -> int:
     exercise_blue_green_order()
     exercise_first_capable_browser_cleanup()
     exercise_retiring_release_ignores_generated_bytecode()
+    exercise_previous_release_requires_current_format()
     exercise_browser_cleanup_skip_failure_and_malformed_result()
     exercise_browser_cleanup_activation_order()
     exercise_already_active_health_has_rendered_contract()
+    exercise_current_transaction_durability()
     exercise_legacy_control_plane_is_durably_retired()
     exercise_internal_socket_rebind_order()
     exercise_rollback_restores_control_plane_before_background_services()

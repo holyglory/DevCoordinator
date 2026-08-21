@@ -9,7 +9,6 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
-from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -17,7 +16,7 @@ if str(ROOT / "scripts") not in sys.path:
     sys.path.insert(0, str(ROOT / "scripts"))
 
 import refresh_edge_tls_credential as refresh  # noqa: E402
-import activate_availability_release as activation  # noqa: E402
+import switch_same_schema_release as release_switch  # noqa: E402
 
 
 class FakeRunner:
@@ -41,22 +40,6 @@ class FakeRunner:
         if Path(argv[1]).name == "pkey" and not self.key_matches:
             return b"another-public-key"
         return b"one-public-key"
-
-
-class HookRunner:
-    def __init__(self, *, valid: bool = True) -> None:
-        self.valid = valid
-
-    def run_json(self, argv):
-        return {
-            "ok": self.valid,
-            "checked": self.valid,
-            "leaf_sha256": "a" * 64,
-            "public_key_sha256": "b" * 64,
-        }
-
-    def status(self, _argv):
-        return 0
 
 
 class RefreshTests(unittest.TestCase):
@@ -119,49 +102,12 @@ class RefreshTests(unittest.TestCase):
                 expected_uid=os.geteuid(),
             )
 
-    def test_certbot_hook_replaces_and_restores_legacy_hook(self) -> None:
-        release_root = self.root / "releases"
-        release = release_root / ("d" * 64)
-        helper = release / "bin/devcoordinator-edge-cert-refresh"
-        helper.parent.mkdir(parents=True)
-        helper.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-        helper.chmod(0o555)
-        hooks = self.root / "hooks"
-        hooks.mkdir(mode=0o755)
-        legacy = hooks / "devops-console"
-        legacy.write_text("#!/bin/sh\nsystemctl reload devops-console\n", encoding="utf-8")
-        legacy.chmod(0o700)
-        rollback = self.root / "rollback"
-        rollback.mkdir(mode=0o700)
-        with mock.patch.object(activation, "IMMUTABLE_RELEASE_ROOT", release_root):
-            evidence = activation.install_edge_certbot_hook(
-                release=release,
-                rollback_directory=rollback,
-                expected_uid=os.geteuid(),
-                hook_root=hooks,
-                runner=HookRunner(),
-            )
-            installed = hooks / "devcoordinator-edge"
-            self.assertTrue(installed.is_file())
-            self.assertFalse(legacy.exists())
-            self.assertIn(str(helper), installed.read_text(encoding="utf-8"))
-            self.assertEqual(installed.stat().st_mode & 0o777, 0o700)
-            activation._restore_prepared_graph(
-                {"prior_units": {}, "prior_files": evidence["prior_files"]},
-                runner=HookRunner(),
-                expected_uid=os.geteuid(),
-            )
-        self.assertFalse(installed.exists())
-        self.assertIn("reload devops-console", legacy.read_text(encoding="utf-8"))
-        with self.assertRaisesRegex(refresh.RefreshError, "did not serve"):
-            refresh.refresh(
-                lineage=self.lineage,
-                domain="vr.ae",
-                runner=FakeRunner(),
-                inode_reader=lambda _port: 11,
-                peer_reader=lambda _host, _port: "0" * 64,
-                expected_uid=os.geteuid(),
-            )
+    def test_current_hook_uses_stable_refresh_launcher_and_exact_lineage(self) -> None:
+        payload = release_switch.certbot_hook_payload().decode("utf-8")
+        self.assertIn(str(release_switch.EDGE_CERT_REFRESH_LAUNCHER), payload)
+        self.assertIn("RENEWED_LINEAGE", payload)
+        self.assertIn("/etc/letsencrypt/live/vr.ae", payload)
+        self.assertNotIn("/opt/devcoordinator/releases/", payload)
 
 
 if __name__ == "__main__":
