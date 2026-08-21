@@ -13,6 +13,11 @@ from .broker import (
     accepted_request_fingerprint,
 )
 from .broker_persistence import BrokerPersistence
+from .server_credentials import (
+    ServerCredentialError,
+    secret_environment_literal,
+    validate_server_credential_bindings,
+)
 from .store import CoordinatorStore, canonical_json, utc_timestamp
 from .worker_artifacts import (
     WorkerArtifactError,
@@ -41,6 +46,30 @@ WORKER_READ_OPERATIONS = frozenset(
     }
 )
 WORKER_OPERATIONS = WORKER_MUTATION_OPERATIONS | WORKER_READ_OPERATIONS
+_WORKER_CANDIDATE_FIELDS = frozenset(
+    {
+        "server_definition_id",
+        "repo_id",
+        "family_id",
+        "root_repo_id",
+        "project_kind",
+        "root_repository",
+        "repository",
+        "name",
+        "cwd",
+        "argv",
+        "environment",
+        "credential_bindings",
+        "log_path",
+        "execution_uid",
+        "keep_alive",
+        "definition_fingerprint",
+        "definition_generation",
+        "policy_generation",
+        "supervisor_epoch",
+        "supervisor_generation",
+    }
+)
 
 
 class BrokerWorkerOperations:
@@ -216,6 +245,10 @@ class BrokerWorkerOperations:
                                 **dict(candidate),
                                 "argv": list(candidate["argv"]),
                                 "environment": dict(candidate["environment"]),
+                                "credential_bindings": [
+                                    dict(binding)
+                                    for binding in candidate["credential_bindings"]
+                                ],
                             }
                         },
                     )
@@ -325,13 +358,36 @@ class BrokerWorkerOperations:
     ) -> None:
         request = accepted.request
         if (
-            str(candidate["server_definition_id"]) != request.resource_id
+            set(candidate) != _WORKER_CANDIDATE_FIELDS
+            or str(candidate["server_definition_id"]) != request.resource_id
             or str(candidate["repo_id"]) != request.project_id
             or int(candidate["execution_uid"]) <= 0
         ):
             raise WorkerSupervisionConflict(
                 "worker launch candidate changed exact repository or execution identity"
             )
+        environment = candidate.get("environment")
+        if not isinstance(environment, Mapping):
+            raise WorkerSupervisionConflict(
+                "worker launch candidate environment is invalid"
+            )
+        try:
+            bindings = validate_server_credential_bindings(
+                request.resource_id, candidate.get("credential_bindings")
+            )
+            if set(environment) & {binding.name for binding in bindings}:
+                raise ServerCredentialError(
+                    "worker environment duplicates a credential binding"
+                )
+            if any(
+                secret_environment_literal(name, value)
+                for name, value in environment.items()
+            ):
+                raise ServerCredentialError(
+                    "worker launch candidate contains a secret literal"
+                )
+        except ServerCredentialError as error:
+            raise WorkerSupervisionConflict(str(error)) from error
 
     @staticmethod
     def _require_attempt_identity(
@@ -512,22 +568,11 @@ class BrokerWorkerOperations:
                 operation_id=accepted.request.operation_id,
             )
         candidate = dict(prepared["candidate"])
-        required = {
-            "server_definition_id",
-            "repo_id",
-            "execution_uid",
-            "definition_generation",
-            "policy_generation",
-            "supervisor_epoch",
-            "supervisor_generation",
-            "cwd",
-            "argv",
-            "environment",
-        }
         if (
-            not required.issubset(candidate)
+            set(candidate) != _WORKER_CANDIDATE_FIELDS
             or not isinstance(candidate["argv"], list)
             or not isinstance(candidate["environment"], dict)
+            or not isinstance(candidate["credential_bindings"], list)
         ):
             raise BrokerBackendError(
                 "operation_evidence_corrupt",

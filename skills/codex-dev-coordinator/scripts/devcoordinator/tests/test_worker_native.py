@@ -13,6 +13,7 @@ import uuid
 from unittest import mock
 
 from devcoordinator import worker_native
+from devcoordinator.server_credentials import server_credential_id, staged_material_path
 from devcoordinator.worker_native import (
     LaunchdWorkerManager,
     SystemdWorkerManager,
@@ -208,6 +209,75 @@ class WorkerNativeTests(unittest.TestCase):
         self.assertEqual(state.pid, 4312)
         self.assertEqual(state.control_group, self.control_group)
         self.assertTrue(state.cgroup_populated)
+
+    def test_systemd_loads_only_exact_validated_server_credentials(self) -> None:
+        credential_root = self.root / "server-credentials"
+        credential_root.mkdir(mode=0o700)
+        credential_root.chmod(0o700)
+        credential_id = server_credential_id(self.worker_id, "DATABASE_URL")
+        material = staged_material_path(credential_root, credential_id)
+        material.write_text("synthetic-private-value", encoding="utf-8")
+        material.chmod(0o600)
+        runner = FakeRunner(
+            [
+                (0, "", ""),
+                (
+                    0,
+                    "LoadState=loaded\nActiveState=active\nSubState=running\n"
+                    "MainPID=4312\nExecMainStatus=0\n"
+                    f"ControlGroup={self.control_group}\n",
+                    "",
+                ),
+                (
+                    0,
+                    "LoadState=loaded\n"
+                    f"Slice={project_repository_slice(uid=501, repository_id='repo-one')}\n",
+                    "",
+                ),
+            ]
+        )
+        manager = SystemdWorkerManager(
+            coordinator_script=self.script,
+            python_executable=str(self.python),
+            systemd_run_executable=str(self.systemd_run),
+            systemctl_executable=str(self.systemctl),
+            cgroup_root=self.cgroup_root,
+            credential_material_root=credential_root,
+            credential_material_uid=os.geteuid(),
+            runner=runner,
+        )
+        with mock.patch("devcoordinator.worker_native.os.geteuid", return_value=0), local_identity():
+            manager.start(
+                worker_id=self.worker_id,
+                uid=501,
+                gid=20,
+                repository_id="repo-one",
+                credential_bindings=[
+                    {"name": "DATABASE_URL", "credential_id": credential_id}
+                ],
+            )
+
+        flattened = "\n".join(runner.calls[0])
+        self.assertIn(
+            f"--property=LoadCredential={credential_id}:{material}", flattened
+        )
+        self.assertNotIn("synthetic-private-value", flattened)
+
+    def test_launchd_fails_closed_for_server_credentials(self) -> None:
+        credential_id = server_credential_id(self.worker_id, "DATABASE_URL")
+        manager = self._launchd(FakeRunner())
+        with local_identity(), self.assertRaisesRegex(
+            WorkerNativeError, "does not support"
+        ):
+            manager.start(
+                worker_id=self.worker_id,
+                uid=501,
+                gid=20,
+                repository_id="repo-one",
+                credential_bindings=[
+                    {"name": "DATABASE_URL", "credential_id": credential_id}
+                ],
+            )
 
     def test_systemd_rejects_non_root_manager_and_root_worker(self) -> None:
         manager = self._systemd(FakeRunner())

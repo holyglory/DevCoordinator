@@ -16,6 +16,11 @@ import time
 from typing import Any, Callable, Mapping
 import uuid
 
+from .server_credentials import (
+    ServerCredentialError,
+    secret_environment_literal,
+    validate_server_credential_bindings,
+)
 from .store import (
     AccountStore,
     canonical_json,
@@ -285,7 +290,7 @@ class WorkerController:
                     uid=int(policy["execution_uid"]),
                 )
             if not native_before.active:
-                native = self._manager_instance().start(
+                native = self._native_start(
                     worker_id=worker_id,
                     uid=int(policy["execution_uid"]),
                     gid=int(context["execution_gid"]),
@@ -512,6 +517,7 @@ class WorkerController:
             argv=argv,
             cwd=cwd,
             environment=environment,
+            credential_bindings=self._credential_bindings(worker_id),
         )
         previous_definition = self._definition_snapshot(
             worker_id=worker_id,
@@ -584,7 +590,7 @@ class WorkerController:
                 expected_generation=int(policy["generation"]),
             )
             self._ensure_epoch(worker_id)
-            native = self._manager_instance().start(
+            native = self._native_start(
                 worker_id=worker_id,
                 uid=int(policy["execution_uid"]),
                 gid=int(context["execution_gid"]),
@@ -914,7 +920,7 @@ class WorkerController:
                 attempt_errors: list[str] = []
                 for attempt_number in range(1, STARTUP_AUTOSTART_ATTEMPTS + 1):
                     try:
-                        native = self._manager_instance().start(
+                        native = self._native_start(
                             worker_id=worker_id,
                             uid=uid,
                             gid=int(user.pw_gid),
@@ -1008,6 +1014,7 @@ class WorkerController:
         argv: list[str] | tuple[str, ...],
         cwd: str,
         environment: Mapping[str, str],
+        credential_bindings: list[dict[str, str]],
     ) -> dict[str, Any]:
         if (
             not isinstance(argv, (list, tuple))
@@ -1072,12 +1079,32 @@ class WorkerController:
             )
         normalized_argv = tuple(argv)
         normalized_environment = dict(sorted(environment.items()))
+        try:
+            bindings = validate_server_credential_bindings(
+                context["server_definition_id"], credential_bindings
+            )
+            if set(normalized_environment) & {binding.name for binding in bindings}:
+                raise ServerCredentialError(
+                    "replacement environment duplicates a credential binding"
+                )
+            if any(
+                secret_environment_literal(name, value)
+                for name, value in normalized_environment.items()
+            ):
+                raise ServerCredentialError(
+                    "replacement environment contains a secret literal"
+                )
+        except ServerCredentialError as error:
+            raise WorkerControlError(str(error)) from error
         definition = {
             "name": str(context["name"]),
             "role": str(context.get("role") or ""),
             "cwd": str(resolved_cwd),
             "argv": list(normalized_argv),
             "environment": normalized_environment,
+            "credential_bindings": [
+                binding.to_document() for binding in bindings
+            ],
             "health_url": context.get("health_url_template"),
         }
         return {
@@ -1368,7 +1395,7 @@ class WorkerController:
                     expected_generation=int(restored_policy["generation"]),
                 )
                 self._ensure_epoch(worker_id)
-                restored_native = self._manager_instance().start(
+                restored_native = self._native_start(
                     worker_id=worker_id,
                     uid=int(restored_policy["execution_uid"]),
                     gid=int(context["execution_gid"]),
@@ -1645,6 +1672,56 @@ class WorkerController:
                 state_root=self.state_root,
             )
         return self._manager
+
+    def _credential_bindings(self, worker_id: str) -> list[dict[str, str]]:
+        """Read only exact non-secret binding references for one server."""
+
+        with self.store.read_transaction() as connection:
+            rows = list(
+                connection.execute(
+                    """
+                    SELECT name, credential_id
+                    FROM server_environment_credentials
+                    WHERE server_definition_id = ? ORDER BY name
+                    """,
+                    (worker_id,),
+                )
+            )
+        try:
+            bindings = validate_server_credential_bindings(
+                worker_id,
+                [
+                    {
+                        "name": str(row["name"]),
+                        "credential_id": str(row["credential_id"]),
+                    }
+                    for row in rows
+                ],
+            )
+        except ServerCredentialError as error:
+            raise WorkerControlError(str(error)) from error
+        return [binding.to_document() for binding in bindings]
+
+    def _native_start(
+        self,
+        *,
+        worker_id: str,
+        uid: int,
+        gid: int,
+        repository_id: str,
+    ) -> NativeWorkerState:
+        arguments: dict[str, object] = {
+            "worker_id": worker_id,
+            "uid": uid,
+            "gid": gid,
+            "repository_id": repository_id,
+        }
+        bindings = self._credential_bindings(worker_id)
+        # Keep injected legacy/no-credential manager fakes source-compatible;
+        # a real credential-bearing launch always receives the exact refs.
+        if bindings:
+            arguments["credential_bindings"] = bindings
+        return self._manager_instance().start(**arguments)
 
     def _native_status(self, *, worker_id: str, uid: int) -> NativeWorkerState:
         manager = self._manager_instance()

@@ -4,6 +4,7 @@ import argparse
 import contextlib
 import hashlib
 import io
+import json
 import os
 from pathlib import Path
 import pwd
@@ -20,6 +21,7 @@ from devcoordinator.broker_profile import (
     BrokerClientProfile,
     BrokerRepositoryProfile,
 )
+from devcoordinator.server_credentials import server_credential_id
 from devcoordinator.store import AccountStore, deterministic_id, utc_timestamp
 from devcoordinator.worker_runner import (
     BrokerWorkerAuthority,
@@ -133,6 +135,26 @@ class WorkerRunnerTests(unittest.TestCase):
                 ],
             )
 
+    def _set_credential(self, name: str, value: str) -> Path:
+        credential_id = server_credential_id(self.worker_id, name)
+        timestamp = utc_timestamp(1_000.0)
+        with self.store.immediate_transaction() as connection:
+            connection.execute(
+                """
+                INSERT INTO server_environment_credentials(
+                    server_definition_id,name,credential_id,created_at,updated_at
+                ) VALUES (?,?,?,?,?)
+                """,
+                (self.worker_id, name, credential_id, timestamp, timestamp),
+            )
+        runtime = self.root / "systemd-credentials"
+        runtime.mkdir(mode=0o700, exist_ok=True)
+        runtime.chmod(0o700)
+        material = runtime / credential_id
+        material.write_text(value, encoding="utf-8")
+        material.chmod(0o400)
+        return runtime
+
     def _operation(self, name: str) -> str:
         operation_id = deterministic_id("runner-operation", name)
         timestamp = utc_timestamp(1_000.0)
@@ -225,15 +247,25 @@ class WorkerRunnerTests(unittest.TestCase):
                     "sys.exit(9)"
                 ),
             ),
-            {"RUNNER_SECRET": secret},
         )
+        credential_directory = self._set_credential("RUNNER_SECRET", secret)
         self._start_policy(keep_alive=True, crash_limit=2)
 
-        result = self._runner().run(worker_id=self.worker_id)
+        candidate = self.supervision.launch_candidate(
+            server_definition_id=self.worker_id, supervisor_epoch="runner-epoch"
+        )
+        self.assertNotIn(secret, json.dumps(candidate, sort_keys=True))
+        with mock.patch.dict(
+            os.environ,
+            {"CREDENTIALS_DIRECTORY": str(credential_directory)},
+            clear=False,
+        ):
+            result = self._runner().run(worker_id=self.worker_id)
 
         self.assertTrue(result["ok"])
         self.assertEqual(result["attempts"], 2)
         self.assertFalse(result["restart_allowed"])
+        self.assertNotIn(secret, json.dumps(result, sort_keys=True))
         self.assertEqual(result["repository"]["root_repo"], str(self.project))
         self.assertIsNone(result["repository"]["temporary_repo"])
         self.assertEqual(self.supervision.policy(self.worker_id)["breaker_state"], "tripped")
@@ -262,6 +294,37 @@ class WorkerRunnerTests(unittest.TestCase):
             self.assertIn(b"password=[REDACTED]", payload)
             self.assertEqual(hashlib.sha256(payload).hexdigest(), row["log_artifact_sha256"])
             self.assertLessEqual(len(payload), 1024 * 1024)
+
+    def test_missing_systemd_credential_blocks_before_child_launch(self) -> None:
+        self._set_command((sys.executable, "-c", "raise SystemExit(0)"))
+        credential_id = server_credential_id(self.worker_id, "DATABASE_URL")
+        timestamp = utc_timestamp(1_000.0)
+        with self.store.immediate_transaction() as connection:
+            connection.execute(
+                """
+                INSERT INTO server_environment_credentials(
+                    server_definition_id,name,credential_id,created_at,updated_at
+                ) VALUES (?,?,?,?,?)
+                """,
+                (
+                    self.worker_id,
+                    "DATABASE_URL",
+                    credential_id,
+                    timestamp,
+                    timestamp,
+                ),
+            )
+        self._start_policy(keep_alive=False)
+        with mock.patch.dict(os.environ, {}, clear=True):
+            result = self._runner().run(worker_id=self.worker_id)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["classification"], "worker_credential_invalid")
+        self.assertEqual(result["attempts"], 0)
+        with self.store.read_transaction() as connection:
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM worker_attempts").fetchone()[0],
+                0,
+            )
 
     def test_manual_non_keep_alive_worker_runs_once(self) -> None:
         self._set_command((sys.executable, "-c", "print('finished')"))

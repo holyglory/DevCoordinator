@@ -22,6 +22,14 @@ import sys
 from typing import Any, Callable, Sequence
 import uuid
 
+from .server_credentials import (
+    SERVER_CREDENTIAL_MATERIAL_ROOT,
+    ServerCredentialError,
+    staged_material_path,
+    validate_server_credential_bindings,
+    validate_server_credential_material,
+)
+
 
 _UNIT_PREFIX = "devcoordinator-worker-"
 _SAFE_STATE = re.compile(r"^[A-Za-z][A-Za-z0-9 _-]{0,63}$")
@@ -238,6 +246,8 @@ class SystemdWorkerManager:
         systemd_run_executable: str = "/usr/bin/systemd-run",
         systemctl_executable: str = "/usr/bin/systemctl",
         cgroup_root: Path = Path("/sys/fs/cgroup"),
+        credential_material_root: Path = SERVER_CREDENTIAL_MATERIAL_ROOT,
+        credential_material_uid: int = 0,
         runner: Runner = subprocess.run,
     ) -> None:
         self.coordinator_script = _trusted_script(coordinator_script)
@@ -251,6 +261,8 @@ class SystemdWorkerManager:
             systemctl_executable, description="systemctl executable"
         )
         self.cgroup_root = cgroup_root
+        self.credential_material_root = Path(credential_material_root)
+        self.credential_material_uid = int(credential_material_uid)
         self.runner = runner
 
     @staticmethod
@@ -258,7 +270,13 @@ class SystemdWorkerManager:
         return _UNIT_PREFIX + _worker_id(worker_id) + ".service"
 
     def start(
-        self, *, worker_id: str, uid: int, gid: int, repository_id: str
+        self,
+        *,
+        worker_id: str,
+        uid: int,
+        gid: int,
+        repository_id: str,
+        credential_bindings: object = (),
     ) -> NativeWorkerState:
         worker_id = _worker_id(worker_id)
         if os.geteuid() != 0:
@@ -266,6 +284,20 @@ class SystemdWorkerManager:
                 "systemd cross-account worker supervision requires root authority"
             )
         identity = _identity(uid, gid)
+        try:
+            bindings = validate_server_credential_bindings(
+                worker_id, credential_bindings
+            )
+            for binding in bindings:
+                # Read once before asking systemd to prove mode, ownership,
+                # stable identity, size, and UTF-8 without exposing the value.
+                validate_server_credential_material(
+                    self.credential_material_root,
+                    binding.credential_id,
+                    expected_uid=self.credential_material_uid,
+                )
+        except ServerCredentialError as error:
+            raise WorkerNativeError(str(error)) from error
         unit = self.unit(worker_id)
         repository_slice = project_repository_slice(
             uid=identity.uid, repository_id=repository_id
@@ -295,6 +327,11 @@ class SystemdWorkerManager:
             "--property=TimeoutStopSec=30s",
             "--property=StandardOutput=journal",
             "--property=StandardError=journal",
+            *(
+                f"--property=LoadCredential={binding.credential_id}:"
+                f"{staged_material_path(self.credential_material_root, binding.credential_id)}"
+                for binding in bindings
+            ),
             self.python_executable,
             "-I",
             "-B",
@@ -691,11 +728,27 @@ class LaunchdWorkerManager:
         return target
 
     def start(
-        self, *, worker_id: str, uid: int, gid: int, repository_id: str
+        self,
+        *,
+        worker_id: str,
+        uid: int,
+        gid: int,
+        repository_id: str,
+        credential_bindings: object = (),
     ) -> NativeWorkerState:
         worker_id = _worker_id(worker_id)
         if not isinstance(repository_id, str) or not repository_id:
             raise ValueError("worker repository ID must be one bounded string")
+        try:
+            bindings = validate_server_credential_bindings(
+                worker_id, credential_bindings
+            )
+        except ServerCredentialError as error:
+            raise WorkerNativeError(str(error)) from error
+        if bindings:
+            raise WorkerNativeError(
+                "launchd does not support managed-server credential bindings"
+            )
         identity = _identity(uid, gid)
         target = self._write_plist(worker_id=worker_id, uid=uid, gid=gid)
         domain = self._domain(identity.uid)

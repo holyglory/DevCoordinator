@@ -8,6 +8,7 @@ import tempfile
 import time
 import unittest
 
+from devcoordinator.server_credentials import server_credential_id
 from devcoordinator.store import AccountStore, deterministic_id, utc_timestamp
 from devcoordinator.worker_supervision import (
     WorkerCircuitOpen,
@@ -636,11 +637,60 @@ class WorkerSupervisionTests(unittest.TestCase):
         self.assertEqual(candidate["project_kind"], "primary")
         self.assertEqual(candidate["argv"], ("python3", "worker.py"))
         self.assertEqual(candidate["environment"], {"WORKER_TEST": "1"})
+        self.assertEqual(candidate["credential_bindings"], [])
         manual = self.service.launch_candidate(
             server_definition_id=non_kept, supervisor_epoch="startup"
         )
         self.assertFalse(manual["keep_alive"])
         self.assertEqual(manual["server_definition_id"], non_kept)
+
+    def test_launch_candidate_contains_only_ordered_credential_references(self) -> None:
+        credential_id = server_credential_id(self.server_id, "DATABASE_URL")
+        timestamp = utc_timestamp(self.clock.value)
+        with self.store.immediate_transaction() as connection:
+            connection.execute(
+                """
+                INSERT INTO server_environment_credentials(
+                    server_definition_id,name,credential_id,created_at,updated_at
+                ) VALUES (?,?,?,?,?)
+                """,
+                (
+                    self.server_id,
+                    "DATABASE_URL",
+                    credential_id,
+                    timestamp,
+                    timestamp,
+                ),
+            )
+        self._configure_and_start()
+        candidate = self._fence_candidate()
+        self.assertEqual(
+            candidate["credential_bindings"],
+            [{"name": "DATABASE_URL", "credential_id": credential_id}],
+        )
+        self.assertNotIn("DATABASE_URL", candidate["environment"])
+
+    def test_launch_candidate_rejects_remaining_secret_literal(self) -> None:
+        with self.store.immediate_transaction() as connection:
+            connection.execute(
+                """
+                INSERT INTO server_environment(server_definition_id,name,value)
+                VALUES (?, 'OTHER_URL', ?)
+                """,
+                (
+                    self.server_id,
+                    "postgresql://fixture:synthetic@127.0.0.1/example",
+                ),
+            )
+        self._configure_and_start()
+        self.assertEqual(
+            self.service.fence_startup(supervisor_epoch="secret-literal"), []
+        )
+        with self.assertRaisesRegex(WorkerSupervisionConflict, "secret literal"):
+            self.service.launch_candidate(
+                server_definition_id=self.server_id,
+                supervisor_epoch="secret-literal",
+            )
 
     def test_archive_race_cancels_reserved_attempt_before_launch(self) -> None:
         self._configure_and_start()

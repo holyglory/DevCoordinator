@@ -36,6 +36,7 @@ from devcoordinator.broker_profile import (  # noqa: E402
     BrokerRepositoryProfile,
     BrokerServiceProfile,
 )
+from devcoordinator.server_credentials import server_credential_id  # noqa: E402
 from devcoordinator.store import CoordinatorStore, utc_timestamp  # noqa: E402
 from devcoordinator.worker_supervision import WorkerSupervision  # noqa: E402
 import devcoordinator.worker_artifacts as worker_artifacts  # noqa: E402
@@ -355,6 +356,23 @@ class WorkerBrokerBackendTests(unittest.TestCase):
                     """,
                     (SERVER_ID,),
                 )
+                self.credential_id = server_credential_id(
+                    SERVER_ID, "DATABASE_URL"
+                )
+                connection.execute(
+                    """
+                    INSERT INTO server_environment_credentials(
+                        server_definition_id,name,credential_id,created_at,updated_at
+                    ) VALUES (?,?,?,?,?)
+                    """,
+                    (
+                        SERVER_ID,
+                        "DATABASE_URL",
+                        self.credential_id,
+                        utc_timestamp(),
+                        utc_timestamp(),
+                    ),
+                )
             supervision = WorkerSupervision(store)
             supervision.configure_policy(
                 server_definition_id=SERVER_ID,
@@ -449,6 +467,10 @@ class WorkerBrokerBackendTests(unittest.TestCase):
         self.assertEqual(candidate, preview["result"]["candidate"])
         self.assertEqual(candidate["argv"], ["/usr/bin/python3", "worker.py"])
         self.assertEqual(candidate["environment"], {"WORKER_MODE": "test"})
+        self.assertEqual(
+            candidate["credential_bindings"],
+            [{"name": "DATABASE_URL", "credential_id": self.credential_id}],
+        )
 
         active_preview = self._reply(
             service,

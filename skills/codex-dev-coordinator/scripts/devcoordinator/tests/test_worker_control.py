@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from unittest import mock
 
+from devcoordinator.server_credentials import server_credential_id
 from devcoordinator.store import AccountStore, deterministic_id, utc_timestamp
 from devcoordinator.worker_control import (
     WorkerControlError,
@@ -28,6 +29,7 @@ class FakeNativeManager:
         self.fail_next_removes = 0
         self.on_start_failure = None
         self.on_remove = None
+        self.credential_start_calls: list[list[dict[str, str]]] = []
 
     def status(
         self, *, worker_id: str, allow_missing: bool = False
@@ -45,11 +47,20 @@ class FakeNativeManager:
         )
 
     def start(
-        self, *, worker_id: str, uid: int, gid: int, repository_id: str
+        self,
+        *,
+        worker_id: str,
+        uid: int,
+        gid: int,
+        repository_id: str,
+        credential_bindings: object = (),
     ) -> NativeWorkerState:
         del uid, gid
         if not repository_id:
             raise AssertionError("worker start omitted repository isolation identity")
+        self.credential_start_calls.append(
+            [dict(item) for item in credential_bindings]  # type: ignore[arg-type]
+        )
         self.start_calls += 1
         if self.fail_next_starts:
             self.fail_next_starts -= 1
@@ -285,6 +296,61 @@ class WorkerControllerTests(unittest.TestCase):
         self.assertEqual(stopped["status"], "stopped")
         self.assertEqual(self.manager.stop_calls, 1)
         self.assertFalse(self.supervision.attempt(str(self.manager.attempt["attempt_id"]))["counts_toward_breaker"])
+
+    def test_start_passes_only_exact_server_credential_bindings(self) -> None:
+        credential_id = server_credential_id(self.worker_id, "DATABASE_URL")
+        with self.store.immediate_transaction() as connection:
+            connection.execute(
+                """
+                INSERT INTO server_environment_credentials(
+                    server_definition_id,name,credential_id,created_at,updated_at
+                ) VALUES (?,?,?,?,?)
+                """,
+                (
+                    self.worker_id,
+                    "DATABASE_URL",
+                    credential_id,
+                    utc_timestamp(),
+                    utc_timestamp(),
+                ),
+            )
+        self._start()
+        self.assertEqual(
+            self.manager.credential_start_calls,
+            [[{"name": "DATABASE_URL", "credential_id": credential_id}]],
+        )
+
+    def test_replace_rejects_secret_literal_without_removing_binding(self) -> None:
+        credential_id = server_credential_id(self.worker_id, "DATABASE_URL")
+        with self.store.immediate_transaction() as connection:
+            connection.execute(
+                """
+                INSERT INTO server_environment_credentials(
+                    server_definition_id,name,credential_id,created_at,updated_at
+                ) VALUES (?,?,?,?,?)
+                """,
+                (
+                    self.worker_id,
+                    "DATABASE_URL",
+                    credential_id,
+                    utc_timestamp(),
+                    utc_timestamp(),
+                ),
+            )
+        self._start()
+        with self.assertRaisesRegex(WorkerControlError, "secret literal"):
+            self._replace(
+                environment={
+                    "OTHER_URL": "postgresql://fixture:secret@127.0.0.1/example"
+                }
+            )
+        with self.store.read_transaction() as connection:
+            retained = connection.execute(
+                "SELECT name,credential_id FROM server_environment_credentials "
+                "WHERE server_definition_id=?",
+                (self.worker_id,),
+            ).fetchone()
+        self.assertEqual((retained["name"], retained["credential_id"]), ("DATABASE_URL", credential_id))
 
     def test_startup_reconciliation_retries_transient_native_registration(self) -> None:
         self._start()

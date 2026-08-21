@@ -35,6 +35,13 @@ from .broker_profile import (
     load_broker_profile,
 )
 from .runtime_redaction import redact_runtime_value
+from .server_credentials import (
+    ServerCredentialBinding,
+    ServerCredentialError,
+    load_server_credential_environment,
+    secret_environment_literal,
+    validate_server_credential_bindings,
+)
 from .store import canonical_json, ensure_private_store_directory, fingerprint
 from .worker_supervision import (
     WorkerCircuitOpen,
@@ -260,6 +267,7 @@ class LaunchCandidate:
     name: str
     argv: tuple[str, ...]
     environment: dict[str, str]
+    credential_bindings: tuple[ServerCredentialBinding, ...]
     execution_uid: int
     definition_fingerprint: str
     definition_generation: int
@@ -388,6 +396,23 @@ def validate_launch_candidate(
         ):
             raise WorkerCandidateError("candidate.environment contains an invalid entry")
         environment[key] = value
+    try:
+        credential_bindings = validate_server_credential_bindings(
+            server_id, raw.get("credential_bindings", [])
+        )
+        if set(environment) & {binding.name for binding in credential_bindings}:
+            raise ServerCredentialError(
+                "candidate environment duplicates a credential binding"
+            )
+        if any(
+            secret_environment_literal(name, value)
+            for name, value in environment.items()
+        ):
+            raise ServerCredentialError(
+                "candidate environment contains a secret literal"
+            )
+    except ServerCredentialError as error:
+        raise WorkerCandidateError(str(error)) from error
     _deterministic_environment(environment, execution_uid=execution_uid)
     return LaunchCandidate(
         worker_id=worker_id,
@@ -401,6 +426,7 @@ def validate_launch_candidate(
         name=_bounded_text("candidate.name", raw.get("name")),
         argv=argv,
         environment=environment,
+        credential_bindings=credential_bindings,
         execution_uid=execution_uid,
         definition_fingerprint=_bounded_text(
             "candidate.definition_fingerprint", raw.get("definition_fingerprint")
@@ -1948,6 +1974,23 @@ class WorkerRunner:
                         artifacts=artifacts,
                         candidate=candidate,
                     )
+                try:
+                    credential_environment = load_server_credential_environment(
+                        candidate.credential_bindings,
+                        os.environ.get("CREDENTIALS_DIRECTORY"),
+                        expected_uid=os.geteuid(),
+                    )
+                except ServerCredentialError as error:
+                    return self._blocked_result(
+                        worker_id=worker_id,
+                        classification="worker_credential_invalid",
+                        error=str(error),
+                        attempts=attempts,
+                        artifacts=artifacts,
+                        candidate=candidate,
+                    )
+                execution_environment = dict(candidate.environment)
+                execution_environment.update(credential_environment)
                 begin_request_id = str(uuid.uuid4())
                 try:
                     raw_attempt = self._persist_begin(
@@ -1974,7 +2017,9 @@ class WorkerRunner:
                     redaction_request={
                         "options": {
                             "argv": list(candidate.argv),
-                            "environment": candidate.environment,
+                            # This in-memory-only map lets output redaction
+                            # remove a credential if the child prints it.
+                            "environment": execution_environment,
                         }
                     },
                 )
@@ -1984,7 +2029,7 @@ class WorkerRunner:
                         list(candidate.argv),
                         cwd=str(candidate.cwd),
                         env=_deterministic_environment(
-                            candidate.environment,
+                            execution_environment,
                             execution_uid=candidate.execution_uid,
                         ),
                         shell=False,
@@ -2012,6 +2057,10 @@ class WorkerRunner:
                             "argv": candidate.argv,
                             "cwd": str(candidate.cwd),
                             "environment": candidate.environment,
+                            "credential_bindings": [
+                                binding.to_document()
+                                for binding in candidate.credential_bindings
+                            ],
                             "definition_fingerprint": candidate.definition_fingerprint,
                         }
                     )

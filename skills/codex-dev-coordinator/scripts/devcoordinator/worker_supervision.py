@@ -15,6 +15,11 @@ import sqlite3
 import time
 from typing import Any, Callable, Mapping
 
+from .server_credentials import (
+    ServerCredentialError,
+    secret_environment_literal,
+    validate_server_credential_bindings,
+)
 from .store import AccountStore, canonical_json, deterministic_id, fingerprint, utc_timestamp
 
 
@@ -1732,6 +1737,39 @@ class WorkerSupervision:
                 (server_id,),
             )
         }
+        try:
+            credential_bindings = validate_server_credential_bindings(
+                server_id,
+                [
+                    {
+                        "name": str(item["name"]),
+                        "credential_id": str(item["credential_id"]),
+                    }
+                    for item in connection.execute(
+                        """
+                        SELECT name, credential_id
+                        FROM server_environment_credentials
+                        WHERE server_definition_id = ? ORDER BY name
+                        """,
+                        (server_id,),
+                    )
+                ],
+            )
+            if set(environment) & {binding.name for binding in credential_bindings}:
+                raise ServerCredentialError(
+                    "worker environment duplicates a credential binding"
+                )
+            if any(
+                secret_environment_literal(name, value)
+                for name, value in environment.items()
+            ):
+                raise ServerCredentialError(
+                    "worker environment contains a secret literal"
+                )
+        except ServerCredentialError as error:
+            raise WorkerSupervisionConflict(
+                str(error)
+            ) from error
         return {
             "server_definition_id": server_id,
             "repo_id": str(context["repo_id"]),
@@ -1744,6 +1782,9 @@ class WorkerSupervision:
             "cwd": str(context["cwd"]),
             "argv": arguments,
             "environment": environment,
+            "credential_bindings": [
+                binding.to_document() for binding in credential_bindings
+            ],
             "log_path": context["log_path"],
             "execution_uid": int(policy["execution_uid"]),
             "keep_alive": bool(policy["keep_alive"]),
