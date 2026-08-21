@@ -506,8 +506,6 @@ def main() -> int:
                         "--project",
                         str(project),
                         "--no-docker",
-                        "--legacy-home",
-                        str(root / "missing-legacy-home"),
                     ],
                     env=overlap_environments[1],
                 )

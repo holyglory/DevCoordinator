@@ -3231,8 +3231,6 @@ class RuntimeApiTests(unittest.TestCase):
                         "max_age_seconds": 0,
                         "no_docker": False,
                         "backup_dir": None,
-                        "legacy_home": [],
-                        "legacy_backup_root": None,
                     }
                 )
             with AccountStore.open_default(

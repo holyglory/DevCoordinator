@@ -36,11 +36,13 @@ release when the verified rollback contract permits it.
 
 ## Schema changes
 
-Startup creates schema 15 only for an empty database and refuses every other
-schema. There is no in-place upgrade or legacy importer. A same-schema switch
-also refuses an incompatible authority database before starting the candidate;
-the retained-control rebaseline remains tracked in `CompletionLedger.md` until
-its export/import and rollback path are implemented and verified.
+Startup creates schema 16 only for an empty database and refuses every other
+schema. There is no in-place upgrade or legacy importer. The one reviewed
+schema-15 transition stops every authority writer and direct test-plane reader,
+backs up the authority/profile/Console files, rebuilds only the allowlisted
+durable controls at schema 16, and can restore the exact predecessor before any
+old writer restarts. Operational, observation, test, request, and migration
+history does not cross that boundary.
 
 ## Readiness
 

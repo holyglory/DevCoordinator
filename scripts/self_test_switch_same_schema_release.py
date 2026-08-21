@@ -493,7 +493,9 @@ def exercise_previous_release_requires_current_format() -> None:
         "bin/devcoordinator-browser-accounting",
         "skills/codex-dev-coordinator/scripts/devcoordinator/browser_lifecycle.py",
         "bin/devcoordinator-same-schema-switch",
+        "bin/devcoordinator-retained-control",
         "scripts/switch_same_schema_release.py",
+        "skills/codex-dev-coordinator/scripts/devcoordinator/retained_control.py",
         "deploy/devcoordinator-api.socket",
         "deploy/devcoordinator-authority.socket",
         "deploy/devcoordinator-edge.service",
@@ -863,6 +865,17 @@ def exercise_slot_readiness_waits_for_supervisor_socket() -> None:
 
 def exercise_release_packaging_contract() -> None:
     expect(
+        switch.COORDINATOR_SCHEMA_VERSION == 16
+        and all(
+            "--expected-schema 16" in (ROOT / path).read_text(encoding="utf-8")
+            for path in (
+                "deploy/devcoordinator-authority.service",
+                "deploy/devcoordinator-test-snapshotd.service",
+            )
+        ),
+        "schema-16 release can start with a stale unit preflight",
+    )
+    expect(
         Path("scripts/switch_same_schema_release.py") in switch.installer.SOURCE_FILES,
         "same-schema switch source is absent from immutable releases",
     )
@@ -870,6 +883,15 @@ def exercise_release_packaging_contract() -> None:
         switch.installer.WRAPPERS.get("devcoordinator-same-schema-switch")
         == ("python", "scripts/switch_same_schema_release.py", ()),
         "same-schema immutable wrapper is missing or points elsewhere",
+    )
+    expect(
+        switch.installer.WRAPPERS.get("devcoordinator-retained-control")
+        == (
+            "python",
+            "skills/codex-dev-coordinator/scripts/devcoordinator/retained_control.py",
+            (),
+        ),
+        "semantic retained-control wrapper is missing or points elsewhere",
     )
     expect(
         switch.installer.WRAPPERS.get("devcoordinator-test-store")
@@ -1478,6 +1500,120 @@ def exercise_reset_cli_is_explicit() -> None:
         expect(parsed.reset_test_history is True, f"{action} lost explicit reset flag")
 
 
+def exercise_retained_control_transaction_boundary() -> None:
+    apply_source = inspect.getsource(switch.apply_retained_control_rebaseline)
+    rollback_source = inspect.getsource(switch.restore_retained_control_rebaseline)
+    switch_source = inspect.getsource(switch.apply)
+    verify_source = inspect.getsource(switch.verify)
+    expect(
+        apply_source.index("stop_authority_writers(runner)")
+        < apply_source.index("prepare_rebaseline("),
+        "retained-control export can run while authority/API writers are live",
+    )
+    expect(
+        apply_source.index("stop_console_writers(document, runner)")
+        < apply_source.index("prepare_rebaseline("),
+        "Console controls can be exported while a Console writer is live",
+    )
+    expect(
+        "_retained_backup_destinations(transaction_root)" in apply_source
+        and apply_source.index("_retained_backup_destinations(transaction_root)")
+        < apply_source.index("prepare_rebaseline("),
+        "retained-control preparation is not preceded by exact DB/profile backups",
+    )
+    expect(
+        "apply_retained_control_rebaseline(" in switch_source
+        and switch_source.index("apply_retained_control_rebaseline(")
+        < switch_source.index("restart_services(runner)"),
+        "retained-control publication is not inside the stopped-writer switch window",
+    )
+    expect(
+        "stop_authority_writers(runner)" in rollback_source
+        and "_restore_retained_files(backups)" in rollback_source,
+        "retained-control rollback does not restore exact backups while writers are stopped",
+    )
+    expect(
+        {
+            "devcoordinator-testd.socket",
+            "devcoordinator-test-snapshotd.socket",
+            "devcoordinator-testd.service",
+            "devcoordinator-test-snapshotd.service",
+        }.issubset(switch.AUTHORITY_WRITER_UNITS),
+        "retained-control replacement leaves a direct authority reader or caller live",
+    )
+    expect(
+        "_restore_retained_files(backups)" in apply_source
+        and apply_source.index("_restore_retained_files(backups)")
+        < apply_source.index("_publish_owned_copy("),
+        "partial retained-control publication does not converge from the exact backup",
+    )
+    expect(
+        "unlink_regular_and_fsync" in inspect.getsource(switch._restore_exact_file),
+        "absent-file rollback is not durably fsynced",
+    )
+    expect(
+        switch_source.index("candidate_already_active = unit_active")
+        < switch_source.index("bind_exact_ports(ports)")
+        and "reservations = [] if candidate_already_active else" in switch_source,
+        "candidate-start crash replay still collides with its own exact ports",
+    )
+    expect(
+        'document.get("phase") != "applied"' in verify_source
+        and "_load_bound_retained_manifest(" in verify_source
+        and "_require_live_retained_generation(manifest)" in verify_source,
+        "verification can accept an applying or generation-unbound rebaseline",
+    )
+
+    with tempfile.TemporaryDirectory(prefix="retained-control-exact-backup-") as raw:
+        root = Path(raw)
+        source = root / "source"
+        backup = root / "backup"
+        staged = root / "staged"
+        source.write_bytes(b"exact-before" * 300_000)
+        staged.write_bytes(b"current-after" * 300_000)
+        source.chmod(0o640)
+        old_digest = switch.digest_file(source)
+        new_digest = switch.digest_file(staged)
+        original_read_bytes = Path.read_bytes
+
+        def bounded_read_bytes(path: Path) -> bytes:
+            if path in {source, backup, staged}:
+                raise AssertionError("authority DB path used unbounded read_bytes")
+            return original_read_bytes(path)
+
+        with mock.patch.object(Path, "read_bytes", bounded_read_bytes):
+            evidence = switch._backup_exact_file(source, backup, required=True)
+            switch._publish_owned_copy(
+                source,
+                staged,
+                evidence,
+                expected_sha256=new_digest,
+            )
+            expect(
+                switch.digest_file(source) == new_digest,
+                "retained authority publication did not install the staged database",
+            )
+            # Model a failure immediately after database publication: exact
+            # rollback restores the predecessor, and the same prepared target
+            # remains safe to replay.
+            switch._restore_exact_file(source, evidence)
+            expect(
+                switch.digest_file(source) == old_digest,
+                "failure-after-publication rollback changed authority bytes",
+            )
+            switch._publish_owned_copy(
+                source,
+                staged,
+                evidence,
+                expected_sha256=new_digest,
+            )
+        expect(
+            switch.digest_file(source) == new_digest,
+            "retained authority replay did not reproduce the staged database",
+        )
+        expect(stat.S_IMODE(source.stat().st_mode) == 0o640, "exact rollback changed file mode")
+
+
 def exercise_verification_requires_boot_enablement() -> None:
     source = inspect.getsource(switch.verify)
     rollback_source = inspect.getsource(switch.rollback)
@@ -1522,8 +1658,12 @@ def exercise_verification_requires_boot_enablement() -> None:
         "post-promotion rollback can revive the obsolete control plane",
     )
     expect(
-        'promotion.extend(["--old-socket", candidate_control])' in rollback_source,
-        "post-promotion rollback does not transfer the candidate writer lease",
+        rollback_source.index("restore_retained_control_rebaseline(")
+        < rollback_source.index('"previous Console restore"')
+        and rollback_source.index("stop_console_writers(document, runner)")
+        < rollback_source.index('"previous Console restore"')
+        and '["/usr/bin/systemctl", "disable", candidate]' in rollback_source,
+        "post-promotion rollback starts a Console before stopping writers and restoring retained data",
     )
     expect(
         'args.action == "verify" and value.get("ok") is not True' in main_source
@@ -1558,6 +1698,7 @@ def main() -> int:
     exercise_codex_directory_transaction()
     exercise_opt_in_test_history_reset_and_previous_release_rollback()
     exercise_reset_cli_is_explicit()
+    exercise_retained_control_transaction_boundary()
     exercise_verification_requires_boot_enablement()
     print("same-schema release switch self-test ok")
     return 0

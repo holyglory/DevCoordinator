@@ -1878,8 +1878,6 @@ class BrokerProfileTrustTests(unittest.TestCase):
                         "max_age_seconds": 0,
                         "no_docker": False,
                         "backup_dir": None,
-                        "legacy_home": [],
-                        "legacy_backup_root": None,
                     }
                 )
 
@@ -1931,8 +1929,6 @@ class BrokerProfileTrustTests(unittest.TestCase):
                     {"max_age_seconds": 300},
                     {"no_docker": True},
                     {"backup_dir": [str(root / "backups")]},
-                    {"legacy_home": [str(root / "legacy")]},
-                    {"legacy_backup_root": str(root / "legacy-backups")},
                 ):
                     options = {
                         "agent": "agent-test",
@@ -1940,8 +1936,6 @@ class BrokerProfileTrustTests(unittest.TestCase):
                         "max_age_seconds": 0,
                         "no_docker": False,
                         "backup_dir": None,
-                        "legacy_home": [],
-                        "legacy_backup_root": None,
                     }
                     options.update(override)
                     with self.assertRaisesRegex(
@@ -2011,8 +2005,6 @@ class BrokerProfileTrustTests(unittest.TestCase):
                                     "max_age_seconds": 0,
                                     "no_docker": False,
                                     "backup_dir": None,
-                                    "legacy_home": [],
-                                    "legacy_backup_root": None,
                                 }
                             )
                         self.assertEqual(raised.exception.code, "invalid_reply")
@@ -2628,6 +2620,13 @@ class BrokerProfileTrustTests(unittest.TestCase):
                     arguments={},
                 ),
                 60.0,
+            )
+            self.assertEqual(
+                broker_profile_module._broker_client_timeout_seconds(
+                    BrokerOperation.TEST_RUN_STATUS,
+                    arguments={"run_id": "run-timeout-test"},
+                ),
+                broker_profile_module.TEST_RUN_READ_CLIENT_TIMEOUT_SECONDS,
             )
             for invalid_arguments in (
                 None,

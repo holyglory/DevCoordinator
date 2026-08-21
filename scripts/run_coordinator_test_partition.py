@@ -50,6 +50,7 @@ PARTITIONS = (
         or _is_named(
             "test_maintenance",
             "test_project_profile_revocation",
+            "test_retained_control",
         )(module),
     ),
     Partition(

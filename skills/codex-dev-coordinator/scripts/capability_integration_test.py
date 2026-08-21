@@ -476,29 +476,8 @@ def normalized_inventory_lease(
 def bootstrap_normalized_fixture(
     *, root: Path, project: Path, env: dict[str, str]
 ) -> None:
-    """Create isolated SQLite authority without discovering account state."""
+    """Create one isolated current SQLite authority by observing it once."""
 
-    legacy_home = root / "empty-legacy-source"
-    legacy_home.mkdir(mode=0o700)
-    legacy_state = {
-        "version": 2,
-        "revision": 0,
-        "created_at": "2026-07-15T00:00:00Z",
-        "updated_at": "2026-07-15T00:00:00Z",
-        "leases": {},
-        "servers": {},
-        "port_assignments": {},
-        "history": [],
-        "operations": {},
-        "docker": {"last_commands": [], "stats_history": {}, "metadata": {}},
-    }
-    legacy_state_file = legacy_home / "state.json"
-    legacy_state_file.write_text(
-        json.dumps(legacy_state, separators=(",", ":"), sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
-    legacy_state_file.chmod(0o600)
-    backup_root = root / "legacy-import-backups"
     observed = run_coordinator_json(
         env,
         [
@@ -508,44 +487,19 @@ def bootstrap_normalized_fixture(
             "--project",
             str(project),
             "--no-docker",
-            "--legacy-home",
-            str(legacy_home),
-            "--legacy-backup-root",
-            str(backup_root),
         ],
         context="normalized fixture bootstrap",
     )
-    imported = observed.get("imported")
-    if not (
-        isinstance(imported, dict)
-        and imported.get("source_count") == 1
-        and imported.get("repository_count") == 0
-        and imported.get("conflict_count") == 0
-        and imported.get("blocking_conflict_count") == 0
-    ):
-        raise AssertionError(
-            "normalized fixture bootstrap did not import exactly the isolated "
-            f"empty source: {observed}"
-        )
+    if observed.get("status") not in {"completed", "fresh"} or "imported" in observed:
+        raise AssertionError(f"current-format fixture bootstrap is invalid: {observed}")
     inventory = run_coordinator_json(
         env,
         ["inventory", "--no-docker"],
         context="normalized fixture inventory",
     )
-    source_homes = {
-        str(item.get("canonical_home"))
-        for item in inventory.get("coordinator_sources", [])
-        if isinstance(item, dict)
-    }
-    expected_homes = {
-        str(legacy_home),
-        str(Path(env["CODEX_AGENT_COORDINATOR_HOME"]) / "coordinator.sqlite3"),
-    }
-    if source_homes != expected_homes:
+    if inventory.get("schema_version") != 3:
         raise AssertionError(
-            "normalized fixture imported coordinator state outside its private source: "
-            f"homes={sorted(source_homes)} "
-            f"sources={inventory.get('coordinator_sources')}"
+            f"normalized fixture did not expose the current inventory: {inventory}"
         )
 
 

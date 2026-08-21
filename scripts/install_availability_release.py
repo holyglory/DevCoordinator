@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build, verify, and render an immutable DevCoordinator release.
+"""Build and verify an immutable DevCoordinator release.
 
 This installer never starts or switches a service. It creates one content-
 addressed, non-writable current-format release. The repository-owned delivery
@@ -9,20 +9,17 @@ driver performs the fenced activation, health verification, and rollback.
 from __future__ import annotations
 
 import argparse
-from datetime import datetime, timedelta, timezone
 import hashlib
-import importlib.util
 import json
 import os
 from pathlib import Path
 import re
 import shutil
-import socket
 import stat
 import subprocess
 import sys
 import uuid
-from typing import Any, Iterable, Mapping
+from typing import Any
 
 
 # This file is copied into each immutable release and is intentionally usable
@@ -45,84 +42,6 @@ from devcoordinator.maintenance import (  # noqa: E402
 DEFAULT_RELEASE_ROOT = Path("/opt/devcoordinator/releases")
 RELEASE_SCHEMA = 1
 RELEASE_RE = re.compile(r"^[a-f0-9]{64}$")
-PORT_RESERVATIONS_KIND = "devcoordinator-first-adoption-port-reservations"
-PREPARED_PORT_RESERVATIONS_KIND = (
-    "devcoordinator-atomic-first-adoption-bindings-prepared"
-)
-CLEAN_PORT_RESERVATIONS_KIND = "devcoordinator-clean-adoption-port-reservations"
-PORT_RESERVATION_ROLES = (
-    "console_outer",
-    "console_inner",
-    "handoff_http",
-    "handoff_https",
-    "handoff_api",
-)
-PORT_RESERVATION_FIELDS = {
-    "lease_id",
-    "port",
-    "agent",
-    "purpose",
-    "status",
-    "expires_at",
-}
-PORT_RESERVATIONS_FIELDS = {
-    "schema_version",
-    "kind",
-    "operation_id",
-    "release_digest",
-    "authority_database",
-    "authority_generation",
-    "authority_state_revision_before",
-    "authority_state_revision_after",
-    "repository_id",
-    "repository_generation",
-    "canonical_root",
-    "port_range",
-    "handoff_ttl_seconds",
-    "reservations",
-    "transaction_journal_sha256",
-    "service_unit",
-    "service_restored",
-    "maintenance_cleared",
-    "created_at",
-    "completed_at",
-    "document_sha256",
-}
-PREPARED_PORT_RESERVATIONS_FIELDS = {
-    "schema_version",
-    "kind",
-    "operation_id",
-    "release_digest",
-    "authority_database",
-    "authority_generation",
-    "authority_state_revision_before",
-    "authority_state_revision_after",
-    "repository_id",
-    "repository_generation",
-    "canonical_root",
-    "port_range",
-    "handoff_ttl_seconds",
-    "reservations",
-    "port_journal_sha256",
-    "atomic_transaction_journal_sha256",
-    "service_unit",
-    "service_stopped",
-    "maintenance",
-    "created_at",
-    "completed_at",
-    "document_sha256",
-}
-CLEAN_PORT_RESERVATIONS_FIELDS = {
-    "schema_version",
-    "kind",
-    "operation_id",
-    "release_digest",
-    "reservations",
-    "created_at",
-    "document_sha256",
-}
-CLEAN_PORT_RESERVATION_FIELDS = {"port"}
-MAX_PORT_RESERVATIONS_BYTES = 1024 * 1024
 AVAILABILITY_TEMPLATES = (
     "devcoordinator-api.service",
     "devcoordinator-api.socket",
@@ -162,7 +81,6 @@ SOURCE_FILES = (
     Path("apps/DevOpsConsole/Tools/production-console-acceptance.mjs"),
     Path("deploy/devcoordinator-read-only.rules"),
     Path("deploy/devcoordinator-test.rules"),
-    Path("scripts/activate_availability_release.py"),
     Path("scripts/availability_schema_check.py"),
     Path("scripts/browser_lcp_acceptance.py"),
     Path("scripts/check_availability_topology.py"),
@@ -172,7 +90,6 @@ SOURCE_FILES = (
     Path("scripts/manage_maintenance_mode.py"),
     Path("scripts/manage_universal_test_credentials.py"),
     Path("scripts/manage_test_store.py"),
-    Path("scripts/orchestrate_availability_cutover.py"),
     Path("scripts/read_coordinator_call_log.py"),
     Path("scripts/audit_project_runtime_isolation.py"),
     Path("scripts/refresh_edge_tls_credential.py"),
@@ -215,26 +132,6 @@ WRAPPERS = {
         "skills/codex-dev-coordinator/scripts/dev_coordinator.py",
         ("systemd-unit",),
     ),
-    "devcoordinator-availability-activate": (
-        "python",
-        "scripts/activate_availability_release.py",
-        (),
-    ),
-    "devcoordinator-authority-readiness": (
-        "python",
-        "scripts/orchestrate_availability_cutover.py",
-        ("recover-authority-readiness",),
-    ),
-    "devcoordinator-authority-readiness-rebind": (
-        "python",
-        "scripts/orchestrate_availability_cutover.py",
-        ("rebind-authority-readiness",),
-    ),
-    "devcoordinator-authority-readiness-reattest": (
-        "python",
-        "scripts/orchestrate_availability_cutover.py",
-        ("reattest-authority-readiness",),
-    ),
     "devcoordinator-authority-repository-repair": (
         "python",
         "skills/codex-dev-coordinator/scripts/dev_coordinator.py",
@@ -268,11 +165,6 @@ WRAPPERS = {
     "devcoordinator-console-slot-control": (
         "node",
         "apps/DevOpsConsole/edge/console-slot-control.mjs",
-        (),
-    ),
-    "devcoordinator-console-state-migration": (
-        "node",
-        "apps/DevOpsConsole/edge/console-state-migration-cli.mjs",
         (),
     ),
     "devcoordinator-edge-publication": (
@@ -328,6 +220,11 @@ WRAPPERS = {
     "devcoordinator-same-schema-switch": (
         "python",
         "scripts/switch_same_schema_release.py",
+        (),
+    ),
+    "devcoordinator-retained-control": (
+        "python",
+        "skills/codex-dev-coordinator/scripts/devcoordinator/retained_control.py",
         (),
     ),
     "devcoordinator": (
@@ -1004,6 +901,19 @@ def plan_release(repo: Path, release_root: Path) -> dict[str, Any]:
         in paths
     )
     capabilities = {
+        "current_format_delivery": all(
+            path in paths
+            for path in (
+                "bin/devcoordinator-same-schema-switch",
+                "bin/devcoordinator-retained-control",
+                "scripts/switch_same_schema_release.py",
+                "skills/codex-dev-coordinator/scripts/devcoordinator/retained_control.py",
+                "deploy/devcoordinator-api.socket",
+                "deploy/devcoordinator-authority.socket",
+                "deploy/devcoordinator-edge.service",
+                "deploy/devcoordinator-console@.service",
+            )
+        ),
         "edge_systemd_sockets": "bin/devcoordinator-edge" in paths,
         "console_immutable_backend": "bin/devcoordinator-console" in paths,
         # These capabilities are bound to the exact content-addressed source
@@ -1073,33 +983,6 @@ def plan_release(repo: Path, release_root: Path) -> dict[str, Any]:
                 "skills/codex-dev-coordinator/scripts/devcoordinator/broker_host.py",
             )
         ),
-        "authority_readiness_recovery": all(
-            path in paths
-            for path in (
-                "bin/devcoordinator-authority-readiness",
-                "scripts/orchestrate_availability_cutover.py",
-                "skills/codex-dev-coordinator/scripts/devcoordinator/broker_cli.py",
-                "skills/codex-dev-coordinator/scripts/devcoordinator/maintenance.py",
-            )
-        ),
-        "authority_readiness_rebind": all(
-            path in paths
-            for path in (
-                "bin/devcoordinator-authority-readiness-rebind",
-                "scripts/orchestrate_availability_cutover.py",
-                "skills/codex-dev-coordinator/scripts/devcoordinator/broker_cli.py",
-                "skills/codex-dev-coordinator/scripts/devcoordinator/maintenance.py",
-            )
-        ),
-        "authority_readiness_reattestation": all(
-            path in paths
-            for path in (
-                "bin/devcoordinator-authority-readiness-reattest",
-                "scripts/orchestrate_availability_cutover.py",
-                "skills/codex-dev-coordinator/scripts/devcoordinator/broker_cli.py",
-                "skills/codex-dev-coordinator/scripts/devcoordinator/maintenance.py",
-            )
-        ),
         "typed_maintenance_control": all(
             path in paths
             for path in (
@@ -1154,14 +1037,6 @@ def plan_release(repo: Path, release_root: Path) -> dict[str, Any]:
                 "skills/codex-dev-coordinator/scripts/devcoordinator/universal_test_credentials.py",
                 "skills/codex-dev-coordinator/scripts/devcoordinator/universal_test_runtime.py",
                 "skills/codex-dev-coordinator/scripts/devcoordinator/universal_test_runner.py",
-            )
-        ),
-        "evidence_gated_activation": all(
-            path in paths
-            for path in (
-                "bin/devcoordinator-availability-activate",
-                "scripts/activate_availability_release.py",
-                "scripts/orchestrate_availability_cutover.py",
             )
         ),
     }
@@ -1622,799 +1497,6 @@ def verify_release(
     }
 
 
-def _strict_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-    result: dict[str, Any] = {}
-    for key, value in pairs:
-        if key in result:
-            raise ReleaseError(f"port reservation bundle repeats field {key!r}")
-        result[key] = value
-    return result
-
-
-def _utc_bundle_time(value: object, field: str) -> datetime:
-    if (
-        not isinstance(value, str)
-        or re.fullmatch(
-            r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,6})?Z",
-            value,
-        )
-        is None
-    ):
-        raise ReleaseError(f"port reservation {field} must be a UTC timestamp")
-    try:
-        parsed = datetime.fromisoformat(value[:-1] + "+00:00")
-    except ValueError as error:
-        raise ReleaseError(f"port reservation {field} is invalid") from error
-    if parsed.utcoffset() != timezone.utc.utcoffset(parsed):
-        raise ReleaseError(f"port reservation {field} must be UTC")
-    return parsed
-
-
-def _canonical_absolute_path(value: object, field: str) -> str:
-    if not isinstance(value, str) or not value or "\x00" in value:
-        raise ReleaseError(f"port reservation {field} is invalid")
-    candidate = Path(value)
-    if (
-        not candidate.is_absolute()
-        or str(Path(os.path.abspath(candidate))) != value
-        or str(candidate.resolve(strict=False)) != value
-    ):
-        raise ReleaseError(f"port reservation {field} must be an absolute canonical path")
-    return value
-
-
-def _verify_prepared_port_reservation_fence(document: dict[str, Any]) -> None:
-    if os.geteuid() != 0:
-        raise ReleaseError(
-            "prepared port reservations require the authority UID"
-        )
-    unit = str(document["service_unit"])
-    active = subprocess.run(
-        ["/usr/bin/systemctl", "is-active", "--quiet", unit],
-        check=False,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        timeout=5,
-    ).returncode
-    if active != 3:
-        raise ReleaseError(
-            "prepared port reservations require the stopped legacy broker"
-        )
-    maintenance = document["maintenance"]
-    if (
-        not isinstance(maintenance, dict)
-        or set(maintenance)
-        != {
-            "root",
-            "gid",
-            "deployment_id",
-            "message",
-            "retry_after_seconds",
-            "started_at",
-        }
-        or type(maintenance["gid"]) is not int
-        or maintenance["gid"] < 0
-        or type(maintenance["retry_after_seconds"]) is not int
-        or maintenance["retry_after_seconds"] <= 0
-    ):
-        raise ReleaseError("prepared port maintenance binding is invalid")
-    root = Path(
-        _canonical_absolute_path(maintenance["root"], "maintenance root")
-    )
-    try:
-        deployment_id = str(uuid.UUID(str(maintenance["deployment_id"])))
-    except (ValueError, TypeError, AttributeError) as error:
-        raise ReleaseError(
-            "prepared port maintenance deployment is invalid"
-        ) from error
-    try:
-        marker = load_maintenance_state(
-            expected_uid=0,
-            expected_gid=int(maintenance["gid"]),
-            maintenance_root=root,
-        )
-    except MaintenanceMarkerError as error:
-        raise ReleaseError(
-            "prepared port maintenance marker is unavailable"
-        ) from error
-    if (
-        marker is None
-        or marker.deployment_id != deployment_id
-        or marker.message != maintenance["message"]
-        or marker.retry_after_seconds
-        != maintenance["retry_after_seconds"]
-        or marker.started_at != maintenance["started_at"]
-    ):
-        raise ReleaseError("prepared port maintenance marker changed")
-
-
-def _clean_port_reservations(
-    reservations: object,
-) -> dict[str, dict[str, int]]:
-    if not isinstance(reservations, Mapping) or set(reservations) != set(
-        PORT_RESERVATION_ROLES
-    ):
-        raise ReleaseError("clean port reservation roles are invalid")
-    normalized: dict[str, dict[str, int]] = {}
-    ports: list[int] = []
-    for role in PORT_RESERVATION_ROLES:
-        reservation = reservations[role]
-        if (
-            not isinstance(reservation, Mapping)
-            or set(reservation) != CLEAN_PORT_RESERVATION_FIELDS
-            or type(reservation["port"]) is not int
-            or not 30000 <= int(reservation["port"]) <= 60999
-        ):
-            raise ReleaseError(f"clean port reservation {role} is invalid")
-        port = int(reservation["port"])
-        normalized[role] = {"port": port}
-        ports.append(port)
-    if len(set(ports)) != len(PORT_RESERVATION_ROLES):
-        raise ReleaseError(
-            "clean port reservations must be five distinct high ports"
-        )
-    return normalized
-
-
-def _verify_clean_ports_bindable(
-    reservations: Mapping[str, Mapping[str, int]],
-) -> None:
-    listeners: list[socket.socket] = []
-    try:
-        for role in PORT_RESERVATION_ROLES:
-            listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            listeners.append(listener)
-            try:
-                listener.bind(("127.0.0.1", int(reservations[role]["port"])))
-            except OSError as error:
-                raise ReleaseError(
-                    f"clean port reservation {role} is not bindable on 127.0.0.1"
-                ) from error
-    finally:
-        for listener in listeners:
-            listener.close()
-
-
-def validated_port_reservations(
-    path: Path,
-    *,
-    expected_document_sha256: str,
-    release_digest: str,
-) -> dict[str, Any]:
-    """Read one private, release-bound first-adoption reservation bundle."""
-
-    if (
-        not isinstance(expected_document_sha256, str)
-        or RELEASE_RE.fullmatch(expected_document_sha256) is None
-    ):
-        raise ReleaseError("port reservation bundle SHA-256 is invalid")
-    path = path.expanduser()
-    if not path.is_absolute():
-        raise ReleaseError("port reservation bundle path must be absolute")
-    path = Path(os.path.abspath(path))
-    before = path.lstat()
-    if (
-        stat.S_ISLNK(before.st_mode)
-        or not stat.S_ISREG(before.st_mode)
-        or path.resolve(strict=True) != path
-        or before.st_uid != os.geteuid()
-        or stat.S_IMODE(before.st_mode) != 0o600
-        or before.st_nlink != 1
-        or before.st_size <= 0
-        or before.st_size > MAX_PORT_RESERVATIONS_BYTES
-    ):
-        raise ReleaseError(
-            "port reservation bundle must be one canonical private regular file "
-            "owned by the current authority UID"
-        )
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
-    descriptor = os.open(path, flags)
-    try:
-        opened = os.fstat(descriptor)
-        if (
-            opened.st_dev != before.st_dev
-            or opened.st_ino != before.st_ino
-            or not stat.S_ISREG(opened.st_mode)
-            or opened.st_uid != os.geteuid()
-            or stat.S_IMODE(opened.st_mode) != 0o600
-            or opened.st_nlink != 1
-            or opened.st_size != before.st_size
-        ):
-            raise ReleaseError("port reservation bundle identity changed while opening")
-        chunks: list[bytes] = []
-        remaining = MAX_PORT_RESERVATIONS_BYTES + 1
-        while remaining:
-            chunk = os.read(descriptor, min(remaining, 64 * 1024))
-            if not chunk:
-                break
-            chunks.append(chunk)
-            remaining -= len(chunk)
-        payload = b"".join(chunks)
-        after_open = os.fstat(descriptor)
-    finally:
-        os.close(descriptor)
-    after_path = path.lstat()
-    identity_fields = ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns")
-    if (
-        len(payload) != before.st_size
-        or len(payload) > MAX_PORT_RESERVATIONS_BYTES
-        or any(getattr(before, field) != getattr(after_open, field) for field in identity_fields)
-        or any(getattr(before, field) != getattr(after_path, field) for field in identity_fields)
-    ):
-        raise ReleaseError("port reservation bundle changed while reading")
-    try:
-        document = json.loads(payload, object_pairs_hook=_strict_json_object)
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise ReleaseError("port reservation bundle is invalid JSON") from error
-    prepared = (
-        isinstance(document, dict)
-        and document.get("kind") == PREPARED_PORT_RESERVATIONS_KIND
-    )
-    clean = (
-        isinstance(document, dict)
-        and document.get("kind") == CLEAN_PORT_RESERVATIONS_KIND
-    )
-    expected_fields = (
-        CLEAN_PORT_RESERVATIONS_FIELDS
-        if clean
-        else (
-            PREPARED_PORT_RESERVATIONS_FIELDS
-            if prepared
-            else PORT_RESERVATIONS_FIELDS
-        )
-    )
-    if (
-        not isinstance(document, dict)
-        or set(document) != expected_fields
-        or document.get("schema_version") != 1
-        or document.get("kind")
-        not in {
-            PORT_RESERVATIONS_KIND,
-            PREPARED_PORT_RESERVATIONS_KIND,
-            CLEAN_PORT_RESERVATIONS_KIND,
-        }
-    ):
-        raise ReleaseError("port reservation bundle fields are invalid")
-    unsigned = {
-        key: value for key, value in document.items() if key != "document_sha256"
-    }
-    canonical_digest = hashlib.sha256(
-        json.dumps(
-            unsigned,
-            sort_keys=True,
-            separators=(",", ":"),
-            ensure_ascii=False,
-            allow_nan=False,
-        ).encode("utf-8")
-    ).hexdigest()
-    if (
-        document["document_sha256"] != canonical_digest
-        or expected_document_sha256 != canonical_digest
-    ):
-        raise ReleaseError("port reservation bundle canonical digest is invalid")
-    try:
-        operation_id = str(uuid.UUID(str(document["operation_id"])))
-    except (ValueError, TypeError, AttributeError) as error:
-        raise ReleaseError("port reservation operation ID is invalid") from error
-    if operation_id != document["operation_id"]:
-        raise ReleaseError("port reservation operation ID is not canonical")
-    if (
-        not isinstance(release_digest, str)
-        or RELEASE_RE.fullmatch(release_digest) is None
-        or document["release_digest"] != release_digest
-    ):
-        raise ReleaseError("port reservation bundle belongs to another immutable release")
-    if clean:
-        _utc_bundle_time(document["created_at"], "creation time")
-        clean_reservations = _clean_port_reservations(document["reservations"])
-        _verify_clean_ports_bindable(clean_reservations)
-        return {
-            **document,
-            "reservations": clean_reservations,
-        }
-    _canonical_absolute_path(document["authority_database"], "authority database")
-    _canonical_absolute_path(document["canonical_root"], "canonical root")
-    if (
-        not isinstance(document["authority_generation"], str)
-        or not document["authority_generation"]
-        or len(document["authority_generation"]) > 256
-        or any(ord(character) < 0x20 for character in document["authority_generation"])
-        or not isinstance(document["repository_id"], str)
-        or not document["repository_id"]
-        or len(document["repository_id"].encode("utf-8")) > 256
-        or any(ord(character) < 0x20 for character in document["repository_id"])
-        or type(document["repository_generation"]) is not int
-        or document["repository_generation"] < 0
-        or type(document["authority_state_revision_before"]) is not int
-        or document["authority_state_revision_before"] < 0
-        or type(document["authority_state_revision_after"]) is not int
-        or document["authority_state_revision_after"]
-        != document["authority_state_revision_before"] + 1
-    ):
-        raise ReleaseError("port reservation authority binding is invalid")
-    if document["port_range"] != {"start": 30000, "end": 60999}:
-        raise ReleaseError("port reservation range must be exactly 30000 through 60999")
-    if (
-        type(document["handoff_ttl_seconds"]) is not int
-        or document["handoff_ttl_seconds"] < 60
-        or document["handoff_ttl_seconds"] > 86_400
-    ):
-        raise ReleaseError("port reservation handoff TTL is invalid")
-    if prepared:
-        if (
-            document["service_unit"] != "devcoordinator-broker.service"
-            or document["service_stopped"] is not True
-            or not isinstance(document["port_journal_sha256"], str)
-            or RELEASE_RE.fullmatch(document["port_journal_sha256"]) is None
-            or not isinstance(
-                document["atomic_transaction_journal_sha256"], str
-            )
-            or RELEASE_RE.fullmatch(
-                document["atomic_transaction_journal_sha256"]
-            )
-            is None
-        ):
-            raise ReleaseError(
-                "prepared port reservation fence evidence is incomplete"
-            )
-        _verify_prepared_port_reservation_fence(document)
-    elif (
-        document["service_unit"] != "devcoordinator-broker.service"
-        or document["service_restored"] is not True
-        or document["maintenance_cleared"] is not True
-        or not isinstance(document["transaction_journal_sha256"], str)
-        or RELEASE_RE.fullmatch(document["transaction_journal_sha256"]) is None
-    ):
-        raise ReleaseError("port reservation recovery evidence is incomplete")
-    created_at = _utc_bundle_time(document["created_at"], "creation time")
-    completed_at = _utc_bundle_time(document["completed_at"], "completion time")
-    if completed_at < created_at:
-        raise ReleaseError("port reservation completion predates creation")
-    reservations = document["reservations"]
-    if not isinstance(reservations, dict) or set(reservations) != set(
-        PORT_RESERVATION_ROLES
-    ):
-        raise ReleaseError("port reservation roles are invalid")
-    expected_agent = f"cutover:first-adoption:{operation_id}"
-    ports: list[int] = []
-    leases: list[str] = []
-    purposes: list[str] = []
-    handoff_expiries: list[datetime] = []
-    for role in PORT_RESERVATION_ROLES:
-        reservation = reservations[role]
-        if not isinstance(reservation, dict) or set(reservation) != PORT_RESERVATION_FIELDS:
-            raise ReleaseError(f"port reservation {role} fields are invalid")
-        lease_id = reservation["lease_id"]
-        port = reservation["port"]
-        purpose = reservation["purpose"]
-        try:
-            canonical_lease_id = str(uuid.UUID(str(lease_id)))
-        except (ValueError, TypeError, AttributeError) as error:
-            raise ReleaseError(f"port reservation {role} lease ID is invalid") from error
-        if (
-            canonical_lease_id != lease_id
-            or type(port) is not int
-            or not 30000 <= port <= 60999
-            or reservation["agent"] != expected_agent
-            or purpose != f"first-adoption:{release_digest}:{role}"
-            or reservation["status"] != "active"
-        ):
-            raise ReleaseError(f"port reservation {role} binding is invalid")
-        ports.append(port)
-        leases.append(lease_id)
-        purposes.append(purpose)
-        expires_at = reservation["expires_at"]
-        if role.startswith("console_"):
-            if expires_at is not None:
-                raise ReleaseError("Console port reservations must not expire")
-        else:
-            handoff_expiries.append(
-                _utc_bundle_time(expires_at, f"{role} expiry")
-            )
-    if len(set(ports)) != len(PORT_RESERVATION_ROLES):
-        raise ReleaseError("reserved ports must be five distinct broker-leased high ports")
-    if len(set(leases)) != len(PORT_RESERVATION_ROLES):
-        raise ReleaseError("port reservation lease IDs must be distinct")
-    if len(set(purposes)) != len(PORT_RESERVATION_ROLES):
-        raise ReleaseError("port reservation purposes must be distinct")
-    expected_expiry = created_at + timedelta(
-        seconds=document["handoff_ttl_seconds"]
-    )
-    if (
-        len(handoff_expiries) != 3
-        or any(expiry != expected_expiry for expiry in handoff_expiries)
-        or handoff_expiries[0] <= datetime.now(timezone.utc)
-    ):
-        raise ReleaseError(
-            "handoff ports must be three distinct broker-leased high ports with one future expiry"
-        )
-    return document
-
-
-def prepare_clean_port_reservations(
-    release: Path,
-    output: Path,
-    *,
-    operation_id: str,
-    ports: Mapping[str, int],
-) -> dict[str, Any]:
-    """Publish one private, release-bound clean-adoption port bundle."""
-
-    verified = verify_release(release)
-    release_digest = str(verified["release_digest"])
-    try:
-        canonical_operation_id = str(uuid.UUID(str(operation_id)))
-    except (ValueError, TypeError, AttributeError) as error:
-        raise ReleaseError("clean port reservation operation ID is invalid") from error
-    if canonical_operation_id != operation_id:
-        raise ReleaseError("clean port reservation operation ID is not canonical")
-    reservations = _clean_port_reservations(
-        {
-            role: {"port": ports[role]}
-            for role in PORT_RESERVATION_ROLES
-        }
-        if isinstance(ports, Mapping) and set(ports) == set(PORT_RESERVATION_ROLES)
-        else ports
-    )
-    _verify_clean_ports_bindable(reservations)
-    unsigned = {
-        "schema_version": 1,
-        "kind": CLEAN_PORT_RESERVATIONS_KIND,
-        "operation_id": canonical_operation_id,
-        "release_digest": release_digest,
-        "reservations": reservations,
-        "created_at": datetime.now(timezone.utc)
-        .isoformat(timespec="milliseconds")
-        .replace("+00:00", "Z"),
-    }
-    document = {
-        **unsigned,
-        "document_sha256": hashlib.sha256(_canonical_json(unsigned)).hexdigest(),
-    }
-    payload = _canonical_json(document) + b"\n"
-    if len(payload) > MAX_PORT_RESERVATIONS_BYTES:
-        raise ReleaseError("clean port reservation bundle exceeds its byte budget")
-
-    output = output.expanduser()
-    if not output.is_absolute():
-        raise ReleaseError("clean port reservation output must be absolute")
-    output = Path(
-        _canonical_absolute_path(
-            str(Path(os.path.abspath(output))), "clean port reservation output"
-        )
-    )
-    try:
-        parent_info = output.parent.lstat()
-    except OSError as error:
-        raise ReleaseError("clean port reservation output parent is unavailable") from error
-    if (
-        stat.S_ISLNK(parent_info.st_mode)
-        or not stat.S_ISDIR(parent_info.st_mode)
-        or output.parent.resolve(strict=True) != output.parent
-        or parent_info.st_uid != os.geteuid()
-        or stat.S_IMODE(parent_info.st_mode) & 0o022
-    ):
-        raise ReleaseError("clean port reservation output parent is unsafe")
-    if output.exists() or output.is_symlink():
-        raise ReleaseError("clean port reservation output already exists")
-
-    temporary = output.parent / f".{output.name}.{uuid.uuid4().hex}.partial"
-    _install_bytes(
-        temporary,
-        payload,
-        mode=0o600,
-        uid=os.geteuid(),
-        gid=os.getegid(),
-    )
-    try:
-        try:
-            os.link(temporary, output, follow_symlinks=False)
-        except FileExistsError as error:
-            raise ReleaseError("clean port reservation output appeared") from error
-        temporary.unlink()
-        parent_descriptor = os.open(
-            output.parent,
-            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
-        )
-        try:
-            os.fsync(parent_descriptor)
-        finally:
-            os.close(parent_descriptor)
-    finally:
-        temporary.unlink(missing_ok=True)
-    validated = validated_port_reservations(
-        output,
-        expected_document_sha256=str(document["document_sha256"]),
-        release_digest=release_digest,
-    )
-    if validated != document:
-        raise ReleaseError("published clean port reservation bundle changed")
-    return validated
-
-
-def render_units(
-    release: Path,
-    output: Path,
-    *,
-    total_memory_bytes: int | None = None,
-    host_cpu_count: int | None = None,
-    port_reservations: Path,
-    port_reservations_sha256: str,
-) -> dict[str, Any]:
-    verified = verify_release(release)
-    release = release.resolve(strict=True)
-    reservation_bundle = validated_port_reservations(
-        port_reservations,
-        expected_document_sha256=port_reservations_sha256,
-        release_digest=verified["release_digest"],
-    )
-    reservations = reservation_bundle["reservations"]
-    handoff_http_port = reservations["handoff_http"]["port"]
-    handoff_https_port = reservations["handoff_https"]["port"]
-    handoff_api_port = reservations["handoff_api"]["port"]
-    output = output.resolve()
-    if output.exists() or output.is_symlink():
-        raise ReleaseError("unit output must be one absent path")
-    output.mkdir(parents=True, mode=0o755)
-    digest = verified["release_digest"]
-    capacity = derive_slice_capacity(
-        host_memory_bytes() if total_memory_bytes is None else total_memory_bytes,
-        cpu_count=host_cpu_count,
-    )
-    handoff = {
-        "DEVCOORDINATOR_HANDOFF_HTTP_PORT": str(handoff_http_port),
-        "DEVCOORDINATOR_HANDOFF_HTTPS_PORT": str(handoff_https_port),
-        "DEVCOORDINATOR_HANDOFF_API_PORT": str(handoff_api_port),
-    }
-    rendered: list[str] = []
-    try:
-        for name in AVAILABILITY_TEMPLATES:
-            source = release / "deploy" / name
-            if not source.is_file() or source.is_symlink():
-                raise ReleaseError(
-                    f"immutable availability template is missing or unsafe: {name}"
-                )
-            text = source.read_text(encoding="utf-8").replace("RELEASE_DIGEST", digest)
-            for placeholder, field in CAPACITY_PLACEHOLDERS.items():
-                text = text.replace(placeholder, str(capacity[field]))
-            for placeholder, value in handoff.items():
-                text = text.replace(placeholder, value)
-            if any(placeholder in text for placeholder in (*CAPACITY_PLACEHOLDERS, *handoff)):
-                raise ReleaseError(f"availability template retained a placeholder: {name}")
-            target = output / name
-            descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
-            with os.fdopen(descriptor, "w", encoding="utf-8", closefd=True) as handle:
-                handle.write(text)
-                handle.flush()
-                os.fsync(handle.fileno())
-            rendered.append(name)
-    except BaseException:
-        for name in rendered:
-            (output / name).unlink(missing_ok=True)
-        output.rmdir()
-        raise
-    return {
-        "ok": True,
-        "release_digest": digest,
-        "output": str(output),
-        "files": sorted(rendered),
-        "activation_ready": all(verified["capabilities"].values()),
-        "capabilities": verified["capabilities"],
-        "capacity": capacity,
-        "handoff_ports": {
-            "http": handoff_http_port,
-            "https": handoff_https_port,
-            "api": handoff_api_port,
-        },
-        "port_reservations": str(port_reservations.expanduser().absolute()),
-        "port_reservations_sha256": reservation_bundle["document_sha256"],
-    }
-
-
-def initialize_observer_projection(
-    release: Path,
-    publication: Path,
-    *,
-    owner_uid: int,
-    owner_gid: int,
-    database: Path | None = None,
-) -> dict[str, Any]:
-    """Explicitly initialize the observer-owned database and publication."""
-
-    verified = verify_release(release)
-    release = release.resolve(strict=True)
-    module_path = (
-        release
-        / "skills/codex-dev-coordinator/scripts/devcoordinator/inventory_projection.py"
-    )
-    if not module_path.is_file() or module_path.is_symlink():
-        raise ReleaseError("verified release has no retained inventory projection module")
-    publication = publication.expanduser().absolute()
-    database = (
-        publication.with_name("inventory.sqlite3")
-        if database is None
-        else database.expanduser().absolute()
-    )
-    if database.parent != publication.parent or database == publication:
-        raise ReleaseError("retained inventory database must be a sibling of its publication")
-    try:
-        parent = publication.parent.lstat()
-    except OSError as error:
-        raise ReleaseError("retained inventory parent does not exist") from error
-    if (
-        stat.S_ISLNK(parent.st_mode)
-        or not stat.S_ISDIR(parent.st_mode)
-        or parent.st_uid != owner_uid
-        or stat.S_IMODE(parent.st_mode) & 0o022
-    ):
-        raise ReleaseError("retained inventory parent has unsafe ownership or mode")
-    if os.geteuid() != 0 and (owner_uid, owner_gid) != (os.geteuid(), os.getegid()):
-        raise ReleaseError("only root may initialize a projection for another identity")
-
-    spec = importlib.util.spec_from_file_location(
-        f"devcoordinator_inventory_projection_{verified['release_digest']}", module_path
-    )
-    if spec is None or spec.loader is None:
-        raise ReleaseError("cannot load the verified retained inventory module")
-    projection = importlib.util.module_from_spec(spec)
-    previous_dont_write_bytecode = sys.dont_write_bytecode
-    sys.dont_write_bytecode = True
-    try:
-        spec.loader.exec_module(projection)
-    finally:
-        sys.dont_write_bytecode = previous_dont_write_bytecode
-
-    if publication.exists() or publication.is_symlink():
-        try:
-            current = projection.read_projection(
-                publication, expected_owner_uid=owner_uid
-            )
-            if not database.exists() and not database.is_symlink():
-                projection.initialize_inventory_store(
-                    database,
-                    current,
-                    owner_uid=owner_uid,
-                    owner_gid=owner_gid,
-                )
-            retained = projection.verify_inventory_store(
-                database,
-                publication,
-                expected_owner_uid=owner_uid,
-            )
-        except Exception as error:
-            raise ReleaseError(f"existing retained projection is invalid: {error}") from error
-        return {
-            "ok": True,
-            "created": False,
-            "release_digest": verified["release_digest"],
-            "publication": str(publication),
-            "database": str(database),
-            "generation": retained["generation"],
-        }
-
-    if database.exists() or database.is_symlink():
-        raise ReleaseError("retained inventory database exists without its publication")
-
-    published_at = datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace(
-        "+00:00", "Z"
-    )
-    initial = projection.envelope(
-        generation=1,
-        inventory=projection.empty_inventory(),
-        published_at=published_at,
-    )
-    try:
-        projection.initialize_inventory_store(
-            database,
-            initial,
-            owner_uid=owner_uid,
-            owner_gid=owner_gid,
-        )
-        projection.publish_projection(
-            publication,
-            initial,
-            owner_uid=owner_uid,
-            owner_gid=owner_gid,
-        )
-        current = projection.read_projection(
-            publication, expected_owner_uid=owner_uid
-        )
-        retained = projection.verify_inventory_store(
-            database,
-            publication,
-            expected_owner_uid=owner_uid,
-        )
-    except Exception as error:
-        database.unlink(missing_ok=True)
-        Path(f"{database}-wal").unlink(missing_ok=True)
-        Path(f"{database}-shm").unlink(missing_ok=True)
-        publication.unlink(missing_ok=True)
-        raise ReleaseError(f"cannot initialize retained projection: {error}") from error
-    return {
-        "ok": True,
-        "created": True,
-        "release_digest": verified["release_digest"],
-        "publication": str(publication),
-        "database": str(database),
-        "generation": retained["generation"],
-    }
-
-
-def render_console_slot(
-    release: Path,
-    output: Path,
-    *,
-    port_reservations: Path,
-    port_reservations_sha256: str,
-    bootstrap_active: bool = False,
-) -> dict[str, Any]:
-    verified = verify_release(release)
-    reservation_bundle = validated_port_reservations(
-        port_reservations,
-        expected_document_sha256=port_reservations_sha256,
-        release_digest=verified["release_digest"],
-    )
-    reservations = reservation_bundle["reservations"]
-    port = reservations["console_outer"]["port"]
-    inner_port = reservations["console_inner"]["port"]
-    output = output.resolve()
-    if output.name != f"{verified['release_digest']}.env":
-        raise ReleaseError("Console slot filename must be exactly <release-digest>.env")
-    if output.parent.is_symlink():
-        raise ReleaseError("Console slot directory must not be a symlink")
-    output.parent.mkdir(parents=True, exist_ok=True, mode=0o750)
-    parent = output.parent.lstat()
-    if not stat.S_ISDIR(parent.st_mode) or stat.S_IMODE(parent.st_mode) & 0o022:
-        raise ReleaseError("Console slot directory has unsafe permissions")
-    payload = (
-        "# Generated immutable Console candidate slot.\n"
-        "BIND_HOST=127.0.0.1\n"
-        "DEV_HTTP=0\n"
-        "HTTP_PORT=0\n"
-        f"HTTPS_PORT={port}\n"
-        f"DEVCOORDINATOR_RELEASE_DIGEST={verified['release_digest']}\n"
-        f"DEVCOORDINATOR_CONSOLE_INNER_PORT={inner_port}\n"
-        f"DEVCOORDINATOR_CONSOLE_CONTROL_SOCKET=/run/devcoordinator-console/{verified['release_digest']}.sock\n"
-        "DEVCOORDINATOR_CONSOLE_SUPERVISOR_STATE=/var/lib/devcoordinator-console/supervisor\n"
-        "DEVCOORDINATOR_CONSOLE_RUNTIME=/run/devcoordinator-console\n"
-        f"DEVCOORDINATOR_CONSOLE_BOOTSTRAP_ACTIVE={1 if bootstrap_active else 0}\n"
-    ).encode("utf-8")
-    if output.exists() or output.is_symlink():
-        if output.is_file() and not output.is_symlink() and output.read_bytes() == payload:
-            return {
-                "ok": True,
-                "created": False,
-                "release_digest": verified["release_digest"],
-                "slot": str(output),
-                "port": port,
-                "inner_port": inner_port,
-                "port_reservations": str(port_reservations.expanduser().absolute()),
-                "port_reservations_sha256": reservation_bundle["document_sha256"],
-                "bootstrap_active": bootstrap_active,
-                "parallel_writer_safe": verified["capabilities"]["console_parallel_writer_safe"],
-            }
-        raise ReleaseError("Console slot already exists with different or unsafe content")
-    _install_bytes(
-        output,
-        payload,
-        mode=0o644,
-        uid=os.geteuid(),
-        gid=os.getegid(),
-    )
-    return {
-        "ok": True,
-        "created": True,
-        "release_digest": verified["release_digest"],
-        "slot": str(output),
-        "port": port,
-        "inner_port": inner_port,
-        "port_reservations": str(port_reservations.expanduser().absolute()),
-        "port_reservations_sha256": reservation_bundle["document_sha256"],
-        "bootstrap_active": bootstrap_active,
-        "parallel_writer_safe": verified["capabilities"]["console_parallel_writer_safe"],
-    }
-
-
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     subcommands = parser.add_subparsers(dest="action", required=True)
@@ -2428,25 +1510,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     stage.add_argument("--owner-gid", type=int, default=0)
     verify = subcommands.add_parser("verify")
     verify.add_argument("--release", type=Path, required=True)
-    render = subcommands.add_parser("render-units")
-    render.add_argument("--release", type=Path, required=True)
-    render.add_argument("--output", type=Path, required=True)
-    render.add_argument("--host-memory-bytes", type=int)
-    render.add_argument("--host-cpu-count", type=int)
-    render.add_argument("--port-reservations", type=Path, required=True)
-    render.add_argument("--port-reservations-sha256", required=True)
-    observer = subcommands.add_parser("init-observer-projection")
-    observer.add_argument("--release", type=Path, required=True)
-    observer.add_argument("--publication", type=Path, required=True)
-    observer.add_argument("--database", type=Path)
-    observer.add_argument("--owner-uid", type=int, required=True)
-    observer.add_argument("--owner-gid", type=int, required=True)
-    console_slot = subcommands.add_parser("render-console-slot")
-    console_slot.add_argument("--release", type=Path, required=True)
-    console_slot.add_argument("--output", type=Path, required=True)
-    console_slot.add_argument("--port-reservations", type=Path, required=True)
-    console_slot.add_argument("--port-reservations-sha256", required=True)
-    console_slot.add_argument("--bootstrap-active", action="store_true")
     return parser.parse_args(argv)
 
 
@@ -2464,33 +1527,8 @@ def main(argv: list[str] | None = None) -> int:
                 owner_uid=args.owner_uid,
                 owner_gid=args.owner_gid,
             )
-        elif args.action == "verify":
-            result = verify_release(args.release)
-        elif args.action == "render-units":
-            result = render_units(
-                args.release,
-                args.output,
-                total_memory_bytes=args.host_memory_bytes,
-                host_cpu_count=args.host_cpu_count,
-                port_reservations=args.port_reservations,
-                port_reservations_sha256=args.port_reservations_sha256,
-            )
-        elif args.action == "init-observer-projection":
-            result = initialize_observer_projection(
-                args.release,
-                args.publication,
-                owner_uid=args.owner_uid,
-                owner_gid=args.owner_gid,
-                database=args.database,
-            )
         else:
-            result = render_console_slot(
-                args.release,
-                args.output,
-                port_reservations=args.port_reservations,
-                port_reservations_sha256=args.port_reservations_sha256,
-                bootstrap_active=bool(args.bootstrap_active),
-            )
+            result = verify_release(args.release)
     except (OSError, ValueError, ReleaseError, json.JSONDecodeError) as error:
         print(json.dumps({"ok": False, "error": str(error)}, sort_keys=True), file=sys.stderr)
         return 1

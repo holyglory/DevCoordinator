@@ -7,9 +7,7 @@ import re
 import sqlite3
 from typing import Iterable, Mapping
 
-SCHEMA_VERSION = 15
-LEGACY_SCHEMA_VERSIONS = frozenset({12, 13, 14})
-MINIMUM_MIGRATABLE_SCHEMA_VERSION = 1
+SCHEMA_VERSION = 16
 
 
 _SHA256_FINGERPRINT = re.compile(r"sha256:[0-9a-f]{64}")

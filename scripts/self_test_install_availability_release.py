@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import importlib.util
 import json
 import os
@@ -36,73 +35,6 @@ def must_fail(operation, label: str) -> None:
     raise AssertionError(f"unsafe immutable release condition was accepted: {label}")
 
 
-def write_port_reservations(
-    root: Path, release_digest: str
-) -> tuple[Path, str]:
-    operation_id = "12345678-1234-4234-8234-123456789abc"
-    created_at = "2099-01-01T00:00:00.000Z"
-    expires_at = "2099-01-01T01:00:00.000Z"
-    ports = {
-        "console_outer": 30443,
-        "console_inner": 30444,
-        "handoff_http": 38080,
-        "handoff_https": 38443,
-        "handoff_api": 39876,
-    }
-    reservations = {
-        role: {
-            "lease_id": f"00000000-0000-4000-8000-{index:012d}",
-            "port": port,
-            "agent": f"cutover:first-adoption:{operation_id}",
-            "purpose": f"first-adoption:{release_digest}:{role}",
-            "status": "active",
-            "expires_at": None if role.startswith("console_") else expires_at,
-        }
-        for index, (role, port) in enumerate(ports.items(), start=1)
-    }
-    authority_database = root / "authority.sqlite3"
-    authority_database.touch()
-    canonical_root = root / "canonical-repository"
-    canonical_root.mkdir()
-    document: dict[str, object] = {
-        "schema_version": 1,
-        "kind": INSTALLER.PORT_RESERVATIONS_KIND,
-        "operation_id": operation_id,
-        "release_digest": release_digest,
-        "authority_database": str(authority_database),
-        "authority_generation": "authority-generation-7",
-        "authority_state_revision_before": 41,
-        "authority_state_revision_after": 42,
-        "repository_id": "repository-stable-id",
-        "repository_generation": 3,
-        "canonical_root": str(canonical_root),
-        "port_range": {"start": 30000, "end": 60999},
-        "handoff_ttl_seconds": 3600,
-        "reservations": reservations,
-        "transaction_journal_sha256": "a" * 64,
-        "service_unit": "devcoordinator-broker.service",
-        "service_restored": True,
-        "maintenance_cleared": True,
-        "created_at": created_at,
-        "completed_at": "2099-01-01T00:00:01.000Z",
-    }
-    document["document_sha256"] = hashlib.sha256(
-        json.dumps(
-            document,
-            sort_keys=True,
-            separators=(",", ":"),
-            ensure_ascii=False,
-            allow_nan=False,
-        ).encode("utf-8")
-    ).hexdigest()
-    destination = root / "port-reservations.json"
-    destination.write_text(
-        json.dumps(document, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-    )
-    destination.chmod(0o600)
-    return destination, str(document["document_sha256"])
-
-
 def main() -> int:
     first = INSTALLER.plan_release(ROOT, Path("/opt/devcoordinator/releases"))
     second = INSTALLER.plan_release(ROOT, Path("/opt/devcoordinator/releases"))
@@ -121,11 +53,19 @@ def main() -> int:
         "bin/devcoordinator-testd",
         "bin/devcoordinator-compose-host-access",
         "bin/devcoordinator-authority-repository-repair",
+        "bin/devcoordinator-same-schema-switch",
+        "bin/devcoordinator-retained-control",
+        "scripts/switch_same_schema_release.py",
+    ):
+        expect(required in paths, f"release omitted {required}")
+    for retired in (
         "bin/devcoordinator-availability-activate",
         "scripts/activate_availability_release.py",
         "scripts/orchestrate_availability_cutover.py",
+        "apps/DevOpsConsole/edge/first-adoption-route-resolution-cli.mjs",
+        "apps/DevOpsConsole/edge/console-state-migration-cli.mjs",
     ):
-        expect(required in paths, f"release omitted {required}")
+        expect(retired not in paths, f"release retained retired path {retired}")
 
     obsolete_fragments = (
         "repository-owner",
@@ -153,6 +93,10 @@ def main() -> int:
         and first["capabilities"]["out_of_band_bug_registry"] is True
         and first["capabilities"]["project_runtime_isolation"] is True,
         "release omitted a current operational capability",
+    )
+    expect(
+        first["capabilities"]["current_format_delivery"] is True,
+        "release omitted the current-format delivery capability",
     )
 
     with tempfile.TemporaryDirectory() as temporary:
@@ -210,22 +154,6 @@ def main() -> int:
         manifest.chmod(0o644)
         manifest.write_bytes(original)
         manifest.chmod(0o444)
-
-        reservations, digest = write_port_reservations(root, release.name)
-        rendered = root / "rendered"
-        INSTALLER.render_units(
-            release,
-            rendered,
-            port_reservations=reservations,
-            port_reservations_sha256=digest,
-        )
-        authority_socket = rendered / "devcoordinator-authority.socket"
-        expect(authority_socket.is_file(), "rendered graph omitted authority socket")
-        socket_source = authority_socket.read_text(encoding="utf-8")
-        expect(
-            "SocketMode=0666" in socket_source and "SocketGroup=" not in socket_source,
-            "authority socket is not trusted-local and host-wide",
-        )
 
     print("immutable availability release self-test ok")
     return 0

@@ -32,10 +32,10 @@ def _rows(inventory: dict[str, Any], key: str) -> list[dict[str, Any]]:
 
 
 def current_registration_inventory_view(inventory: dict[str, Any]) -> dict[str, Any]:
-    """Return the legacy-shaped registration rows declared by schema v2.
+    """Return legacy-shaped registration rows declared by normalized inventory.
 
     Raw inventories from the retired coordinator have no ``schema_version``
-    and remain valid inputs for rollback verification.  A schema-v2 payload is
+    and remain valid inputs for rollback verification.  A schema-v2/v3 payload is
     different: its colliding top-level lease and assignment collections are
     normalized, so the registration guard must use and strictly validate the
     explicit ``v1_compatibility`` projection instead of guessing by row shape.
@@ -46,23 +46,27 @@ def current_registration_inventory_view(inventory: dict[str, Any]) -> dict[str, 
     if "schema_version" not in inventory:
         return inventory
     schema_version = inventory.get("schema_version")
-    if not isinstance(schema_version, int) or isinstance(schema_version, bool) or schema_version != 2:
+    if (
+        not isinstance(schema_version, int)
+        or isinstance(schema_version, bool)
+        or schema_version not in {2, 3}
+    ):
         raise RegistrationGraphError("registration inventory schema_version is unsupported")
     compatibility = inventory.get("v1_compatibility")
     if not isinstance(compatibility, dict):
         raise RegistrationGraphError(
-            "schema-v2 registration inventory requires an object v1_compatibility projection"
+            "normalized registration inventory requires an object v1_compatibility projection"
         )
     projected = dict(inventory)
     for key in REGISTRATION_INVENTORY_KEYS:
         if key not in compatibility:
             raise RegistrationGraphError(
-                f"schema-v2 v1_compatibility projection is missing {key!r}"
+                f"normalized v1_compatibility projection is missing {key!r}"
             )
         value = compatibility[key]
         if not isinstance(value, list) or any(not isinstance(item, dict) for item in value):
             raise RegistrationGraphError(
-                f"schema-v2 v1_compatibility {key!r} must be a list of objects"
+                f"normalized v1_compatibility {key!r} must be a list of objects"
             )
         projected[key] = value
     return projected

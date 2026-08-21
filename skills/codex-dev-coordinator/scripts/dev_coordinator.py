@@ -2855,59 +2855,29 @@ def _strict_git_repository_root(project: str) -> Path:
     return root
 
 
-def _require_normalized_bootstrap_before_mutation(store: AccountStore) -> None:
-    """Import same-UID legacy truth before the first normalized mutation.
-
-    A pure inventory never creates the SQLite store. Once a mutation opens a
-    fresh store, legacy capture/import must run before repository installation
-    or action reservation can establish normalized authority.
-    """
+def _require_current_normalized_authority(store: AccountStore) -> None:
+    """Require one current store; retired JSON/bootstrap import is unsupported."""
 
     if authority_mode() == "system":
         # A server-wide client journal is a per-UID linkage/reconciliation
-        # cache, never an authority migration destination. Importing the old
-        # account store here would recreate split authority and can fence
-        # valid broker mutations with historical definition conflicts.
+        # cache, never an authority destination. It must not read account
+        # control state before a broker mutation.
         return
 
     with store.read_transaction() as connection:
         metadata = connection.execute(
             """
-            SELECT migration_state, first_sqlite_mutation_at, state_revision
+            SELECT migration_state
             FROM schema_metadata WHERE singleton = 1
             """
         ).fetchone()
     if metadata is None:
         raise ActionFencedError("normalized coordinator metadata is missing")
-    first_mutation = metadata["first_sqlite_mutation_at"]
     migration_state = str(metadata["migration_state"] or "empty")
-    if migration_state == "conflicted":
+    if migration_state not in {"empty", "ready"}:
         raise ActionFencedError(
-            "legacy coordinator migration has unresolved blocking conflicts; "
-            "resolve them through explicit observe before mutation"
-        )
-    if first_mutation is not None and migration_state != "empty":
-        late_writers = store.detect_late_legacy_writers()
-        if late_writers:
-            raise ActionFencedError(
-                "a retired legacy coordinator source changed after capture; run explicit "
-                "observe and reconcile that writer before mutation"
-            )
-        return
-    report = bootstrap_legacy_import(store)
-    if report.get("blocking_conflict_count"):
-        raise ActionFencedError(
-            "legacy coordinator state has blocking migration conflicts; run explicit observe "
-            "and resolve its migration report before mutating this repository"
-        )
-    if report.get("attempted") and not report.get("committed"):
-        raise ActionFencedError(
-            "legacy coordinator state was not committed; run explicit observe before mutation"
-        )
-    if report.get("late_writer_sources"):
-        raise ActionFencedError(
-            "a legacy coordinator source changed after capture; run explicit observe and "
-            "reconcile that writer before mutation"
+            "coordinator authority is not current-format ready; run the "
+            "root-owned retained-control rebaseline"
         )
 
 
@@ -3150,7 +3120,7 @@ def normalized_repository_action_guard(
             yield active["repo_id"]
             return
     with _open_normalized_action_store() as store:
-        _require_normalized_bootstrap_before_mutation(store)
+        _require_current_normalized_authority(store)
         # Preserve the existing fence-first boundary for a known effective
         # worktree. Discovery of its primary worktree invokes trusted Git and
         # happens only after an already-disabled effective repository fails.
@@ -12041,119 +12011,6 @@ def pure_normalized_inventory(
     return result
 
 
-def discover_same_uid_legacy_homes(
-    *, explicit_homes: list[str] | None = None
-) -> list[Path]:
-    """Find migration-only JSON homes owned by this effective account."""
-
-    uid = os.geteuid()
-    candidates: set[Path] = set()
-    if explicit_homes is not None:
-        candidates.update(Path(item).expanduser().absolute() for item in explicit_homes)
-    else:
-        account_home = posix_account_home()
-        candidates.add(account_home / ".codex" / "agent-coordinator")
-        candidates.add(account_home / ".claude" / "agent-coordinator")
-        parall_root = account_home / "Library" / "Application Support" / "Parall"
-        if parall_root.is_dir() and not parall_root.is_symlink():
-            # Bound discovery to known application state suffixes. rglob is
-            # migration-only and candidates still pass the importer's strict
-            # no-symlink/private-owner checks.
-            for state_file in parall_root.rglob(".codex/agent-coordinator/state.json"):
-                candidates.add(state_file.parent)
-    safe: list[Path] = []
-    for candidate in sorted(candidates, key=str):
-        state_file = candidate / "state.json"
-        try:
-            home_metadata = candidate.lstat()
-            state_metadata = state_file.lstat()
-        except FileNotFoundError:
-            continue
-        if (
-            stat.S_ISLNK(home_metadata.st_mode)
-            or not stat.S_ISDIR(home_metadata.st_mode)
-            or home_metadata.st_uid != uid
-            or stat.S_IMODE(home_metadata.st_mode) != 0o700
-            or stat.S_ISLNK(state_metadata.st_mode)
-            or not stat.S_ISREG(state_metadata.st_mode)
-            or state_metadata.st_uid != uid
-            or stat.S_IMODE(state_metadata.st_mode) != 0o600
-        ):
-            continue
-        safe.append(candidate)
-    return safe
-
-
-def bootstrap_legacy_import(
-    store: AccountStore,
-    *,
-    explicit_homes: list[str] | None = None,
-    backup_root: str | None = None,
-) -> dict[str, Any]:
-    candidates = discover_same_uid_legacy_homes(explicit_homes=explicit_homes)
-    reconciliation = store.reconcile_imported_legacy_conflicts()
-    with store.read_transaction() as connection:
-        imported_homes = {
-            str(row[0])
-            for row in connection.execute(
-                """
-                SELECT canonical_home FROM coordinator_sources
-                WHERE captured_sha256 IS NOT NULL AND status IN ('imported', 'retired')
-                """
-            )
-        }
-    pending = [
-        candidate for candidate in candidates if str(candidate) not in imported_homes
-    ]
-    if not pending:
-        return {
-            "attempted": bool(reconciliation.attempted),
-            "source_count": int(reconciliation.source_count),
-            "committed": bool(reconciliation.committed),
-            "conflict_count": int(reconciliation.conflict_count),
-            "blocking_conflict_count": int(reconciliation.blocking_conflict_count),
-            "reclassified_conflict_count": int(reconciliation.reclassified_count),
-            "destination_generation": reconciliation.destination_generation,
-            "late_writer_sources": list(store.detect_late_legacy_writers()),
-        }
-    root = (
-        Path(backup_root).expanduser().absolute()
-        if backup_root
-        else coordinator_home() / "legacy-import-backups"
-    )
-    report = store.import_legacy_homes(pending, root)
-    with store.read_transaction() as connection:
-        aggregate_conflicts = [
-            dict(row)
-            for row in connection.execute(
-                """
-                SELECT conflict_kind, severity FROM migration_conflicts
-                WHERE disposition='open'
-                ORDER BY conflict_kind, conflict_id
-                """
-            )
-        ]
-    return {
-        "attempted": True,
-        "committed": bool(report.committed),
-        "source_count": int(report.source_count) + int(reconciliation.source_count),
-        "repository_count": int(report.repository_count),
-        "missing_repository_count": int(report.missing_repository_count),
-        "unassigned_count": int(report.unassigned_count),
-        "exact_duplicate_count": int(report.exact_duplicate_count),
-        "conflict_count": len(aggregate_conflicts),
-        "blocking_conflict_count": sum(
-            1 for item in aggregate_conflicts if item["severity"] == "blocking"
-        ),
-        "conflict_kinds": sorted(
-            {str(item["conflict_kind"]) for item in aggregate_conflicts}
-        ),
-        "destination_generation": report.destination_generation,
-        "reclassified_conflict_count": int(reconciliation.reclassified_count),
-        "late_writer_sources": list(store.detect_late_legacy_writers()),
-    }
-
-
 def ensure_observation_host(store: AccountStore) -> str:
     """Create the local-host row only when it is actually absent."""
 
@@ -12301,10 +12158,6 @@ def coordinated_observe_host(options: dict[str, Any]) -> dict[str, Any]:
             account_scoped_options.append("--no-docker")
         if options.get("backup_dir"):
             account_scoped_options.append("--backup-dir")
-        if options.get("legacy_home"):
-            account_scoped_options.append("--legacy-home")
-        if options.get("legacy_backup_root"):
-            account_scoped_options.append("--legacy-backup-root")
         if account_scoped_options:
             raise ValueError(
                 "server-wide observation is one full-Docker broker snapshot and "
@@ -12376,11 +12229,6 @@ def coordinated_observe_host(options: dict[str, Any]) -> dict[str, Any]:
         }
         return response
     with AccountStore.open_default(coordinator_home()) as store:
-        imported = bootstrap_legacy_import(
-            store,
-            explicit_homes=options.get("legacy_home"),
-            backup_root=options.get("legacy_backup_root"),
-        )
         host_id = ensure_observation_host(store)
         include_docker = not bool(options.get("no_docker"))
         observer_domain = observation_domain_for_scope(
@@ -12468,7 +12316,6 @@ def coordinated_observe_host(options: dict[str, Any]) -> dict[str, Any]:
             "completed_at": outcome.completed_at,
             "max_age_seconds": max_age_seconds,
             "request": {"agent": agent, "project": project},
-            "imported": imported,
             "state_revision": int(metadata["state_revision"]),
             "observation_revision": int(metadata["observation_revision"]),
         }
@@ -18218,8 +18065,6 @@ def coordinated_runtime_dispatch(
                 "max_age_seconds": 0,
                 "no_docker": False,
                 "backup_dir": None,
-                "legacy_home": [],
-                "legacy_backup_root": None,
             }
         )
         start_inventory = coordinated_build_inventory()
@@ -19217,8 +19062,6 @@ def coordinated_runtime_request(
                             "max_age_seconds": 0,
                             "no_docker": False,
                             "backup_dir": None,
-                            "legacy_home": [],
-                            "legacy_backup_root": None,
                         }
                     ),
                     inventory=coordinated_build_inventory,
@@ -19875,15 +19718,6 @@ def build_parser() -> argparse.ArgumentParser:
     observe.add_argument("--backup-dir", action="append")
     observe.add_argument("--no-docker", action="store_true")
     observe.add_argument("--compact-json", action="store_true")
-    observe.add_argument(
-        "--legacy-home",
-        action="append",
-        help="explicit same-UID legacy coordinator home (migration/testing override)",
-    )
-    observe.add_argument(
-        "--legacy-backup-root",
-        help="private backup root outside Git for captured legacy state",
-    )
 
     state = sub.add_parser("state")
     state_sub = state.add_subparsers(dest="action", required=True)
@@ -20226,7 +20060,6 @@ def handle_cli(args: argparse.Namespace) -> Any:
             args,
             coordinator_home=coordinator_home(),
             canonical_project=canonical_project,
-            bootstrap_legacy_import=bootstrap_legacy_import,
             observe_before_plan=lambda project, agent: coordinated_observe_host(
                 {
                     "project": project,
@@ -20234,8 +20067,6 @@ def handle_cli(args: argparse.Namespace) -> Any:
                     "max_age_seconds": 0,
                     "no_docker": False,
                     "backup_dir": None,
-                    "legacy_home": [],
-                    "legacy_backup_root": None,
                 }
             ),
             observe_before_apply=lambda project, agent: coordinated_observe_host(
@@ -20245,8 +20076,6 @@ def handle_cli(args: argparse.Namespace) -> Any:
                     "max_age_seconds": 0,
                     "no_docker": False,
                     "backup_dir": None,
-                    "legacy_home": [],
-                    "legacy_backup_root": None,
                 }
             ),
             broker_profile_loader=configured_broker_profile,
@@ -22317,8 +22146,6 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
                             "max_age_seconds": 0,
                             "no_docker": False,
                             "backup_dir": None,
-                            "legacy_home": [],
-                            "legacy_backup_root": None,
                         }
                     ),
                 )

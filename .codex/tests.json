@@ -111,11 +111,13 @@
         "skills/codex-dev-coordinator/scripts/devcoordinator/broker*.py",
         "skills/codex-dev-coordinator/scripts/devcoordinator/events.py",
         "skills/codex-dev-coordinator/scripts/devcoordinator/maintenance.py",
+        "skills/codex-dev-coordinator/scripts/devcoordinator/retained_control.py",
         "skills/codex-dev-coordinator/scripts/devcoordinator/schema.py",
         "skills/codex-dev-coordinator/scripts/devcoordinator/store.py",
         "skills/codex-dev-coordinator/scripts/devcoordinator/tests/test_broker*.py",
         "skills/codex-dev-coordinator/scripts/devcoordinator/tests/test_maintenance.py",
-        "skills/codex-dev-coordinator/scripts/devcoordinator/tests/test_project_profile_revocation.py"
+        "skills/codex-dev-coordinator/scripts/devcoordinator/tests/test_project_profile_revocation.py",
+        "skills/codex-dev-coordinator/scripts/devcoordinator/tests/test_retained_control.py"
       ],
       "intents": [
         "change",
@@ -149,13 +151,11 @@
         "skills/codex-dev-coordinator/scripts/devcoordinator/events.py",
         "skills/codex-dev-coordinator/scripts/devcoordinator/schema.py",
         "skills/codex-dev-coordinator/scripts/devcoordinator/sqlite_lifecycle.py",
-        "skills/codex-dev-coordinator/scripts/devcoordinator/storage_split.py",
         "skills/codex-dev-coordinator/scripts/devcoordinator/store.py",
         "skills/codex-dev-coordinator/scripts/devcoordinator/store_backup.py",
         "skills/codex-dev-coordinator/scripts/devcoordinator/tests/test_database_backups.py",
         "skills/codex-dev-coordinator/scripts/devcoordinator/tests/test_docker_grouping_regressions.py",
         "skills/codex-dev-coordinator/scripts/devcoordinator/tests/test_ephemeral_*.py",
-        "skills/codex-dev-coordinator/scripts/devcoordinator/tests/test_storage_split.py",
         "skills/codex-dev-coordinator/scripts/devcoordinator/tests/test_store_backup.py"
       ],
       "intents": [
@@ -192,9 +192,7 @@
         "skills/codex-dev-coordinator/scripts/devcoordinator/host_*.py",
         "skills/codex-dev-coordinator/scripts/devcoordinator/image_publication.py",
         "skills/codex-dev-coordinator/scripts/devcoordinator/inventory_projection.py",
-        "skills/codex-dev-coordinator/scripts/devcoordinator/legacy_import.py",
         "skills/codex-dev-coordinator/scripts/devcoordinator/lifecycle_cli.py",
-        "skills/codex-dev-coordinator/scripts/devcoordinator/live_fault_*.py",
         "skills/codex-dev-coordinator/scripts/devcoordinator/normalized_server_lifecycle.py",
         "skills/codex-dev-coordinator/scripts/devcoordinator/observation_freshness.py",
         "skills/codex-dev-coordinator/scripts/devcoordinator/observer.py",
@@ -214,7 +212,6 @@
         "skills/codex-dev-coordinator/scripts/devcoordinator/tests/test_generic_lifecycle.py",
         "skills/codex-dev-coordinator/scripts/devcoordinator/tests/test_image_publication.py",
         "skills/codex-dev-coordinator/scripts/devcoordinator/tests/test_lifecycle_cli_apply_observation.py",
-        "skills/codex-dev-coordinator/scripts/devcoordinator/tests/test_live_fault_acceptance.py",
         "skills/codex-dev-coordinator/scripts/devcoordinator/tests/test_normalized_server_lifecycle.py",
         "skills/codex-dev-coordinator/scripts/devcoordinator/tests/test_observation_events.py",
         "skills/codex-dev-coordinator/scripts/devcoordinator/tests/test_observer.py",

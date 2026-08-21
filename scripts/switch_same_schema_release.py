@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Switch the production graph to one immutable current-format release.
 
-Retained control data stays at the fixed authority path. This routine release
-path deliberately refuses an incompatible authority schema; the separate
-retained-control rebaseline creates a fresh current database instead of
-carrying an in-place schema migration chain.
+Retained control data stays at the fixed authority path. An incompatible
+authority schema is replaced, while its writers are stopped, by the semantic
+allowlist in ``devcoordinator.retained_control``. No in-place migration chain
+or operational/test/history state crosses that boundary.
 
 The switch installs the immutable unit set, refreshes systemd identities and
 runtime directories, starts a second Console slot on two unused loopback
@@ -45,6 +45,7 @@ if str(SCRIPT_ROOT) not in sys.path:
 import browser_lcp_acceptance as browser_lcp  # noqa: E402
 import install_availability_release as installer  # noqa: E402
 from devcoordinator.schema import SCHEMA_VERSION as COORDINATOR_SCHEMA_VERSION  # noqa: E402
+from devcoordinator import retained_control  # noqa: E402
 
 
 KIND = "devcoordinator-same-schema-release-switch"
@@ -146,6 +147,17 @@ TEST_SPOOL_QUEUES = (
 SLOT_ROOT = Path("/etc/devcoordinator/console-slots")
 CLIENT_PROFILE = Path("/etc/devcoordinator/client-profiles.json")
 AUTHORITY_DATABASE = Path("/var/lib/devcoordinator/authority.sqlite3")
+CONSOLE_STATE_ROOT = Path("/var/lib/devcoordinator-console")
+AUTHORITY_WRITER_UNITS = (
+    "devcoordinator-testd.socket",
+    "devcoordinator-test-snapshotd.socket",
+    "devcoordinator-api.socket",
+    "devcoordinator-authority.socket",
+    "devcoordinator-testd.service",
+    "devcoordinator-test-snapshotd.service",
+    "devcoordinator-api.service",
+    "devcoordinator-authority.service",
+)
 PUBLICATION_FILE = Path("/var/lib/devcoordinator-edge/routes.publication")
 MAINTENANCE_ROOT = Path("/run/devcoordinator-maintenance")
 MAINTENANCE_MARKER = MAINTENANCE_ROOT / "maintenance.json"
@@ -253,6 +265,198 @@ def atomic_bytes(path: Path, payload: bytes, mode: int) -> None:
             os.close(parent)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def atomic_regular_copy(
+    source: Path,
+    destination: Path,
+    *,
+    mode: int,
+    expected_sha256: str | None = None,
+) -> dict[str, object]:
+    """Stream one stable no-follow file into an fsynced atomic replacement."""
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(
+        f".{destination.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+    )
+    source_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        source_descriptor = os.open(source, source_flags)
+    except OSError as error:
+        raise SwitchError(f"atomic copy source is unavailable: {source}: {error}") from error
+    try:
+        before = os.fstat(source_descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise SwitchError(f"atomic copy source is not a regular file: {source}")
+        target_descriptor = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+            mode,
+        )
+        digest = hashlib.sha256()
+        size = 0
+        try:
+            with os.fdopen(target_descriptor, "wb", closefd=True) as target:
+                while True:
+                    block = os.read(source_descriptor, 1024 * 1024)
+                    if not block:
+                        break
+                    target.write(block)
+                    digest.update(block)
+                    size += len(block)
+                target.flush()
+                os.fsync(target.fileno())
+            after = os.fstat(source_descriptor)
+            if (
+                before.st_dev,
+                before.st_ino,
+                before.st_size,
+                before.st_mtime_ns,
+            ) != (
+                after.st_dev,
+                after.st_ino,
+                after.st_size,
+                after.st_mtime_ns,
+            ) or size != before.st_size:
+                raise SwitchError(f"atomic copy source changed while reading: {source}")
+            observed_sha256 = digest.hexdigest()
+            if expected_sha256 is not None and observed_sha256 != expected_sha256:
+                raise SwitchError(f"atomic copy source digest changed: {source}")
+            os.chmod(temporary, mode)
+            os.replace(temporary, destination)
+            parent = os.open(
+                destination.parent,
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+            )
+            try:
+                os.fsync(parent)
+            finally:
+                os.close(parent)
+            return {
+                "sha256": observed_sha256,
+                "size": size,
+                "source_uid": before.st_uid,
+                "source_gid": before.st_gid,
+                "source_mode": stat.S_IMODE(before.st_mode),
+            }
+        finally:
+            temporary.unlink(missing_ok=True)
+    finally:
+        os.close(source_descriptor)
+
+
+def fsync_file_and_parent(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    parent = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(parent)
+    finally:
+        os.close(parent)
+
+
+def path_parent_identity(path: Path) -> dict[str, int | str]:
+    """Return one canonical, non-writable parent identity for a fixed path."""
+
+    if not path.is_absolute() or Path(os.path.abspath(path)) != path:
+        raise SwitchError(f"retained-control path is not canonical: {path}")
+    parent = path.parent
+    try:
+        info = parent.lstat()
+        resolved = parent.resolve(strict=True)
+    except OSError as error:
+        raise SwitchError(f"retained-control parent is unavailable: {parent}: {error}") from error
+    if (
+        resolved != parent
+        or stat.S_ISLNK(info.st_mode)
+        or not stat.S_ISDIR(info.st_mode)
+        or stat.S_IMODE(info.st_mode) & 0o022
+    ):
+        raise SwitchError(f"retained-control parent is unsafe: {parent}")
+    return {
+        "path": str(parent),
+        "device": info.st_dev,
+        "inode": info.st_ino,
+        "uid": info.st_uid,
+        "gid": info.st_gid,
+        "mode": stat.S_IMODE(info.st_mode),
+    }
+
+
+def exact_file_identity(path: Path) -> dict[str, object]:
+    parent = path_parent_identity(path)
+    try:
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except OSError as error:
+        raise SwitchError(f"retained-control file is unavailable: {path}: {error}") from error
+    digest = hashlib.sha256()
+    size = 0
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise SwitchError(f"retained-control file is not regular: {path}")
+        if (before.st_uid, before.st_gid) != (parent["uid"], parent["gid"]):
+            raise SwitchError(
+                f"retained-control file is not owned by its parent identity: {path}"
+            )
+        while True:
+            block = os.read(descriptor, 1024 * 1024)
+            if not block:
+                break
+            digest.update(block)
+            size += len(block)
+        after = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    if (
+        (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+        != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+        or size != before.st_size
+    ):
+        raise SwitchError(f"retained-control file changed while hashing: {path}")
+    return {
+        "path": str(path),
+        "present": True,
+        "sha256": digest.hexdigest(),
+        "bytes": size,
+        "mode": stat.S_IMODE(before.st_mode),
+        "uid": before.st_uid,
+        "gid": before.st_gid,
+        "device": before.st_dev,
+        "inode": before.st_ino,
+        "mtime_ns": before.st_mtime_ns,
+        "parent": parent,
+    }
+
+
+def require_parent_identity(path: Path, expected: object) -> None:
+    if not isinstance(expected, Mapping) or path_parent_identity(path) != dict(expected):
+        raise SwitchError(f"retained-control parent identity changed: {path.parent}")
+
+
+def fsync_parent(path: Path) -> None:
+    descriptor = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def unlink_regular_and_fsync(path: Path, *, parent_identity: object) -> None:
+    require_parent_identity(path, parent_identity)
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        fsync_parent(path)
+        return
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        raise SwitchError(f"retained-control unlink target is unsafe: {path}")
+    path.unlink()
+    fsync_parent(path)
 
 
 def load_json(path: Path) -> dict[str, object]:
@@ -1182,9 +1386,26 @@ def prepare(
         if existing.get("release") != str(release):
             raise SwitchError("same-schema transaction belongs to another release")
         require_test_history_reset_mode(existing, requested=reset_test_history)
+        retained_rebaseline_intent(existing)
         return existing
     current_unit, current_digest = active_console(runner)
     require_previous_current_format_release(release.parent / current_digest)
+    authority_schema = _authority_schema_version()
+    if authority_schema not in {
+        retained_control.REBASELINE_SOURCE_SCHEMA,
+        COORDINATOR_SCHEMA_VERSION,
+    }:
+        raise SwitchError("authority schema is outside the one reviewed 15 -> 16 rebaseline")
+    retained_rebaseline = {
+        "required": authority_schema != COORDINATOR_SCHEMA_VERSION,
+        "source_schema_version": authority_schema,
+        "target_schema_version": COORDINATOR_SCHEMA_VERSION,
+        "status": "planned",
+    }
+    if current_digest == release.name and retained_rebaseline["required"] is True:
+        raise SwitchError(
+            "an already-active release cannot perform the one-time retained-control rebaseline"
+        )
     current_slot = SLOT_ROOT / f"{current_digest}.env"
     if not current_slot.is_file() or current_slot.is_symlink():
         raise SwitchError("active Console slot configuration is unavailable")
@@ -1205,7 +1426,11 @@ def prepare(
         document = {
             "schema_version": VERSION,
             "kind": KIND,
-            "phase": "prepared" if reset_test_history else "applied",
+            "phase": (
+                "prepared"
+                if reset_test_history or retained_rebaseline["required"] is True
+                else "applied"
+            ),
             "release": str(release),
             "release_digest": release.name,
             "previous_release_digest": current_digest,
@@ -1232,12 +1457,13 @@ def prepare(
             "publication_switched": True,
             "already_active": True,
             "headless_browser_cleanup": browser_cleanup,
+            "retained_control_rebaseline": retained_rebaseline,
         }
         if reset_test_history:
             document["test_history_reset"] = test_history_reset_intent(
                 release, previous_release_digest=current_digest
             )
-        else:
+        if not reset_test_history and retained_rebaseline["required"] is not True:
             document["completed_at"] = now()
         atomic_json(transaction_root / "journal.json", document)
         return document
@@ -1283,6 +1509,7 @@ def prepare(
         "promoted": False,
         "publication_switched": False,
         "headless_browser_cleanup": browser_cleanup,
+        "retained_control_rebaseline": retained_rebaseline,
     }
     if reset_test_history:
         document["test_history_reset"] = test_history_reset_intent(
@@ -1368,15 +1595,731 @@ def _authority_schema_version(path: Path = AUTHORITY_DATABASE) -> int:
 
 
 def require_current_authority_schema() -> int:
-    """Refuse in-place upgrades; retained-control rebaseline owns incompatibility."""
+    """Require the current schema after any semantic retained-control rebaseline."""
 
     current = _authority_schema_version()
     if current != COORDINATOR_SCHEMA_VERSION:
         raise SwitchError(
-            "authority schema is incompatible with this release; run the "
-            "retained-control rebaseline instead of a same-schema switch"
+            "authority schema is incompatible after retained-control preparation"
         )
     return current
+
+
+def retained_rebaseline_intent(document: Mapping[str, object]) -> dict[str, object]:
+    raw = document.get("retained_control_rebaseline")
+    if (
+        not isinstance(raw, Mapping)
+        or type(raw.get("required")) is not bool
+        or type(raw.get("source_schema_version")) is not int
+        or raw.get("target_schema_version") != COORDINATOR_SCHEMA_VERSION
+        or raw.get("status")
+        not in {
+            "planned",
+            "backed-up",
+            "prepared",
+            "publishing",
+            "published",
+            "applied",
+            "rolled-back",
+        }
+    ):
+        raise SwitchError("retained-control rebaseline intent is invalid")
+    if raw["required"] is True:
+        if (
+            raw["source_schema_version"] != retained_control.REBASELINE_SOURCE_SCHEMA
+            or document.get("already_active") is True
+        ):
+            raise SwitchError("retained-control rebaseline is not an exact 15 -> 16 release switch")
+    elif raw["source_schema_version"] != COORDINATOR_SCHEMA_VERSION:
+        raise SwitchError("unneeded retained-control rebaseline has an incompatible source")
+    return dict(raw)
+
+
+def validate_retained_rebaseline_paths(
+    intent: Mapping[str, object],
+    transaction_root: Path,
+) -> None:
+    expected_backups = {
+        str(AUTHORITY_DATABASE): transaction_root
+        / "retained-control-backups/authority.sqlite3",
+        str(CLIENT_PROFILE): transaction_root
+        / "retained-control-backups/client-profiles.json",
+        **{
+            str(CONSOLE_STATE_ROOT / name): transaction_root
+            / "retained-control-backups"
+            / f"console-{name}"
+            for name in retained_control.CONSOLE_FILES
+        },
+    }
+    backups = intent.get("backups")
+    if backups is not None:
+        if not isinstance(backups, Mapping) or set(backups) != set(expected_backups):
+            raise SwitchError("retained-control backup destinations are invalid")
+        for destination, expected_backup in expected_backups.items():
+            evidence = backups[destination]
+            if not isinstance(evidence, Mapping) or type(evidence.get("existed")) is not bool:
+                raise SwitchError("retained-control backup evidence is invalid")
+            source = evidence.get("source")
+            if (
+                not isinstance(source, Mapping)
+                or source.get("path") != destination
+                or source.get("present") is not evidence["existed"]
+                or not isinstance(source.get("parent"), Mapping)
+            ):
+                raise SwitchError("retained-control source identity is invalid")
+            require_parent_identity(Path(destination), source["parent"])
+            if evidence["existed"] is True:
+                backup = evidence.get("backup")
+                if (
+                    set(evidence) != {"existed", "source", "backup"}
+                    or not isinstance(backup, Mapping)
+                    or Path(str(backup.get("path") or "")) != expected_backup
+                ):
+                    raise SwitchError("retained-control backup escaped its transaction")
+                if (
+                    re.fullmatch(r"[0-9a-f]{64}", str(source.get("sha256") or "")) is None
+                    or type(source.get("bytes")) is not int
+                    or int(source["bytes"]) <= 0
+                    or any(
+                        type(source.get(field)) is not int
+                        for field in ("mode", "uid", "gid", "device", "inode", "mtime_ns")
+                    )
+                    or exact_file_identity(expected_backup) != dict(backup)
+                    or backup.get("sha256") != source.get("sha256")
+                    or backup.get("bytes") != source.get("bytes")
+                    or backup.get("mode") != 0o600
+                    or backup.get("uid") != os.geteuid()
+                    or backup.get("gid") != os.getegid()
+                ):
+                    raise SwitchError("retained-control backup identity is invalid")
+            elif set(evidence) != {"existed", "source"} or set(source) != {
+                "path",
+                "present",
+                "parent",
+            }:
+                raise SwitchError("absent retained-control backup has extra evidence")
+    manifest = intent.get("manifest")
+    if manifest is not None and Path(str(manifest)) != transaction_root / "retained-control/retained-control.json":
+        raise SwitchError("retained-control manifest escaped its transaction")
+
+
+def stop_authority_writers(runner: Runner) -> None:
+    """Quiesce authority writers plus testd/snapshotd direct-generation readers."""
+
+    for unit in AUTHORITY_WRITER_UNITS:
+        runner.require(["/usr/bin/systemctl", "stop", unit], f"stop authority writer {unit}")
+    active = [unit for unit in AUTHORITY_WRITER_UNITS if unit_active(runner, unit)]
+    if active:
+        raise SwitchError("authority writers did not stop: " + ", ".join(active))
+
+
+def stop_console_writers(document: Mapping[str, object], runner: Runner) -> None:
+    units = {
+        str(document.get("previous_console_unit") or ""),
+        str(document.get("candidate_console_unit") or ""),
+    }
+    units.discard("")
+    for unit in sorted(units):
+        if not re.fullmatch(r"devcoordinator-console@[0-9a-f]{64}\.service", unit):
+            raise SwitchError("retained-control Console writer identity is invalid")
+        runner.require(["/usr/bin/systemctl", "stop", unit], f"stop Console writer {unit}")
+    active = [unit for unit in sorted(units) if unit_active(runner, unit)]
+    if active:
+        raise SwitchError("Console writers did not stop: " + ", ".join(active))
+
+
+def _checkpoint_authority_database() -> None:
+    try:
+        connection = sqlite3.connect(str(AUTHORITY_DATABASE), timeout=10.0)
+        try:
+            result = connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+        finally:
+            connection.close()
+    except sqlite3.Error as error:
+        raise SwitchError(f"authority checkpoint failed: {error}") from error
+    if result is None or tuple(int(value) for value in result) != (0, 0, 0):
+        raise SwitchError("authority checkpoint did not quiesce every WAL frame")
+
+
+def _backup_exact_file(
+    source: Path,
+    destination: Path,
+    *,
+    required: bool,
+) -> dict[str, object]:
+    parent = path_parent_identity(source)
+    try:
+        info = source.lstat()
+    except FileNotFoundError:
+        if required:
+            raise SwitchError(f"required retained-control source is missing: {source}")
+        return {
+            "existed": False,
+            "source": {"path": str(source), "present": False, "parent": parent},
+        }
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        raise SwitchError(f"retained-control source is not a regular file: {source}")
+    source_identity = exact_file_identity(source)
+    destination_parent = path_parent_identity(destination)
+    if destination_parent["uid"] != os.geteuid() or destination_parent["mode"] != 0o700:
+        raise SwitchError("retained-control backup parent is not private")
+    copied = atomic_regular_copy(source, destination, mode=0o600)
+    if exact_file_identity(source) != source_identity:
+        raise SwitchError(f"retained-control source changed while backing up: {source}")
+    backup_identity = exact_file_identity(destination)
+    if (
+        backup_identity["sha256"] != copied["sha256"]
+        or backup_identity["bytes"] != copied["size"]
+        or backup_identity["mode"] != 0o600
+        or backup_identity["uid"] != os.geteuid()
+        or backup_identity["gid"] != os.getegid()
+    ):
+        raise SwitchError("retained-control exact backup identity is invalid")
+    return {
+        "existed": True,
+        "source": source_identity,
+        "backup": backup_identity,
+    }
+
+
+def _retained_backup_destinations(transaction_root: Path) -> dict[str, dict[str, object]]:
+    root = transaction_root / "retained-control-backups"
+    root.mkdir(mode=0o700, exist_ok=True)
+    info = root.lstat()
+    if (
+        stat.S_ISLNK(info.st_mode)
+        or not stat.S_ISDIR(info.st_mode)
+        or info.st_uid != 0
+        or stat.S_IMODE(info.st_mode) != 0o700
+    ):
+        raise SwitchError("retained-control backup root is not root-owned mode 0700")
+    sources = {
+        AUTHORITY_DATABASE: (root / "authority.sqlite3", True),
+        CLIENT_PROFILE: (root / "client-profiles.json", True),
+        **{
+            CONSOLE_STATE_ROOT / name: (root / f"console-{name}", False)
+            for name in retained_control.CONSOLE_FILES
+        },
+    }
+    return {
+        str(source): _backup_exact_file(source, backup, required=required)
+        for source, (backup, required) in sources.items()
+    }
+
+
+def _publish_owned_file(
+    destination: Path,
+    payload: bytes,
+    evidence: Mapping[str, object],
+) -> None:
+    source_identity = evidence.get("source")
+    if not isinstance(source_identity, Mapping):
+        raise SwitchError("retained-control source identity is invalid")
+    require_parent_identity(destination, source_identity.get("parent"))
+    if evidence.get("existed") is not True:
+        # Newly introduced current-format Console files inherit the fixed
+        # service state directory identity.
+        parent = path_parent_identity(destination)
+        uid, gid, mode = int(parent["uid"]), int(parent["gid"]), 0o600
+    else:
+        try:
+            uid = int(source_identity["uid"])
+            gid = int(source_identity["gid"])
+            mode = int(source_identity["mode"])
+        except (KeyError, TypeError, ValueError) as error:
+            raise SwitchError("retained-control ownership evidence is invalid") from error
+    atomic_bytes(destination, payload, mode)
+    os.chown(destination, uid, gid)
+    os.chmod(destination, mode)
+    fsync_file_and_parent(destination)
+    current = exact_file_identity(destination)
+    if (
+        current["sha256"] != hashlib.sha256(payload).hexdigest()
+        or current["bytes"] != len(payload)
+        or (current["uid"], current["gid"], current["mode"]) != (uid, gid, mode)
+    ):
+        raise SwitchError("retained-control publication identity is invalid")
+
+
+def _publish_owned_copy(
+    destination: Path,
+    source: Path,
+    evidence: Mapping[str, object],
+    *,
+    expected_sha256: str,
+) -> None:
+    source_identity = evidence.get("source")
+    if not isinstance(source_identity, Mapping):
+        raise SwitchError("retained-control source identity is invalid")
+    require_parent_identity(destination, source_identity.get("parent"))
+    if evidence.get("existed") is True:
+        try:
+            uid = int(source_identity["uid"])
+            gid = int(source_identity["gid"])
+            mode = int(source_identity["mode"])
+        except (KeyError, TypeError, ValueError) as error:
+            raise SwitchError("retained-control ownership evidence is invalid") from error
+    elif evidence.get("existed") is False:
+        parent = path_parent_identity(destination)
+        uid, gid, mode = int(parent["uid"]), int(parent["gid"]), 0o600
+    else:
+        raise SwitchError("retained-control destination existence evidence is invalid")
+    copied = atomic_regular_copy(
+        source,
+        destination,
+        mode=mode,
+        expected_sha256=expected_sha256,
+    )
+    os.chown(destination, uid, gid)
+    os.chmod(destination, mode)
+    fsync_file_and_parent(destination)
+    current = exact_file_identity(destination)
+    if (
+        current["sha256"] != expected_sha256
+        or current["bytes"] != copied["size"]
+        or (current["uid"], current["gid"], current["mode"]) != (uid, gid, mode)
+    ):
+        raise SwitchError("streamed retained-control publication identity is invalid")
+
+
+def _restore_exact_file(destination: Path, evidence: Mapping[str, object]) -> None:
+    if evidence.get("existed") is False:
+        source = evidence.get("source")
+        if not isinstance(source, Mapping):
+            raise SwitchError("retained-control absent rollback identity is invalid")
+        unlink_regular_and_fsync(destination, parent_identity=source.get("parent"))
+        return
+    if evidence.get("existed") is not True:
+        raise SwitchError("retained-control rollback evidence is invalid")
+    backup_identity = evidence.get("backup")
+    if not isinstance(backup_identity, Mapping):
+        raise SwitchError("retained-control rollback backup identity is invalid")
+    backup = Path(str(backup_identity.get("path") or ""))
+    if exact_file_identity(backup) != dict(backup_identity):
+        raise SwitchError("retained-control rollback backup is unavailable")
+    expected = backup_identity.get("sha256")
+    if not isinstance(expected, str) or re.fullmatch(r"[0-9a-f]{64}", expected) is None:
+        raise SwitchError("retained-control rollback digest is invalid")
+    _publish_owned_copy(
+        destination,
+        backup,
+        evidence,
+        expected_sha256=expected,
+    )
+
+
+def _unlink_authority_sidecars(database_evidence: Mapping[str, object]) -> None:
+    source = database_evidence.get("source")
+    if not isinstance(source, Mapping):
+        raise SwitchError("authority rollback identity is unavailable")
+    parent = source.get("parent")
+    for sidecar in (Path(f"{AUTHORITY_DATABASE}-wal"), Path(f"{AUTHORITY_DATABASE}-shm")):
+        unlink_regular_and_fsync(sidecar, parent_identity=parent)
+
+
+def _restore_retained_files(backups: Mapping[str, object]) -> None:
+    database = backups.get(str(AUTHORITY_DATABASE))
+    if not isinstance(database, Mapping):
+        raise SwitchError("retained-control database backup is unavailable")
+    _unlink_authority_sidecars(database)
+    for destination in (
+        AUTHORITY_DATABASE,
+        CLIENT_PROFILE,
+        *(CONSOLE_STATE_ROOT / name for name in retained_control.CONSOLE_FILES),
+    ):
+        evidence = backups.get(str(destination))
+        if not isinstance(evidence, Mapping):
+            raise SwitchError("retained-control rollback evidence is incomplete")
+        _restore_exact_file(destination, evidence)
+
+
+def _validate_manifest_backup_binding(
+    manifest: Mapping[str, object], backups: Mapping[str, object]
+) -> None:
+    source = manifest.get("source")
+    if (
+        not isinstance(source, Mapping)
+        or source.get("schema_version") != retained_control.REBASELINE_SOURCE_SCHEMA
+    ):
+        raise SwitchError("retained-control source manifest is invalid")
+    database = backups.get(str(AUTHORITY_DATABASE))
+    profile = backups.get(str(CLIENT_PROFILE))
+    if (
+        not isinstance(database, Mapping)
+        or not isinstance(profile, Mapping)
+        or source.get("database") != database.get("source")
+        or source.get("profile") != profile.get("source")
+    ):
+        raise SwitchError("retained-control source is not bound to its exact backups")
+    console_sources = manifest.get("console_sources")
+    if not isinstance(console_sources, Mapping) or set(console_sources) != set(
+        retained_control.CONSOLE_FILES
+    ):
+        raise SwitchError("retained Console source manifest is invalid")
+    for name in retained_control.CONSOLE_FILES:
+        evidence = backups.get(str(CONSOLE_STATE_ROOT / name))
+        if not isinstance(evidence, Mapping) or console_sources[name] != evidence.get("source"):
+            raise SwitchError("retained Console source is not bound to its exact backup")
+
+
+def _load_bound_retained_manifest(
+    intent: Mapping[str, object],
+    transaction_root: Path,
+    backups: Mapping[str, object],
+) -> dict[str, object]:
+    manifest_path = Path(str(intent.get("manifest") or ""))
+    if manifest_path != transaction_root / "retained-control/retained-control.json":
+        raise SwitchError("retained-control manifest escaped its transaction")
+    manifest = load_json(manifest_path)
+    unsigned = dict(manifest)
+    claimed_digest = unsigned.pop("document_sha256", None)
+    if (
+        manifest.get("schema_version") != retained_control.VERSION
+        or manifest.get("kind") != retained_control.KIND
+        or claimed_digest != intent.get("document_sha256")
+        or not isinstance(claimed_digest, str)
+        or hashlib.sha256(canonical(unsigned)).hexdigest() != claimed_digest
+    ):
+        raise SwitchError("retained-control manifest digest is invalid")
+    target = manifest.get("target")
+    if (
+        not isinstance(target, Mapping)
+        or target.get("schema_version") != COORDINATOR_SCHEMA_VERSION
+    ):
+        raise SwitchError("retained-control target is invalid")
+    output_root = transaction_root / "retained-control"
+    target_database = target.get("database")
+    target_profile = target.get("profile")
+    if not isinstance(target_database, Mapping) or not isinstance(target_profile, Mapping):
+        raise SwitchError("retained-control staged target identities are invalid")
+    if (
+        Path(str(target_database.get("path") or "")) != output_root / "authority.sqlite3"
+        or Path(str(target_profile.get("path") or ""))
+        != output_root / "client-profiles.json"
+        or exact_file_identity(Path(str(target_database["path"]))) != dict(target_database)
+        or exact_file_identity(Path(str(target_profile["path"]))) != dict(target_profile)
+    ):
+        raise SwitchError("retained-control staged target changed")
+    console_files = manifest.get("console_files")
+    if not isinstance(console_files, Mapping) or set(console_files) != set(
+        retained_control.CONSOLE_FILES
+    ):
+        raise SwitchError("retained Console staged evidence is invalid")
+    for name in retained_control.CONSOLE_FILES:
+        evidence = console_files[name]
+        staged = output_root / "console" / name
+        if (
+            not isinstance(evidence, Mapping)
+            or exact_file_identity(staged)["sha256"] != evidence.get("sha256")
+            or exact_file_identity(staged)["bytes"] != evidence.get("bytes")
+        ):
+            raise SwitchError("retained Console staged target changed")
+    _validate_manifest_backup_binding(manifest, backups)
+    return manifest
+
+
+def _require_exact_live_retained_target(
+    manifest: Mapping[str, object], backups: Mapping[str, object]
+) -> None:
+    target = manifest.get("target")
+    console_files = manifest.get("console_files")
+    if not isinstance(target, Mapping) or not isinstance(console_files, Mapping):
+        raise SwitchError("retained-control target evidence is unavailable")
+    expected: tuple[tuple[Path, Mapping[str, object]], ...] = (
+        (AUTHORITY_DATABASE, target["database"]),
+        (CLIENT_PROFILE, target["profile"]),
+        *tuple(
+            (CONSOLE_STATE_ROOT / name, console_files[name])
+            for name in retained_control.CONSOLE_FILES
+        ),
+    )
+    for destination, staged in expected:
+        backup = backups.get(str(destination))
+        if not isinstance(staged, Mapping) or not isinstance(backup, Mapping):
+            raise SwitchError("retained-control live target evidence is incomplete")
+        current = exact_file_identity(destination)
+        source = backup.get("source")
+        if not isinstance(source, Mapping):
+            raise SwitchError("retained-control source ownership is unavailable")
+        desired_owner = (
+            (source.get("uid"), source.get("gid"), source.get("mode"))
+            if backup.get("existed") is True
+            else (
+                source["parent"]["uid"],
+                source["parent"]["gid"],
+                0o600,
+            )
+        )
+        if (
+            current.get("sha256") != staged.get("sha256")
+            or current.get("bytes") != staged.get("bytes")
+            or (current.get("uid"), current.get("gid"), current.get("mode"))
+            != desired_owner
+        ):
+            raise SwitchError(f"retained-control live target changed: {destination}")
+    require_current_authority_schema()
+
+
+def _require_live_retained_generation(manifest: Mapping[str, object]) -> None:
+    target = manifest.get("target")
+    if not isinstance(target, Mapping):
+        raise SwitchError("retained-control target generation is unavailable")
+    generation = target.get("database_generation")
+    if not isinstance(generation, str) or not generation:
+        raise SwitchError("retained-control target generation is invalid")
+    try:
+        connection = sqlite3.connect(f"{AUTHORITY_DATABASE.as_uri()}?mode=ro", uri=True)
+        try:
+            connection.execute("PRAGMA query_only=ON")
+            row = connection.execute(
+                "SELECT schema_version,database_generation FROM schema_metadata WHERE singleton=1"
+            ).fetchone()
+        finally:
+            connection.close()
+    except sqlite3.Error as error:
+        raise SwitchError(f"published retained authority is unreadable: {error}") from error
+    if row != (COORDINATOR_SCHEMA_VERSION, generation):
+        raise SwitchError("published retained authority has another schema or generation")
+    raw_profile, _profile_identity = retained_control._read_console(CLIENT_PROFILE, {})
+    if not isinstance(raw_profile, Mapping):
+        raise SwitchError("published retained profile is invalid")
+    profile = raw_profile
+    service = profile.get("service")
+    if (
+        profile.get("version") != 2
+        or not isinstance(service, Mapping)
+        or service.get("database_generation") != generation
+    ):
+        raise SwitchError("published retained profile has another authority generation")
+    raw_routes, _routes_identity = retained_control._read_console(
+        CONSOLE_STATE_ROOT / "routes.json", {"version": 1, "routes": {}}
+    )
+    routes = retained_control._validate_console_routes(raw_routes)
+    raw_access, _access_identity = retained_control._read_console(
+        CONSOLE_STATE_ROOT / "access-control.json",
+        {"version": 3, "users": {}, "requests": {}},
+    )
+    retained_control._validate_console_access(raw_access, routes["routes"])
+    raw_prefs, _prefs_identity = retained_control._read_console(
+        CONSOLE_STATE_ROOT / "ui-prefs.json",
+        {"version": 1, "hidden": {"servers": [], "docker": [], "projects": []}},
+    )
+    retained_control._validate_console_prefs(raw_prefs)
+
+
+def apply_retained_control_rebaseline(
+    document: dict[str, object],
+    journal_path: Path,
+    transaction_root: Path,
+    runner: Runner,
+) -> dict[str, object]:
+    intent = retained_rebaseline_intent(document)
+    validate_retained_rebaseline_paths(intent, transaction_root)
+    if intent["required"] is not True:
+        return intent
+    if intent["status"] in {"published", "applied"}:
+        backups = intent.get("backups")
+        if not isinstance(backups, Mapping):
+            raise SwitchError("applied retained-control transaction lost its backups")
+        manifest = _load_bound_retained_manifest(intent, transaction_root, backups)
+        _require_live_retained_generation(manifest)
+        return intent
+
+    stop_authority_writers(runner)
+    stop_console_writers(document, runner)
+    if intent["status"] == "planned":
+        _checkpoint_authority_database()
+        backups = _retained_backup_destinations(transaction_root)
+        intent.update({"status": "backed-up", "backups": backups, "backed_up_at": now()})
+        document["retained_control_rebaseline"] = intent
+        save_phase(journal_path, document, "applying")
+        validate_retained_rebaseline_paths(intent, transaction_root)
+    backups = intent.get("backups")
+    if not isinstance(backups, Mapping):
+        raise SwitchError("retained-control backups are unavailable")
+
+    output_root = transaction_root / "retained-control"
+    if intent["status"] == "backed-up":
+        try:
+            prepared = retained_control.prepare_rebaseline(
+                source_database=AUTHORITY_DATABASE,
+                source_profile=CLIENT_PROFILE,
+                console_state_root=CONSOLE_STATE_ROOT,
+                output_root=output_root,
+                expected_uid=0,
+            )
+        except retained_control.RetainedControlError as error:
+            raise SwitchError(f"retained-control preparation failed: {error}") from error
+        intent.update(
+            {
+                "status": "prepared",
+                "manifest": str(output_root / "retained-control.json"),
+                "document_sha256": prepared["document_sha256"],
+                "target_database_generation": prepared["target"]["database_generation"],
+                "prepared_at": now(),
+            }
+        )
+        document["retained_control_rebaseline"] = intent
+        save_phase(journal_path, document, "applying")
+        validate_retained_rebaseline_paths(intent, transaction_root)
+
+    manifest = _load_bound_retained_manifest(intent, transaction_root, backups)
+    target = manifest.get("target")
+    if not isinstance(target, Mapping):
+        raise SwitchError("retained-control target is invalid")
+    target_database_evidence = target.get("database")
+    target_profile_evidence = target.get("profile")
+    if not isinstance(target_database_evidence, Mapping) or not isinstance(
+        target_profile_evidence, Mapping
+    ):
+        raise SwitchError("retained-control staged target identities are invalid")
+    target_database = Path(str(target_database_evidence["path"]))
+    target_profile = Path(str(target_profile_evidence["path"]))
+    database_backup = backups.get(str(AUTHORITY_DATABASE))
+    profile_backup = backups.get(str(CLIENT_PROFILE))
+    if not isinstance(database_backup, Mapping) or not isinstance(profile_backup, Mapping):
+        raise SwitchError("retained-control exact backups are incomplete")
+    intent.update({"status": "publishing", "publishing_at": now()})
+    document["retained_control_rebaseline"] = intent
+    save_phase(journal_path, document, "applying")
+    try:
+        # Always converge from the exact predecessor first.  This makes an
+        # interrupted partial publish replayable even when the journal update
+        # immediately after one os.replace never reached disk.
+        _restore_retained_files(backups)
+        _publish_owned_copy(
+            AUTHORITY_DATABASE,
+            target_database,
+            database_backup,
+            expected_sha256=str(target_database_evidence["sha256"]),
+        )
+        _publish_owned_copy(
+            CLIENT_PROFILE,
+            target_profile,
+            profile_backup,
+            expected_sha256=str(target_profile_evidence["sha256"]),
+        )
+        console_evidence = manifest.get("console_files")
+        if not isinstance(console_evidence, Mapping):
+            raise SwitchError("retained Console target evidence is unavailable")
+        for name in retained_control.CONSOLE_FILES:
+            destination = CONSOLE_STATE_ROOT / name
+            evidence = backups.get(str(destination))
+            staged = output_root / "console" / name
+            if not isinstance(evidence, Mapping):
+                raise SwitchError("retained Console backup evidence is incomplete")
+            _publish_owned_copy(
+                destination,
+                staged,
+                evidence,
+                expected_sha256=str(console_evidence[name]["sha256"]),
+            )
+        _require_exact_live_retained_target(manifest, backups)
+    except BaseException as error:
+        try:
+            _restore_retained_files(backups)
+            intent.update({"status": "prepared", "publication_recovered_at": now()})
+            document["retained_control_rebaseline"] = intent
+            save_phase(journal_path, document, "applying")
+        except BaseException as rollback_error:
+            raise SwitchError(
+                "retained-control publication and exact rollback both failed: "
+                f"publish={error}; rollback={rollback_error}"
+            ) from rollback_error
+        raise SwitchError(
+            f"retained-control publication failed and exact files were restored: {error}"
+        ) from error
+    intent.update({"status": "published", "published_at": now()})
+    document["retained_control_rebaseline"] = intent
+    save_phase(journal_path, document, "applying")
+    return intent
+
+
+def complete_retained_control_rebaseline(
+    document: dict[str, object],
+    journal_path: Path,
+    transaction_root: Path,
+) -> dict[str, object]:
+    intent = retained_rebaseline_intent(document)
+    if intent["required"] is not True:
+        return intent
+    if intent["status"] not in {"published", "applied"}:
+        raise SwitchError("retained-control services started before publication completed")
+    backups = intent.get("backups")
+    if not isinstance(backups, Mapping):
+        raise SwitchError("retained-control completion lost its exact backups")
+    manifest = _load_bound_retained_manifest(intent, transaction_root, backups)
+    _require_live_retained_generation(manifest)
+    if intent["status"] == "published":
+        intent.update({"status": "applied", "applied_at": now()})
+        document["retained_control_rebaseline"] = intent
+        save_phase(journal_path, document, "applying")
+    return intent
+
+
+def restore_retained_control_rebaseline(
+    document: dict[str, object],
+    journal_path: Path,
+    transaction_root: Path,
+    runner: Runner,
+) -> None:
+    intent = retained_rebaseline_intent(document)
+    validate_retained_rebaseline_paths(intent, transaction_root)
+    if intent["required"] is not True or intent["status"] in {"planned", "rolled-back"}:
+        return
+    backups = intent.get("backups")
+    if not isinstance(backups, Mapping):
+        raise SwitchError("retained-control rollback backups are unavailable")
+    stop_authority_writers(runner)
+    stop_console_writers(document, runner)
+    _restore_retained_files(backups)
+    intent.update({"status": "rolled-back", "rolled_back_at": now()})
+    document["retained_control_rebaseline"] = intent
+    save_phase(journal_path, document, "rollback-retained-control-restored")
+
+
+def restart_previous_console(
+    release: Path,
+    document: Mapping[str, object],
+    runner: Runner,
+) -> None:
+    unit = str(document.get("previous_console_unit") or "")
+    control = str(document.get("previous_control_socket") or "")
+    if re.fullmatch(r"devcoordinator-console@[0-9a-f]{64}\.service", unit) is None:
+        raise SwitchError("previous Console restart identity is invalid")
+    runner.require(["/usr/bin/systemctl", "enable", "--now", unit], "restore active Console")
+    status = wait_slot_status(
+        runner,
+        release,
+        control,
+        unit,
+        "restored active Console status",
+    )
+    if status.get("mode") == "standby":
+        runner.require_json(
+            [
+                str(release / "bin/devcoordinator-console-slot-control"),
+                "promote",
+                "--socket",
+                control,
+                "--timeout-seconds",
+                "30",
+            ],
+            "restored active Console promotion",
+        )
+        status = wait_slot_status(
+            runner,
+            release,
+            control,
+            unit,
+            "promoted active Console status",
+        )
+    if status.get("mode") != "active":
+        raise SwitchError("restarted already-active Console is not active")
+    require_probe(
+        direct_https_health(int(document["previous_outer_port"]), "/healthz"),
+        "restarted already-active Console health",
+    )
 
 
 def restart_services(runner: Runner) -> None:
@@ -2172,10 +3115,17 @@ def apply(
     reset = require_test_history_reset_mode(
         document, requested=reset_test_history
     )
+    rebaseline = retained_rebaseline_intent(document)
     if document.get("phase") == "applied":
         validate_headless_browser_cleanup_plan(document, release)
         if reset is not None and reset.get("status") != "complete":
             raise SwitchError("applied same-schema reset lacks completion evidence")
+        if rebaseline["required"] is True and rebaseline["status"] != "applied":
+            raise SwitchError("applied release lacks retained-control rebaseline evidence")
+        if rebaseline["required"] is True:
+            apply_retained_control_rebaseline(
+                document, journal_path, transaction_root, runner
+            )
         return document
     if document.get("phase") not in {"prepared", "applying"}:
         raise SwitchError("same-schema journal cannot be applied from this phase")
@@ -2189,8 +3139,16 @@ def apply(
         save_phase(journal_path, document, "applied", completed_at=now())
         return document
 
+    candidate = str(document["candidate_console_unit"])
+    candidate_already_active = unit_active(runner, candidate)
+    if (
+        candidate_already_active
+        and rebaseline["required"] is True
+        and rebaseline["status"] != "applied"
+    ):
+        raise SwitchError("active candidate predates retained-control completion")
     ports = [int(document["candidate_outer_port"]), int(document["candidate_inner_port"])]
-    reservations = bind_exact_ports(ports)
+    reservations = [] if candidate_already_active else bind_exact_ports(ports)
     try:
         if not document.get("backups"):
             document["backups"] = backup_destinations(document, transaction_root)
@@ -2218,13 +3176,18 @@ def apply(
             journal_path,
             runner,
         )
+        apply_retained_control_rebaseline(
+            document, journal_path, transaction_root, runner
+        )
         require_current_authority_schema()
         restart_services(runner)
+        complete_retained_control_rebaseline(
+            document, journal_path, transaction_root
+        )
     finally:
         for listener in reservations:
             listener.close()
 
-    candidate = str(document["candidate_console_unit"])
     previous = str(document["previous_console_unit"])
     candidate_control = str(document["candidate_control_socket"])
     previous_control = str(document["previous_control_socket"])
@@ -2340,11 +3303,24 @@ def verify(
     document = load_journal(transaction_root / "journal.json")
     if document is None or document.get("release") != str(release):
         raise SwitchError("same-schema switch journal is unavailable")
+    if document.get("phase") != "applied":
+        raise SwitchError("same-schema switch is not applied")
     reset = require_test_history_reset_mode(
         document, requested=reset_test_history
     )
     if reset is not None and reset.get("status") != "complete":
         raise SwitchError("same-schema test-history reset is incomplete")
+    rebaseline = retained_rebaseline_intent(document)
+    if rebaseline["required"] is True and rebaseline["status"] != "applied":
+        raise SwitchError("retained-control rebaseline is incomplete")
+    if rebaseline["required"] is True:
+        backups = rebaseline.get("backups")
+        if not isinstance(backups, Mapping):
+            raise SwitchError("retained-control verification lost its exact backups")
+        validate_retained_rebaseline_paths(rebaseline, transaction_root)
+        manifest = _load_bound_retained_manifest(rebaseline, transaction_root, backups)
+        _require_live_retained_generation(manifest)
+    authority_schema = require_current_authority_schema()
     units = [*SERVICE_ORDER, *REQUIRED_SOCKETS, str(document["candidate_console_unit"])]
     states = {unit: unit_active(runner, unit) for unit in units}
     enabled_states = {unit: unit_enabled(runner, unit) for unit in units}
@@ -2489,6 +3465,7 @@ def verify(
         and all(bool(item["ok"]) for item in installed_client_access.values())
         and launcher_healthy
         and all(bool(item["ok"]) for item in codex_directories.values())
+        and authority_schema == COORDINATOR_SCHEMA_VERSION
     )
     result = {
         "ok": ok,
@@ -2534,6 +3511,8 @@ def verify(
         },
         "codex_rule_directories": codex_directories,
         "test_history_reset": dict(reset) if reset is not None else None,
+        "retained_control_rebaseline": rebaseline,
+        "authority_schema_version": authority_schema,
     }
     return result
 
@@ -2569,6 +3548,14 @@ def rollback(
         }:
             reset_test_history_for_rollback(document, journal_path, runner)
             restart_test_plane(runner)
+        rebaseline = retained_rebaseline_intent(document)
+        if rebaseline["required"] is True:
+            if rebaseline["status"] not in {"planned", "rolled-back"}:
+                restore_retained_control_rebaseline(
+                    document, journal_path, transaction_root, runner
+                )
+            restart_services(runner)
+            restart_previous_console(release, document, runner)
         save_phase(journal_path, document, "rolled-back", completed_at=now())
         return document
 
@@ -2589,89 +3576,13 @@ def rollback(
     if not live_is_candidate and not live_is_previous:
         raise SwitchError("rollback found an unknown edge Console target")
 
-    # If the edge still serves the previous slot, retire the failed candidate
-    # first. Older unit revisions shared one RuntimeDirectory and could remove
-    # the previous control socket while stopping; the exact previous restart
-    # below recreates it without guessing process identity.
-    if live_is_previous and unit_active(runner, candidate):
-        runner.run(["/usr/bin/systemctl", "stop", candidate])
-        runner.run(["/usr/bin/systemctl", "disable", candidate])
-
-    runner.require(
-        ["/usr/bin/systemctl", "restart", previous],
-        "previous Console control recovery",
+    # Restore the schema-15 data before any previous binary or Console writer
+    # is allowed to start.  This also converges a crash after any one of the
+    # five retained files was replaced.
+    stop_console_writers(document, runner)
+    restore_retained_control_rebaseline(
+        document, journal_path, transaction_root, runner
     )
-    try:
-        previous_status = wait_slot_status(
-            runner,
-            release,
-            previous_control,
-            previous,
-            "previous Console status",
-            timeout_seconds=2,
-        )
-    except SwitchError:
-        previous_status = wait_slot_status(
-            runner,
-            release,
-            previous_control,
-            previous,
-            "previous Console status",
-        )
-    if previous_status.get("mode") != "active":
-        promotion = [
-            str(release / "bin/devcoordinator-console-slot-control"),
-            "promote",
-            "--socket",
-            previous_control,
-            "--timeout-seconds",
-            "30",
-        ]
-        if live_is_candidate:
-            promotion.extend(["--old-socket", candidate_control])
-        runner.require_json(promotion, "previous Console promotion")
-    if live_is_candidate:
-        switch_publication(
-            runner,
-            release,
-            digest=str(document["previous_release_digest"]),
-            port=int(document["previous_outer_port"]),
-        )
-    require_probe(
-        direct_https_health(int(document["previous_outer_port"]), "/healthz"),
-        "restored Console direct health",
-    )
-    require_probe(http_health("https://console.vr.ae/healthz", 8.0), "restored public Console health")
-    if unit_active(runner, candidate):
-        runner.run(["/usr/bin/systemctl", "stop", candidate])
-        runner.run(["/usr/bin/systemctl", "disable", candidate])
-        # A legacy candidate stop may have removed the shared directory after
-        # publication was restored. Recreate and re-probe the old slot before
-        # declaring rollback complete.
-        runner.require(
-            ["/usr/bin/systemctl", "restart", previous],
-            "previous Console post-candidate recovery",
-        )
-        previous_status = wait_slot_status(
-            runner,
-            release,
-            previous_control,
-            previous,
-            "previous Console status",
-        )
-        if previous_status.get("mode") != "active":
-            runner.require_json(
-                [
-                    str(release / "bin/devcoordinator-console-slot-control"),
-                    "promote",
-                    "--socket",
-                    previous_control,
-                    "--timeout-seconds",
-                    "30",
-                ],
-                "previous Console promotion",
-            )
-
     restore_destination_backups(backups)
     directory_states = document.get("codex_directory_states")
     if not isinstance(directory_states, Mapping):
@@ -2687,6 +3598,11 @@ def rollback(
         reset_test_history_for_rollback(document, journal_path, runner)
     normalize_local_paths(runner)
     restore_rollback_control_plane(runner)
+
+    # Both Console writers were stopped by retained-data restoration. Start
+    # only the exact previous instance after the old units and authority are
+    # coherent, then return the edge publication to it.
+    runner.run(["/usr/bin/systemctl", "disable", candidate])
     runner.require(["/usr/bin/systemctl", "enable", "--now", previous], "previous Console restore")
     final_status = wait_slot_status(
         runner,
@@ -2696,7 +3612,31 @@ def rollback(
         "previous Console final status",
     )
     if final_status.get("mode") != "active":
+        promotion = [
+            str(release / "bin/devcoordinator-console-slot-control"),
+            "promote",
+            "--socket",
+            previous_control,
+            "--timeout-seconds",
+            "30",
+        ]
+        runner.require_json(promotion, "previous Console promotion")
+        final_status = wait_slot_status(
+            runner,
+            release,
+            previous_control,
+            previous,
+            "previous Console promoted status",
+        )
+    if final_status.get("mode") != "active":
         raise SwitchError("restored previous Console slot is not active")
+    if live_is_candidate:
+        switch_publication(
+            runner,
+            release,
+            digest=str(document["previous_release_digest"]),
+            port=int(document["previous_outer_port"]),
+        )
     require_probe(
         direct_https_health(int(document["previous_outer_port"]), "/healthz"),
         "restored Console final direct health",

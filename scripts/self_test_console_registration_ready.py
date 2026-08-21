@@ -726,7 +726,6 @@ def actual_api_delayed_registration_test() -> None:
             dc = load("actual_registration_coordinator", coordinator_script)
             # A developer's other coordinator homes or system broker profile
             # must not influence this isolated normalized fixture.
-            dc.discover_same_uid_legacy_homes = lambda **_kwargs: []
             dc.load_broker_profile = lambda **_kwargs: None
 
             with dc.AccountStore.open_default(home) as store:
@@ -752,17 +751,6 @@ def actual_api_delayed_registration_test() -> None:
                                 timestamp,
                                 timestamp,
                             ),
-                        )
-                        dc.establish_repository_owner_authority(
-                            connection,
-                            repository_id=repo_id,
-                            owner_uid=max(os.geteuid(), 1),
-                            repository_generation=0,
-                            operation_id=f"api-readiness-fixture-owner-{repo_id}",
-                            actor="readiness-test",
-                            reason="actual API readiness fixture owner authority",
-                            timestamp=timestamp,
-                            evidence={"kind": "actual-api-readiness-fixture-owner"},
                         )
                         connection.execute(
                             """
@@ -1119,17 +1107,6 @@ def normalized_producer_contract_test() -> None:
                             timestamp,
                             timestamp,
                         ),
-                    )
-                    dc.establish_repository_owner_authority(
-                        connection,
-                        repository_id=repo_id,
-                        owner_uid=max(os.geteuid(), 1),
-                        repository_generation=0,
-                        operation_id=f"readiness-fixture-owner-{repo_id}",
-                        actor="readiness-test",
-                        reason="normalized producer fixture owner authority",
-                        timestamp=timestamp,
-                        evidence={"kind": "normalized-producer-fixture-owner"},
                     )
                     connection.execute(
                         """

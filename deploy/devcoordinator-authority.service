@@ -13,7 +13,7 @@ UMask=0077
 Environment=DEVCOORDINATOR_ROLE=authority
 Environment=DEVCOORDINATOR_BROWSER_LIFECYCLE_STATE=/var/lib/devcoordinator-browser-lifecycle/browser-lifecycle.json
 Environment=DEVCOORDINATOR_BROWSER_IDLE_SECONDS=900
-ExecStartPre=/opt/devcoordinator/releases/RELEASE_DIGEST/bin/devcoordinator-schema-check --read-only --database /var/lib/devcoordinator/authority.sqlite3 --expected-schema 15
+ExecStartPre=/opt/devcoordinator/releases/RELEASE_DIGEST/bin/devcoordinator-schema-check --read-only --database /var/lib/devcoordinator/authority.sqlite3 --expected-schema 16
 ExecStart=/opt/devcoordinator/releases/RELEASE_DIGEST/bin/devcoordinator-authority --systemd-socket --database /var/lib/devcoordinator/authority.sqlite3 --test-plane-socket /run/devcoordinator-testd/testd.sock --call-log /var/log/devcoordinator/calls.jsonl --call-log-max-bytes 4194304 --call-log-backups 4
 Restart=on-failure
 RestartSec=2

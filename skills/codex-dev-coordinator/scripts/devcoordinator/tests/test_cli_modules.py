@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
+import io
 import json
 import os
 import socket
@@ -1461,17 +1463,25 @@ class LifecycleParserContractTests(unittest.TestCase):
                         fence=fence,
                     )
 
-    def test_system_client_journal_never_imports_legacy_account_authority(self) -> None:
-        with (
-            mock.patch.object(dev_coordinator, "authority_mode", return_value="system"),
-            mock.patch.object(
-                dev_coordinator,
-                "bootstrap_legacy_import",
-                side_effect=AssertionError("system journal imported account authority"),
-            ) as legacy_import,
-        ):
-            dev_coordinator._require_normalized_bootstrap_before_mutation(object())
-        legacy_import.assert_not_called()
+    def test_system_client_journal_never_reads_account_authority(self) -> None:
+        store = mock.Mock()
+        with mock.patch.object(dev_coordinator, "authority_mode", return_value="system"):
+            dev_coordinator._require_current_normalized_authority(store)
+        store.read_transaction.assert_not_called()
+
+    def test_observe_parser_has_no_legacy_import_transport(self) -> None:
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            dev_coordinator.build_parser().parse_args(
+                [
+                    "observe",
+                    "--agent",
+                    "test",
+                    "--project",
+                    "/repository",
+                    "--legacy-home",
+                    "/retired",
+                ]
+            )
 
     def test_service_authority_rejects_user_workload_commands(self) -> None:
         args = dev_coordinator.build_parser().parse_args(["server", "list"])

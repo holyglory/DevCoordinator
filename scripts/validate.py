@@ -1369,10 +1369,7 @@ def run_availability_architecture_tests() -> None:
         "self_test_install_availability_release.py",
         "self_test_server_wide_installer_fence.py",
         "self_test_browser_lcp_acceptance.py",
-        "self_test_browser_cutover_binding.py",
         "self_test_install_browser_lcp_runtime.py",
-        "self_test_orchestrate_availability_cutover.py",
-        "self_test_activate_availability_release.py",
         "self_test_refresh_edge_tls_credential.py",
         "self_test_project_isolation.py",
     )

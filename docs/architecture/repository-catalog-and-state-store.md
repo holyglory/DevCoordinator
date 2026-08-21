@@ -51,16 +51,17 @@ or deny access to a local caller.
 
 ## Current schema
 
-Schema 15 is the trusted-local model. It contains repositories, direct resource
+Schema 16 is the trusted-local model. It contains repositories, direct resource
 associations, runtime definitions and observations, leases and port
 assignments, operations, tests, cleanup state, and evidence. It does not contain
 repository membership, control-binding, local ACL/grant, owner-transfer,
 client-enrollment, or group-policy tables.
 
-Migration from schemas 12–14 copies any useful repository association into
-current resource rows, removes obsolete local-authorization tables and columns,
-and advances the database generation atomically. Fresh databases are created
-directly at schema 15.
+There is no migration chain or legacy importer. The one reviewed schema-15
+boundary rebuilds a fresh schema-16 authority from an exact retained-control
+allowlist while writers are stopped, advances mutable control generations, and
+discards operations, observations, tests, request history, and retired migration
+state. Fresh databases are created directly at schema 16.
 
 ## Inventory contract
 
