@@ -228,7 +228,7 @@ def _snapshot_correlations(
     plan = arguments.get("plan")
     repository_id = arguments.get("repository_id")
     run_id = None
-    attempt_id = None
+    execution_id = None
     if isinstance(candidate, Mapping):
         repository_id = candidate.get("repository_id", repository_id)
         run_id = candidate.get("run_id")
@@ -236,11 +236,11 @@ def _snapshot_correlations(
         repository_id = plan.get("repository_id", repository_id)
     if isinstance(execution, Mapping):
         run_id = execution.get("run_id", run_id)
-        attempt_id = execution.get("execution_id")
+        execution_id = execution.get("execution_id")
     return (
         repository_id if isinstance(repository_id, str) else None,
         run_id if isinstance(run_id, str) else None,
-        attempt_id if isinstance(attempt_id, str) else None,
+        execution_id if isinstance(execution_id, str) else None,
     )
 
 
@@ -2577,7 +2577,7 @@ class UnixSnapshotServiceClient(RepositoryUIDPlanPreviewer, RepositoryLaunchDesc
         call_journal = getattr(self, "call_journal", None)
         if call_journal is None:
             return
-        repository_id, run_id, attempt_id = _snapshot_correlations(arguments)
+        repository_id, run_id, execution_id = _snapshot_correlations(arguments)
         call_journal.record(
             event_record(
                 boundary="snapshot_client",
@@ -2596,7 +2596,7 @@ class UnixSnapshotServiceClient(RepositoryUIDPlanPreviewer, RepositoryLaunchDesc
                 message=message,
                 repository_id=repository_id,
                 run_id=run_id,
-                attempt_id=attempt_id,
+                attempt_id=execution_id,
                 diagnostic=diagnostic,
             )
         )
@@ -2854,7 +2854,7 @@ class UnixSnapshotServiceServer:
     ) -> None:
         if self.call_journal is None:
             return
-        repository_id, run_id, attempt_id = _snapshot_correlations(arguments)
+        repository_id, run_id, execution_id = _snapshot_correlations(arguments)
         self.call_journal.record(
             event_record(
                 boundary="snapshotd",
@@ -2875,7 +2875,7 @@ class UnixSnapshotServiceServer:
                 message=message,
                 repository_id=repository_id,
                 run_id=run_id,
-                attempt_id=attempt_id,
+                attempt_id=execution_id,
                 diagnostic=diagnostic,
             )
         )
