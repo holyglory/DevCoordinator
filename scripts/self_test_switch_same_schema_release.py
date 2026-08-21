@@ -9,11 +9,13 @@ import json
 import os
 from pathlib import Path
 import shutil
+import sqlite3
 import stat
 import subprocess
 import sys
 import tempfile
 from contextlib import redirect_stdout
+from types import SimpleNamespace
 from unittest import mock
 
 
@@ -22,6 +24,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 import switch_same_schema_release as switch  # noqa: E402
 from devcoordinator.server_credentials import server_credential_id  # noqa: E402
+from devcoordinator.schema import initialize_schema  # noqa: E402
 
 
 DIGEST = "a" * 64
@@ -54,6 +57,168 @@ class FakeRunner:
     def require(self, argv: list[str], _label: str) -> str:
         self.commands.append(list(argv))
         return ""
+
+
+def worker_cutover_database(
+    path: Path,
+    *,
+    schema_version: int,
+    running: bool,
+    role: str = "web",
+) -> dict[str, object]:
+    worker_id = "11111111-1111-4111-8111-111111111111"
+    repo_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    host_id = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+    attempt_id = "dddddddd-dddd-4ddd-8ddd-dddddddddddd"
+    stamp = "2026-08-21T00:00:00.000Z"
+    credential_id = server_credential_id(worker_id, "DATABASE_URL")
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute("PRAGMA foreign_keys=ON")
+        initialize_schema(
+            connection,
+            database_generation="worker-cutover-generation",
+            timestamp=stamp,
+        )
+        connection.execute(
+            "INSERT INTO hosts VALUES (?,?,?,?,?,?)",
+            (host_id, "machine", "linux", "host", stamp, stamp),
+        )
+        connection.execute(
+            "INSERT INTO repositories VALUES (?,?,?,?,?,?,?,?)",
+            (repo_id, host_id, "/srv/repository", "Repository", "active", 2, stamp, stamp),
+        )
+        connection.execute(
+            "INSERT INTO repository_installations(repo_id,status,startup_fenced,generation,actor,updated_at) "
+            "VALUES (?,?,?,?,?,?)",
+            (repo_id, "installed", 0, 1, "owner", stamp),
+        )
+        connection.execute(
+            "INSERT INTO server_definitions VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                worker_id,
+                repo_id,
+                "credentialized-web",
+                role,
+                "/srv/repository",
+                None,
+                None,
+                "definition-fingerprint",
+                8 if schema_version == 16 else 7,
+                stamp,
+                stamp,
+            ),
+        )
+        if schema_version == 16:
+            connection.execute(
+                "INSERT INTO server_environment_credentials VALUES (?,?,?,?,?)",
+                (worker_id, "DATABASE_URL", credential_id, stamp, stamp),
+            )
+        connection.execute(
+            """
+            INSERT INTO worker_policies(
+                server_definition_id,repo_id,execution_uid,keep_alive,
+                desired_state,breaker_state,crash_limit,crash_window_seconds,
+                generation,requested_by,created_at,updated_at
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                worker_id,
+                repo_id,
+                os.geteuid() or 1000,
+                1,
+                "running",
+                "armed",
+                5,
+                60,
+                5 if schema_version == 16 else 4,
+                "owner",
+                stamp,
+                stamp,
+            ),
+        )
+        if running:
+            connection.execute(
+                """
+                INSERT INTO worker_attempts(
+                    attempt_id,begin_request_id,server_definition_id,repo_id,
+                    definition_generation,policy_generation,
+                    supervisor_generation,supervisor_epoch,state,
+                    launch_report_id,pid,process_start_time,process_fingerprint,
+                    reserved_at,launched_at,created_at,updated_at
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    attempt_id,
+                    "begin-worker-cutover",
+                    worker_id,
+                    repo_id,
+                    8,
+                    5,
+                    3,
+                    "worker-cutover-epoch",
+                    "running",
+                    "launch-worker-cutover",
+                    42424,
+                    "process-start",
+                    "process-fingerprint",
+                    stamp,
+                    stamp,
+                    stamp,
+                    stamp,
+                ),
+            )
+        connection.execute(
+            """
+            INSERT INTO worker_supervisor_states(
+                server_definition_id,repo_id,state,supervisor_epoch,
+                supervisor_generation,current_attempt_id,updated_at
+            ) VALUES (?,?,?,?,?,?,?)
+            """,
+            (
+                worker_id,
+                repo_id,
+                "running" if running else "idle",
+                "worker-cutover-epoch" if running else None,
+                3 if running else 0,
+                attempt_id if running else None,
+                stamp,
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO server_observations(
+                server_definition_id,lifecycle,pid,process_start_time,
+                process_fingerprint,listener_observable,health_classification,
+                health_ok,sampled_at,observation_fingerprint
+            ) VALUES (?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                worker_id,
+                "running" if running else "stopped",
+                42424 if running else None,
+                "process-start" if running else None,
+                "process-fingerprint" if running else None,
+                None,
+                "supervised_process_running" if running else "stopped",
+                1 if running else None,
+                stamp,
+                "observation-fingerprint",
+            ),
+        )
+        connection.execute(
+            "UPDATE schema_metadata SET schema_version=?,state_revision=7",
+            (schema_version,),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    return {
+        "worker_id": worker_id,
+        "repo_id": repo_id,
+        "attempt_id": attempt_id,
+        "credential_id": credential_id,
+    }
 
 
 class BrowserCleanupRunner(FakeRunner):
@@ -1537,6 +1702,13 @@ def exercise_retained_control_transaction_boundary() -> None:
         "schema rebaseline does not fail closed before interrupting control-plane writers",
     )
     expect(
+        apply_source.index("bind_source_worker_quiescence(")
+        < apply_source.index("stop_authority_writers(runner)")
+        < apply_source.index("post_stop_proof = source_worker_quiescence_proof(")
+        < apply_source.index("_checkpoint_authority_database()"),
+        "source worker proof is not frozen on both sides of writer shutdown",
+    )
+    expect(
         switch_source.index("require_no_managed_worker_units(runner)")
         < switch_source.index("install_rendered_destinations(rendered)")
         and switch_source.index("require_no_managed_worker_units(runner)")
@@ -1574,6 +1746,14 @@ def exercise_retained_control_transaction_boundary() -> None:
     expect(
         "unlink_regular_and_fsync" in inspect.getsource(switch._restore_exact_file),
         "absent-file rollback is not durably fsynced",
+    )
+    expect(
+        "_cleanup_server_credential_temporaries(" in apply_source
+        and "_cleanup_server_credential_temporaries("
+        in rollback_source
+        and "_cleanup_server_credential_temporaries("
+        in inspect.getsource(switch._require_exact_live_retained_target),
+        "credential atomic remnants are not cleaned on replay, rollback, and verify",
     )
     expect(
         switch_source.index("candidate_already_active = unit_active")
@@ -1799,6 +1979,45 @@ def exercise_retained_server_credential_transaction() -> None:
                     secret not in json.dumps(backups),
                     "credential backup evidence contains credential bytes",
                 )
+                backup_root = (
+                    transaction
+                    / "retained-control-backups/server-credentials"
+                )
+                live_orphan = live_root / (
+                    f".{credential_a}.credential.123."
+                    + "a" * 32
+                    + ".tmp"
+                )
+                backup_orphan = backup_root / (
+                    f".{credential_b}.credential.456."
+                    + "b" * 32
+                    + ".tmp"
+                )
+                for orphan in (live_orphan, backup_orphan):
+                    orphan.write_bytes(b"partial-secret-bytes")
+                    orphan.chmod(0o600)
+                removed = switch._cleanup_server_credential_temporaries(
+                    credentials, transaction
+                )
+                expect(
+                    removed == 2
+                    and not live_orphan.exists()
+                    and not backup_orphan.exists(),
+                    "credential replay did not remove exact atomic remnants",
+                )
+                unsafe_orphan = live_root / (
+                    f".{credential_a}.credential.789."
+                    + "c" * 32
+                    + ".tmp"
+                )
+                unsafe_orphan.symlink_to(staged_paths[credential_a])
+                must_reject(
+                    lambda: switch._cleanup_server_credential_temporaries(
+                        credentials, transaction
+                    ),
+                    "unsafe credential atomic remnant was removed",
+                )
+                unsafe_orphan.unlink()
 
                 authority_root = root / "authority"
                 profile_root = root / "profile"
@@ -2011,9 +2230,644 @@ def exercise_rebaseline_refuses_managed_worker_interruption() -> None:
         raise AssertionError("malformed managed-worker identity was ignored")
 
 
+def exercise_source_worker_quiescence_is_exact_and_race_safe() -> None:
+    class EmptyWorkerRunner(FakeRunner):
+        def require(self, argv: list[str], _label: str) -> str:
+            self.commands.append(list(argv))
+            if "list-units" in argv:
+                return "postgresql.service loaded active running database\n"
+            return ""
+
+    with tempfile.TemporaryDirectory(prefix="worker-source-proof-") as raw:
+        root = Path(raw)
+        database = root / "authority.sqlite3"
+        identities = worker_cutover_database(
+            database, schema_version=15, running=False
+        )
+        runner = EmptyWorkerRunner()
+        journal = root / "journal.json"
+        document: dict[str, object] = {"phase": "prepared"}
+        intent: dict[str, object] = {}
+        with mock.patch.object(switch, "AUTHORITY_DATABASE", database):
+            proof = switch.bind_source_worker_quiescence(
+                document, intent, journal, runner
+            )
+            expect(
+                switch._valid_source_worker_quiescence(proof),
+                "source worker quiescence proof is not self-validating",
+            )
+            connection = sqlite3.connect(database)
+            connection.execute(
+                "UPDATE worker_policies SET generation=generation+1 "
+                "WHERE server_definition_id=?",
+                (identities["worker_id"],),
+            )
+            connection.commit()
+            connection.close()
+            try:
+                switch.bind_source_worker_quiescence(
+                    document, intent, journal, runner
+                )
+            except switch.SwitchError as error:
+                expect(
+                    "changed" in str(error),
+                    "source race returned an unrelated diagnostic",
+                )
+            else:
+                raise AssertionError("source worker race did not invalidate its proof")
+
+            connection = sqlite3.connect(database)
+            connection.execute(
+                "UPDATE worker_policies SET generation=generation-1 "
+                "WHERE server_definition_id=?",
+                (identities["worker_id"],),
+            )
+            connection.execute(
+                "UPDATE worker_supervisor_states SET state='fenced' "
+                "WHERE server_definition_id=?",
+                (identities["worker_id"],),
+            )
+            connection.commit()
+            connection.close()
+            fenced = switch.source_worker_quiescence_proof(runner)
+            expect(
+                fenced["current_attempts"] == [],
+                "attempt-free fenced worker was treated as active",
+            )
+
+            class ActiveRunner(EmptyWorkerRunner):
+                def require(self, argv: list[str], _label: str) -> str:
+                    self.commands.append(list(argv))
+                    if "list-units" in argv:
+                        return (
+                            f"devcoordinator-worker-{identities['worker_id']}.service "
+                            "loaded active running worker\n"
+                        )
+                    return ""
+
+            active = ActiveRunner()
+            try:
+                switch.source_worker_quiescence_proof(active)
+            except switch.SwitchError as error:
+                expect(
+                    str(identities["worker_id"]) in str(error),
+                    "source worker blocker omitted its exact identity",
+                )
+            else:
+                raise AssertionError("loaded source worker passed quiescence proof")
+
+
+def exercise_credentialized_web_worker_convergence() -> None:
+    class ConvergenceRunner(FakeRunner):
+        def __init__(self, worker_id: str, worker_slice: str, control_group: str) -> None:
+            super().__init__()
+            self.worker_id = worker_id
+            self.worker_slice = worker_slice
+            self.control_group = control_group
+            self.loaded = True
+
+        def require(self, argv: list[str], _label: str) -> str:
+            self.commands.append(list(argv))
+            if "list-units" in argv:
+                if not self.loaded:
+                    return ""
+                return (
+                    f"devcoordinator-worker-{self.worker_id}.service "
+                    "loaded active running worker\n"
+                )
+            return ""
+
+        def run(self, argv: list[str]) -> subprocess.CompletedProcess[str]:
+            self.commands.append(list(argv))
+            if "show" in argv and self.loaded:
+                return subprocess.CompletedProcess(
+                    argv,
+                    0,
+                    "\n".join(
+                        (
+                            "LoadState=loaded",
+                            "ActiveState=active",
+                            "SubState=running",
+                            "MainPID=41414",
+                            f"ControlGroup={self.control_group}",
+                            f"Slice={self.worker_slice}",
+                        )
+                    ),
+                    "",
+                )
+            return subprocess.CompletedProcess(argv, 1, "LoadState=not-found\n", "not found")
+
+    with tempfile.TemporaryDirectory(prefix="credential-worker-convergence-") as raw:
+        root = Path(raw)
+        source_database = root / "source.sqlite3"
+        source_ids = worker_cutover_database(
+            source_database, schema_version=15, running=False, role="web"
+        )
+
+        class EmptyRunner(FakeRunner):
+            def require(self, argv: list[str], _label: str) -> str:
+                self.commands.append(list(argv))
+                return ""
+
+        with mock.patch.object(switch, "AUTHORITY_DATABASE", source_database):
+            source_proof = switch.source_worker_quiescence_proof(EmptyRunner())
+
+        target_database = root / "target.sqlite3"
+        target_ids = worker_cutover_database(
+            target_database, schema_version=16, running=True, role="web"
+        )
+        expect(source_ids["worker_id"] == target_ids["worker_id"], "worker fixture drifted")
+        transaction = root / "transaction"
+        transaction.mkdir(mode=0o700)
+        retained = transaction / "retained-control"
+        retained.mkdir(mode=0o700)
+        staged_root = retained / "server-credentials"
+        staged_root.mkdir(mode=0o700)
+        staged = staged_root / f"{target_ids['credential_id']}.credential"
+        staged.write_bytes(b"synthetic-database-url")
+        staged.chmod(0o600)
+        manifest = {
+            "server_credentials": [
+                {
+                    "server_definition_id": target_ids["worker_id"],
+                    "name": "DATABASE_URL",
+                    "credential_id": target_ids["credential_id"],
+                    "material": switch.exact_file_identity(staged),
+                }
+            ]
+        }
+        live_root = root / "live-credentials"
+        live_root.mkdir(mode=0o700)
+        control_group = (
+            "/devcoordinator.slice/"
+            f"devcoordinator-worker-{target_ids['worker_id']}.service"
+        )
+        cgroup_root = root / "cgroup"
+        events = cgroup_root.joinpath(*control_group.split("/")[1:]) / "cgroup.events"
+        events.parent.mkdir(parents=True, mode=0o700)
+        events.write_text("populated 1\n", encoding="ascii")
+        worker_slice = switch.project_repository_slice(
+            uid=os.geteuid() or 1000,
+            repository_id=str(target_ids["repo_id"]),
+        )
+        runner = ConvergenceRunner(
+            str(target_ids["worker_id"]), worker_slice, control_group
+        )
+        clock_value = [0.0]
+
+        def clock() -> float:
+            return clock_value[0]
+
+        def sleeper(seconds: float) -> None:
+            clock_value[0] += seconds
+
+        with (
+            mock.patch.object(switch, "AUTHORITY_DATABASE", target_database),
+            mock.patch.object(
+                switch, "SERVER_CREDENTIAL_MATERIAL_ROOT", live_root
+            ),
+        ):
+            blockers, _fingerprint = switch._credentialized_worker_blockers(
+                manifest,
+                transaction,
+                runner,
+                source_proof=source_proof,
+                cgroup_root=cgroup_root,
+                process_observer=lambda _pid, _started: "alive",
+            )
+            expect(blockers == (), "credentialized web worker did not converge")
+            switch.require_credentialized_worker_convergence(
+                manifest,
+                transaction,
+                runner,
+                source_proof=source_proof,
+                timeout_seconds=5.0,
+                stable_seconds=2.0,
+                clock=clock,
+                sleeper=sleeper,
+                cgroup_root=cgroup_root,
+                process_observer=lambda _pid, _started: "alive",
+            )
+            expect(
+                clock_value[0] >= 2.0,
+                "credentialized worker passed without a stable-running interval",
+            )
+
+            connection = sqlite3.connect(target_database)
+            connection.execute(
+                "UPDATE server_observations SET health_ok=NULL "
+                "WHERE server_definition_id=?",
+                (target_ids["worker_id"],),
+            )
+            connection.commit()
+            connection.close()
+            blockers, _fingerprint = switch._credentialized_worker_blockers(
+                manifest,
+                transaction,
+                runner,
+                source_proof=source_proof,
+                cgroup_root=cgroup_root,
+                process_observer=lambda _pid, _started: "alive",
+            )
+            expect(
+                blockers == (),
+                "worker without a health contract required synthetic health",
+            )
+
+            connection = sqlite3.connect(target_database)
+            connection.execute(
+                "UPDATE server_definitions SET health_url_template='/healthz' "
+                "WHERE server_definition_id=?",
+                (target_ids["worker_id"],),
+            )
+            connection.commit()
+            connection.close()
+            blockers, _fingerprint = switch._credentialized_worker_blockers(
+                manifest,
+                transaction,
+                runner,
+                source_proof=source_proof,
+                cgroup_root=cgroup_root,
+                process_observer=lambda _pid, _started: "alive",
+            )
+            expect(
+                blockers == (target_ids["worker_id"],),
+                "configured worker health contract accepted unknown health",
+            )
+
+            connection = sqlite3.connect(target_database)
+            connection.execute(
+                "UPDATE server_definitions SET health_url_template=NULL "
+                "WHERE server_definition_id=?",
+                (target_ids["worker_id"],),
+            )
+            connection.execute(
+                "UPDATE worker_attempts SET policy_generation=4 "
+                "WHERE attempt_id=?",
+                (target_ids["attempt_id"],),
+            )
+            connection.commit()
+            connection.close()
+            blockers, _fingerprint = switch._credentialized_worker_blockers(
+                manifest,
+                transaction,
+                runner,
+                source_proof=source_proof,
+                cgroup_root=cgroup_root,
+                process_observer=lambda _pid, _started: "alive",
+            )
+            expect(
+                blockers == (target_ids["worker_id"],),
+                "stale credentialized worker attempt generation was accepted",
+            )
+
+            connection = sqlite3.connect(target_database)
+            connection.execute(
+                "UPDATE worker_supervisor_states SET state='tripped',"
+                "current_attempt_id=NULL WHERE server_definition_id=?",
+                (target_ids["worker_id"],),
+            )
+            connection.execute(
+                "DELETE FROM worker_attempts WHERE attempt_id=?",
+                (target_ids["attempt_id"],),
+            )
+            connection.execute(
+                "UPDATE worker_policies SET desired_state='running',breaker_state='tripped' "
+                "WHERE server_definition_id=?",
+                (target_ids["worker_id"],),
+            )
+            connection.execute(
+                "UPDATE server_observations SET lifecycle='stopped',pid=NULL,"
+                "process_start_time=NULL,process_fingerprint=NULL,health_ok=NULL "
+                "WHERE server_definition_id=?",
+                (target_ids["worker_id"],),
+            )
+            connection.commit()
+            connection.close()
+            runner.loaded = False
+            blockers, _fingerprint = switch._credentialized_worker_blockers(
+                manifest,
+                transaction,
+                runner,
+                source_proof=source_proof,
+                cgroup_root=cgroup_root,
+                process_observer=lambda _pid, _started: "absent",
+            )
+            expect(blockers == (), "tripped credentialized web worker did not remain absent")
+
+            connection = sqlite3.connect(target_database)
+            connection.execute(
+                "DELETE FROM worker_supervisor_states WHERE server_definition_id=?",
+                (target_ids["worker_id"],),
+            )
+            connection.execute(
+                "DELETE FROM worker_policies WHERE server_definition_id=?",
+                (target_ids["worker_id"],),
+            )
+            connection.commit()
+            connection.close()
+            no_policy_proof = dict(source_proof)
+            no_policy_proof["policy_expectations"] = []
+            no_policy_proof["policy_count"] = 0
+            no_policy_proof["supervisor_count"] = 0
+            no_policy_proof["observation_count"] = 0
+            blockers, _fingerprint = switch._credentialized_worker_blockers(
+                manifest,
+                transaction,
+                runner,
+                source_proof=no_policy_proof,
+                cgroup_root=cgroup_root,
+                process_observer=lambda _pid, _started: "absent",
+            )
+            expect(
+                blockers == (),
+                "never-started credentialized definition was required to have a policy",
+            )
+
+
+def exercise_candidate_worker_rollback_cleanup() -> None:
+    policy_worker = "11111111-1111-4111-8111-111111111111"
+    policyless_worker = "22222222-2222-4222-8222-222222222222"
+    inactive_worker = "33333333-3333-4333-8333-333333333333"
+    source_proof = {
+        "schema_version": 15,
+        "database_generation": "source-generation",
+        "state_revision": 0,
+        "worker_units": [],
+        "active_supervisors": [],
+        "current_attempts": [],
+        "active_observations": [],
+        "policy_expectations": [],
+        "policy_count": 0,
+        "supervisor_count": 0,
+        "observation_count": 0,
+        "worker_state_sha256": "a" * 64,
+    }
+    expect(
+        switch._valid_source_worker_quiescence(source_proof),
+        "candidate cleanup fixture lacks a valid empty-source proof",
+    )
+    rows = {
+        policy_worker: {
+            "server_definition_id": policy_worker,
+            "name": "worker",
+            "canonical_root": "/srv/repository",
+            "execution_uid": os.geteuid() or 1000,
+        },
+        policyless_worker: {
+            "server_definition_id": policyless_worker,
+            "name": "orphan",
+            "canonical_root": "/srv/repository",
+            "execution_uid": None,
+        },
+        inactive_worker: {
+            "server_definition_id": inactive_worker,
+            "name": "inactive",
+            "canonical_root": "/srv/repository",
+            "execution_uid": os.geteuid() or 1000,
+        },
+    }
+    calls: list[tuple[str, str]] = []
+
+    class StoreContext:
+        def __enter__(self) -> object:
+            return object()
+
+        def __exit__(self, *_values: object) -> None:
+            return None
+
+    class Controller:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        def stop(self, *, worker_id: str, **_values: object) -> dict[str, object]:
+            calls.append(("controller", worker_id))
+            return {"ok": True}
+
+    class Manager:
+        def remove(self, *, worker_id: str) -> SimpleNamespace:
+            calls.append(("native", worker_id))
+            return SimpleNamespace(loaded=False, active=False)
+
+    loaded_reads = [
+        (policyless_worker,),
+        (),
+    ]
+    state_reads = [
+        (rows, (policy_worker,)),
+        ({}, ()),
+    ]
+    with (
+        mock.patch.object(
+            switch,
+            "loaded_managed_worker_ids",
+            side_effect=loaded_reads,
+        ),
+        mock.patch.object(
+            switch,
+            "_candidate_worker_cleanup_rows",
+            side_effect=state_reads,
+        ),
+        mock.patch.object(
+            switch, "_candidate_coordinator_script", return_value=Path(__file__)
+        ),
+        mock.patch.object(
+            switch.AccountStore, "open", return_value=StoreContext()
+        ),
+        mock.patch.object(switch, "WorkerController", Controller),
+        mock.patch.object(
+            switch,
+            "_worker_native_factory",
+            return_value=lambda **_values: Manager(),
+        ),
+    ):
+        stopped = switch.stop_candidate_workers_for_rollback(
+            {"release": "/candidate"},
+            {"source_worker_quiescence": source_proof},
+            FakeRunner(),
+        )
+    expect(
+        stopped == (policy_worker, policyless_worker),
+        "candidate cleanup did not cover exact post-source workers",
+    )
+    expect(
+        calls == [
+            ("controller", policy_worker),
+            ("native", policyless_worker),
+        ],
+        "candidate cleanup bypassed controller fallback or policyless native removal",
+    )
+
+    class BoundedRunner(FakeRunner):
+        def __init__(self) -> None:
+            super().__init__()
+            self.timeouts: list[float] = []
+
+        def run_bounded(
+            self, argv: list[str], *, timeout_seconds: float
+        ) -> subprocess.CompletedProcess[str]:
+            self.commands.append(list(argv))
+            self.timeouts.append(timeout_seconds)
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+    bounded_runner = BoundedRunner()
+    manager = switch._worker_native_factory(bounded_runner)(
+        coordinator_script=(
+            ROOT / "skills/codex-dev-coordinator/scripts/dev_coordinator.py"
+        ),
+        state_root=None,
+    )
+    manager.runner(["/usr/bin/systemctl", "stop", "example.service"])
+    expect(
+        bounded_runner.timeouts == [45.0],
+        "candidate native cleanup is not bounded above TimeoutStopSec",
+    )
+
+    class FailingController(Controller):
+        def stop(self, *, worker_id: str, **_values: object) -> dict[str, object]:
+            raise switch.WorkerControlError("injected candidate cleanup failure")
+
+    with (
+        mock.patch.object(
+            switch, "loaded_managed_worker_ids", return_value=()
+        ),
+        mock.patch.object(
+            switch,
+            "_candidate_worker_cleanup_rows",
+            return_value=(rows, (policy_worker,)),
+        ),
+        mock.patch.object(
+            switch, "_candidate_coordinator_script", return_value=Path(__file__)
+        ),
+        mock.patch.object(
+            switch.AccountStore, "open", return_value=StoreContext()
+        ),
+        mock.patch.object(switch, "WorkerController", FailingController),
+        mock.patch.object(
+            switch,
+            "_worker_native_factory",
+            return_value=lambda **_values: Manager(),
+        ),
+    ):
+        try:
+            switch.stop_candidate_workers_for_rollback(
+                {"release": "/candidate"},
+                {"source_worker_quiescence": source_proof},
+                FakeRunner(),
+            )
+        except switch.SwitchError as error:
+            expect(
+                policy_worker in str(error),
+                "candidate cleanup failure omitted exact worker identity",
+            )
+        else:
+            raise AssertionError("candidate cleanup failure allowed source restoration")
+
+    order: list[str] = []
+    intent = {
+        "required": True,
+        "status": "applied",
+        "backups": {"exact": {}},
+        "source_worker_quiescence": source_proof,
+    }
+    document = {"retained_control_rebaseline": intent}
+    with tempfile.TemporaryDirectory(prefix="candidate-rollback-order-") as raw:
+        journal = Path(raw) / "journal.json"
+        with (
+            mock.patch.object(
+                switch, "retained_rebaseline_intent", return_value=intent
+            ),
+            mock.patch.object(
+                switch, "validate_retained_rebaseline_paths"
+            ),
+            mock.patch.object(
+                switch,
+                "stop_authority_writers",
+                side_effect=lambda _runner: order.append("authority"),
+            ),
+            mock.patch.object(
+                switch,
+                "stop_candidate_workers_for_rollback",
+                side_effect=lambda *_args: order.append("candidate") or (),
+            ),
+            mock.patch.object(
+                switch,
+                "stop_console_writers",
+                side_effect=lambda *_args: order.append("console"),
+            ),
+            mock.patch.object(
+                switch,
+                "_load_bound_retained_manifest",
+                return_value={"server_credentials": []},
+            ),
+            mock.patch.object(
+                switch, "_server_credentials_from_manifest", return_value={}
+            ),
+            mock.patch.object(
+                switch,
+                "_restore_retained_files",
+                side_effect=lambda *_args: order.append("restore"),
+            ),
+            mock.patch.object(
+                switch,
+                "source_worker_quiescence_proof",
+                return_value=source_proof,
+            ),
+            mock.patch.object(switch, "save_phase"),
+        ):
+            switch.restore_retained_control_rebaseline(
+                document, journal, Path(raw), FakeRunner()
+            )
+        expect(
+            order == ["authority", "candidate", "console", "restore"],
+            "candidate rollback cleanup did not precede source restoration",
+        )
+
+        order.clear()
+        intent["status"] = "applied"
+        with (
+            mock.patch.object(
+                switch, "retained_rebaseline_intent", return_value=intent
+            ),
+            mock.patch.object(
+                switch, "validate_retained_rebaseline_paths"
+            ),
+            mock.patch.object(
+                switch,
+                "stop_authority_writers",
+                side_effect=lambda _runner: order.append("authority"),
+            ),
+            mock.patch.object(
+                switch,
+                "stop_candidate_workers_for_rollback",
+                side_effect=switch.SwitchError("injected candidate failure"),
+            ),
+            mock.patch.object(
+                switch,
+                "_restore_retained_files",
+                side_effect=lambda *_args: order.append("restore"),
+            ),
+        ):
+            try:
+                switch.restore_retained_control_rebaseline(
+                    document, journal, Path(raw), FakeRunner()
+                )
+            except switch.SwitchError:
+                pass
+            else:
+                raise AssertionError("candidate rollback failure was ignored")
+        expect(
+            order == ["authority"],
+            "candidate cleanup failure allowed source restoration",
+        )
+
+
 def exercise_verification_requires_boot_enablement() -> None:
     source = inspect.getsource(switch.verify)
     rollback_source = inspect.getsource(switch.rollback)
+    retained_rollback_source = inspect.getsource(
+        switch.restore_retained_control_rebaseline
+    )
     main_source = inspect.getsource(switch.main)
     expect(
         "enabled_states = {unit: unit_enabled" in source
@@ -2065,19 +2919,50 @@ def exercise_verification_requires_boot_enablement() -> None:
     expect(
         rollback_source.index("restore_retained_control_rebaseline(")
         < rollback_source.index('"previous Console restore"')
-        and rollback_source.index("require_no_managed_worker_units(runner)")
-        < rollback_source.index("stop_console_writers(document, runner)")
-        and rollback_source.index("stop_console_writers(document, runner)")
-        < rollback_source.index('"previous Console restore"')
+        and retained_rollback_source.index("stop_authority_writers(runner)")
+        < retained_rollback_source.index("stop_candidate_workers_for_rollback(")
+        < retained_rollback_source.index("stop_console_writers(document, runner)")
+        < retained_rollback_source.index("_restore_retained_files(")
         and '["/usr/bin/systemctl", "disable", candidate]' in rollback_source,
         "post-promotion rollback starts a Console before stopping writers and restoring retained data",
     )
     expect(
         'args.action == "verify" and value.get("ok") is not True' in main_source
+        and "public_switch_result(args.action, value)" in main_source
         and 'raise SwitchError("same-schema control-plane health failed")'
         not in source,
         "failed health verification hides its structured invariant evidence",
     )
+
+
+def exercise_cli_result_excludes_private_transaction_evidence() -> None:
+    credential_sha = "f" * 64
+    value = {
+        "phase": "applied",
+        "release_digest": DIGEST,
+        "previous_release_digest": "b" * 64,
+        "backups": {
+            "/private/credential": {
+                "source": {
+                    "path": "/private/credential",
+                    "sha256": credential_sha,
+                }
+            }
+        },
+        "retained_control_rebaseline": {
+            "required": True,
+            "status": "applied",
+            "source_schema_version": 15,
+            "target_schema_version": 16,
+            "backups": {"credential_sha256": credential_sha},
+            "manifest": "/private/retained-control.json",
+        },
+    }
+    public = switch.public_switch_result("apply", value)
+    encoded = json.dumps(public, sort_keys=True)
+    expect(public["ok"] is True and public["phase"] == "applied", "public result lost status")
+    for forbidden in (credential_sha, "/private", "backups", "manifest", "sha256"):
+        expect(forbidden not in encoded, f"public result disclosed private {forbidden}")
 
 
 def main() -> int:
@@ -2108,7 +2993,11 @@ def main() -> int:
     exercise_retained_control_transaction_boundary()
     exercise_retained_server_credential_transaction()
     exercise_rebaseline_refuses_managed_worker_interruption()
+    exercise_source_worker_quiescence_is_exact_and_race_safe()
+    exercise_credentialized_web_worker_convergence()
+    exercise_candidate_worker_rollback_cleanup()
     exercise_verification_requires_boot_enablement()
+    exercise_cli_result_excludes_private_transaction_evidence()
     print("same-schema release switch self-test ok")
     return 0
 

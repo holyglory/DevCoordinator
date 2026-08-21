@@ -32,7 +32,7 @@ import stat
 import subprocess
 import sys
 import time
-from typing import Mapping, Sequence
+from typing import Callable, Mapping, Sequence
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 import uuid
@@ -54,6 +54,17 @@ from devcoordinator.server_credentials import (  # noqa: E402
     staged_material_path,
     validate_server_credential_binding,
 )
+from devcoordinator.store import AccountStore  # noqa: E402
+from devcoordinator.worker_control import (  # noqa: E402
+    WorkerControlError,
+    WorkerController,
+)
+from devcoordinator.worker_native import (  # noqa: E402
+    WorkerNativeError,
+    native_worker_manager,
+    project_repository_slice,
+)
+from devcoordinator.worker_runner import observe_worker_process_identity  # noqa: E402
 
 
 KIND = "devcoordinator-same-schema-release-switch"
@@ -160,6 +171,8 @@ WORKER_UNIT = re.compile(
     r"^devcoordinator-worker-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
     r"[0-9a-f]{4}-[0-9a-f]{12})\.service$"
 )
+CGROUP_ROOT = Path("/sys/fs/cgroup")
+WORKER_CUTOVER_LIMIT = 4096
 AUTHORITY_WRITER_UNITS = (
     "devcoordinator-testd.socket",
     "devcoordinator-test-snapshotd.socket",
@@ -622,6 +635,75 @@ def _reject_server_credential_extras(
         raise SwitchError("live server credential root is unavailable") from error
 
 
+def _cleanup_server_credential_temporaries(
+    credentials: Mapping[str, Mapping[str, object]],
+    transaction_root: Path,
+) -> int:
+    """Remove only exact affected atomic-copy remnants without reading bytes."""
+
+    if not credentials:
+        return 0
+    affected = set(credentials)
+    roots = (
+        SERVER_CREDENTIAL_MATERIAL_ROOT,
+        transaction_root / "retained-control-backups/server-credentials",
+    )
+    removed = 0
+    for root in roots:
+        if (
+            root != SERVER_CREDENTIAL_MATERIAL_ROOT
+            and not root.exists()
+            and not root.is_symlink()
+        ):
+            continue
+        _private_owned_directory(root, field="server credential atomic root")
+        try:
+            entries = root.iterdir()
+            for index, entry in enumerate(entries):
+                if index >= retained_control.MAX_ROWS_PER_COLLECTION:
+                    raise SwitchError("server credential atomic root is excessive")
+                name = entry.name
+                if not name.startswith(".") or len(name) < 38:
+                    continue
+                credential_id = name[1:37]
+                if credential_id not in affected:
+                    continue
+                expected = re.fullmatch(
+                    r"\."
+                    + re.escape(credential_id)
+                    + re.escape(SERVER_CREDENTIAL_FILE_SUFFIX)
+                    + r"\.[0-9]+\.[0-9a-f]{32}\.tmp",
+                    name,
+                )
+                if expected is None:
+                    raise SwitchError(
+                        "affected server credential atomic remnant is invalid"
+                    )
+                try:
+                    info = entry.lstat()
+                except OSError as error:
+                    raise SwitchError(
+                        "affected server credential atomic remnant is unavailable"
+                    ) from error
+                if (
+                    stat.S_ISLNK(info.st_mode)
+                    or not stat.S_ISREG(info.st_mode)
+                    or info.st_uid != os.geteuid()
+                    or info.st_gid != os.getegid()
+                    or stat.S_IMODE(info.st_mode) != 0o600
+                    or info.st_nlink != 1
+                ):
+                    raise SwitchError(
+                        "affected server credential atomic remnant is unsafe"
+                    )
+                entry.unlink()
+                fsync_parent(entry)
+                removed += 1
+        except OSError as error:
+            raise SwitchError("server credential atomic root is unavailable") from error
+    return removed
+
+
 def require_parent_identity(path: Path, expected: object) -> None:
     if not isinstance(expected, Mapping) or path_parent_identity(path) != dict(expected):
         raise SwitchError(f"retained-control parent identity changed: {path.parent}")
@@ -916,6 +998,22 @@ class Runner:
             text=True,
             check=False,
         )
+
+    def run_bounded(
+        self, argv: Sequence[str], *, timeout_seconds: float
+    ) -> subprocess.CompletedProcess[str]:
+        try:
+            return subprocess.run(
+                list(argv),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+                timeout=max(0.1, float(timeout_seconds)),
+            )
+        except subprocess.TimeoutExpired as error:
+            raise SwitchError("bounded native worker cleanup timed out") from error
 
     def require(self, argv: Sequence[str], label: str) -> str:
         result = self.run(argv)
@@ -1819,6 +1917,11 @@ def retained_rebaseline_intent(document: Mapping[str, object]) -> dict[str, obje
             or document.get("already_active") is True
         ):
             raise SwitchError("retained-control rebaseline is not an exact 15 -> 16 release switch")
+        proof = raw.get("source_worker_quiescence")
+        if proof is not None and not _valid_source_worker_quiescence(proof):
+            raise SwitchError("retained-control source worker proof is invalid")
+        if raw["status"] != "planned" and proof is None:
+            raise SwitchError("retained-control source worker proof is missing")
     elif raw["source_schema_version"] != COORDINATOR_SCHEMA_VERSION:
         raise SwitchError("unneeded retained-control rebaseline has an incompatible source")
     return dict(raw)
@@ -1938,7 +2041,7 @@ def loaded_managed_worker_ids(runner: Runner) -> tuple[str, ...]:
         raise SwitchError("managed worker unit inventory is excessive")
     worker_ids: set[str] = set()
     for index, line in enumerate(output.splitlines()):
-        if index >= 4096:
+        if index >= WORKER_CUTOVER_LIMIT:
             raise SwitchError("managed worker unit inventory is excessive")
         fields = line.split()
         if not fields:
@@ -1968,6 +2071,865 @@ def require_no_managed_worker_units(runner: Runner) -> None:
             "schema rebaseline requires these managed workers to stop first: "
             + ", ".join(worker_ids)
         )
+
+
+def source_worker_quiescence_proof(runner: Runner) -> dict[str, object]:
+    """Prove schema-15 has no live worker before retained-state mutation."""
+
+    unit_ids_before = loaded_managed_worker_ids(runner)
+    try:
+        connection = sqlite3.connect(
+            f"{AUTHORITY_DATABASE.as_uri()}?mode=ro", uri=True, timeout=10.0
+        )
+        connection.row_factory = sqlite3.Row
+        try:
+            connection.execute("PRAGMA query_only=ON")
+            metadata = connection.execute(
+                "SELECT schema_version,database_generation,state_revision "
+                "FROM schema_metadata WHERE singleton=1"
+            ).fetchone()
+            policies = [
+                dict(row)
+                for row in connection.execute(
+                    """
+                    SELECT definition.server_definition_id,
+                           definition.generation AS definition_generation,
+                           definition.definition_fingerprint,
+                           policy.generation AS policy_generation,
+                           policy.repo_id,policy.execution_uid,policy.keep_alive,
+                           policy.desired_state,policy.breaker_state
+                    FROM worker_policies policy
+                    JOIN server_definitions definition USING(server_definition_id)
+                    ORDER BY definition.server_definition_id
+                    """
+                )
+            ]
+            supervisors = [
+                dict(row)
+                for row in connection.execute(
+                    """
+                    SELECT server_definition_id,state,supervisor_epoch,
+                           supervisor_generation,current_attempt_id
+                    FROM worker_supervisor_states
+                    ORDER BY server_definition_id
+                    """
+                )
+            ]
+            attempts = [
+                dict(row)
+                for row in connection.execute(
+                    """
+                    SELECT attempt_id,server_definition_id,state,
+                           definition_generation,policy_generation,
+                           supervisor_generation,supervisor_epoch,pid,
+                           process_start_time,process_fingerprint
+                    FROM worker_attempts
+                    WHERE state IN ('reserved','running')
+                    ORDER BY server_definition_id,attempt_id
+                    """
+                )
+            ]
+            observations = [
+                dict(row)
+                for row in connection.execute(
+                    """
+                    SELECT policy.server_definition_id,
+                           observation.lifecycle,observation.pid,
+                           observation.process_start_time,
+                           observation.process_fingerprint,
+                           observation.listener_observable,
+                           observation.health_classification,
+                           observation.health_ok
+                    FROM worker_policies policy
+                    LEFT JOIN server_observations observation USING(server_definition_id)
+                    ORDER BY policy.server_definition_id
+                    """
+                )
+            ]
+        finally:
+            connection.close()
+    except sqlite3.Error as error:
+        raise SwitchError("source worker quiescence cannot be read") from error
+    if (
+        metadata is None
+        or metadata["schema_version"] != retained_control.REBASELINE_SOURCE_SCHEMA
+        or not isinstance(metadata["database_generation"], str)
+        or not metadata["database_generation"]
+        or type(metadata["state_revision"]) is not int
+        or int(metadata["state_revision"]) < 0
+    ):
+        raise SwitchError("source worker quiescence has incompatible authority identity")
+    if any(
+        len(values) > WORKER_CUTOVER_LIMIT
+        for values in (policies, supervisors, attempts, observations)
+    ):
+        raise SwitchError("source worker quiescence is excessive")
+
+    def canonical_worker_id(value: object) -> str:
+        try:
+            parsed = str(uuid.UUID(str(value)))
+        except (ValueError, TypeError, AttributeError) as error:
+            raise SwitchError("source worker identity is invalid") from error
+        if parsed != value:
+            raise SwitchError("source worker identity is not canonical")
+        return parsed
+
+    policy_ids: set[str] = set()
+    for row in policies:
+        worker_id = canonical_worker_id(row["server_definition_id"])
+        if (
+            worker_id in policy_ids
+            or type(row["execution_uid"]) is not int
+            or int(row["execution_uid"]) <= 0
+            or type(row["definition_generation"]) is not int
+            or type(row["policy_generation"]) is not int
+        ):
+            raise SwitchError("source worker policy evidence is invalid")
+        policy_ids.add(worker_id)
+    supervisor_ids = {
+        canonical_worker_id(row["server_definition_id"])
+        for row in supervisors
+    }
+    if supervisor_ids != policy_ids or len(supervisor_ids) != len(supervisors):
+        raise SwitchError("source worker supervisor coverage is invalid")
+    observation_ids = {
+        canonical_worker_id(row["server_definition_id"])
+        for row in observations
+    }
+    if observation_ids != policy_ids or len(observation_ids) != len(observations):
+        raise SwitchError("source worker observation coverage is invalid")
+    for row in attempts:
+        canonical_worker_id(row["server_definition_id"])
+        state = str(row["state"])
+        pid = row["pid"]
+        started = row["process_start_time"]
+        if (
+            (state == "reserved" and (pid is not None or started is not None))
+            or (
+                state == "running"
+                and (
+                    type(pid) is not int
+                    or int(pid) <= 1
+                    or not isinstance(started, str)
+                    or not started
+                )
+            )
+        ):
+            raise SwitchError("source worker attempt evidence is invalid")
+    unit_ids_after = loaded_managed_worker_ids(runner)
+    active_supervisors = sorted(
+        str(row["server_definition_id"])
+        for row in supervisors
+        if row["current_attempt_id"] is not None
+        or str(row["state"]) in {"launching", "running", "stopping"}
+    )
+    active_attempts = sorted(
+        str(row["server_definition_id"]) for row in attempts
+    )
+    active_observations = sorted(
+        str(row["server_definition_id"])
+        for row in observations
+        if row["pid"] is not None
+        or str(row["lifecycle"])
+        in {"starting", "running", "unhealthy", "stopping"}
+    )
+    blockers = sorted(
+        {
+            *unit_ids_before,
+            *unit_ids_after,
+            *active_supervisors,
+            *active_attempts,
+            *active_observations,
+        }
+    )
+    if blockers:
+        raise SwitchError(
+            "schema rebaseline requires these managed workers to stop first: "
+            + ", ".join(blockers)
+        )
+    state_document = {
+        "policies": policies,
+        "supervisors": supervisors,
+        "current_attempts": attempts,
+        "worker_observations": observations,
+    }
+    return {
+        "schema_version": int(metadata["schema_version"]),
+        "database_generation": str(metadata["database_generation"]),
+        "state_revision": int(metadata["state_revision"]),
+        "worker_units": [],
+        "active_supervisors": [],
+        "current_attempts": [],
+        "active_observations": [],
+        "policy_expectations": policies,
+        "policy_count": len(policies),
+        "supervisor_count": len(supervisors),
+        "observation_count": len(observations),
+        "worker_state_sha256": hashlib.sha256(
+            canonical(state_document)
+        ).hexdigest(),
+    }
+
+
+def _valid_policy_expectations(value: object, *, expected_count: object) -> bool:
+    if (
+        not isinstance(value, list)
+        or type(expected_count) is not int
+        or len(value) != expected_count
+        or len(value) > WORKER_CUTOVER_LIMIT
+    ):
+        return False
+    seen: set[str] = set()
+    expected_fields = {
+        "server_definition_id",
+        "definition_generation",
+        "definition_fingerprint",
+        "policy_generation",
+        "repo_id",
+        "execution_uid",
+        "keep_alive",
+        "desired_state",
+        "breaker_state",
+    }
+    for row in value:
+        if not isinstance(row, Mapping) or set(row) != expected_fields:
+            return False
+        try:
+            worker_id = str(uuid.UUID(str(row["server_definition_id"])))
+        except (ValueError, TypeError, AttributeError):
+            return False
+        if (
+            worker_id != row["server_definition_id"]
+            or worker_id in seen
+            or type(row["definition_generation"]) is not int
+            or int(row["definition_generation"]) < 0
+            or type(row["policy_generation"]) is not int
+            or int(row["policy_generation"]) < 0
+            or not isinstance(row["definition_fingerprint"], str)
+            or not row["definition_fingerprint"]
+            or len(row["definition_fingerprint"].encode("utf-8")) > 512
+            or type(row["execution_uid"]) is not int
+            or int(row["execution_uid"]) <= 0
+            or row["keep_alive"] not in {0, 1}
+            or row["desired_state"] not in {"running", "stopped"}
+            or row["breaker_state"] not in {"armed", "tripped"}
+        ):
+            return False
+        seen.add(worker_id)
+    return True
+
+
+def _valid_source_worker_quiescence(value: object) -> bool:
+    return bool(
+        isinstance(value, Mapping)
+        and set(value)
+        == {
+            "schema_version",
+            "database_generation",
+            "state_revision",
+            "worker_units",
+            "active_supervisors",
+            "current_attempts",
+            "active_observations",
+            "policy_expectations",
+            "policy_count",
+            "supervisor_count",
+            "observation_count",
+            "worker_state_sha256",
+        }
+        and value.get("schema_version")
+        == retained_control.REBASELINE_SOURCE_SCHEMA
+        and isinstance(value.get("database_generation"), str)
+        and bool(value.get("database_generation"))
+        and all(value.get(field) == [] for field in (
+            "worker_units",
+            "active_supervisors",
+            "current_attempts",
+            "active_observations",
+        ))
+        and _valid_policy_expectations(
+            value.get("policy_expectations"),
+            expected_count=value.get("policy_count"),
+        )
+        and all(
+            type(value.get(field)) is int and int(value[field]) >= 0
+            for field in (
+                "state_revision",
+                "policy_count",
+                "supervisor_count",
+                "observation_count",
+            )
+        )
+        and value.get("supervisor_count") == value.get("policy_count")
+        and value.get("observation_count") == value.get("policy_count")
+        and re.fullmatch(
+            r"[0-9a-f]{64}", str(value.get("worker_state_sha256") or "")
+        )
+        is not None
+    )
+
+
+def bind_source_worker_quiescence(
+    document: dict[str, object],
+    intent: dict[str, object],
+    journal_path: Path,
+    runner: Runner,
+) -> dict[str, object]:
+    observed = source_worker_quiescence_proof(runner)
+    retained = intent.get("source_worker_quiescence")
+    if retained is None:
+        intent["source_worker_quiescence"] = observed
+        document["retained_control_rebaseline"] = intent
+        save_phase(journal_path, document, str(document["phase"]))
+        return observed
+    if not _valid_source_worker_quiescence(retained) or dict(retained) != observed:
+        raise SwitchError("source worker quiescence changed before schema rebaseline")
+    return observed
+
+
+def _managed_worker_native_state(
+    runner: Runner,
+    worker_id: str,
+    *,
+    cgroup_root: Path = CGROUP_ROOT,
+) -> dict[str, object]:
+    try:
+        canonical_id = str(uuid.UUID(worker_id))
+    except (ValueError, TypeError, AttributeError) as error:
+        raise SwitchError("credentialized worker identity is invalid") from error
+    if canonical_id != worker_id:
+        raise SwitchError("credentialized worker identity is not canonical")
+    unit = f"devcoordinator-worker-{worker_id}.service"
+    completed = runner.run(
+        [
+            "/usr/bin/systemctl",
+            "show",
+            unit,
+            "--property=LoadState",
+            "--property=ActiveState",
+            "--property=SubState",
+            "--property=MainPID",
+            "--property=ControlGroup",
+            "--property=Slice",
+            "--no-pager",
+        ]
+    )
+    if len((completed.stdout + completed.stderr).encode("utf-8")) > 64 * 1024:
+        raise SwitchError("credentialized worker native evidence is excessive")
+    values = {
+        key: value
+        for line in completed.stdout.splitlines()
+        if "=" in line
+        for key, value in (line.split("=", 1),)
+    }
+    if completed.returncode != 0 or values.get("LoadState") == "not-found":
+        return {
+            "loaded": False,
+            "active": False,
+            "main_pid": None,
+            "control_group": None,
+            "slice": None,
+            "cgroup_populated": False,
+        }
+    required = {
+        "LoadState",
+        "ActiveState",
+        "SubState",
+        "MainPID",
+        "ControlGroup",
+        "Slice",
+    }
+    if set(values) != required or values["LoadState"] != "loaded":
+        raise SwitchError("credentialized worker native evidence is incomplete")
+    active = values["ActiveState"] in {
+        "active",
+        "activating",
+        "deactivating",
+        "reloading",
+    }
+    raw_pid = values["MainPID"]
+    main_pid = int(raw_pid) if raw_pid.isdigit() and int(raw_pid) > 1 else None
+    control_group = values["ControlGroup"]
+    if (
+        not control_group.startswith("/")
+        or "\x00" in control_group
+        or any(part in {"", ".", ".."} for part in control_group.split("/")[1:])
+    ):
+        raise SwitchError("credentialized worker control group is invalid")
+    events = cgroup_root.joinpath(*control_group.split("/")[1:]) / "cgroup.events"
+    try:
+        info = events.lstat()
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode) or info.st_size > 4096:
+            raise SwitchError("credentialized worker cgroup evidence is unsafe")
+        event_values = dict(
+            line.split(" ", 1)
+            for line in events.read_text(encoding="ascii").splitlines()
+            if " " in line
+        )
+    except OSError as error:
+        raise SwitchError("credentialized worker cgroup evidence is unavailable") from error
+    if event_values.get("populated") not in {"0", "1"}:
+        raise SwitchError("credentialized worker cgroup evidence is invalid")
+    return {
+        "loaded": True,
+        "active": active,
+        "main_pid": main_pid,
+        "control_group": control_group,
+        "slice": values["Slice"],
+        "cgroup_populated": event_values["populated"] == "1",
+    }
+
+
+def _credentialized_worker_rows() -> tuple[
+    dict[str, dict[str, object]], dict[str, set[tuple[str, str]]]
+]:
+    try:
+        connection = sqlite3.connect(
+            f"{AUTHORITY_DATABASE.as_uri()}?mode=ro", uri=True, timeout=10.0
+        )
+        connection.row_factory = sqlite3.Row
+        try:
+            connection.execute("PRAGMA query_only=ON")
+            rows = [
+                dict(row)
+                for row in connection.execute(
+                    """
+                    SELECT definition.server_definition_id,definition.name,
+                           definition.repo_id,
+                           definition.generation AS definition_generation,
+                           definition.health_url_template,
+                           repository.canonical_root,
+                           policy.execution_uid,policy.keep_alive,
+                           policy.desired_state,policy.breaker_state,
+                           policy.generation AS policy_generation,
+                           supervisor.state AS supervisor_state,
+                           supervisor.supervisor_epoch,
+                           supervisor.supervisor_generation,
+                           supervisor.current_attempt_id,
+                           attempt.state AS attempt_state,attempt.pid AS attempt_pid,
+                           attempt.process_start_time AS attempt_process_start_time,
+                           attempt.process_fingerprint AS attempt_process_fingerprint,
+                           attempt.definition_generation AS attempt_definition_generation,
+                           attempt.policy_generation AS attempt_policy_generation,
+                           attempt.supervisor_generation AS attempt_supervisor_generation,
+                           attempt.supervisor_epoch AS attempt_supervisor_epoch,
+                           observation.lifecycle AS observation_lifecycle,
+                           observation.pid AS observation_pid,
+                           observation.process_start_time AS observation_process_start_time,
+                           observation.process_fingerprint AS observation_process_fingerprint,
+                           observation.listener_observable,
+                           observation.health_classification,observation.health_ok
+                    FROM server_definitions definition
+                    JOIN repositories repository USING(repo_id)
+                    LEFT JOIN worker_policies policy USING(server_definition_id)
+                    LEFT JOIN worker_supervisor_states supervisor USING(server_definition_id)
+                    LEFT JOIN worker_attempts attempt
+                      ON attempt.attempt_id=supervisor.current_attempt_id
+                    LEFT JOIN server_observations observation USING(server_definition_id)
+                    WHERE EXISTS (
+                        SELECT 1 FROM server_environment_credentials credential
+                        WHERE credential.server_definition_id=definition.server_definition_id
+                    )
+                    ORDER BY definition.server_definition_id
+                    """
+                )
+            ]
+            binding_rows = list(
+                connection.execute(
+                    """
+                    SELECT server_definition_id,name,credential_id
+                    FROM server_environment_credentials
+                    ORDER BY server_definition_id,name
+                    """
+                )
+            )
+        finally:
+            connection.close()
+    except sqlite3.Error as error:
+        raise SwitchError("credentialized worker convergence cannot be read") from error
+    if (
+        len(rows) > WORKER_CUTOVER_LIMIT
+        or len(binding_rows) > retained_control.MAX_ROWS_PER_COLLECTION
+    ):
+        raise SwitchError("credentialized worker convergence is excessive")
+    by_id = {str(row["server_definition_id"]): row for row in rows}
+    if len(by_id) != len(rows):
+        raise SwitchError("credentialized worker convergence is duplicated")
+    bindings: dict[str, set[tuple[str, str]]] = {}
+    for row in binding_rows:
+        bindings.setdefault(str(row["server_definition_id"]), set()).add(
+            (str(row["name"]), str(row["credential_id"]))
+        )
+    return by_id, bindings
+
+
+def _credentialized_worker_blockers(
+    manifest: Mapping[str, object],
+    transaction_root: Path,
+    runner: Runner,
+    *,
+    source_proof: Mapping[str, object],
+    cgroup_root: Path = CGROUP_ROOT,
+    process_observer: Callable[[int, str], str] = observe_worker_process_identity,
+) -> tuple[tuple[str, ...], str]:
+    credentials = _server_credentials_from_manifest(manifest, transaction_root)
+    expected_bindings: dict[str, set[tuple[str, str]]] = {}
+    for credential_id, value in credentials.items():
+        expected_bindings.setdefault(
+            str(value["server_definition_id"]), set()
+        ).add((str(value["name"]), credential_id))
+    rows, retained_bindings = _credentialized_worker_rows()
+    loaded = set(loaded_managed_worker_ids(runner))
+    raw_expectations = source_proof.get("policy_expectations")
+    if not isinstance(raw_expectations, list):
+        raise SwitchError("credentialized worker source expectations are invalid")
+    source_expectations = {
+        str(value["server_definition_id"]): value
+        for value in raw_expectations
+        if isinstance(value, Mapping)
+        and isinstance(value.get("server_definition_id"), str)
+    }
+    if len(source_expectations) != len(raw_expectations):
+        raise SwitchError("credentialized worker source expectations are invalid")
+    blockers: set[str] = set()
+    stability: list[dict[str, object]] = []
+    for server_id, expected in expected_bindings.items():
+        row = rows.get(server_id)
+        source = source_expectations.get(server_id)
+        if row is None or retained_bindings.get(server_id) != expected:
+            blockers.add(server_id)
+            continue
+        policy_present = row.get("policy_generation") is not None
+        if policy_present:
+            if (
+                source is None
+                or row.get("definition_generation")
+                != int(source["definition_generation"]) + 1
+                or row.get("policy_generation")
+                != int(source["policy_generation"]) + 1
+            ):
+                blockers.add(server_id)
+                continue
+        elif source is not None:
+            blockers.add(server_id)
+            continue
+        expected_running = bool(
+            policy_present
+            and row.get("keep_alive") == 1
+            and row.get("desired_state") == "running"
+            and row.get("breaker_state") == "armed"
+        )
+        active_observation = bool(
+            row.get("observation_pid") is not None
+            or str(row.get("observation_lifecycle") or "")
+            in {"starting", "running", "unhealthy", "stopping"}
+        )
+        if not expected_running:
+            if (
+                server_id in loaded
+                or row.get("current_attempt_id") is not None
+                or row.get("attempt_state") in {"reserved", "running"}
+                or active_observation
+            ):
+                blockers.add(server_id)
+            else:
+                stability.append(
+                    {
+                        "server_definition_id": server_id,
+                        "state": "absent",
+                        "definition_generation": row["definition_generation"],
+                        "policy_generation": row["policy_generation"],
+                    }
+                )
+            continue
+        try:
+            native = _managed_worker_native_state(
+                runner, server_id, cgroup_root=cgroup_root
+            )
+        except SwitchError:
+            blockers.add(server_id)
+            continue
+        expected_slice = project_repository_slice(
+            uid=int(row["execution_uid"]), repository_id=str(row["repo_id"])
+        )
+        attempt_pid = row.get("attempt_pid")
+        attempt_start = row.get("attempt_process_start_time")
+        try:
+            process_alive = bool(
+                type(attempt_pid) is int
+                and isinstance(attempt_start, str)
+                and attempt_start
+                and process_observer(attempt_pid, attempt_start) == "alive"
+            )
+        except (OSError, RuntimeError, ValueError):
+            process_alive = False
+        health_contract = bool(
+            row.get("health_url_template")
+            or row.get("listener_observable") is not None
+        )
+        if (
+            row.get("supervisor_state") != "running"
+            or row.get("current_attempt_id") is None
+            or row.get("attempt_state") != "running"
+            or row.get("attempt_definition_generation")
+            != row.get("definition_generation")
+            or row.get("attempt_policy_generation") != row.get("policy_generation")
+            or row.get("attempt_supervisor_generation")
+            != row.get("supervisor_generation")
+            or row.get("attempt_supervisor_epoch") != row.get("supervisor_epoch")
+            or server_id not in loaded
+            or native.get("loaded") is not True
+            or native.get("active") is not True
+            or native.get("main_pid") is None
+            or native.get("cgroup_populated") is not True
+            or native.get("slice") != expected_slice
+            or not process_alive
+            or row.get("observation_lifecycle") != "running"
+            or row.get("observation_pid") != attempt_pid
+            or row.get("observation_process_start_time") != attempt_start
+            or row.get("observation_process_fingerprint")
+            != row.get("attempt_process_fingerprint")
+            or (health_contract and row.get("health_ok") != 1)
+        ):
+            blockers.add(server_id)
+        else:
+            stability.append(
+                {
+                    "server_definition_id": server_id,
+                    "state": "running",
+                    "definition_generation": row["definition_generation"],
+                    "policy_generation": row["policy_generation"],
+                    "supervisor_generation": row["supervisor_generation"],
+                    "supervisor_epoch": row["supervisor_epoch"],
+                    "attempt_id": row["current_attempt_id"],
+                    "attempt_pid": attempt_pid,
+                    "attempt_process_start_time": attempt_start,
+                    "native_main_pid": native["main_pid"],
+                    "native_control_group": native["control_group"],
+                    "native_slice": native["slice"],
+                    "health_contract": health_contract,
+                    "health_ok": row["health_ok"] if health_contract else None,
+                }
+            )
+    extra_rows = set(rows) - set(expected_bindings)
+    if extra_rows:
+        blockers.update(extra_rows)
+    return (
+        tuple(sorted(blockers)),
+        hashlib.sha256(
+            canonical(
+                sorted(
+                    stability,
+                    key=lambda item: str(item["server_definition_id"]),
+                )
+            )
+        ).hexdigest(),
+    )
+
+
+def require_credentialized_worker_convergence(
+    manifest: Mapping[str, object],
+    transaction_root: Path,
+    runner: Runner,
+    *,
+    source_proof: Mapping[str, object],
+    timeout_seconds: float = 60.0,
+    stable_seconds: float = 2.0,
+    clock: Callable[[], float] = time.monotonic,
+    sleeper: Callable[[float], None] = time.sleep,
+    cgroup_root: Path = CGROUP_ROOT,
+    process_observer: Callable[[int, str], str] = observe_worker_process_identity,
+) -> None:
+    deadline = float(clock()) + max(0.1, float(timeout_seconds))
+    stable_fingerprint: str | None = None
+    stable_since: float | None = None
+    while True:
+        blockers, fingerprint = _credentialized_worker_blockers(
+            manifest,
+            transaction_root,
+            runner,
+            source_proof=source_proof,
+            cgroup_root=cgroup_root,
+            process_observer=process_observer,
+        )
+        if not blockers:
+            observed_at = float(clock())
+            if (
+                stable_fingerprint == fingerprint
+                and stable_since is not None
+                and observed_at - stable_since >= max(0.1, float(stable_seconds))
+            ):
+                return
+            if stable_fingerprint != fingerprint:
+                stable_fingerprint = fingerprint
+                stable_since = observed_at
+        else:
+            stable_fingerprint = None
+            stable_since = None
+        if float(clock()) >= deadline:
+            raise SwitchError(
+                "credentialized workers did not converge: " + ", ".join(blockers)
+            )
+        sleeper(min(0.1, max(0.0, deadline - float(clock()))))
+
+
+def _candidate_coordinator_script(document: Mapping[str, object]) -> Path:
+    release = Path(str(document.get("release") or ""))
+    script = release / "skills/codex-dev-coordinator/scripts/dev_coordinator.py"
+    try:
+        resolved = script.resolve(strict=True)
+        info = resolved.lstat()
+    except OSError as error:
+        raise SwitchError("candidate worker controller script is unavailable") from error
+    if resolved != script or stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        raise SwitchError("candidate worker controller script is unsafe")
+    return script
+
+
+def _worker_native_factory(runner: Runner) -> Callable[..., object]:
+    def manager_factory(
+        *, coordinator_script: Path, state_root: Path | None = None
+    ) -> object:
+        def native_runner(
+            argv: Sequence[str], **_values: object
+        ) -> subprocess.CompletedProcess[str]:
+            bounded = getattr(runner, "run_bounded", None)
+            if callable(bounded):
+                return bounded(argv, timeout_seconds=45.0)
+            # Focused injected runners are already synchronous and bounded by
+            # their test invocation; production always uses Runner above.
+            return runner.run(argv)
+
+        return native_worker_manager(
+            coordinator_script=coordinator_script,
+            state_root=state_root,
+            runner=native_runner,
+        )
+
+    return manager_factory
+
+
+def _candidate_worker_cleanup_rows() -> tuple[
+    dict[str, dict[str, object]], tuple[str, ...]
+]:
+    try:
+        connection = sqlite3.connect(
+            f"{AUTHORITY_DATABASE.as_uri()}?mode=ro", uri=True, timeout=10.0
+        )
+        connection.row_factory = sqlite3.Row
+        try:
+            connection.execute("PRAGMA query_only=ON")
+            rows = [
+                dict(row)
+                for row in connection.execute(
+                    """
+                    SELECT definition.server_definition_id,definition.name,
+                           repository.canonical_root,policy.execution_uid
+                    FROM server_definitions definition
+                    JOIN repositories repository USING(repo_id)
+                    LEFT JOIN worker_policies policy USING(server_definition_id)
+                    ORDER BY definition.server_definition_id
+                    """
+                )
+            ]
+            nonterminal = tuple(
+                sorted(
+                    {
+                        str(row[0])
+                        for row in connection.execute(
+                            """
+                            SELECT server_definition_id FROM worker_attempts
+                            WHERE state IN ('reserved','running')
+                            UNION
+                            SELECT server_definition_id FROM worker_supervisor_states
+                            WHERE current_attempt_id IS NOT NULL
+                               OR state IN ('launching','running','stopping')
+                            """
+                        )
+                    }
+                )
+            )
+        finally:
+            connection.close()
+    except sqlite3.Error as error:
+        raise SwitchError("candidate worker cleanup state cannot be read") from error
+    if len(rows) > WORKER_CUTOVER_LIMIT or len(nonterminal) > WORKER_CUTOVER_LIMIT:
+        raise SwitchError("candidate worker cleanup state is excessive")
+    by_id = {str(row["server_definition_id"]): row for row in rows}
+    if len(by_id) != len(rows):
+        raise SwitchError("candidate worker cleanup state is duplicated")
+    return by_id, nonterminal
+
+
+def stop_candidate_workers_for_rollback(
+    document: Mapping[str, object],
+    intent: Mapping[str, object],
+    runner: Runner,
+) -> tuple[str, ...]:
+    """Stop only post-rebaseline workers, proven by the empty source receipt."""
+
+    source_proof = intent.get("source_worker_quiescence")
+    if not _valid_source_worker_quiescence(source_proof):
+        raise SwitchError("candidate worker cleanup lacks empty source proof")
+    loaded = set(loaded_managed_worker_ids(runner))
+    rows, nonterminal = _candidate_worker_cleanup_rows()
+    candidates = tuple(sorted(loaded | set(nonterminal)))
+    script = _candidate_coordinator_script(document)
+    manager_factory = _worker_native_factory(runner)
+    for worker_id in candidates:
+        row = rows.get(worker_id)
+        if row is not None and row.get("execution_uid") is not None:
+            try:
+                with AccountStore.open(
+                    AUTHORITY_DATABASE,
+                    expected_uid=os.geteuid(),
+                    busy_timeout_ms=10_000,
+                ) as store:
+                    WorkerController(
+                        store,
+                        coordinator_script=script,
+                        manager_factory=manager_factory,
+                        execution_uid=int(row["execution_uid"]),
+                    ).stop(
+                        worker_id=worker_id,
+                        canonical_repository=str(row["canonical_root"]),
+                        name=str(row["name"]),
+                        actor="release:retained-control-rollback",
+                        timeout_seconds=10.0,
+                    )
+            except (WorkerControlError, WorkerNativeError, OSError) as error:
+                raise SwitchError(
+                    "candidate worker cleanup failed: " + worker_id
+                ) from error
+            continue
+        if worker_id not in loaded:
+            raise SwitchError(
+                "candidate worker without policy retained nonterminal state: "
+                + worker_id
+            )
+        try:
+            manager = manager_factory(
+                coordinator_script=script,
+                state_root=None,
+            )
+            removed = manager.remove(worker_id=worker_id)
+        except (WorkerNativeError, OSError) as error:
+            raise SwitchError(
+                "candidate worker unit without policy could not be removed: "
+                + worker_id
+            ) from error
+        if removed.loaded or removed.active:
+            raise SwitchError(
+                "candidate worker unit without policy remained loaded: " + worker_id
+            )
+    remaining_units = loaded_managed_worker_ids(runner)
+    _rows, remaining_nonterminal = _candidate_worker_cleanup_rows()
+    if remaining_units or remaining_nonterminal:
+        raise SwitchError(
+            "candidate worker cleanup remained incomplete: "
+            + ", ".join(sorted({*remaining_units, *remaining_nonterminal}))
+        )
+    return candidates
 
 
 def stop_console_writers(document: Mapping[str, object], runner: Runner) -> None:
@@ -2079,6 +3041,7 @@ def _server_credential_backup_destinations(
     _private_owned_directory(
         backup_root, field="retained server credential backup root"
     )
+    _cleanup_server_credential_temporaries(credentials, transaction_root)
     result: dict[str, dict[str, object]] = {}
     for credential_id in sorted(credentials):
         destination = _server_credential_destination(credential_id)
@@ -2411,7 +3374,40 @@ def _load_bound_retained_manifest(
             raise SwitchError("retained Console staged target changed")
     credentials = _server_credentials_from_manifest(manifest, transaction_root)
     _validate_manifest_backup_binding(manifest, backups, credentials)
+    source = manifest.get("source")
+    source_proof = intent.get("source_worker_quiescence")
+    if (
+        not isinstance(source, Mapping)
+        or not _valid_source_worker_quiescence(source_proof)
+        or source.get("schema_version") != source_proof.get("schema_version")
+        or source.get("database_generation")
+        != source_proof.get("database_generation")
+    ):
+        raise SwitchError(
+            "retained source manifest is not bound to worker quiescence proof"
+        )
     return manifest
+
+
+def _unbound_prepared_server_credentials(
+    transaction_root: Path,
+) -> dict[str, dict[str, object]]:
+    """Recover affected IDs only to clean a pre-journal backup interruption."""
+
+    manifest_path = transaction_root / "retained-control/retained-control.json"
+    if not manifest_path.exists() and not manifest_path.is_symlink():
+        return {}
+    manifest = load_json(manifest_path)
+    unsigned = dict(manifest)
+    claimed = unsigned.pop("document_sha256", None)
+    if (
+        manifest.get("schema_version") != retained_control.VERSION
+        or manifest.get("kind") != retained_control.KIND
+        or not isinstance(claimed, str)
+        or hashlib.sha256(canonical(unsigned)).hexdigest() != claimed
+    ):
+        raise SwitchError("unbound retained-control manifest is invalid")
+    return _server_credentials_from_manifest(manifest, transaction_root)
 
 
 def _require_exact_live_server_credentials(
@@ -2481,6 +3477,7 @@ def _require_exact_live_retained_target(
         ):
             raise SwitchError(f"retained-control live target changed: {destination}")
     credentials = _server_credentials_from_manifest(manifest, transaction_root)
+    _cleanup_server_credential_temporaries(credentials, transaction_root)
     _require_exact_live_server_credentials(credentials)
     require_current_authority_schema()
 
@@ -2553,8 +3550,26 @@ def apply_retained_control_rebaseline(
         _require_live_retained_generation(manifest)
         return intent
 
-    require_no_managed_worker_units(runner)
+    source_status = intent["status"] in {"planned", "backed-up", "prepared"}
+    if source_status:
+        bind_source_worker_quiescence(document, intent, journal_path, runner)
+    else:
+        require_no_managed_worker_units(runner)
     stop_authority_writers(runner)
+    if source_status:
+        post_stop_proof = source_worker_quiescence_proof(runner)
+        retained_proof = intent.get("source_worker_quiescence")
+        if (
+            not _valid_source_worker_quiescence(retained_proof)
+            or dict(retained_proof) != post_stop_proof
+        ):
+            raise SwitchError(
+                "source worker quiescence changed while authority writers stopped"
+            )
+    else:
+        # Close the unit-start TOCTOU even when replay begins from a partially
+        # published database whose schema cannot yet be read as schema 15.
+        require_no_managed_worker_units(runner)
     stop_console_writers(document, runner)
     if intent["status"] == "planned":
         _checkpoint_authority_database()
@@ -2604,6 +3619,7 @@ def apply_retained_control_rebaseline(
 
     manifest = _load_bound_retained_manifest(intent, transaction_root, backups)
     credentials = _server_credentials_from_manifest(manifest, transaction_root)
+    _cleanup_server_credential_temporaries(credentials, transaction_root)
     target = manifest.get("target")
     if not isinstance(target, Mapping):
         raise SwitchError("retained-control target is invalid")
@@ -2627,6 +3643,15 @@ def apply_retained_control_rebaseline(
         # interrupted partial publish replayable even when the journal update
         # immediately after one os.replace never reached disk.
         _restore_retained_files(backups, credentials)
+        retained_proof = intent.get("source_worker_quiescence")
+        restored_proof = source_worker_quiescence_proof(runner)
+        if (
+            not _valid_source_worker_quiescence(retained_proof)
+            or dict(retained_proof) != restored_proof
+        ):
+            raise SwitchError(
+                "restored source worker quiescence differs from its journal proof"
+            )
         _publish_server_credentials(credentials, backups)
         _publish_owned_copy(
             AUTHORITY_DATABASE,
@@ -2682,6 +3707,7 @@ def complete_retained_control_rebaseline(
     document: dict[str, object],
     journal_path: Path,
     transaction_root: Path,
+    runner: Runner,
 ) -> dict[str, object]:
     intent = retained_rebaseline_intent(document)
     if intent["required"] is not True:
@@ -2694,6 +3720,12 @@ def complete_retained_control_rebaseline(
     manifest = _load_bound_retained_manifest(intent, transaction_root, backups)
     _require_exact_live_retained_target(manifest, backups, transaction_root)
     _require_live_retained_generation(manifest)
+    require_credentialized_worker_convergence(
+        manifest,
+        transaction_root,
+        runner,
+        source_proof=intent["source_worker_quiescence"],
+    )
     if intent["status"] == "published":
         intent.update({"status": "applied", "applied_at": now()})
         document["retained_control_rebaseline"] = intent
@@ -2714,15 +3746,47 @@ def restore_retained_control_rebaseline(
     backups = intent.get("backups")
     if not isinstance(backups, Mapping):
         raise SwitchError("retained-control rollback backups are unavailable")
-    require_no_managed_worker_units(runner)
-    stop_authority_writers(runner)
+    status = str(intent["status"])
+    retained_proof = intent.get("source_worker_quiescence")
+    if status in {"backed-up", "prepared"}:
+        observed = source_worker_quiescence_proof(runner)
+        if (
+            not _valid_source_worker_quiescence(retained_proof)
+            or dict(retained_proof) != observed
+        ):
+            raise SwitchError("source worker quiescence changed before rollback")
+        stop_authority_writers(runner)
+        observed = source_worker_quiescence_proof(runner)
+        if dict(retained_proof) != observed:
+            raise SwitchError("source worker quiescence changed while stopping writers")
+    elif status == "publishing":
+        require_no_managed_worker_units(runner)
+        stop_authority_writers(runner)
+        require_no_managed_worker_units(runner)
+    elif status in {"published", "applied"}:
+        # The journal proves the predecessor contained no worker. Every exact
+        # current attempt/unit was therefore created by this candidate.
+        stop_authority_writers(runner)
+        stop_candidate_workers_for_rollback(document, intent, runner)
+    else:
+        raise SwitchError("retained-control rollback status is invalid")
     stop_console_writers(document, runner)
-    if intent["status"] == "backed-up":
+    if status == "backed-up":
+        affected = _unbound_prepared_server_credentials(transaction_root)
+        if affected:
+            _cleanup_server_credential_temporaries(affected, transaction_root)
         credentials: Mapping[str, Mapping[str, object]] = {}
     else:
         manifest = _load_bound_retained_manifest(intent, transaction_root, backups)
         credentials = _server_credentials_from_manifest(manifest, transaction_root)
+        _cleanup_server_credential_temporaries(credentials, transaction_root)
     _restore_retained_files(backups, credentials)
+    restored_proof = source_worker_quiescence_proof(runner)
+    if (
+        not _valid_source_worker_quiescence(retained_proof)
+        or dict(retained_proof) != restored_proof
+    ):
+        raise SwitchError("restored source worker quiescence differs from its journal proof")
     intent.update({"status": "rolled-back", "rolled_back_at": now()})
     document["retained_control_rebaseline"] = intent
     save_phase(journal_path, document, "rollback-retained-control-restored")
@@ -3580,10 +4644,15 @@ def apply(
     if document.get("phase") not in {"prepared", "applying"}:
         raise SwitchError("same-schema journal cannot be applied from this phase")
     if rebaseline["required"] is True and rebaseline["status"] != "applied":
-        # Refuse before installing release destinations or running cleanup.
-        # Existing workers are not interrupted; the operator chooses the
-        # exact targeted restart that clears this one-time schema boundary.
-        require_no_managed_worker_units(runner)
+        if rebaseline["status"] in {"planned", "backed-up", "prepared"}:
+            # The proof is computed before this first journal mutation.
+            bind_source_worker_quiescence(
+                document, rebaseline, journal_path, runner
+            )
+        else:
+            # A publishing replay can temporarily expose either schema; its
+            # exact schema-15 proof is rechecked after predecessor restore.
+            require_no_managed_worker_units(runner)
 
     if document.get("already_active") is True:
         validate_headless_browser_cleanup_plan(document, release)
@@ -3637,7 +4706,7 @@ def apply(
         require_current_authority_schema()
         restart_services(runner)
         complete_retained_control_rebaseline(
-            document, journal_path, transaction_root
+            document, journal_path, transaction_root, runner
         )
     finally:
         for listener in reservations:
@@ -4037,13 +5106,6 @@ def rollback(
     # Restore the schema-15 data before any previous binary or Console writer
     # is allowed to start.  This also converges a crash after any one of the
     # retained control or credential files was replaced.
-    rollback_rebaseline = retained_rebaseline_intent(document)
-    if (
-        rollback_rebaseline["required"] is True
-        and rollback_rebaseline["status"] not in {"planned", "rolled-back"}
-    ):
-        require_no_managed_worker_units(runner)
-    stop_console_writers(document, runner)
     restore_retained_control_rebaseline(
         document, journal_path, transaction_root, runner
     )
@@ -4143,6 +5205,45 @@ def parser() -> argparse.ArgumentParser:
     return result
 
 
+def public_switch_result(action: str, value: Mapping[str, object]) -> dict[str, object]:
+    """Return a bounded path-, backup-, and credential-evidence-free CLI result."""
+
+    if action not in {"prepare", "apply", "rollback", "verify"}:
+        raise SwitchError("same-schema public result action is invalid")
+    release_digest = value.get("release_digest")
+    if not isinstance(release_digest, str) or RELEASE_RE.fullmatch(release_digest) is None:
+        raise SwitchError("same-schema public result release identity is invalid")
+    result: dict[str, object] = {
+        "ok": value.get("ok") is True if action == "verify" else True,
+        "action": action,
+        "release_digest": release_digest,
+        "phase": str(value.get("phase") or ("verified" if action == "verify" else action)),
+    }
+    previous = value.get("previous_release_digest")
+    if isinstance(previous, str) and RELEASE_RE.fullmatch(previous) is not None:
+        result["previous_release_digest"] = previous
+    rebaseline = value.get("retained_control_rebaseline")
+    if isinstance(rebaseline, Mapping):
+        result["retained_control_rebaseline"] = {
+            field: rebaseline.get(field)
+            for field in (
+                "required",
+                "status",
+                "source_schema_version",
+                "target_schema_version",
+            )
+        }
+    reset = value.get("test_history_reset")
+    if isinstance(reset, Mapping):
+        result["test_history_reset"] = {
+            field: reset.get(field) for field in ("required", "status")
+        }
+    authority_schema = value.get("authority_schema_version")
+    if type(authority_schema) is int:
+        result["authority_schema_version"] = authority_schema
+    return result
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     try:
@@ -4182,7 +5283,7 @@ def main(argv: list[str] | None = None) -> int:
     except (SwitchError, installer.ReleaseError, OSError, ValueError) as error:
         print(json.dumps({"ok": False, "error": str(error)}, sort_keys=True), file=sys.stderr)
         return 1
-    print(json.dumps(value, sort_keys=True))
+    print(json.dumps(public_switch_result(args.action, value), sort_keys=True))
     if args.action == "verify" and value.get("ok") is not True:
         return 1
     return 0
