@@ -23,6 +23,7 @@ from devcoordinator.universal_test_runner import (
     _dotnet_readiness,
     _dotnet_restore_project,
     _dotnet_restore_semantic_options,
+    _jsonl_cases,
     _load,
     _run_dotnet_probe,
     _trx_cases,
@@ -89,6 +90,21 @@ class UniversalTestRunnerTests(unittest.TestCase):
                 validate_result_package(result_path), "cases"
             )
         )
+
+    def test_jsonl_reporter_accepts_blank_zero_case_stream(self) -> None:
+        report = self.output / "reporter.events.jsonl"
+        report.write_text("\n  \n", encoding="utf-8")
+        self.assertEqual(_jsonl_cases(report), ([], []))
+        report.write_text(
+            "\n" + json.dumps({"id": "case-1", "status": "passed"}) + "\n\n",
+            encoding="utf-8",
+        )
+        cases, failures = _jsonl_cases(report)
+        self.assertEqual([item["case_id"] for item in cases], ["case-1"])
+        self.assertEqual(failures, [])
+        report.write_text("\nnot-json\n", encoding="utf-8")
+        with self.assertRaises(json.JSONDecodeError):
+            _jsonl_cases(report)
 
     def result_package_content(self, result_path: Path) -> dict[str, object]:
         package = validate_result_package(result_path)

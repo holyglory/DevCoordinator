@@ -1602,6 +1602,8 @@ def _jsonl_cases(path: Path) -> tuple[list[dict[str, object]], list[dict[str, ob
         for index, line in enumerate(stream):
             if index >= MAX_CASES or len(line.encode("utf-8")) > 1024 * 1024:
                 raise TestStoreContractError("JSONL reporter output is excessive")
+            if not line.strip():
+                continue
             value = json.loads(line)
             if not isinstance(value, Mapping):
                 raise TestStoreContractError("JSONL reporter event is invalid")

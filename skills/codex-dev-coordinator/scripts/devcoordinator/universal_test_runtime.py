@@ -4346,7 +4346,24 @@ class SystemdTestAttemptManager:
 
     def status(self, runtime_id: str) -> NativeTestAttemptState:
         runtime_id = _safe_id("runtime_id", runtime_id)
-        descriptor, native = self._native_context(runtime_id)
+        try:
+            descriptor, native = self._native_context(runtime_id)
+        except TestAttemptRuntimeNotFound:
+            fields, returncode = self._systemd_show(runtime_id)
+            if returncode != 0 or fields.get("LoadState") == "not-found":
+                return NativeTestAttemptState(
+                    runtime_id=runtime_id,
+                    loaded=False,
+                    active=False,
+                    state="absent",
+                    exit_status=None,
+                    finished_at=float(self.clock()),
+                    systemd_unit=self._unit(runtime_id),
+                    cgroup_populated=False,
+                )
+            raise TestStoreConflict(
+                "test execution is loaded without exact launch evidence"
+            )
         fields, returncode = self._systemd_show(runtime_id)
         if returncode != 0 or fields.get("LoadState") == "not-found":
             return self._collected_status(runtime_id)
@@ -4600,9 +4617,6 @@ class BrokerTestAttemptCoordinator:
         )
         if record.runtime_id is not None:
             return {
-                "execution_id": record.descriptor.execution_id,
-                "generation": record.descriptor.generation,
-                "systemd_unit": record.runtime_id + ".service",
                 "runtime_id": record.runtime_id,
                 "launch_ack_id": "test-launch-" + record.ticket_id.removeprefix("test-ticket-"),
             }
@@ -4620,9 +4634,6 @@ class BrokerTestAttemptCoordinator:
         self._tickets[ticket_id] = replacement
         self._runtimes[state.runtime_id] = ticket_id
         return {
-            "execution_id": record.descriptor.execution_id,
-            "generation": record.descriptor.generation,
-            "systemd_unit": state.systemd_unit or state.runtime_id + ".service",
             "runtime_id": state.runtime_id,
             "launch_ack_id": "test-launch-" + record.ticket_id.removeprefix("test-ticket-"),
         }
@@ -4735,9 +4746,6 @@ class BrokerTestAttemptCoordinator:
         self._runtimes[runtime_id] = ticket_id
         self._recovered_runtimes[runtime_id] = descriptor
         return {
-            "execution_id": descriptor.execution_id,
-            "generation": descriptor.generation,
-            "systemd_unit": runtime_id + ".service",
             "runtime_id": runtime_id,
             "launch_ack_id": "test-launch-"
             + ticket_id.removeprefix("test-ticket-"),
@@ -4832,9 +4840,6 @@ class BrokerTestAttemptCoordinator:
                     "test attempt is active without recoverable launch evidence"
                 )
             return {
-                "execution_id": expected_execution_id,
-                "generation": None,
-                "systemd_unit": runtime_id + ".service",
                 "runtime_id": runtime_id,
                 "cancelled": True,
                 "absent": True,
@@ -4857,9 +4862,6 @@ class BrokerTestAttemptCoordinator:
         )
         absent = not state.loaded and not state.active
         return {
-            "execution_id": descriptor.execution_id,
-            "generation": descriptor.generation,
-            "systemd_unit": state.systemd_unit or runtime_id + ".service",
             "runtime_id": runtime_id,
             "cancelled": not state.active,
             "absent": absent,
@@ -4967,29 +4969,55 @@ class BrokerTestAttemptCoordinator:
         expected_repository_generation: int,
     ) -> dict[str, object]:
         runtime_id = _safe_id("runtime_id", runtime_id)
-        descriptor = self.runtime_descriptor(runtime_id)
+        expected_execution_id = _safe_id(
+            "expected_execution_id", expected_execution_id
+        )
+        expected_repository_id = _safe_id(
+            "expected_repository_id", expected_repository_id
+        )
         if (
-            descriptor.execution_id
-            != _safe_id("expected_execution_id", expected_execution_id)
-            or descriptor.repository_id
-            != _safe_id("expected_repository_id", expected_repository_id)
+            type(expected_repository_generation) is not int
+            or expected_repository_generation < 0
+        ):
+            raise TestStoreContractError(
+                "expected_repository_generation must be non-negative"
+            )
+        if runtime_id != _runtime_id_for_execution(expected_execution_id):
+            raise TestStoreConflict(
+                "test execution collection runtime identity is contradictory"
+            )
+        try:
+            descriptor = self.runtime_descriptor(runtime_id)
+        except TestAttemptRuntimeNotFound:
+            state = self._require_exact_native_state(
+                runtime_id, self.manager.status(runtime_id)
+            )
+            if state.loaded or state.active or state.result_package is not None:
+                raise TestStoreConflict(
+                    "test execution collection native state contradicts absent launch evidence"
+                )
+            ticket_id = self._runtimes.pop(runtime_id, None)
+            if ticket_id is not None:
+                self._tickets.pop(ticket_id, None)
+            self._recovered_runtimes.pop(runtime_id, None)
+            return {"runtime_id": runtime_id, "collected": True}
+        if (
+            descriptor.execution_id != expected_execution_id
+            or descriptor.repository_id != expected_repository_id
             or descriptor.repository_generation != expected_repository_generation
         ):
-            raise TestStoreConflict("test attempt collection identity is contradictory")
+            raise TestStoreConflict("test execution collection identity is contradictory")
         state = self._require_exact_native_state(
             runtime_id, self.manager.status(runtime_id)
         )
         if state.active or state.cgroup_populated is not False:
-            raise TestStoreConflict("test attempt lacks stopped cgroup proof")
+            raise TestStoreConflict("test execution lacks stopped cgroup proof")
         self.manager.collect(runtime_id)
         ticket_id = self._runtimes.pop(runtime_id, None)
         if ticket_id is not None:
             self._tickets.pop(ticket_id, None)
         self._recovered_runtimes.pop(runtime_id, None)
         return {
-            "execution_id": descriptor.execution_id,
-            "generation": descriptor.generation,
-            "systemd_unit": state.systemd_unit or runtime_id + ".service",
             "runtime_id": runtime_id,
             "collected": True,
         }

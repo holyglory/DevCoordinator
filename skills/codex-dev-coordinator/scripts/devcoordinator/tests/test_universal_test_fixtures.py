@@ -141,6 +141,67 @@ class UniversalTestFixtureProviderTests(unittest.TestCase):
             reason="idempotent",
         )
 
+    def test_fixture_launch_prefetches_an_uncached_exact_sealed_image(self) -> None:
+        class ColdFixtureHost(FixtureHost):
+            def __init__(self) -> None:
+                super().__init__()
+                self.image_cached = False
+                self.image_prefetches = []
+
+            def docker_inspect_ephemeral_image(self, target):
+                self.image_cache_checks.append(target)
+                if not self.image_cached:
+                    return {"cached": False, "image_ref": target.image_ref}
+                return super().docker_inspect_ephemeral_image(target)
+
+            def docker_prefetch_ephemeral_image(self, target):
+                self.image_prefetches.append(target)
+                self.image_cached = True
+                return {
+                    **self.docker_inspect_ephemeral_image(target),
+                    "cache_origin": "pulled",
+                    "changed": True,
+                }
+
+        self.host = ColdFixtureHost()
+        provider = self.provider()
+        runtime_id = "devcoordinator-test-" + "9" * 32
+
+        lease = provider.provision(self.descriptor(), runtime_id=runtime_id)
+
+        self.assertEqual(len(self.host.image_prefetches), 1)
+        self.assertEqual(self.host.image_prefetches[0].template_id, TEMPLATE)
+        self.assertEqual(self.host.image_prefetches[0].image_ref, IMAGE)
+        self.assertEqual(lease.fixtures, ("postgres",))
+        provider.cleanup(
+            runtime_id=runtime_id,
+            descriptor_fingerprint=lease.descriptor_fingerprint,
+            reason="terminal",
+        )
+
+    def test_fixture_launch_rejects_mismatched_prefetch_evidence(self) -> None:
+        class MismatchedPrefetchHost(FixtureHost):
+            def docker_inspect_ephemeral_image(self, target):
+                return {"cached": False, "image_ref": target.image_ref}
+
+            def docker_prefetch_ephemeral_image(self, target):
+                return {
+                    "cached": True,
+                    "image_ref": target.image_ref,
+                    "image_id": "sha256:" + "c" * 64,
+                    "repo_digest": "postgres@sha256:" + "d" * 64,
+                    "os": "linux",
+                    "architecture": "amd64",
+                }
+
+        self.host = MismatchedPrefetchHost()
+        provider = self.provider()
+
+        with self.assertRaisesRegex(TestStoreConflict, "exact sealed image"):
+            provider.provision(
+                self.descriptor(), runtime_id="devcoordinator-test-" + "8" * 32
+            )
+
     def test_sealed_fixture_template_is_available_to_another_repository(self) -> None:
         consumer_root = self.fixture.root / "consumer"
         consumer_root.mkdir()

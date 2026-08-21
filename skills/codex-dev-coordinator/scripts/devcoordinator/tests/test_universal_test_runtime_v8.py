@@ -342,6 +342,31 @@ class UniversalTestRuntimeV8Tests(unittest.TestCase):
         self.assertNotIn("result", observed)
         self.assertNotIn("result_chunk", observed)
 
+    def test_never_launched_terminal_execution_collects_from_exact_absence(self) -> None:
+        def absent(argv, **_kwargs):
+            self.assertIn("show", argv)
+            return subprocess.CompletedProcess(
+                argv,
+                1,
+                "LoadState=not-found\nActiveState=inactive\nSubState=dead\n",
+                "unit not found",
+            )
+
+        coordinator = BrokerTestAttemptCoordinator(
+            self.manager(absent), clock=lambda: 100.0
+        )
+
+        self.assertEqual(
+            coordinator.collect(
+                self.runtime_id,
+                expected_execution_id=self.descriptor.execution_id,
+                expected_repository_id=self.descriptor.repository_id,
+                expected_repository_generation=self.descriptor.repository_generation,
+            ),
+            {"runtime_id": self.runtime_id, "collected": True},
+        )
+        self.assertFalse((self.attempt_root / self.runtime_id).exists())
+
 
 if __name__ == "__main__":
     unittest.main()
