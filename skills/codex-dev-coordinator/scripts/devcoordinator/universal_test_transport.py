@@ -46,6 +46,7 @@ MAX_TEST_PLANE_FRAME_BYTES = 768 * 1024
 DEFAULT_TEST_PLANE_TIMEOUT_SECONDS = 10.0
 TEST_CATALOG_READ_TIMEOUT_SECONDS = 60.0
 TEST_SETUP_READ_TIMEOUT_SECONDS = 60.0
+TEST_QUEUE_STATUS_READ_TIMEOUT_SECONDS = 60.0
 DEFAULT_TEST_PLAN_PREVIEW_TIMEOUT_SECONDS = 180.0
 DEFAULT_TEST_PLANE_CONCURRENCY = 8
 LOGGER = logging.getLogger(__name__)
@@ -56,6 +57,7 @@ TEST_PLAN_PREVIEW = "test.plan_preview"
 TEST_PLAN_REGISTER = "test.plan_register"
 TEST_PLAN_REPOSITORY = "test.plan_repository"
 TEST_RUN_SUBMIT = "test.run_submit"
+TEST_QUEUE_STATUS = "test.queue_status"
 TEST_RUN_LIST = "test.run_list"
 TEST_RUN_STATUS = "test.run_status"
 TEST_RUN_SUMMARY = "test.run_summary"
@@ -76,6 +78,7 @@ TEST_PLANE_OPERATIONS = frozenset(
         TEST_PLAN_REGISTER,
         TEST_PLAN_REPOSITORY,
         TEST_RUN_SUBMIT,
+        TEST_QUEUE_STATUS,
         TEST_RUN_LIST,
         TEST_RUN_STATUS,
         TEST_RUN_SUMMARY,
@@ -123,6 +126,7 @@ _OPERATION_ARGUMENTS = {
         ),
         frozenset({"priority", "target_resources"}),
     ),
+    TEST_QUEUE_STATUS: (frozenset({"repository_id"}), frozenset()),
     TEST_RUN_LIST: (
         frozenset({"repository_id"}),
         frozenset({"after", "limit", "state"}),
@@ -599,6 +603,8 @@ class TestPlaneDispatcher:
             values = dict(arguments)
             values["target_resources"] = _target_resources(values.get("target_resources"))
             return self.service.submit(**values)
+        if operation == TEST_QUEUE_STATUS:
+            return self.service.queue_status(**arguments)
         if operation == TEST_RUN_LIST:
             return self.service.runs(**arguments)
         if operation == TEST_RUN_STATUS:
@@ -1341,6 +1347,13 @@ class UnixTestPlaneClient:
     def runs(self, **arguments):
         return self._call(TEST_RUN_LIST, arguments)
 
+    def queue_status(self, *, repository_id: str):
+        return self._call(
+            TEST_QUEUE_STATUS,
+            {"repository_id": repository_id},
+            timeout_seconds=TEST_QUEUE_STATUS_READ_TIMEOUT_SECONDS,
+        )
+
     def status(self, *, run_id: str, repository_id: str):
         return self._call(
             TEST_RUN_STATUS,
@@ -1485,6 +1498,8 @@ __all__ = [
     "TEST_ARTIFACT_RESOLVE",
     "TEST_EVIDENCE",
     "TEST_REPOSITORY_STATS",
+    "TEST_QUEUE_STATUS",
+    "TEST_QUEUE_STATUS_READ_TIMEOUT_SECONDS",
     "TEST_RUN_CASES",
     "TEST_RUN_RETRY",
     "TEST_REPOSITORY_SETUP",

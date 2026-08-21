@@ -1272,6 +1272,8 @@ class TestPlaneClient(Protocol):
         state: str | None = None,
     ) -> Mapping[str, object]: ...
 
+    def queue_status(self, *, repository_id: str) -> Mapping[str, object]: ...
+
     def summary(
         self, *, run_id: str, repository_id: str
     ) -> Mapping[str, object]: ...
@@ -1727,6 +1729,14 @@ class StoreTestPlaneAdapter:
                 "next_cursor": (
                     rows[-1]["run_id"] if len(rows) == page_limit else None
                 ),
+            }
+        )
+
+    def queue_status(self, *, repository_id: str) -> Mapping[str, object]:
+        return self._bounded(
+            {
+                "schema_version": 1,
+                **self._store.queue_status(repository_id=repository_id),
             }
         )
 

@@ -127,6 +127,7 @@ class BrokerOperation(str, Enum):
     TEST_PLAN_PREVIEW = "test.plan_preview"
     TEST_PLAN_REGISTER = "test.plan_register"
     TEST_RUN_SUBMIT = "test.run_submit"
+    TEST_QUEUE_STATUS = "test.queue_status"
     TEST_RUN_LIST = "test.run_list"
     TEST_RUN_STATUS = "test.run_status"
     TEST_RUN_SUMMARY = "test.run_summary"
@@ -734,6 +735,7 @@ class SerializedMutationWriter:
             BrokerOperation.INVENTORY_READ,
             BrokerOperation.EVENTS_READ,
             BrokerOperation.TEST_HEALTH,
+            BrokerOperation.TEST_QUEUE_STATUS,
             BrokerOperation.TEST_RUN_LIST,
             BrokerOperation.TEST_RUN_STATUS,
             BrokerOperation.TEST_RUN_SUMMARY,
@@ -2404,6 +2406,21 @@ def _validate_arguments(
                 operation_id,
                 maximum_bytes=256,
             ),
+        }
+
+    if operation == BrokerOperation.TEST_QUEUE_STATUS:
+        if set(value) != {"expected_repository_id"}:
+            raise BrokerError(
+                "invalid_arguments",
+                "Test queue status requires exactly expected_repository_id.",
+                operation_id=operation_id,
+            )
+        return {
+            "expected_repository_id": _opaque_argument(
+                value["expected_repository_id"],
+                "expected_repository_id",
+                operation_id,
+            )
         }
 
     if operation == BrokerOperation.TEST_RUN_LIST:

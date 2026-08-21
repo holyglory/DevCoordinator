@@ -264,6 +264,7 @@ _ASYNC_TEST_OPERATIONS = frozenset(
         BrokerOperation.TEST_PLAN_PREVIEW,
         BrokerOperation.TEST_PLAN_REGISTER,
         BrokerOperation.TEST_RUN_SUBMIT,
+        BrokerOperation.TEST_QUEUE_STATUS,
         BrokerOperation.TEST_RUN_LIST,
         BrokerOperation.TEST_RUN_STATUS,
         BrokerOperation.TEST_RUN_SUMMARY,
@@ -954,6 +955,22 @@ class StoreBackedMutationBackend:
                     )
                 )
                 self._require_test_repository(result, repository_id)
+                return result
+
+            if request.operation is BrokerOperation.TEST_QUEUE_STATUS:
+                expected_repository_id = request.arguments[
+                    "expected_repository_id"
+                ]
+                if expected_repository_id != request.project_id:
+                    raise BrokerBackendError(
+                        "test_repository_mismatch",
+                        "The test queue status does not belong to the requested repository.",
+                        operation_id=request.operation_id,
+                    )
+                result = dict(
+                    plane.queue_status(repository_id=request.project_id)
+                )
+                self._require_test_repository(result, request.project_id)
                 return result
 
             if request.operation is BrokerOperation.TEST_RUN_LIST:
