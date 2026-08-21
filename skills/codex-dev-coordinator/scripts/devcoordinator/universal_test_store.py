@@ -47,7 +47,7 @@ MAX_FAILURE_RESULTS = MAX_CASE_RESULTS
 MAX_ARTIFACT_RESULTS = 64
 MAX_RESULT_PACKAGE_BYTES = 1024 * 1024 * 1024
 MAX_EVENT_DETAIL_BYTES = 16 * 1024
-MAX_ROLLUP_REBUILD_BATCH = 1_000
+MAX_STATISTICS_SERIES_DAYS = 365
 MAX_NONTERMINAL_RUNS_PER_RECONCILE = 10_000
 DEFAULT_MEMORY_BOOTSTRAP_MIB = 512
 
@@ -612,63 +612,6 @@ CREATE TABLE test_mutation_journal (
     created_at REAL NOT NULL
 ) STRICT;
 
-CREATE TABLE test_rollup_hourly (
-    repository_id TEXT NOT NULL,
-    bucket_start REAL NOT NULL,
-    run_count INTEGER NOT NULL,
-    attempt_count INTEGER NOT NULL,
-    selected_target_count INTEGER NOT NULL,
-    eligible_target_count INTEGER NOT NULL,
-    avoided_target_count INTEGER NOT NULL,
-    case_count INTEGER NOT NULL,
-    passed_count INTEGER NOT NULL,
-    failed_count INTEGER NOT NULL,
-    skipped_count INTEGER NOT NULL,
-    error_count INTEGER NOT NULL,
-    queue_seconds REAL NOT NULL,
-    attempt_queue_seconds REAL NOT NULL,
-    aggregate_test_seconds REAL NOT NULL,
-    attempt_wall_seconds REAL NOT NULL,
-    wall_seconds REAL NOT NULL,
-    retry_attempt_count INTEGER NOT NULL,
-    flake_count INTEGER NOT NULL,
-    slow_count INTEGER NOT NULL,
-    regression_count INTEGER NOT NULL,
-    max_attempt_seconds REAL NOT NULL,
-    success_count INTEGER NOT NULL,
-    failure_count INTEGER NOT NULL,
-    infrastructure_count INTEGER NOT NULL,
-    PRIMARY KEY(repository_id, bucket_start)
-) STRICT;
-
-CREATE TABLE test_rollup_daily (
-    repository_id TEXT NOT NULL,
-    bucket_start REAL NOT NULL,
-    run_count INTEGER NOT NULL,
-    attempt_count INTEGER NOT NULL,
-    selected_target_count INTEGER NOT NULL,
-    eligible_target_count INTEGER NOT NULL,
-    avoided_target_count INTEGER NOT NULL,
-    case_count INTEGER NOT NULL,
-    passed_count INTEGER NOT NULL,
-    failed_count INTEGER NOT NULL,
-    skipped_count INTEGER NOT NULL,
-    error_count INTEGER NOT NULL,
-    queue_seconds REAL NOT NULL,
-    attempt_queue_seconds REAL NOT NULL,
-    aggregate_test_seconds REAL NOT NULL,
-    attempt_wall_seconds REAL NOT NULL,
-    wall_seconds REAL NOT NULL,
-    retry_attempt_count INTEGER NOT NULL,
-    flake_count INTEGER NOT NULL,
-    slow_count INTEGER NOT NULL,
-    regression_count INTEGER NOT NULL,
-    max_attempt_seconds REAL NOT NULL,
-    success_count INTEGER NOT NULL,
-    failure_count INTEGER NOT NULL,
-    infrastructure_count INTEGER NOT NULL,
-    PRIMARY KEY(repository_id, bucket_start)
-) STRICT;
 """
 
 def _canonical_json(value: object) -> str:
@@ -1014,12 +957,8 @@ def _now(clock: Callable[[], float]) -> float:
     return _finite_nonnegative("clock", clock())
 
 
-def _bucket_start(timestamp: float, seconds: int) -> float:
-    return float(int(timestamp) // seconds * seconds)
-
-
 class UniversalTestStore:
-    """Transactional test-plane persistence with exact attempt fencing."""
+    """Transactional test-plane persistence with exact execution fencing."""
 
     def __init__(
         self,
@@ -1550,12 +1489,6 @@ class UniversalTestStore:
                 },
                 created_at=timestamp,
             )
-            if initial_finished_at is not None:
-                self._refresh_rollups(
-                    connection,
-                    repository_id=plan.repository_id,
-                    finished_at=initial_finished_at,
-                )
             return result
 
     def register_plan(
@@ -2907,11 +2840,6 @@ class UniversalTestStore:
                 run_id=str(target["run_id"]),
                 issued_at=timestamp,
             )
-            self._refresh_rollups(
-                connection,
-                repository_id=str(run["repository_id"]),
-                finished_at=timestamp,
-            )
             result = {
                 "attempt_id": execution_id,
                 "execution_id": execution_id,
@@ -4028,424 +3956,414 @@ class UniversalTestStore:
                 return run_state, classification.value
         raise AssertionError("terminal failure state was not classified")
 
-    def _refresh_rollups(
-        self,
-        connection: sqlite3.Connection,
-        *,
-        repository_id: str,
-        finished_at: float,
-    ) -> None:
-        """Refresh compatible bounded statistics from one execution per target."""
-
-        for table, seconds in (
-            ("test_rollup_hourly", 3_600),
-            ("test_rollup_daily", 86_400),
-        ):
-            bucket = _bucket_start(finished_at, seconds)
-            end = bucket + seconds
-            executions = connection.execute(
-                """
-                SELECT
-                  COUNT(*) AS attempt_count,
-                  COALESCE(SUM(passed_count + failed_count + skipped_count + error_count), 0) AS case_count,
-                  COALESCE(SUM(passed_count), 0) AS passed_count,
-                  COALESCE(SUM(failed_count), 0) AS failed_count,
-                  COALESCE(SUM(skipped_count), 0) AS skipped_count,
-                  COALESCE(SUM(error_count), 0) AS error_count,
-                  COALESCE(SUM(CASE WHEN EXISTS (
-                    SELECT 1 FROM test_case_results AS observed_case
-                    WHERE observed_case.target_id = target.target_id
-                  ) THEN (
-                    SELECT COALESCE(SUM(result.duration_seconds), 0.0)
-                    FROM test_case_results AS result
-                    WHERE result.target_id = target.target_id
-                  ) ELSE target.duration_seconds END), 0.0) AS aggregate_test_seconds,
-                  COALESCE(SUM(target.duration_seconds), 0.0) AS attempt_wall_seconds,
-                  COALESCE(SUM(CASE
-                    WHEN target.started_at IS NOT NULL
-                    THEN MAX(0.0, target.started_at - target.queued_at)
-                    ELSE 0.0 END), 0.0) AS attempt_queue_seconds,
-                  0 AS retry_attempt_count,
-                  COALESCE(SUM(CASE
-                    WHEN target.duration_seconds > target.estimated_seconds * 1.25
-                    THEN 1 ELSE 0 END), 0) AS slow_count,
-                  COALESCE(MAX(target.duration_seconds), 0.0) AS max_attempt_seconds,
-                  COALESCE(SUM(CASE
-                    WHEN target.state = 'succeeded' AND EXISTS (
-                      SELECT 1
-                      FROM test_run_targets AS prior_target
-                      JOIN test_runs AS prior_run
-                        ON prior_run.run_id = prior_target.run_id
-                      WHERE prior_run.repository_id = run.repository_id
-                        AND prior_run.source_fingerprint = run.source_fingerprint
-                        AND prior_target.target_name = target.target_name
-                        AND prior_target.state = 'test_failed'
-                        AND prior_target.finished_at < target.finished_at
-                    ) THEN 1 ELSE 0 END), 0) AS flake_count,
-                  COALESCE(SUM(CASE
-                    WHEN target.state = 'succeeded'
-                     AND (
-                       SELECT COUNT(*)
-                       FROM test_run_targets AS prior_target
-                       JOIN test_runs AS prior_run
-                         ON prior_run.run_id = prior_target.run_id
-                       WHERE prior_run.repository_id = run.repository_id
-                         AND prior_target.target_name = target.target_name
-                         AND prior_target.state = 'succeeded'
-                         AND prior_target.finished_at < target.finished_at
-                     ) >= 3
-                     AND target.duration_seconds > 1.25 * (
-                       SELECT AVG(prior_target.duration_seconds)
-                       FROM test_run_targets AS prior_target
-                       JOIN test_runs AS prior_run
-                         ON prior_run.run_id = prior_target.run_id
-                       WHERE prior_run.repository_id = run.repository_id
-                         AND prior_target.target_name = target.target_name
-                         AND prior_target.state = 'succeeded'
-                         AND prior_target.finished_at < target.finished_at
-                     )
-                    THEN 1 ELSE 0 END), 0) AS regression_count,
-                  COALESCE(SUM(CASE WHEN target.state = 'succeeded' THEN 1 ELSE 0 END), 0) AS success_count,
-                  COALESCE(SUM(CASE WHEN target.state = 'test_failed' THEN 1 ELSE 0 END), 0) AS failure_count,
-                  COALESCE(SUM(CASE WHEN target.state IN (
-                    'infrastructure_failed', 'timed_out', 'incomplete'
-                  ) THEN 1 ELSE 0 END), 0) AS infrastructure_count
-                FROM test_run_targets AS target
-                JOIN test_runs AS run ON run.run_id = target.run_id
-                WHERE run.repository_id = ?
-                  AND target.execution_id IS NOT NULL
-                  AND target.finished_at >= ? AND target.finished_at < ?
-                """,
-                (repository_id, bucket, end),
-            ).fetchone()
-            runs = connection.execute(
-                """
-                SELECT
-                  COUNT(*) AS run_count,
-                  COALESCE(SUM(selected_target_count), 0) AS selected_target_count,
-                  COALESCE(SUM(eligible_target_count), 0) AS eligible_target_count,
-                  COALESCE(SUM(eligible_target_count - selected_target_count), 0) AS avoided_target_count,
-                  COALESCE(SUM(CASE WHEN started_at IS NOT NULL
-                    THEN MAX(0.0, started_at - queued_at) ELSE 0.0 END), 0.0) AS queue_seconds,
-                  COALESCE(SUM(CASE WHEN started_at IS NOT NULL
-                    THEN MAX(0.0, finished_at - started_at) ELSE 0.0 END), 0.0) AS wall_seconds
-                FROM test_runs
-                WHERE repository_id = ?
-                  AND finished_at >= ? AND finished_at < ?
-                """,
-                (repository_id, bucket, end),
-            ).fetchone()
-            connection.execute(
-                f"""
-                INSERT INTO {table}(
-                    repository_id, bucket_start, run_count, attempt_count,
-                    selected_target_count, eligible_target_count,
-                    avoided_target_count, case_count,
-                    passed_count, failed_count, skipped_count, error_count,
-                    queue_seconds, attempt_queue_seconds,
-                    aggregate_test_seconds, attempt_wall_seconds, wall_seconds,
-                    retry_attempt_count, flake_count, slow_count,
-                    regression_count, max_attempt_seconds, success_count,
-                    failure_count, infrastructure_count
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(repository_id, bucket_start) DO UPDATE SET
-                    run_count = excluded.run_count,
-                    attempt_count = excluded.attempt_count,
-                    selected_target_count = excluded.selected_target_count,
-                    eligible_target_count = excluded.eligible_target_count,
-                    avoided_target_count = excluded.avoided_target_count,
-                    case_count = excluded.case_count,
-                    passed_count = excluded.passed_count,
-                    failed_count = excluded.failed_count,
-                    skipped_count = excluded.skipped_count,
-                    error_count = excluded.error_count,
-                    queue_seconds = excluded.queue_seconds,
-                    attempt_queue_seconds = excluded.attempt_queue_seconds,
-                    aggregate_test_seconds = excluded.aggregate_test_seconds,
-                    attempt_wall_seconds = excluded.attempt_wall_seconds,
-                    wall_seconds = excluded.wall_seconds,
-                    retry_attempt_count = excluded.retry_attempt_count,
-                    flake_count = excluded.flake_count,
-                    slow_count = excluded.slow_count,
-                    regression_count = excluded.regression_count,
-                    max_attempt_seconds = excluded.max_attempt_seconds,
-                    success_count = excluded.success_count,
-                    failure_count = excluded.failure_count,
-                    infrastructure_count = excluded.infrastructure_count
-                """,
-                (
-                    repository_id,
-                    bucket,
-                    int(runs["run_count"]),
-                    int(executions["attempt_count"]),
-                    int(runs["selected_target_count"]),
-                    int(runs["eligible_target_count"]),
-                    int(runs["avoided_target_count"]),
-                    int(executions["case_count"]),
-                    int(executions["passed_count"]),
-                    int(executions["failed_count"]),
-                    int(executions["skipped_count"]),
-                    int(executions["error_count"]),
-                    float(runs["queue_seconds"]),
-                    float(executions["attempt_queue_seconds"]),
-                    float(executions["aggregate_test_seconds"]),
-                    float(executions["attempt_wall_seconds"]),
-                    float(runs["wall_seconds"]),
-                    int(executions["retry_attempt_count"]),
-                    int(executions["flake_count"]),
-                    int(executions["slow_count"]),
-                    int(executions["regression_count"]),
-                    float(executions["max_attempt_seconds"]),
-                    int(executions["success_count"]),
-                    int(executions["failure_count"]),
-                    int(executions["infrastructure_count"]),
-                ),
-            )
-
-    def begin_rollup_rebuild(self) -> dict[str, object]:
-        connection = self._connect(readonly=True)
-        try:
-            connection.execute("BEGIN")
-            generation = self._generation(connection)
-            execution_upper = int(
-                connection.execute(
-                    "SELECT COALESCE(MAX(rowid), 0) FROM test_run_targets"
-                ).fetchone()[0]
-            )
-            run_upper = int(
-                connection.execute(
-                    "SELECT COALESCE(MAX(rowid), 0) FROM test_runs"
-                ).fetchone()[0]
-            )
-            connection.execute("COMMIT")
-        finally:
-            connection.close()
-        return {
-            "schema_version": 1,
-            "store_generation": generation,
-            # Retain the published cursor field name for bounded stats callers.
-            "attempt_rowid_upper": execution_upper,
-            "run_rowid_upper": run_upper,
-            "after_repository_id": "",
-            "after_bucket_start": -1,
-        }
-
-    @staticmethod
-    def _rollup_rebuild_cursor(
-        value: Mapping[str, object],
-    ) -> dict[str, object]:
-        expected = {
-            "schema_version",
-            "store_generation",
-            "attempt_rowid_upper",
-            "run_rowid_upper",
-            "after_repository_id",
-            "after_bucket_start",
-        }
-        if set(value) != expected or value.get("schema_version") != 1:
-            raise TestStoreContractError("rollup rebuild cursor is invalid")
-        generation = value.get("store_generation")
-        repository_id = value.get("after_repository_id")
-        if not isinstance(generation, str) or not generation:
-            raise TestStoreContractError("rollup rebuild generation is invalid")
-        if not isinstance(repository_id, str):
-            raise TestStoreContractError("rollup rebuild repository cursor is invalid")
-        if repository_id:
-            _safe_id("after_repository_id", repository_id)
-        integers: dict[str, int] = {}
-        for field in (
-            "attempt_rowid_upper",
-            "run_rowid_upper",
-            "after_bucket_start",
-        ):
-            raw = value.get(field)
-            if type(raw) is not int:
-                raise TestStoreContractError(f"{field} must be an integer")
-            integers[field] = int(raw)
-        if integers["attempt_rowid_upper"] < 0 or integers["run_rowid_upper"] < 0:
-            raise TestStoreContractError("rollup rebuild rowid bound is invalid")
-        if integers["after_bucket_start"] < -1:
-            raise TestStoreContractError("rollup rebuild bucket cursor is invalid")
-        return {
-            "schema_version": 1,
-            "store_generation": generation,
-            "attempt_rowid_upper": integers["attempt_rowid_upper"],
-            "run_rowid_upper": integers["run_rowid_upper"],
-            "after_repository_id": repository_id,
-            "after_bucket_start": integers["after_bucket_start"],
-        }
-
-    def rebuild_rollup_batch(
-        self,
-        cursor: Mapping[str, object],
-        *,
-        batch_size: int = 64,
-    ) -> dict[str, object]:
-        state = self._rollup_rebuild_cursor(cursor)
-        batch_size = _positive_int(
-            "batch_size", batch_size, maximum=MAX_ROLLUP_REBUILD_BATCH
-        )
-        with self._transaction() as connection:
-            if not hmac.compare_digest(
-                str(state["store_generation"]), self._generation(connection)
-            ):
-                raise TestStoreConflict("rollup rebuild store generation changed")
-            rows = connection.execute(
-                """
-                WITH source_buckets(repository_id, bucket_start) AS (
-                    SELECT run.repository_id,
-                           CAST(target.finished_at / 3600 AS INTEGER) * 3600
-                    FROM test_run_targets AS target
-                    JOIN test_runs AS run ON run.run_id = target.run_id
-                    WHERE target.rowid <= ? AND target.finished_at IS NOT NULL
-                    UNION
-                    SELECT repository_id,
-                           CAST(finished_at / 3600 AS INTEGER) * 3600
-                    FROM test_runs
-                    WHERE rowid <= ? AND finished_at IS NOT NULL
-                )
-                SELECT repository_id, bucket_start
-                FROM source_buckets
-                WHERE repository_id > ?
-                   OR (repository_id = ? AND bucket_start > ?)
-                ORDER BY repository_id, bucket_start
-                LIMIT ?
-                """,
-                (
-                    state["attempt_rowid_upper"],
-                    state["run_rowid_upper"],
-                    state["after_repository_id"],
-                    state["after_repository_id"],
-                    state["after_bucket_start"],
-                    batch_size + 1,
-                ),
-            ).fetchall()
-            selected = rows[:batch_size]
-            for row in selected:
-                self._refresh_rollups(
-                    connection,
-                    repository_id=str(row["repository_id"]),
-                    finished_at=float(row["bucket_start"]),
-                )
-            next_cursor = dict(state)
-            if selected:
-                next_cursor["after_repository_id"] = str(
-                    selected[-1]["repository_id"]
-                )
-                next_cursor["after_bucket_start"] = int(
-                    selected[-1]["bucket_start"]
-                )
-            return {
-                "cursor": next_cursor,
-                "processed": len(selected),
-                "complete": len(rows) <= batch_size,
-            }
-
-    def rebuild_rollups(self, *, batch_size: int = 64) -> dict[str, int]:
-        cursor = self.begin_rollup_rebuild()
-        while True:
-            result = self.rebuild_rollup_batch(cursor, batch_size=batch_size)
-            cursor = result["cursor"]  # type: ignore[assignment]
-            if bool(result["complete"]):
-                break
-        connection = self._connect(readonly=True)
-        try:
-            return {
-                "hourly": int(
-                    connection.execute(
-                        "SELECT COUNT(*) FROM test_rollup_hourly"
-                    ).fetchone()[0]
-                ),
-                "daily": int(
-                    connection.execute(
-                        "SELECT COUNT(*) FROM test_rollup_daily"
-                    ).fetchone()[0]
-                ),
-            }
-        finally:
-            connection.close()
-
-    def rollups(
-        self,
-        *,
-        repository_id: str,
-        grain: str,
-        since: float = 0,
-        limit: int = 1_000,
-    ) -> tuple[dict[str, object], ...]:
-        repository_id = _safe_id("repository_id", repository_id)
-        if grain not in {"hourly", "daily"}:
-            raise TestStoreContractError("grain must be hourly or daily")
-        since = _finite_nonnegative("since", since)
-        limit = _positive_int("limit", limit, maximum=10_000)
-        table = "test_rollup_hourly" if grain == "hourly" else "test_rollup_daily"
-        connection = self._connect(readonly=True)
-        try:
-            return tuple(
-                dict(row)
-                for row in connection.execute(
-                    f"""
-                    SELECT * FROM {table}
-                    WHERE repository_id = ? AND bucket_start >= ?
-                    ORDER BY bucket_start LIMIT ?
-                    """,
-                    (repository_id, since, limit),
-                ).fetchall()
-            )
-        finally:
-            connection.close()
-
     def current_time(self) -> float:
         """Return the store's validated clock for deterministic projections."""
 
         return _now(self._clock)
 
-    def rollup_totals(
+    def repository_statistics(
         self,
         *,
         repository_id: str,
-        grain: str,
         since: float,
-        before: float,
-    ) -> dict[str, int | float | None]:
-        """Aggregate one materialized-rollup range without result-table scans."""
+        limit: int = 25,
+    ) -> dict[str, object]:
+        """Derive bounded daily statistics from terminal run and execution rows.
+
+        Terminal rows remain the only authority.  The series is deliberately
+        computed at read time so statistics cannot drift from run state or
+        become a second lifecycle journal.  Totals cover the complete requested
+        window even when the returned daily series is limited.
+        """
 
         repository_id = _safe_id("repository_id", repository_id)
-        if grain not in {"hourly", "daily"}:
-            raise TestStoreContractError("grain must be hourly or daily")
         since = _finite_nonnegative("since", since)
-        before = _finite_nonnegative("before", before)
-        if before <= since:
-            raise TestStoreContractError("rollup range must be positive")
-        table = "test_rollup_hourly" if grain == "hourly" else "test_rollup_daily"
-        additive = (
-            "run_count", "attempt_count", "selected_target_count",
-            "eligible_target_count", "avoided_target_count", "case_count",
-            "passed_count", "failed_count", "skipped_count", "error_count",
-            "queue_seconds", "attempt_queue_seconds",
-            "aggregate_test_seconds", "attempt_wall_seconds", "wall_seconds",
-            "retry_attempt_count", "flake_count", "slow_count",
-            "regression_count", "success_count", "failure_count",
-            "infrastructure_count",
+        limit = _positive_int(
+            "limit", limit, maximum=MAX_STATISTICS_SERIES_DAYS
         )
-        columns = ", ".join(f"COALESCE(SUM({field}), 0) AS {field}" for field in additive)
+        observed_at = self.current_time()
+        integer_fields = (
+            "run_count",
+            "selected_target_count",
+            "eligible_target_count",
+            "avoided_target_count",
+            "succeeded_run_count",
+            "test_failed_run_count",
+            "infrastructure_failed_run_count",
+            "timed_out_run_count",
+            "cancelled_run_count",
+            "incomplete_run_count",
+            "execution_count",
+            "case_count",
+            "passed_count",
+            "failed_count",
+            "skipped_count",
+            "error_count",
+            "succeeded_execution_count",
+            "test_failed_execution_count",
+            "infrastructure_failed_execution_count",
+            "timed_out_execution_count",
+            "cancelled_execution_count",
+            "incomplete_execution_count",
+        )
+        float_fields = (
+            "run_queue_seconds",
+            "execution_queue_seconds",
+            "test_seconds",
+            "execution_wall_seconds",
+            "run_wall_seconds",
+            "max_execution_seconds",
+        )
         connection = self._connect(readonly=True)
         try:
-            row = connection.execute(
-                f"""
-                SELECT {columns},
-                       COALESCE(MAX(max_attempt_seconds), 0.0) AS max_attempt_seconds,
-                       MAX(bucket_start) AS latest_bucket
-                FROM {table}
-                WHERE repository_id = ? AND bucket_start >= ? AND bucket_start < ?
+            rows = connection.execute(
+                """
+                WITH run_daily AS (
+                    SELECT
+                        CAST(finished_at / 86400 AS INTEGER) * 86400 AS bucket_start,
+                        COUNT(*) AS run_count,
+                        SUM(selected_target_count) AS selected_target_count,
+                        SUM(eligible_target_count) AS eligible_target_count,
+                        SUM(eligible_target_count - selected_target_count)
+                            AS avoided_target_count,
+                        SUM(CASE WHEN state = 'succeeded' THEN 1 ELSE 0 END)
+                            AS succeeded_run_count,
+                        SUM(CASE WHEN state = 'failed'
+                                      AND failure_classification = 'test_failure'
+                                 THEN 1 ELSE 0 END) AS test_failed_run_count,
+                        SUM(CASE WHEN state = 'failed'
+                                      AND failure_classification = 'infrastructure_failure'
+                                 THEN 1 ELSE 0 END) AS infrastructure_failed_run_count,
+                        SUM(CASE WHEN state = 'timed_out' THEN 1 ELSE 0 END)
+                            AS timed_out_run_count,
+                        SUM(CASE WHEN state = 'cancelled' THEN 1 ELSE 0 END)
+                            AS cancelled_run_count,
+                        SUM(CASE WHEN state = 'incomplete' THEN 1 ELSE 0 END)
+                            AS incomplete_run_count,
+                        SUM(CASE
+                              WHEN started_at IS NULL OR started_at <= queued_at
+                              THEN 0.0 ELSE started_at - queued_at END)
+                            AS run_queue_seconds,
+                        SUM(CASE
+                              WHEN started_at IS NULL OR finished_at <= started_at
+                              THEN 0.0 ELSE finished_at - started_at END)
+                            AS run_wall_seconds
+                    FROM test_runs
+                    WHERE repository_id = ?
+                      AND finished_at IS NOT NULL
+                      AND finished_at >= ? AND finished_at <= ?
+                      AND state IN (
+                          'succeeded', 'failed', 'timed_out', 'cancelled',
+                          'incomplete'
+                      )
+                    GROUP BY bucket_start
+                ),
+                execution_daily AS (
+                    SELECT
+                        CAST(target.finished_at / 86400 AS INTEGER) * 86400
+                            AS bucket_start,
+                        COUNT(*) AS execution_count,
+                        SUM(target.passed_count + target.failed_count
+                            + target.skipped_count + target.error_count)
+                            AS case_count,
+                        SUM(target.passed_count) AS passed_count,
+                        SUM(target.failed_count) AS failed_count,
+                        SUM(target.skipped_count) AS skipped_count,
+                        SUM(target.error_count) AS error_count,
+                        SUM(CASE
+                              WHEN target.started_at IS NULL
+                                   OR target.started_at <= target.queued_at
+                              THEN 0.0 ELSE target.started_at - target.queued_at END)
+                            AS execution_queue_seconds,
+                        SUM(COALESCE(target.duration_seconds, 0.0)) AS test_seconds,
+                        SUM(COALESCE(target.duration_seconds, 0.0))
+                            AS execution_wall_seconds,
+                        MAX(COALESCE(target.duration_seconds, 0.0))
+                            AS max_execution_seconds,
+                        SUM(CASE WHEN target.state = 'succeeded' THEN 1 ELSE 0 END)
+                            AS succeeded_execution_count,
+                        SUM(CASE WHEN target.state = 'test_failed' THEN 1 ELSE 0 END)
+                            AS test_failed_execution_count,
+                        SUM(CASE WHEN target.state = 'infrastructure_failed'
+                                 THEN 1 ELSE 0 END)
+                            AS infrastructure_failed_execution_count,
+                        SUM(CASE WHEN target.state = 'timed_out' THEN 1 ELSE 0 END)
+                            AS timed_out_execution_count,
+                        SUM(CASE WHEN target.state = 'cancelled' THEN 1 ELSE 0 END)
+                            AS cancelled_execution_count,
+                        SUM(CASE WHEN target.state = 'incomplete' THEN 1 ELSE 0 END)
+                            AS incomplete_execution_count
+                    FROM test_run_targets AS target
+                    JOIN test_runs AS run ON run.run_id = target.run_id
+                    WHERE run.repository_id = ?
+                      AND target.execution_id IS NOT NULL
+                      AND target.finished_at IS NOT NULL
+                      AND target.finished_at >= ? AND target.finished_at <= ?
+                      AND target.state IN (
+                          'succeeded', 'test_failed', 'infrastructure_failed',
+                          'timed_out', 'cancelled', 'incomplete'
+                      )
+                    GROUP BY bucket_start
+                ),
+                bounded_buckets AS (
+                    SELECT bucket_start
+                    FROM (
+                        SELECT bucket_start FROM run_daily
+                        UNION
+                        SELECT bucket_start FROM execution_daily
+                    )
+                    ORDER BY bucket_start DESC
+                    LIMIT ?
+                )
+                SELECT bucket.bucket_start,
+                       COALESCE(run.run_count, 0) AS run_count,
+                       COALESCE(run.selected_target_count, 0)
+                           AS selected_target_count,
+                       COALESCE(run.eligible_target_count, 0)
+                           AS eligible_target_count,
+                       COALESCE(run.avoided_target_count, 0)
+                           AS avoided_target_count,
+                       COALESCE(run.succeeded_run_count, 0)
+                           AS succeeded_run_count,
+                       COALESCE(run.test_failed_run_count, 0)
+                           AS test_failed_run_count,
+                       COALESCE(run.infrastructure_failed_run_count, 0)
+                           AS infrastructure_failed_run_count,
+                       COALESCE(run.timed_out_run_count, 0)
+                           AS timed_out_run_count,
+                       COALESCE(run.cancelled_run_count, 0)
+                           AS cancelled_run_count,
+                       COALESCE(run.incomplete_run_count, 0)
+                           AS incomplete_run_count,
+                       COALESCE(run.run_queue_seconds, 0.0)
+                           AS run_queue_seconds,
+                       COALESCE(execution.execution_count, 0)
+                           AS execution_count,
+                       COALESCE(execution.case_count, 0) AS case_count,
+                       COALESCE(execution.passed_count, 0) AS passed_count,
+                       COALESCE(execution.failed_count, 0) AS failed_count,
+                       COALESCE(execution.skipped_count, 0) AS skipped_count,
+                       COALESCE(execution.error_count, 0) AS error_count,
+                       COALESCE(execution.execution_queue_seconds, 0.0)
+                           AS execution_queue_seconds,
+                       COALESCE(execution.test_seconds, 0.0) AS test_seconds,
+                       COALESCE(execution.execution_wall_seconds, 0.0)
+                           AS execution_wall_seconds,
+                       COALESCE(run.run_wall_seconds, 0.0) AS run_wall_seconds,
+                       COALESCE(execution.max_execution_seconds, 0.0)
+                           AS max_execution_seconds,
+                       COALESCE(execution.succeeded_execution_count, 0)
+                           AS succeeded_execution_count,
+                       COALESCE(execution.test_failed_execution_count, 0)
+                           AS test_failed_execution_count,
+                       COALESCE(execution.infrastructure_failed_execution_count, 0)
+                           AS infrastructure_failed_execution_count,
+                       COALESCE(execution.timed_out_execution_count, 0)
+                           AS timed_out_execution_count,
+                       COALESCE(execution.cancelled_execution_count, 0)
+                           AS cancelled_execution_count,
+                       COALESCE(execution.incomplete_execution_count, 0)
+                           AS incomplete_execution_count
+                FROM bounded_buckets AS bucket
+                LEFT JOIN run_daily AS run USING(bucket_start)
+                LEFT JOIN execution_daily AS execution USING(bucket_start)
+                ORDER BY bucket.bucket_start
                 """,
-                (repository_id, since, before),
+                (
+                    repository_id,
+                    since,
+                    observed_at,
+                    repository_id,
+                    since,
+                    observed_at,
+                    limit,
+                ),
+            ).fetchall()
+            totals_row = connection.execute(
+                """
+                WITH run_totals AS (
+                    SELECT
+                        COUNT(*) AS run_count,
+                        COALESCE(SUM(selected_target_count), 0)
+                            AS selected_target_count,
+                        COALESCE(SUM(eligible_target_count), 0)
+                            AS eligible_target_count,
+                        COALESCE(SUM(eligible_target_count - selected_target_count), 0)
+                            AS avoided_target_count,
+                        COALESCE(SUM(CASE WHEN state = 'succeeded'
+                                          THEN 1 ELSE 0 END), 0)
+                            AS succeeded_run_count,
+                        COALESCE(SUM(CASE WHEN state = 'failed'
+                                              AND failure_classification = 'test_failure'
+                                          THEN 1 ELSE 0 END), 0)
+                            AS test_failed_run_count,
+                        COALESCE(SUM(CASE WHEN state = 'failed'
+                                              AND failure_classification = 'infrastructure_failure'
+                                          THEN 1 ELSE 0 END), 0)
+                            AS infrastructure_failed_run_count,
+                        COALESCE(SUM(CASE WHEN state = 'timed_out'
+                                          THEN 1 ELSE 0 END), 0)
+                            AS timed_out_run_count,
+                        COALESCE(SUM(CASE WHEN state = 'cancelled'
+                                          THEN 1 ELSE 0 END), 0)
+                            AS cancelled_run_count,
+                        COALESCE(SUM(CASE WHEN state = 'incomplete'
+                                          THEN 1 ELSE 0 END), 0)
+                            AS incomplete_run_count,
+                        COALESCE(SUM(CASE
+                              WHEN started_at IS NULL OR started_at <= queued_at
+                              THEN 0.0 ELSE started_at - queued_at END), 0.0)
+                            AS run_queue_seconds,
+                        COALESCE(SUM(CASE
+                              WHEN started_at IS NULL OR finished_at <= started_at
+                              THEN 0.0 ELSE finished_at - started_at END), 0.0)
+                            AS run_wall_seconds
+                    FROM test_runs
+                    WHERE repository_id = ?
+                      AND finished_at IS NOT NULL
+                      AND finished_at >= ? AND finished_at <= ?
+                      AND state IN (
+                          'succeeded', 'failed', 'timed_out', 'cancelled',
+                          'incomplete'
+                      )
+                ),
+                execution_totals AS (
+                    SELECT
+                        COUNT(*) AS execution_count,
+                        COALESCE(SUM(target.passed_count + target.failed_count
+                            + target.skipped_count + target.error_count), 0)
+                            AS case_count,
+                        COALESCE(SUM(target.passed_count), 0) AS passed_count,
+                        COALESCE(SUM(target.failed_count), 0) AS failed_count,
+                        COALESCE(SUM(target.skipped_count), 0) AS skipped_count,
+                        COALESCE(SUM(target.error_count), 0) AS error_count,
+                        COALESCE(SUM(CASE
+                              WHEN target.started_at IS NULL
+                                   OR target.started_at <= target.queued_at
+                              THEN 0.0 ELSE target.started_at - target.queued_at END), 0.0)
+                            AS execution_queue_seconds,
+                        COALESCE(SUM(target.duration_seconds), 0.0) AS test_seconds,
+                        COALESCE(SUM(target.duration_seconds), 0.0)
+                            AS execution_wall_seconds,
+                        COALESCE(MAX(target.duration_seconds), 0.0)
+                            AS max_execution_seconds,
+                        COALESCE(SUM(CASE WHEN target.state = 'succeeded'
+                                          THEN 1 ELSE 0 END), 0)
+                            AS succeeded_execution_count,
+                        COALESCE(SUM(CASE WHEN target.state = 'test_failed'
+                                          THEN 1 ELSE 0 END), 0)
+                            AS test_failed_execution_count,
+                        COALESCE(SUM(CASE WHEN target.state = 'infrastructure_failed'
+                                          THEN 1 ELSE 0 END), 0)
+                            AS infrastructure_failed_execution_count,
+                        COALESCE(SUM(CASE WHEN target.state = 'timed_out'
+                                          THEN 1 ELSE 0 END), 0)
+                            AS timed_out_execution_count,
+                        COALESCE(SUM(CASE WHEN target.state = 'cancelled'
+                                          THEN 1 ELSE 0 END), 0)
+                            AS cancelled_execution_count,
+                        COALESCE(SUM(CASE WHEN target.state = 'incomplete'
+                                          THEN 1 ELSE 0 END), 0)
+                            AS incomplete_execution_count
+                    FROM test_run_targets AS target
+                    JOIN test_runs AS run ON run.run_id = target.run_id
+                    WHERE run.repository_id = ?
+                      AND target.execution_id IS NOT NULL
+                      AND target.finished_at IS NOT NULL
+                      AND target.finished_at >= ? AND target.finished_at <= ?
+                      AND target.state IN (
+                          'succeeded', 'test_failed', 'infrastructure_failed',
+                          'timed_out', 'cancelled', 'incomplete'
+                      )
+                )
+                SELECT * FROM run_totals CROSS JOIN execution_totals
+                """,
+                (
+                    repository_id,
+                    since,
+                    observed_at,
+                    repository_id,
+                    since,
+                    observed_at,
+                ),
             ).fetchone()
-            if row is None:
-                raise AssertionError("aggregate rollup query returned no row")
-            return dict(row)
         finally:
             connection.close()
+        if totals_row is None:
+            raise AssertionError("statistics aggregate returned no row")
+        series: list[dict[str, int | float]] = []
+        for retained in rows:
+            row = {"bucket_start": float(retained["bucket_start"])}
+            row.update({field: int(retained[field]) for field in integer_fields})
+            row.update({field: float(retained[field]) for field in float_fields})
+            series.append(row)
+        totals: dict[str, int | float] = {
+            field: int(totals_row[field]) for field in integer_fields
+        }
+        totals.update(
+            {field: float(totals_row[field]) for field in float_fields}
+        )
+        return {
+            "repository_id": repository_id,
+            "grain": "daily",
+            "bucket_seconds": 86_400,
+            "window": {
+                "since": since,
+                "observed_at": observed_at,
+                "series_limit": limit,
+            },
+            "totals": totals,
+            "efficiency": self._statistics_efficiency(totals),
+            "series": series,
+        }
+
+    @staticmethod
+    def _statistics_efficiency(
+        values: Mapping[str, object],
+    ) -> dict[str, float | None]:
+        def ratio(numerator: str, denominator: str) -> float | None:
+            bottom = float(values.get(denominator, 0) or 0)
+            if bottom <= 0:
+                return None
+            return float(values.get(numerator, 0) or 0) / bottom
+
+        runs = float(values.get("run_count", 0) or 0)
+        executions = float(values.get("execution_count", 0) or 0)
+        eligible = float(values.get("eligible_target_count", 0) or 0)
+        cases = float(values.get("case_count", 0) or 0)
+        return {
+            "parallelism_ratio": ratio("test_seconds", "run_wall_seconds"),
+            "average_run_queue_seconds": (
+                None
+                if runs <= 0
+                else float(values.get("run_queue_seconds", 0) or 0) / runs
+            ),
+            "average_execution_queue_seconds": (
+                None
+                if executions <= 0
+                else float(values.get("execution_queue_seconds", 0) or 0)
+                / executions
+            ),
+            "selection_savings_ratio": (
+                None
+                if eligible <= 0
+                else float(values.get("avoided_target_count", 0) or 0) / eligible
+            ),
+            "case_pass_rate": (
+                None
+                if cases <= 0
+                else float(values.get("passed_count", 0) or 0) / cases
+            ),
+            "execution_success_rate": ratio(
+                "succeeded_execution_count", "execution_count"
+            ),
+            "test_failure_rate": ratio(
+                "test_failed_execution_count", "execution_count"
+            ),
+            "infrastructure_failure_rate": ratio(
+                "infrastructure_failed_execution_count", "execution_count"
+            ),
+        }
 
     def retain_repository_setup_projection(
         self,
@@ -4597,335 +4515,6 @@ class UniversalTestStore:
         finally:
             connection.close()
 
-    def fleet_rollup_projection(
-        self,
-        *,
-        grain: str,
-        since: float,
-        repository_limit: int = 50,
-        bucket_limit: int = 48,
-        repository_ids: Sequence[str] | None = None,
-    ) -> dict[str, object]:
-        """Return a compact fleet matrix using only materialized rollups."""
-
-        if grain not in {"hourly", "daily"}:
-            raise TestStoreContractError("grain must be hourly or daily")
-        since = _finite_nonnegative("since", since)
-        repository_limit = _positive_int(
-            "repository_limit", repository_limit, maximum=50
-        )
-        bucket_limit = _positive_int("bucket_limit", bucket_limit, maximum=168)
-        scoped_ids: tuple[str, ...] | None = None
-        if repository_ids is not None:
-            if (
-                isinstance(repository_ids, (str, bytes))
-                or not isinstance(repository_ids, Sequence)
-                or len(repository_ids) > 50
-            ):
-                raise TestStoreContractError("fleet repository scope is invalid")
-            scoped_ids = tuple(
-                _safe_id(f"repository_ids[{index}]", value)
-                for index, value in enumerate(repository_ids)
-            )
-            if len(set(scoped_ids)) != len(scoped_ids):
-                raise TestStoreContractError("fleet repository IDs must be unique")
-        seconds = 3_600 if grain == "hourly" else 86_400
-        observed_at = _now(self._clock)
-        latest = _bucket_start(observed_at, seconds)
-        requested_first = min(latest, _bucket_start(since, seconds))
-        actual_bucket_count = min(
-            bucket_limit, int((latest - requested_first) // seconds) + 1
-        )
-        first = latest - (actual_bucket_count - 1) * seconds
-        buckets = tuple(
-            first + index * seconds for index in range(actual_bucket_count)
-        )
-        table = "test_rollup_hourly" if grain == "hourly" else "test_rollup_daily"
-        connection = self._connect(readonly=True)
-        try:
-            scope_clause = ""
-            scope_arguments: tuple[object, ...] = ()
-            if scoped_ids is not None:
-                if scoped_ids:
-                    placeholders = ",".join("?" for _ in scoped_ids)
-                    scope_clause = f" AND repository_id IN ({placeholders})"
-                    scope_arguments = tuple(scoped_ids)
-                else:
-                    scope_clause = " AND 0 = 1"
-            summaries = connection.execute(
-                f"""
-                SELECT repository_id,
-                       SUM(run_count) AS run_count,
-                       SUM(attempt_count) AS attempt_count,
-                       SUM(selected_target_count) AS selected_target_count,
-                       SUM(eligible_target_count) AS eligible_target_count,
-                       SUM(avoided_target_count) AS avoided_target_count,
-                       SUM(case_count) AS case_count,
-                       SUM(passed_count) AS passed_count,
-                       SUM(failed_count) AS failed_count,
-                       SUM(error_count) AS error_count,
-                       SUM(queue_seconds) AS queue_seconds,
-                       SUM(attempt_queue_seconds) AS attempt_queue_seconds,
-                       SUM(aggregate_test_seconds) AS aggregate_test_seconds,
-                       SUM(attempt_wall_seconds) AS attempt_wall_seconds,
-                       SUM(wall_seconds) AS wall_seconds,
-                       SUM(retry_attempt_count) AS retry_attempt_count,
-                       SUM(flake_count) AS flake_count,
-                       SUM(slow_count) AS slow_count,
-                       SUM(regression_count) AS regression_count,
-                       MAX(max_attempt_seconds) AS max_attempt_seconds,
-                       SUM(success_count) AS success_count,
-                       SUM(failure_count) AS failure_count,
-                       SUM(infrastructure_count) AS infrastructure_count,
-                       MAX(bucket_start) AS latest_bucket
-                FROM {table}
-                WHERE bucket_start >= ? AND bucket_start <= ?
-                      {scope_clause}
-                GROUP BY repository_id
-                ORDER BY infrastructure_count DESC, failure_count DESC,
-                         aggregate_test_seconds DESC, repository_id
-                LIMIT ?
-                """,
-                (first, latest, *scope_arguments, repository_limit),
-            ).fetchall()
-            repository_ids = [str(row["repository_id"]) for row in summaries]
-            active_by_repository: dict[str, dict[str, int]] = {}
-            terminal_by_repository: dict[str, dict[str, object]] = {}
-            if repository_ids:
-                placeholders = ",".join("?" for _ in repository_ids)
-                for row in connection.execute(
-                    f"""
-                    SELECT repository_id, state, COUNT(*) AS count
-                    FROM test_runs
-                    WHERE repository_id IN ({placeholders})
-                      AND state IN ('queued', 'running', 'cancelling')
-                    GROUP BY repository_id, state
-                    """,
-                    repository_ids,
-                ).fetchall():
-                    active_by_repository.setdefault(
-                        str(row["repository_id"]), {}
-                    )[str(row["state"])] = int(row["count"])
-                terminal_rows = connection.execute(
-                    f"""
-                    WITH terminal_run_facts AS (
-                        SELECT run.repository_id,
-                               run.run_id,
-                               run.state,
-                               run.finished_at,
-                               MAX(CASE
-                                   WHEN run.failure_classification =
-                                            'infrastructure_failure'
-                                     OR run.state IN ('timed_out', 'incomplete')
-                                     OR target.state IN (
-                                            'infrastructure_failed', 'timed_out',
-                                            'incomplete'
-                                        )
-                                   THEN 1 ELSE 0
-                               END) AS has_infrastructure_failure,
-                               MAX(CASE WHEN target.peak_memory_bytes IS NOT NULL
-                                            OR target.cpu_seconds IS NOT NULL
-                                   THEN 1 ELSE 0 END) AS has_measurement
-                        FROM test_runs AS run
-                        LEFT JOIN test_run_targets AS target
-                               ON target.run_id = run.run_id
-                        WHERE run.repository_id IN ({placeholders})
-                          AND run.finished_at IS NOT NULL
-                          AND run.finished_at >= ?
-                          AND run.finished_at <= ?
-                          AND run.state IN (
-                              'succeeded', 'failed', 'timed_out', 'cancelled',
-                              'incomplete'
-                          )
-                        GROUP BY run.repository_id, run.run_id,
-                                 run.state, run.finished_at
-                    )
-                    SELECT repository_id,
-                           MAX(CASE WHEN has_infrastructure_failure = 1
-                               THEN finished_at END) AS latest_infrastructure_run_at,
-                           MAX(CASE WHEN state = 'succeeded'
-                                         AND has_measurement = 1
-                                         AND has_infrastructure_failure = 0
-                               THEN finished_at END) AS latest_clean_measured_run_at
-                    FROM terminal_run_facts
-                    GROUP BY repository_id
-                    """,
-                    (*repository_ids, first, observed_at),
-                ).fetchall()
-                terminal_by_repository = {
-                    str(row["repository_id"]): dict(row) for row in terminal_rows
-                }
-                cells = connection.execute(
-                    f"""
-                    SELECT repository_id, bucket_start, aggregate_test_seconds,
-                           attempt_count, case_count, failed_count, error_count,
-                           failure_count, infrastructure_count,
-                           wall_seconds, queue_seconds, avoided_target_count,
-                           flake_count, slow_count, regression_count
-                    FROM {table}
-                    WHERE repository_id IN ({placeholders})
-                      AND bucket_start >= ? AND bucket_start <= ?
-                    ORDER BY repository_id, bucket_start
-                    """,
-                    (*repository_ids, first, latest),
-                ).fetchall()
-            else:
-                cells = []
-            return {
-                "grain": grain,
-                "bucket_seconds": seconds,
-                "bucket_starts": list(buckets),
-                "repositories": [
-                    {
-                        **dict(row),
-                        "efficiency": self._rollup_efficiency(dict(row)),
-                        "active": active_by_repository.get(
-                            str(row["repository_id"]), {}
-                        ),
-                        **terminal_by_repository.get(
-                            str(row["repository_id"]), {}
-                        ),
-                    }
-                    for row in summaries
-                ],
-                "cell_fields": [
-                    "repository_id", "bucket_start", "aggregate_test_seconds",
-                    "attempt_count", "case_count", "failed_count", "error_count",
-                    "failure_count", "infrastructure_count",
-                    "wall_seconds", "queue_seconds", "avoided_target_count",
-                    "flake_count", "slow_count", "regression_count",
-                ],
-                "cells": [
-                    [
-                        str(row["repository_id"]),
-                        float(row["bucket_start"]),
-                        float(row["aggregate_test_seconds"]),
-                        int(row["attempt_count"]),
-                        int(row["case_count"]),
-                        int(row["failed_count"]),
-                        int(row["error_count"]),
-                        int(row["failure_count"]),
-                        int(row["infrastructure_count"]),
-                        float(row["wall_seconds"]),
-                        float(row["queue_seconds"]),
-                        int(row["avoided_target_count"]),
-                        int(row["flake_count"]),
-                        int(row["slow_count"]),
-                        int(row["regression_count"]),
-                    ]
-                    for row in cells
-                ],
-            }
-        finally:
-            connection.close()
-
-    def repository_rollup_detail(
-        self,
-        *,
-        repository_id: str,
-        grain: str,
-        since: float,
-        limit: int = 500,
-    ) -> dict[str, object]:
-        """Return one repository trend without touching case/result tables."""
-
-        rows = self.rollups(
-            repository_id=repository_id,
-            grain=grain,
-            since=since,
-            limit=limit,
-        )
-        numeric = (
-            "run_count",
-            "attempt_count",
-            "selected_target_count",
-            "eligible_target_count",
-            "avoided_target_count",
-            "case_count",
-            "passed_count",
-            "failed_count",
-            "skipped_count",
-            "error_count",
-            "queue_seconds",
-            "attempt_queue_seconds",
-            "aggregate_test_seconds",
-            "attempt_wall_seconds",
-            "wall_seconds",
-            "retry_attempt_count",
-            "flake_count",
-            "slow_count",
-            "regression_count",
-            "success_count",
-            "failure_count",
-            "infrastructure_count",
-        )
-        totals: dict[str, int | float] = {
-            field: (0.0 if field.endswith("seconds") else 0) for field in numeric
-        }
-        for row in rows:
-            for field in numeric:
-                totals[field] += row[field]  # type: ignore[operator]
-        totals["max_attempt_seconds"] = max(
-            (float(row["max_attempt_seconds"]) for row in rows), default=0.0
-        )
-        return {
-            "repository_id": repository_id,
-            "grain": grain,
-            "totals": totals,
-            "efficiency": self._rollup_efficiency(totals),
-            "series": list(rows),
-        }
-
-    @staticmethod
-    def _rollup_efficiency(values: Mapping[str, object]) -> dict[str, float | None]:
-        def ratio(numerator: str, denominator: str) -> float | None:
-            bottom = float(values.get(denominator, 0) or 0)
-            return None if bottom <= 0 else float(values.get(numerator, 0) or 0) / bottom
-
-        terminal_attempts = (
-            float(values.get("success_count", 0) or 0)
-            + float(values.get("failure_count", 0) or 0)
-            + float(values.get("infrastructure_count", 0) or 0)
-        )
-        attempts = float(values.get("attempt_count", 0) or 0)
-        runs = float(values.get("run_count", 0) or 0)
-        eligible = float(values.get("eligible_target_count", 0) or 0)
-        return {
-            "parallelism_ratio": ratio("aggregate_test_seconds", "wall_seconds"),
-            "average_run_queue_seconds": (
-                None if runs <= 0 else float(values.get("queue_seconds", 0) or 0) / runs
-            ),
-            "selection_savings_ratio": (
-                None
-                if eligible <= 0
-                else float(values.get("avoided_target_count", 0) or 0) / eligible
-            ),
-            "flake_rate": (
-                None
-                if terminal_attempts <= 0
-                else float(values.get("flake_count", 0) or 0) / terminal_attempts
-            ),
-            "failure_rate": (
-                None
-                if terminal_attempts <= 0
-                else float(values.get("failure_count", 0) or 0)
-                / terminal_attempts
-            ),
-            "infrastructure_rate": (
-                None
-                if terminal_attempts <= 0
-                else float(values.get("infrastructure_count", 0) or 0)
-                / terminal_attempts
-            ),
-            "slow_rate": (
-                None if attempts <= 0 else float(values.get("slow_count", 0) or 0) / attempts
-            ),
-            "regression_rate": (
-                None
-                if attempts <= 0
-                else float(values.get("regression_count", 0) or 0) / attempts
-            ),
-        }
 
     def get_run(
         self, run_id: str, *, repository_id: str | None = None
@@ -5700,6 +5289,7 @@ __all__ = [
     "ExecutionResultPackage",
     "FailureClassification",
     "FailureRecord",
+    "MAX_STATISTICS_SERIES_DAYS",
     "RunnableTarget",
     "SubmissionResult",
     "TargetResources",

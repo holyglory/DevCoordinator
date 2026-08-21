@@ -210,6 +210,8 @@ class TestStoreV8Tests(unittest.TestCase):
         self.assertEqual(self.store.verify()["schema_version"], 8)
         self.assertNotIn("test_target_attempts", tables)
         self.assertNotIn("test_result_chunks", tables)
+        self.assertNotIn("test_rollup_hourly", tables)
+        self.assertNotIn("test_rollup_daily", tables)
         self.assertNotIn("lease_expires_at", columns)
         self.assertNotIn("max_attempts", columns)
         self.assertTrue(
@@ -230,8 +232,7 @@ class TestStoreV8Tests(unittest.TestCase):
                 "test_evidence_attestations",
                 "test_evidence_consumptions",
                 "test_repository_setup_projections",
-                "test_rollup_hourly",
-                "test_rollup_daily",
+                "test_target_resource_profiles",
                 "test_mutation_journal",
             }.issubset(tables)
         )
@@ -538,11 +539,14 @@ class TestStoreV8Tests(unittest.TestCase):
             self.store.repository_setup_catalog(("repo-v8",))[0]["setup_status"],
             "ready",
         )
-        rollups = self.store.rollups(
-            repository_id="repo-v8", grain="hourly", since=0
+        statistics = self.store.repository_statistics(
+            repository_id="repo-v8", since=0
         )
-        self.assertEqual(rollups[0]["attempt_count"], 1)
-        self.assertEqual(rollups[0]["success_count"], 1)
+        self.assertEqual(statistics["totals"]["execution_count"], 1)
+        self.assertEqual(
+            statistics["totals"]["succeeded_execution_count"], 1
+        )
+        self.assertEqual(len(statistics["series"]), 1)
 
 
 if __name__ == "__main__":

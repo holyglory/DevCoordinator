@@ -42,6 +42,7 @@ from .universal_test_planner import (
     TestPlanTimeouts,
 )
 from .universal_test_store import (
+    MAX_STATISTICS_SERIES_DAYS,
     TargetResources,
     TestStoreConflict,
     TestStoreContractError,
@@ -1988,14 +1989,16 @@ class StoreTestPlaneAdapter:
     ) -> Mapping[str, object]:
         if type(days) is not int or not 1 <= days <= 3650:
             raise TestStoreContractError("statistics days is invalid")
-        if type(limit) is not int or not 1 <= limit <= 500:
+        if (
+            type(limit) is not int
+            or not 1 <= limit <= MAX_STATISTICS_SERIES_DAYS
+        ):
             raise TestStoreContractError("statistics limit is invalid")
         return self._bounded(
             {
                 "schema_version": 1,
-                **self._store.repository_rollup_detail(
+                **self._store.repository_statistics(
                     repository_id=repository_id,
-                    grain="daily",
                     since=self._store.current_time() - days * 86_400,
                     limit=limit,
                 ),
