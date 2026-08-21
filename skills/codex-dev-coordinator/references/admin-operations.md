@@ -10,7 +10,6 @@ and repository tests do not need this reference.
 - [Maintenance and authority changes](#maintenance-and-authority-changes)
 - [Profiles and skill links](#profiles-and-skill-links)
 - [Disposable test history](#disposable-test-history)
-- [Fleet test-manifest adoption](#fleet-test-manifest-adoption)
 - [Docker admission](#docker-admission)
 - [Sealed project capabilities](#sealed-project-capabilities)
 - [Compose host-access approval](#compose-host-access-approval)
@@ -74,33 +73,18 @@ failure.
 
 ## Disposable test history
 
-Test history and rollups are disposable unless the user explicitly asks to
-retain them. Prefer a fresh test store during a harness cutover while
-preserving Console/user settings and project runtimes.
+Test history, execution state, and derived statistics are disposable. An
+incompatible DevCoordinator release uses a fresh Test Store while preserving
+retained authority control data, Console/user settings, repository source,
+project databases, credentials, and recoverable backups.
 
 Use the immutable release's
 `devcoordinator-test-store initialize-fresh` operation through the
 delivery workflow. It requires
 the fixed discard confirmation, exact testd identity, operation UUID, and
 readiness output. It must not open or change authority, profile, inventory, or
-Console settings. Do not delete SQLite files manually.
-
-## Fleet test-manifest adoption
-
-Fleet adoption is an explicit administrator action, never a side effect of
-cataloging or planning. Use the immutable
-`devcoordinator-test-manifest-adoption` wrapper:
-
-1. Run `catalog` against the delivery's authority export.
-2. Prepare manifests for every `missing` or `invalid` repository.
-3. Resolve only the exact safety repairs the wrapper reports as repairable.
-4. Prepare, review, and apply the sealed request with its exact plan ID and
-   digest.
-
-Never infer commands from repository names or package files or hand-edit the
-adoption journal. Repository metadata is not an enrollment gate; validate the
-manifest contract and exact repository ID instead. Retain the apply-result
-digest for exact rollback.
+Console settings. It has no test-history importer, spool, recovery lease, or
+result-chunk migration. Do not delete SQLite files manually.
 
 ## Docker admission
 

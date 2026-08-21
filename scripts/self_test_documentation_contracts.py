@@ -207,6 +207,10 @@ def test_governed_routing_surface_and_evidence_are_complete() -> None:
             "artifact-export",
             "cancel",
             "retry",
+            "no standalone stable `test run`",
+            "policy, catalog, stats, and wait",
+            "one execution slot per",
+            "no automatic or in-run retry",
         ),
     )
     require_fragments(
@@ -228,17 +232,52 @@ def test_governed_routing_surface_and_evidence_are_complete() -> None:
         label="manifest/evidence contract",
         text=manifest,
         fragments=(
-            "Manifest schema 3",
+            "Manifest schema 4",
             "complete normalized target execution specification",
             "LoadCredential=",
             "SQLite state handle",
-            "lease_expired_before_launch",
+            "one execution slot",
+            "result-package.tar",
+            "no semantic result-chunk protocol",
             "one exact failure record",
             "bounded UTF-8 tail",
             "mode-0600",
             "Installed test-access acceptance",
         ),
     )
+    require_fragments(
+        label="current test architecture",
+        text=architecture,
+        fragments=(
+            "one execution slot per selected target",
+            "result-package.tar",
+            "Restart never renews a lease",
+            "systemd cgroup/TTL cleanup",
+            "Cgroup isolation",
+            "per-run resource quotas are not",
+            "exact repository ID and generation",
+            "path escape",
+            "idempotent replay",
+            "recorded actual non-root",
+            "LoadCredential=",
+            "fixed 8 KiB ceiling",
+        ),
+    )
+    for label, text in (
+        ("governed skill", skill),
+        ("governed client", client),
+        ("manifest/evidence", manifest),
+        ("test architecture", architecture),
+    ):
+        for retired in (
+            "--spool",
+            "`max_attempts` and reviewed `retry_on`",
+            "lease_expired_before_launch",
+            "publishes atomic ordered result chunks",
+            "same-schema active-attempt recovery",
+        ):
+            if retired in text:
+                raise AssertionError(f"{label} still documents retired contract: {retired}")
 
 
 def test_failure_intake_fallback_task_routing_and_public_audit_are_explicit() -> None:

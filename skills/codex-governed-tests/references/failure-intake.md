@@ -19,7 +19,7 @@ profiles, broker, API, authority, testd, or call-journal health:
 ```bash
 devcoordinator-bug report \
   --component test-harness \
-  --summary "governed tests failed before any measured attempt" \
+  --summary "governed tests failed before any measured execution" \
   --expected "enqueue starts the selected governed targets" \
   --actual "infrastructure_failure: snapshot service unavailable" \
   --step "Run from the affected repository root." \
@@ -34,7 +34,10 @@ devcoordinator-bug report \
 Required fields are component, summary, expected behavior, actual typed
 failure, and at least one ordered step. Repeat `--command-arg=ARG` in exact argv
 order, using the equals form when an argument begins with `-`. Include every
-available call, operation, run, and attempt ID; omit correlations not returned.
+available call, operation, run, and execution ID; omit correlations not returned.
+The current bug CLI names the execution-correlation option `--attempt-id`; that
+field is diagnostic attribution and does not imply a lease or recoverable
+multi-attempt test lifecycle.
 `devcoordinator bug report ...` is the equivalent integrated form when the
 stable client remains available.
 

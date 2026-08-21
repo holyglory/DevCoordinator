@@ -19,18 +19,21 @@ bounded decisions. It does not own a second run state machine.
 | `enqueue` | Validate manifest, create/register a policy-derived plan, and submit routine intents |
 | `submit PLAN` | Submit one reviewed handoff/release plan |
 | `follow RUN` | Read immediately or wait for one bounded decision |
-| `queue-status` | Read bounded planning, scheduler, blocker, active-attempt, and capacity state without a run |
+| `queue-status` | Read bounded planning, scheduler, blocker, active-execution, and capacity state without a run |
 | `failures RUN` | Read one ordered cursor-bounded failure page |
 | `cases RUN` | Read one ordered cursor-bounded case page |
 | `artifact RUN ARTIFACT` | Resolve exact verified metadata and a bounded text tail where supported |
 | `artifact-export RUN ARTIFACT --output FILE` | Verify and atomically materialize complete bytes locally |
 | `cancel RUN --reason TEXT` | Request exact idempotent cancellation |
-| `retry RUN --failed-only` | Create only a valid failed-work retry under retained policy |
+| `retry RUN --failed-only` | Create a new immutable run for valid failed work |
 
 The routine parser intentionally has no separate `status`, `summary`, or
-`wait` aliases. `follow` owns immediate observation, bounded waiting, and the
-terminal summary. The advanced administrative CLI may retain those exact reads
-as thin mappings, but it cannot invent different lifecycle semantics.
+`wait` aliases and no standalone `test run`. `enqueue` is the routine run
+journey; `follow` owns immediate observation, bounded waiting, and the terminal
+summary. The advanced interface exposes manifest management, plan,
+status/summary/wait, `policy check`, `catalog`, and `stats` as thin testd
+mappings. It cannot invent different planning, scheduling, retry, or conclusion
+semantics.
 
 ## Enqueue and submission
 
@@ -59,17 +62,22 @@ Every successful path emits exactly one complete JSON result containing
 `ok: true`, exact run identity, current state, `wait_timed_out`, continuation,
 and next command. Terminal run conclusion remains a separate value.
 
-While active, representative attempts expose bounded identity and liveness:
-attempt ID, start, last heartbeat, lease expiry, target deadline, elapsed time,
-current memory when known, and observed/retained output counters without output
-text. Live failure-record count is read from retained failures and cannot be
-reported as zero while the failure index is populated.
+While active, representative executions expose bounded identity and liveness:
+execution ID, start, target deadline, elapsed time, current memory when known,
+and observed/retained output counters without output text. Live failure-record
+count is read from retained failures and cannot be reported as zero while the
+failure index is populated.
 
 During a same-schema authority or testd replacement, follow tolerates typed
 scheduler unavailability, maintenance, saturation, reset, and timeout until its
 deadline. Each nested read uses no more than the remaining budget minus a final
 response margin. It preserves the last valid observation, never resubmits, and
 returns either the recovered truth or a bounded timed-out decision.
+
+Replacement imports an already complete atomic result package first. It stops
+the exact transient unit and cancels any otherwise unfinished execution before
+reopening admission. It does not renew a lease, resurrect an execution, or
+replay a semantic result stream.
 
 ## Diagnostics and bounds
 
@@ -81,7 +89,7 @@ When either the store has more rows or a requested page was shortened by size,
 `next_cursor` names the last returned record. Null appears only after complete
 exhaustion. Every successful read or mutation explicitly sets `ok: true`.
 
-Queue status distinguishes snapshot planning, scheduler wait, active execution,
+Queue status distinguishes protected source capture, scheduler wait, active execution,
 current blockers, and memory-derived capacity. Unknown capacity stays null or
 typed unknown; it is never fabricated.
 
@@ -100,6 +108,10 @@ Read-only follow, queue, failure, case, and artifact operations may cross a
 same-schema release digest change only when protocol, authority generation,
 schema, result bounds, capabilities, and exact requested identity still match. Enqueue,
 submit, cancel, retry, and every non-test command retain exact release matching.
+
+Retry is explicit and never occurs inside the original run. `retry
+--failed-only` registers a new immutable plan/run with new execution identities
+and a dense exact dependency graph. A changed source requires a fresh plan.
 
 ## Optional MCP
 

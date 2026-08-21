@@ -6,9 +6,9 @@ description: Run and inspect repository tests through DevCoordinator's governed 
 # Codex Governed Tests
 
 Use DevCoordinator for asynchronous, attributed, bounded-evidence repository
-tests. Testd and its isolated Test Store own plan, run, attempt, deadline,
-result-order, conclusion, and lease semantics; calling agents do not recreate
-them in shell or prose.
+tests. Testd and its isolated Test Store own plans, runs, one execution slot per
+selected target, deadlines, atomic result import, and conclusions; calling
+agents do not recreate them in shell or prose.
 
 ## Route the test before launch
 
@@ -42,9 +42,11 @@ devcoordinator test enqueue --intent change
 devcoordinator test follow dc1:run:RUN_ID --wait-seconds 30
 ```
 
-Enqueue emits a replay-safe acknowledgement before slow snapshot planning. It
+Enqueue emits a replay-safe acknowledgement before protected source capture. It
 includes the exact operation identity, replay command, and bounded
 `queue-status` continuation; stdout still ends with one complete JSON result.
+Planning may inspect current changes, but every governed target executes from
+the resulting immutable capture.
 
 For handoff or release, enqueue stops after registered immutable plan creation.
 Review the plan and execute its exact returned command:
@@ -58,7 +60,7 @@ devcoordinator test submit dc1:plan:PLAN_ID
 handoff or release plan. Cancel only the exact returned run:
 
 ```bash
-devcoordinator test cancel dc1:run:RUN_ID --reason "superseded by current work"
+devcoordinator test cancel dc1:run:RUN_ID --reason "replaced by current work"
 ```
 
 Use command-scoped `--project /absolute/worktree` from another cwd. Every
@@ -74,11 +76,16 @@ enqueue  submit  follow  queue-status  failures
 cases    artifact  artifact-export  cancel  retry
 ```
 
+The protected advanced interface also exposes manifest management, plan,
+status, summary, policy, catalog, stats, and wait as thin mappings over testd.
+It has no local planner or second lifecycle authority. There is no standalone
+stable `test run`; `enqueue` is the routine run journey.
+
 `follow` always returns one non-empty bounded JSON decision with `ok: true`,
-state, timeout truth, continuation, and next command. For active attempts it
-shows bounded exact attempt identity, start, heartbeat, lease/deadline, memory,
-and content-free output progress. An advancing heartbeat is progress even when
-case counts have not changed.
+state, timeout truth, continuation, and next command. For active executions it
+shows bounded exact execution identity, start, deadline, elapsed time, memory,
+and content-free output progress. Case counts may remain unchanged during a
+quiet valid phase.
 
 A bounded wait treats scheduler replacement, maintenance, saturation,
 connection reset, and transport timeout as transient reads until its caller
@@ -88,6 +95,11 @@ time to return one final decision. A zero-wait follow is one observation.
 Read every returned failure or case page using `next_cursor`; pages remain under
 the 8 KiB envelope and preserve every retained failure without gaps or
 duplicates. A failed run conclusion is separate from command success.
+
+There is no automatic or in-run retry. `retry --failed-only` creates a new
+immutable run with new execution identities and a dense exact dependency
+graph. If current source changed, create a fresh plan; never replay a prior
+live-source fingerprint.
 
 Use `artifact` for verified metadata and bounded textual tails. Use
 `artifact-export` for complete text, binary, or directory-archive bytes:
@@ -99,7 +111,7 @@ devcoordinator test artifact-export \
 ```
 
 The output parent must be a canonical real directory and the destination must
-not exist. The client verifies stable identity, contiguous chunks, total size,
+not exist. The client verifies stable identity, contiguous byte pages, total size,
 and full SHA-256, then atomically publishes mode `0600`. Artifact bytes never
 enter agent JSON, the call journal, Console, or public HTTP.
 
@@ -125,6 +137,7 @@ current blocker or give the user a copyable notice.
 - Read [the governed test client](references/governed-test-client.md) for exact
   commands, continuations, bounds, liveness, replacement, and MCP behavior.
 - Read [manifest and evidence](references/manifest-and-evidence.md) for schema,
-  drivers, retry, capability, state-handle, secret, and artifact contracts.
+  drivers, manual retry, capability, state-handle, secret, and artifact
+  contracts.
 - Read [failure intake](references/failure-intake.md) for the copyable bug
   report, advisory fallback, task-routing rule, and fresh production bug audit.

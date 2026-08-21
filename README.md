@@ -10,9 +10,11 @@ and trusted local accounts.
 - Immutable IDs, generations, operation UUIDs, and lifecycle state—not names,
   paths, ports, images, or local account—select work.
 - Repository code runs as the recorded non-root caller in systemd cgroups with
-  bounded TTL and cleanup.
-- Testd and its isolated Test Store own plans, runs, attempts, deadlines,
-  ordered results, conclusions, and same-schema recovery.
+  bounded TTL and cleanup. Cgroups remain required isolation and accounting;
+  repository declarations do not become per-run CPU/memory/PID quotas.
+- Testd and its isolated Test Store own plans, runs, one execution slot per
+  target, deadlines, atomic result-package import, and conclusions. Restart
+  imports a complete package first, then cancels and cleans unfinished work.
 - Credentials use separate sealed transport and never ordinary metadata, argv,
   results, or logs.
 - Public identity and route grants remain authorization boundaries. Local Unix

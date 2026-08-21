@@ -31,9 +31,11 @@ work are disposable.
   independent conclusion.
 - A repository test manifest continues to declare inputs, intents, current
   targets, no-shell commands, working directories, exact dependencies,
-  timeouts, artifacts, explicit sharding/retry policy, and sealed fixture,
+  timeouts, artifacts, explicit sharding, and sealed fixture,
   credential, or typed state-handle references. Planning may inspect the live
   worktree, but every governed execution uses one immutable captured source.
+  Manifest schema 4 has no target retry policy: each selected target has one
+  execution slot, and explicit failed-only retry creates a new immutable run.
 - The completed pre-availability installation, legacy authority import,
   storage split, fleet adoption, temporary handoff listeners, and rollback to
   the pre-availability layout are unsupported and removed. Current releases

@@ -1,5 +1,14 @@
 # DC-2026-08-09-TESTD-RECOVERY-01 — Durable active attempts survive testd replacement
 
+## Supersession
+
+DC-2026-08-19-ARCHITECTURE-SIMPLIFICATION-02 supersedes this recovery design.
+Current replacement imports a complete atomic `result-package.tar` when
+present; otherwise it stops, proves the cgroup empty, and cancels the unfinished
+exact execution. No durable spool, recovery lease, heartbeat resurrection, or
+semantic result-chunk replay remains. The content below records why the former
+design existed; it is not current implementation guidance.
+
 ## Context
 
 During same-schema delivery, GlobalFinance governed run `run-7ec79d7a602332cd52ebb39dafb1cf2d` remained in its native transient unit while testd was unavailable longer than the ordinary 30-second attempt lease. The replacement daemon reconstructed the exact active spool envelope, but its first ordinary heartbeat rejected the expired lease. The same scheduler turn then reaped the attempt as `running_heartbeat_lost` after 320 seconds with no runner result.

@@ -84,9 +84,19 @@ Why: Metadata-only access, embedding bytes in the bounded agent result, returnin
 
 ID: DC-2026-08-19-TEST-SIMPLIFICATION-01 · Details: [supporting record](DecisionDetails/DC-2026-08-19-TEST-SIMPLIFICATION-01.md)
 
-Decision: Keep the existing non-root runner and privileged snapshot/runtime process boundaries, but make testd/Test Store the only semantic plan, run, attempt, deadline, lease, result-order, and conclusion authority. Incompatible releases drain attempts and create a fresh disposable Test Store; retire legacy migration/admission and compatibility-only target resource fields. Narrow the routine API and isolate framework-specific preparation/reporting behind drivers.
+Decision: Keep the non-root runner and privileged snapshot/runtime process
+boundaries and make testd/Test Store the sole semantic test authority. The
+lease, result-chunk, active-attempt recovery, and target retry-policy parts of
+this decision are superseded by DC-2026-08-19-ARCHITECTURE-SIMPLIFICATION-02:
+current runs have one execution slot per target, one atomic result package,
+result-first restart cleanup, and manual retry as a new immutable run.
 
-Why: Keeping the additive compatibility architecture, rewriting the harness, and simplifying in place were considered. Additive compatibility produced repeated projection, retry, progress, result-stream, and deadline defects; a rewrite risks losing required exact-identity, bounded-evidence, secret, and process-isolation controls. In-place simplification preserves those controls while deleting obsolete states and reducing the number of components that interpret lifecycle meaning.
+Why: Keeping the additive compatibility architecture, rewriting the harness,
+and simplifying in place were considered. Additive compatibility produced
+repeated projection, retry, progress, result-stream, and deadline defects;
+in-place simplification preserved exact identity, bounded evidence, secret
+transport, and process isolation while later evidence justified deleting the
+remaining lease and result-stream compatibility state.
 
 ## DC-2026-08-17-DATABASE-BACKUP-RETIREMENT-01 — Backup retirement is exact and confirmed
 
@@ -136,13 +146,19 @@ Decision: Let the immutable root administrative release select only an exact pro
 
 Why: Direct `systemctl`, generic root runtime commands, worker-role emulation, a fixed project-sealed unit bundle, and omitting the lifecycle were considered. Direct and generic commands escape project attribution; worker supervision misrepresents a bounded maintenance one-shot; omission leaves approved host work outside Coordinator. The sealed bundle preserves exact source, native unit identity, non-root execution, rollback/replay evidence, and a separate destructive activation decision.
 
-## DC-2026-08-09-TESTD-RECOVERY-01 — Durable active attempts survive testd replacement
+## DC-2026-08-09-TESTD-RECOVERY-01 — Superseded active-test recovery
 
 ID: DC-2026-08-09-TESTD-RECOVERY-01 · Details: [supporting record](DecisionDetails/DC-2026-08-09-TESTD-RECOVERY-01.md)
 
-Decision: When replacement testd reconstructs an active attempt from its private durable spool, grant that exact still-active attempt one bounded recovery lease using the retained generation and lease owner before the ordinary heartbeat/reaper turn. The normal runtime observer must then renew or terminalize it. Wrong-owner, stale-generation, reaped, terminal, missing-spool, and contradictory-runtime identities remain rejected and no launch identity is regenerated.
+Decision: Superseded by DC-2026-08-19-ARCHITECTURE-SIMPLIFICATION-02. Current
+replacement imports a complete atomic result package when present; otherwise
+it stops, cgroup-cleans, and cancels the unfinished exact execution. It never
+reconstructs a spool, grants a recovery lease, or resurrects the run.
 
-Why: Abandoning every lease that expires during deployment, lengthening all ordinary leases, stopping native runners during testd replacement, and a spool-bound recovery lease were considered. Immediate abandonment discarded a live GlobalFinance run; long global leases delay genuine crash detection; stopping runners wastes work and can lose evidence. One exact recovery lease preserves independent runner supervision while retaining prompt ordinary heartbeat-loss detection and generation-fenced replay.
+Why: A recovery lease was previously selected over immediate abandonment and
+long global leases to preserve valuable work, but test runs and unfinished
+workers are now confirmed disposable. Result-first cleanup preserves complete
+evidence without retaining a second recovery state machine.
 
 ## DC-2026-08-09-TEST-BATCHING-01 — Broad tests use one governed batch
 
@@ -228,7 +244,13 @@ Why: Repeatedly repairing modes/ACLs, synthesizing every account's groups, and t
 
 ID: DC-2026-08-01-TEST-CAPACITY-01 · Details: [supporting record](DecisionDetails/DC-2026-08-01-TEST-CAPACITY-01.md)
 
-Decision: Admit test attempts from current host `MemAvailable` minus one control-plane reserve and learned per-target peak memory. Keep fair ordering, dependency waves, exact-live-worktree exclusion, exclusive resources, TTL, cancellation, and cleanup; remove declared CPU/memory/PID admission, active-job quotas, per-attempt CPU/memory/PID limits, and the containing test-slice limits. Record peak memory and CPU time after each attempt; CPU is telemetry only and may saturate the host.
+Decision: Admit test executions from current host `MemAvailable` minus one
+control-plane reserve and learned per-target peak memory. Keep fair ordering,
+exact dependency scheduling, immutable source, exclusive resources, TTL,
+cancellation, systemd cgroup isolation, and cleanup; remove declared
+CPU/memory/PID admission and per-execution CPU/memory/PID quotas. Record peak
+memory and CPU time after each execution; CPU is telemetry only and may
+saturate the host.
 
 Why: Static host/UID/repository quotas, manifest-sized workers, and manual capacity tuning were considered. They permanently queued valid work when declarations exceeded a generated 6 GiB ceiling, duplicated limits at several layers, and contradicted the single-developer goal of minimizing paid wall time. Live memory plus learned peaks uses the real constraint, adapts automatically, and keeps CPU fully utilized without discarding test isolation or host-memory protection.
 
