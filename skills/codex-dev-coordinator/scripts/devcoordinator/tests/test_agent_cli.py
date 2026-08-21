@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import hashlib
 import io
 import json
 from pathlib import Path
@@ -167,6 +169,16 @@ class AgentCliTests(unittest.TestCase):
             ["test", "cases", "run-1", "--project", "/repo"],
             ["test", "failures", "run-1", "--project", "/repo"],
             ["test", "artifact", "run-1", "artifact-1", "--project", "/repo"],
+            [
+                "test",
+                "artifact-export",
+                "run-1",
+                "artifact-1",
+                "--output",
+                "/tmp/artifact.tar",
+                "--project",
+                "/repo",
+            ],
         )
         for argv in cases:
             with self.subTest(argv=argv):
@@ -1121,6 +1133,7 @@ class AgentCliTests(unittest.TestCase):
             set(actions),
             {
                 "artifact",
+                "artifact-export",
                 "cancel",
                 "cases",
                 "enqueue",
@@ -1132,9 +1145,86 @@ class AgentCliTests(unittest.TestCase):
             },
         )
 
+    def test_artifact_export_streams_and_atomically_publishes_verified_bytes(self) -> None:
+        payload = b"a" * (agent_cli.TEST_ARTIFACT_EXPORT_CHUNK_BYTES + 17)
+        digest = hashlib.sha256(payload).hexdigest()
+        artifact_id = "artifact-" + "1" * 32
+        calls: list[int] = []
+
+        class Profile:
+            def test_artifact_chunk(
+                self,
+                *,
+                repository,
+                run_id,
+                artifact_id: str,
+                offset,
+                length,
+            ):
+                del repository, run_id, length
+                calls.append(offset)
+                chunk = payload[
+                    offset : offset + agent_cli.TEST_ARTIFACT_EXPORT_CHUNK_BYTES
+                ]
+                next_offset = offset + len(chunk)
+                artifact = {
+                    "artifact_id": artifact_id,
+                    "kind": "directory",
+                    "storage_handle": f"test-artifact://{artifact_id}/{digest}",
+                    "sha256": digest,
+                    "size_bytes": len(payload),
+                    "verified": 1,
+                }
+                return {
+                    "artifact": artifact,
+                    "artifact_chunk": {
+                        **artifact,
+                        "content_identity": "identity-1",
+                        "offset": offset,
+                        "next_offset": next_offset,
+                        "data_base64": base64.b64encode(chunk).decode("ascii"),
+                        "eof": next_offset == len(payload),
+                    },
+                }
+
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary).resolve() / "evidence.tar"
+            result = agent_cli._export_test_artifact(
+                profile=Profile(),
+                repository="repo-1",
+                run_id="run-1",
+                artifact_id=artifact_id,
+                output=str(output),
+            )
+
+            self.assertEqual(output.read_bytes(), payload)
+            self.assertEqual(output.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(calls, [0, agent_cli.TEST_ARTIFACT_EXPORT_CHUNK_BYTES])
+            self.assertEqual(result["action"], "artifact_exported")
+            self.assertEqual(result["artifact"]["sha256"], digest)
+            self.assertNotIn("data_base64", json.dumps(result))
+            with self.assertRaisesRegex(
+                agent_cli.AgentCliError, "destination already exists"
+            ):
+                agent_cli._export_test_artifact(
+                    profile=Profile(),
+                    repository="repo-1",
+                    run_id="run-1",
+                    artifact_id=artifact_id,
+                    output=str(output),
+                )
+
     def test_only_read_only_test_continuations_allow_compatible_release(self) -> None:
         allowed = (
             ["test", "artifact", "run-1", "artifact-1"],
+            [
+                "test",
+                "artifact-export",
+                "run-1",
+                "artifact-1",
+                "--output",
+                "/tmp/artifact.tar",
+            ],
             ["test", "cases", "run-1"],
             ["test", "failures", "run-1"],
             ["test", "follow", "run-1"],

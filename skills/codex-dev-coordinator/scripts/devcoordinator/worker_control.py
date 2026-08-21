@@ -11,6 +11,7 @@ import json
 import os
 from pathlib import Path
 import pwd
+import signal
 import time
 from typing import Any, Callable, Mapping
 import uuid
@@ -54,10 +55,84 @@ class WorkerReplaceError(WorkerControlError):
 
 ManagerFactory = Callable[..., Any]
 ProcessObserver = Callable[[int, str], str]
+ProcessTerminator = Callable[..., str]
 STARTUP_AUTOSTART_ATTEMPTS = 3
 STARTUP_AUTOSTART_RETRY_SECONDS = 0.25
 STARTUP_CONVERGENCE_SECONDS = 60.0
 STARTUP_CONVERGENCE_POLL_SECONDS = 0.1
+
+
+def terminate_worker_process_group(
+    *,
+    pid: int,
+    process_start_time: str,
+    timeout_seconds: float,
+    observer: ProcessObserver,
+    clock: Callable[[], float],
+    sleeper: Callable[[float], None],
+) -> str:
+    """Terminate only a retained session-leading worker process identity.
+
+    ``security-assumptions.md`` names runaway processes and stale identity as
+    credible failures and requires immutable identity plus bounded cleanup;
+    this is the narrow fallback after native cgroup ownership is absent.
+    """
+
+    if type(pid) is not int or pid <= 1 or not process_start_time:
+        raise WorkerControlError("worker process-group identity is invalid")
+    state = observer(pid, process_start_time)
+    if state in {"absent", "mismatch"}:
+        return state
+    if state != "alive":
+        raise WorkerControlError("worker process identity is unobservable")
+    try:
+        process_group = os.getpgid(pid)
+    except ProcessLookupError:
+        state = observer(pid, process_start_time)
+        if state in {"absent", "mismatch"}:
+            return state
+        raise WorkerControlError("worker process group disappeared ambiguously")
+    except OSError as error:
+        raise WorkerControlError("worker process group is unobservable") from error
+    if process_group != pid:
+        raise WorkerControlError(
+            "retained worker process is not its exact session process-group leader"
+        )
+    deadline = float(clock()) + max(0.1, float(timeout_seconds))
+    for signum in (signal.SIGTERM, signal.SIGKILL):
+        state = observer(pid, process_start_time)
+        if state in {"absent", "mismatch"}:
+            return state
+        if state != "alive":
+            raise WorkerControlError("worker process identity changed before termination")
+        try:
+            os.killpg(pid, signum)
+        except ProcessLookupError:
+            state = observer(pid, process_start_time)
+            if state in {"absent", "mismatch"}:
+                return state
+            raise WorkerControlError("worker process group disappearance is unproven")
+        except OSError as error:
+            raise WorkerControlError("worker process-group termination failed") from error
+        phase_deadline = min(
+            deadline,
+            float(clock()) + max(0.05, float(timeout_seconds) / 2.0),
+        )
+        while float(clock()) < phase_deadline:
+            state = observer(pid, process_start_time)
+            if state in {"absent", "mismatch"}:
+                return state
+            if state != "alive":
+                raise WorkerControlError(
+                    "worker process identity changed during termination"
+                )
+            sleeper(min(0.05, max(0.0, phase_deadline - float(clock()))))
+    state = observer(pid, process_start_time)
+    if state not in {"absent", "mismatch"}:
+        raise WorkerControlError(
+            "worker process group remained active after bounded termination"
+        )
+    return state
 
 
 class WorkerController:
@@ -72,6 +147,7 @@ class WorkerController:
         state_root: Path | None = None,
         execution_uid: int | None = None,
         process_observer: ProcessObserver = observe_worker_process_identity,
+        process_terminator: ProcessTerminator = terminate_worker_process_group,
         clock: Callable[[], float] = time.monotonic,
         sleeper: Callable[[float], None] = time.sleep,
     ) -> None:
@@ -98,6 +174,7 @@ class WorkerController:
             )
         self.execution_uid = requested_uid
         self.process_observer = process_observer
+        self.process_terminator = process_terminator
         self.clock = clock
         self.sleeper = sleeper
         self._manager: Any | None = None
@@ -267,10 +344,38 @@ class WorkerController:
                 operation_id=operation_id,
                 expected_generation=int(policy["generation"]),
             )
-            native = self._native_stop(
-                worker_id=worker_id, uid=int(policy["execution_uid"])
-            )
+            native_error: str | None = None
+            try:
+                native = self._native_stop(
+                    worker_id=worker_id, uid=int(policy["execution_uid"])
+                )
+            except WorkerNativeError as error:
+                observed_native = self._native_status(
+                    worker_id=worker_id, uid=int(policy["execution_uid"])
+                )
+                if observed_native.active or observed_native.loaded:
+                    raise
+                native = observed_native
+                native_error = str(error)[:4096]
             if not native.active:
+                if active_attempt is not None:
+                    pid = active_attempt.get("pid")
+                    started = active_attempt.get("process_start_time")
+                    if type(pid) is int and isinstance(started, str) and started:
+                        process_state = self.process_observer(pid, started)
+                        if process_state == "alive":
+                            process_state = self.process_terminator(
+                                pid=pid,
+                                process_start_time=started,
+                                timeout_seconds=timeout_seconds,
+                                observer=self.process_observer,
+                                clock=self.clock,
+                                sleeper=self.sleeper,
+                            )
+                        if process_state not in {"absent", "mismatch"}:
+                            raise WorkerControlError(
+                                "stopped worker process absence is unproven"
+                            )
                 self._settle_stopped_runner(
                     worker_id=worker_id, evidence_key=operation_id
                 )
@@ -284,7 +389,7 @@ class WorkerController:
                 context=context,
                 policy=policy,
                 native=native.to_dict(),
-                native_error=None,
+                native_error=native_error,
             )
             payload["terminal_process_proof"] = terminal_process_proof
             self._finish_operation(operation_id, result=payload)

@@ -9,6 +9,9 @@ returns one compact JSON decision envelope.
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -32,6 +35,7 @@ from .agent_contract import (
 
 MAX_CAPABILITIES_RESULT_BYTES = 3 * 1024
 MAX_OPERATION_FOLLOW_RESULT_BYTES = 3 * 1024
+TEST_ARTIFACT_EXPORT_CHUNK_BYTES = 1024 * 1024
 _REPOSITORY_ADOPTION_FAILURE_CODES = frozenset(
     {
         "repository_adoption_constraint_failed",
@@ -157,6 +161,205 @@ def _bounded_test_case_page(result: Mapping[str, Any]) -> dict[str, Any]:
                     "test case page cannot publish a safe continuation cursor"
                 )
             document["next_cursor"] = cursor
+
+
+def _export_test_artifact(
+    *,
+    profile: Any,
+    repository: str,
+    run_id: str,
+    artifact_id: str,
+    output: str,
+) -> dict[str, Any]:
+    """Stream one exact artifact to a new atomically published local file."""
+
+    output_path = Path(os.path.abspath(os.path.expanduser(output)))
+    parent = output_path.parent
+    try:
+        resolved_parent = parent.resolve(strict=True)
+    except OSError as error:
+        raise AgentCliError(
+            "artifact_export_path_invalid",
+            "artifact export parent is unavailable",
+        ) from error
+    if resolved_parent != parent or output_path.name in {"", ".", ".."}:
+        raise AgentCliError(
+            "artifact_export_path_invalid",
+            "artifact export requires a canonical real parent directory",
+        )
+    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    directory_flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    try:
+        directory_fd = os.open(parent, directory_flags)
+    except OSError as error:
+        raise AgentCliError(
+            "artifact_export_path_invalid",
+            "artifact export parent is unsafe",
+        ) from error
+    temporary_name = f".{output_path.name}.devcoordinator-{uuid.uuid4().hex}.tmp"
+    descriptor: int | None = None
+    published = False
+    try:
+        try:
+            os.stat(output_path.name, dir_fd=directory_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            raise AgentCliError(
+                "artifact_export_exists",
+                "artifact export destination already exists",
+            )
+        descriptor = os.open(
+            temporary_name,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+            0o600,
+            dir_fd=directory_fd,
+        )
+        digest = hashlib.sha256()
+        offset = 0
+        identity: tuple[object, ...] | None = None
+        final: Mapping[str, Any] | None = None
+        for _ in range(34):
+            result = profile.test_artifact_chunk(
+                repository=repository,
+                run_id=run_id,
+                artifact_id=artifact_id,
+                offset=offset,
+                length=TEST_ARTIFACT_EXPORT_CHUNK_BYTES,
+            )
+            chunk = result.get("artifact_chunk")
+            artifact = result.get("artifact")
+            if not isinstance(chunk, Mapping) or not isinstance(artifact, Mapping):
+                raise AgentCliError(
+                    "artifact_export_reply_invalid",
+                    "artifact export reply omitted verified chunk metadata",
+                )
+            current_identity = (
+                chunk.get("artifact_id"),
+                chunk.get("kind"),
+                chunk.get("storage_handle"),
+                chunk.get("sha256"),
+                chunk.get("size_bytes"),
+                chunk.get("content_identity"),
+            )
+            if (
+                current_identity[0] != artifact_id
+                or artifact.get("artifact_id") != artifact_id
+                or artifact.get("verified") not in {1, True}
+                or artifact.get("kind") != current_identity[1]
+                or artifact.get("storage_handle") != current_identity[2]
+                or artifact.get("sha256") != current_identity[3]
+                or artifact.get("size_bytes") != current_identity[4]
+                or not isinstance(current_identity[3], str)
+                or not isinstance(current_identity[4], int)
+                or not isinstance(current_identity[5], str)
+                or chunk.get("offset") != offset
+                or type(chunk.get("next_offset")) is not int
+                or type(chunk.get("eof")) is not bool
+                or not isinstance(chunk.get("data_base64"), str)
+                or (identity is not None and current_identity != identity)
+            ):
+                raise AgentCliError(
+                    "artifact_export_reply_invalid",
+                    "artifact export chunk identity is contradictory",
+                )
+            try:
+                payload = base64.b64decode(
+                    chunk["data_base64"], validate=True
+                )
+            except (ValueError, binascii.Error) as error:
+                raise AgentCliError(
+                    "artifact_export_reply_invalid",
+                    "artifact export chunk encoding is invalid",
+                ) from error
+            next_offset = int(chunk["next_offset"])
+            if (
+                next_offset != offset + len(payload)
+                or next_offset > int(current_identity[4])
+                or (not chunk["eof"] and not payload)
+                or chunk["eof"] != (next_offset == int(current_identity[4]))
+            ):
+                raise AgentCliError(
+                    "artifact_export_reply_invalid",
+                    "artifact export chunk order is invalid",
+                )
+            view = memoryview(payload)
+            written = 0
+            while written < len(view):
+                count = os.write(descriptor, view[written:])
+                if count <= 0:
+                    raise OSError("artifact export write made no progress")
+                written += count
+            digest.update(payload)
+            offset = next_offset
+            identity = current_identity
+            final = artifact
+            if chunk["eof"]:
+                break
+        else:
+            raise AgentCliError(
+                "artifact_export_reply_invalid",
+                "artifact export exceeded its chunk bound",
+            )
+        if (
+            identity is None
+            or final is None
+            or offset != identity[4]
+            or digest.hexdigest() != identity[3]
+        ):
+            raise AgentCliError(
+                "artifact_export_integrity_failed",
+                "artifact export failed complete digest verification",
+            )
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = None
+        os.link(
+            temporary_name,
+            output_path.name,
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
+            follow_symlinks=False,
+        )
+        published = True
+        os.fsync(directory_fd)
+        os.unlink(temporary_name, dir_fd=directory_fd)
+        return require_agent_result(
+            {
+                "schema_version": 1,
+                "ok": True,
+                "action": "artifact_exported",
+                "run_id": run_id,
+                "artifact": {
+                    "artifact_id": artifact_id,
+                    "kind": identity[1],
+                    "storage_handle": identity[2],
+                    "sha256": identity[3],
+                    "size_bytes": identity[4],
+                },
+                "output": str(output_path),
+            },
+            surface="test artifact export",
+        )
+    except AgentCliError:
+        raise
+    except OSError as error:
+        raise AgentCliError(
+            "artifact_export_failed", "artifact export could not be published"
+        ) from error
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        if not published:
+            try:
+                os.unlink(temporary_name, dir_fd=directory_fd)
+            except OSError:
+                pass
+        os.close(directory_fd)
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -413,6 +616,15 @@ def _parser() -> argparse.ArgumentParser:
     artifact.add_argument("artifact", help="exact artifact ID")
     _add_scoped_project(artifact)
 
+    artifact_export = test_actions.add_parser(
+        "artifact-export",
+        help="export one exact verified artifact to a new local file",
+    )
+    artifact_export.add_argument("run", help="dc1:run handle or exact run ID")
+    artifact_export.add_argument("artifact", help="exact artifact ID")
+    artifact_export.add_argument("--output", required=True)
+    _add_scoped_project(artifact_export)
+
     cancel = test_actions.add_parser(
         "cancel", help="request cancellation of one exact run"
     )
@@ -519,6 +731,7 @@ def _allows_compatible_release(namespace: argparse.Namespace) -> bool:
 
     return namespace.command == "test" and namespace.test_action in {
         "artifact",
+        "artifact-export",
         "cases",
         "failures",
         "follow",
@@ -2183,9 +2396,17 @@ def _test(
             limit=namespace.limit,
         )
         return _bounded_test_case_page(result)
-    if action == "artifact":
+    if action in {"artifact", "artifact-export"}:
         run_id = _handle_identity(namespace.run, expected_kind="run")
         artifact_id = _handle_identity(namespace.artifact, expected_kind="artifact")
+        if action == "artifact-export":
+            return _export_test_artifact(
+                profile=profile,
+                repository=root.repo_id,
+                run_id=run_id,
+                artifact_id=artifact_id,
+                output=namespace.output,
+            )
         return require_agent_result(
             profile.test_artifact(
                 repository=root.repo_id,

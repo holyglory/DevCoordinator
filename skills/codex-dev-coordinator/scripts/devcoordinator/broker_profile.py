@@ -906,6 +906,26 @@ class BrokerClientProfile:
             arguments={"run_id": str(run_id), "artifact_id": str(artifact_id)},
         )
 
+    def test_artifact_chunk(
+        self,
+        *,
+        repository: str,
+        run_id: str,
+        artifact_id: str,
+        offset: int,
+        length: int,
+    ) -> dict[str, Any]:
+        return self._test_run_call(
+            repository=repository,
+            operation=BrokerOperation.TEST_ARTIFACT_RESOLVE,
+            arguments={
+                "run_id": str(run_id),
+                "artifact_id": str(artifact_id),
+                "offset": offset,
+                "length": length,
+            },
+        )
+
     def test_run_cases(
         self, *, repository: str, run_id: str, after: int = 0, limit: int = 25
     ) -> dict[str, Any]:

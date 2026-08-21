@@ -116,7 +116,10 @@ normalized attempt/result crosses the store or scheduler.
    `cpu.stat usage_usec`; both feed later scheduling and fleet telemetry. CPU is
    observational only. The runner exposes only opaque artifact IDs and digests;
    the protected collector copies and revalidates execution-private files before
-   testd stores public handles.
+   testd stores public handles. An explicit local export command may page a
+   verified retained blob through stable identity-bound chunks; the caller
+   verifies the complete digest and atomically publishes a new file without
+   putting artifact bytes in agent JSON, logs, Console, or public HTTP.
 7. Chunked result and exit evidence is durably spooled. Exact attempt,
    repository-generation, attempt-generation, chunk, and operation IDs make
    replay idempotent and prevent an abandoned attempt from completing a retry.
@@ -443,6 +446,12 @@ test policy check
 test catalog|stats
 test wait --repository-id REPOSITORY --run-id RUN --timeout-seconds N
 ```
+
+The stable intent client additionally provides
+`devcoordinator test artifact-export RUN ARTIFACT --output NEW_FILE` for complete
+local materialization. It refuses an existing destination, symlinked parent,
+identity drift, noncontiguous pages, a short transfer, or a final digest/size
+mismatch and removes its unpublished temporary file on failure.
 
 Manifest and plan commands derive repository identity from the explicit root
 and temporary-repository context. Every later operation over an opaque plan,

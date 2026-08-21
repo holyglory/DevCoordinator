@@ -915,16 +915,24 @@ class CoordinatorRuntimeRequestSubmitter(RuntimeRequestSubmitter):
             f"oom_killed={str(oom_killed).lower()})."
         )[:8192]
 
-        if context.next_chunk_index == 0:
+        if chunk_id not in context.result_chunk_ids:
+            if (
+                context.next_chunk_index != len(context.result_chunk_ids)
+                or context.next_chunk_index >= 4_096
+            ):
+                raise TestStoreConflict(
+                    "native exit failure result identity is contradictory"
+                )
+            chunk_index = context.next_chunk_index
             context.result_chunk_ids.append(chunk_id)
-            context.next_chunk_index = 1
+            context.next_chunk_index += 1
             context.terminal_duration_seconds = duration_seconds
             return {
                 "state": "result",
                 "exit_envelope": None,
                 "result_chunk": {
                     "chunk_id": chunk_id,
-                    "chunk_index": 0,
+                    "chunk_index": chunk_index,
                     "cases": [],
                     "failures": [
                         {
@@ -942,7 +950,12 @@ class CoordinatorRuntimeRequestSubmitter(RuntimeRequestSubmitter):
                 "current_memory_bytes": None,
                 "launch_confirmed": True,
             }
-        if context.result_chunk_ids != [chunk_id] or context.next_chunk_index != 1:
+        if (
+            not context.result_chunk_ids
+            or context.result_chunk_ids[-1] != chunk_id
+            or context.result_chunk_ids.count(chunk_id) != 1
+            or context.next_chunk_index != len(context.result_chunk_ids)
+        ):
             raise TestStoreConflict(
                 "native exit failure result identity is contradictory"
             )
@@ -962,7 +975,7 @@ class CoordinatorRuntimeRequestSubmitter(RuntimeRequestSubmitter):
                     + "\0"
                     + conclusion.value
                     + "\0"
-                    + chunk_id
+                    + "\0".join(context.result_chunk_ids)
                 ).encode("utf-8")
             ).hexdigest()[:32],
             attempt_id=context.attempt_id,
@@ -976,7 +989,7 @@ class CoordinatorRuntimeRequestSubmitter(RuntimeRequestSubmitter):
             ),
             conclusion=conclusion,
             duration_seconds=duration,
-            result_chunk_ids=(chunk_id,),
+            result_chunk_ids=tuple(context.result_chunk_ids),
             peak_memory_bytes=peak_memory_bytes,
             cpu_seconds=cpu_seconds,
         )

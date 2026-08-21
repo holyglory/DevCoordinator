@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 from devcoordinator.broker import (
     AcceptedBrokerRequest,
@@ -526,6 +527,55 @@ class UniversalTestResultBindingTests(unittest.TestCase):
             },
         )
         self.assertEqual(retry["repository_id"], "repo-tests")
+
+    def test_artifact_chunk_is_bound_to_exact_verified_metadata(self) -> None:
+        artifact_id = "artifact-" + "1" * 32
+        digest = "a" * 64
+        self.plane.overrides["artifact"] = {
+            "schema_version": 1,
+            "run_id": self.plane.source_run_id,
+            "repository_id": "repo-tests",
+            "artifact": {
+                "artifact_id": artifact_id,
+                "verified": 1,
+                "kind": "directory",
+                "sha256": digest,
+                "size_bytes": 10,
+                "storage_handle": f"test-artifact://{artifact_id}/{digest}",
+            },
+        }
+        chunk = {
+            "artifact_id": artifact_id,
+            "kind": "directory",
+            "storage_handle": f"test-artifact://{artifact_id}/{digest}",
+            "sha256": digest,
+            "size_bytes": 10,
+            "content_identity": "identity-1",
+            "offset": 0,
+            "next_offset": 10,
+            "data_base64": "YWFhYWFhYWFhYQ==",
+            "eof": True,
+        }
+        with mock.patch(
+            "devcoordinator.broker_backend.verified_artifact_chunk",
+            return_value=chunk,
+        ) as read:
+            result = self.execute(
+                BrokerOperation.TEST_ARTIFACT_RESOLVE,
+                {
+                    "run_id": self.plane.source_run_id,
+                    "artifact_id": artifact_id,
+                    "offset": 0,
+                    "length": 1024 * 1024,
+                },
+            )
+
+        self.assertEqual(result["artifact_chunk"], chunk)
+        read.assert_called_once_with(
+            self.plane.overrides["artifact"]["artifact"],
+            offset=0,
+            length=1024 * 1024,
+        )
 
     def test_evidence_consumption_is_exactly_bound_to_broker_operation(self) -> None:
         consumed = self.execute(

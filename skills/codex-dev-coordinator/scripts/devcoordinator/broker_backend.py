@@ -187,6 +187,7 @@ from .universal_test_service import (
     TestPlaneClient,
     decode_test_plan_document,
     verified_text_artifact_content,
+    verified_artifact_chunk,
 )
 from .universal_test_transport import (
     TEST_CATALOG_READ_TIMEOUT_SECONDS,
@@ -1292,6 +1293,23 @@ class StoreBackedMutationBackend:
                     raise TestStoreContractError(
                         "testd returned a contradictory artifact identity"
                     )
+                if "offset" in request.arguments:
+                    chunk = verified_artifact_chunk(
+                        artifact,
+                        offset=int(request.arguments["offset"]),
+                        length=int(request.arguments["length"]),
+                    )
+                    result["artifact_chunk"] = chunk
+                    if (
+                        not isinstance(chunk, Mapping)
+                        or chunk.get("artifact_id") != artifact_id
+                        or chunk.get("sha256") != artifact.get("sha256")
+                        or chunk.get("size_bytes") != artifact.get("size_bytes")
+                    ):
+                        raise TestStoreContractError(
+                            "testd returned contradictory artifact chunk evidence"
+                        )
+                    return result
                 content = verified_text_artifact_content(artifact)
                 result["artifact_content"] = content
                 if content is not None and (

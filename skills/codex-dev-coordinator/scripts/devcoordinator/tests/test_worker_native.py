@@ -68,7 +68,6 @@ class WorkerNativeTests(unittest.TestCase):
         cgroup = self.cgroup_root.joinpath(*self.control_group.split("/")[1:])
         cgroup.mkdir(parents=True)
         (cgroup / "cgroup.events").write_text("populated 1\n", encoding="ascii")
-        (cgroup / "cgroup.kill").write_text("", encoding="ascii")
 
     def tearDown(self) -> None:
         self.temp.cleanup()
@@ -374,13 +373,58 @@ class WorkerNativeTests(unittest.TestCase):
                 ],
             ],
         )
-        self.assertEqual(state.termination_method, "cgroup.kill")
+        self.assertEqual(state.termination_method, "systemd-control-group")
         self.assertFalse(state.cgroup_populated)
-        self.assertEqual(
-            self.cgroup_root.joinpath(
-                *self.control_group.split("/")[1:], "cgroup.kill"
-            ).read_text(encoding="ascii"),
-            "1",
+
+    def test_systemd_stop_escalates_only_the_exact_transitional_unit(self) -> None:
+        unit = f"devcoordinator-worker-{self.worker_id}.service"
+        runner = FakeRunner(
+            [
+                (
+                    0,
+                    "LoadState=loaded\nActiveState=active\nSubState=running\n"
+                    "MainPID=4312\nExecMainStatus=0\n"
+                    f"ControlGroup={self.control_group}\n",
+                    "",
+                ),
+                (0, "", ""),
+                (
+                    0,
+                    "LoadState=loaded\nActiveState=deactivating\nSubState=stop-sigterm\n"
+                    "MainPID=4312\nExecMainStatus=0\n"
+                    f"ControlGroup={self.control_group}\n",
+                    "",
+                ),
+                (0, "", ""),
+                (0, "", ""),
+                (
+                    0,
+                    "LoadState=loaded\nActiveState=inactive\nSubState=dead\n"
+                    "MainPID=0\nExecMainStatus=0\n"
+                    f"ControlGroup={self.control_group}\n",
+                    "",
+                ),
+            ]
+        )
+        manager = self._systemd(runner)
+        with mock.patch.object(
+            manager,
+            "_control_group_populated",
+            side_effect=[True, True, False, False],
+        ):
+            state = manager.stop(worker_id=self.worker_id)
+
+        self.assertFalse(state.active)
+        self.assertEqual(state.termination_method, "systemd-control-group")
+        self.assertIn(
+            [
+                str(self.systemctl.resolve()),
+                "kill",
+                "--kill-whom=all",
+                "--signal=KILL",
+                unit,
+            ],
+            runner.calls,
         )
 
     @unittest.skipIf(os.geteuid() == 0, "per-user launchd requires a non-root test account")

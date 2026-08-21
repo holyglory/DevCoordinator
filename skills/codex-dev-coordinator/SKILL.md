@@ -195,12 +195,22 @@ devcoordinator test enqueue --intent change
 devcoordinator test follow dc1:run:RUN_ID --wait-seconds 30
 devcoordinator test failures dc1:run:RUN_ID
 devcoordinator test cases dc1:run:RUN_ID
+devcoordinator test artifact-export dc1:run:RUN_ID dc1:artifact:ARTIFACT_ID \
+  --output /canonical/new/evidence.tar
 ```
 
 Failure and case reads are cursor-bounded. Follow each returned `next_cursor`
 with `--after` until it is null; every page stays within the agent result
 contract, while the retained index preserves every failure and case from the
 bounded reporter stream.
+
+Ordinary `test artifact` returns verified metadata and a bounded tail for
+supported text kinds. Use `artifact-export` when an agent or release tool needs
+the complete retained bytes, including a directory archive. The destination
+parent must already be a canonical real directory and the destination must not
+exist. Python pages the exact artifact through the local broker, verifies
+stable identity, order, total size and full SHA-256, and atomically publishes a
+mode-0600 file; binary bytes never enter the final agent JSON or call journal.
 
 Do not recreate the selected batch by invoking its test files, packages, or
 targets one at a time locally. If `.codex/tests.json` is absent or invalid, a

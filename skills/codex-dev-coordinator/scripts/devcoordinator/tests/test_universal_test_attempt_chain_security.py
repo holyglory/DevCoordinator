@@ -2006,6 +2006,66 @@ class UniversalTestAttemptChainSecurityTests(unittest.TestCase):
             [chunk["chunk_id"]],
         )
 
+    def test_native_exit_without_result_appends_after_retained_chunk_prefix(self) -> None:
+        runtime_id = "devcoordinator-test-" + hashlib.sha256(
+            b"attempt-partial-result"
+        ).hexdigest()[:32]
+
+        class Calls:
+            def call(self, *, operation, **_kwargs):
+                if operation.value == "test.attempt_status":
+                    return {
+                        "state": "exited",
+                        "exit_status": 1,
+                        "result": None,
+                        "result_chunk": None,
+                        "termination": {
+                            "reason": "signal",
+                            "systemd_result": "signal",
+                            "exec_main_code": 2,
+                            "oom_killed": False,
+                        },
+                        "resource_usage": {
+                            "peak_memory_bytes": 1024,
+                            "cpu_seconds": 0.5,
+                        },
+                    }
+                raise AssertionError(f"unexpected operation: {operation}")
+
+        submitter = CoordinatorRuntimeRequestSubmitter(
+            BrokerConnection(Path("/tmp/devcoordinator-unused.sock"), "authority-1"),
+            clock=lambda: 12.0,
+        )
+        submitter.calls = Calls()
+        submitter.recover(
+            runtime_id,
+            context=RunnerRecoveryContext(
+                repository_id="repo-partial-result",
+                repository_generation=5,
+                attempt_id="attempt-partial-result",
+                generation=3,
+                started_at=10.0,
+                next_chunk_index=1,
+                result_chunk_ids=("chunk-retained-green-cases",),
+            ),
+        )
+
+        failure = submitter.observe(runtime_id)
+        terminal = submitter.observe(runtime_id)
+
+        self.assertEqual(failure["state"], "result")
+        self.assertEqual(failure["result_chunk"]["chunk_index"], 1)
+        self.assertEqual(
+            terminal["exit_envelope"]["result_chunk_ids"],
+            [
+                "chunk-retained-green-cases",
+                failure["result_chunk"]["chunk_id"],
+            ],
+        )
+        self.assertEqual(
+            terminal["exit_envelope"]["conclusion"], "infrastructure_failed"
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
