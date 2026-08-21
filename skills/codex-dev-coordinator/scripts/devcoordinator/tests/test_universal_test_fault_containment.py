@@ -6,6 +6,7 @@ import subprocess
 import tempfile
 import unittest
 
+from devcoordinator.universal_test_result_package import RESULT_PACKAGE_FILE_NAME
 from devcoordinator.universal_test_runtime import (
     SystemdTestAttemptManager,
     TestAttemptDescriptor,
@@ -78,7 +79,7 @@ class UniversalTestFaultContainmentTests(unittest.TestCase):
 
     def descriptor(self, *, repository_id: str = "hostile-repo") -> TestAttemptDescriptor:
         return TestAttemptDescriptor(
-            attempt_id="attempt-hostile-containment",
+            execution_id="execution-hostile-containment",
             target_id="target-hostile-containment",
             run_id="run-hostile-containment",
             repository_id=repository_id,
@@ -108,6 +109,55 @@ class UniversalTestFaultContainmentTests(unittest.TestCase):
             network="none",
             ttl_seconds=37,
         )
+
+    def prepared_runtime(
+        self,
+        raw: str,
+        *,
+        runner,
+        populated: bool,
+    ) -> tuple[SystemdTestAttemptManager, str, Path]:
+        """Publish the exact descriptor and native identity observed by status."""
+
+        root = Path(raw)
+        attempt_root = root / "attempts"
+        cgroup_root = root / "cgroup"
+        cgroup_root.mkdir(mode=0o700)
+        manager = SystemdTestAttemptManager(
+            attempt_root=attempt_root,
+            artifact_root=root / "artifacts",
+            result_package_root=root / "result-packages",
+            cgroup_root=cgroup_root,
+            runner=runner,
+        )
+        descriptor = self.descriptor()
+        runtime_id = manager._runtime_id(descriptor)
+        state = attempt_root / runtime_id
+        state.mkdir(parents=True, mode=0o700)
+        launch_path, result_path = manager._publish_runner_launch(
+            descriptor,
+            state=state,
+            execution_root=Path(descriptor.execution_root),
+            owner_gid=os.getegid(),
+        )
+        self.assertEqual(launch_path, state / "launch.json")
+        self.assertEqual(result_path, state / "output" / RESULT_PACKAGE_FILE_NAME)
+        control_group = f"/tests.slice/{runtime_id}.service"
+        manager._publish_native_evidence(
+            runtime_id,
+            descriptor,
+            invocation_id="test-invocation-" + "1" * 32,
+            prepared_at=1.0,
+            started_at=2.0,
+            control_group=control_group,
+        )
+        events = manager._control_group_path(control_group) / "cgroup.events"
+        events.parent.mkdir(parents=True, mode=0o700)
+        events.write_text(
+            f"populated {1 if populated else 0}\n",
+            encoding="ascii",
+        )
+        return manager, runtime_id, events
 
     def test_attempts_keep_ttl_and_isolation_without_resource_quotas(self) -> None:
         descriptor = self.descriptor()
@@ -178,11 +228,12 @@ class UniversalTestFaultContainmentTests(unittest.TestCase):
                     return subprocess.CompletedProcess(argv, 0, stdout, "")
 
                 with tempfile.TemporaryDirectory(prefix="test-systemd-result-") as raw:
-                    manager = SystemdTestAttemptManager(
-                        attempt_root=Path(raw) / "attempts",
+                    manager, runtime_id, _events = self.prepared_runtime(
+                        raw,
                         runner=runner,
+                        populated=False,
                     )
-                    state = manager.status("devcoordinator-test-deadbeef")
+                    state = manager.status(runtime_id)
                 self.assertFalse(state.active)
                 self.assertEqual(state.systemd_result, result)
                 self.assertEqual(state.exec_main_code, int(code))
@@ -207,11 +258,12 @@ class UniversalTestFaultContainmentTests(unittest.TestCase):
             return subprocess.CompletedProcess(argv, 0, stdout, "")
 
         with tempfile.TemporaryDirectory(prefix="test-systemd-usage-null-") as raw:
-            manager = SystemdTestAttemptManager(
-                attempt_root=Path(raw) / "attempts",
+            manager, runtime_id, _events = self.prepared_runtime(
+                raw,
                 runner=runner,
+                populated=False,
             )
-            state = manager.status("devcoordinator-test-deadbeef")
+            state = manager.status(runtime_id)
         self.assertIsNone(state.cpu_seconds)
         self.assertIsNone(state.peak_memory_bytes)
 
@@ -232,11 +284,12 @@ class UniversalTestFaultContainmentTests(unittest.TestCase):
             return subprocess.CompletedProcess(argv, 0, stdout, "")
 
         with tempfile.TemporaryDirectory(prefix="test-systemd-current-usage-") as raw:
-            manager = SystemdTestAttemptManager(
-                attempt_root=Path(raw) / "attempts",
+            manager, runtime_id, _events = self.prepared_runtime(
+                raw,
                 runner=runner,
+                populated=True,
             )
-            state = manager.status("devcoordinator-test-deadbeef")
+            state = manager.status(runtime_id)
         self.assertTrue(state.active)
         self.assertEqual(state.current_memory_bytes, 96 * 1024 * 1024)
 
@@ -254,15 +307,16 @@ class UniversalTestFaultContainmentTests(unittest.TestCase):
             return subprocess.CompletedProcess(argv, 0, stdout, "")
 
         with tempfile.TemporaryDirectory(prefix="test-systemd-starting-") as raw:
-            manager = SystemdTestAttemptManager(
-                attempt_root=Path(raw) / "attempts",
+            manager, runtime_id, _events = self.prepared_runtime(
+                raw,
                 runner=runner,
+                populated=True,
             )
-            state = manager.status("devcoordinator-test-deadbeef")
+            state = manager.status(runtime_id)
 
         self.assertTrue(state.loaded)
         self.assertTrue(state.active)
-        self.assertEqual(state.state, "start")
+        self.assertEqual(state.state, "running")
         self.assertIsNone(state.exit_status)
         self.assertIsNone(state.systemd_result)
         self.assertIsNone(state.termination_reason)
@@ -285,20 +339,19 @@ class UniversalTestFaultContainmentTests(unittest.TestCase):
             return subprocess.CompletedProcess(argv, 0, stdout, "")
 
         with tempfile.TemporaryDirectory(prefix="test-systemd-deactivating-") as raw:
-            attempt_root = Path(raw) / "attempts"
-            runtime_root = attempt_root / "devcoordinator-test-deadbeef"
-            runtime_root.mkdir(parents=True)
+            manager, runtime_id, _events = self.prepared_runtime(
+                raw,
+                runner=runner,
+                populated=True,
+            )
+            runtime_root = manager.attempt_root / runtime_id
             marker = runtime_root / "still-draining"
             marker.write_text("preserve", encoding="utf-8")
-            manager = SystemdTestAttemptManager(
-                attempt_root=attempt_root,
-                runner=runner,
-            )
-            state = manager.status("devcoordinator-test-deadbeef")
+            state = manager.status(runtime_id)
 
             self.assertTrue(state.loaded)
             self.assertTrue(state.active)
-            self.assertEqual(state.state, "stop-sigterm")
+            self.assertEqual(state.state, "running")
             self.assertIsNone(state.exit_status)
             self.assertIsNone(state.systemd_result)
             self.assertIsNone(state.termination_reason)
@@ -307,13 +360,15 @@ class UniversalTestFaultContainmentTests(unittest.TestCase):
 
     def test_cancellation_force_kills_only_the_exact_still_active_unit(self) -> None:
         calls: list[list[str]] = []
-        observations = iter(("active", "inactive"))
+        observations = iter(("active", "inactive", "inactive"))
 
         def runner(argv, **_kwargs):
             calls.append(list(argv))
             if "show" not in argv:
                 return subprocess.CompletedProcess(argv, 0, "", "")
             active = next(observations)
+            if active == "inactive":
+                events.write_text("populated 0\n", encoding="ascii")
             stdout = "\n".join((
                 "LoadState=loaded",
                 f"ActiveState={active}",
@@ -329,11 +384,12 @@ class UniversalTestFaultContainmentTests(unittest.TestCase):
             return subprocess.CompletedProcess(argv, 0, stdout, "")
 
         with tempfile.TemporaryDirectory(prefix="test-systemd-force-cancel-") as raw:
-            manager = SystemdTestAttemptManager(
-                attempt_root=Path(raw) / "attempts",
+            manager, runtime_id, events = self.prepared_runtime(
+                raw,
                 runner=runner,
+                populated=True,
             )
-            state = manager.cancel("devcoordinator-test-deadbeef")
+            state = manager.cancel(runtime_id)
 
         self.assertFalse(state.active)
         self.assertEqual(
@@ -343,12 +399,12 @@ class UniversalTestFaultContainmentTests(unittest.TestCase):
                 "kill",
                 "--kill-whom=all",
                 "--signal=KILL",
-                "devcoordinator-test-deadbeef.service",
+                f"{runtime_id}.service",
             ]],
         )
         self.assertTrue(
             all(
-                "devcoordinator-test-deadbeef.service" in call
+                f"{runtime_id}.service" in call
                 for call in calls
             )
         )
