@@ -14,12 +14,18 @@ import time
 from typing import Any, Mapping
 import uuid
 
+from .broker import BrokerError
 from .broker_host import (
     EphemeralDockerContainerTarget,
     EphemeralDockerCreateTarget,
     EphemeralDockerIdentity,
 )
-from .broker_persistence import BrokerPersistence, EphemeralImageTarget, SealedTestFixtureTemplate
+from .broker_persistence import (
+    BrokerPersistence,
+    EphemeralImageTarget,
+    SealedTestFixtureTemplate,
+    _normalize_ephemeral_image_cache_proof,
+)
 from .ephemeral_secrets import EphemeralSecretError, VolatileRunSecretManager
 from .universal_test_runtime import (
     TEST_ATTEMPT_ACCOUNT_ID,
@@ -268,16 +274,45 @@ class BrokerSealedFixtureProvider:
             if found.get("found") is True:
                 full_id = found.get("full_container_id")
             else:
-                image = self.host.docker_inspect_ephemeral_image(
-                    EphemeralImageTarget(
-                        template_id=str(raw["template_id"]),
-                        repo_id=str(raw["repository_id"]),
-                        image_ref=str(raw["image_ref"]),
-                        template_fingerprint=str(raw["template_fingerprint"]),
-                    )
+                image_target = EphemeralImageTarget(
+                    template_id=str(raw["template_id"]),
+                    repo_id=str(raw["repository_id"]),
+                    image_ref=str(raw["image_ref"]),
+                    template_fingerprint=str(raw["template_fingerprint"]),
                 )
+                image = self.host.docker_inspect_ephemeral_image(
+                    image_target
+                )
+                if not isinstance(image, Mapping):
+                    raise TestStoreConflict("sealed fixture image cache is unobservable")
                 if image.get("cached") is not True:
-                    raise TestStoreConflict("sealed fixture image is not cached")
+                    prefetch = getattr(self.host, "docker_prefetch_ephemeral_image", None)
+                    if not callable(prefetch):
+                        raise TestStoreConflict(
+                            "sealed fixture image prefetch is unavailable"
+                        )
+                    image = prefetch(image_target)
+                    if not isinstance(image, Mapping):
+                        raise TestStoreConflict(
+                            "sealed fixture image cache is unobservable"
+                        )
+                proof = {
+                    key: image.get(key)
+                    for key in (
+                        "cached",
+                        "image_ref",
+                        "image_id",
+                        "repo_digest",
+                        "os",
+                        "architecture",
+                    )
+                }
+                try:
+                    _normalize_ephemeral_image_cache_proof(
+                        proof, target=image_target
+                    )
+                except BrokerError as error:
+                    raise TestStoreConflict(error.message) from error
                 secret_mount = None
                 if raw.get("secret_policy") is not None:
                     from .ephemeral_secrets import EphemeralSecretPolicy

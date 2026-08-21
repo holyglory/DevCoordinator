@@ -1503,7 +1503,30 @@ class TestdEngine:
         running: list[str] = []
         completed: list[str] = []
         failed: list[dict[str, str]] = []
-        for attempt_id, active in tuple(self._active.items()):
+        active_items = tuple(self._active.items())
+        if len(active_items) > 1:
+            # Native observations are deliberately serial at the authority
+            # boundary. Protect the entire retained fanout before the first
+            # potentially slow status call so later healthy attempts cannot
+            # lose a short lease merely because earlier observations consumed
+            # the pass. Each successful running observation below restores its
+            # ordinary short lease; persistent observation failure therefore
+            # remains bounded by MAX_LEASE_SECONDS.
+            fanout_lease_seconds = min(
+                MAX_LEASE_SECONDS,
+                self.lease_seconds * (len(active_items) + 1),
+            )
+            # The first attempt is observed immediately and must not be
+            # renewed if that observation fails. Only attempts waiting behind
+            # earlier serial calls receive fanout protection.
+            for _attempt_id, waiting in active_items[1:]:
+                self.store.heartbeat_attempt(
+                    waiting.lease.attempt_id,
+                    generation=waiting.lease.generation,
+                    lease_seconds=fanout_lease_seconds,
+                    operation_id=str(uuid.uuid4()),
+                )
+        for attempt_id, active in active_items:
             try:
                 self._acknowledge_active(active)
                 run = self.store.get_run(active.candidate.run_id)

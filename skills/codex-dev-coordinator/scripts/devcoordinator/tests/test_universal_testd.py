@@ -803,6 +803,21 @@ class TestdEngineTests(EngineFixture):
         self.assertEqual(cancelled["unresolved_attempt_ids"], [])
         self.assertEqual(self.store.get_run(submitted.run_id)["state"], "cancelled")
 
+    def test_single_heartbeat_does_not_preemptively_extend_observation(self) -> None:
+        self.submit_live()
+        self.engine.schedule(launch_batch=1)
+        with mock.patch.object(
+            self.engine,
+            "_renew_active_leases",
+            wraps=self.engine._renew_active_leases,
+        ) as renew:
+            heartbeat = self.engine.heartbeat()
+
+        self.assertEqual(heartbeat["running_attempt_ids"], [
+            self.launcher.requests[0].ticket.attempt_id
+        ])
+        renew.assert_not_called()
+
     def test_cancel_terminal_envelope_is_stable_while_store_replay_fails(self) -> None:
         submitted = self.submit_live()
         self.engine.schedule(launch_batch=1)

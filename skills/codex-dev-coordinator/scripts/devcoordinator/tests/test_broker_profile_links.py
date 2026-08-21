@@ -2504,6 +2504,18 @@ class BrokerProfileTrustTests(unittest.TestCase):
                 broker_profile_module.TEST_SETUP_READ_CLIENT_TIMEOUT_SECONDS,
             ),
             (BrokerOperation.TEST_RUN_SUBMIT, 60.0),
+            (
+                BrokerOperation.TEST_RUN_STATUS,
+                broker_profile_module.TEST_RUN_READ_CLIENT_TIMEOUT_SECONDS,
+            ),
+            (
+                BrokerOperation.TEST_RUN_FAILURES,
+                broker_profile_module.TEST_RUN_READ_CLIENT_TIMEOUT_SECONDS,
+            ),
+            (
+                BrokerOperation.TEST_ARTIFACT_RESOLVE,
+                broker_profile_module.TEST_RUN_READ_CLIENT_TIMEOUT_SECONDS,
+            ),
             (BrokerOperation.REPOSITORY_REMOVE, 60.0),
             (
                 BrokerOperation.REPOSITORY_APPROVE_COMPOSE_HOST_ACCESS,
@@ -2579,6 +2591,15 @@ class BrokerProfileTrustTests(unittest.TestCase):
                                 "actor": "timeout-test",
                             }
                             if operation == BrokerOperation.TEST_RUN_SUBMIT
+                            else {"run_id": "run-timeout"}
+                            if operation == BrokerOperation.TEST_RUN_STATUS
+                            else {"run_id": "run-timeout", "limit": 25}
+                            if operation == BrokerOperation.TEST_RUN_FAILURES
+                            else {
+                                "run_id": "run-timeout",
+                                "artifact_id": "artifact-" + "a" * 32,
+                            }
+                            if operation == BrokerOperation.TEST_ARTIFACT_RESOLVE
                             else {"database_name": "app"}
                             if operation == BrokerOperation.DATABASE_BACKUP
                             else (

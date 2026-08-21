@@ -1698,6 +1698,40 @@ class UniversalTestAttemptChainSecurityTests(unittest.TestCase):
             {"runtime_id": runtime_id, "cancelled": True, "absent": True},
         )
 
+    def test_exact_never_launched_terminal_attempt_collects_as_absent(self) -> None:
+        attempt_id = "attempt-terminal-before-launch"
+        runtime_id = "devcoordinator-test-" + hashlib.sha256(
+            attempt_id.encode("utf-8")
+        ).hexdigest()[:32]
+
+        class AbsentNative(_FakeNativeManager):
+            def recover_descriptor(self, _runtime_id: str) -> TestAttemptDescriptor:
+                raise TestAttemptRuntimeNotFound("launch evidence is absent")
+
+            def status(self, observed_runtime_id: str) -> NativeTestAttemptState:
+                return NativeTestAttemptState(
+                    runtime_id=observed_runtime_id,
+                    loaded=False,
+                    active=False,
+                    state="not-found",
+                    exit_status=None,
+                )
+
+            def collect(self, _runtime_id: str) -> None:
+                raise AssertionError("an absent native runtime must not be collected")
+
+        coordinator = BrokerTestAttemptCoordinator(AbsentNative())
+
+        self.assertEqual(
+            coordinator.collect(
+                runtime_id,
+                expected_attempt_id=attempt_id,
+                expected_repository_id="repo-terminal-before-launch",
+                expected_repository_generation=4,
+            ),
+            {"runtime_id": runtime_id, "collected": True},
+        )
+
     def test_generic_descriptor_failure_never_proves_runtime_cleanup(self) -> None:
         attempt_id = "attempt-damaged-evidence"
         runtime_id = "devcoordinator-test-" + hashlib.sha256(

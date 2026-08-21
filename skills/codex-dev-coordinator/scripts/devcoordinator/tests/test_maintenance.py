@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import json
+import importlib.util
+import io
 import os
 from pathlib import Path
+from contextlib import redirect_stdout
 import socket
 import tempfile
 import time
@@ -69,6 +72,29 @@ class MaintenanceTests(unittest.TestCase):
             "retry_after_seconds": 30,
             "started_at": "2026-07-26T19:00:00Z",
         }
+
+    def test_packaged_status_uses_current_read_only_loader_signature(self) -> None:
+        helper_path = (
+            Path(__file__).resolve().parents[5]
+            / "scripts/manage_maintenance_mode.py"
+        )
+        specification = importlib.util.spec_from_file_location(
+            "manage_maintenance_mode_test", helper_path
+        )
+        assert specification is not None and specification.loader is not None
+        helper = importlib.util.module_from_spec(specification)
+        specification.loader.exec_module(helper)
+        output = io.StringIO()
+        with mock.patch.object(helper, "_identity", return_value=(0, 0)), mock.patch.object(
+            helper, "load_maintenance_state", return_value=None
+        ) as load, redirect_stdout(output):
+            self.assertEqual(helper.main(["status"]), 0)
+
+        load.assert_called_once_with()
+        self.assertEqual(
+            json.loads(output.getvalue()),
+            {"active": False, "changed": False, "ok": True},
+        )
 
     def _request(self, operation: BrokerOperation) -> BrokerRequest:
         run_id = str(uuid.uuid4())

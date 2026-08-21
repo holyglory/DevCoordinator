@@ -4858,11 +4858,42 @@ class BrokerTestAttemptCoordinator:
         """Stop and remove one measured runtime after testd commits terminal state."""
 
         runtime_id = _safe_id("runtime_id", runtime_id)
-        descriptor = self.runtime_descriptor(runtime_id)
+        expected_attempt_id = _safe_id("expected_attempt_id", expected_attempt_id)
+        expected_repository_id = _safe_id(
+            "expected_repository_id", expected_repository_id
+        )
         if (
-            descriptor.attempt_id != _safe_id("expected_attempt_id", expected_attempt_id)
-            or descriptor.repository_id
-            != _safe_id("expected_repository_id", expected_repository_id)
+            type(expected_repository_generation) is not int
+            or expected_repository_generation < 0
+        ):
+            raise TestStoreContractError(
+                "expected_repository_generation must be non-negative"
+            )
+        if runtime_id != _runtime_id_for_attempt(expected_attempt_id):
+            raise TestStoreConflict(
+                "test attempt collection runtime identity is contradictory"
+            )
+        try:
+            descriptor = self.runtime_descriptor(runtime_id)
+        except TestAttemptRuntimeNotFound:
+            # A terminal attempt may fail before launch evidence exists. Once
+            # its deterministic runtime is freshly proven absent, collection
+            # is complete and must not block supervision of unrelated work.
+            state = self._require_exact_native_state(
+                runtime_id, self.manager.status(runtime_id)
+            )
+            if state.loaded or state.active or state.result_document is not None:
+                raise TestStoreConflict(
+                    "test attempt collection native state contradicts absent launch evidence"
+                )
+            ticket_id = self._runtimes.pop(runtime_id, None)
+            if ticket_id is not None:
+                self._tickets.pop(ticket_id, None)
+            self._recovered_runtimes.pop(runtime_id, None)
+            return {"runtime_id": runtime_id, "collected": True}
+        if (
+            descriptor.attempt_id != expected_attempt_id
+            or descriptor.repository_id != expected_repository_id
             or descriptor.repository_generation != expected_repository_generation
         ):
             raise TestStoreConflict("test attempt collection identity is contradictory")

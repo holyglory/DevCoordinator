@@ -413,6 +413,16 @@ def apply_publication(
         expected_uid=service_uid,
     )
     _require_plan_confirmation(manifest, confirmation_fingerprint)
+    publication_status = manifest.get("status")
+    if publication_status not in {
+        "planned",
+        "build_failed",
+        "build_outcome_uncertain",
+        "built",
+        "rolling_out",
+        "rollout_pending",
+    }:
+        raise ImagePublicationError("publication is not in a buildable or resumable state")
     material = _require_plan_current(
         manifest,
         specification,
@@ -421,14 +431,6 @@ def apply_publication(
         compose_configuration_verifier=compose_configuration_verifier,
         now=now,
     )
-    publication_status = manifest.get("status")
-    if publication_status not in {
-        "planned",
-        "build_failed",
-        "build_outcome_uncertain",
-        "built",
-    }:
-        raise ImagePublicationError("publication is not in a buildable state")
 
     run_docker = docker_runner or _run_docker
     environment = _docker_environment()
@@ -436,7 +438,7 @@ def apply_publication(
     _require_real_directory(snapshot_directory)
     _require_snapshot_integrity(manifest, snapshot_directory, specification)
 
-    if publication_status == "built":
+    if publication_status in {"built", "rolling_out", "rollout_pending"}:
         retained_image = manifest.get("image")
         retained_package = manifest.get("runtime_package")
         if not isinstance(retained_image, Mapping) or not isinstance(
@@ -968,6 +970,12 @@ def build_command_for(
 def publication_summary(manifest: Mapping[str, Any], *, artifact_directory: Path) -> dict[str, Any]:
     """Return useful evidence without exposing environment payloads or build logs."""
 
+    status = manifest.get("status")
+    reconciliation_action = (
+        "apply"
+        if status in {"built", "rolling_out", "rollout_pending"}
+        else None
+    )
     return {
         "operation_id": manifest.get("operation_id"),
         "status": manifest.get("status"),
@@ -979,6 +987,7 @@ def publication_summary(manifest: Mapping[str, Any], *, artifact_directory: Path
         "artifact_directory": str(artifact_directory),
         "runtime_verification": manifest.get("runtime_verification"),
         "rollback": manifest.get("rollback"),
+        "reconciliation_action": reconciliation_action,
     }
 
 
@@ -1548,9 +1557,20 @@ def _require_plan_current(
         renderer=compose_renderer,
         compose_configuration_verifier=compose_configuration_verifier,
     )
-    planned_previous = manifest.get("previous_image_id")
-    current_previous = docker_image_id(specification.image, required=False)
-    if planned_previous != current_previous:
+    current_image = docker_image_id(specification.image, required=False)
+    publication_status = manifest.get("status")
+    if publication_status in {"built", "rolling_out", "rollout_pending"}:
+        retained_image = manifest.get("image")
+        expected_image = (
+            retained_image.get("image_id")
+            if isinstance(retained_image, Mapping)
+            else None
+        )
+        if not isinstance(expected_image, str) or current_image != expected_image:
+            raise ImagePublicationError(
+                "built publication image tag changed before rollout reconciliation"
+            )
+    elif manifest.get("previous_image_id") != current_image:
         raise ImagePublicationError("publication image tag changed since the plan was created")
     return material
 

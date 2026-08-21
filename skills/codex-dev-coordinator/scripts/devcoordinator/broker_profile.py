@@ -53,6 +53,7 @@ HOST_OBSERVE_CLIENT_TIMEOUT_SECONDS = 11 * 60.0
 INVENTORY_READ_CLIENT_TIMEOUT_SECONDS = 60.0
 TEST_CATALOG_READ_CLIENT_TIMEOUT_SECONDS = 60.0
 TEST_SETUP_READ_CLIENT_TIMEOUT_SECONDS = 60.0
+TEST_RUN_READ_CLIENT_TIMEOUT_SECONDS = 60.0
 TEST_WAIT_RESPONSE_MARGIN_SECONDS = 1.0
 _TRANSIENT_TEST_WAIT_CODES = frozenset(
     {
@@ -1225,6 +1226,16 @@ def _broker_client_timeout_seconds(
         return TEST_CATALOG_READ_CLIENT_TIMEOUT_SECONDS
     if operation is BrokerOperation.TEST_REPOSITORY_SETUP:
         return TEST_SETUP_READ_CLIENT_TIMEOUT_SECONDS
+    if operation in {
+        BrokerOperation.TEST_RUN_STATUS,
+        BrokerOperation.TEST_RUN_SUMMARY,
+        BrokerOperation.TEST_RUN_FAILURES,
+        BrokerOperation.TEST_RUN_ARTIFACTS,
+        BrokerOperation.TEST_ARTIFACT_RESOLVE,
+        BrokerOperation.TEST_RUN_CASES,
+        BrokerOperation.TEST_EVENTS_READ,
+    }:
+        return TEST_RUN_READ_CLIENT_TIMEOUT_SECONDS
     if operation is BrokerOperation.TEST_RUN_SUBMIT:
         # Submission is logically short but can contend with post-restart
         # snapshot/test-store recovery. Preserve its durable run handle rather
