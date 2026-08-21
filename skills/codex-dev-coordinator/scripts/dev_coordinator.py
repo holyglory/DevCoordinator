@@ -20282,7 +20282,6 @@ def handle_cli(args: argparse.Namespace) -> Any:
             args,
             canonical_project=canonical_project,
             broker_profile_loader=configured_broker_profile,
-            statistics_reader=coordinated_test_statistics_read,
         )
     if args.group == "observe":
         return coordinated_observe_host(namespace_to_options(args))

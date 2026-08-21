@@ -137,7 +137,7 @@ class AgentMcpProtocolTests(unittest.TestCase):
         listed = session.handle(
             {"jsonrpc": "2.0", "id": 4, "method": "tools/list"}
         )
-        self.assertEqual(len(listed["result"]["tools"]), 11)
+        self.assertEqual(len(listed["result"]["tools"]), 13)
 
     def test_stdio_emits_only_one_finite_json_rpc_line_per_response(self) -> None:
         input_stream = io.BytesIO(
@@ -197,6 +197,8 @@ class AgentMcpToolTests(unittest.TestCase):
                 "test_enqueue",
                 "test_submit",
                 "test_follow",
+                "test_cancel",
+                "test_artifact",
                 "bug_report",
                 "bug_list",
                 "bug_close",
@@ -218,6 +220,7 @@ class AgentMcpToolTests(unittest.TestCase):
             "runtime_status",
             "operation_follow",
             "test_follow",
+            "test_artifact",
             "bug_list",
         ):
             annotations = tools[name]["annotations"]
@@ -237,6 +240,16 @@ class AgentMcpToolTests(unittest.TestCase):
             self.assertFalse(tools[name]["annotations"]["readOnlyHint"])
             self.assertFalse(tools[name]["annotations"]["destructiveHint"])
             self.assertFalse(tools[name]["annotations"]["idempotentHint"])
+        self.assertEqual(
+            tools["test_cancel"]["annotations"],
+            {
+                "readOnlyHint": False,
+                "destructiveHint": True,
+                "idempotentHint": True,
+                "openWorldHint": False,
+            },
+        )
+        self.assertNotIn("test_artifact_export", tools)
         self.assertEqual(
             tools["bug_close"]["annotations"],
             {
@@ -314,6 +327,63 @@ class AgentMcpToolTests(unittest.TestCase):
                 "test_submit",
                 {"plan": "dc1:plan:plan-1", "operation_id": operation_id},
             )
+        self.assertEqual(result["structuredContent"]["operation_id"], operation_id)
+
+    def test_test_cancel_and_artifact_use_exact_stable_argv(self) -> None:
+        operation_id = "00000000-0000-4000-8000-000000000001"
+        self.assertEqual(
+            agent_mcp._argv_for_tool(
+                "test_cancel",
+                {
+                    "run": "dc1:run:run-1",
+                    "reason": "superseded",
+                    "operation_id": operation_id,
+                },
+            ),
+            [
+                "test",
+                "cancel",
+                "dc1:run:run-1",
+                "--reason",
+                "superseded",
+                "--operation-id",
+                operation_id,
+            ],
+        )
+        self.assertEqual(
+            agent_mcp._argv_for_tool(
+                "test_artifact",
+                {
+                    "run": "dc1:run:run-1",
+                    "artifact": "dc1:artifact:artifact-1",
+                },
+            ),
+            [
+                "test",
+                "artifact",
+                "dc1:run:run-1",
+                "dc1:artifact:artifact-1",
+            ],
+        )
+
+    def test_test_cancel_generates_mutation_uuid_before_execute(self) -> None:
+        captured = {}
+
+        def execute(namespace):
+            captured["namespace"] = namespace
+            return {
+                "schema_version": 1,
+                "ok": True,
+                "operation_id": namespace.operation_id,
+            }
+
+        with mock.patch.object(agent_cli, "_execute", side_effect=execute):
+            result = agent_mcp._call_tool(
+                "test_cancel",
+                {"run": "dc1:run:run-1", "reason": "superseded"},
+            )
+        operation_id = captured["namespace"].operation_id
+        self.assertEqual(str(uuid.UUID(operation_id)), operation_id)
         self.assertEqual(result["structuredContent"]["operation_id"], operation_id)
 
     def test_operation_follow_uses_exact_stable_parser_form(self) -> None:
