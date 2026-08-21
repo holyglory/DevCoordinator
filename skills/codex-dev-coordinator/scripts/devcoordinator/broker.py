@@ -49,6 +49,11 @@ from .maintenance import (
     PUBLIC_MAINTENANCE_MESSAGE,
     load_maintenance_state,
 )
+from .server_credentials import (
+    ServerCredentialError,
+    secret_argument_sequence,
+    secret_environment_literal,
+)
 
 PROTOCOL_VERSION = 1
 # Inventory is a bounded whole-host graph.  Keep the local protocol bounded,
@@ -3153,6 +3158,20 @@ def _validate_arguments(
                     "argv must be a bounded non-empty array of NUL-free strings.",
                     operation_id=operation_id,
                 )
+            try:
+                credential_argument = secret_argument_sequence(argv)
+            except ServerCredentialError as error:
+                raise BrokerError(
+                    "invalid_arguments",
+                    "argv contains an invalid persistent-server argument.",
+                    operation_id=operation_id,
+                ) from error
+            if credential_argument:
+                raise BrokerError(
+                    "invalid_arguments",
+                    "Persistent server credentials must not appear in command arguments.",
+                    operation_id=operation_id,
+                )
             environment = value["environment"]
             if (
                 not isinstance(environment, dict)
@@ -3177,6 +3196,24 @@ def _validate_arguments(
                 raise BrokerError(
                     "invalid_arguments",
                     "environment must be a bounded NUL-free string map.",
+                    operation_id=operation_id,
+                )
+            try:
+                credential_literal = any(
+                    secret_environment_literal(key, item)
+                    for key, item in environment.items()
+                )
+            except ServerCredentialError as error:
+                raise BrokerError(
+                    "invalid_arguments",
+                    "environment contains an invalid environment name.",
+                    operation_id=operation_id,
+                ) from error
+            if credential_literal:
+                raise BrokerError(
+                    "invalid_arguments",
+                    "Persistent server credentials must use the dedicated sealed "
+                    "credential transport, not a literal environment value.",
                     operation_id=operation_id,
                 )
             cwd = _bounded_single_line_argument(
@@ -3224,6 +3261,20 @@ def _validate_arguments(
                 raise BrokerError(
                     "invalid_arguments",
                     "argv must be a bounded non-empty array of NUL-free strings.",
+                    operation_id=operation_id,
+                )
+            try:
+                credential_argument = secret_argument_sequence(argv)
+            except ServerCredentialError as error:
+                raise BrokerError(
+                    "invalid_arguments",
+                    "argv contains an invalid temporary-service argument.",
+                    operation_id=operation_id,
+                ) from error
+            if credential_argument:
+                raise BrokerError(
+                    "invalid_arguments",
+                    "Temporary service credentials must not appear in command arguments.",
                     operation_id=operation_id,
                 )
             shell = str(argv[0]).rsplit("/", 1)[-1]

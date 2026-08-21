@@ -46,6 +46,8 @@ from .server_credentials import (
     MAX_SERVER_CREDENTIAL_BYTES,
     SERVER_CREDENTIAL_FILE_SUFFIX,
     ServerCredentialError,
+    secret_argument_literal,
+    secret_argument_sequence,
     secret_environment_literal,
     server_credential_id,
     staged_material_path,
@@ -724,6 +726,31 @@ def _copy_server_environment(
         evidence,
         affected,
     )
+
+
+def _validate_server_descriptor_literals(source: sqlite3.Connection) -> None:
+    arguments: dict[str, list[str]] = {}
+    for row in source.execute(
+        "SELECT server_definition_id,argument FROM server_command_arguments "
+        "ORDER BY server_definition_id,ordinal"
+    ):
+        arguments.setdefault(str(row[0]), []).append(str(row[1]))
+    try:
+        for server_id, argv in arguments.items():
+            if secret_argument_sequence(argv):
+                raise RetainedControlError(
+                    f"server {server_id!r} command contains literal credential transport"
+                )
+        for row in source.execute(
+            "SELECT server_definition_id,health_url_template FROM server_definitions "
+            "WHERE health_url_template IS NOT NULL ORDER BY server_definition_id"
+        ):
+            if secret_argument_literal(str(row[1])):
+                raise RetainedControlError(
+                    f"server {str(row[0])!r} health URL contains literal credential transport"
+                )
+    except ServerCredentialError as error:
+        raise RetainedControlError("server descriptor credential check failed") from error
 
 
 def _credentialized_server_fingerprint(
@@ -1577,6 +1604,7 @@ def prepare_rebaseline(
         unknown = sorted(source_table_names - _known_source_tables())
         if unknown:
             raise RetainedControlError("source authority has unknown collections: " + ", ".join(unknown))
+        _validate_server_descriptor_literals(source)
 
         target.execute("PRAGMA foreign_keys=ON")
         target.execute("PRAGMA synchronous=FULL")
@@ -1744,6 +1772,43 @@ def parser() -> argparse.ArgumentParser:
     return result
 
 
+def public_rebaseline_result(result: Mapping[str, Any]) -> dict[str, Any]:
+    """Project private staged evidence into a bounded non-secret CLI summary."""
+
+    source = result.get("source")
+    target = result.get("target")
+    retained = result.get("retained_collections")
+    console_counts = result.get("console_counts")
+    credentials = result.get("server_credentials")
+    if (
+        not isinstance(source, Mapping)
+        or not isinstance(target, Mapping)
+        or not isinstance(retained, Mapping)
+        or not isinstance(console_counts, Mapping)
+        or not isinstance(credentials, list)
+    ):
+        raise RetainedControlError("retained-control public result is invalid")
+    return {
+        "ok": True,
+        "kind": KIND,
+        "schema_version": VERSION,
+        "source_schema_version": source.get("schema_version"),
+        "target_schema_version": target.get("schema_version"),
+        "target_database_generation": target.get("database_generation"),
+        "retained_collections": {
+            str(name): int(count)
+            for name, count in sorted(retained.items())
+            if type(count) is int and int(count) >= 0
+        },
+        "server_credential_count": len(credentials),
+        "console_counts": {
+            str(name): int(count)
+            for name, count in sorted(console_counts.items())
+            if type(count) is int and int(count) >= 0
+        },
+    }
+
+
 def main(argv: list[str] | None = None) -> int:
     arguments = parser().parse_args(argv)
     try:
@@ -1758,7 +1823,7 @@ def main(argv: list[str] | None = None) -> int:
     except (OSError, sqlite3.Error, RetainedControlError, ValueError) as error:
         print(json.dumps({"ok": False, "error": str(error)}, sort_keys=True), file=sys.stderr)
         return 1
-    print(json.dumps({"ok": True, **result}, sort_keys=True))
+    print(json.dumps(public_rebaseline_result(result), sort_keys=True))
     return 0
 
 

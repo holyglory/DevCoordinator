@@ -51,6 +51,18 @@ work are disposable.
   reobserves current host resources. Terminal operations, observations,
   tombstones, cleanup history, test data, and legacy migration records are not
   retained across that rebuild.
+- A legacy managed-server environment value that is credential-bearing is
+  converted at that stopped-service boundary into an opaque schema-16 binding
+  plus one exact root-owned material file outside SQLite. The switch publishes
+  or rolls back the database, binding, and material together. The fixed worker
+  unit receives only its bound material through systemd `LoadCredential`; the
+  runner injects it only into the child process and uses it only in memory for
+  output redaction. Ordinary repository declarations and runtime replacement
+  requests cannot submit literal credentials in environment values, command
+  arguments, or health URLs. Credential-free connection and health URLs remain
+  ordinary configuration. Exact credential hashes and backup identities stay
+  inside the root-private replay transaction; installed switch commands return
+  only a bounded public summary.
 - The steady-state service boundary remains public edge, unprivileged
   Console/API application, root host authority, unprivileged test scheduler,
   and transient non-root repository/test units. One-time handoff and duplicate
@@ -88,5 +100,7 @@ Static contracts reject retired modules, binaries, units, operations, manifest
 fields, tables, and documentation. Focused tests cover fresh-state launch,
 dependency scheduling, timeout, cancellation, artifact validation, daemon
 restart cleanup, retained-control export/import, current-format activation,
-health, and rollback. Final readiness requires the complete repository-owned
-software delivery workflow and installed browser/client acceptance.
+health, exact persistent-server credential delivery, missing or changed
+material, partial credential publication, and rollback. Final readiness
+requires the complete repository-owned software delivery workflow and installed
+browser/client acceptance.

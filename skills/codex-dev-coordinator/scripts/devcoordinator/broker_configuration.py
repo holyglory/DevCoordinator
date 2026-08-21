@@ -54,6 +54,13 @@ from .observation_freshness import (
     require_exact_fresh_observation,
 )
 from .repository_lifecycle import LifecycleError, RepositoryLifecycle, ResourceKind
+from .server_credentials import (
+    ServerCredentialError,
+    secret_argument_literal,
+    secret_argument_sequence,
+    secret_environment_literal,
+    validate_server_credential_bindings,
+)
 from .sqlite_lifecycle import SQLiteLifecyclePersistence
 from .store import (
     AccountStore,
@@ -81,6 +88,45 @@ class DeclaredComposeConfigurationError(RuntimeError):
 
 class DeclaredRuntimeConfigurationError(RuntimeError):
     """One repository-owned runtime manifest could not be cataloged."""
+
+
+def _require_nonsecret_server_descriptor(
+    argv: Sequence[str], health_url: object,
+) -> None:
+    try:
+        if secret_argument_sequence(argv):
+            raise ValueError(
+                "persistent server credentials must not appear in command arguments"
+            )
+        if health_url is not None:
+            if not isinstance(health_url, str):
+                raise ValueError("server health_url must be text when provided")
+            if secret_argument_literal(health_url):
+                raise ValueError(
+                    "persistent server credentials must not appear in health URLs"
+                )
+    except ServerCredentialError as error:
+        raise ValueError("persistent server descriptor is invalid") from error
+
+
+def _server_credential_binding_documents(
+    connection: sqlite3.Connection, server_definition_id: str
+) -> list[dict[str, str]]:
+    values = [
+        {"name": str(row[0]), "credential_id": str(row[1])}
+        for row in connection.execute(
+            "SELECT name,credential_id FROM server_environment_credentials "
+            "WHERE server_definition_id=? ORDER BY name",
+            (server_definition_id,),
+        )
+    ]
+    try:
+        bindings = validate_server_credential_bindings(
+            server_definition_id, values
+        )
+    except ServerCredentialError as error:
+        raise ValueError("persistent server credential bindings are invalid") from error
+    return [binding.to_document() for binding in bindings]
 
 
 def _runtime_manifest_document(root: Path) -> Mapping[str, Any] | None:
@@ -198,6 +244,12 @@ def declared_servers_from_runtime_manifest(root: Path) -> tuple[dict[str, Any], 
             raise DeclaredRuntimeConfigurationError(
                 f"server {name!r} requires bounded structured argv"
             )
+        try:
+            _require_nonsecret_server_descriptor(argv_raw, raw.get("health_url"))
+        except ValueError as error:
+            raise DeclaredRuntimeConfigurationError(
+                f"server {name!r} contains a literal credential"
+            ) from error
         port = raw.get("port")
         if port is not None and (
             isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535
@@ -682,12 +734,22 @@ def _synchronize_server_definitions(
                 f"configured server cwd escapes canonical repository: {cwd}"
             )
         environment = _bounded_server_environment(raw.get("env"))
+        argv = raw.get("argv")
+        if argv is None and isinstance(raw.get("cmd"), str):
+            try:
+                argv = shlex.split(str(raw["cmd"]))
+            except ValueError as error:
+                raise ValueError(f"configured server {name!r} command is invalid") from error
+        if not isinstance(argv, (list, tuple)):
+            raise ValueError(f"configured server {name!r} requires structured argv")
+        _require_nonsecret_server_descriptor(argv, raw.get("health_url"))
         specifications.append(
             {
                 "raw": raw,
                 "name": name,
                 "cwd": str(cwd),
                 "environment": environment,
+                "argv": list(argv),
             }
         )
 
@@ -740,15 +802,17 @@ def _synchronize_server_definitions(
             raise RuntimeError(
                 "derived server identity conflicts with another persisted definition"
             )
+        credential_bindings = _server_credential_binding_documents(
+            connection, server_id
+        )
         definition = {
-            "repo_id": repo_id,
             "name": name,
-            "role": raw.get("role"),
+            "role": str(raw.get("role") or ""),
             "cwd": item["cwd"],
-            "cmd": raw.get("cmd"),
-            "argv": raw.get("argv"),
+            "argv": item["argv"],
+            "environment": item["environment"],
+            "credential_bindings": credential_bindings,
             "health_url": raw.get("health_url"),
-            "env": item["environment"],
         }
         definition_fingerprint = "sha256:" + fingerprint(definition)
         current = connection.execute(
@@ -796,12 +860,8 @@ def _synchronize_server_definitions(
             "DELETE FROM server_command_arguments WHERE server_definition_id = ?",
             (server_id,),
         )
-        argv = raw.get("argv")
-        if (
-            isinstance(argv, list)
-            and argv
-            and all(isinstance(argument, str) for argument in argv)
-        ):
+        argv = item["argv"]
+        if argv:
             connection.executemany(
                 """
                 INSERT INTO server_command_arguments(
@@ -829,6 +889,12 @@ def _synchronize_server_definitions(
                     for key, value in item["environment"].items()
                 ],
             )
+        connection.execute(
+            "UPDATE startup_policies SET immutable_fingerprint=?, "
+            "generation=generation+1,updated_at=? "
+            "WHERE resource_kind='server' AND resource_id=?",
+            (definition_fingerprint, now, server_id),
+        )
         server_ids[name] = server_id
     return server_ids
 
@@ -948,6 +1014,15 @@ def _bounded_server_environment(value: Any) -> dict[str, str]:
             or len(item.encode("utf-8")) > _MAX_SERVER_ENVIRONMENT_VALUE_BYTES
         ):
             raise ValueError("server env must be a bounded NUL-free string map")
+        try:
+            credential_literal = secret_environment_literal(name, item)
+        except ServerCredentialError as error:
+            raise ValueError("server env must use valid environment names") from error
+        if credential_literal:
+            raise ValueError(
+                "persistent server credentials must use the dedicated sealed "
+                "credential transport, not a literal environment value"
+            )
         total_bytes += len(name.encode("utf-8")) + len(item.encode("utf-8"))
         environment[name] = item
     if total_bytes > _MAX_SERVER_ENVIRONMENT_BYTES:

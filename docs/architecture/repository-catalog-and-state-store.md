@@ -53,15 +53,19 @@ or deny access to a local caller.
 
 Schema 16 is the trusted-local model. It contains repositories, direct resource
 associations, runtime definitions and observations, leases and port
-assignments, operations, tests, cleanup state, and evidence. It does not contain
-repository membership, control-binding, local ACL/grant, owner-transfer,
-client-enrollment, or group-policy tables.
+assignments, non-secret persistent-server credential bindings, operations,
+tests, cleanup state, and evidence. Credential material is not a database
+collection. The schema does not contain repository membership, control-binding,
+local ACL/grant, owner-transfer, client-enrollment, or group-policy tables.
 
 There is no migration chain or legacy importer. The one reviewed schema-15
 boundary rebuilds a fresh schema-16 authority from an exact retained-control
 allowlist while writers are stopped, advances mutable control generations, and
 discards operations, observations, tests, request history, and retired migration
-state. Fresh databases are created directly at schema 16.
+state. A credential-bearing legacy server environment entry becomes an opaque
+binding and an exact root-owned material file outside SQLite; database/profile,
+material publication, and rollback are one replayable transaction. Fresh
+databases are created directly at schema 16.
 
 ## Inventory contract
 
@@ -83,3 +87,16 @@ secret transport, non-loopback exposure, and destructive-data confirmation
 remain governed by their own requirements. See
 [`security-assumptions.md`](../../security-assumptions.md) and
 [`single-developer-local-trust.md`](single-developer-local-trust.md).
+
+Persistent managed-server launch candidates contain only ordered environment
+name/credential identifiers. The root manager validates the exact private
+material and supplies it to that server's fixed non-root systemd unit with
+`LoadCredential`. The runner never returns the value or includes it in a
+descriptor, fingerprint, database, profile, journal, or result; it reads the
+unit-private credential only at child launch and keeps the value in memory for
+child environment injection and log redaction. Missing, extra, substituted, or
+unsafe material fails before repository code starts. Literal secret-shaped
+environment values, command arguments, and health URLs are rejected at
+repository configuration, direct lifecycle, and runtime replacement boundaries.
+The replay transaction may retain exact hashes beside the root-readable material
+for crash recovery, but CLI and delivery output expose only counts and status.

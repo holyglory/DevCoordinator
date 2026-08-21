@@ -904,6 +904,77 @@ class RetainedControlTests(unittest.TestCase):
         self.assertEqual(recovered["target"]["database_generation"], "recovered-generation")
         self.assertTrue((partial / "retained-control.json").is_file())
 
+    def test_public_result_excludes_private_credential_evidence(self) -> None:
+        private = {
+            "source": {"schema_version": 15, "database": {"sha256": "a" * 64}},
+            "target": {
+                "schema_version": 16,
+                "database_generation": "target-generation",
+                "database": {"path": "/private/authority.sqlite3"},
+            },
+            "retained_collections": {"repositories": 1},
+            "console_counts": {"routes": 1},
+            "server_credentials": [
+                {
+                    "credential_id": str(uuid.uuid4()),
+                    "material": {
+                        "path": "/private/credential",
+                        "sha256": "f" * 64,
+                    },
+                }
+            ],
+            "document_sha256": "e" * 64,
+        }
+        public = retained_control.public_rebaseline_result(private)
+        encoded = json.dumps(public, sort_keys=True)
+        self.assertEqual(public["server_credential_count"], 1)
+        for forbidden in ("/private", "sha256", "credential_id", "material"):
+            self.assertNotIn(forbidden, encoded)
+
+    def test_server_descriptor_literal_credentials_are_rejected_without_echo(self) -> None:
+        secret = "synthetic-descriptor-secret"
+        mutations = (
+            (
+                "INSERT INTO server_command_arguments VALUES ('server-2',0,'--password'); "
+                "INSERT INTO server_command_arguments VALUES ('server-2',1,'"
+                + secret
+                + "')",
+                "command contains literal credential",
+            ),
+            (
+                "UPDATE server_definitions SET health_url_template="
+                "'https://worker:"
+                + secret
+                + "@health.invalid/status' WHERE server_definition_id='server-2'",
+                "health URL contains literal credential",
+            ),
+        )
+        for index, (script, message) in enumerate(mutations):
+            with self.subTest(message=message):
+                self.tearDown()
+                self.setUp()
+                connection = sqlite3.connect(self.database)
+                connection.executescript(script)
+                connection.commit()
+                connection.close()
+                with self.assertRaisesRegex(
+                    retained_control.RetainedControlError, message
+                ) as raised:
+                    self._prepare(f"descriptor-secret-{index}")
+                self.assertNotIn(secret, str(raised.exception))
+
+        self.tearDown()
+        self.setUp()
+        connection = sqlite3.connect(self.database)
+        connection.execute(
+            "UPDATE server_definitions SET health_url_template=? "
+            "WHERE server_definition_id='server-2'",
+            ("https://health.invalid/status?mode=ready",),
+        )
+        connection.commit()
+        connection.close()
+        self.assertEqual(self._prepare("safe-descriptor")["server_credentials"], [])
+
 
 if __name__ == "__main__":
     unittest.main()

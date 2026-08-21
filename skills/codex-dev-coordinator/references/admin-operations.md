@@ -78,6 +78,18 @@ incompatible DevCoordinator release uses a fresh Test Store while preserving
 retained authority control data, Console/user settings, repository source,
 project databases, credentials, and recoverable backups.
 
+For the one reviewed schema-15 to schema-16 authority rebuild, a
+credential-bearing managed-server environment value is preserved only through
+its dedicated server-owned material transport. SQLite retains an opaque binding,
+not the value. The release transaction publishes and rolls back the exact
+root-owned material with the authority, and the fixed worker receives it only
+through systemd `LoadCredential`. Never put a credential literal in
+`.codex/dev-runtime.json` or a runtime replacement request; those surfaces are
+non-secret configuration and reject credential-bearing environment values,
+command arguments, and health URLs. Internal replay hashes and backups remain
+root-private; the administrative command returns only a bounded status/count
+summary.
+
 Use the immutable release's
 `devcoordinator-test-store initialize-fresh` operation through the
 delivery workflow. It requires

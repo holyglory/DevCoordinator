@@ -17,6 +17,13 @@ import sqlite3
 from typing import Any, Callable
 import uuid
 
+from .server_credentials import (
+    ServerCredentialError,
+    secret_argument_literal,
+    secret_argument_sequence,
+    secret_environment_literal,
+    validate_server_credential_bindings,
+)
 from .store import (
     AccountStore,
     canonical_json,
@@ -32,6 +39,57 @@ class NormalizedLifecycleConflict(RuntimeError):
 
 class NormalizedObservationConflict(NormalizedLifecycleConflict):
     """A host observation changed while a lifecycle action was reserving."""
+
+
+def _require_nonsecret_server_environment(environment: dict[str, str]) -> None:
+    try:
+        credential_literal = any(
+            secret_environment_literal(name, value)
+            for name, value in environment.items()
+        )
+    except (AttributeError, ServerCredentialError) as error:
+        raise ValueError("server environment contains an invalid entry") from error
+    if credential_literal:
+        raise ValueError(
+            "persistent server credentials must use the dedicated sealed "
+            "credential transport, not a literal environment value"
+        )
+
+
+def _require_nonsecret_server_descriptor(
+    argv: tuple[str, ...], health_url: str | None
+) -> None:
+    try:
+        if secret_argument_sequence(argv):
+            raise ValueError(
+                "persistent server credentials must not appear in command arguments"
+            )
+        if health_url is not None and secret_argument_literal(health_url):
+            raise ValueError(
+                "persistent server credentials must not appear in health URLs"
+            )
+    except ServerCredentialError as error:
+        raise ValueError("persistent server descriptor is invalid") from error
+
+
+def _server_credential_binding_documents(
+    connection: sqlite3.Connection, server_definition_id: str
+) -> list[dict[str, str]]:
+    values = [
+        {"name": str(row[0]), "credential_id": str(row[1])}
+        for row in connection.execute(
+            "SELECT name,credential_id FROM server_environment_credentials "
+            "WHERE server_definition_id=? ORDER BY name",
+            (server_definition_id,),
+        )
+    ]
+    try:
+        bindings = validate_server_credential_bindings(
+            server_definition_id, values
+        )
+    except ServerCredentialError as error:
+        raise ValueError("persistent server credential bindings are invalid") from error
+    return [binding.to_document() for binding in bindings]
 
 
 @dataclass(frozen=True)
@@ -863,7 +921,13 @@ class NormalizedServerLifecycle:
                     f"'{owner['server_name']}' of {owner['canonical_root']}"
                 )
 
-            definition = self._definition_payload(request, selected)
+            definition = self._definition_payload(
+                request,
+                selected,
+                credential_bindings=_server_credential_binding_documents(
+                    connection, definition_id
+                ),
+            )
             definition_fingerprint = fingerprint(definition)
             previous_generation = int(existing["generation"]) if existing else -1
             definition_generation = previous_generation + 1
@@ -1211,6 +1275,8 @@ class NormalizedServerLifecycle:
     ) -> dict[str, Any]:
         """Bind templates to the exact reserved port before host launch."""
 
+        _require_nonsecret_server_environment(environment)
+        _require_nonsecret_server_descriptor(argv, health_url)
         timestamp = utc_timestamp()
         with self.store.immediate_transaction() as connection:
             self._running_operation(connection, operation_id, "server.start")
@@ -1230,6 +1296,9 @@ class NormalizedServerLifecycle:
                 "health_url": health_url,
                 "port": row["listener_port"],
                 "host": row["listener_host"],
+                "credential_bindings": _server_credential_binding_documents(
+                    connection, server_definition_id
+                ),
             }
             definition_fingerprint = fingerprint(definition)
             connection.execute(
@@ -1568,6 +1637,8 @@ class NormalizedServerLifecycle:
             raise ValueError("server register requires --name")
         if not 1 <= int(request.port) <= 65535:
             raise ValueError("server register port is outside 1-65535")
+        _require_nonsecret_server_environment(request.environment)
+        _require_nonsecret_server_descriptor(request.argv, request.health_url)
         timestamp = utc_timestamp()
         with self.store.immediate_transaction() as connection:
             repository = NormalizedPortLifecycle._repository(
@@ -1648,6 +1719,9 @@ class NormalizedServerLifecycle:
                 "health_url": request.health_url,
                 "port": int(request.port),
                 "host": request.host,
+                "credential_bindings": _server_credential_binding_documents(
+                    connection, definition_id
+                ),
             }
             definition_fingerprint = fingerprint(definition)
             generation = (int(existing["generation"]) + 1) if existing else 0
@@ -2428,6 +2502,9 @@ class NormalizedServerLifecycle:
                 "port": int(port),
                 "host": "127.0.0.1",
                 "relocated_from": old_project,
+                "credential_bindings": _server_credential_binding_documents(
+                    connection, str(definition["server_definition_id"])
+                ),
             }
             definition_fingerprint = fingerprint(definition_payload)
             connection.execute(
@@ -2795,6 +2872,8 @@ class NormalizedServerLifecycle:
             raise ValueError("server start requires --name")
         if not request.argv or any("\x00" in item for item in request.argv):
             raise ValueError("server start requires NUL-free structured argv")
+        _require_nonsecret_server_environment(request.environment)
+        _require_nonsecret_server_descriptor(request.argv, request.health_url)
         if not Path(request.cwd).is_dir():
             raise FileNotFoundError(
                 f"server cwd does not exist or is not a directory: {request.cwd}"
@@ -2880,7 +2959,10 @@ class NormalizedServerLifecycle:
 
     @staticmethod
     def _definition_payload(
-        request: ServerStartRequest, selected_port: int
+        request: ServerStartRequest,
+        selected_port: int,
+        *,
+        credential_bindings: list[dict[str, str]],
     ) -> dict[str, Any]:
         return {
             "name": request.name,
@@ -2891,6 +2973,7 @@ class NormalizedServerLifecycle:
             "health_url": request.health_url,
             "port": int(selected_port),
             "host": request.host,
+            "credential_bindings": credential_bindings,
         }
 
     @staticmethod
@@ -2901,6 +2984,8 @@ class NormalizedServerLifecycle:
         argv: tuple[str, ...],
         environment: dict[str, str],
     ) -> None:
+        _require_nonsecret_server_environment(environment)
+        _require_nonsecret_server_descriptor(argv, None)
         connection.execute(
             "DELETE FROM server_command_arguments WHERE server_definition_id = ?",
             (definition_id,),
