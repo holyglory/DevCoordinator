@@ -153,15 +153,11 @@ from devcoordinator.store import (
     normalize_telemetry_byte_count,
     utc_timestamp,
 )
-from devcoordinator.test_runner import (
-    test_statistics,
-)
 from devcoordinator.universal_test_cli import (
     UniversalTestCliError,
     add_universal_test_cli_parser,
     handle_universal_test_cli,
 )
-from devcoordinator.test_records import CoordinatorTestRecords
 from devcoordinator.observation_freshness import (
     ObservationFreshnessError,
     capture_observation_freshness_fence,
@@ -235,7 +231,6 @@ RUNTIME_REAPER_WAKE = threading.Event()
 RUNTIME_CLEANUP_AGENT = "runtime-session-cleanup"
 STATE_BACKEND_ENV = "DEVCOORDINATOR_STATE_BACKEND"
 AUTHORITY_ENV = "DEVCOORDINATOR_AUTHORITY"
-TEST_READ_AUTHORITY_ENV = "DEVCOORDINATOR_TEST_READ_AUTHORITY"
 SYSTEM_AUTHORITY_ROOT = Path(
     "/Library/Application Support/DevCoordinator"
     if sys.platform == "darwin"
@@ -21316,11 +21311,8 @@ API_GET_ROUTES = frozenset(
         "/v1/servers",
         "/v1/archives",
         "/v1/events",
-        "/v1/tests",
-        "/v1/test-fleet",
         "/v1/test-repositories",
         "/v1/test-runs",
-        "/v1/test-events",
     }
 )
 
@@ -21441,64 +21433,16 @@ def parse_event_query(raw_query: str) -> dict[str, Any]:
     return {"after": after, "limit": limit}
 
 
-def parse_test_stats_query(raw_query: str) -> dict[str, Any]:
-    values = parse_qs(
-        raw_query,
-        keep_blank_values=True,
-        strict_parsing=True,
-        max_num_fields=3,
-    )
-    if set(values) - {"project", "days", "limit"} or any(
-        len(items) != 1 for items in values.values()
-    ):
-        raise ValueError("test stats accept one project, days, and limit")
-    project = values.get("project", [""])[0].strip()
-    if not project or len(project) > 4096:
-        raise ValueError("test stats require one bounded project identity")
-    raw_days = values.get("days", ["30"])[0]
-    raw_limit = values.get("limit", ["25"])[0]
-    if not raw_days.isdigit() or not raw_limit.isdigit():
-        raise ValueError("test stats days and limit must be integers")
-    days = int(raw_days)
-    limit = int(raw_limit)
-    if not 1 <= days <= 3650 or not 1 <= limit <= 500:
-        raise ValueError("test stats require days 1-3650 and limit 1-500")
-    return {"project": project, "days": days, "limit": limit}
-
-
-def parse_test_fleet_query(raw_query: str) -> dict[str, int]:
-    if not raw_query:
-        return {"hours": 24}
-    values = parse_qs(
-        raw_query,
-        keep_blank_values=True,
-        strict_parsing=True,
-        max_num_fields=1,
-    )
-    if set(values) != {"hours"} or len(values["hours"]) != 1:
-        raise ValueError("fleet test statistics accept one hours parameter")
-    raw_hours = values["hours"][0]
-    if not raw_hours.isdigit():
-        raise ValueError("fleet test statistics hours must be an integer")
-    hours = int(raw_hours)
-    if not 1 <= hours <= 168:
-        raise ValueError("fleet test statistics hours must be from 1 through 168")
-    return {"hours": hours}
-
-
 _TEST_RUN_STATES = frozenset(
     {
         "queued",
         "running",
         "cancelling",
-        "superseding",
         "succeeded",
         "failed",
         "timed_out",
         "cancelled",
         "incomplete",
-        "abandoned",
-        "superseded",
     }
 )
 
@@ -21555,27 +21499,6 @@ def parse_test_run_list_query(raw_query: str) -> dict[str, Any]:
             raise ValueError("test run state is invalid")
         result["state"] = values["state"]
     return result
-
-
-def parse_test_events_query(raw_query: str) -> dict[str, Any]:
-    values = _single_query_values(
-        raw_query,
-        allowed=frozenset({"repo_id", "after", "limit"}),
-        required=frozenset({"repo_id"}),
-    )
-    raw_after = values.get("after", "0")
-    raw_limit = values.get("limit", "200")
-    if not raw_after.isdigit() or not raw_limit.isdigit():
-        raise ValueError("test event cursor and limit must be integers")
-    after = int(raw_after)
-    limit = int(raw_limit)
-    if after < 0 or not 1 <= limit <= 500:
-        raise ValueError("test event cursor or limit is invalid")
-    return {
-        "repository_id": _test_entity_id(values["repo_id"], "repo_id"),
-        "after_event_id": after,
-        "limit": limit,
-    }
 
 
 def parse_test_evidence_query(raw_query: str, *, cases: bool) -> dict[str, Any]:
@@ -21705,21 +21628,6 @@ def coordinated_test_run_evidence_read(
     return dict(result)
 
 
-def coordinated_test_events_read(
-    *, repository_id: str, after_event_id: int = 0, limit: int = 200
-) -> dict[str, Any]:
-    result = _async_test_profile().test_events(
-        repository=repository_id,
-        after_event_id=after_event_id,
-        limit=limit,
-    )
-    if result.get("repository_id") != repository_id or not isinstance(
-        result.get("events"), list
-    ):
-        raise RuntimeError("broker returned contradictory test events")
-    return dict(result)
-
-
 def coordinated_test_repository_setup_read(*, repository_id: str) -> dict[str, Any]:
     result = _async_test_profile().test_repository_setup(repository=repository_id)
     if result.get("repository_id") != repository_id or result.get("status") not in {
@@ -21810,95 +21718,6 @@ def coordinated_test_run_retry(
     return dict(result)
 
 
-def _test_read_authority() -> str:
-    """Return the explicit/final test statistics authority.
-
-    The server-wide product fails closed on TestDB/testd.  Legacy authority
-    reads remain available only to the explicitly selected account-mode
-    compatibility surface and can never be enabled for a production service.
-    """
-
-    configured = str(os.environ.get(TEST_READ_AUTHORITY_ENV) or "").strip().lower()
-    mode = authority_mode()
-    if not configured:
-        return "legacy" if mode == "account" else "testd"
-    if configured not in {"testd", "legacy"}:
-        raise ValueError(
-            f"{TEST_READ_AUTHORITY_ENV} must be 'testd' or 'legacy'"
-        )
-    if configured == "legacy" and mode != "account":
-        raise RuntimeError(
-            "legacy test reads are forbidden outside explicit account authority mode"
-        )
-    return configured
-
-
-def coordinated_test_statistics_read(
-    *, project: str, days: int, limit: int
-) -> dict[str, Any]:
-    """Read one repository's test projection through the active authority."""
-
-    profile = configured_broker_profile()
-    if profile is not None:
-        matches = [
-            repository
-            for repository in profile.repositories.values()
-            if repository.repo_id == project
-            or repository.canonical_root == str(Path(project).expanduser().resolve())
-        ]
-        if len(matches) != 1:
-            raise ValueError("project is not uniquely configured for test statistics")
-        return test_statistics(
-            profile=profile,
-            project=matches[0].canonical_root,
-            days=days,
-            limit=limit,
-        )
-
-    if _test_read_authority() == "testd":
-        raise RuntimeError(
-            "TestDB/testd is the active test read authority, but its protected "
-            "broker profile is unavailable; legacy authority statistics are fenced"
-        )
-
-    database_path = coordinator_home() / NORMALIZED_DATABASE_NAME
-    with AccountStore.open_default_read_only(coordinator_home()) as store:
-        with store.read_transaction() as connection:
-            row = connection.execute(
-                "SELECT repo_id FROM repositories WHERE repo_id = ? OR canonical_root = ?",
-                (project, str(Path(project).expanduser().resolve())),
-            ).fetchone()
-    if row is None:
-        raise ValueError("project is not present in Coordinator authority")
-    records = CoordinatorTestRecords(
-        database_path,
-        expected_uid=os.geteuid(),
-        busy_timeout_ms=5_000,
-    )
-    return records.stats_for_repository(
-        repo_id=str(row["repo_id"]), days=days, limit=limit
-    )
-
-
-def coordinated_test_fleet_read(*, hours: int = 24) -> dict[str, Any]:
-    """Read one host-wide bounded test projection through active authority."""
-
-    profile = configured_broker_profile()
-    if profile is not None:
-        return profile.fleet_test_statistics(hours=hours)
-    if _test_read_authority() == "testd":
-        raise RuntimeError(
-            "TestDB/testd is the active test read authority, but its protected "
-            "broker profile is unavailable; legacy authority fleet statistics are fenced"
-        )
-    records = CoordinatorTestRecords(
-        coordinator_home() / NORMALIZED_DATABASE_NAME,
-        expected_uid=os.geteuid(),
-        busy_timeout_ms=5_000,
-    )
-    return records.fleet_overview(hours=hours)
-
-
 def coordinated_test_repository_list() -> dict[str, Any]:
     """Return the lightweight configured repository catalog for test views.
 
@@ -21908,57 +21727,37 @@ def coordinated_test_repository_list() -> dict[str, Any]:
     """
 
     profile = configured_broker_profile()
-    if profile is not None:
-        result = profile.test_repository_catalog()
-        roots_by_id = {
-            repository.repo_id: repository.canonical_root
-            for repository in profile.repositories.values()
+    if profile is None:
+        raise RuntimeError(
+            "TestDB/testd is the active test read authority, but its protected "
+            "broker profile is unavailable"
+        )
+    result = profile.test_repository_catalog()
+    roots_by_id = {
+        repository.repo_id: repository.canonical_root
+        for repository in profile.repositories.values()
+    }
+    repositories = [
+        {
+            **dict(row),
+            "canonical_root": roots_by_id.get(str(row.get("repo_id") or "")),
         }
-        repositories = [
-            {
-                **dict(row),
-                "canonical_root": roots_by_id.get(str(row.get("repo_id") or "")),
-            }
-            for row in (result.get("repositories") or [])
-            if isinstance(row, Mapping)
-        ]
-        if (
-            len(repositories) != len(result.get("repositories") or [])
-            or len({str(row.get("repo_id") or "") for row in repositories})
-            != len(repositories)
-            or any(
-                not str(row.get("repo_id") or "")
-                or not str(row.get("canonical_root") or "")
-                or not str(row.get("display_name") or "")
-                or row.get("setup_status") not in {"ready", "missing", "invalid"}
-                for row in repositories
-            )
-        ):
-            raise RuntimeError("broker returned contradictory test repository catalog")
-    else:
-        if _test_read_authority() == "testd":
-            raise RuntimeError(
-                "TestDB/testd is the active test read authority, but its protected "
-                "broker profile is unavailable; legacy repository catalog is fenced"
-            )
-        with AccountStore.open_default_read_only(coordinator_home()) as store:
-            with store.read_transaction() as connection:
-                repositories = [
-                    {
-                        **dict(row),
-                        "setup_status": "missing",
-                        "setup_observed_at": None,
-                        "setup_retained": False,
-                    }
-                    for row in connection.execute(
-                        """
-                        SELECT repo_id, display_name
-                        FROM repositories
-                        WHERE state = 'active'
-                        ORDER BY lower(display_name), canonical_root, repo_id
-                        """
-                    )
-                ]
+        for row in (result.get("repositories") or [])
+        if isinstance(row, Mapping)
+    ]
+    if (
+        len(repositories) != len(result.get("repositories") or [])
+        or len({str(row.get("repo_id") or "") for row in repositories})
+        != len(repositories)
+        or any(
+            not str(row.get("repo_id") or "")
+            or not str(row.get("canonical_root") or "")
+            or not str(row.get("display_name") or "")
+            or row.get("setup_status") not in {"ready", "missing", "invalid"}
+            for row in repositories
+        )
+    ):
+        raise RuntimeError("broker returned contradictory test repository catalog")
     repositories.sort(
         key=lambda row: (
             str(row["display_name"]).casefold(),
@@ -22393,14 +22192,6 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
                 result = coordinated_list_archives()
             elif path == "/v1/events":
                 result = coordinated_list_events(**parse_event_query(raw_query))
-            elif path == "/v1/tests":
-                result = coordinated_test_statistics_read(
-                    **parse_test_stats_query(raw_query)
-                )
-            elif path == "/v1/test-fleet":
-                result = coordinated_test_fleet_read(
-                    **parse_test_fleet_query(raw_query)
-                )
             elif path == "/v1/test-repositories":
                 if raw_query:
                     raise ValueError("test repository catalog does not accept query parameters")
@@ -22408,10 +22199,6 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
             elif path == "/v1/test-runs":
                 result = coordinated_test_runs_read(
                     **parse_test_run_list_query(raw_query)
-                )
-            elif path == "/v1/test-events":
-                result = coordinated_test_events_read(
-                    **parse_test_events_query(raw_query)
                 )
             elif path == "/v1/inventory/no-docker":
                 target = parse_registration_inventory_query(raw_query)

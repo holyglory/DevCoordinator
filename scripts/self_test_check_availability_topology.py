@@ -695,12 +695,13 @@ def main() -> int:
         shutil.copytree(clean, legacy_test_reader)
         replace(
             legacy_test_reader / "devcoordinator-api.service",
+            "Environment=DEVCOORDINATOR_ROLE=api\n",
+            "Environment=DEVCOORDINATOR_ROLE=api\n"
             "Environment=DEVCOORDINATOR_TEST_READ_AUTHORITY=testd\n",
-            "",
         )
         expect(
             "api_inventory_projection_invalid" in codes(legacy_test_reader),
-            "API activation without final testd read authority was not rejected",
+            "legacy API test-read authority selection was not rejected",
         )
 
         shared_api_profile = Path(raw) / "shared-api-profile"

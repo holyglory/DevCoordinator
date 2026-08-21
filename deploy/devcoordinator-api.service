@@ -11,7 +11,6 @@ Slice=devcoordinator-control.slice
 UMask=0077
 Environment=DEVCOORDINATOR_ROLE=api
 Environment=DEVCOORDINATOR_INVENTORY_PUBLICATION=/var/lib/devcoordinator-observer/inventory.publication
-Environment=DEVCOORDINATOR_TEST_READ_AUTHORITY=testd
 Environment=DEVCOORDINATOR_CALL_LOG=/var/log/devcoordinator/calls.jsonl
 Environment=DEVCOORDINATOR_CALL_LOG_MAX_BYTES=4194304
 Environment=DEVCOORDINATOR_CALL_LOG_BACKUPS=4

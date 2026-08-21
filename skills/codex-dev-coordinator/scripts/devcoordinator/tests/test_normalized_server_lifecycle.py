@@ -1268,6 +1268,26 @@ class NormalizedPortLifecycleTests(unittest.TestCase):
             repository="repo-a", after=None, limit=25, state=None
         )
 
+    def test_test_http_surface_has_no_legacy_stats_or_event_authority(self) -> None:
+        self.assertTrue(
+            {"/v1/tests", "/v1/test-fleet", "/v1/test-events"}.isdisjoint(
+                dev_coordinator.API_GET_ROUTES
+            )
+        )
+        for name in (
+            "TEST_READ_AUTHORITY_ENV",
+            "_test_read_authority",
+            "coordinated_test_statistics_read",
+            "coordinated_test_fleet_read",
+            "coordinated_test_events_read",
+        ):
+            self.assertFalse(hasattr(dev_coordinator, name), name)
+        with mock.patch.object(
+            dev_coordinator, "configured_broker_profile", return_value=None
+        ):
+            with self.assertRaisesRegex(RuntimeError, "protected broker profile"):
+                dev_coordinator.coordinated_test_repository_list()
+
     def test_console_manual_plan_forwards_only_bounded_target_names(self) -> None:
         profile = mock.Mock()
         root = mock.Mock(

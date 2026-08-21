@@ -756,7 +756,6 @@ def validate_service(
         if values(unit, "Service", "Environment") != [
             expected_role,
             "DEVCOORDINATOR_INVENTORY_PUBLICATION=/var/lib/devcoordinator-observer/inventory.publication",
-            "DEVCOORDINATOR_TEST_READ_AUTHORITY=testd",
             "DEVCOORDINATOR_CALL_LOG=/var/log/devcoordinator/calls.jsonl",
             "DEVCOORDINATOR_CALL_LOG_MAX_BYTES=4194304",
             "DEVCOORDINATOR_CALL_LOG_BACKUPS=4",
@@ -765,7 +764,7 @@ def validate_service(
                 violation(
                     "api_inventory_projection_invalid",
                     path,
-                    "API must read the exact retained observer publication and final testd store",
+                    "API must use only the current retained observer and call-log environment",
                 )
             )
     if path.name == "devcoordinator-console@.service":
