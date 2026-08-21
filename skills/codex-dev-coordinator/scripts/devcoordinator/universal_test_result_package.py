@@ -304,7 +304,7 @@ class _VerifiedArtifactReader:
 
 def _normalize_identity(value: Mapping[str, object]) -> dict[str, object]:
     expected = {
-        "attempt_id",
+        "execution_id",
         "target_id",
         "run_id",
         "repository_id",
@@ -324,7 +324,7 @@ def _normalize_identity(value: Mapping[str, object]) -> dict[str, object]:
     ):
         raise ResultPackageError("result package generation is invalid")
     return {
-        "attempt_id": _safe_id("attempt_id", value["attempt_id"]),
+        "execution_id": _safe_id("execution_id", value["execution_id"]),
         "target_id": _safe_id("target_id", value["target_id"]),
         "run_id": _safe_id("run_id", value["run_id"]),
         "repository_id": _safe_id("repository_id", value["repository_id"]),

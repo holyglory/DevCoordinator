@@ -142,8 +142,8 @@ class TestAttemptLaunchUncertain(TestStoreConflict):
     """A replay cannot yet prove whether the deterministic runtime started."""
 
 
-def _runtime_id_for_attempt(attempt_id: object) -> str:
-    normalized = _safe_id("attempt_id", attempt_id)
+def _runtime_id_for_execution(execution_id: object) -> str:
+    normalized = _safe_id("execution_id", execution_id)
     suffix = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:32]
     return "devcoordinator-test-" + suffix
 
@@ -411,7 +411,7 @@ def _environment(value: object) -> dict[str, str]:
 
 @dataclass(frozen=True)
 class TestAttemptDescriptor:
-    attempt_id: str
+    execution_id: str
     target_id: str
     run_id: str
     repository_id: str
@@ -446,7 +446,7 @@ class TestAttemptDescriptor:
     credentials: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
-        for name in ("attempt_id", "target_id", "run_id", "repository_id"):
+        for name in ("execution_id", "target_id", "run_id", "repository_id"):
             object.__setattr__(self, name, _safe_id(name, getattr(self, name)))
         object.__setattr__(
             self,
@@ -1170,7 +1170,7 @@ class TestAttemptDescriptor:
 
     def to_document(self) -> dict[str, object]:
         return {
-            "attempt_id": self.attempt_id,
+            "execution_id": self.execution_id,
             "target_id": self.target_id,
             "run_id": self.run_id,
             "repository_id": self.repository_id,
@@ -1838,7 +1838,7 @@ class SystemdTestAttemptManager:
 
     @staticmethod
     def _runtime_id(descriptor: TestAttemptDescriptor) -> str:
-        return _runtime_id_for_attempt(descriptor.attempt_id)
+        return _runtime_id_for_execution(descriptor.execution_id)
 
     @staticmethod
     def _repository_slice(descriptor: TestAttemptDescriptor) -> str:
@@ -3097,7 +3097,7 @@ class SystemdTestAttemptManager:
     @staticmethod
     def _package_identity(descriptor: TestAttemptDescriptor) -> dict[str, object]:
         return {
-            "attempt_id": descriptor.attempt_id,
+            "execution_id": descriptor.execution_id,
             "target_id": descriptor.target_id,
             "run_id": descriptor.run_id,
             "repository_id": descriptor.repository_id,
@@ -3135,7 +3135,7 @@ class SystemdTestAttemptManager:
         progress: dict[str, object] = {}
         latest_output_at: float | None = None
         for stream in ("stdout", "stderr"):
-            path = output / f"{descriptor.attempt_id}-{stream}.log"
+            path = output / f"{descriptor.execution_id}-{stream}.log"
             try:
                 metadata = path.lstat()
             except FileNotFoundError:
@@ -4518,7 +4518,10 @@ class BrokerTestAttemptCoordinator:
         ticket_id = "test-ticket-" + uuid.uuid4().hex
         public = {
             "ticket_id": ticket_id,
-            "attempt_id": descriptor.attempt_id,
+            "execution_id": descriptor.execution_id,
+            "systemd_unit": (
+                _runtime_id_for_execution(descriptor.execution_id) + ".service"
+            ),
             "target_id": descriptor.target_id,
             "run_id": descriptor.run_id,
             "repository_id": descriptor.repository_id,
@@ -4557,13 +4560,13 @@ class BrokerTestAttemptCoordinator:
         self,
         *,
         ticket_id: str,
-        attempt_id: str,
+        execution_id: str,
         generation: int,
         expected_repository_id: str | None = None,
         expected_repository_generation: int | None = None,
     ) -> dict[str, object]:
         ticket_id = _safe_id("ticket_id", ticket_id)
-        attempt_id = _safe_id("attempt_id", attempt_id)
+        execution_id = _safe_id("execution_id", execution_id)
         if expected_repository_id is not None:
             expected_repository_id = _safe_id(
                 "expected_repository_id", expected_repository_id
@@ -4579,17 +4582,17 @@ class BrokerTestAttemptCoordinator:
         if record is None:
             return self._recover_launched_runtime(
                 ticket_id=ticket_id,
-                attempt_id=attempt_id,
+                execution_id=execution_id,
                 generation=generation,
                 expected_repository_id=expected_repository_id,
                 expected_repository_generation=expected_repository_generation,
             )
         if (
-            record.descriptor.attempt_id != attempt_id
+            record.descriptor.execution_id != execution_id
             or type(generation) is not int
             or record.descriptor.generation != generation
         ):
-            raise TestStoreConflict("test attempt ticket generation is stale")
+            raise TestStoreConflict("test execution ticket generation is stale")
         self._require_launch_request_binding(
             record.descriptor,
             expected_repository_id=expected_repository_id,
@@ -4597,23 +4600,29 @@ class BrokerTestAttemptCoordinator:
         )
         if record.runtime_id is not None:
             return {
+                "execution_id": record.descriptor.execution_id,
+                "generation": record.descriptor.generation,
+                "systemd_unit": record.runtime_id + ".service",
                 "runtime_id": record.runtime_id,
                 "launch_ack_id": "test-launch-" + record.ticket_id.removeprefix("test-ticket-"),
             }
         if record.expires_at <= float(self.clock()):
-            raise TestStoreConflict("test attempt ticket expired")
+            raise TestStoreConflict("test execution ticket expired")
         start_bound = getattr(self.manager, "start_bound", None)
         state = (
             start_bound(record.descriptor, launch_ticket_id=ticket_id)
             if callable(start_bound)
             else self.manager.start(record.descriptor)
         )
-        expected_runtime_id = _runtime_id_for_attempt(attempt_id)
+        expected_runtime_id = _runtime_id_for_execution(execution_id)
         state = self._require_exact_native_state(expected_runtime_id, state)
         replacement = _TicketRecord(**{**record.__dict__, "runtime_id": state.runtime_id})
         self._tickets[ticket_id] = replacement
         self._runtimes[state.runtime_id] = ticket_id
         return {
+            "execution_id": record.descriptor.execution_id,
+            "generation": record.descriptor.generation,
+            "systemd_unit": state.systemd_unit or state.runtime_id + ".service",
             "runtime_id": state.runtime_id,
             "launch_ack_id": "test-launch-" + record.ticket_id.removeprefix("test-ticket-"),
         }
@@ -4641,7 +4650,7 @@ class BrokerTestAttemptCoordinator:
         self,
         *,
         ticket_id: str,
-        attempt_id: str,
+        execution_id: str,
         generation: int,
         expected_repository_id: str | None,
         expected_repository_generation: int | None,
@@ -4653,7 +4662,7 @@ class BrokerTestAttemptCoordinator:
             raise TestAttemptLaunchUncertain(
                 "test attempt ticket is unknown and lacks recovery binding"
             )
-        runtime_id = _runtime_id_for_attempt(attempt_id)
+        runtime_id = _runtime_id_for_execution(execution_id)
         recover_binding = getattr(self.manager, "recover_launch_binding", None)
         try:
             if callable(recover_binding):
@@ -4685,7 +4694,7 @@ class BrokerTestAttemptCoordinator:
             ) from error
 
         if (
-            descriptor.attempt_id != attempt_id
+            descriptor.execution_id != execution_id
             or type(generation) is not int
             or descriptor.generation != generation
         ):
@@ -4726,6 +4735,9 @@ class BrokerTestAttemptCoordinator:
         self._runtimes[runtime_id] = ticket_id
         self._recovered_runtimes[runtime_id] = descriptor
         return {
+            "execution_id": descriptor.execution_id,
+            "generation": descriptor.generation,
+            "systemd_unit": runtime_id + ".service",
             "runtime_id": runtime_id,
             "launch_ack_id": "test-launch-"
             + ticket_id.removeprefix("test-ticket-"),
@@ -4773,17 +4785,19 @@ class BrokerTestAttemptCoordinator:
         runtime_id: str,
         *,
         reason: str,
-        expected_attempt_id: str | None = None,
+        expected_execution_id: str | None = None,
         expected_repository_id: str | None = None,
         expected_repository_generation: int | None = None,
     ) -> dict[str, object]:
         del reason
         runtime_id = _safe_id("runtime_id", runtime_id)
-        if expected_attempt_id is not None:
-            expected_attempt_id = _safe_id("expected_attempt_id", expected_attempt_id)
-            if runtime_id != _runtime_id_for_attempt(expected_attempt_id):
+        if expected_execution_id is not None:
+            expected_execution_id = _safe_id(
+                "expected_execution_id", expected_execution_id
+            )
+            if runtime_id != _runtime_id_for_execution(expected_execution_id):
                 raise TestStoreConflict(
-                    "test attempt cancellation runtime identity is contradictory"
+                    "test execution cancellation runtime identity is contradictory"
                 )
         if expected_repository_id is not None:
             expected_repository_id = _safe_id(
@@ -4805,7 +4819,7 @@ class BrokerTestAttemptCoordinator:
             # observation must independently prove that no unit is loaded or
             # active; a generic descriptor/contract failure is never enough.
             if (
-                expected_attempt_id is None
+                expected_execution_id is None
                 or expected_repository_id is None
                 or expected_repository_generation is None
             ):
@@ -4817,25 +4831,35 @@ class BrokerTestAttemptCoordinator:
                 raise TestStoreConflict(
                     "test attempt is active without recoverable launch evidence"
                 )
-            return {"runtime_id": runtime_id, "cancelled": True, "absent": True}
+            return {
+                "execution_id": expected_execution_id,
+                "generation": None,
+                "systemd_unit": runtime_id + ".service",
+                "runtime_id": runtime_id,
+                "cancelled": True,
+                "absent": True,
+            }
 
         if (
-            expected_attempt_id is not None
+            expected_execution_id is not None
             and (
-                descriptor.attempt_id != expected_attempt_id
+                descriptor.execution_id != expected_execution_id
                 or descriptor.repository_id != expected_repository_id
                 or descriptor.repository_generation
                 != expected_repository_generation
             )
         ):
             raise TestStoreConflict(
-                "test attempt cancellation binding is contradictory"
+                "test execution cancellation binding is contradictory"
             )
         state = self._require_exact_native_state(
             runtime_id, self.manager.cancel(runtime_id)
         )
         absent = not state.loaded and not state.active
         return {
+            "execution_id": descriptor.execution_id,
+            "generation": descriptor.generation,
+            "systemd_unit": state.systemd_unit or runtime_id + ".service",
             "runtime_id": runtime_id,
             "cancelled": not state.active,
             "absent": absent,
@@ -4859,9 +4883,8 @@ class BrokerTestAttemptCoordinator:
         else:
             lifecycle = "exited"
         return {
-            "execution_id": descriptor.attempt_id,
+            "execution_id": descriptor.execution_id,
             "runtime_id": runtime_id,
-            "attempt_id": descriptor.attempt_id,
             "generation": descriptor.generation,
             "repository_id": descriptor.repository_id,
             "repository_generation": descriptor.repository_generation,
@@ -4911,7 +4934,7 @@ class BrokerTestAttemptCoordinator:
         descriptor = self.runtime_descriptor(runtime_id)
         package = self.manager.resolve_result_package(storage_handle)
         expected_identity = {
-            "attempt_id": descriptor.attempt_id,
+            "execution_id": descriptor.execution_id,
             "target_id": descriptor.target_id,
             "run_id": descriptor.run_id,
             "repository_id": descriptor.repository_id,
@@ -4939,14 +4962,15 @@ class BrokerTestAttemptCoordinator:
         self,
         runtime_id: str,
         *,
-        expected_attempt_id: str,
+        expected_execution_id: str,
         expected_repository_id: str,
         expected_repository_generation: int,
     ) -> dict[str, object]:
         runtime_id = _safe_id("runtime_id", runtime_id)
         descriptor = self.runtime_descriptor(runtime_id)
         if (
-            descriptor.attempt_id != _safe_id("expected_attempt_id", expected_attempt_id)
+            descriptor.execution_id
+            != _safe_id("expected_execution_id", expected_execution_id)
             or descriptor.repository_id
             != _safe_id("expected_repository_id", expected_repository_id)
             or descriptor.repository_generation != expected_repository_generation
@@ -4962,7 +4986,13 @@ class BrokerTestAttemptCoordinator:
         if ticket_id is not None:
             self._tickets.pop(ticket_id, None)
         self._recovered_runtimes.pop(runtime_id, None)
-        return {"runtime_id": runtime_id, "collected": True}
+        return {
+            "execution_id": descriptor.execution_id,
+            "generation": descriptor.generation,
+            "systemd_unit": state.systemd_unit or runtime_id + ".service",
+            "runtime_id": runtime_id,
+            "collected": True,
+        }
 
 
 __all__ = [

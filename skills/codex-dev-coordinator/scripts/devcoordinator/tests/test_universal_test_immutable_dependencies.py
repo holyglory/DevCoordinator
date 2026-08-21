@@ -111,7 +111,7 @@ class ImmutableDependencyBindingTests(unittest.TestCase):
 
     def descriptor(self, *bindings) -> TestAttemptDescriptor:
         return TestAttemptDescriptor(
-            attempt_id="attempt-dependencies",
+            execution_id="execution-dependencies",
             target_id="target-dependencies",
             run_id="run-dependencies",
             repository_id="repo-dependencies",
@@ -176,7 +176,7 @@ class ImmutableDependencyBindingTests(unittest.TestCase):
         self.assertFalse((self.materialized / "ui" / "node_modules").exists())
         rewritten = RootSnapshotService._argv(
             ["{python}", "-m", "pytest"],
-            attempt_id="attempt-dependencies",
+            execution_id="execution-dependencies",
             shard_index=0,
             shard_count=1,
             python_executable=python_executable,
@@ -753,7 +753,7 @@ class ImmutableDependencyBindingTests(unittest.TestCase):
         self.assertEqual(dotnet_executable, str(dotnet))
         rewritten = RootSnapshotService._argv(
             ["{dotnet}", "test", "src/App.sln"],
-            attempt_id="attempt-dotnet",
+            execution_id="execution-dotnet",
             shard_index=0,
             shard_count=1,
             dotnet_executable=dotnet_executable,

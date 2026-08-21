@@ -56,7 +56,7 @@ class UniversalTestRunnerTests(unittest.TestCase):
 
     def descriptor(self, argv: tuple[str, ...]) -> TestAttemptDescriptor:
         return TestAttemptDescriptor(
-            attempt_id="attempt-runner-evidence",
+            execution_id="execution-runner-evidence",
             target_id="target-runner-evidence",
             run_id="run-runner-evidence",
             repository_id="repo-runner-evidence",
@@ -202,8 +202,8 @@ class UniversalTestRunnerTests(unittest.TestCase):
         self, descriptor: TestAttemptDescriptor, result_path: Path
     ) -> str:
         paths = (
-            self.output / f"{descriptor.attempt_id}-stdout.log",
-            self.output / f"{descriptor.attempt_id}-stderr.log",
+            self.output / f"{descriptor.execution_id}-stdout.log",
+            self.output / f"{descriptor.execution_id}-stderr.log",
         )
         values: dict[str, str] = {}
         for path in paths:
@@ -485,7 +485,7 @@ class UniversalTestRunnerTests(unittest.TestCase):
         self.assertFalse(any(item["classification"] == "test_failure" for item in failures))
         self.assertEqual(result["returncode"], 127)
         self.assertTrue(result["incomplete_reporting"])
-        stderr = (self.output / f"{descriptor.attempt_id}-stderr.log").read_text(
+        stderr = (self.output / f"{descriptor.execution_id}-stderr.log").read_text(
             encoding="utf-8"
         )
         self.assertIn("FileNotFoundError", stderr)
@@ -725,8 +725,8 @@ class UniversalTestRunnerTests(unittest.TestCase):
             json.dumps({"descriptor": descriptor.to_document()}),
             encoding="utf-8",
         )
-        (output / f"{descriptor.attempt_id}-stdout.log").write_bytes(b"progress\n")
-        (output / f"{descriptor.attempt_id}-stderr.log").write_bytes(b"warn\n")
+        (output / f"{descriptor.execution_id}-stdout.log").write_bytes(b"progress\n")
+        (output / f"{descriptor.execution_id}-stderr.log").write_bytes(b"warn\n")
 
         def active(_argv, **_kwargs):
             stdout = "\n".join((
@@ -758,7 +758,7 @@ class UniversalTestRunnerTests(unittest.TestCase):
         self.assertNotIn("progress", json.dumps(observed.output_progress))
 
         stdout_progress = output / (
-            f"{descriptor.attempt_id}-stdout.log.progress.json"
+            f"{descriptor.execution_id}-stdout.log.progress.json"
         )
         stdout_progress.write_text(
             json.dumps(
@@ -1536,7 +1536,7 @@ raise SystemExit(1)
                 for item in failures
             )
         )
-        stderr = (self.output / f"{descriptor.attempt_id}-stderr.log").read_text(
+        stderr = (self.output / f"{descriptor.execution_id}-stderr.log").read_text(
             encoding="utf-8"
         )
         self.assertIn("NU1301", stderr)
@@ -1775,7 +1775,7 @@ raise SystemExit(1)
         self.assertFalse(
             any(item["classification"] == "incomplete_reporting" for item in failures)
         )
-        stderr = (self.output / f"{descriptor.attempt_id}-stderr.log").read_text(
+        stderr = (self.output / f"{descriptor.execution_id}-stderr.log").read_text(
             encoding="utf-8"
         )
         self.assertIn("selected SDK could not be initialized", stderr)
@@ -1825,7 +1825,7 @@ raise SystemExit(1)
         failure = self.assert_single_infrastructure_failure(failures)
         self.assertIn("requested dotnet SDK 10.0.301", failure["message"])
         self.assertIn("cacheworker/global.json", failure["message"])
-        stderr = (self.output / f"{descriptor.attempt_id}-stderr.log").read_text(
+        stderr = (self.output / f"{descriptor.execution_id}-stderr.log").read_text(
             encoding="utf-8"
         )
         self.assertIn("Requested SDK version: 10.0.301", stderr)
@@ -2397,7 +2397,7 @@ raise SystemExit(1)
         result_path = self.output / RESULT_PACKAGE_FILE_NAME
         self.assertEqual(run(descriptor, self.output, result_path), 1)
         payload = result_path.read_bytes()
-        capture = (self.output / f"{descriptor.attempt_id}-stdout.log").read_text(
+        capture = (self.output / f"{descriptor.execution_id}-stdout.log").read_text(
             encoding="utf-8"
         )
         self.assertNotIn(secret.encode("utf-8"), payload)
@@ -2406,7 +2406,7 @@ raise SystemExit(1)
         self.assertFalse(
             (
                 self.output
-                / f"{descriptor.attempt_id}-stdout.log.progress.json"
+                / f"{descriptor.execution_id}-stdout.log.progress.json"
             ).exists()
         )
         result = self.result_document(result_path)

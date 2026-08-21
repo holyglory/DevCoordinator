@@ -63,7 +63,7 @@ class V8SchedulerTests(unittest.TestCase):
 
     def test_active_observed_memory_is_not_double_counted(self) -> None:
         active = ActiveAllocation(
-            attempt_id="execution-active",
+            execution_id="execution-active",
             target_id="target-active",
             repository_id="repo-active",
             owner_uid=1001,
@@ -80,7 +80,7 @@ class V8SchedulerTests(unittest.TestCase):
 
     def test_exact_exclusive_resource_blocks_only_the_conflicting_target(self) -> None:
         active = ActiveAllocation(
-            attempt_id="execution-active",
+            execution_id="execution-active",
             target_id="target-active",
             repository_id="repo-active",
             owner_uid=1001,

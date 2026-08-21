@@ -34,7 +34,7 @@ class UniversalTestRuntimeV8Tests(unittest.TestCase):
         self.cgroup_root = self.base / "cgroup"
         self.cgroup_root.mkdir(mode=0o700)
         self.descriptor = TestAttemptDescriptor(
-            attempt_id="attempt-runtime-v8",
+            execution_id="execution-runtime-v8",
             target_id="target-runtime-v8",
             run_id="run-runtime-v8",
             repository_id="repo-runtime-v8",
@@ -331,7 +331,8 @@ class UniversalTestRuntimeV8Tests(unittest.TestCase):
 
         observed = coordinator.observe(self.runtime_id)
 
-        self.assertEqual(observed["execution_id"], self.descriptor.attempt_id)
+        self.assertEqual(observed["execution_id"], self.descriptor.execution_id)
+        self.assertNotIn("attempt_id", observed)
         self.assertEqual(observed["generation"], self.descriptor.generation)
         self.assertEqual(observed["state"], "exited")
         self.assertTrue(observed["unit_inactive"])

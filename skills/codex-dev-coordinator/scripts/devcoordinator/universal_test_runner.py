@@ -479,7 +479,7 @@ def _write_execution_provenance(
         fixture_provenance = [dict(item) for item in decoded]
     document = {
         "schema_version": 1,
-        "attempt_id": descriptor.attempt_id,
+        "execution_id": descriptor.execution_id,
         "repository_id": descriptor.repository_id,
         "repository_generation": descriptor.repository_generation,
         "source": {
@@ -804,7 +804,7 @@ def _capture_artifact(
         raise TestStoreContractError("runner capture artifact is unsafe")
     artifact_id = "artifact-" + hashlib.sha256(
         (
-            descriptor.attempt_id
+            descriptor.execution_id
             + "\0capture\0"
             + stream_name
             + "\0"
@@ -854,7 +854,7 @@ def _artifact(
         if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
             raise TestStoreContractError("runner directory artifact is unsafe")
         archive_name = "directory-" + hashlib.sha256(
-            (descriptor.attempt_id + "\0" + str(policy["name"])).encode("utf-8")
+            (descriptor.execution_id + "\0" + str(policy["name"])).encode("utf-8")
         ).hexdigest()[:32] + ".tar"
         archive_path = output / archive_name
         archive_path.unlink(missing_ok=True)
@@ -881,7 +881,7 @@ def _artifact(
             os.close(archive_fd)
         artifact_id = "artifact-" + hashlib.sha256(
             (
-                descriptor.attempt_id
+                descriptor.execution_id
                 + "\0"
                 + str(policy["name"])
                 + "\0"
@@ -907,7 +907,7 @@ def _artifact(
     )
     artifact_id = "artifact-" + hashlib.sha256(
         (
-            descriptor.attempt_id
+            descriptor.execution_id
             + "\0"
             + str(policy["name"])
             + "\0"
@@ -945,7 +945,7 @@ def _generated_artifact(
         field="generated reporter artifact",
     )
     artifact_id = "artifact-" + hashlib.sha256(
-        (descriptor.attempt_id + "\0" + name + "\0" + digest).encode("utf-8")
+        (descriptor.execution_id + "\0" + name + "\0" + digest).encode("utf-8")
     ).hexdigest()[:32]
     return {
         "artifact_id": artifact_id,
@@ -2117,7 +2117,7 @@ def _ensure_failed_case_evidence(
                 "failure_id": "failure-"
                 + hashlib.sha256(
                     (
-                        descriptor.attempt_id
+                        descriptor.execution_id
                         + "\0missing-case-detail\0"
                         + case_id
                     ).encode("utf-8")
@@ -2190,8 +2190,8 @@ def run(
         raise TestStoreContractError("runner cwd escapes attempt root")
     if result_path != output / RESULT_PACKAGE_FILE_NAME:
         raise TestStoreContractError("runner result package boundary is invalid")
-    stdout_path = output / f"{descriptor.attempt_id}-stdout.log"
-    stderr_path = output / f"{descriptor.attempt_id}-stderr.log"
+    stdout_path = output / f"{descriptor.execution_id}-stdout.log"
+    stderr_path = output / f"{descriptor.execution_id}-stderr.log"
     for path in (stdout_path, stderr_path):
         path.unlink(missing_ok=True)
     adapted_argv, adapted_environment, generated_reporter, generated_kind = (
@@ -2383,7 +2383,7 @@ def run(
             {
                 "failure_id": "failure-" + hashlib.sha256(
                     (
-                        descriptor.attempt_id
+                        descriptor.execution_id
                         + "\0process-launch\0"
                         + type(launch_error).__name__
                         + "\0"
@@ -2477,7 +2477,7 @@ def run(
             {
                 "failure_id": "failure-" + hashlib.sha256(
                     (
-                        descriptor.attempt_id
+                        descriptor.execution_id
                         + "\0dotnet-readiness\0"
                         + readiness_failure.stage
                         + "\0"
@@ -2508,7 +2508,7 @@ def run(
         failures.append(
             {
                 "failure_id": "failure-" + hashlib.sha256(
-                    (descriptor.attempt_id + "\0project-timeout").encode("utf-8")
+                    (descriptor.execution_id + "\0project-timeout").encode("utf-8")
                 ).hexdigest()[:32],
                 "classification": "timeout",
                 "message": (
@@ -2703,7 +2703,7 @@ def run(
         cases = [
             {
                 "case_id": "case-" + hashlib.sha256(
-                    descriptor.attempt_id.encode("utf-8")
+                    descriptor.execution_id.encode("utf-8")
                 ).hexdigest()[:32],
                 "display_name": descriptor.target_name,
                 "status": "passed" if returncode == 0 else "failed",
@@ -2808,7 +2808,7 @@ def run(
             {
                 "failure_id": "failure-" + hashlib.sha256(
                     (
-                        descriptor.attempt_id
+                        descriptor.execution_id
                         + "\0process-exit\0"
                         + str(returncode)
                     ).encode("utf-8")
@@ -2868,7 +2868,7 @@ def run(
         publish_result_package(
             result_path,
             identity={
-                "attempt_id": descriptor.attempt_id,
+                "execution_id": descriptor.execution_id,
                 "target_id": descriptor.target_id,
                 "run_id": descriptor.run_id,
                 "repository_id": descriptor.repository_id,

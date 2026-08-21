@@ -34,7 +34,7 @@ class UniversalTestResultPackageTests(unittest.TestCase):
     @staticmethod
     def identity() -> dict[str, object]:
         return {
-            "attempt_id": "attempt-package",
+            "execution_id": "execution-package",
             "target_id": "target-package",
             "run_id": "run-package",
             "repository_id": "repo-package",

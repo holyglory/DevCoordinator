@@ -22,13 +22,9 @@ TERMINAL_STATES = frozenset(
     {
         "succeeded",
         "failed",
-        "test_failed",
-        "infrastructure_failed",
         "timed_out",
         "cancelled",
         "incomplete",
-        "abandoned",
-        "superseded",
     }
 )
 

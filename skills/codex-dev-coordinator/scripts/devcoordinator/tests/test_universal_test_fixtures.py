@@ -69,7 +69,7 @@ class UniversalTestFixtureProviderTests(unittest.TestCase):
 
     def descriptor(self) -> TestAttemptDescriptor:
         return TestAttemptDescriptor(
-            attempt_id="attempt-sealed-fixture",
+            execution_id="execution-sealed-fixture",
             target_id="target-sealed-fixture",
             run_id="run-sealed-fixture",
             repository_id="repo-ephemeral",

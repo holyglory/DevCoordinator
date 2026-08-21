@@ -9,7 +9,7 @@ import uuid
 from devcoordinator.universal_test_contract import SourceMode, parse_test_manifest
 from devcoordinator.universal_test_planner import SourceIdentity, create_test_plan
 from devcoordinator.universal_test_store import (
-    AttemptConclusion,
+    ExecutionConclusion,
     CaseResult,
     ExecutionResultPackage,
     FailureClassification,
@@ -177,7 +177,7 @@ class UniversalTestStoreReadTests(unittest.TestCase):
                 ),
                 reporter_complete=True,
             ),
-            conclusion=AttemptConclusion.TEST_FAILED,
+            conclusion=ExecutionConclusion.TEST_FAILED,
             duration_seconds=0.3,
             operation_id=operation_id(),
             unit_inactive=True,

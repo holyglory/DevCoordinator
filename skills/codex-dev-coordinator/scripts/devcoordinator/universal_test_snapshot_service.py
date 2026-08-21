@@ -2256,7 +2256,7 @@ class RootSnapshotService:
     def _argv(
         values: Sequence[object],
         *,
-        attempt_id: str,
+        execution_id: str,
         shard_index: int,
         shard_count: int,
         python_executable: str | None = None,
@@ -2266,8 +2266,8 @@ class RootSnapshotService:
             "{python}": python_executable or "/usr/bin/python3",
             "{node}": "/usr/bin/node",
             "{dotnet}": dotnet_executable or "/usr/bin/dotnet",
-            "{events}": f".devcoordinator-test/{attempt_id}-events.jsonl",
-            "{results}": f".devcoordinator-test/{attempt_id}-results.json",
+            "{events}": f".devcoordinator-test/{execution_id}-events.jsonl",
+            "{results}": f".devcoordinator-test/{execution_id}-results.json",
             "{shard_index}": str(shard_index),
             "{shard_count}": str(shard_count),
         }
@@ -2439,7 +2439,7 @@ class RootSnapshotService:
             )
         supplementary_gids = self._supplementary_developer_gids(account_uids)
         descriptor = TestAttemptDescriptor(
-            attempt_id=execution.attempt_id,
+            execution_id=execution.execution_id,
             target_id=candidate.target_id,
             run_id=candidate.run_id,
             repository_id=candidate.repository_id,
@@ -2458,7 +2458,7 @@ class RootSnapshotService:
             shard_count=candidate.shard_count,
             argv=self._argv(
                 launch["argv"],  # type: ignore[arg-type]
-                attempt_id=execution.attempt_id,
+                execution_id=execution.execution_id,
                 shard_index=candidate.shard_index,
                 shard_count=candidate.shard_count,
                 python_executable=python_executable,

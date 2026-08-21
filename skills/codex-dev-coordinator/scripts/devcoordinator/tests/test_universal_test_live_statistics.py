@@ -16,7 +16,7 @@ from devcoordinator.universal_test_planner import (
 from devcoordinator.universal_test_service import StoreTestPlaneAdapter
 from devcoordinator.universal_test_store import (
     MAX_STATISTICS_SERIES_DAYS,
-    AttemptConclusion,
+    ExecutionConclusion,
     CaseResult,
     ExecutionResultPackage,
     FailureClassification,
@@ -116,7 +116,7 @@ class LiveStatisticsTests(unittest.TestCase):
         eligible: int = 1,
         queue_seconds: float = 0.0,
         duration_seconds: float = 2.0,
-        conclusion: AttemptConclusion = AttemptConclusion.SUCCEEDED,
+        conclusion: ExecutionConclusion = ExecutionConclusion.SUCCEEDED,
     ):
         submitted = self.submit(repository_id, label, eligible=eligible)
         self.clock.advance(queue_seconds)
@@ -144,7 +144,7 @@ class LiveStatisticsTests(unittest.TestCase):
             operation_id=str(uuid.uuid4()),
         )
         self.clock.advance(duration_seconds)
-        failed = conclusion is AttemptConclusion.TEST_FAILED
+        failed = conclusion is ExecutionConclusion.TEST_FAILED
         artifact = ExecutionResultPackage(
             package_id=f"package-{label}",
             cases=(
@@ -190,7 +190,7 @@ class LiveStatisticsTests(unittest.TestCase):
             eligible=3,
             queue_seconds=5.0,
             duration_seconds=7.0,
-            conclusion=AttemptConclusion.TEST_FAILED,
+            conclusion=ExecutionConclusion.TEST_FAILED,
         )
         self.submit("repo-visible", "still-queued", eligible=4)
 

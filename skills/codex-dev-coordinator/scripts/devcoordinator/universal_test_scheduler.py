@@ -34,7 +34,7 @@ class HostMemorySnapshot:
 
 @dataclass(frozen=True)
 class ActiveAllocation:
-    attempt_id: str
+    execution_id: str
     target_id: str
     repository_id: str
     owner_uid: int
@@ -355,7 +355,7 @@ def allocations_from_store(
 
     return tuple(
         ActiveAllocation(
-            attempt_id=str(value["attempt_id"]),
+            execution_id=str(value["execution_id"]),
             target_id=str(value["target_id"]),
             repository_id=str(value["repository_id"]),
             owner_uid=int(value["owner_uid"]),

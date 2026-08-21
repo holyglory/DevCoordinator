@@ -211,7 +211,7 @@ class BrokerSealedFixtureProvider:
             owner_uid=descriptor.owner_uid,
             repository_generation=descriptor.repository_generation,
             template=str(binding["template"]),
-            operation_id=descriptor.attempt_id,
+            operation_id=descriptor.execution_id,
         )
         run_uuid = str(
             uuid.uuid5(
