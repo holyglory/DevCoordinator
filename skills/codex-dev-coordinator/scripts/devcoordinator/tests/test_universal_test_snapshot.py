@@ -53,7 +53,7 @@ from devcoordinator.universal_test_uid_helper import execute as execute_uid_help
 
 def manifest_document() -> dict[str, object]:
     return {
-        "schema_version": 3,
+        "schema_version": 4,
         "defaults": {
             "timeout_seconds": 300,
             "network": "none",
@@ -75,10 +75,6 @@ def manifest_document() -> dict[str, object]:
                 "inputs": ["**"],
                 "depends_on": [],
                 "intents": ["handoff", "release", "manual"],
-                "retry": {
-                    "max_attempts": 2,
-                    "retry_on": ["lease_expired_before_launch"],
-                },
             }
         },
         "evidence_policies": {},

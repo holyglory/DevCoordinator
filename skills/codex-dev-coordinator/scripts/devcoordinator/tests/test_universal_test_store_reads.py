@@ -23,7 +23,7 @@ def operation_id() -> str:
 
 def selected_plan(*, repository_id: str = "repo-tests"):
     manifest = parse_test_manifest({
-        "schema_version": 3,
+        "schema_version": 4,
         "defaults": {
             "timeout_seconds": 60,
             "network": "none",
@@ -41,10 +41,6 @@ def selected_plan(*, repository_id: str = "repo-tests"):
                 "inputs": ["**"],
                 "depends_on": [],
                 "intents": ["release"],
-                "retry": {
-                    "max_attempts": 2,
-                    "retry_on": ["lease_expired_before_launch"],
-                },
             },
         },
         "evidence_policies": {},

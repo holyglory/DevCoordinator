@@ -131,9 +131,14 @@ class BrokerOperation(str, Enum):
     TEST_RUN_STATUS = "test.run_status"
     TEST_RUN_SUMMARY = "test.run_summary"
     TEST_RUN_FAILURES = "test.run_failures"
+    TEST_RUN_CASES = "test.run_cases"
     TEST_RUN_ARTIFACTS = "test.run_artifacts"
     TEST_ARTIFACT_RESOLVE = "test.artifact_resolve"
     TEST_RUN_CANCEL = "test.run_cancel"
+    TEST_RUN_RETRY = "test.run_retry"
+    TEST_EVIDENCE_CHECK = "test.evidence_check"
+    TEST_EVIDENCE_CONSUME = "test.evidence_consume"
+    TEST_REPOSITORY_STATS = "test.repository_stats"
     TEST_REPOSITORY_SETUP = "test.repository_setup"
     TEST_REPOSITORY_CATALOG = "test.repository_catalog"
     TEST_ATTEMPT_TICKET = "test.attempt_ticket"
@@ -710,10 +715,13 @@ class SerializedMutationWriter:
             BrokerOperation.TEST_RUN_STATUS,
             BrokerOperation.TEST_RUN_SUMMARY,
             BrokerOperation.TEST_RUN_FAILURES,
+            BrokerOperation.TEST_RUN_CASES,
             BrokerOperation.TEST_RUN_ARTIFACTS,
             BrokerOperation.TEST_ARTIFACT_RESOLVE,
             BrokerOperation.TEST_REPOSITORY_SETUP,
             BrokerOperation.TEST_REPOSITORY_CATALOG,
+            BrokerOperation.TEST_EVIDENCE_CHECK,
+            BrokerOperation.TEST_REPOSITORY_STATS,
             BrokerOperation.TEST_ATTEMPT_STATUS,
             BrokerOperation.EPHEMERAL_STATUS,
             BrokerOperation.EPHEMERAL_IMAGE_STATUS,
@@ -2397,14 +2405,11 @@ def _validate_arguments(
                 "queued",
                 "running",
                 "cancelling",
-                "superseding",
                 "succeeded",
                 "failed",
                 "timed_out",
                 "cancelled",
                 "incomplete",
-                "abandoned",
-                "superseded",
             }:
                 raise BrokerError(
                     "invalid_arguments",
@@ -2461,6 +2466,40 @@ def _validate_arguments(
             )
         return normalized
 
+    if operation == BrokerOperation.TEST_RUN_CASES:
+        allowed = {"run_id", "after", "limit", "expected_repository_id"}
+        if "run_id" not in value or set(value) - allowed:
+            raise BrokerError(
+                "invalid_arguments",
+                "Test case reads require run_id and accept only after and limit.",
+                operation_id=operation_id,
+            )
+        after = value.get("after", 0)
+        limit = value.get("limit", 25)
+        if (
+            not _is_exact_int(after)
+            or after < 0
+            or not _is_exact_int(limit)
+            or not 1 <= limit <= 50
+        ):
+            raise BrokerError(
+                "invalid_arguments",
+                "Test case cursor and limit are invalid.",
+                operation_id=operation_id,
+            )
+        normalized = {
+            "run_id": _opaque_argument(value["run_id"], "run_id", operation_id),
+            "after": after,
+            "limit": limit,
+        }
+        if "expected_repository_id" in value:
+            normalized["expected_repository_id"] = _opaque_argument(
+                value["expected_repository_id"],
+                "expected_repository_id",
+                operation_id,
+            )
+        return normalized
+
     if operation == BrokerOperation.TEST_REPOSITORY_SETUP:
         if value:
             raise BrokerError(
@@ -2506,6 +2545,74 @@ def _validate_arguments(
                 operation_id,
             )
         return normalized
+
+    if operation == BrokerOperation.TEST_RUN_RETRY:
+        if (
+            not {"run_id", "failed_only", "actor"}.issubset(value)
+            or set(value)
+            - {"run_id", "failed_only", "actor", "expected_repository_id"}
+            or type(value["failed_only"]) is not bool
+        ):
+            raise BrokerError(
+                "invalid_arguments",
+                "Test retry requires run_id, failed_only, and actor.",
+                operation_id=operation_id,
+            )
+        normalized = {
+            "run_id": _opaque_argument(value["run_id"], "run_id", operation_id),
+            "failed_only": value["failed_only"],
+            "actor": _bounded_single_line_argument(
+                value["actor"], "actor", operation_id, maximum_bytes=256
+            ),
+        }
+        if "expected_repository_id" in value:
+            normalized["expected_repository_id"] = _opaque_argument(
+                value["expected_repository_id"],
+                "expected_repository_id",
+                operation_id,
+            )
+        return normalized
+
+    if operation in {
+        BrokerOperation.TEST_EVIDENCE_CHECK,
+        BrokerOperation.TEST_EVIDENCE_CONSUME,
+    }:
+        if set(value) != {"snapshot_id", "policy_name"}:
+            raise BrokerError(
+                "invalid_arguments",
+                "Test evidence checks require snapshot_id and policy_name.",
+                operation_id=operation_id,
+            )
+        return {
+            "snapshot_id": _opaque_argument(
+                value["snapshot_id"], "snapshot_id", operation_id
+            ),
+            "policy_name": _opaque_argument(
+                value["policy_name"], "policy_name", operation_id
+            ),
+        }
+
+    if operation == BrokerOperation.TEST_REPOSITORY_STATS:
+        if set(value) - {"days", "limit"}:
+            raise BrokerError(
+                "invalid_arguments",
+                "Test statistics accept only days and limit.",
+                operation_id=operation_id,
+            )
+        days = value.get("days", 30)
+        limit = value.get("limit", 25)
+        if (
+            not _is_exact_int(days)
+            or not 1 <= days <= 3650
+            or not _is_exact_int(limit)
+            or not 1 <= limit <= 500
+        ):
+            raise BrokerError(
+                "invalid_arguments",
+                "Test statistics days or limit is invalid.",
+                operation_id=operation_id,
+            )
+        return {"days": days, "limit": limit}
 
     if operation == BrokerOperation.TEST_ATTEMPT_TICKET:
         if set(value) != {"descriptor", "launch_timeout_seconds"}:

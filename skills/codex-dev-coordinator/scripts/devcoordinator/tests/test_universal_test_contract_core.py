@@ -81,10 +81,6 @@ def valid_manifest() -> dict[str, object]:
                     "release",
                     "manual",
                 ],
-                "retry": {
-                    "max_attempts": 2,
-                    "retry_on": ["lease_expired_before_launch"],
-                },
             },
             "unit": {
                 "driver": "pytest",
@@ -111,10 +107,6 @@ def valid_manifest() -> dict[str, object]:
                         "max_bytes": 8_388_608,
                     }
                 ],
-                "retry": {
-                    "max_attempts": 2,
-                    "retry_on": ["lease_expired_before_launch"],
-                },
             },
             "integration": {
                 "driver": "automation",
@@ -127,10 +119,6 @@ def valid_manifest() -> dict[str, object]:
                 "fixtures": ["database"],
                 "network": "loopback",
                 "exclusive_resources": ["integration-db"],
-                "retry": {
-                    "max_attempts": 2,
-                    "retry_on": ["lease_expired_before_launch"],
-                },
             },
         },
         "evidence_policies": {
@@ -238,7 +226,7 @@ class ManifestContractTests(unittest.TestCase):
                 with self.assertRaises(ManifestContractError):
                     parse_test_manifest(document)
 
-    def test_normalizes_complete_schema_three_contract(self) -> None:
+    def test_normalizes_complete_schema_four_contract(self) -> None:
         contract = parse_test_manifest(valid_manifest())
         self.assertEqual(contract.schema_version, MANIFEST_SCHEMA_VERSION)
         self.assertEqual(contract.intents["handoff"].source_mode, SourceMode.IMMUTABLE)
@@ -476,50 +464,19 @@ class ManifestContractTests(unittest.TestCase):
         with self.assertRaisesRegex(ManifestContractError, "dependency cycle"):
             parse_test_manifest(document)
 
-    def test_schema_three_retry_policy_is_infrastructure_only(self) -> None:
-        document = valid_manifest()
-        document["targets"]["unit"]["retry"] = {  # type: ignore[index]
-            "max_attempts": 1,
-            "retry_on": [],
-        }
-        contract = parse_test_manifest(document)
-        self.assertEqual(contract.targets["unit"].retry.max_attempts, 1)
-        self.assertEqual(contract.targets["unit"].retry.retry_on, ())
-        planned = create_test_plan(
-            contract,
-            intent="manual",
-            source=source(SourceMode.IMMUTABLE),
-            requested_targets=("unit",),
-        )
-        execution = _plan_documents(contract, planned, Path("/tmp/execution"))
-        self.assertEqual(
-            execution["target_resources"]["unit"]["max_attempts"], 1
-        )
-
+    def test_schema_four_rejects_retired_automatic_retry_policy(self) -> None:
         document = valid_manifest()
         document["targets"]["unit"]["retry"] = {  # type: ignore[index]
             "max_attempts": 2,
-            "retry_on": ["test_failure"],
+            "retry_on": ["lease_expired_before_launch"],
         }
-        with self.assertRaisesRegex(
-            ManifestContractError, "unsupported automatic retry"
-        ):
+        with self.assertRaisesRegex(ManifestContractError, r"unknown field\(s\): retry"):
             parse_test_manifest(document)
 
+    def test_rejects_schema_three(self) -> None:
         document = valid_manifest()
-        del document["targets"]["unit"]["retry"]  # type: ignore[index]
-        with self.assertRaisesRegex(ManifestContractError, "explicit retry policy"):
-            parse_test_manifest(document)
-
-        document = valid_manifest()
-        del document["targets"]["unit"]["retry"]["retry_on"]  # type: ignore[index]
-        with self.assertRaisesRegex(ManifestContractError, "retry policy is missing"):
-            parse_test_manifest(document)
-
-    def test_rejects_schema_two_even_with_explicit_retry(self) -> None:
-        document = valid_manifest()
-        document["schema_version"] = 2
-        with self.assertRaisesRegex(ManifestContractError, "only manifest schema 3"):
+        document["schema_version"] = 3
+        with self.assertRaisesRegex(ManifestContractError, "only manifest schema 4"):
             parse_test_manifest(document)
 
     def test_rejects_unknown_fixture_and_secret_environment(self) -> None:
@@ -549,10 +506,6 @@ class ManifestContractTests(unittest.TestCase):
             "intents": ["manual"],
             "credentials": ["health-sweep-admin"],
             "network": "external",
-            "retry": {
-                "max_attempts": 2,
-                "retry_on": ["lease_expired_before_launch"],
-            },
         }
 
         contract = parse_test_manifest(document)
@@ -629,10 +582,6 @@ class ManifestContractTests(unittest.TestCase):
             "depends_on": [],
             "intents": ["manual"],
             "network": "host-loopback",
-            "retry": {
-                "max_attempts": 2,
-                "retry_on": ["lease_expired_before_launch"],
-            },
         }
         contract = parse_test_manifest(document)
         self.assertEqual(contract.targets["host-health"].network, "host-loopback")
@@ -802,10 +751,6 @@ class TestPlannerTests(unittest.TestCase):
             "inputs": ["scripts/manual-probe"],
             "depends_on": [],
             "intents": ["manual"],
-            "retry": {
-                "max_attempts": 2,
-                "retry_on": ["lease_expired_before_launch"],
-            },
         }
         contract = parse_test_manifest(document)
 
@@ -934,10 +879,6 @@ class TestPlannerTests(unittest.TestCase):
             "inputs": ["docs/**"],
             "depends_on": [],
             "intents": ["manual"],
-            "retry": {
-                "max_attempts": 2,
-                "retry_on": ["lease_expired_before_launch"],
-            },
         }
         contract = parse_test_manifest(document)
         plan = create_test_plan(

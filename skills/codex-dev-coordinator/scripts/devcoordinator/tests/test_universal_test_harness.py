@@ -57,7 +57,7 @@ class PreviewTestPlane:
             target: {
                 "estimated_seconds": 60.0,
                 "shard_count": 1,
-                "max_attempts": 2,
+                "ttl_seconds": 300,
                 "worktree_key": f"/var/lib/devcoordinator-test-snapshots/{self.selected_plan.source.snapshot_id}/root",
                 "exclusive_resources": [],
             }

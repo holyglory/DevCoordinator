@@ -401,10 +401,6 @@ def _manifest_template() -> dict[str, object]:
                 "inputs": ["**"],
                 "depends_on": [],
                 "intents": all_intents,
-                "retry": {
-                    "max_attempts": 2,
-                    "retry_on": ["lease_expired_before_launch"],
-                },
             }
         },
         "intents": intents,

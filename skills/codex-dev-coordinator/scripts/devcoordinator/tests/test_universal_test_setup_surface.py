@@ -34,7 +34,7 @@ from devcoordinator.universal_test_uid_helper import execute
 
 def manifest_document() -> dict[str, object]:
     return {
-        "schema_version": 3,
+        "schema_version": 4,
         "defaults": {
             "timeout_seconds": 300,
             "network": "none",
@@ -56,10 +56,6 @@ def manifest_document() -> dict[str, object]:
                 "inputs": ["src/**"],
                 "depends_on": [],
                 "intents": ["handoff"],
-                "retry": {
-                    "max_attempts": 2,
-                    "retry_on": ["lease_expired_before_launch"],
-                },
             },
             "unit": {
                 "driver": "pytest",
@@ -71,10 +67,6 @@ def manifest_document() -> dict[str, object]:
                 "intents": ["handoff"],
                 "network": "loopback",
                 "fixtures": ["postgres"],
-                "retry": {
-                    "max_attempts": 2,
-                    "retry_on": ["lease_expired_before_launch"],
-                },
             },
         },
         "evidence_policies": {
@@ -326,10 +318,6 @@ class RepositorySetupSurfaceTests(unittest.TestCase):
             "depends_on": [],
             "intents": ["manual"],
             "network": "host-loopback",
-            "retry": {
-                "max_attempts": 2,
-                "retry_on": ["lease_expired_before_launch"],
-            },
         }
         document["targets"]["external-health"] = {  # type: ignore[index]
             "driver": "automation",
@@ -340,10 +328,6 @@ class RepositorySetupSurfaceTests(unittest.TestCase):
             "depends_on": [],
             "intents": ["manual"],
             "network": "external",
-            "retry": {
-                "max_attempts": 2,
-                "retry_on": ["lease_expired_before_launch"],
-            },
         }
         (self.root / ".codex" / "tests.json").write_text(
             json.dumps(document, sort_keys=True), encoding="utf-8"

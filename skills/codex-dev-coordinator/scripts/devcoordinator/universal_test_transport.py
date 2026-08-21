@@ -60,9 +60,13 @@ TEST_RUN_LIST = "test.run_list"
 TEST_RUN_STATUS = "test.run_status"
 TEST_RUN_SUMMARY = "test.run_summary"
 TEST_RUN_FAILURES = "test.run_failures"
+TEST_RUN_CASES = "test.run_cases"
 TEST_RUN_ARTIFACTS = "test.run_artifacts"
 TEST_ARTIFACT_RESOLVE = "test.artifact_resolve"
 TEST_RUN_CANCEL = "test.run_cancel"
+TEST_RUN_RETRY = "test.run_retry"
+TEST_EVIDENCE = "test.evidence"
+TEST_REPOSITORY_STATS = "test.repository_stats"
 
 TEST_PLANE_OPERATIONS = frozenset(
     {
@@ -76,9 +80,13 @@ TEST_PLANE_OPERATIONS = frozenset(
         TEST_RUN_STATUS,
         TEST_RUN_SUMMARY,
         TEST_RUN_FAILURES,
+        TEST_RUN_CASES,
         TEST_RUN_ARTIFACTS,
         TEST_ARTIFACT_RESOLVE,
         TEST_RUN_CANCEL,
+        TEST_RUN_RETRY,
+        TEST_EVIDENCE,
+        TEST_REPOSITORY_STATS,
     }
 )
 
@@ -125,6 +133,10 @@ _OPERATION_ARGUMENTS = {
         frozenset({"run_id", "repository_id"}),
         frozenset({"after", "limit"}),
     ),
+    TEST_RUN_CASES: (
+        frozenset({"run_id", "repository_id"}),
+        frozenset({"after", "limit"}),
+    ),
     TEST_RUN_ARTIFACTS: (
         frozenset({"run_id", "repository_id"}),
         frozenset({"after", "limit"}),
@@ -138,6 +150,20 @@ _OPERATION_ARGUMENTS = {
             {"run_id", "repository_id", "actor", "reason", "operation_id"}
         ),
         frozenset(),
+    ),
+    TEST_RUN_RETRY: (
+        frozenset(
+            {"run_id", "repository_id", "actor", "failed_only", "operation_id"}
+        ),
+        frozenset(),
+    ),
+    TEST_EVIDENCE: (
+        frozenset({"repository_id", "snapshot_id", "policy_name"}),
+        frozenset({"operation_id"}),
+    ),
+    TEST_REPOSITORY_STATS: (
+        frozenset({"repository_id"}),
+        frozenset({"days", "limit"}),
     ),
 }
 
@@ -579,12 +605,20 @@ class TestPlaneDispatcher:
             return self.service.summary(**arguments)
         if operation == TEST_RUN_FAILURES:
             return self.service.failures(**arguments)
+        if operation == TEST_RUN_CASES:
+            return self.service.cases(**arguments)
         if operation == TEST_RUN_ARTIFACTS:
             return self.service.artifacts(**arguments)
         if operation == TEST_ARTIFACT_RESOLVE:
             return self.service.artifact(**arguments)
         if operation == TEST_RUN_CANCEL:
             return self.service.cancel(**arguments)
+        if operation == TEST_RUN_RETRY:
+            return self.service.retry(**arguments)
+        if operation == TEST_EVIDENCE:
+            return self.service.evidence(**arguments)
+        if operation == TEST_REPOSITORY_STATS:
+            return self.service.statistics(**arguments)
         raise AssertionError("fixed operation allowlist and dispatcher diverged")
 
 
@@ -1332,6 +1366,24 @@ class UnixTestPlaneClient:
             arguments["after"] = after
         return self._call(TEST_RUN_FAILURES, arguments)
 
+    def cases(
+        self,
+        *,
+        run_id: str,
+        repository_id: str,
+        after: int = 0,
+        limit: int = 25,
+    ):
+        return self._call(
+            TEST_RUN_CASES,
+            {
+                "run_id": run_id,
+                "repository_id": repository_id,
+                "after": after,
+                "limit": limit,
+            },
+        )
+
     def artifacts(
         self,
         *,
@@ -1379,11 +1431,58 @@ class UnixTestPlaneClient:
             },
         )
 
+    def retry(
+        self,
+        *,
+        run_id: str,
+        repository_id: str,
+        actor: str,
+        failed_only: bool,
+        operation_id: str,
+    ):
+        return self._call(
+            TEST_RUN_RETRY,
+            {
+                "run_id": run_id,
+                "repository_id": repository_id,
+                "actor": actor,
+                "failed_only": failed_only,
+                "operation_id": operation_id,
+            },
+        )
+
+    def evidence(
+        self,
+        *,
+        repository_id: str,
+        snapshot_id: str,
+        policy_name: str,
+        operation_id: str | None = None,
+    ):
+        arguments: dict[str, object] = {
+            "repository_id": repository_id,
+            "snapshot_id": snapshot_id,
+            "policy_name": policy_name,
+        }
+        if operation_id is not None:
+            arguments["operation_id"] = operation_id
+        return self._call(TEST_EVIDENCE, arguments)
+
+    def statistics(self, *, repository_id: str, days: int = 30, limit: int = 25):
+        return self._call(
+            TEST_REPOSITORY_STATS,
+            {"repository_id": repository_id, "days": days, "limit": limit},
+        )
+
 
 __all__ = [
     "TEST_PLANE_OPERATIONS",
     "TEST_HEALTH",
     "TEST_ARTIFACT_RESOLVE",
+    "TEST_EVIDENCE",
+    "TEST_REPOSITORY_STATS",
+    "TEST_RUN_CASES",
+    "TEST_RUN_RETRY",
     "TEST_REPOSITORY_SETUP",
     "TestPlaneDispatcher",
     "TestPlaneTransportError",

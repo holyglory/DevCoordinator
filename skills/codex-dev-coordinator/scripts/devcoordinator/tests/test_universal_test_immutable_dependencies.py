@@ -277,7 +277,7 @@ class ImmutableDependencyBindingTests(unittest.TestCase):
 
     def test_lock_digest_comes_from_a_real_snapshot_scan(self) -> None:
         manifest_document = {
-            "schema_version": 3,
+            "schema_version": 4,
             "defaults": {
                 "timeout_seconds": 30,
                 "network": "none",
@@ -297,10 +297,6 @@ class ImmutableDependencyBindingTests(unittest.TestCase):
                     "inputs": ["**"],
                     "depends_on": [],
                     "intents": ["manual"],
-                    "retry": {
-                        "max_attempts": 2,
-                        "retry_on": ["lease_expired_before_launch"],
-                    },
                 }
             },
             "evidence_policies": {},

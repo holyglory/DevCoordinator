@@ -916,6 +916,7 @@ class BrokerClientProfile:
             operation=BrokerOperation.TEST_RUN_CASES,
             arguments={"run_id": str(run_id), "after": after, "limit": limit},
         )
+
     def test_repository_setup(self, *, repository: str) -> dict[str, Any]:
         configured = self.repository_by_id(repository)
         return self._test_call(
@@ -966,6 +967,43 @@ class BrokerClientProfile:
             operation_id=str(operation_id),
         )
 
+    def check_test_evidence(
+        self, *, repository: str, policy: str, snapshot: str
+    ) -> dict[str, Any]:
+        configured = self.repository_by_id(repository)
+        return self._test_call(
+            repository=configured,
+            operation=BrokerOperation.TEST_EVIDENCE_CHECK,
+            arguments={"policy_name": str(policy), "snapshot_id": str(snapshot)},
+        )
+
+    def consume_test_evidence(
+        self,
+        *,
+        repository: str,
+        policy: str,
+        snapshot: str,
+        operation_id: str,
+    ) -> dict[str, Any]:
+        configured = self.repository_by_id(repository)
+        return self._test_call(
+            repository=configured,
+            operation=BrokerOperation.TEST_EVIDENCE_CONSUME,
+            arguments={"policy_name": str(policy), "snapshot_id": str(snapshot)},
+            operation_id=str(operation_id),
+            expose_operation_id=True,
+        )
+
+    def test_statistics(
+        self, *, repository: str, days: int = 30, limit: int = 25
+    ) -> dict[str, Any]:
+        configured = self.repository_by_id(repository)
+        return self._test_call(
+            repository=configured,
+            operation=BrokerOperation.TEST_REPOSITORY_STATS,
+            arguments={"days": days, "limit": limit},
+        )
+
     def wait_test_run(
         self, *, repository: str, run_id: str, timeout_seconds: int
     ) -> dict[str, Any]:
@@ -979,13 +1017,9 @@ class BrokerClientProfile:
         terminal = {
             "succeeded",
             "failed",
-            "test_failed",
-            "infrastructure_failed",
             "timed_out",
             "cancelled",
             "incomplete",
-            "abandoned",
-            "superseded",
         }
         status: dict[str, Any] | None = None
 

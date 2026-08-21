@@ -63,7 +63,7 @@
       "source_mode": "immutable"
     }
   },
-  "schema_version": 3,
+  "schema_version": 4,
   "targets": {
     "console-tests": {
       "argv": [
@@ -86,12 +86,6 @@
       ],
       "network": "loopback",
       "reporter": "jsonl",
-      "retry": {
-        "max_attempts": 2,
-        "retry_on": [
-          "lease_expired_before_launch"
-        ]
-      },
       "shard": {
         "max_shards": 4,
         "mode": "history"
@@ -131,13 +125,7 @@
         "manual"
       ],
       "network": "loopback",
-      "reporter": "automation-events",
-      "retry": {
-        "max_attempts": 2,
-        "retry_on": [
-          "lease_expired_before_launch"
-        ]
-      }
+      "reporter": "automation-events"
     },
     "coordinator-resources-storage": {
       "argv": [
@@ -177,13 +165,7 @@
         "release",
         "manual"
       ],
-      "reporter": "automation-events",
-      "retry": {
-        "max_attempts": 2,
-        "retry_on": [
-          "lease_expired_before_launch"
-        ]
-      }
+      "reporter": "automation-events"
     },
     "coordinator-runtime-lifecycle": {
       "argv": [
@@ -250,13 +232,7 @@
         "manual"
       ],
       "network": "loopback",
-      "reporter": "automation-events",
-      "retry": {
-        "max_attempts": 2,
-        "retry_on": [
-          "lease_expired_before_launch"
-        ]
-      }
+      "reporter": "automation-events"
     },
     "coordinator-universal-harness": {
       "argv": [
@@ -292,13 +268,7 @@
         "manual"
       ],
       "network": "loopback",
-      "reporter": "automation-events",
-      "retry": {
-        "max_attempts": 2,
-        "retry_on": [
-          "lease_expired_before_launch"
-        ]
-      }
+      "reporter": "automation-events"
     },
     "repository-validation": {
       "argv": [
@@ -321,12 +291,6 @@
         "manual"
       ],
       "reporter": "automation-events",
-      "retry": {
-        "max_attempts": 2,
-        "retry_on": [
-          "lease_expired_before_launch"
-        ]
-      },
       "timeout_seconds": 300
     },
     "software-delivery-runner-probe": {
@@ -348,13 +312,7 @@
         "manual"
       ],
       "network": "none",
-      "reporter": "automation-events",
-      "retry": {
-        "max_attempts": 2,
-        "retry_on": [
-          "lease_expired_before_launch"
-        ]
-      }
+      "reporter": "automation-events"
     }
   }
 }

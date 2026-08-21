@@ -20,7 +20,7 @@ from types import MappingProxyType
 from typing import Any, Mapping, Sequence
 
 
-MANIFEST_SCHEMA_VERSION = 3
+MANIFEST_SCHEMA_VERSION = 4
 MANIFEST_RELATIVE_PATH = PurePosixPath(".codex/tests.json")
 MAX_MANIFEST_BYTES = 512 * 1024
 
@@ -54,7 +54,6 @@ _TARGET_FIELDS = frozenset(
         "credentials",
         "state_handles",
         "shard",
-        "retry",
         "artifacts",
         "environment",
     }
@@ -67,7 +66,6 @@ _EVIDENCE_FIELDS = frozenset(
     {"intent", "required_targets", "max_age_seconds", "allow_reuse"}
 )
 _SHARD_FIELDS = frozenset({"mode", "max_shards"})
-_RETRY_FIELDS = frozenset({"max_attempts", "retry_on"})
 _ARTIFACT_FIELDS = frozenset(
     {"name", "path", "kind", "required", "max_bytes"}
 )
@@ -93,7 +91,6 @@ _ALLOWED_INTENTS = frozenset(
     {"change", "checkpoint", "handoff", "release", "manual"}
 )
 _ALLOWED_SHARD_MODES = frozenset({"none", "files", "history"})
-_ALLOWED_RETRY_EVENTS = frozenset({"lease_expired_before_launch"})
 _ALLOWED_ARTIFACT_KINDS = frozenset(
     {"log", "jsonl", "junit", "trx", "coverage", "trace", "directory"}
 )
@@ -158,19 +155,6 @@ class ManifestDefaults:
 class ShardPolicy:
     mode: str
     max_shards: int
-
-
-@dataclass(frozen=True)
-class RetryPolicy:
-    """Bounded infrastructure-only retry policy.
-
-    Assertion failures, timeouts, incomplete reporting, cancellations, and a
-    running worker's lost heartbeat are intentionally absent.  The scheduler
-    may retry only a lease that expired before execution launched.
-    """
-
-    max_attempts: int
-    retry_on: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -253,7 +237,6 @@ class TargetContract:
     fixtures: tuple[str, ...]
     credentials: tuple[str, ...]
     shard: ShardPolicy
-    retry: RetryPolicy
     artifacts: tuple[ArtifactContract, ...]
     environment: Mapping[str, str]
     state_handles: tuple[str, ...] = ()
@@ -815,60 +798,6 @@ def _parse_shard(value: object, *, target_path: str) -> ShardPolicy:
     return ShardPolicy(mode=mode, max_shards=max_shards)
 
 
-def _parse_retry(
-    value: object,
-    *,
-    target_path: str,
-) -> RetryPolicy:
-    path = f"{target_path}.retry"
-    if value is None:
-        raise ManifestContractError(
-            "every target requires an explicit retry policy", path=path
-        )
-    raw = _object(value, path=path)
-    _reject_unknown(raw, _RETRY_FIELDS, path=path)
-    missing = sorted(_RETRY_FIELDS - set(raw))
-    if missing:
-        raise ManifestContractError(
-            "retry policy is missing: " + ", ".join(missing), path=path
-        )
-    max_attempts = _integer(
-        raw["max_attempts"],
-        path=f"{path}.max_attempts",
-        minimum=1,
-        maximum=4,
-    )
-    events = tuple(
-        _string(item, path=f"{path}.retry_on[{index}]", maximum=64)
-        for index, item in enumerate(
-            _string_list(
-                raw["retry_on"],
-                path=f"{path}.retry_on",
-                allow_empty=True,
-                maximum_items=1,
-            )
-        )
-    )
-    if len(set(events)) != len(events):
-        raise ManifestContractError("retry events must be unique", path=f"{path}.retry_on")
-    unknown = sorted(set(events) - _ALLOWED_RETRY_EVENTS)
-    if unknown:
-        raise ManifestContractError(
-            "unsupported automatic retry event(s): " + ", ".join(unknown),
-            path=f"{path}.retry_on",
-        )
-    if max_attempts == 1 and events:
-        raise ManifestContractError(
-            "max_attempts 1 requires an empty retry_on list", path=path
-        )
-    if max_attempts > 1 and events != ("lease_expired_before_launch",):
-        raise ManifestContractError(
-            "multiple attempts require lease_expired_before_launch as the sole retry event",
-            path=path,
-        )
-    return RetryPolicy(max_attempts=max_attempts, retry_on=events)
-
-
 def _parse_targets(
     value: object,
     *,
@@ -1093,10 +1022,6 @@ def _parse_targets(
             fixtures=target_fixtures,
             credentials=target_credentials,
             shard=_parse_shard(definition.get("shard", {}), target_path=path),
-            retry=_parse_retry(
-                definition.get("retry"),
-                target_path=path,
-            ),
             artifacts=_parse_artifacts(
                 definition.get("artifacts", []),
                 target_path=path,
@@ -1281,10 +1206,6 @@ def manifest_to_document(manifest: TestManifest) -> dict[str, object]:
                 "shard": {
                     "mode": target.shard.mode,
                     "max_shards": target.shard.max_shards,
-                },
-                "retry": {
-                    "max_attempts": target.retry.max_attempts,
-                    "retry_on": list(target.retry.retry_on),
                 },
                 "artifacts": [
                     {
@@ -1571,7 +1492,6 @@ __all__ = [
     "MANIFEST_SCHEMA_VERSION",
     "ManifestContractError",
     "ManifestDefaults",
-    "RetryPolicy",
     "ShardPolicy",
     "SourceMode",
     "TargetContract",

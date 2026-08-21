@@ -268,9 +268,14 @@ _ASYNC_TEST_OPERATIONS = frozenset(
         BrokerOperation.TEST_RUN_STATUS,
         BrokerOperation.TEST_RUN_SUMMARY,
         BrokerOperation.TEST_RUN_FAILURES,
+        BrokerOperation.TEST_RUN_CASES,
         BrokerOperation.TEST_RUN_ARTIFACTS,
         BrokerOperation.TEST_ARTIFACT_RESOLVE,
         BrokerOperation.TEST_RUN_CANCEL,
+        BrokerOperation.TEST_RUN_RETRY,
+        BrokerOperation.TEST_EVIDENCE_CHECK,
+        BrokerOperation.TEST_EVIDENCE_CONSUME,
+        BrokerOperation.TEST_REPOSITORY_STATS,
         BrokerOperation.TEST_REPOSITORY_SETUP,
         BrokerOperation.TEST_REPOSITORY_CATALOG,
     }
@@ -326,6 +331,7 @@ def _test_run_actor(accepted: AcceptedBrokerRequest) -> str:
     if request.operation not in {
         BrokerOperation.TEST_RUN_SUBMIT,
         BrokerOperation.TEST_RUN_CANCEL,
+        BrokerOperation.TEST_RUN_RETRY,
     }:
         return broker_actor
     requested = request.arguments.get("actor")
@@ -995,6 +1001,37 @@ class StoreBackedMutationBackend:
                 self._require_test_repository(result, request.project_id)
                 return result
 
+            if request.operation is BrokerOperation.TEST_REPOSITORY_STATS:
+                result = dict(
+                    plane.statistics(
+                        repository_id=request.project_id,
+                        days=int(request.arguments["days"]),
+                        limit=int(request.arguments["limit"]),
+                    )
+                )
+                self._require_test_repository(result, request.project_id)
+                return result
+
+            if request.operation in {
+                BrokerOperation.TEST_EVIDENCE_CHECK,
+                BrokerOperation.TEST_EVIDENCE_CONSUME,
+            }:
+                result = dict(
+                    plane.evidence(
+                        repository_id=request.project_id,
+                        snapshot_id=str(request.arguments["snapshot_id"]),
+                        policy_name=str(request.arguments["policy_name"]),
+                        operation_id=(
+                            request.operation_id
+                            if request.operation
+                            is BrokerOperation.TEST_EVIDENCE_CONSUME
+                            else None
+                        ),
+                    )
+                )
+                self._require_test_repository(result, request.project_id)
+                return result
+
             run_id = str(request.arguments.get("run_id") or "")
             if run_id:
                 # Opaque run identifiers never supply authority. Resolve the
@@ -1049,6 +1086,21 @@ class StoreBackedMutationBackend:
                         run_id=run_id,
                         repository_id=repository_id,
                         after=request.arguments.get("after"),
+                        limit=int(request.arguments["limit"]),
+                    )
+                )
+                self._require_test_run_result(
+                    result,
+                    expected_run_id=run_id,
+                    expected_repo_id=repository_id,
+                )
+                return result
+            if request.operation is BrokerOperation.TEST_RUN_CASES:
+                result = dict(
+                    plane.cases(
+                        run_id=run_id,
+                        repository_id=repository_id,
+                        after=int(request.arguments.get("after", 0)),
                         limit=int(request.arguments["limit"]),
                     )
                 )
@@ -1147,6 +1199,18 @@ class StoreBackedMutationBackend:
                     expected_run_id=run_id,
                     expected_repo_id=repository_id,
                 )
+                return result
+            if request.operation is BrokerOperation.TEST_RUN_RETRY:
+                result = dict(
+                    plane.retry(
+                        run_id=run_id,
+                        repository_id=repository_id,
+                        actor=actor,
+                        failed_only=bool(request.arguments["failed_only"]),
+                        operation_id=request.operation_id,
+                    )
+                )
+                self._require_test_repository(result, repository_id)
                 return result
         except TestPlanPreviewUnavailable as error:
             unavailable_code = getattr(error, "code", "test_plan_preview_unavailable")

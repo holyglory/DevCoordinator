@@ -1284,6 +1284,15 @@ class TestPlaneClient(Protocol):
         limit: int = 25,
     ) -> Mapping[str, object]: ...
 
+    def cases(
+        self,
+        *,
+        run_id: str,
+        repository_id: str,
+        after: int = 0,
+        limit: int = 25,
+    ) -> Mapping[str, object]: ...
+
     def artifacts(
         self,
         *,
@@ -1305,6 +1314,29 @@ class TestPlaneClient(Protocol):
         actor: str,
         reason: str,
         operation_id: str,
+    ) -> Mapping[str, object]: ...
+
+    def retry(
+        self,
+        *,
+        run_id: str,
+        repository_id: str,
+        actor: str,
+        failed_only: bool,
+        operation_id: str,
+    ) -> Mapping[str, object]: ...
+
+    def evidence(
+        self,
+        *,
+        repository_id: str,
+        snapshot_id: str,
+        policy_name: str,
+        operation_id: str | None = None,
+    ) -> Mapping[str, object]: ...
+
+    def statistics(
+        self, *, repository_id: str, days: int = 30, limit: int = 25
     ) -> Mapping[str, object]: ...
 
 
@@ -1810,6 +1842,29 @@ class StoreTestPlaneAdapter:
             }
         )
 
+    def cases(
+        self,
+        *,
+        run_id: str,
+        repository_id: str,
+        after: int = 0,
+        limit: int = 25,
+    ) -> Mapping[str, object]:
+        self._store.get_run(run_id, repository_id=repository_id)
+        page_limit = self._page_limit(limit)
+        rows = self._store.cases(run_id=run_id, after=after, limit=page_limit)
+        return self._bounded(
+            {
+                "schema_version": 1,
+                "repository_id": repository_id,
+                "run_id": run_id,
+                "cases": list(rows),
+                "next_cursor": (
+                    int(rows[-1]["cursor"]) if len(rows) == page_limit else None
+                ),
+            }
+        )
+
     def artifacts(
         self,
         *,
@@ -1879,6 +1934,74 @@ class StoreTestPlaneAdapter:
             }
         )
 
+    def retry(
+        self,
+        *,
+        run_id: str,
+        repository_id: str,
+        actor: str,
+        failed_only: bool,
+        operation_id: str,
+    ) -> Mapping[str, object]:
+        self._store.get_run(run_id, repository_id=repository_id)
+        result = self._store.retry_run(
+            run_id,
+            actor=actor,
+            failed_only=failed_only,
+            operation_id=operation_id,
+        )
+        return self._bounded(
+            {
+                "schema_version": 1,
+                "repository_id": repository_id,
+                "source_run_id": run_id,
+                **result.__dict__,
+            }
+        )
+
+    def evidence(
+        self,
+        *,
+        repository_id: str,
+        snapshot_id: str,
+        policy_name: str,
+        operation_id: str | None = None,
+    ) -> Mapping[str, object]:
+        result = (
+            self._store.check_evidence_policy(
+                repository_id=repository_id,
+                snapshot_id=snapshot_id,
+                policy_name=policy_name,
+            )
+            if operation_id is None
+            else self._store.consume_evidence_policy(
+                repository_id=repository_id,
+                snapshot_id=snapshot_id,
+                policy_name=policy_name,
+                operation_id=operation_id,
+            )
+        )
+        return self._bounded({"schema_version": 1, **result})
+
+    def statistics(
+        self, *, repository_id: str, days: int = 30, limit: int = 25
+    ) -> Mapping[str, object]:
+        if type(days) is not int or not 1 <= days <= 3650:
+            raise TestStoreContractError("statistics days is invalid")
+        if type(limit) is not int or not 1 <= limit <= 500:
+            raise TestStoreContractError("statistics limit is invalid")
+        return self._bounded(
+            {
+                "schema_version": 1,
+                **self._store.repository_rollup_detail(
+                    repository_id=repository_id,
+                    grain="daily",
+                    since=self._store.current_time() - days * 86_400,
+                    limit=limit,
+                ),
+            }
+        )
+
     @staticmethod
     def _status_document(run: Mapping[str, object]) -> dict[str, object]:
         targets = list(run["targets"])
@@ -1886,7 +2009,7 @@ class StoreTestPlaneAdapter:
             1
             for target in targets
             if target["state"]
-            not in {"queued", "leased", "running"}
+            not in {"queued", "starting", "running", "stopping"}
         )
         return {
             "schema_version": 1,
@@ -1906,7 +2029,6 @@ class StoreTestPlaneAdapter:
                 "total_targets": len(targets),
             },
             "usage": run.get("usage"),
-            "lease_expiry_evidence": run["lease_expiry_evidence"],
             "targets": [
                 {
                     "target_id": target["target_id"],
@@ -1916,7 +2038,29 @@ class StoreTestPlaneAdapter:
                     "shard_count": target["shard_count"],
                     "state": target["state"],
                     "wait": target.get("wait"),
-                    "active_attempt": target.get("active_attempt"),
+                    "execution": (
+                        None
+                        if target.get("execution_id") is None
+                        else {
+                            "execution_id": target["execution_id"],
+                            "generation": target["generation"],
+                            "repository_generation": target[
+                                "repository_generation"
+                            ],
+                            "systemd_unit": target["systemd_unit"],
+                            "systemd_invocation_id": target[
+                                "systemd_invocation_id"
+                            ],
+                            "launch_operation_id": target[
+                                "launch_operation_id"
+                            ],
+                            "launch_confirmed": target["launch_ack_id"] is not None,
+                            "launch_deadline_at": target["launch_deadline_at"],
+                            "started_at": target["started_at"],
+                            "deadline_at": target["deadline_at"],
+                            "last_observed_at": target["last_observed_at"],
+                        }
+                    ),
                     "usage": target.get("usage"),
                 }
                 for target in targets

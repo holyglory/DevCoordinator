@@ -79,7 +79,7 @@ class CachedPlanPreviewer:
             name: {
                 "estimated_seconds": 1.0,
                 "shard_count": 1,
-                "max_attempts": 2,
+                "ttl_seconds": 300,
                 "worktree_key": self.plan.source.original_root,
                 "exclusive_resources": [],
             }

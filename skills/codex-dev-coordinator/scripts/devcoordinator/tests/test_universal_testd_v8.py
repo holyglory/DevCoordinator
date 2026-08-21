@@ -42,7 +42,7 @@ def governed_plan(
     dependency_map = dependencies or {name: () for name in names}
     manifest = parse_test_manifest(
         {
-            "schema_version": 3,
+            "schema_version": 4,
             "defaults": {
                 "timeout_seconds": 20,
                 "network": "none",
@@ -62,10 +62,6 @@ def governed_plan(
                     "inputs": ["src/**"],
                     "depends_on": list(dependency_map[name]),
                     "intents": ["release"],
-                    "retry": {
-                        "max_attempts": 1,
-                        "retry_on": [],
-                    },
                 }
                 for name in names
             },
