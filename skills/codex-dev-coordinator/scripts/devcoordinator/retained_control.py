@@ -99,6 +99,23 @@ SCHEMA_15_RETAINED_COLUMNS: Mapping[str, tuple[str, ...]] = {
     "repository_scopes": ("repo_id", "family_id", "project_kind", "git_dir", "git_common_dir", "identity_fingerprint", "root_device", "root_inode", "created_at", "updated_at"),
 }
 
+# This obsolete authorization table can legitimately survive the schema-15
+# trusted-local migration as an empty child table.  Match its historical shape
+# exactly before discarding it so a changed table cannot hide new control data.
+SCHEMA_15_RETIRED_COLUMNS: Mapping[str, tuple[str, ...]] = {
+    "broker_repository_enrollments": (
+        "uid",
+        "repo_id",
+        "account_id",
+        "enabled",
+        "issued_at",
+        "valid_until_epoch",
+        "enrollment_snapshot_id",
+        "grant_snapshot_id",
+        "updated_at",
+    ),
+}
+
 
 class RetainedControlError(RuntimeError):
     """The retained-control view cannot be constructed safely."""
@@ -1224,6 +1241,11 @@ def prepare_rebaseline(
             if _columns(source, table) != expected_columns:
                 raise RetainedControlError(
                     f"retained {table} columns differ from frozen schema 15"
+                )
+        for table, expected_columns in SCHEMA_15_RETIRED_COLUMNS.items():
+            if table in source_table_names and _columns(source, table) != expected_columns:
+                raise RetainedControlError(
+                    f"retired {table} columns differ from frozen schema 15"
                 )
         unknown = sorted(source_table_names - _known_source_tables())
         if unknown:

@@ -146,6 +146,68 @@ class RetainedControlTests(unittest.TestCase):
             for table in sorted(retained_control.SCHEMA_15_DISPOSABLE_TEST_COLLECTIONS):
                 connection.execute(f'CREATE TABLE "{table}"(row_id TEXT PRIMARY KEY)')
                 connection.execute(f'INSERT INTO "{table}" VALUES (?)', (f"history-{table}",))
+            connection.execute(
+                """
+                CREATE TABLE broker_acl_principals(
+                    uid INTEGER PRIMARY KEY CHECK(uid >= 0),
+                    account_id TEXT NOT NULL,
+                    enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0, 1)),
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                "CREATE UNIQUE INDEX broker_principal_uid_account_identity "
+                "ON broker_acl_principals(uid, account_id)"
+            )
+            connection.execute(
+                """
+                CREATE TABLE broker_repository_enrollments(
+                    uid INTEGER NOT NULL,
+                    repo_id TEXT NOT NULL
+                        REFERENCES repositories(repo_id) ON DELETE CASCADE,
+                    account_id TEXT NOT NULL,
+                    enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0, 1)),
+                    issued_at TEXT NOT NULL,
+                    valid_until_epoch INTEGER NOT NULL CHECK(valid_until_epoch > 0),
+                    enrollment_snapshot_id TEXT
+                        REFERENCES observation_snapshots(snapshot_id) ON DELETE RESTRICT,
+                    grant_snapshot_id TEXT
+                        REFERENCES observation_snapshots(snapshot_id) ON DELETE RESTRICT,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY(uid, repo_id),
+                    FOREIGN KEY(uid, account_id)
+                        REFERENCES broker_acl_principals(uid, account_id) ON DELETE CASCADE,
+                    CHECK(
+                        (enrollment_snapshot_id IS NULL AND grant_snapshot_id IS NULL)
+                        OR
+                        (enrollment_snapshot_id IS NOT NULL AND grant_snapshot_id IS NOT NULL)
+                    )
+                )
+                """
+            )
+            connection.execute(
+                "CREATE INDEX broker_repository_enrollments_by_repo "
+                "ON broker_repository_enrollments(repo_id, enabled, valid_until_epoch)"
+            )
+            connection.execute(
+                "INSERT INTO broker_acl_principals VALUES (?,?,?,?)",
+                (1000, "legacy-local-account", 1, STAMP),
+            )
+            connection.execute(
+                "INSERT INTO broker_repository_enrollments VALUES (?,?,?,?,?,?,?,?,?)",
+                (
+                    1000,
+                    "repo-1",
+                    "legacy-local-account",
+                    1,
+                    STAMP,
+                    4_102_444_800,
+                    None,
+                    None,
+                    STAMP,
+                ),
+            )
             connection.execute("CREATE TABLE migration_conflicts(conflict_id TEXT PRIMARY KEY)")
             connection.execute("INSERT INTO migration_conflicts VALUES ('legacy-history')")
             connection.execute(
@@ -370,6 +432,18 @@ class RetainedControlTests(unittest.TestCase):
                     "SELECT 1 FROM sqlite_master WHERE type='table' AND name='migration_conflicts'"
                 ).fetchone()
             )
+            self.assertIsNone(
+                target.execute(
+                    "SELECT 1 FROM sqlite_master "
+                    "WHERE type='table' AND name='broker_repository_enrollments'"
+                ).fetchone()
+            )
+            self.assertIsNone(
+                target.execute(
+                    "SELECT 1 FROM sqlite_master "
+                    "WHERE type='table' AND name='broker_acl_principals'"
+                ).fetchone()
+            )
         finally:
             target.close()
         access = json.loads((self.root / "out/console/access-control.json").read_text())
@@ -390,6 +464,8 @@ class RetainedControlTests(unittest.TestCase):
         self.assertEqual(self.profile.stat().st_ino, profile_identity)
         self.assertIn("test_runs", result["rejected_collections"])
         self.assertIn("migration_conflicts", result["rejected_collections"])
+        self.assertIn("broker_repository_enrollments", result["rejected_collections"])
+        self.assertNotIn("broker_repository_enrollments", result["retained_collections"])
         self.assertIn("operations", result["rejected_collections"])
         self.assertIn("events", result["rejected_collections"])
         self.assertIn("observation_snapshots", result["rejected_collections"])
@@ -413,6 +489,19 @@ class RetainedControlTests(unittest.TestCase):
         connection.close()
         with self.assertRaisesRegex(retained_control.RetainedControlError, "unknown collections"):
             self._prepare("unknown-out")
+
+    def test_changed_retired_enrollment_shape_is_rejected(self) -> None:
+        connection = sqlite3.connect(self.database)
+        connection.execute(
+            "ALTER TABLE broker_repository_enrollments ADD COLUMN invented_control TEXT"
+        )
+        connection.commit()
+        connection.close()
+        with self.assertRaisesRegex(
+            retained_control.RetainedControlError,
+            "retired broker_repository_enrollments columns differ from frozen schema 15",
+        ):
+            self._prepare("changed-retired-out")
 
     def test_changed_verified_backup_is_rejected(self) -> None:
         (self.root / "backup.dump").write_bytes(b"changed")

@@ -1339,6 +1339,9 @@ _LEGACY_LOCAL_AUTHORIZATION_TABLES = (
     "broker_host_observation_acl",
     "broker_cleanup_acl",
     "broker_lifecycle_acl",
+    # security-assumptions.md confirms one trusted local developer: repository
+    # enrollment was an authorization gate, not retained repository control.
+    "broker_repository_enrollments",
     "broker_repository_configurations",
     "broker_assignment_owners",
     "broker_lease_owners",
