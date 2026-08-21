@@ -1081,6 +1081,15 @@ class StoreBackedMutationBackend:
                     )
                 )
                 self._require_test_repository(result, request.project_id)
+                if (
+                    request.operation is BrokerOperation.TEST_EVIDENCE_CONSUME
+                    and result.get("operation_id") != request.operation_id
+                ):
+                    raise BrokerBackendError(
+                        "test_evidence_consumption_mismatch",
+                        "Test evidence consumption returned a contradictory operation identity.",
+                        operation_id=request.operation_id,
+                    )
                 return result
 
             run_id = str(request.arguments.get("run_id") or "")

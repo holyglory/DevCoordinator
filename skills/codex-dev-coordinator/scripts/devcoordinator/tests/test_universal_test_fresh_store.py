@@ -7,7 +7,10 @@ import tempfile
 import unittest
 import uuid
 
-from devcoordinator.universal_test_store import UniversalTestStore
+from devcoordinator.universal_test_store import (
+    TEST_STORE_SCHEMA_VERSION,
+    UniversalTestStore,
+)
 
 
 def _load_repository_cli():
@@ -97,7 +100,7 @@ class FreshTestStoreInitializationTests(unittest.TestCase):
         self.assertEqual(authority_sentinel.read_bytes(), authority_before)
 
         store = UniversalTestStore.open(self.test_path)
-        self.assertEqual(store.verify()["schema_version"], 7)
+        self.assertEqual(store.verify()["schema_version"], TEST_STORE_SCHEMA_VERSION)
         connection = store._connect(readonly=True)
         try:
             rows = connection.execute(

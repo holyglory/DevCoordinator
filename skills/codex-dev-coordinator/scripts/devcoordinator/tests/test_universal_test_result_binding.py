@@ -178,6 +178,51 @@ class ResultPlane:
             },
         )
 
+    def retry(self, *, run_id: str, **_arguments):
+        self.downstream_calls.append("retry")
+        return self.overrides.get(
+            "retry",
+            {
+                "schema_version": 1,
+                "run_id": "run-retry-created",
+                "source_run_id": run_id,
+                "repository_id": _arguments["repository_id"],
+                "state": "queued",
+            },
+        )
+
+    def evidence(
+        self,
+        *,
+        repository_id: str,
+        snapshot_id: str,
+        policy_name: str,
+        operation_id: str | None = None,
+    ):
+        if operation_id is None:
+            return self.overrides.get(
+                "policy_check",
+                {
+                    "schema_version": 1,
+                    "repository_id": repository_id,
+                    "snapshot_id": snapshot_id,
+                    "policy_name": policy_name,
+                    "satisfied": True,
+                },
+            )
+        return self.overrides.get(
+            "policy_consume",
+            {
+                "schema_version": 1,
+                "repository_id": repository_id,
+                "snapshot_id": snapshot_id,
+                "policy_name": policy_name,
+                "satisfied": True,
+                "consumed": True,
+                "operation_id": operation_id,
+            },
+        )
+
 class UniversalTestResultBindingTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
@@ -376,8 +421,24 @@ class UniversalTestResultBindingTests(unittest.TestCase):
                 self.assertEqual(self.plane.downstream_calls, [])
 
     def test_retry_result_is_reauthorized_against_new_run_repository(self) -> None:
-        with self.assertRaises(ValueError):
-            BrokerOperation("test.run_retry")
+        self.plane.overrides["retry"] = {
+            "schema_version": 1,
+            "run_id": "run-retry-foreign",
+            "source_run_id": self.plane.source_run_id,
+            "repository_id": "repo-foreign",
+            "state": "queued",
+        }
+        with self.assertRaises(BrokerBackendError) as raised:
+            self.execute(
+                BrokerOperation.TEST_RUN_RETRY,
+                {
+                    "run_id": self.plane.source_run_id,
+                    "failed_only": True,
+                    "actor": TEST_ACTOR,
+                },
+            )
+        self.assertEqual(raised.exception.code, "test_repository_mismatch")
+        self.assertIn("retry", self.plane.downstream_calls)
 
     def test_remote_not_found_is_not_reported_as_scheduler_unavailable(self) -> None:
         self.plane.status_error = TestPlaneTransportError(

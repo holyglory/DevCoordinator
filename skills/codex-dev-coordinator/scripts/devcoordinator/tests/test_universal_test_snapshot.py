@@ -1174,12 +1174,16 @@ class UniversalTestSnapshotTests(unittest.TestCase):
             ("untracked.txt", ChangeStatus.UNTRACKED, None),
             {(item.path, item.status, item.previous_path) for item in changes},
         )
-        with self.assertRaisesRegex(
-            SnapshotMaterializationError, "cannot be materialized"
-        ):
-            FilesystemSnapshotMaterializer(
-                self.store, allow_unprotected_test_store=True
-            ).materialize(request)
+        materialized = FilesystemSnapshotMaterializer(
+            self.store, allow_unprotected_test_store=True
+        ).materialize(request)
+        self.assertTrue(materialized.complete)
+        self.assertEqual(materialized.repository_id, request.repository_id)
+        self.assertEqual(materialized.content_fingerprint, scan.content_fingerprint)
+        captured_root = Path(materialized.materialized_root)
+        self.assertTrue((captured_root / "renamed.txt").is_file())
+        self.assertTrue((captured_root / "untracked.txt").is_file())
+        self.assertFalse((captured_root / "tracked.txt").exists())
 
         planned = execute_uid_helper(
             {

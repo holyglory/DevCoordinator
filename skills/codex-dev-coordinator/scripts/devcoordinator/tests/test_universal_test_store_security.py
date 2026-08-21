@@ -9,6 +9,7 @@ import unittest
 from unittest import mock
 
 from devcoordinator.universal_test_store import (
+    TEST_STORE_SCHEMA_VERSION,
     TestStoreContractError,
     TestStoreConflict,
     TestStoreSecurityError,
@@ -40,7 +41,9 @@ class UniversalTestStoreSecurityTests(unittest.TestCase):
 
         reopened = UniversalTestStore.open(self.database)
 
-        self.assertEqual(reopened.verify()["schema_version"], 7)
+        self.assertEqual(
+            reopened.verify()["schema_version"], TEST_STORE_SCHEMA_VERSION
+        )
 
     def test_open_rejects_symlink_database(self) -> None:
         real = self.root / "real.sqlite3"
@@ -74,7 +77,9 @@ class UniversalTestStoreSecurityTests(unittest.TestCase):
 
         reopened = UniversalTestStore.open(self.database)
 
-        self.assertEqual(reopened.verify()["schema_version"], 7)
+        self.assertEqual(
+            reopened.verify()["schema_version"], TEST_STORE_SCHEMA_VERSION
+        )
 
     def test_expected_uid_is_compatibility_only(self) -> None:
         reopened = UniversalTestStore.open(

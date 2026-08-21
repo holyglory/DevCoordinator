@@ -436,7 +436,7 @@ class ManifestContractTests(unittest.TestCase):
                 document["global_inputs"] = rng.choice(wrong_container_values)
             elif mutation == 3:
                 document["schema_version"] = rng.choice(
-                    [None, True, False, -1, 0, 1, 2, 4, 1.5, "3"]
+                    [None, True, False, -1, 0, 1, 2, 3, 5, 1.5, "4"]
                 )
             elif mutation == 4:
                 document["unknown_" + rng.randbytes(6).hex()] = {
