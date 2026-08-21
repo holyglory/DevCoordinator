@@ -171,17 +171,30 @@ test('ExecStart assignments override malicious EnvironmentFile values', async ()
 
 test('deployment runbook preserves an existing production environment file', async () => {
   const readme = await fsp.readFile(path.join(APP_ROOT, 'README.md'), 'utf8');
-  const deploy = readme.split('## Deploy (systemd)')[1]?.split('## Exposing a dev server')[0] ?? '';
-  assert.match(deploy, /cp -a "\$CONSOLE_ENV" "\$CUTOVER_BACKUP\/console\.env"/);
-  assert.match(deploy, /chmod 600 "\$CONSOLE_ENV"/);
-  assert.match(deploy, /legacy-migration-initial" --env-only/);
+  const quickStart = readme.split('## Quick start')[1]?.split('## Configuration')[0] ?? '';
+  const deploy = readme
+    .split('## Deploy the current systemd release')[1]
+    ?.split('## Manage Google account access')[0] ?? '';
+
+  assert.match(deploy, /scripts\/software_owned_delivery\.py run/);
+  assert.match(deploy, /one immutable, content-addressed release/);
+  assert.match(
+    deploy,
+    /Console routes, users, grants, settings, secret\s+references, and project data remain in their existing service-owned stores/,
+  );
+  assert.match(deploy, /The Test Store and unfinished test work are disposable/);
+  assert.doesNotMatch(
+    deploy,
+    /(?:install|cp|mv|rm)[^\n]*(?:console\.env|\.env\.example)/,
+    'the current delivery runbook must not replace or remove the external production environment',
+  );
 
   let createIfAbsent = false;
   let templateInstallCount = 0;
-  for (const rawLine of deploy.split('\n')) {
+  for (const rawLine of quickStart.split('\n')) {
     const line = rawLine.trim();
-    if (line === 'if [ ! -e "$CONSOLE_ENV" ]; then') createIfAbsent = true;
-    if (line.includes('.env.example') && line.includes('"$CONSOLE_ENV"')) {
+    if (line === 'if [ ! -e "$HOME/.config/devops-console/console.env" ]; then') createIfAbsent = true;
+    if (line.includes('.env.example') && line.includes('"$HOME/.config/devops-console/console.env"')) {
       templateInstallCount += 1;
       assert.equal(createIfAbsent, true, 'template install must be inside the create-if-absent guard');
     }
@@ -223,253 +236,29 @@ test('cutover process identity and signaling are Linux-format and PID-reuse safe
   );
 });
 
-test('existing-host runbook models the legacy Console child-coordinator topology', async () => {
+test('deployment runbook models the current single Console topology', async () => {
   const readme = await fsp.readFile(path.join(APP_ROOT, 'README.md'), 'utf8');
-  const cutover = readme.split('### Existing-host checkout cutover')[1]?.split('Both units run as')[0] ?? '';
+  const deploy = readme
+    .split('## Deploy the current systemd release')[1]
+    ?.split('## Manage Google account access')[0] ?? '';
+  const normalizedDeploy = deploy.replace(/\s+/g, ' ');
 
   for (const marker of [
-    'ControlGroup --value devops-console.service',
-    'legacy-processes.json',
-    '"console": consoles[0]',
-    'stat_text.rfind(")")',
-    'if len(records) != 2:',
-    'verify_legacy_cutover_boundary.py',
-    'terminate_captured_legacy_process.py',
-    'check_legacy_cutover_stopped.py',
-    '--continuous-clean-seconds 5',
-    '--continuous-clean-seconds 0.25',
-    '--wait-timeout-seconds 30 --poll-interval-seconds 0.02',
-    '--wait-timeout-seconds 5 --poll-interval-seconds 0.01',
-    '--wait-timeout-seconds 10 --poll-interval-seconds 0.02',
-    '--max-observation-gap-seconds 0.1',
-    '--max-observation-gap-seconds 0.05',
-    'cgroup-samples.stable.json',
-    'cgroup-samples.prestop-final.json',
-    'STOP_ATTEMPTED_THIS_RUN=1',
-    'legacy-stopped-boundary.json',
-    '.TREE.json.XXXXXX',
-    '.SHA256SUMS.XXXXXX',
-    'trap \'rm -f "$tree_tmp" "$sha_tmp"\' EXIT',
-    'backup directory/symlink topology mismatch after refresh',
-    'sync -f .',
-    'every observed child instance',
-    'find "$CONSOLE_STATE" "$COORDINATOR_HOME" -type f -exec chmod 600 {} +',
-    '90-cutover-killmode.conf',
-    'KillMode --value devops-console.service',
-    'pre-cutover-identities.json',
-    '"server_id": servers[0]["id"]',
-    '.precutover-inventory-home.XXXXXX',
-    'inventory --no-docker',
-    'retired-assignment-plan.json',
-    'Every old-project assignment must be represented',
-    'prepare_retired_assignment_cleanup.py" plan',
-    'prepare_retired_assignment_cleanup.py" apply',
-    'one all-or-none state commit',
-    'retired-assignment-post-cleanup.json',
-    '--sync-state-only',
-    'user-runtime.writer-free/routes.json',
-    'user-runtime.writer-free/ui-prefs.json',
-    'user-runtime.writer-free/access-control.json',
-    'sha256sum --check "$CUTOVER_BACKUP/console.env.sha256"',
-    'coordinator-state.poststop.json',
-    'coordinator-state.pre-relocate.json',
-    'restore_coordinator_state.py',
-    'state-migration.attempted',
-    'relocation.attempted',
-    'no state mutation phase marker; preserving current coordinator state',
-    'trap cleanup_cutover_override EXIT',
-    'trap - EXIT',
-    'restore_enablement devops-console.service',
-    'verify_legacy_console_rollback_ready.py',
-    'rollback-readiness.json',
-    '--main-pid "$ROLLBACK_MAIN_PID" --cgroup "$ROLLBACK_CGROUP"',
-    '--inventory-url http://127.0.0.1:29876/v1/inventory',
-    '--expected-identities "$CUTOVER_BACKUP/pre-cutover-identities.json"',
-    '--project "$OLD_PROJECT" --name devops-console --port 443',
-    'captured lease ID still dangling after `locked_state` pruned',
-    'Clean absence and an assignment-only unregistered state fail',
-    'no inventory row with that captured lease ID may survive',
-    'listener-owner snapshot after the inventory response',
-    'Raw inventory is never persisted to rollback evidence',
-    '--timeout-seconds 30 --poll-interval-seconds 0.1',
-    'verify_post_cutover_registration.py',
-    'post-cutover-registration-graph.json',
-    '--expected-identities "$CUTOVER_BACKUP/pre-cutover-identities.json"',
-    'systemctl show --property MainPID --value devops-console.service',
-    '--main-pid "$CONSOLE_MAIN_PID"',
-    'systemctl disable dev-coordinator.service',
-    'dev-coordinator.service.preexisting',
-    'sudo rm -f /etc/systemd/system/dev-coordinator.service',
-    'systemctl reset-failed dev-coordinator.service devops-console.service',
-    'check_coordinator_auth_boundary.py',
-    '--inventory-output "$CUTOVER_BACKUP/post-cutover-inventory.json"',
-    "grep -Eq '^status=200 remote=[^[:space:]]+ tls=0$'",
-    'check_loaded_systemd_paths.py',
-    'resolved-unit-paths.json',
-    'sha256sum --check SHA256SUMS',
-    'For every real attempt, create a new timestamped private backup path',
-    'Retain the backup, script, ledgers, and manifest after success or failure',
-    'not a kernel-continuous monitor',
-    'can leave the ledger `running` or otherwise incomplete',
-    '`cutover-run-started`, `service-stop-attempted`',
-    '`state-migration-attempted`, `relocation-attempted`, and `cutover-success`',
-    'Shell syntax is not helper-interface validation',
-  ]) assert.ok(cutover.includes(marker), marker);
+    'one immutable, content-addressed release',
+    'scripts/software_owned_delivery.py run',
+    'atomically activates the current service topology',
+    'rolls back to the immediately preceding current-format release',
+    'Repository registrations, Console routes, users, grants, settings, secret',
+    'The Test Store and unfinished test work are disposable',
+    'Pre-availability checkout units, handoff listeners, legacy import, fleet adoption, storage split,',
+    'and rollback to the old layout are unsupported',
+  ]) assert.ok(normalizedDeploy.includes(marker), marker);
 
-  assert.doesNotMatch(cutover, /systemctl restart dev-coordinator\.service/);
-  assert.doesNotMatch(cutover, /sleep 2/, 'registration correctness must not depend on a timing sleep');
-  assert.doesNotMatch(cutover, /MainPID --value dev-coordinator\.service/);
-  assert.doesNotMatch(cutover, /\[ -s [^\n]*cgroup\.procs/);
-  assert.doesNotMatch(cutover, /assert status\(/);
-  assert.doesNotMatch(cutover, /--samples(?:\s|=)/, 'cutover must not use point-sample mode');
-  assert.equal((cutover.match(/\.rfind\("\)"\)/g) ?? []).length, 1);
-  assert.equal(
-    (cutover.match(/--continuous-clean-seconds 5/g) ?? []).length,
-    1,
-    'the stable-topology gate requires one five-second observed-clean window',
-  );
-  assert.equal(
-    (cutover.match(/--max-observation-gap-seconds 0\.1/g) ?? []).length,
-    1,
-    'the stable-topology gate enforces its explicit maximum observation gap',
-  );
-  assert.match(
-    cutover,
-    /--continuous-clean-seconds 0\.25 \\\n  --wait-timeout-seconds 5 --poll-interval-seconds 0\.01 \\\n  --max-observation-gap-seconds 0\.05\npython3 "\$DEVCOORDINATOR_ROOT\/scripts\/write_cutover_phase_marker\.py" \\\n  --marker "\$CUTOVER_BACKUP\/service-stop\.attempted" \\\n  --phase service-stop-attempted\nSTOP_ATTEMPTED_THIS_RUN=1\nsudo systemctl stop devops-console\.service/,
-    'the short final handoff must flow only through the durable marker and rollback flag into the service stop',
-  );
-  const stoppedEvidenceIndex = cutover.indexOf(
-    'chmod 600 "$CUTOVER_BACKUP/evidence/legacy-stopped-boundary.json"',
-  );
-  const stoppedManifestIndex = cutover.indexOf(
-    'refresh_manifest\n',
-    stoppedEvidenceIndex,
-  );
-  const writerFreeCopyIndex = cutover.indexOf(
-    'install -d -m 700 "$CUTOVER_BACKUP/user-runtime.writer-free"',
-  );
-  assert.ok(
-    stoppedEvidenceIndex >= 0
-      && stoppedManifestIndex > stoppedEvidenceIndex
-      && writerFreeCopyIndex > stoppedManifestIndex,
-    'the stopped-boundary JSON must be manifest-bound before any writer-free state copy',
-  );
-  assert.match(
-    cutover,
-    /refresh_manifest\(\) \{[\s\S]*?trap 'rm -f "\$tree_tmp" "\$sha_tmp"' EXIT[\s\S]*?mv -f "\$tree_tmp" TREE\.json[\s\S]*?mv -f "\$sha_tmp" SHA256SUMS[\s\S]*?backup directory\/symlink topology mismatch after refresh[\s\S]*?sync -f \.[\s\S]*?\nSH\n\}/,
-    'manifest refresh must clean temporary files, atomically bind topology and hashes, verify, and sync',
-  );
-  assert.equal(
-    (cutover.match(/sudo rm -f \/run\/systemd\/system\/devops-console\.service\.d\/90-cutover-killmode\.conf/g) ?? []).length,
-    3,
-    'normal cutover, failure trap, and rollback must remove the temporary KillMode override',
-  );
-  assert.equal(
-    (cutover.match(/scripts\/terminate_captured_legacy_process\.py/g) ?? []).length,
-    2,
-    'normal stop and rollback must share the exact guarded termination helper',
-  );
-  assert.equal(
-    (cutover.match(/scripts\/check_legacy_cutover_stopped\.py/g) ?? []).length,
-    2,
-    'normal cutover and rollback must both prove captured processes, cgroup, and listeners stopped',
-  );
-  const bashBlocks = [...cutover.matchAll(/```bash\n([\s\S]*?)```/g)].map((match) => match[1]);
-  for (const marker of [
-    'legacy-processes.json',
-    'cgroup-samples.stable.json',
-    'systemctl stop devops-console.service',
-    'systemctl start dev-coordinator.service',
-    'ROLLBACK_STATE=',
-  ]) {
-    const block = bashBlocks.find((candidate) => candidate.includes(marker));
-    assert.ok(block, `missing executable cutover block for ${marker}`);
-    assert.match(block, /^set -euo pipefail\n/, `${marker} block must fail closed`);
-  }
-
-  const stopBlock = bashBlocks.find((candidate) => candidate.includes('systemctl stop devops-console.service'));
-  const shellGuard = stopBlock.split('\n', 1)[0];
-  let failClosedResult;
-  try {
-    await execFileAsync('/bin/bash', [
-      '-c',
-      `${shellGuard}\nverify_post_stop() { return 23; }\nrelocate() { printf 'relocation-sentinel'; }\nverify_post_stop\nrelocate`,
-    ]);
-    assert.fail('a failing post-stop verifier unexpectedly reached the next command');
-  } catch (error) {
-    failClosedResult = error;
-  }
-  assert.equal(failClosedResult.code, 23);
-  assert.doesNotMatch(failClosedResult.stdout ?? '', /relocation-sentinel/);
-
-  const stopLegacy = cutover.indexOf('systemctl stop devops-console.service');
-  const safeKillOverride = cutover.indexOf('90-cutover-killmode.conf');
-  const stableSamples = cutover.indexOf('cgroup-samples.stable.json');
-  const finalSamples = cutover.indexOf('cgroup-samples.prestop-final.json');
-  const poststopCheckpoint = cutover.indexOf('coordinator-state.poststop.json');
-  const trapCleared = cutover.indexOf('trap - EXIT', poststopCheckpoint);
-  const stoppedBoundaryChecks = [...cutover.matchAll(/scripts\/check_legacy_cutover_stopped\.py/g)]
-    .map((match) => match.index);
-  const relocate = cutover.indexOf('port relocate --agent');
-  const retiredAssignmentCleanup = cutover.indexOf('prepare_retired_assignment_cleanup.py" apply');
-  const retiredAssignmentPostCleanup = cutover.indexOf('retired-assignment-post-cleanup.json');
-  const finalModeRepair = cutover.indexOf('find "$CONSOLE_STATE" "$COORDINATOR_HOME" -type f -exec chmod 600 {} +');
-  const finalLayoutPreflight = cutover.indexOf('scripts/check_production_layout.py', finalModeRepair);
-  const migrationMarker = cutover.indexOf('state-migration.attempted');
-  const finalSync = cutover.indexOf('--sync-state-only');
-  const preRelocateCheckpoint = cutover.indexOf('coordinator-state.pre-relocate.json');
-  const relocationMarker = cutover.indexOf('relocation.attempted');
-  const installUnits = cutover.indexOf('sudo install -m 0644', relocate);
-  const startCoordinator = cutover.indexOf('systemctl start dev-coordinator.service', installUnits);
-  const resolvedUnitPaths = cutover.indexOf('check_loaded_systemd_paths.py', installUnits);
-  const startConsole = cutover.indexOf('systemctl start devops-console.service', startCoordinator);
-  const rollbackStateDecision = cutover.indexOf('ROLLBACK_STATE=');
-  const rollbackStart = cutover.indexOf(
-    'sudo systemctl start devops-console.service',
-    rollbackStateDecision,
-  );
-  const rollbackMainIdentity = cutover.indexOf(
-    'ROLLBACK_MAIN_PID="$(systemctl show --property MainPID --value devops-console.service)"',
-    rollbackStart,
-  );
-  const rollbackCgroupIdentity = cutover.indexOf(
-    'ROLLBACK_CGROUP="$(systemctl show --property ControlGroup --value devops-console.service)"',
-    rollbackStart,
-  );
-  const rollbackReady = cutover.indexOf(
-    'verify_legacy_console_rollback_ready.py',
-    rollbackStart,
-  );
-  assert.ok(
-    stableSamples >= 0 && stableSamples < safeKillOverride && safeKillOverride < finalSamples
-      && finalSamples < stopLegacy
-      && stopLegacy < poststopCheckpoint && poststopCheckpoint < trapCleared
-      && trapCleared < finalModeRepair && finalModeRepair < finalLayoutPreflight
-      && finalLayoutPreflight < migrationMarker && migrationMarker < finalSync
-      && finalSync < preRelocateCheckpoint && preRelocateCheckpoint < relocationMarker
-      && relocationMarker < retiredAssignmentCleanup && retiredAssignmentCleanup < relocate
-      && relocate < retiredAssignmentPostCleanup && retiredAssignmentPostCleanup < installUnits
-      && installUnits < resolvedUnitPaths && resolvedUnitPaths < startCoordinator
-      && startCoordinator < startConsole,
-    'legacy cgroup must stop and relocate before split units start',
-  );
-  assert.equal(stoppedBoundaryChecks.length, 2);
-  assert.ok(
-    stopLegacy < stoppedBoundaryChecks[0] && stoppedBoundaryChecks[0] < poststopCheckpoint
-      && stoppedBoundaryChecks[1] < rollbackStateDecision,
-    'rollback must recheck the old cgroup before any state restoration decision',
-  );
-  assert.ok(
-    rollbackStateDecision < rollbackStart
-      && rollbackStart < rollbackMainIdentity
-      && rollbackStart < rollbackCgroupIdentity
-      && rollbackMainIdentity < rollbackReady
-      && rollbackCgroupIdentity < rollbackReady,
-    'rollback must bind its restored systemd identity before the bounded readiness verifier',
-  );
+  assert.equal((deploy.match(/scripts\/software_owned_delivery\.py run/g) ?? []).length, 1);
+  assert.doesNotMatch(readme, /### Existing-host checkout cutover/);
   assert.doesNotMatch(
-    cutover.slice(rollbackStart, rollbackReady),
-    /\bsleep\s+\d/,
-    'rollback readiness must not depend on a fixed post-start sleep',
+    deploy,
+    /child-coordinator|legacy-processes\.json|90-cutover-killmode|verify_legacy_cutover_boundary|CUTOVER_BACKUP/,
   );
+  assert.doesNotMatch(deploy, /systemctl (?:start|stop|restart|disable) dev-coordinator\.service/);
 });
