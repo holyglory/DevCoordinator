@@ -104,6 +104,20 @@ def observe(peer, path, owner_uid, socket_mode=0o666):
 """
     for relative in MODULE.PYTHON_TRUST_SOURCES:
         write(root, relative, safe_python)
+    write(
+        root,
+        "skills/codex-dev-coordinator/scripts/devcoordinator/worker_runner.py",
+        safe_python
+        + """
+
+class WorkerLogCapture:
+    def _publish_redacted(self, placeholder, published):
+        if stat.S_IMODE(placeholder.st_mode) != 0o600:
+            raise RuntimeError("redacted placeholder mode changed")
+        if published.st_nlink != 1:
+            raise RuntimeError("redacted artifact link count changed")
+""",
+    )
 
     safe_node = """export async function publish(fsp, file) {
   await fsp.chmod(file, 0o666);
@@ -362,6 +376,7 @@ def authorize_host_call(peer, request):
         identity_gate = case(base, temp, "identity-gate")
         append(
             identity_gate,
+            "skills/codex-dev-coordinator/scripts/devcoordinator/universal_test_runner.py",
             """
 def reject_identity(root_identity, expected_uid):
     if root_identity.get("uid") != expected_uid:
@@ -386,6 +401,57 @@ def reject_runtime_mode(metadata):
         expect(
             "local_permission_metadata_branch_forbidden" in codes(runtime_mode),
             "runtime permission denial was not detected",
+        )
+
+        worker_scope_owner = case(base, temp, "worker-scope-owner")
+        append(
+            worker_scope_owner,
+            "skills/codex-dev-coordinator/scripts/devcoordinator/worker_runner.py",
+            """
+
+class WorkerLogCapture:
+    def _publish_redacted(self, metadata):
+        if metadata.st_uid != 0 or metadata.st_gid != 0:
+            raise PermissionError("worker log owner denied")
+""",
+        )
+        expect(
+            "local_permission_metadata_branch_forbidden" in codes(worker_scope_owner),
+            "owner denial inside the file-integrity scope was not detected",
+        )
+
+        worker_scope_renamed = case(base, temp, "worker-scope-renamed")
+        append(
+            worker_scope_renamed,
+            "skills/codex-dev-coordinator/scripts/devcoordinator/worker_runner.py",
+            """
+
+class WorkerLogCapture:
+    def publish_redacted(self, metadata):
+        if stat.S_IMODE(metadata.st_mode) != 0o600:
+            raise PermissionError("worker log mode denied")
+""",
+        )
+        expect(
+            "local_permission_metadata_branch_forbidden" in codes(worker_scope_renamed),
+            "renamed file-integrity scope unexpectedly bypassed detection",
+        )
+
+        worker_scope_class = case(base, temp, "worker-scope-class")
+        append(
+            worker_scope_class,
+            "skills/codex-dev-coordinator/scripts/devcoordinator/worker_runner.py",
+            """
+
+class OtherLogCapture:
+    def _publish_redacted(self, metadata):
+        if metadata.st_nlink != 1:
+            raise PermissionError("worker log links denied")
+""",
+        )
+        expect(
+            "local_permission_metadata_branch_forbidden" in codes(worker_scope_class),
+            "same method name in another class unexpectedly bypassed detection",
         )
 
         publication_option = case(base, temp, "publication-option")

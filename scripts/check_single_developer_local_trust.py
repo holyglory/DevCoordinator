@@ -93,6 +93,16 @@ METADATA_GUARD_SOURCES = frozenset(
     }
 )
 
+# These exact production scopes validate the integrity of a file publication;
+# they do not admit or deny a local caller.  Keep this exception qualified by
+# both source path and class/function name, and keep the permitted metadata
+# kinds narrower than the general local-trust detector.
+LOCAL_FILE_INTEGRITY_SCOPES = {
+    "skills/codex-dev-coordinator/scripts/devcoordinator/worker_runner.py": {
+        "WorkerLogCapture._publish_redacted": frozenset({"mode", "nlink"}),
+    },
+}
+
 NODE_TRUST_SOURCES = (
     "apps/DevOpsConsole/edge/publication.mjs",
     "apps/DevOpsConsole/edge/publication-cli.mjs",
@@ -313,10 +323,11 @@ def _call_name(node: ast.AST) -> str:
     return ""
 
 
-def _condition_uses_permission_metadata(
+def _condition_permission_metadata_kinds(
     test: ast.AST, parents: dict[ast.AST, ast.AST]
-) -> bool:
+) -> frozenset[str]:
     del parents
+    kinds: set[str] = set()
     type_only_modes: set[int] = set()
     for candidate in ast.walk(test):
         if (
@@ -335,13 +346,13 @@ def _condition_uses_permission_metadata(
             "st_gid",
             "st_nlink",
         }:
-            return True
+            kinds.add(node.attr.removeprefix("st_"))
         if isinstance(node, ast.Call) and _call_name(node.func).endswith("S_IMODE"):
-            return True
+            kinds.add("mode")
         if isinstance(node, ast.Attribute) and node.attr == "st_mode":
             if id(node) in type_only_modes:
                 continue
-            return True
+            kinds.add("mode")
         if isinstance(node, ast.Subscript):
             key = node.slice
             if isinstance(key, ast.Constant) and key.value in {
@@ -356,7 +367,7 @@ def _condition_uses_permission_metadata(
                     base,
                     re.IGNORECASE,
                 ):
-                    return True
+                    kinds.add(str(key.value))
         if (
             isinstance(node, ast.Call)
             and isinstance(node.func, ast.Attribute)
@@ -371,8 +382,8 @@ def _condition_uses_permission_metadata(
                 base,
                 re.IGNORECASE,
             ):
-                return True
-    return False
+                kinds.add(str(node.args[0].value))
+    return frozenset(kinds)
 
 
 def _has_denial_path(node: ast.AST, source: str) -> bool:
@@ -399,6 +410,7 @@ class _PythonTrustVisitor(ast.NodeVisitor):
         self.check_metadata = check_metadata
         self.findings: list[Finding] = []
         self.parents: dict[ast.AST, ast.AST] = {}
+        self.classes: list[str] = []
         self.functions: list[str] = []
 
     def visit(self, node: ast.AST) -> object:
@@ -424,12 +436,30 @@ class _PythonTrustVisitor(ast.NodeVisitor):
 
     visit_AsyncFunctionDef = visit_FunctionDef
 
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        self.classes.append(node.name)
+        self.generic_visit(node)
+        self.classes.pop()
+
+    def _qualified_function_scope(self) -> str:
+        return ".".join((*self.classes, *self.functions))
+
+    def _is_scoped_file_integrity_check(
+        self, metadata_kinds: frozenset[str]
+    ) -> bool:
+        allowed = LOCAL_FILE_INTEGRITY_SCOPES.get(self.relative, {}).get(
+            self._qualified_function_scope()
+        )
+        return allowed is not None and metadata_kinds <= allowed
+
     def _visit_branch(self, node: ast.If | ast.While | ast.Assert) -> None:
         test = node.test
+        metadata_kinds = _condition_permission_metadata_kinds(test, self.parents)
         if (
             self.check_metadata
-            and _condition_uses_permission_metadata(test, self.parents)
+            and metadata_kinds
             and _has_denial_path(node, self.source)
+            and not self._is_scoped_file_integrity_check(metadata_kinds)
         ):
             self.findings.append(
                 Finding(
