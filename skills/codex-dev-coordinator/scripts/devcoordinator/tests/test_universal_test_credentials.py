@@ -30,7 +30,6 @@ from devcoordinator.universal_test_runner import run
 from devcoordinator.universal_test_runtime import (
     SystemdTestAttemptManager,
     TestAttemptDescriptor,
-    TestAttemptRuntimeNotFound,
 )
 from devcoordinator.universal_test_store import (
     TestStoreConflict,
@@ -525,7 +524,7 @@ class UniversalTestOperationalCredentialTests(unittest.TestCase):
             self.provider._prepared_state_path(committed_runtime).exists()
         )
 
-    def test_absent_terminal_cleanup_requires_exact_launch_and_native_evidence(
+    def test_exact_absence_allows_cleanup_but_loaded_without_evidence_fails(
         self,
     ) -> None:
         self.register()
@@ -536,14 +535,56 @@ class UniversalTestOperationalCredentialTests(unittest.TestCase):
             str(lease.credential_files[0]["source_path"])
         ).parent
 
-        def unavailable_systemd(
+        def loaded_without_evidence(
             argv, **_values
         ) -> subprocess.CompletedProcess[str]:
             return subprocess.CompletedProcess(
                 list(argv),
-                1,
-                stdout="",
-                stderr="unit not found",
+                0,
+                stdout="\n".join(
+                    (
+                        "LoadState=loaded",
+                        "ActiveState=active",
+                        "SubState=running",
+                    )
+                ),
+                stderr="",
+            )
+
+        contradictory = SystemdTestAttemptManager(
+            attempt_root=self.root / "attempts",
+            artifact_root=self.root / "artifacts",
+            result_package_root=self.root / "result-packages",
+            cgroup_root=self.root / "cgroup",
+            credential_provider=BrokerOperationalCredentialProvider(
+                registry_path=self.registry,
+                material_root=self.material_root,
+                runtime_root=self.runtime_root,
+                expected_authority_uid=self.owner_uid,
+            ),
+            runner=loaded_without_evidence,
+        )
+        with self.assertRaisesRegex(
+            TestStoreConflict,
+            "loaded without exact launch evidence",
+        ):
+            contradictory.status(runtime_id)
+        self.assertTrue(lease_directory.is_dir())
+
+        def exact_not_found(
+            argv, **_values
+        ) -> subprocess.CompletedProcess[str]:
+            return subprocess.CompletedProcess(
+                list(argv),
+                0,
+                stdout="\n".join(
+                    (
+                        "LoadState=not-found",
+                        "ActiveState=inactive",
+                        "SubState=dead",
+                    )
+                ),
+                stderr="",
             )
 
         manager = SystemdTestAttemptManager(
@@ -557,29 +598,7 @@ class UniversalTestOperationalCredentialTests(unittest.TestCase):
                 runtime_root=self.runtime_root,
                 expected_authority_uid=self.owner_uid,
             ),
-            runner=unavailable_systemd,
-        )
-        with self.assertRaisesRegex(
-            TestAttemptRuntimeNotFound,
-            "launch evidence is absent",
-        ):
-            manager.status(runtime_id)
-        self.assertTrue(lease_directory.is_dir())
-
-        state_root = manager._prepare_attempt_state(runtime_id)
-        manager._publish_runner_launch(
-            descriptor,
-            state=state_root,
-            execution_root=self.repository,
-            owner_gid=os.getegid(),
-        )
-        manager._publish_native_evidence(
-            runtime_id,
-            descriptor,
-            invocation_id="test-invocation-" + "1" * 32,
-            prepared_at=1_700_000_000.0,
-            started_at=1_700_000_001.0,
-            control_group=f"/system.slice/{runtime_id}.service",
+            runner=exact_not_found,
         )
         state = manager.status(runtime_id)
         self.assertEqual(state.state, "absent")

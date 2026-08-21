@@ -142,6 +142,66 @@ class UniversalTestRunnerTests(unittest.TestCase):
         copy_result_package_artifact(package, artifact_id, destination)
         return destination.getvalue()
 
+    def runtime_manager(
+        self,
+        name: str,
+        *,
+        runner,
+    ) -> SystemdTestAttemptManager:
+        runtime_root = Path(self.temporary.name) / name
+        cgroup_root = runtime_root / "cgroup"
+        cgroup_root.mkdir(parents=True, mode=0o700)
+        return SystemdTestAttemptManager(
+            attempt_root=runtime_root / "attempts",
+            artifact_root=runtime_root / "artifacts",
+            result_package_root=runtime_root / "result-packages",
+            cgroup_root=cgroup_root,
+            runner=runner,
+        )
+
+    def prepare_runtime_observation(
+        self,
+        manager: SystemdTestAttemptManager,
+        descriptor: TestAttemptDescriptor,
+        *,
+        populated: bool,
+        copy_runner_output: bool = True,
+        prepared_at: float = 11.0,
+        started_at: float | None = 12.0,
+    ) -> tuple[str, Path, str]:
+        runtime_id = manager._runtime_id(descriptor)
+        state = manager.attempt_root / runtime_id
+        state.mkdir(parents=True, mode=0o700)
+        _launch_path, result_path = manager._publish_runner_launch(
+            descriptor,
+            state=state,
+            execution_root=Path(descriptor.execution_root),
+            owner_gid=os.getegid(),
+        )
+        if copy_runner_output:
+            for source in self.output.iterdir():
+                destination = state / "output" / source.name
+                if source.is_dir():
+                    shutil.copytree(source, destination, copy_function=shutil.copy2)
+                else:
+                    shutil.copy2(source, destination)
+        control_group = f"/tests.slice/{runtime_id}.service"
+        manager._publish_native_evidence(
+            runtime_id,
+            descriptor,
+            invocation_id="test-invocation-" + "1" * 32,
+            prepared_at=prepared_at,
+            started_at=started_at,
+            control_group=control_group,
+        )
+        events = manager._control_group_path(control_group) / "cgroup.events"
+        events.parent.mkdir(parents=True, mode=0o700)
+        events.write_text(
+            f"populated {1 if populated else 0}\n",
+            encoding="ascii",
+        )
+        return runtime_id, result_path, control_group
+
     def fake_dotnet(self, source: str) -> Path:
         executable = self.root / "fake-dotnet"
         executable.write_text(
@@ -560,48 +620,42 @@ class UniversalTestRunnerTests(unittest.TestCase):
         self.assertEqual(run(descriptor, self.output, result_path), 0)
         expected = self.result_document(result_path)
 
-        runtime_id = "devcoordinator-test-collected-usage"
-        attempt_root = Path(self.temporary.name) / "collected-attempts"
-        state_root = attempt_root / runtime_id
-        state_root.mkdir(parents=True)
-        shutil.copytree(self.output, state_root / "output", copy_function=shutil.copy2)
-        (state_root / "launch.json").write_text(
-            json.dumps({"descriptor": descriptor.to_document()}),
-            encoding="utf-8",
-        )
-
         def collected(_argv, **_kwargs):
             return subprocess.CompletedProcess(_argv, 1, "", "unit collected")
 
-        manager = SystemdTestAttemptManager(
-            attempt_root=attempt_root,
-            artifact_root=Path(self.temporary.name) / "collected-artifacts",
-            runner=collected,
+        manager = self.runtime_manager("collected-usage", runner=collected)
+        runtime_id, _result_path, _control_group = self.prepare_runtime_observation(
+            manager,
+            descriptor,
+            populated=False,
         )
         observed = manager.status(runtime_id)
 
-        self.assertEqual(observed.state, "collected")
+        self.assertEqual(observed.state, "absent")
         self.assertEqual(
             observed.peak_memory_bytes,
             expected["peak_memory_bytes"],
         )
         self.assertEqual(observed.cpu_seconds, expected["cpu_seconds"])
+        self.assertIsNotNone(observed.result_package)
+        assert observed.result_package is not None
+        retained = manager.resolve_result_package(
+            str(observed.result_package["storage_handle"])
+        )
+        self.assertEqual(
+            retained.manifest["resource_usage"]["peak_memory_bytes"],
+            expected["peak_memory_bytes"],
+        )
+        self.assertEqual(
+            retained.manifest["resource_usage"]["cpu_seconds"],
+            expected["cpu_seconds"],
+        )
 
     def test_successful_not_found_observation_drains_durable_result(self) -> None:
         descriptor = self.descriptor(("/usr/bin/python3", "-c", "pass"))
         result_path = self.output / RESULT_PACKAGE_FILE_NAME
         self.assertEqual(run(descriptor, self.output, result_path), 0)
         expected = self.result_document(result_path)
-
-        runtime_id = "devcoordinator-test-collected-not-found"
-        attempt_root = Path(self.temporary.name) / "not-found-attempts"
-        state_root = attempt_root / runtime_id
-        state_root.mkdir(parents=True)
-        shutil.copytree(self.output, state_root / "output", copy_function=shutil.copy2)
-        (state_root / "launch.json").write_text(
-            json.dumps({"descriptor": descriptor.to_document()}),
-            encoding="utf-8",
-        )
 
         def collected(_argv, **_kwargs):
             stdout = "\n".join((
@@ -615,32 +669,35 @@ class UniversalTestRunnerTests(unittest.TestCase):
             ))
             return subprocess.CompletedProcess(_argv, 0, stdout, "")
 
-        manager = SystemdTestAttemptManager(
-            attempt_root=attempt_root,
-            artifact_root=Path(self.temporary.name) / "not-found-artifacts",
-            runner=collected,
+        manager = self.runtime_manager("not-found", runner=collected)
+        runtime_id, _result_path, _control_group = self.prepare_runtime_observation(
+            manager,
+            descriptor,
+            populated=False,
         )
         observed = manager.status(runtime_id)
 
-        self.assertEqual(observed.state, "collected")
+        self.assertEqual(observed.state, "absent")
         self.assertEqual(observed.exit_status, expected["returncode"])
-        self.assertEqual(observed.result_document, expected)
+        self.assertIsNotNone(observed.result_package)
+        assert observed.result_package is not None
+        retained = manager.resolve_result_package(
+            str(observed.result_package["storage_handle"])
+        )
+        self.assertEqual(
+            retained.manifest["outcome"]["returncode"],
+            expected["returncode"],
+        )
+        self.assertEqual(
+            retained.evidence.identity,
+            manager._package_identity(descriptor),
+        )
         self.assertEqual(observed.termination_reason, "success")
 
     def test_loaded_unit_prefers_cgroup_usage_over_runner_fallback(self) -> None:
         descriptor = self.descriptor(("/usr/bin/python3", "-c", "pass"))
         result_path = self.output / RESULT_PACKAGE_FILE_NAME
         self.assertEqual(run(descriptor, self.output, result_path), 0)
-
-        runtime_id = "devcoordinator-test-cgroup-usage"
-        attempt_root = Path(self.temporary.name) / "cgroup-attempts"
-        state_root = attempt_root / runtime_id
-        state_root.mkdir(parents=True)
-        shutil.copytree(self.output, state_root / "output", copy_function=shutil.copy2)
-        (state_root / "launch.json").write_text(
-            json.dumps({"descriptor": descriptor.to_document()}),
-            encoding="utf-8",
-        )
 
         def observed(_argv, **_kwargs):
             stdout = "\n".join((
@@ -657,10 +714,11 @@ class UniversalTestRunnerTests(unittest.TestCase):
             ))
             return subprocess.CompletedProcess(_argv, 0, stdout, "")
 
-        manager = SystemdTestAttemptManager(
-            attempt_root=attempt_root,
-            artifact_root=Path(self.temporary.name) / "cgroup-artifacts",
-            runner=observed,
+        manager = self.runtime_manager("cgroup-usage", runner=observed)
+        runtime_id, _result_path, _control_group = self.prepare_runtime_observation(
+            manager,
+            descriptor,
+            populated=False,
         )
         state = manager.status(runtime_id)
 
@@ -668,20 +726,10 @@ class UniversalTestRunnerTests(unittest.TestCase):
         self.assertEqual(state.cpu_seconds, 3.5)
         self.assertIsNone(state.current_memory_bytes)
 
-    def test_active_unit_exposes_atomic_runner_result_for_terminal_convergence(self) -> None:
+    def test_active_unit_defers_atomic_runner_result_until_terminal_convergence(self) -> None:
         descriptor = self.descriptor(("/usr/bin/python3", "-c", "pass"))
         result_path = self.output / RESULT_PACKAGE_FILE_NAME
         self.assertEqual(run(descriptor, self.output, result_path), 0)
-        expected = self.result_document(result_path)
-        runtime_id = "devcoordinator-test-active-result"
-        attempt_root = Path(self.temporary.name) / "active-result-attempts"
-        state_root = attempt_root / runtime_id
-        state_root.mkdir(parents=True)
-        shutil.copytree(self.output, state_root / "output", copy_function=shutil.copy2)
-        (state_root / "launch.json").write_text(
-            json.dumps({"descriptor": descriptor.to_document()}),
-            encoding="utf-8",
-        )
 
         def active(_argv, **_kwargs):
             stdout = "\n".join((
@@ -698,51 +746,52 @@ class UniversalTestRunnerTests(unittest.TestCase):
             ))
             return subprocess.CompletedProcess(_argv, 0, stdout, "")
 
-        manager = SystemdTestAttemptManager(
-            attempt_root=attempt_root,
-            artifact_root=Path(self.temporary.name) / "active-result-artifacts",
-            runner=active,
+        manager = self.runtime_manager("active-result", runner=active)
+        runtime_id, published_path, _control_group = self.prepare_runtime_observation(
+            manager,
+            descriptor,
+            populated=True,
         )
 
         observed = manager.status(runtime_id)
 
         self.assertTrue(observed.active)
-        self.assertEqual(observed.result_document, expected)
+        self.assertTrue(published_path.is_file())
+        self.assertIsNone(observed.result_package)
         self.assertEqual(observed.current_memory_bytes, 1024 * 1024)
 
-    def test_active_unit_recovers_nonextending_start_from_legacy_launch_time(self) -> None:
+    def test_active_unit_uses_nonextending_native_preparation_time_when_start_is_missing(self) -> None:
         descriptor = self.descriptor(("/usr/bin/python3", "-c", "pass"))
-        runtime_id = "devcoordinator-test-recovered-start"
-        attempt_root = Path(self.temporary.name) / "recovered-start-attempts"
-        state_root = attempt_root / runtime_id
-        state_root.mkdir(parents=True)
-        launch_path = state_root / "launch.json"
-        launch_path.write_text(
-            json.dumps({"descriptor": descriptor.to_document()}),
-            encoding="utf-8",
-        )
-        os.utime(launch_path, (12.5, 12.5))
-        manager = SystemdTestAttemptManager(
-            attempt_root=attempt_root,
-            artifact_root=Path(self.temporary.name) / "recovered-start-artifacts",
+
+        def active(_argv, **_kwargs):
+            stdout = "\n".join((
+                "LoadState=loaded",
+                "ActiveState=active",
+                "SubState=running",
+                "Result=",
+                "ExecMainCode=0",
+                "ExecMainStatus=0",
+                "OOMKilled=no",
+            ))
+            return subprocess.CompletedProcess(_argv, 0, stdout, "")
+
+        manager = self.runtime_manager("recovered-start", runner=active)
+        runtime_id, _result_path, _control_group = self.prepare_runtime_observation(
+            manager,
+            descriptor,
+            populated=True,
+            copy_runner_output=False,
+            prepared_at=12.5,
+            started_at=None,
         )
 
-        self.assertEqual(manager._attempt_started_at(runtime_id), 12.5)
-        self.assertEqual(manager._started[runtime_id], 12.5)
+        observed = manager.status(runtime_id)
+
+        self.assertTrue(observed.active)
+        self.assertEqual(observed.started_at, 12.5)
 
     def test_active_unit_exposes_bounded_output_growth_without_content(self) -> None:
         descriptor = self.descriptor(("/usr/bin/python3", "-c", "pass"))
-        runtime_id = "devcoordinator-test-active-progress"
-        attempt_root = Path(self.temporary.name) / "active-progress-attempts"
-        state_root = attempt_root / runtime_id
-        output = state_root / "output"
-        output.mkdir(parents=True)
-        (state_root / "launch.json").write_text(
-            json.dumps({"descriptor": descriptor.to_document()}),
-            encoding="utf-8",
-        )
-        (output / f"{descriptor.execution_id}-stdout.log").write_bytes(b"progress\n")
-        (output / f"{descriptor.execution_id}-stderr.log").write_bytes(b"warn\n")
 
         def active(_argv, **_kwargs):
             stdout = "\n".join((
@@ -759,11 +808,16 @@ class UniversalTestRunnerTests(unittest.TestCase):
             ))
             return subprocess.CompletedProcess(_argv, 0, stdout, "")
 
-        manager = SystemdTestAttemptManager(
-            attempt_root=attempt_root,
-            artifact_root=Path(self.temporary.name) / "active-progress-artifacts",
-            runner=active,
+        manager = self.runtime_manager("active-progress", runner=active)
+        runtime_id, _result_path, _control_group = self.prepare_runtime_observation(
+            manager,
+            descriptor,
+            populated=True,
+            copy_runner_output=False,
         )
+        output = manager.attempt_root / runtime_id / "output"
+        (output / f"{descriptor.execution_id}-stdout.log").write_bytes(b"progress\n")
+        (output / f"{descriptor.execution_id}-stderr.log").write_bytes(b"warn\n")
 
         observed = manager.status(runtime_id)
 
