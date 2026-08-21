@@ -137,7 +137,7 @@ class AgentMcpProtocolTests(unittest.TestCase):
         listed = session.handle(
             {"jsonrpc": "2.0", "id": 4, "method": "tools/list"}
         )
-        self.assertEqual(len(listed["result"]["tools"]), 12)
+        self.assertEqual(len(listed["result"]["tools"]), 11)
 
     def test_stdio_emits_only_one_finite_json_rpc_line_per_response(self) -> None:
         input_stream = io.BytesIO(
@@ -194,10 +194,9 @@ class AgentMcpToolTests(unittest.TestCase):
                 "runtime_status",
                 "runtime_ensure",
                 "operation_follow",
-                "test_run",
+                "test_enqueue",
+                "test_submit",
                 "test_follow",
-                "test_cancel",
-                "test_artifact",
                 "bug_report",
                 "bug_list",
                 "bug_close",
@@ -219,7 +218,6 @@ class AgentMcpToolTests(unittest.TestCase):
             "runtime_status",
             "operation_follow",
             "test_follow",
-            "test_artifact",
             "bug_list",
         ):
             annotations = tools[name]["annotations"]
@@ -235,7 +233,7 @@ class AgentMcpToolTests(unittest.TestCase):
                 "openWorldHint": False,
             },
         )
-        for name in ("test_run",):
+        for name in ("test_enqueue", "test_submit"):
             self.assertFalse(tools[name]["annotations"]["readOnlyHint"])
             self.assertFalse(tools[name]["annotations"]["destructiveHint"])
             self.assertFalse(tools[name]["annotations"]["idempotentHint"])
@@ -260,7 +258,7 @@ class AgentMcpToolTests(unittest.TestCase):
         self.assertEqual(json.loads(result["content"][0]["text"]), expected)
         self.assertNotIn("\n", result["content"][0]["text"])
 
-    def test_test_run_generates_mutation_uuid_before_execute(self) -> None:
+    def test_test_enqueue_generates_mutation_uuid_before_execute(self) -> None:
         seen = {}
 
         def execute(namespace):
@@ -272,7 +270,7 @@ class AgentMcpToolTests(unittest.TestCase):
             }
 
         with mock.patch.object(agent_cli, "_execute", side_effect=execute):
-            result = agent_mcp._call_tool("test_run", {"intent": "change"})
+            result = agent_mcp._call_tool("test_enqueue", {"intent": "change"})
         operation_id = seen["namespace"].operation_id
         self.assertEqual(str(uuid.UUID(operation_id)), operation_id)
         self.assertEqual(result["structuredContent"]["operation_id"], operation_id)
@@ -313,8 +311,8 @@ class AgentMcpToolTests(unittest.TestCase):
 
         with mock.patch.object(agent_cli, "_execute", side_effect=execute):
             result = agent_mcp._call_tool(
-                "test_run",
-                {"intent": "manual", "targets": ["unit"], "operation_id": operation_id},
+                "test_submit",
+                {"plan": "dc1:plan:plan-1", "operation_id": operation_id},
             )
         self.assertEqual(result["structuredContent"]["operation_id"], operation_id)
 
@@ -470,7 +468,7 @@ class AgentMcpToolTests(unittest.TestCase):
 
         with mock.patch.object(agent_cli, "_execute", side_effect=fail):
             result = agent_mcp._call_tool(
-                "test_run", {"intent": "checkpoint"}
+                "test_enqueue", {"intent": "checkpoint"}
             )
         error = result["structuredContent"]
         self.assertTrue(result["isError"])
@@ -501,7 +499,7 @@ class AgentMcpToolTests(unittest.TestCase):
             mock.patch.object(agent_cli, "_execute", side_effect=execute),
         ):
             result = agent_mcp._call_tool(
-                "test_run", {"intent": "change"}
+                "test_enqueue", {"intent": "change"}
             )
         records = [call.args[0] for call in journal.record.call_args_list]
         self.assertEqual([record["phase"] for record in records], ["received", "completed"])

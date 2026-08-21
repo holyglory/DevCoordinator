@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import copy
 import hashlib
 import json
@@ -29,6 +30,7 @@ from devcoordinator.universal_test_scheduler import (
 from devcoordinator.universal_test_service import (
     RepositoryUIDPlanPreviewer,
     StoreTestPlaneAdapter,
+    verified_artifact_chunk,
     verified_text_artifact_content,
     TestPlaneClient,
     TestPlanPreviewUnavailable,
@@ -782,6 +784,24 @@ class UniversalTestStoreTests(StoreFixture):
         self.assertTrue(content["truncated"])
         self.assertTrue(content["text"].endswith("exact-tail\n"))
         self.assertNotIn("discarded-prefix", content["text"])
+        first = verified_artifact_chunk(
+            resolved["artifact"],
+            offset=0,
+            length=17,
+            artifact_root=artifact_root,
+        )
+        second = verified_artifact_chunk(
+            resolved["artifact"],
+            offset=17,
+            length=1024 * 1024,
+            artifact_root=artifact_root,
+        )
+        self.assertEqual(base64.b64decode(first["data_base64"]), payload[:17])
+        self.assertEqual(base64.b64decode(second["data_base64"]), payload[17:])
+        self.assertEqual(first["content_identity"], second["content_identity"])
+        self.assertFalse(first["eof"])
+        self.assertTrue(second["eof"])
+        self.assertEqual(second["next_offset"], len(payload))
 
     def test_status_exposes_advancing_active_attempt_liveness(self) -> None:
         submitted = self.submit()

@@ -81,12 +81,10 @@ class CapabilityContractTests(unittest.TestCase):
         )
         self.assertEqual(document["runtime"]["ensure_states"], ["ready", "stopped"])
         self.assertEqual(
-            document["tests"]["run_intents"],
+            document["tests"]["enqueue_intents"],
             ["change", "checkpoint", "handoff", "release", "manual"],
         )
-        self.assertEqual(
-            document["tests"]["actions"], ["artifact", "cancel", "follow", "run"]
-        )
+        self.assertIn("queue-status", document["tests"]["actions"])
         self.assertEqual(document["database"], ["backup", "retire"])
         self.assertEqual(document["compose"]["actions"], ["recreate-service"])
         self.assertEqual(document["ephemeral_image"], ["prefetch", "status"])

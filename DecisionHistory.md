@@ -2,18 +2,20 @@
 
 ## Direction
 
-Confirmed simplification direction: retain repository registrations, routes,
+Confirmed S1 simplification direction: retain repository registrations, routes,
 Console users/grants/settings, secret references, valuable repository source,
-project databases, and recoverable database-backup artifacts; rebuild all
-other incompatible execution state. Tests, plans, cases, artifacts, rollups,
-queues, retries, progress, evidence reuse, and unfinished attempts are
-disposable. A DevCoordinator restart cancels unfinished tests for rerun. The
-public test surface is run, follow, cancel, and artifact retrieval. The
-completed pre-availability cutover, legacy authority import/storage split,
-temporary handoff services, historical test journal, and rollback to the old
-layout are unsupported. Current releases use immutable packaging, atomic
-activation, health verification, and rollback to the preceding current-format
-release. See
+project databases, and recoverable database-backup artifacts while rebuilding
+incompatible disposable execution state. Testd and its Test Store remain the
+sole semantic test authority; completed pre-availability cutover, duplicate
+legacy authority/import paths, and compatibility-only state machinery are
+removed. The stable test actions remain `enqueue`, reviewed `submit`, `follow`,
+`queue-status`, `failures`, `cases`, `artifact`, `artifact-export`, `cancel`, and
+`retry`. Same-schema active-attempt recovery, bounded diagnostic continuations,
+verified artifact export, exact identities and generations, path containment,
+idempotency, non-root execution, cgroup isolation, TTL cleanup, and separate
+secret transport remain current requirements. Current releases use immutable
+packaging, atomic activation, health verification, and rollback to the
+preceding current-format release. See
 [DC-2026-08-19-ARCHITECTURE-SIMPLIFICATION-02](DecisionDetails/DC-2026-08-19-ARCHITECTURE-SIMPLIFICATION-02.md).
 
 Confirmed product direction: one canonical Git worktree is one project, temporary worktrees remain children of their original repository, and immutable Coordinator identities determine every resource relationship. Python publishes one root-repository → temporary-repository → resource tree; Board and Console render it without ownership heuristics and keep current, actionable content compact. The Board separates resource work from incident review into one active center workspace with one vertical scroll owner, while the selected resource inspector remains stable. Performance reconciles whole-host totals as dense stacked composition with explicit attribution coverage and residuals; project and Agent-browser detail appears only on demand. Headless automation browsers are measured host workloads whose caller-independent idle cleanup belongs to Coordinator, while project/test owners retain their own browser lifecycle. See [DC-2026-08-03-BROWSER-LIFECYCLE-01](DecisionDetails/DC-2026-08-03-BROWSER-LIFECYCLE-01.md), [DC-2026-08-03-PERFORMANCE-01](DecisionDetails/DC-2026-08-03-PERFORMANCE-01.md), [DC-2026-07-27-BOARD-INCIDENTS-01](DecisionDetails/DC-2026-07-27-BOARD-INCIDENTS-01.md), [DC-2026-07-25-RUNTIME-01](DecisionDetails/DC-2026-07-25-RUNTIME-01.md), and [DC-2026-07-21-CONSOLE-DATA-01](DecisionDetails/DC-2026-07-21-CONSOLE-DATA-01.md).
@@ -28,9 +30,11 @@ Confirmed container-cleanup exception: on this single-developer server, an agent
 
 Confirmed project systemd boundary: the immutable root administrative release may commission only an exact project `deploy/systemd/<unit>.service` non-root one-shot and optional sibling timer through non-mutating plan/status and a revalidated fingerprint-bound apply. Installation, replacement, one-shot execution, and timer activation are distinct desired states; implementing the capability never authorizes executing a particular maintenance or retention job. See [DC-2026-08-10-SYSTEMD-COMMISSIONING-01](DecisionDetails/DC-2026-08-10-SYSTEMD-COMMISSIONING-01.md).
 
-Confirmed test-execution direction: direct local tests are narrow feedback only—one invocation must be proven before launch to collect at most 20 cases, enforce at most 10 seconds of execution, need no shared state, and not reconstruct a larger suite through repeated commands. Unknown or larger scope and all durable evidence use one governed Coordinator batch; the same local bounds apply during a reported harness outage. A private durable active-attempt spool may grant its exact generation/owner binding one bounded recovery lease after testd replacement, so independently supervised native work survives control-plane downtime without permitting a reaped or terminal attempt to return. See [DC-2026-08-09-TESTD-RECOVERY-01](DecisionDetails/DC-2026-08-09-TESTD-RECOVERY-01.md) and [DC-2026-08-09-TEST-BATCHING-01](DecisionDetails/DC-2026-08-09-TEST-BATCHING-01.md).
+Confirmed test-execution direction: direct local tests are narrow feedback only—one invocation must be proven before launch to collect at most 20 cases, enforce at most 10 seconds of execution, need no shared state, and not reconstruct a larger suite through repeated commands. Unknown or larger scope and all durable evidence use one governed Coordinator batch; the same local bounds apply during a reported harness outage. A private durable active-attempt spool may grant its exact generation/owner binding one bounded recovery lease after testd replacement, so independently supervised native work survives control-plane downtime without permitting a reaped or terminal attempt to return. Verified retained artifacts remain server-owned, but an explicit local agent command may stream their exact bytes in bounded ordered chunks, verify the complete digest as the caller, and atomically publish a new local file without exposing bytes in agent JSON, logs, Console, or public traffic. See [DC-2026-08-21-TEST-ARTIFACT-EXPORT-01](DecisionDetails/DC-2026-08-21-TEST-ARTIFACT-EXPORT-01.md), [DC-2026-08-09-TESTD-RECOVERY-01](DecisionDetails/DC-2026-08-09-TESTD-RECOVERY-01.md), and [DC-2026-08-09-TEST-BATCHING-01](DecisionDetails/DC-2026-08-09-TEST-BATCHING-01.md).
 
 Confirmed test-simplification direction: a DevCoordinator cutover changes DevCoordinator itself, never a repository under test. Testd and its isolated Test Store are the sole semantic authority for plans, runs, attempts, deadlines, result order, terminal conclusions, and leases. Every repository's test data and Test Store compatibility history are disposable; an incompatible release activates an empty store without backup/import/migration. Repository registrations, routes, users and grants remain retained control data, including their exact authority-database recovery gates. The privileged snapshot/runtime boundary returns exact host facts and performs only idempotent prepare/start/observe/stop/collect actions. Routine agents use enqueue, reviewed submit, follow, and cancel, with bounded diagnostic continuations. Framework-specific command adaptation, dependency preparation, and reporter parsing live behind explicit drivers rather than in the scheduler/store core. See [DC-2026-08-19-TEST-SIMPLIFICATION-01](DecisionDetails/DC-2026-08-19-TEST-SIMPLIFICATION-01.md).
+
+Confirmed immutable state direction: an immutable target may consume a repository-owned live SQLite state directory only through a bounded manifest-declared handle that the root boundary containment-checks, identity-pins, and reintroduces read-only at its canonical path inside the unit-private namespace. The database remains live and authoritative; it is never copied into the snapshot, made writable, or exposed to another target. See [DC-2026-08-20-IMMUTABLE-STATE-HANDLE-01](DecisionDetails/DC-2026-08-20-IMMUTABLE-STATE-HANDLE-01.md).
 
 Confirmed acceptance-scope direction: DevCoordinator readiness is held open by acceptance of DevCoordinator-owned capabilities and interfaces, not by live canaries tied to a particular external consumer repository. External repositories may supply regression evidence, but their names, resources, credentials, or application-specific browser journeys do not remain DevCoordinator completion blockers. See [DC-2026-08-11-ACCEPTANCE-SCOPE-01](DecisionDetails/DC-2026-08-11-ACCEPTANCE-SCOPE-01.md).
 
@@ -40,18 +44,38 @@ Confirmed efficiency direction: delivery-efficiency measurement remains owned by
 
 ID: DC-2026-08-19-ARCHITECTURE-SIMPLIFICATION-02 · Details: [supporting record](DecisionDetails/DC-2026-08-19-ARCHITECTURE-SIMPLIFICATION-02.md)
 
-Decision: Remove the completed pre-availability cutover and legacy authority
-compatibility product; make test execution current-run-only; cancel unfinished
-attempts on restart; expose only run/follow/cancel/artifact; rebuild
-incompatible operational state from retained repositories, routes, users,
-grants/settings and current host observation; and keep only the public,
-application, root-authority, scheduler, and transient-execution boundaries.
+Decision: Remove the completed pre-availability cutover and duplicate legacy
+authority/import compatibility product, rebuild incompatible disposable
+execution state from retained repositories, routes, users, grants/settings and
+current host observation, and keep only the public, application,
+root-authority, scheduler, and transient-execution boundaries. Preserve the
+stable enqueue/reviewed-submit/follow/queue-status/failures/cases/artifact/
+artifact-export/cancel/retry surface and the current same-schema recovery,
+bounded-evidence, exact-identity, non-root, cgroup, TTL, containment,
+idempotency, and secret-transport requirements.
 
 Why: Keeping or merely refactoring compatibility retained two test journals,
-historical analytics, recovery/chunk state machines, one hundred authority and
-broker table names, and 36k production lines for a completed cutover. A clean
-current-state architecture directly matches the confirmed retention boundary;
-rerunning disposable work is simpler than recovering it.
+historical analytics, duplicate lifecycle interpretations, one hundred
+authority and broker table names, and 36k production lines for a completed
+cutover. A clean current-state architecture matches the confirmed retention
+boundary without deleting supported agent journeys or their regression
+guarantees.
+
+## DC-2026-08-20-IMMUTABLE-STATE-HANDLE-01 — Immutable tests receive explicit read-only live state handles
+
+ID: DC-2026-08-20-IMMUTABLE-STATE-HANDLE-01 · Details: [supporting record](DecisionDetails/DC-2026-08-20-IMMUTABLE-STATE-HANDLE-01.md)
+
+Decision: Extend schema-3 test manifests with bounded named SQLite state handles. Only targets that explicitly reference a handle receive its root-validated repository-contained directory as an identity-pinned read-only bind at its canonical path plus the declared non-secret environment path; snapshots and artifacts never contain the database.
+
+Why: Snapshot-copying the database, exposing the primary checkout, using a writable bind, hard-coding a product repository, and a generic arbitrary mount surface were considered. Copies break live database identity, checkout exposure and writable binds weaken isolation, repository-specific rules couple Coordinator to a consumer, and arbitrary mounts are too broad. A typed SQLite handle is the narrow reusable behavior required by authoritative repository state.
+
+## DC-2026-08-21-TEST-ARTIFACT-EXPORT-01 — Verified artifacts stream to an atomic caller-owned file
+
+ID: DC-2026-08-21-TEST-ARTIFACT-EXPORT-01 · Details: [supporting record](DecisionDetails/DC-2026-08-21-TEST-ARTIFACT-EXPORT-01.md)
+
+Decision: Add an explicit local artifact-export command that pages exact verified bytes through the existing broker/test plane, validates stable artifact identity, byte order, total size and complete SHA-256 in the caller, then publishes a new mode-0600 file atomically without overwrite. Agent JSON, call journals, Console and public HTTP retain metadata only.
+
+Why: Metadata-only access, embedding bytes in the bounded agent result, returning a private service path, and a public download endpoint were considered. Metadata alone cannot bind release evidence; agent JSON cannot carry large artifacts; service paths bypass the supported interface; and public download expands the trust boundary. Bounded local streaming preserves existing service ownership and makes all retained artifact kinds usable without public exposure.
 
 ## DC-2026-08-19-TEST-SIMPLIFICATION-01 — Testd owns one disposable execution state machine
 

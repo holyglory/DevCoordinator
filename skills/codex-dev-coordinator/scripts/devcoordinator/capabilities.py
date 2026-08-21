@@ -113,12 +113,23 @@ def broker_capabilities(
             "surface": "console:#/routes",
         },
         "process_isolation": {
-            "termination": "cgroup.kill",
+            "termination": "systemd-unit",
             "empty_proof": "populated=0",
         },
         "tests": {
-            "actions": ["artifact", "cancel", "follow", "run"],
-            "run_intents": [
+            "actions": [
+                "artifact",
+                "artifact-export",
+                "cancel",
+                "cases",
+                "enqueue",
+                "failures",
+                "follow",
+                "queue-status",
+                "retry",
+                "submit",
+            ],
+            "enqueue_intents": [
                 "change",
                 "checkpoint",
                 "handoff",

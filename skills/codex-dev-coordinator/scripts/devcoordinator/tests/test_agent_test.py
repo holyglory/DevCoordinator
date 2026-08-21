@@ -15,8 +15,10 @@ from devcoordinator.broker_backend import _test_run_actor
 from devcoordinator.agent_test import (
     MAX_TEST_RESULT_BYTES,
     child_operation_id,
+    enqueue_test,
+    project_queue_status,
     project_test_follow,
-    run_test,
+    submit_test_plan,
 )
 
 
@@ -89,7 +91,44 @@ class Profile:
 
 
 class AgentTestTests(unittest.TestCase):
-    def test_run_replays_completed_durable_preview_and_submits(self) -> None:
+    def test_queue_status_projection_is_bounded_without_run_identity(self) -> None:
+        result = project_queue_status(
+            {
+                "repository_id": "repo-1",
+                "sampled_at": 123.0,
+                "phase": "scheduler",
+                "global_targets": {"queued": 4, "leased": 1, "running": 2},
+                "repository_targets": {"queued": 2, "leased": 0, "running": 0},
+                "repository_runnable_targets": 1,
+                "approximate_first_position": 3,
+                "position_population_truncated": False,
+                "blockers": [{"code": "host_memory", "target_count": 1}],
+                "representative_targets": [
+                    {
+                        "run_id": "run-1",
+                        "target_name": "server-tests",
+                        "state": "queued",
+                        "attempt_id": None,
+                        "wait_code": "exact_dependency_pending",
+                    }
+                ],
+                "worker_capacity": {
+                    "model": "dynamic_memory_admission",
+                    "limit": None,
+                    "available": None,
+                },
+            },
+            repository_id="repo-1",
+        )
+
+        self.assertEqual(result["classification"], "test_queue_status")
+        self.assertEqual(result["approximate_first_position"], 3)
+        self.assertNotIn("run_id", result)
+        self.assertEqual(
+            result["representative_targets"][0]["target_name"], "server-tests"
+        )
+
+    def test_enqueue_replays_completed_durable_preview_and_submits(self) -> None:
         profile = Profile()
         profile.preview_test_plan = mock.Mock(
             return_value={
@@ -104,7 +143,7 @@ class AgentTestTests(unittest.TestCase):
                 "registered": True,
             }
         )
-        result = run_test(
+        result = enqueue_test(
             profile=profile,
             repository=SimpleNamespace(repo_id="repo-1", canonical_root="/repo"),
             temporary_repository=None,
@@ -119,7 +158,7 @@ class AgentTestTests(unittest.TestCase):
         self.assertTrue(result["plan"]["replayed"])
         self.assertEqual(len(profile.submit_calls), 1)
 
-    def _run(
+    def _enqueue(
         self, *, intent: str = "change", account_id: str = "account-tests"
     ):
         profile = Profile(intent=intent, account_id=account_id)
@@ -128,7 +167,7 @@ class AgentTestTests(unittest.TestCase):
             "devcoordinator.universal_test_service.decode_test_plan_document",
             return_value=profile.plan,
         ):
-            result = run_test(
+            result = enqueue_test(
                 profile=profile,
                 repository=repository,
                 temporary_repository=None,
@@ -146,8 +185,8 @@ class AgentTestTests(unittest.TestCase):
         self.assertEqual(first, child_operation_id(ROOT_OPERATION, "submit"))
         self.assertNotEqual(first, ROOT_OPERATION)
 
-    def test_run_previews_then_submits_deterministic_child(self) -> None:
-        profile, result = self._run()
+    def test_routine_enqueue_previews_then_submits_deterministic_child(self) -> None:
+        profile, result = self._enqueue()
         self.assertEqual(len(profile.preview_calls), 1)
         self.assertEqual(len(profile.submit_calls), 1)
         self.assertEqual(
@@ -164,19 +203,36 @@ class AgentTestTests(unittest.TestCase):
             MAX_TEST_RESULT_BYTES,
         )
 
-    def test_handoff_and_release_are_submitted_by_the_run_command(self) -> None:
+    def test_handoff_and_release_stop_for_explicit_plan_review(self) -> None:
         for intent in ("handoff", "release"):
             with self.subTest(intent=intent):
-                profile, result = self._run(intent=intent)
-                self.assertEqual(len(profile.submit_calls), 1)
-                self.assertTrue(result["submission_performed"])
-                self.assertEqual(result["classification"], "test_run_started")
-                self.assertEqual(result["continuation"], "dc1:run:run-1")
+                profile, result = self._enqueue(intent=intent)
+                self.assertEqual(profile.submit_calls, [])
+                self.assertFalse(result["submission_performed"])
+                self.assertEqual(result["classification"], "test_plan_ready")
+                self.assertEqual(result["continuation"], f"dc1:plan:{profile.plan.plan_id}")
+                self.assertEqual(
+                    result["next_command"],
+                    f"devcoordinator test submit dc1:plan:{profile.plan.plan_id}",
+                )
 
-    def test_run_codex_actor_survives_api_account_routing(self) -> None:
-        profile, result = self._run(account_id="devcoordinator-api")
-        self.assertEqual(result["classification"], "test_run_started")
+    def test_routine_enqueue_codex_actor_survives_api_account_routing(self) -> None:
+        profile, result = self._enqueue(account_id="devcoordinator-api")
+        self.assertEqual(result["classification"], "test_enqueued")
         self.assertEqual(profile.resolved_actor, "codex:thread-1")
+
+    def test_plan_submit_forwards_the_current_actor_contract(self) -> None:
+        profile = Profile(intent="handoff")
+        result = submit_test_plan(
+            profile=profile,
+            repository=SimpleNamespace(repo_id="repo-1"),
+            plan_id="plan-1",
+            actor="codex:thread-1",
+            operation_id=ROOT_OPERATION,
+        )
+        self.assertEqual(result["continuation"], "dc1:run:run-1")
+        self.assertEqual(profile.submit_calls[0]["actor"], "codex:thread-1")
+        self.assertNotIn("requested_actor", profile.submit_calls[0])
 
     def test_follow_projects_terminal_failures_without_raw_summary(self) -> None:
         status = {"run_id": "run-1", "state": "failed"}
@@ -313,7 +369,10 @@ class AgentTestTests(unittest.TestCase):
         self.assertEqual(result["failure_count"], 487)
         self.assertEqual(result["failure_record_count"], 129)
         self.assertTrue(result["failures_truncated"])
-        self.assertIsNone(result["next_command"])
+        self.assertEqual(
+            result["next_command"],
+            "devcoordinator test failures dc1:run:run-1",
+        )
 
 
 if __name__ == "__main__":

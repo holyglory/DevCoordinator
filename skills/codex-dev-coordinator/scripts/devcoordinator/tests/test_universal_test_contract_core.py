@@ -162,6 +162,82 @@ def source(mode: SourceMode, fingerprint: str = "a" * 64) -> SourceIdentity:
 
 
 class ManifestContractTests(unittest.TestCase):
+    def test_named_sqlite_state_handles_are_canonical_and_target_scoped(self) -> None:
+        document = valid_manifest()
+        document["state_handles"] = {
+            "delivery-state": {
+                "kind": "sqlite",
+                "path": ".product-delivery/delivery.sqlite3",
+                "environment": "DELIVERY_STATE_DATABASE",
+            }
+        }
+        document["intents"]["handoff"]["allow_reuse"] = False
+        document["evidence_policies"]["handoff"]["allow_reuse"] = False
+        document["targets"]["integration"]["state_handles"] = ["delivery-state"]
+
+        contract = parse_test_manifest(document)
+        canonical = manifest_to_document(contract)
+
+        self.assertEqual(
+            contract.targets["integration"].state_handles, ("delivery-state",)
+        )
+        self.assertEqual(contract.targets["lint"].state_handles, ())
+        self.assertEqual(
+            canonical["state_handles"]["delivery-state"],
+            {
+                "kind": "sqlite",
+                "path": ".product-delivery/delivery.sqlite3",
+                "environment": "DELIVERY_STATE_DATABASE",
+            },
+        )
+        self.assertEqual(
+            parse_test_manifest(canonical).fingerprint, contract.fingerprint
+        )
+        plan = create_test_plan(
+            contract,
+            intent="manual",
+            source=source(SourceMode.IMMUTABLE),
+            requested_targets=("integration",),
+        )
+        planned = _plan_documents(contract, plan, Path("/snapshot"))
+        self.assertEqual(
+            planned["launch_catalog"]["integration"]["state_handles"],
+            [
+                {
+                    "name": "delivery-state",
+                    "kind": "sqlite",
+                    "path": ".product-delivery/delivery.sqlite3",
+                    "environment": "DELIVERY_STATE_DATABASE",
+                }
+            ],
+        )
+        self.assertEqual(planned["launch_catalog"]["lint"]["state_handles"], [])
+
+    def test_state_handles_reject_unknown_unsafe_and_secret_shaped_requests(self) -> None:
+        unknown = valid_manifest()
+        unknown["targets"]["lint"]["state_handles"] = ["missing"]
+        secret = valid_manifest()
+        secret["state_handles"] = {
+            "delivery-state": {
+                "kind": "sqlite",
+                "path": ".product-delivery/delivery.sqlite3",
+                "environment": "DELIVERY_STATE_SECRET",
+            }
+        }
+        shallow = valid_manifest()
+        shallow["state_handles"] = {
+            "delivery-state": {
+                "kind": "sqlite",
+                "path": "delivery.sqlite3",
+                "environment": "DELIVERY_STATE_DATABASE",
+            }
+        }
+
+        for document in (unknown, secret, shallow):
+            with self.subTest(document=document):
+                with self.assertRaises(ManifestContractError):
+                    parse_test_manifest(document)
+
     def test_normalizes_complete_schema_three_contract(self) -> None:
         contract = parse_test_manifest(valid_manifest())
         self.assertEqual(contract.schema_version, MANIFEST_SCHEMA_VERSION)

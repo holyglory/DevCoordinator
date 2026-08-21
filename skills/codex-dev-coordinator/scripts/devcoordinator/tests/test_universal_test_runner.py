@@ -1051,6 +1051,44 @@ class UniversalTestRunnerTests(unittest.TestCase):
         self.assertFalse(chunks[0]["reporter_complete"])
         self.assertTrue(chunks[-1]["reporter_complete"])
 
+    def test_runner_retains_failure_details_beyond_legacy_sample_cap(self) -> None:
+        executable = self.root / "many-failures"
+        executable.write_text(
+            """#!/usr/bin/python3
+from pathlib import Path
+import sys
+
+destination = Path(sys.argv[sys.argv.index('--junitxml') + 1])
+results = ''.join(
+    f'<testcase name="case-{index}"><failure>failure {index}</failure></testcase>'
+    for index in range(130)
+)
+destination.write_text(f'<testsuite>{results}</testsuite>', encoding='utf-8')
+raise SystemExit(1)
+""",
+            encoding="utf-8",
+        )
+        executable.chmod(0o755)
+        descriptor = replace(
+            self.descriptor((str(executable),)),
+            driver="pytest",
+            reporter="pytest-events",
+            target_name="many-failures",
+        )
+        result_path = self.output / "many-failures-result.json"
+
+        self.assertEqual(run(descriptor, self.output, result_path), 1)
+
+        failures = self.result_failures(result_path)
+        cases = self.result_cases(result_path)
+        self.assertEqual(len(cases), 130)
+        self.assertEqual(len(failures), 130)
+        self.assertEqual(
+            {failure["case_id"] for failure in failures},
+            {case["case_id"] for case in cases},
+        )
+        self.assertGreater(len(self.result_chunks(result_path)), 2)
+
     def test_typed_drivers_receive_fixed_reporter_adapters(self) -> None:
         base = self.descriptor(("/usr/bin/python3", "-m", "pytest", "tests"))
         pytest_argv, _, pytest_reporter, pytest_kind = adapt_driver_invocation(
@@ -1475,6 +1513,37 @@ class UniversalTestRunnerTests(unittest.TestCase):
             ),
             ("-p:Configuration=Release",),
         )
+        for property_argument in (
+            "-p:UseSharedCompilation=false",
+            "/p:UseSharedCompilation=0",
+            "--property:UseSharedCompilation=true",
+        ):
+            self.assertEqual(
+                _dotnet_restore_semantic_options(
+                    (
+                        "/usr/bin/dotnet",
+                        "test",
+                        first.name,
+                        property_argument,
+                    )
+                ),
+                (),
+            )
+        for property_argument in (
+            "-p:UseSharedCompilation",
+            "-p:UseSharedCompilation=maybe",
+        ):
+            with self.assertRaisesRegex(
+                TestStoreContractError, "requires a boolean value"
+            ):
+                _dotnet_restore_semantic_options(
+                    (
+                        "/usr/bin/dotnet",
+                        "test",
+                        first.name,
+                        property_argument,
+                    )
+                )
         self.assertEqual(
             _dotnet_restore_project(
                 ("/usr/bin/dotnet", "build", second.name, "--no-restore"),

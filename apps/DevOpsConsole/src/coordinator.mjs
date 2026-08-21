@@ -257,6 +257,8 @@ function consoleDockerProjection(value, docker, trustedObservations) {
 
 export function coordinatorTimeoutFor(apiPath) {
   if (apiPath === '/v1/runtime') return 300_000;
+  if (apiPath === '/v1/archives') return 60_000;
+  if (apiPath.endsWith('/logs')) return 60_000;
   if (apiPath === '/v1/lifecycle/apply') return 600_000;
   if (apiPath.startsWith('/v1/lifecycle/')) return 300_000;
   if (apiPath.startsWith('/v1/projects/')) return 300_000; // compose up can run minutes
@@ -374,6 +376,7 @@ export function createCoordinator({ config, log }) {
 
   const invCache = { value: undefined, at: 0, inflight: null, generation: 0, dirty: false };
   const srvCache = { value: undefined, at: 0, inflight: null, generation: 0, dirty: false };
+  const archiveCache = { value: undefined, at: 0, inflight: null, generation: 0, dirty: false };
   const testRepositoryCache = { value: undefined, at: 0, inflight: null, generation: 0 };
   const trustedDockerObservations = new Map();
   const observationFlights = new Map();
@@ -532,7 +535,7 @@ export function createCoordinator({ config, log }) {
   }
 
   function invalidateCaches({ preserveInventory = false } = {}) {
-    for (const cache of [invCache, srvCache]) {
+    for (const cache of [invCache, srvCache, archiveCache]) {
       cache.generation += 1;
       if (preserveInventory && cache === invCache && cache.value !== undefined) {
         cache.dirty = true;
@@ -682,10 +685,10 @@ export function createCoordinator({ config, log }) {
     return ensureInflight;
   }
 
-  function startCachedGet(cache, apiPath, onValue = null) {
+  function startCachedGet(cache, apiPath, onValue = null, loader = null) {
     if (cache.inflight) return cache.inflight;
     const generation = cache.generation;
-    const inflight = request('GET', apiPath)
+    const inflight = (loader ? loader() : request('GET', apiPath))
       .then((value) => {
         if (cache.generation === generation) {
           cache.value = value;
@@ -703,11 +706,11 @@ export function createCoordinator({ config, log }) {
     return inflight;
   }
 
-  function cachedGet(cache, apiPath, maxAgeMs, onValue = null) {
+  function cachedGet(cache, apiPath, maxAgeMs, onValue = null, loader = null) {
     if (!cache.dirty && cache.value !== undefined && Date.now() - cache.at <= maxAgeMs) {
       return Promise.resolve(cache.value);
     }
-    return startCachedGet(cache, apiPath, onValue);
+    return startCachedGet(cache, apiPath, onValue, loader);
   }
 
   function inventory({ maxAgeMs = 5000 } = {}) {
@@ -849,6 +852,26 @@ export function createCoordinator({ config, log }) {
 
   function serversRaw({ maxAgeMs = 3000 } = {}) {
     return cachedGet(srvCache, '/v1/servers', maxAgeMs);
+  }
+
+  async function readLifecycleArchives() {
+    try {
+      return await request('GET', '/v1/archives');
+    } catch (error) {
+      if (!(error instanceof CoordError) || error.status !== 502 || closed) throw error;
+      await delay(250);
+      return request('GET', '/v1/archives');
+    }
+  }
+
+  function lifecycleArchives({ maxAgeMs = 5000 } = {}) {
+    return cachedGet(
+      archiveCache,
+      '/v1/archives',
+      maxAgeMs,
+      null,
+      readLifecycleArchives,
+    );
   }
 
   function events({ after = null, limit = 100 } = {}) {
@@ -1212,7 +1235,7 @@ export function createCoordinator({ config, log }) {
     dockerLogs: (b = {}) => request('POST', '/v1/docker/logs', b),
     runtimeAction,
     runtimeArtifact,
-    lifecycleArchives: () => request('GET', '/v1/archives'),
+    lifecycleArchives,
     lifecyclePlan: (b = {}) => request('POST', '/v1/lifecycle/plan', b),
     lifecycleApply: async (b = {}) => lifecycleResult(
       'apply', await request('POST', '/v1/lifecycle/apply', b),

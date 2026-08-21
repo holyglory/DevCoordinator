@@ -986,7 +986,62 @@ class TestdEngineTests(EngineFixture):
         self.assertEqual(self.store.get_run(submitted.run_id)["state"], "failed")
         self.assertEqual(self.launcher.cancelled, [])
 
-    @unittest.skip("testd restart cancels disposable attempts")
+    def test_cancelling_result_stream_stops_native_before_drain_completes(self) -> None:
+        submitted = self.submit_live()
+        self.engine.schedule(launch_batch=1)
+        request = self.launcher.requests[0]
+        runtime_id = "runtime-" + request.ticket.attempt_id
+        chunk_id = "chunk-cancelling-result-stream"
+        self.store.request_cancel(
+            submitted.run_id,
+            actor="user@example.com",
+            reason="manual cancellation",
+            operation_id=operation_id(),
+        )
+        self.launcher.observations[runtime_id] = [
+            RunnerObservation(
+                "result",
+                result_chunk={
+                    "chunk_id": chunk_id,
+                    "chunk_index": 0,
+                    "cases": [],
+                    "failures": [],
+                    "artifacts": [],
+                    "reporter_complete": True,
+                },
+            ),
+            RunnerObservation(
+                "exited",
+                AttemptExitEnvelope(
+                    envelope_id="exit-cancelling-result-stream",
+                    attempt_id=request.ticket.attempt_id,
+                    generation=request.ticket.generation,
+                    operation_id=operation_id(),
+                    conclusion=AttemptConclusion.TEST_FAILED,
+                    duration_seconds=1.0,
+                    result_chunk_ids=(chunk_id,),
+                ),
+            ),
+        ]
+
+        heartbeat = self.engine.heartbeat()
+
+        self.assertEqual(
+            self.launcher.cancelled,
+            [
+                (
+                    runtime_id,
+                    "run cancellation requested after result publication",
+                )
+            ],
+        )
+        self.assertEqual(
+            heartbeat["completed_attempt_ids"], [request.ticket.attempt_id]
+        )
+        retained = self.store.get_run(submitted.run_id)
+        self.assertEqual(retained["state"], "cancelled")
+        self.assertEqual(retained["targets"][0]["state"], "test_failed")
+
     def test_durable_exit_replays_after_testd_crash(self) -> None:
         submitted = self.submit_live()
         self.engine.schedule(launch_batch=1)

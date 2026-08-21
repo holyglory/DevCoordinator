@@ -8,6 +8,8 @@ same protocol without changing broker call sites.
 
 from __future__ import annotations
 
+import base64
+from datetime import UTC, datetime
 from dataclasses import replace
 import hashlib
 import json
@@ -57,6 +59,7 @@ from .universal_test_summary import (
 MAX_TEST_PLANE_RESPONSE_BYTES = 256 * 1024
 MAX_TEST_PLANE_PAGE_SIZE = 50
 MAX_TEST_ARTIFACT_TEXT_TAIL_BYTES = 4 * 1024
+MAX_TEST_ARTIFACT_EXPORT_CHUNK_BYTES = 1024 * 1024
 _TEXT_ARTIFACT_KINDS = frozenset({"jsonl", "junit", "log", "trx"})
 _SAFE_REPOSITORY_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:@/-]{0,255}$")
 _TEST_INTENTS = frozenset({"change", "checkpoint", "handoff", "release", "manual"})
@@ -139,6 +142,106 @@ def verified_text_artifact_content(
         "size_bytes": size_bytes,
         "retained_bytes": len(retained),
         "truncated": len(retained) < size_bytes,
+    }
+
+
+def verified_artifact_chunk(
+    artifact: Mapping[str, object],
+    *,
+    offset: int,
+    length: int,
+    artifact_root: Path = Path("/var/lib/devcoordinator-test-artifacts"),
+) -> Mapping[str, object]:
+    """Read one identity-stable chunk from a verified retained artifact.
+
+    The local caller verifies the combined digest after ordered paging. The
+    server binds every page to the same root-private inode and immutable
+    artifact metadata, so bytes never need to enter the final agent result.
+    """
+
+    artifact_id = artifact.get("artifact_id")
+    digest = artifact.get("sha256")
+    size_bytes = artifact.get("size_bytes")
+    kind = artifact.get("kind")
+    storage_handle = artifact.get("storage_handle")
+    if (
+        not isinstance(artifact_id, str)
+        or re.fullmatch(r"artifact-[0-9a-f]{32}", artifact_id) is None
+        or not isinstance(digest, str)
+        or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+        or type(size_bytes) is not int
+        or not 0 <= size_bytes <= 32 * 1024 * 1024
+        or not isinstance(kind, str)
+        or not kind
+        or storage_handle != f"test-artifact://{artifact_id}/{digest}"
+        or artifact.get("verified") not in {1, True}
+        or type(offset) is not int
+        or not 0 <= offset <= size_bytes
+        or type(length) is not int
+        or not 1 <= length <= MAX_TEST_ARTIFACT_EXPORT_CHUNK_BYTES
+    ):
+        raise TestStoreContractError(
+            "test artifact metadata cannot authorize chunk retrieval"
+        )
+    root = Path(artifact_root).absolute()
+    try:
+        root_metadata = root.lstat()
+    except OSError as error:
+        raise TestStoreConflict("test artifact store is unavailable") from error
+    if not stat.S_ISDIR(root_metadata.st_mode) or stat.S_ISLNK(root_metadata.st_mode):
+        raise TestStoreConflict("test artifact store is unsafe")
+    path = root / f"{artifact_id}-{digest}.blob"
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise TestStoreConflict("test artifact content is unavailable") from error
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode) or before.st_size != size_bytes:
+            raise TestStoreConflict("test artifact content identity is invalid")
+        expected = min(length, size_bytes - offset)
+        os.lseek(descriptor, offset, os.SEEK_SET)
+        payload = bytearray()
+        while len(payload) < expected:
+            value = os.read(descriptor, expected - len(payload))
+            if not value:
+                break
+            payload.extend(value)
+        after = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    try:
+        path_after = path.lstat()
+    except OSError as error:
+        raise TestStoreConflict("test artifact content changed during read") from error
+    identity = (before.st_dev, before.st_ino, before.st_size)
+    if (
+        len(payload) != expected
+        or identity != (after.st_dev, after.st_ino, after.st_size)
+        or identity != (path_after.st_dev, path_after.st_ino, path_after.st_size)
+    ):
+        raise TestStoreConflict("test artifact chunk failed identity verification")
+    next_offset = offset + len(payload)
+    return {
+        "artifact_id": artifact_id,
+        "kind": kind,
+        "storage_handle": storage_handle,
+        "sha256": digest,
+        "size_bytes": size_bytes,
+        "content_identity": deterministic_fingerprint(
+            {
+                "artifact_id": artifact_id,
+                "sha256": digest,
+                "size_bytes": size_bytes,
+                "device": before.st_dev,
+                "inode": before.st_ino,
+            }
+        ),
+        "offset": offset,
+        "next_offset": next_offset,
+        "data_base64": base64.b64encode(bytes(payload)).decode("ascii"),
+        "eof": next_offset == size_bytes,
     }
 
 _PLAN_FIELDS = frozenset(

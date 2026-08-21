@@ -730,24 +730,48 @@ class GenericLifecycleBrokerTests(unittest.TestCase):
                         """,
                         (now, now),
                     )
+                    connection.execute(
+                        """
+                        INSERT INTO repositories(
+                            repo_id, host_id, canonical_root, display_name, state,
+                            generation, created_at, updated_at
+                        ) VALUES ('repo-active-anchor', ?, '/repos/active-anchor',
+                                  'Active Anchor', 'active', 0, ?, ?)
+                        """,
+                        (fixtures.HOST_ID, now, now),
+                    )
+                    connection.execute(
+                        """
+                        INSERT INTO repository_installations(
+                            repo_id, status, startup_fenced, generation, actor,
+                            disabled_at, reason, updated_at
+                        ) VALUES ('repo-active-anchor', 'installed', 0, 0,
+                                  'fixture', NULL, NULL, ?)
+                        """,
+                        (now,),
+                    )
             adapter = RestorableLifecycleAdapter()
             service = _service(persistence, actions, adapter)
 
+            planned_request = BrokerRequest.create(
+                account_id=fixtures.ACCOUNT_ID,
+                project_id="repo-active-anchor",
+                resource_id=fixtures.PROJECT_ID,
+                operation=BrokerOperation.CLEANUP_PLAN,
+                authority_generation=fixtures.CURRENT_AUTHORITY_GENERATION,
+                arguments={
+                    "action": "archive",
+                    "target_kind": "project",
+                    "target_id": fixtures.PROJECT_ID,
+                    "reason": "generic project archive",
+                },
+            )
             planned = service.reply_for_document(
-                fixtures.peer_for(),
-                fixtures.request_for(
-                    BrokerOperation.CLEANUP_PLAN,
-                    resource_id=fixtures.PROJECT_ID,
-                    arguments={
-                        "action": "archive",
-                        "target_kind": "project",
-                        "target_id": fixtures.PROJECT_ID,
-                        "reason": "generic project archive",
-                    },
-                ).to_wire(),
+                fixtures.peer_for(), planned_request.to_wire()
             )
             self.assertTrue(planned["ok"], planned)
             self.assertEqual(planned["result"]["confirmation_phrase"], "")
+            self.assertEqual(planned["result"]["target_id"], fixtures.PROJECT_ID)
 
             applied_request = BrokerRequest.create(
                 account_id=fixtures.ACCOUNT_ID,

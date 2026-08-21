@@ -370,23 +370,39 @@ class SystemdWorkerManager:
                 raise WorkerNativeError(
                     "systemd did not expose the worker control group before termination"
                 )
-            self._kill_control_group(current.control_group)
             terminated_control_group = current.control_group
         _run(self.runner, [self.systemctl_executable, "stop", unit])
         stopped = self.status(worker_id=worker_id, allow_missing=True)
+        if stopped.active:
+            _run(
+                self.runner,
+                [
+                    self.systemctl_executable,
+                    "kill",
+                    "--kill-whom=all",
+                    "--signal=KILL",
+                    unit,
+                ],
+            )
+            _run(self.runner, [self.systemctl_executable, "stop", unit])
+            stopped = self.status(worker_id=worker_id, allow_missing=True)
+        if stopped.active:
+            raise WorkerNativeError(
+                "systemd did not prove the worker runner stopped"
+            )
         if terminated_control_group is not None:
             populated = self._control_group_populated(
                 terminated_control_group, allow_missing=True
             )
             if populated:
                 raise WorkerNativeError(
-                    "worker control group remained populated after cgroup.kill"
+                    "worker control group remained populated after systemd stop"
                 )
             stopped = replace(
                 stopped,
                 control_group=terminated_control_group,
                 cgroup_populated=False,
-                termination_method="cgroup.kill",
+                termination_method="systemd-control-group",
             )
         return stopped
 
@@ -447,23 +463,6 @@ class SystemdWorkerManager:
         if values.get("populated") not in {"0", "1"}:
             raise WorkerNativeError("worker cgroup.events has invalid populated evidence")
         return values["populated"] == "1"
-
-    def _kill_control_group(self, control_group: str) -> None:
-        if os.geteuid() != 0:
-            raise WorkerNativeError("cgroup.kill requires root authority")
-        target = self._control_group_path(control_group) / "cgroup.kill"
-        try:
-            descriptor = os.open(
-                target,
-                os.O_WRONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
-            )
-            try:
-                if os.write(descriptor, b"1") != 1:
-                    raise OSError("short cgroup.kill write")
-            finally:
-                os.close(descriptor)
-        except OSError as error:
-            raise WorkerNativeError("worker cgroup.kill is unavailable") from error
 
     def status(
         self, *, worker_id: str, allow_missing: bool = False
@@ -531,7 +530,8 @@ class SystemdWorkerManager:
             manager="systemd",
             unit=unit,
             loaded=load_state == "loaded",
-            active=active_state in {"active", "activating", "reloading"},
+            active=active_state
+            in {"active", "activating", "deactivating", "reloading"},
             state=sub_state,
             pid=pid,
             exit_status=exit_status,

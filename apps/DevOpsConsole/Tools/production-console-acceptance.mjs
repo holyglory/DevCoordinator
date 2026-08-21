@@ -708,17 +708,21 @@ async function exerciseLogs(page, route, journeys) {
   }
   try {
     const panelId = await logToggle.getAttribute('aria-controls');
+    if (!panelId) throw new Error('log disclosure omitted its exact panel identity');
+    const escapedPanelId = String(panelId).replaceAll('"', '\\"');
+    const panel = page.locator(`[id="${escapedPanelId}"]`);
     await logToggle.click();
-    await page.waitForFunction(() => ![...document.querySelectorAll('.log-empty')]
-      .some((element) => element.getClientRects().length && /loading/i.test(element.textContent || '')), null, { timeout: 10_000 });
-    const panel = panelId
-      ? page.locator(`[id="${String(panelId).replaceAll('"', '\\"')}"]`)
-      : page.locator('.panel').filter({ visible: true }).last();
+    await panel.waitFor({ state: 'visible', timeout: 5_000 });
+    await page.waitForFunction((exactPanelId) => {
+      const exactPanel = document.getElementById(exactPanelId);
+      return Boolean(exactPanel) && ![...exactPanel.querySelectorAll('.log-empty')]
+        .some((element) => element.getClientRects().length && /loading/i.test(element.textContent || ''));
+    }, panelId, { timeout: 65_000 });
     const inlineError = panel.locator('.log-empty.err').filter({ visible: true });
     if (await inlineError.count()) {
       throw new Error(`log disclosure failed: ${text(await inlineError.first().textContent())}`);
     }
-    await logToggle.click();
+    await page.locator(`[aria-controls="${escapedPanelId}"]`).filter({ visible: true }).first().click();
     journeys.push({ name: 'log disclosure', status: 'passed' });
   } catch (error) {
     journeys.push({ name: 'log disclosure', status: 'failed', detail: text(error.message) });

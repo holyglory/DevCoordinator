@@ -449,6 +449,7 @@ class TestAttemptDescriptor:
     ttl_seconds: int
     source_provenance: Mapping[str, object] = field(default_factory=dict)
     dependency_bindings: tuple[Mapping[str, object], ...] = ()
+    state_bindings: tuple[Mapping[str, object], ...] = ()
     toolchain_bindings: tuple[Mapping[str, object], ...] = ()
     supplementary_gids: tuple[int, ...] = ()
     fixture_bindings: tuple[Mapping[str, object], ...] = ()
@@ -980,6 +981,82 @@ class TestAttemptDescriptor:
         object.__setattr__(
             self, "dependency_bindings", tuple(normalized_dependencies)
         )
+        normalized_state_bindings: list[Mapping[str, object]] = []
+        state_fields = {
+            "name",
+            "kind",
+            "source_directory",
+            "source_device",
+            "source_inode",
+            "database_name",
+            "database_device",
+            "database_inode",
+            "destination_directory",
+            "environment",
+        }
+        for raw in self.state_bindings:
+            if not isinstance(raw, Mapping) or set(raw) != state_fields:
+                raise TestStoreContractError(
+                    "test attempt state binding fields are invalid"
+                )
+            name = str(raw["name"])
+            kind = str(raw["kind"])
+            source_directory = _absolute_path(
+                "state binding source directory", raw["source_directory"]
+            )
+            database_name = str(raw["database_name"])
+            destination_directory = _absolute_path(
+                "state binding destination directory", raw["destination_directory"]
+            )
+            environment = str(raw["environment"])
+            if (
+                _OPERATIONAL_CREDENTIAL_ALIAS.fullmatch(name) is None
+                or kind != "sqlite"
+                or PurePosixPath(database_name).name != database_name
+                or database_name in {"", ".", ".."}
+                or destination_directory != source_directory
+                or _ENVIRONMENT_NAME.fullmatch(environment) is None
+                or _SECRET_ENVIRONMENT_NAME.search(environment)
+                or Path(self.original_root) not in Path(source_directory).parents
+            ):
+                raise TestStoreContractError("test attempt state binding is invalid")
+            identities: dict[str, int] = {}
+            for field_name in (
+                "source_device",
+                "source_inode",
+                "database_device",
+                "database_inode",
+            ):
+                value = raw[field_name]
+                if type(value) is not int or value < 0:
+                    raise TestStoreContractError(
+                        "test attempt state binding identity is invalid"
+                    )
+                identities[field_name] = int(value)
+            normalized_state_bindings.append(
+                {
+                    "name": name,
+                    "kind": kind,
+                    "source_directory": source_directory,
+                    **identities,
+                    "database_name": database_name,
+                    "destination_directory": destination_directory,
+                    "environment": environment,
+                }
+            )
+        if (
+            len(normalized_state_bindings) > 8
+            or len({item["name"] for item in normalized_state_bindings})
+            != len(normalized_state_bindings)
+            or len({item["source_directory"] for item in normalized_state_bindings})
+            != len(normalized_state_bindings)
+            or len({item["destination_directory"] for item in normalized_state_bindings})
+            != len(normalized_state_bindings)
+            or len({item["environment"] for item in normalized_state_bindings})
+            != len(normalized_state_bindings)
+        ):
+            raise TestStoreContractError("test attempt state bindings are ambiguous")
+        object.__setattr__(self, "state_bindings", tuple(normalized_state_bindings))
         normalized_standalone_toolchains: list[Mapping[str, object]] = []
         standalone_fields = {
             "resolved_executable",
@@ -1084,6 +1161,7 @@ class TestAttemptDescriptor:
         raw = dict(value)
         raw.setdefault("source_provenance", {})
         raw.setdefault("dependency_bindings", ())
+        raw.setdefault("state_bindings", ())
         raw.setdefault("toolchain_bindings", ())
         raw.setdefault("supplementary_gids", ())
         raw.setdefault("fixture_bindings", ())
@@ -1131,6 +1209,7 @@ class TestAttemptDescriptor:
             "ttl_seconds": self.ttl_seconds,
             "source_provenance": dict(self.source_provenance),
             "dependency_bindings": [dict(item) for item in self.dependency_bindings],
+            "state_bindings": [dict(item) for item in self.state_bindings],
             "toolchain_bindings": [dict(item) for item in self.toolchain_bindings],
             "supplementary_gids": list(self.supplementary_gids),
             "fixture_bindings": [dict(item) for item in self.fixture_bindings],
@@ -2216,6 +2295,56 @@ class SystemdTestAttemptManager:
         return mount_source, destination
 
     @classmethod
+    def _validate_state_binding(
+        cls,
+        descriptor: TestAttemptDescriptor,
+        binding: Mapping[str, object],
+    ) -> tuple[Path, Path, Path]:
+        """Revalidate one live repository-state identity before unit launch."""
+
+        original_root = Path(descriptor.original_root)
+        cls._require_real_directory(
+            original_root, field="test state repository root"
+        )
+        source = Path(str(binding["source_directory"]))
+        source_metadata = cls._require_real_directory(
+            source, field="test state source directory"
+        )
+        database = source / str(binding["database_name"])
+        try:
+            database_metadata = database.lstat()
+            resolved_database = database.resolve(strict=True)
+        except OSError as error:
+            raise TestStoreConflict("test state database is unavailable") from error
+        if (
+            original_root not in source.parents
+            or source_metadata.st_dev != binding["source_device"]
+            or source_metadata.st_ino != binding["source_inode"]
+            or resolved_database != database
+            or not stat.S_ISREG(database_metadata.st_mode)
+            or stat.S_ISLNK(database_metadata.st_mode)
+            or database_metadata.st_dev != binding["database_device"]
+            or database_metadata.st_ino != binding["database_inode"]
+        ):
+            raise TestStoreConflict("test state handle changed after planning")
+        destination = Path(str(binding["destination_directory"]))
+        if destination != source:
+            raise TestStoreConflict("test state destination identity is invalid")
+        return source, destination, destination / database.name
+
+    @classmethod
+    def _state_environment(
+        cls, descriptor: TestAttemptDescriptor
+    ) -> dict[str, str]:
+        environment: dict[str, str] = {}
+        for binding in descriptor.state_bindings:
+            _source, _destination, database = cls._validate_state_binding(
+                descriptor, binding
+            )
+            environment[str(binding["environment"])] = str(database)
+        return environment
+
+    @classmethod
     def _prepare_dependency_mountpoints(
         cls,
         descriptor: TestAttemptDescriptor,
@@ -2688,6 +2817,7 @@ class SystemdTestAttemptManager:
                     *PurePosixPath(str(binding["destination"])).parts
                 )
                 runtime_environment["DEVCOORDINATOR_NUGET_SOURCE"] = str(destination)
+        runtime_environment.update(self._state_environment(descriptor))
         runtime_descriptor = replace(
             descriptor,
             execution_root=str(execution_root),
@@ -2774,7 +2904,11 @@ class SystemdTestAttemptManager:
                 )
             ):
                 raise ValueError("invalid fields")
-            descriptor = TestAttemptDescriptor.from_document(document["descriptor"])
+            raw_descriptor = document["descriptor"]
+            descriptor = TestAttemptDescriptor.from_document(raw_descriptor)
+            retained_descriptor_fingerprint = deterministic_fingerprint(
+                raw_descriptor
+            )
             launch_ticket_id = (
                 None
                 if document["schema_version"] == 1
@@ -2794,7 +2928,8 @@ class SystemdTestAttemptManager:
             raise TestStoreConflict("test attempt launch evidence is invalid") from error
         output_root = state / "output"
         if (
-            document["descriptor_fingerprint"] != descriptor.fingerprint
+            document["descriptor_fingerprint"]
+            not in {descriptor.fingerprint, retained_descriptor_fingerprint}
             or document["output_root"] != str(output_root)
             or document["result_path"] != str(output_root / "result.json")
             or self._runtime_id(descriptor) != runtime_id
@@ -3696,6 +3831,18 @@ class SystemdTestAttemptManager:
                 "--property=BindReadOnlyPaths="
                 + _systemd_bind_mapping(
                     "test dependency", source, destination
+                )
+            )
+        for binding in descriptor.state_bindings:
+            source, destination, _database = cls._validate_state_binding(
+                descriptor, binding
+            )
+            properties.append(
+                "--property=BindReadOnlyPaths="
+                + (
+                    _systemd_bind_path("test state", source)
+                    if source == destination
+                    else _systemd_bind_mapping("test state", source, destination)
                 )
             )
         credential_files: list[Mapping[str, object]] = []

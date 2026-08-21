@@ -566,6 +566,7 @@ class WorkerControllerTests(unittest.TestCase):
             coordinator_script=Path(__file__).parents[2] / "dev_coordinator.py",
             manager_factory=lambda **_kwargs: self.manager,
             process_observer=lambda _pid, _started: "alive",
+            process_terminator=lambda **_kwargs: "alive",
             sleeper=lambda _seconds: None,
         )
 
@@ -582,6 +583,47 @@ class WorkerControllerTests(unittest.TestCase):
             "stopped",
         )
         self.assertEqual(self.manager.start_calls, 1)
+
+    def test_stop_terminates_exact_orphan_process_after_runner_is_absent(self) -> None:
+        self._start()
+        self.manager.active = False
+        alive = [True]
+        terminated: list[tuple[int, str]] = []
+
+        def observe(_pid: int, _started: str) -> str:
+            return "alive" if alive[0] else "absent"
+
+        def terminate(**values) -> str:
+            terminated.append((values["pid"], values["process_start_time"]))
+            alive[0] = False
+            return "absent"
+
+        controller = WorkerController(
+            self.store,
+            coordinator_script=Path(__file__).parents[2] / "dev_coordinator.py",
+            manager_factory=lambda **_kwargs: self.manager,
+            process_observer=observe,
+            process_terminator=terminate,
+            sleeper=lambda _seconds: None,
+        )
+
+        stopped = controller.stop(
+            worker_id=self.worker_id,
+            canonical_repository=str(self.project),
+            name="queue-worker",
+            actor="test-agent",
+            timeout_seconds=0.1,
+        )
+
+        self.assertEqual(terminated, [(31_001, "fake-start-1")])
+        self.assertEqual(stopped["status"], "stopped")
+        self.assertEqual(
+            self.supervision.policy(self.worker_id)["supervisor_state"],
+            "stopped",
+        )
+        self.assertIsNone(
+            self.supervision.policy(self.worker_id)["current_attempt_id"]
+        )
 
     def test_active_unmanaged_observation_requires_exact_server_stop(self) -> None:
         timestamp = utc_timestamp()

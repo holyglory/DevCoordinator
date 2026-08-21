@@ -302,11 +302,72 @@ test('legacy nested evidence still preserves maintenance across rolling upgrades
   );
 });
 
-test('host observation receives a Docker-sized deadline without widening ordinary requests', () => {
+test('host and evidence reads receive bounded operation-sized deadlines', () => {
   assert.equal(coordinatorTimeoutFor('/v1/observe'), 720_000);
   assert.equal(coordinatorTimeoutFor('/v1/inventory'), 60_000);
+  assert.equal(coordinatorTimeoutFor('/v1/archives'), 60_000);
+  assert.equal(coordinatorTimeoutFor('/v1/servers/logs'), 60_000);
   assert.equal(coordinatorTimeoutFor('/v1/servers/start'), 15_000);
   assert.equal(coordinatorTimeoutFor('/v1/lifecycle/apply'), 600_000);
+});
+
+test('archive reads coalesce and lifecycle mutations invalidate their cache', async (t) => {
+  let archiveReads = 0;
+  const responder = async ({ req, res }) => {
+    if (req.url === '/v1/archives') {
+      archiveReads += 1;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ archives: [] }));
+      return true;
+    }
+    if (req.url === '/v1/lifecycle/plan') {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ ok: true }));
+      return true;
+    }
+    return false;
+  };
+  const { client } = await fixture(t, { responder });
+
+  await Promise.all([
+    client.lifecycleArchives(),
+    client.lifecycleArchives(),
+    client.lifecycleArchives(),
+  ]);
+  await client.lifecycleArchives();
+  assert.equal(archiveReads, 1);
+
+  await client.lifecyclePlan({
+    action: 'archive', target_kind: 'project', target_id: 'repo-1',
+  });
+  await client.lifecycleArchives();
+  assert.equal(archiveReads, 2);
+});
+
+test('archive reads recover one coalesced cold-cutover 502', async (t) => {
+  let archiveReads = 0;
+  const responder = async ({ req, res }) => {
+    if (req.url !== '/v1/archives') return false;
+    archiveReads += 1;
+    res.writeHead(archiveReads === 1 ? 502 : 200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify(
+      archiveReads === 1
+        ? { error: 'cold authority route is activating' }
+        : { archives: [] },
+    ));
+    return true;
+  };
+  const { client } = await fixture(t, { responder });
+
+  const [first, second] = await Promise.all([
+    client.lifecycleArchives(),
+    client.lifecycleArchives(),
+  ]);
+
+  assert.deepEqual(first, { archives: [] });
+  assert.deepEqual(second, first);
+  assert.equal(archiveReads, 2);
 });
 
 function recordingLog(entries) {

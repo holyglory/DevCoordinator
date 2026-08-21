@@ -118,6 +118,8 @@ test('production acceptance source retains fail-closed health, loading, geometry
     'repository group collapse/expand',
     'log disclosure',
     'data-log-capable="true"',
+    'document.getElementById(exactPanelId)',
+    'timeout: 65_000',
     '.log-empty.err',
     'run-tests dialog open/cancel',
     'create-route dialog open/cancel',

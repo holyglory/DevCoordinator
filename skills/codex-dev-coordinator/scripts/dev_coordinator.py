@@ -146,7 +146,6 @@ from devcoordinator.repository_lifecycle import (
     StandaloneRetirementPlan,
 )
 from devcoordinator.sqlite_lifecycle import SQLiteLifecyclePersistence
-from devcoordinator.schema import SCHEMA_VERSION as AUTHORITY_SCHEMA_VERSION
 from devcoordinator.store import (
     AccountStore,
     deterministic_id,
@@ -154,11 +153,15 @@ from devcoordinator.store import (
     normalize_telemetry_byte_count,
     utc_timestamp,
 )
+from devcoordinator.test_runner import (
+    test_statistics,
+)
 from devcoordinator.universal_test_cli import (
     UniversalTestCliError,
     add_universal_test_cli_parser,
     handle_universal_test_cli,
 )
+from devcoordinator.test_records import CoordinatorTestRecords
 from devcoordinator.observation_freshness import (
     ObservationFreshnessError,
     capture_observation_freshness_fence,
@@ -232,6 +235,7 @@ RUNTIME_REAPER_WAKE = threading.Event()
 RUNTIME_CLEANUP_AGENT = "runtime-session-cleanup"
 STATE_BACKEND_ENV = "DEVCOORDINATOR_STATE_BACKEND"
 AUTHORITY_ENV = "DEVCOORDINATOR_AUTHORITY"
+TEST_READ_AUTHORITY_ENV = "DEVCOORDINATOR_TEST_READ_AUTHORITY"
 SYSTEM_AUTHORITY_ROOT = Path(
     "/Library/Application Support/DevCoordinator"
     if sys.platform == "darwin"
@@ -2857,16 +2861,58 @@ def _strict_git_repository_root(project: str) -> Path:
 
 
 def _require_normalized_bootstrap_before_mutation(store: AccountStore) -> None:
-    """Require the one current normalized schema; no legacy import exists."""
+    """Import same-UID legacy truth before the first normalized mutation.
+
+    A pure inventory never creates the SQLite store. Once a mutation opens a
+    fresh store, legacy capture/import must run before repository installation
+    or action reservation can establish normalized authority.
+    """
+
+    if authority_mode() == "system":
+        # A server-wide client journal is a per-UID linkage/reconciliation
+        # cache, never an authority migration destination. Importing the old
+        # account store here would recreate split authority and can fence
+        # valid broker mutations with historical definition conflicts.
+        return
 
     with store.read_transaction() as connection:
         metadata = connection.execute(
-            "SELECT schema_version FROM schema_metadata WHERE singleton = 1"
+            """
+            SELECT migration_state, first_sqlite_mutation_at, state_revision
+            FROM schema_metadata WHERE singleton = 1
+            """
         ).fetchone()
-    if metadata is None or int(metadata["schema_version"]) != AUTHORITY_SCHEMA_VERSION:
+    if metadata is None:
+        raise ActionFencedError("normalized coordinator metadata is missing")
+    first_mutation = metadata["first_sqlite_mutation_at"]
+    migration_state = str(metadata["migration_state"] or "empty")
+    if migration_state == "conflicted":
         raise ActionFencedError(
-            "Coordinator state is not on the current schema; rebuild it through "
-            "the retained-control rebaseline before mutation"
+            "legacy coordinator migration has unresolved blocking conflicts; "
+            "resolve them through explicit observe before mutation"
+        )
+    if first_mutation is not None and migration_state != "empty":
+        late_writers = store.detect_late_legacy_writers()
+        if late_writers:
+            raise ActionFencedError(
+                "a retired legacy coordinator source changed after capture; run explicit "
+                "observe and reconcile that writer before mutation"
+            )
+        return
+    report = bootstrap_legacy_import(store)
+    if report.get("blocking_conflict_count"):
+        raise ActionFencedError(
+            "legacy coordinator state has blocking migration conflicts; run explicit observe "
+            "and resolve its migration report before mutating this repository"
+        )
+    if report.get("attempted") and not report.get("committed"):
+        raise ActionFencedError(
+            "legacy coordinator state was not committed; run explicit observe before mutation"
+        )
+    if report.get("late_writer_sources"):
+        raise ActionFencedError(
+            "a legacy coordinator source changed after capture; run explicit observe and "
+            "reconcile that writer before mutation"
         )
 
 
@@ -11696,6 +11742,11 @@ def filter_normalized_inventory_project(
     }
     result["repositories"] = repositories
     result["repository_trees"] = repository_trees
+    result["test_statistics"] = [
+        row
+        for row in result.get("test_statistics", [])
+        if str(row.get("repo_id")) in family_repo_ids
+    ]
     result["leases"] = [
         row for row in result.get("leases", []) if str(row.get("repo_id")) in repo_ids
     ]
@@ -11995,6 +12046,119 @@ def pure_normalized_inventory(
     return result
 
 
+def discover_same_uid_legacy_homes(
+    *, explicit_homes: list[str] | None = None
+) -> list[Path]:
+    """Find migration-only JSON homes owned by this effective account."""
+
+    uid = os.geteuid()
+    candidates: set[Path] = set()
+    if explicit_homes is not None:
+        candidates.update(Path(item).expanduser().absolute() for item in explicit_homes)
+    else:
+        account_home = posix_account_home()
+        candidates.add(account_home / ".codex" / "agent-coordinator")
+        candidates.add(account_home / ".claude" / "agent-coordinator")
+        parall_root = account_home / "Library" / "Application Support" / "Parall"
+        if parall_root.is_dir() and not parall_root.is_symlink():
+            # Bound discovery to known application state suffixes. rglob is
+            # migration-only and candidates still pass the importer's strict
+            # no-symlink/private-owner checks.
+            for state_file in parall_root.rglob(".codex/agent-coordinator/state.json"):
+                candidates.add(state_file.parent)
+    safe: list[Path] = []
+    for candidate in sorted(candidates, key=str):
+        state_file = candidate / "state.json"
+        try:
+            home_metadata = candidate.lstat()
+            state_metadata = state_file.lstat()
+        except FileNotFoundError:
+            continue
+        if (
+            stat.S_ISLNK(home_metadata.st_mode)
+            or not stat.S_ISDIR(home_metadata.st_mode)
+            or home_metadata.st_uid != uid
+            or stat.S_IMODE(home_metadata.st_mode) != 0o700
+            or stat.S_ISLNK(state_metadata.st_mode)
+            or not stat.S_ISREG(state_metadata.st_mode)
+            or state_metadata.st_uid != uid
+            or stat.S_IMODE(state_metadata.st_mode) != 0o600
+        ):
+            continue
+        safe.append(candidate)
+    return safe
+
+
+def bootstrap_legacy_import(
+    store: AccountStore,
+    *,
+    explicit_homes: list[str] | None = None,
+    backup_root: str | None = None,
+) -> dict[str, Any]:
+    candidates = discover_same_uid_legacy_homes(explicit_homes=explicit_homes)
+    reconciliation = store.reconcile_imported_legacy_conflicts()
+    with store.read_transaction() as connection:
+        imported_homes = {
+            str(row[0])
+            for row in connection.execute(
+                """
+                SELECT canonical_home FROM coordinator_sources
+                WHERE captured_sha256 IS NOT NULL AND status IN ('imported', 'retired')
+                """
+            )
+        }
+    pending = [
+        candidate for candidate in candidates if str(candidate) not in imported_homes
+    ]
+    if not pending:
+        return {
+            "attempted": bool(reconciliation.attempted),
+            "source_count": int(reconciliation.source_count),
+            "committed": bool(reconciliation.committed),
+            "conflict_count": int(reconciliation.conflict_count),
+            "blocking_conflict_count": int(reconciliation.blocking_conflict_count),
+            "reclassified_conflict_count": int(reconciliation.reclassified_count),
+            "destination_generation": reconciliation.destination_generation,
+            "late_writer_sources": list(store.detect_late_legacy_writers()),
+        }
+    root = (
+        Path(backup_root).expanduser().absolute()
+        if backup_root
+        else coordinator_home() / "legacy-import-backups"
+    )
+    report = store.import_legacy_homes(pending, root)
+    with store.read_transaction() as connection:
+        aggregate_conflicts = [
+            dict(row)
+            for row in connection.execute(
+                """
+                SELECT conflict_kind, severity FROM migration_conflicts
+                WHERE disposition='open'
+                ORDER BY conflict_kind, conflict_id
+                """
+            )
+        ]
+    return {
+        "attempted": True,
+        "committed": bool(report.committed),
+        "source_count": int(report.source_count) + int(reconciliation.source_count),
+        "repository_count": int(report.repository_count),
+        "missing_repository_count": int(report.missing_repository_count),
+        "unassigned_count": int(report.unassigned_count),
+        "exact_duplicate_count": int(report.exact_duplicate_count),
+        "conflict_count": len(aggregate_conflicts),
+        "blocking_conflict_count": sum(
+            1 for item in aggregate_conflicts if item["severity"] == "blocking"
+        ),
+        "conflict_kinds": sorted(
+            {str(item["conflict_kind"]) for item in aggregate_conflicts}
+        ),
+        "destination_generation": report.destination_generation,
+        "reclassified_conflict_count": int(reconciliation.reclassified_count),
+        "late_writer_sources": list(store.detect_late_legacy_writers()),
+    }
+
+
 def ensure_observation_host(store: AccountStore) -> str:
     """Create the local-host row only when it is actually absent."""
 
@@ -12143,9 +12307,9 @@ def coordinated_observe_host(options: dict[str, Any]) -> dict[str, Any]:
         if options.get("backup_dir"):
             account_scoped_options.append("--backup-dir")
         if options.get("legacy_home"):
-            account_scoped_options.append("--legacy-home (retired)")
+            account_scoped_options.append("--legacy-home")
         if options.get("legacy_backup_root"):
-            account_scoped_options.append("--legacy-backup-root (retired)")
+            account_scoped_options.append("--legacy-backup-root")
         if account_scoped_options:
             raise ValueError(
                 "server-wide observation is one full-Docker broker snapshot and "
@@ -12217,6 +12381,11 @@ def coordinated_observe_host(options: dict[str, Any]) -> dict[str, Any]:
         }
         return response
     with AccountStore.open_default(coordinator_home()) as store:
+        imported = bootstrap_legacy_import(
+            store,
+            explicit_homes=options.get("legacy_home"),
+            backup_root=options.get("legacy_backup_root"),
+        )
         host_id = ensure_observation_host(store)
         include_docker = not bool(options.get("no_docker"))
         observer_domain = observation_domain_for_scope(
@@ -12304,6 +12473,7 @@ def coordinated_observe_host(options: dict[str, Any]) -> dict[str, Any]:
             "completed_at": outcome.completed_at,
             "max_age_seconds": max_age_seconds,
             "request": {"agent": agent, "project": project},
+            "imported": imported,
             "state_revision": int(metadata["state_revision"]),
             "observation_revision": int(metadata["observation_revision"]),
         }
@@ -19710,6 +19880,15 @@ def build_parser() -> argparse.ArgumentParser:
     observe.add_argument("--backup-dir", action="append")
     observe.add_argument("--no-docker", action="store_true")
     observe.add_argument("--compact-json", action="store_true")
+    observe.add_argument(
+        "--legacy-home",
+        action="append",
+        help="explicit same-UID legacy coordinator home (migration/testing override)",
+    )
+    observe.add_argument(
+        "--legacy-backup-root",
+        help="private backup root outside Git for captured legacy state",
+    )
 
     state = sub.add_parser("state")
     state_sub = state.add_subparsers(dest="action", required=True)
@@ -20052,6 +20231,7 @@ def handle_cli(args: argparse.Namespace) -> Any:
             args,
             coordinator_home=coordinator_home(),
             canonical_project=canonical_project,
+            bootstrap_legacy_import=bootstrap_legacy_import,
             observe_before_plan=lambda project, agent: coordinated_observe_host(
                 {
                     "project": project,
@@ -20102,6 +20282,7 @@ def handle_cli(args: argparse.Namespace) -> Any:
             args,
             canonical_project=canonical_project,
             broker_profile_loader=configured_broker_profile,
+            statistics_reader=coordinated_test_statistics_read,
         )
     if args.group == "observe":
         return coordinated_observe_host(namespace_to_options(args))
@@ -21136,13 +21317,16 @@ API_GET_ROUTES = frozenset(
         "/v1/servers",
         "/v1/archives",
         "/v1/events",
+        "/v1/tests",
+        "/v1/test-fleet",
         "/v1/test-repositories",
         "/v1/test-runs",
+        "/v1/test-events",
     }
 )
 
 _TEST_RUN_API_PATH = re.compile(
-    r"^/v1/test-runs/([^/]+)(?:/(summary|failures|artifacts|cancel))?$"
+    r"^/v1/test-runs/([^/]+)(?:/(summary|failures|artifacts|cases|cancel|retry))?$"
 )
 _TEST_REPOSITORY_SETUP_API_PATH = re.compile(
     r"^/v1/test-repositories/([^/]+)/setup$"
@@ -21309,6 +21493,13 @@ _TEST_RUN_STATES = frozenset(
         "running",
         "cancelling",
         "superseding",
+        "succeeded",
+        "failed",
+        "timed_out",
+        "cancelled",
+        "incomplete",
+        "abandoned",
+        "superseded",
     }
 )
 
@@ -21367,7 +21558,28 @@ def parse_test_run_list_query(raw_query: str) -> dict[str, Any]:
     return result
 
 
-def parse_test_evidence_query(raw_query: str) -> dict[str, Any]:
+def parse_test_events_query(raw_query: str) -> dict[str, Any]:
+    values = _single_query_values(
+        raw_query,
+        allowed=frozenset({"repo_id", "after", "limit"}),
+        required=frozenset({"repo_id"}),
+    )
+    raw_after = values.get("after", "0")
+    raw_limit = values.get("limit", "200")
+    if not raw_after.isdigit() or not raw_limit.isdigit():
+        raise ValueError("test event cursor and limit must be integers")
+    after = int(raw_after)
+    limit = int(raw_limit)
+    if after < 0 or not 1 <= limit <= 500:
+        raise ValueError("test event cursor or limit is invalid")
+    return {
+        "repository_id": _test_entity_id(values["repo_id"], "repo_id"),
+        "after_event_id": after,
+        "limit": limit,
+    }
+
+
+def parse_test_evidence_query(raw_query: str, *, cases: bool) -> dict[str, Any]:
     values = _single_query_values(
         raw_query,
         allowed=frozenset({"repo_id", "after", "limit"}),
@@ -21380,7 +21592,12 @@ def parse_test_evidence_query(raw_query: str) -> dict[str, Any]:
         "repository_id": _test_entity_id(values["repo_id"], "repo_id"),
         "limit": int(raw_limit),
     }
-    if "after" in values:
+    if cases:
+        raw_after = values.get("after", "0")
+        if not raw_after.isdigit():
+            raise ValueError("test case cursor must be non-negative")
+        result["after"] = int(raw_after)
+    elif "after" in values:
         result["after"] = _test_entity_id(values["after"], "after")
     return result
 
@@ -21470,6 +21687,14 @@ def coordinated_test_run_evidence_read(
             limit=limit,
         )
         collection = "artifacts"
+    elif kind == "cases":
+        result = profile.test_run_cases(
+            repository=repository_id,
+            run_id=run_id,
+            after=int(after or 0),
+            limit=limit,
+        )
+        collection = "cases"
     else:
         raise ValueError("test evidence kind is invalid")
     if (
@@ -21478,6 +21703,21 @@ def coordinated_test_run_evidence_read(
         or not isinstance(result.get(collection), list)
     ):
         raise RuntimeError("broker returned contradictory test evidence")
+    return dict(result)
+
+
+def coordinated_test_events_read(
+    *, repository_id: str, after_event_id: int = 0, limit: int = 200
+) -> dict[str, Any]:
+    result = _async_test_profile().test_events(
+        repository=repository_id,
+        after_event_id=after_event_id,
+        limit=limit,
+    )
+    if result.get("repository_id") != repository_id or not isinstance(
+        result.get("events"), list
+    ):
+        raise RuntimeError("broker returned contradictory test events")
     return dict(result)
 
 
@@ -21542,6 +21782,124 @@ def coordinated_test_run_cancel(
     return dict(result)
 
 
+def coordinated_test_run_retry(
+    *, run_id: str, payload: Mapping[str, Any]
+) -> dict[str, Any]:
+    values = _test_mutation_payload(
+        payload, required=frozenset({"repo_id", "failed_only", "operation_id"})
+    )
+    if type(values["failed_only"]) is not bool:
+        raise ValueError("test retry failed_only must be boolean")
+    expected_repository_id = _test_entity_id(values["repo_id"], "repo_id")
+    result = _async_test_profile().retry_test_run(
+        repository=expected_repository_id,
+        run_id=run_id,
+        failed_only=bool(values["failed_only"]),
+        operation_id=str(values["operation_id"]),
+        actor=str(values["actor"]),
+    )
+    retry_run_id = result.get("run_id")
+    if (
+        not isinstance(retry_run_id, str)
+        or not retry_run_id
+        or len(retry_run_id) > 128
+        or retry_run_id[0] in "_.:@-"
+        or any(character not in OPAQUE_IDENTIFIER_CHARS for character in retry_run_id)
+        or result.get("repository_id") != expected_repository_id
+    ):
+        raise RuntimeError("broker returned contradictory test retry")
+    return dict(result)
+
+
+def _test_read_authority() -> str:
+    """Return the explicit/final test statistics authority.
+
+    The server-wide product fails closed on TestDB/testd.  Legacy authority
+    reads remain available only to the explicitly selected account-mode
+    compatibility surface and can never be enabled for a production service.
+    """
+
+    configured = str(os.environ.get(TEST_READ_AUTHORITY_ENV) or "").strip().lower()
+    mode = authority_mode()
+    if not configured:
+        return "legacy" if mode == "account" else "testd"
+    if configured not in {"testd", "legacy"}:
+        raise ValueError(
+            f"{TEST_READ_AUTHORITY_ENV} must be 'testd' or 'legacy'"
+        )
+    if configured == "legacy" and mode != "account":
+        raise RuntimeError(
+            "legacy test reads are forbidden outside explicit account authority mode"
+        )
+    return configured
+
+
+def coordinated_test_statistics_read(
+    *, project: str, days: int, limit: int
+) -> dict[str, Any]:
+    """Read one repository's test projection through the active authority."""
+
+    profile = configured_broker_profile()
+    if profile is not None:
+        matches = [
+            repository
+            for repository in profile.repositories.values()
+            if repository.repo_id == project
+            or repository.canonical_root == str(Path(project).expanduser().resolve())
+        ]
+        if len(matches) != 1:
+            raise ValueError("project is not uniquely configured for test statistics")
+        return test_statistics(
+            profile=profile,
+            project=matches[0].canonical_root,
+            days=days,
+            limit=limit,
+        )
+
+    if _test_read_authority() == "testd":
+        raise RuntimeError(
+            "TestDB/testd is the active test read authority, but its protected "
+            "broker profile is unavailable; legacy authority statistics are fenced"
+        )
+
+    database_path = coordinator_home() / NORMALIZED_DATABASE_NAME
+    with AccountStore.open_default_read_only(coordinator_home()) as store:
+        with store.read_transaction() as connection:
+            row = connection.execute(
+                "SELECT repo_id FROM repositories WHERE repo_id = ? OR canonical_root = ?",
+                (project, str(Path(project).expanduser().resolve())),
+            ).fetchone()
+    if row is None:
+        raise ValueError("project is not present in Coordinator authority")
+    records = CoordinatorTestRecords(
+        database_path,
+        expected_uid=os.geteuid(),
+        busy_timeout_ms=5_000,
+    )
+    return records.stats_for_repository(
+        repo_id=str(row["repo_id"]), days=days, limit=limit
+    )
+
+
+def coordinated_test_fleet_read(*, hours: int = 24) -> dict[str, Any]:
+    """Read one host-wide bounded test projection through active authority."""
+
+    profile = configured_broker_profile()
+    if profile is not None:
+        return profile.fleet_test_statistics(hours=hours)
+    if _test_read_authority() == "testd":
+        raise RuntimeError(
+            "TestDB/testd is the active test read authority, but its protected "
+            "broker profile is unavailable; legacy authority fleet statistics are fenced"
+        )
+    records = CoordinatorTestRecords(
+        coordinator_home() / NORMALIZED_DATABASE_NAME,
+        expected_uid=os.geteuid(),
+        busy_timeout_ms=5_000,
+    )
+    return records.fleet_overview(hours=hours)
+
+
 def coordinated_test_repository_list() -> dict[str, Any]:
     """Return the lightweight configured repository catalog for test views.
 
@@ -21579,9 +21937,29 @@ def coordinated_test_repository_list() -> dict[str, Any]:
         ):
             raise RuntimeError("broker returned contradictory test repository catalog")
     else:
-        raise RuntimeError(
-            "the current test repository catalog requires the protected broker profile"
-        )
+        if _test_read_authority() == "testd":
+            raise RuntimeError(
+                "TestDB/testd is the active test read authority, but its protected "
+                "broker profile is unavailable; legacy repository catalog is fenced"
+            )
+        with AccountStore.open_default_read_only(coordinator_home()) as store:
+            with store.read_transaction() as connection:
+                repositories = [
+                    {
+                        **dict(row),
+                        "setup_status": "missing",
+                        "setup_observed_at": None,
+                        "setup_retained": False,
+                    }
+                    for row in connection.execute(
+                        """
+                        SELECT repo_id, display_name
+                        FROM repositories
+                        WHERE state = 'active'
+                        ORDER BY lower(display_name), canonical_root, repo_id
+                        """
+                    )
+                ]
     repositories.sort(
         key=lambda row: (
             str(row["display_name"]).casefold(),
@@ -21953,7 +22331,7 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
                     unquote(test_run_match.group(1), errors="strict"), "run_id"
                 )
                 action = test_run_match.group(2)
-                if action == "cancel":
+                if action in {"cancel", "retry"}:
                     self._send(404, {"error": "not found"})
                     return
                 if action in {None, "summary"}:
@@ -21968,7 +22346,9 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
                         )
                     )
                 else:
-                    query = parse_test_evidence_query(raw_query)
+                    query = parse_test_evidence_query(
+                        raw_query, cases=action == "cases"
+                    )
                     result = coordinated_test_run_evidence_read(
                         repository_id=str(query["repository_id"]),
                         run_id=run_id,
@@ -22014,6 +22394,14 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
                 result = coordinated_list_archives()
             elif path == "/v1/events":
                 result = coordinated_list_events(**parse_event_query(raw_query))
+            elif path == "/v1/tests":
+                result = coordinated_test_statistics_read(
+                    **parse_test_stats_query(raw_query)
+                )
+            elif path == "/v1/test-fleet":
+                result = coordinated_test_fleet_read(
+                    **parse_test_fleet_query(raw_query)
+                )
             elif path == "/v1/test-repositories":
                 if raw_query:
                     raise ValueError("test repository catalog does not accept query parameters")
@@ -22021,6 +22409,10 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
             elif path == "/v1/test-runs":
                 result = coordinated_test_runs_read(
                     **parse_test_run_list_query(raw_query)
+                )
+            elif path == "/v1/test-events":
+                result = coordinated_test_events_read(
+                    **parse_test_events_query(raw_query)
                 )
             elif path == "/v1/inventory/no-docker":
                 target = parse_registration_inventory_query(raw_query)
@@ -22098,11 +22490,18 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
         try:
             payload = self._read_json()
             test_run_match = _TEST_RUN_API_PATH.fullmatch(path)
-            if test_run_match is not None and test_run_match.group(2) == "cancel":
+            if test_run_match is not None and test_run_match.group(2) in {
+                "cancel",
+                "retry",
+            }:
                 run_id = _test_entity_id(
                     unquote(test_run_match.group(1), errors="strict"), "run_id"
                 )
-                result = coordinated_test_run_cancel(run_id=run_id, payload=payload)
+                result = (
+                    coordinated_test_run_cancel(run_id=run_id, payload=payload)
+                    if test_run_match.group(2) == "cancel"
+                    else coordinated_test_run_retry(run_id=run_id, payload=payload)
+                )
                 self._send(200, result)
                 return
             if path == "/v1/runtime":

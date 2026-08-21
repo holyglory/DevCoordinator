@@ -3819,7 +3819,15 @@ def _validate_arguments(
     if operation == BrokerOperation.TEST_ARTIFACT_RESOLVE:
         if (
             not {"run_id", "artifact_id"}.issubset(value)
-            or set(value) - {"run_id", "artifact_id", "expected_repository_id"}
+            or set(value)
+            - {
+                "run_id",
+                "artifact_id",
+                "expected_repository_id",
+                "offset",
+                "length",
+            }
+            or ("offset" in value) != ("length" in value)
         ):
             raise BrokerError(
                 "invalid_arguments",
@@ -3838,6 +3846,22 @@ def _validate_arguments(
                 "expected_repository_id",
                 operation_id,
             )
+        if "offset" in value:
+            offset = value["offset"]
+            length = value["length"]
+            if (
+                not _is_exact_int(offset)
+                or offset < 0
+                or not _is_exact_int(length)
+                or not 1 <= length <= 1024 * 1024
+            ):
+                raise BrokerError(
+                    "invalid_arguments",
+                    "Artifact chunk offset/length are invalid.",
+                    operation_id=operation_id,
+                )
+            normalized["offset"] = offset
+            normalized["length"] = length
         return normalized
 
     raise BrokerError(

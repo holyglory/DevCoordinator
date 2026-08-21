@@ -53,6 +53,7 @@ HOST_OBSERVE_CLIENT_TIMEOUT_SECONDS = 11 * 60.0
 INVENTORY_READ_CLIENT_TIMEOUT_SECONDS = 60.0
 TEST_CATALOG_READ_CLIENT_TIMEOUT_SECONDS = 60.0
 TEST_SETUP_READ_CLIENT_TIMEOUT_SECONDS = 60.0
+TEST_WAIT_RESPONSE_MARGIN_SECONDS = 1.0
 _TRANSIENT_TEST_WAIT_CODES = frozenset(
     {
         "maintenance_in_progress",
@@ -825,6 +826,14 @@ class BrokerClientProfile:
             arguments=arguments,
         )
 
+    def test_queue_status(self, *, repository: str) -> dict[str, Any]:
+        configured = self.repository_by_id(repository)
+        return self._test_call(
+            repository=configured,
+            operation=BrokerOperation.TEST_QUEUE_STATUS,
+            arguments={"expected_repository_id": str(repository)},
+        )
+
     def test_run_summary(self, *, repository: str, run_id: str) -> dict[str, Any]:
         result = self._test_run_call(
             repository=repository,
@@ -879,6 +888,34 @@ class BrokerClientProfile:
             arguments={"run_id": str(run_id), "artifact_id": str(artifact_id)},
         )
 
+    def test_artifact_chunk(
+        self,
+        *,
+        repository: str,
+        run_id: str,
+        artifact_id: str,
+        offset: int,
+        length: int,
+    ) -> dict[str, Any]:
+        return self._test_run_call(
+            repository=repository,
+            operation=BrokerOperation.TEST_ARTIFACT_RESOLVE,
+            arguments={
+                "run_id": str(run_id),
+                "artifact_id": str(artifact_id),
+                "offset": offset,
+                "length": length,
+            },
+        )
+
+    def test_run_cases(
+        self, *, repository: str, run_id: str, after: int = 0, limit: int = 25
+    ) -> dict[str, Any]:
+        return self._test_run_call(
+            repository=repository,
+            operation=BrokerOperation.TEST_RUN_CASES,
+            arguments={"run_id": str(run_id), "after": after, "limit": limit},
+        )
     def test_repository_setup(self, *, repository: str) -> dict[str, Any]:
         configured = self.repository_by_id(repository)
         return self._test_call(
@@ -904,6 +941,27 @@ class BrokerClientProfile:
         return self._test_run_call(
             repository=repository,
             operation=BrokerOperation.TEST_RUN_CANCEL,
+            arguments=arguments,
+            operation_id=str(operation_id),
+        )
+
+    def retry_test_run(
+        self,
+        *,
+        repository: str,
+        run_id: str,
+        failed_only: bool,
+        operation_id: str,
+        actor: str,
+    ) -> dict[str, Any]:
+        arguments = {
+            "run_id": str(run_id),
+            "failed_only": failed_only,
+            "actor": str(actor),
+        }
+        return self._test_run_call(
+            repository=repository,
+            operation=BrokerOperation.TEST_RUN_RETRY,
             arguments=arguments,
             operation_id=str(operation_id),
         )
@@ -944,7 +1002,7 @@ class BrokerClientProfile:
 
         while True:
             remaining = deadline - time.monotonic()
-            if remaining <= 0:
+            if remaining <= TEST_WAIT_RESPONSE_MARGIN_SECONDS:
                 return timed_out()
             try:
                 status_arguments: dict[str, Any] = {
@@ -957,7 +1015,7 @@ class BrokerClientProfile:
                                 BrokerOperation.TEST_RUN_STATUS,
                                 arguments={"run_id": str(run_id)},
                             ),
-                            remaining,
+                            remaining - TEST_WAIT_RESPONSE_MARGIN_SECONDS,
                         ),
                     ),
                 }
@@ -966,22 +1024,28 @@ class BrokerClientProfile:
                 if error.code not in _TRANSIENT_TEST_WAIT_CODES:
                     raise
                 remaining = deadline - time.monotonic()
-                if remaining <= 0:
+                if remaining <= TEST_WAIT_RESPONSE_MARGIN_SECONDS:
                     return timed_out()
-                time.sleep(min(0.25, remaining))
+                time.sleep(
+                    min(0.25, remaining - TEST_WAIT_RESPONSE_MARGIN_SECONDS)
+                )
                 continue
             except OSError:
                 remaining = deadline - time.monotonic()
-                if remaining <= 0:
+                if remaining <= TEST_WAIT_RESPONSE_MARGIN_SECONDS:
                     return timed_out()
-                time.sleep(min(0.25, remaining))
+                time.sleep(
+                    min(0.25, remaining - TEST_WAIT_RESPONSE_MARGIN_SECONDS)
+                )
                 continue
             if str(status.get("state") or status.get("status") or "") in terminal:
                 return status
             remaining = deadline - time.monotonic()
-            if remaining <= 0:
+            if remaining <= TEST_WAIT_RESPONSE_MARGIN_SECONDS:
                 return timed_out()
-            time.sleep(min(0.25, remaining))
+            time.sleep(
+                min(0.25, remaining - TEST_WAIT_RESPONSE_MARGIN_SECONDS)
+            )
 
 
 def call_broker(

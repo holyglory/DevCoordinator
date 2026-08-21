@@ -13,7 +13,11 @@ import unittest
 import uuid
 
 from devcoordinator.broker import BrokerError
-from devcoordinator.universal_test_contract import SourceMode, parse_test_manifest
+from devcoordinator.universal_test_contract import (
+    SourceMode,
+    deterministic_fingerprint,
+    parse_test_manifest,
+)
 from devcoordinator.universal_test_broker import (
     BrokerConnection,
     CoordinatorBrokerTicketIssuer,
@@ -1423,6 +1427,53 @@ class UniversalTestAttemptChainSecurityTests(unittest.TestCase):
         self.assertEqual(recovered_ticket, ticket_id)
         self.assertIn(b'"schema_version":2', launch_path.read_bytes())
 
+    def test_protected_launch_evidence_accepts_prior_descriptor_shape(self) -> None:
+        candidate, lease = self._submit_and_lease(
+            "repo-prior-descriptor", self.repo_a, os.geteuid()
+        )
+        descriptor = self._descriptor(candidate, lease, self.repo_a)
+        runtime_id = "devcoordinator-test-" + hashlib.sha256(
+            descriptor.attempt_id.encode("utf-8")
+        ).hexdigest()[:32]
+        state = self.root / "prior-descriptor" / runtime_id
+        state.mkdir(mode=0o711, parents=True)
+        manager = SystemdTestAttemptManager(
+            attempt_root=state.parent,
+            artifact_root=self.root / "unused-prior-descriptor-artifacts",
+        )
+        launch_path, _result_path = manager._publish_runner_launch(
+            descriptor,
+            state=state,
+            execution_root=self.repo_a,
+            owner_gid=os.getegid(),
+            launch_ticket_id="test-ticket-prior-descriptor",
+        )
+        launch = json.loads(launch_path.read_text(encoding="utf-8"))
+        legacy_descriptor = dict(launch["descriptor"])
+        legacy_descriptor.pop("state_bindings")
+        launch["descriptor"] = legacy_descriptor
+        launch["descriptor_fingerprint"] = deterministic_fingerprint(
+            legacy_descriptor
+        )
+        launch_path.chmod(0o600)
+        launch_path.write_text(
+            json.dumps(
+                launch,
+                ensure_ascii=True,
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+            encoding="utf-8",
+        )
+
+        recovered_descriptor, recovered_ticket = manager.recover_launch_binding(
+            runtime_id
+        )
+
+        self.assertEqual(recovered_descriptor, descriptor)
+        self.assertEqual(recovered_ticket, "test-ticket-prior-descriptor")
+
     def test_broker_ticket_intent_and_credentials_survive_testd_adapter(self) -> None:
         candidate, lease = self._submit_and_lease(
             "repo-ticket-contract", self.repo_a, os.geteuid()
@@ -1954,6 +2005,66 @@ class UniversalTestAttemptChainSecurityTests(unittest.TestCase):
         self.assertEqual(
             terminal["exit_envelope"]["result_chunk_ids"],
             [chunk["chunk_id"]],
+        )
+
+    def test_native_exit_without_result_appends_after_retained_chunk_prefix(self) -> None:
+        runtime_id = "devcoordinator-test-" + hashlib.sha256(
+            b"attempt-partial-result"
+        ).hexdigest()[:32]
+
+        class Calls:
+            def call(self, *, operation, **_kwargs):
+                if operation.value == "test.attempt_status":
+                    return {
+                        "state": "exited",
+                        "exit_status": 1,
+                        "result": None,
+                        "result_chunk": None,
+                        "termination": {
+                            "reason": "signal",
+                            "systemd_result": "signal",
+                            "exec_main_code": 2,
+                            "oom_killed": False,
+                        },
+                        "resource_usage": {
+                            "peak_memory_bytes": 1024,
+                            "cpu_seconds": 0.5,
+                        },
+                    }
+                raise AssertionError(f"unexpected operation: {operation}")
+
+        submitter = CoordinatorRuntimeRequestSubmitter(
+            BrokerConnection(Path("/tmp/devcoordinator-unused.sock"), "authority-1"),
+            clock=lambda: 12.0,
+        )
+        submitter.calls = Calls()
+        submitter.recover(
+            runtime_id,
+            context=RunnerRecoveryContext(
+                repository_id="repo-partial-result",
+                repository_generation=5,
+                attempt_id="attempt-partial-result",
+                generation=3,
+                started_at=10.0,
+                next_chunk_index=1,
+                result_chunk_ids=("chunk-retained-green-cases",),
+            ),
+        )
+
+        failure = submitter.observe(runtime_id)
+        terminal = submitter.observe(runtime_id)
+
+        self.assertEqual(failure["state"], "result")
+        self.assertEqual(failure["result_chunk"]["chunk_index"], 1)
+        self.assertEqual(
+            terminal["exit_envelope"]["result_chunk_ids"],
+            [
+                "chunk-retained-green-cases",
+                failure["result_chunk"]["chunk_id"],
+            ],
+        )
+        self.assertEqual(
+            terminal["exit_envelope"]["conclusion"], "infrastructure_failed"
         )
 
 
