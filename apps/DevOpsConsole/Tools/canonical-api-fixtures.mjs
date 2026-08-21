@@ -43,6 +43,17 @@ export const CANONICAL_BUGS = Object.freeze({
   revision: 'fixture-empty-bugs',
   bugs: [],
 });
+export const CANONICAL_TEST_REPOSITORIES = Object.freeze({
+  schema_version: 1,
+  repositories: [{
+    repo_id: rootRepoId,
+    canonical_root: rootProject,
+    display_name: 'Sample API',
+    setup_status: 'ready',
+    setup_observed_at: '2026-01-15T11:59:00.000Z',
+    setup_retained: true,
+  }],
+});
 
 export const CANONICAL_OVERVIEW = Object.freeze({
   console: {
@@ -287,5 +298,6 @@ export function canonicalApiResponse(url, method = 'GET') {
   if (parsed.pathname === '/api/access/requests') return CANONICAL_INVITES;
   if (parsed.pathname === '/api/lifecycle/list') return CANONICAL_ARCHIVES;
   if (parsed.pathname === '/api/bugs') return CANONICAL_BUGS;
+  if (parsed.pathname === '/api/tests/repositories') return CANONICAL_TEST_REPOSITORIES;
   return null;
 }

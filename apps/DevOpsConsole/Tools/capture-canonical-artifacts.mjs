@@ -1,7 +1,6 @@
 #!/usr/bin/env node
 
 import { createRequire } from 'node:module';
-import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import { promises as fsp } from 'node:fs';
 import path from 'node:path';
@@ -32,22 +31,30 @@ const SOURCE_FILES = [
   'ci/playwright/package.json',
 ];
 
+const TESTS_DETAIL_SOURCES = [
+  GENERATOR,
+  'apps/DevOpsConsole/Tools/canonical-api-fixtures.mjs',
+  'apps/DevOpsConsole/Tools/canonical-artifacts.mjs',
+  'apps/DevOpsConsole/src/auth/pages.mjs',
+  'apps/DevOpsConsole/src/ui/app.css',
+  'apps/DevOpsConsole/src/ui/app.js',
+  'apps/DevOpsConsole/src/ui/index.html',
+  'apps/DevOpsConsole/test/helpers/stack.mjs',
+  'ci/playwright/package-lock.json',
+  'ci/playwright/package.json',
+];
 const CAPTURES = [
   { name: 'login-desktop.png', page: 'login', viewport: { width: 1440, height: 900 } },
   { name: 'login-mobile.png', page: 'login', viewport: { width: 390, height: 844 } },
   { name: 'projects-desktop.png', page: 'projects', viewport: { width: 1440, height: 900 } },
   { name: 'projects-mobile.png', page: 'projects', viewport: { width: 390, height: 844 } },
-];
-const TESTS_DETAIL_OUTPUT = path.join(OUTPUT_ROOT, 'tests-detail-desktop.png');
-const TESTS_DETAIL_SOURCES = [
-  GENERATOR,
-  'apps/DevOpsConsole/src/ui/app.css',
-  'apps/DevOpsConsole/src/ui/app.js',
-  'apps/DevOpsConsole/src/ui/index.html',
-  'apps/DevOpsConsole/test/browser.server-project-disclosures.test.mjs',
-  'apps/DevOpsConsole/test/helpers/stack.mjs',
-  'ci/playwright/package-lock.json',
-  'ci/playwright/package.json',
+  {
+    name: 'tests-detail-desktop.png',
+    page: 'tests',
+    viewport: { width: 1486, height: 1059 },
+    sourceFiles: TESTS_DETAIL_SOURCES,
+    fixtureId: 'devops-console-tests-current-repositories-v1:1486x1059',
+  },
 ];
 
 function loadLockedPlaywright() {
@@ -142,7 +149,7 @@ async function captureOne({ browser, stack, sessionCookie, definition }) {
       }
       globalThis.Date = FixedDate;
     }, CANONICAL_NOW);
-    if (definition.page === 'projects') {
+    if (definition.page !== 'login') {
       await context.addCookies([{
         name: sessionCookie.name,
         value: sessionCookie.value,
@@ -158,7 +165,7 @@ async function captureOne({ browser, stack, sessionCookie, definition }) {
     if (definition.page === 'login') {
       await page.goto(`${origin}/auth/login`, { waitUntil: 'networkidle' });
       await page.waitForSelector('h1', { state: 'visible' });
-    } else {
+    } else if (definition.page === 'projects') {
       await page.goto(`${origin}/#/projects`, { waitUntil: 'networkidle' });
       await page.waitForFunction(() => (
         document.querySelector('#projects-body .tree-node')
@@ -171,6 +178,10 @@ async function captureOne({ browser, stack, sessionCookie, definition }) {
       await page.getByText('queue-worker', { exact: true }).waitFor();
       await page.getByText('preview-web', { exact: true }).waitFor();
       await page.getByText('cleanup after run', { exact: false }).waitFor();
+    } else {
+      await page.goto(`${origin}/#/tests`, { waitUntil: 'networkidle' });
+      const repository = page.locator('#tests-body .test-current-repository').first();
+      await repository.waitFor({ state: 'visible' });
     }
     await settle(page);
     if (unexpectedRequests.length || browserErrors.length) {
@@ -181,50 +192,17 @@ async function captureOne({ browser, stack, sessionCookie, definition }) {
     await writeProvenance({
       pngPath: output,
       repoRoot: REPO_ROOT,
-      fixtureId: `${CANONICAL_FIXTURE_ID}:${definition.page}:${definition.viewport.width}x${definition.viewport.height}`,
+      fixtureId: definition.fixtureId
+        || `${CANONICAL_FIXTURE_ID}:${definition.page}:${definition.viewport.width}x${definition.viewport.height}`,
       generator: GENERATOR,
       viewport: definition.viewport,
-      sourceFiles: SOURCE_FILES,
+      sourceFiles: definition.sourceFiles || SOURCE_FILES,
     });
     const provenance = await verifyArtifactPair(output);
     process.stdout.write(`${path.relative(REPO_ROOT, output)} ${provenance.sha256}\n`);
   } finally {
     await context.close();
   }
-}
-
-async function captureTestsDetail() {
-  const testFile = path.join(APP_ROOT, 'test', 'browser.server-project-disclosures.test.mjs');
-  const pattern = 'Tests loads fleet awareness within one second and reveals repository detail on demand';
-  await new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, [
-      '--test',
-      `--test-name-pattern=${pattern}`,
-      testFile,
-    ], {
-      cwd: REPO_ROOT,
-      env: {
-        ...process.env,
-        TESTS_DESIGN_DETAIL_SCREENSHOT: TESTS_DETAIL_OUTPUT,
-      },
-      stdio: 'inherit',
-    });
-    child.once('error', reject);
-    child.once('exit', (code, signal) => {
-      if (code === 0) resolve();
-      else reject(new Error(`Tests detail capture failed (${signal || `exit ${code}`})`));
-    });
-  });
-  await writeProvenance({
-    pngPath: TESTS_DETAIL_OUTPUT,
-    repoRoot: REPO_ROOT,
-    fixtureId: 'devops-console-tests-selected-design-detail-open-v1:1486x1059',
-    generator: GENERATOR,
-    viewport: { width: 1486, height: 1059 },
-    sourceFiles: TESTS_DETAIL_SOURCES,
-  });
-  const provenance = await verifyArtifactPair(TESTS_DETAIL_OUTPUT);
-  process.stdout.write(`${path.relative(REPO_ROOT, TESTS_DETAIL_OUTPUT)} ${provenance.sha256}\n`);
 }
 
 async function main() {
@@ -266,7 +244,6 @@ async function main() {
     if (stack) await stack.close();
     await fsp.rm(fakeBin, { recursive: true, force: true });
   }
-  await captureTestsDetail();
 }
 
 main().catch((error) => {

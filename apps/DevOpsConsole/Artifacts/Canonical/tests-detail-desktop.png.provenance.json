@@ -2,40 +2,48 @@
   "schema_version": 1,
   "artifact_type": "test-fixture-snapshot",
   "source": "isolated-test-fixture",
-  "fixture_id": "devops-console-tests-selected-design-detail-open-v1:1486x1059",
+  "fixture_id": "devops-console-tests-current-repositories-v1:1486x1059",
   "generator": "apps/DevOpsConsole/Tools/capture-canonical-artifacts.mjs",
   "width": 1486,
   "height": 1059,
-  "sha256": "de38f223e2049f60cb647b9d8f7627da11ba05b72f2adc3dbdd6f86982ebda81",
+  "sha256": "9c6b7ee80d76f949c081f9343d1d813fcf46d61863a6ba1633685a518cf19a66",
   "viewport": {
     "width": 1486,
     "height": 1059
   },
-  "source_sha256": "662002bee5d0d0d1b0e90181940784335e48d6129ddc2a7d3ad25d6e9b2a4c0d",
+  "source_sha256": "ba1fa46541568b81d9ab4dcb5068fbc8fd4e3dc959d5e17e06dca00985a55b6c",
   "source_files": [
     {
+      "path": "apps/DevOpsConsole/Tools/canonical-api-fixtures.mjs",
+      "sha256": "340b0439dcb05bacda236d6b7554814a61d13f772f128208faa5a121ef5b4e26"
+    },
+    {
+      "path": "apps/DevOpsConsole/Tools/canonical-artifacts.mjs",
+      "sha256": "b39af369dfe1878b4db5e8c3f3fdd1bc17e740e6a997a035cd76b2a36989908f"
+    },
+    {
       "path": "apps/DevOpsConsole/Tools/capture-canonical-artifacts.mjs",
-      "sha256": "b7399b9afb33c391bf1bda68750a7ef94f300bbd15efc099adb992e636fe6d31"
+      "sha256": "84e021f9adde567aeb991b1da70f3a3cc13c1a5b35910f17751a1190ddab9fcf"
+    },
+    {
+      "path": "apps/DevOpsConsole/src/auth/pages.mjs",
+      "sha256": "418d78ba17d550e53d1dd377f7caf8bb24fd399615dda7427d1424422644418a"
     },
     {
       "path": "apps/DevOpsConsole/src/ui/app.css",
-      "sha256": "bb07a6b9f65c7c484e9cbf701ee00739818551872e8e4b0e25f1cfd17f7ec56a"
+      "sha256": "e87dcff4b6ebd9863df4e2e86541e9ad35b83a02eda190a4311e3ccc9a58fcef"
     },
     {
       "path": "apps/DevOpsConsole/src/ui/app.js",
-      "sha256": "4b04d992f484917557493e20cac7f4857798c49613d4f27028392c1da558c453"
+      "sha256": "998ae956f8df9a8a9a6dd98b8e94fc893ad54076bee1ddae1c7f0802a823a643"
     },
     {
       "path": "apps/DevOpsConsole/src/ui/index.html",
-      "sha256": "a05af6070bc214122e7b84408c7c8288642a5071ddce1e393465a0f067db4620"
-    },
-    {
-      "path": "apps/DevOpsConsole/test/browser.server-project-disclosures.test.mjs",
-      "sha256": "c319f82af14c71e8d6335d659517471429196a079c18e37ab41e7bfa6883f2ce"
+      "sha256": "dcc1a2128c0b5d62322ec9519138172e5b632baab1bd6e7fc16398d7c9fdc1d9"
     },
     {
       "path": "apps/DevOpsConsole/test/helpers/stack.mjs",
-      "sha256": "f9c22e722343b02d9fbd42530a2d073895c0faf5217335e1859aa76c256c7ef2"
+      "sha256": "bbca8a9863bb056ecffd4bdc39e03f010f0ce0feef79c3546ba1d94b63ad30ab"
     },
     {
       "path": "ci/playwright/package-lock.json",

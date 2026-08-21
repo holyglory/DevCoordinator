@@ -11,11 +11,11 @@
     "width": 390,
     "height": 844
   },
-  "source_sha256": "e606509b81884a4244657d046d36d5a0dc5f29bdc10e609e37b4f7f60dd0a55a",
+  "source_sha256": "ba1fa46541568b81d9ab4dcb5068fbc8fd4e3dc959d5e17e06dca00985a55b6c",
   "source_files": [
     {
       "path": "apps/DevOpsConsole/Tools/canonical-api-fixtures.mjs",
-      "sha256": "f010f962b16b4bc3e67e786b1ca6414c2c66aa7950e377f5f097ebe712e7135b"
+      "sha256": "340b0439dcb05bacda236d6b7554814a61d13f772f128208faa5a121ef5b4e26"
     },
     {
       "path": "apps/DevOpsConsole/Tools/canonical-artifacts.mjs",
@@ -23,7 +23,7 @@
     },
     {
       "path": "apps/DevOpsConsole/Tools/capture-canonical-artifacts.mjs",
-      "sha256": "b7399b9afb33c391bf1bda68750a7ef94f300bbd15efc099adb992e636fe6d31"
+      "sha256": "84e021f9adde567aeb991b1da70f3a3cc13c1a5b35910f17751a1190ddab9fcf"
     },
     {
       "path": "apps/DevOpsConsole/src/auth/pages.mjs",
@@ -31,19 +31,19 @@
     },
     {
       "path": "apps/DevOpsConsole/src/ui/app.css",
-      "sha256": "bb07a6b9f65c7c484e9cbf701ee00739818551872e8e4b0e25f1cfd17f7ec56a"
+      "sha256": "e87dcff4b6ebd9863df4e2e86541e9ad35b83a02eda190a4311e3ccc9a58fcef"
     },
     {
       "path": "apps/DevOpsConsole/src/ui/app.js",
-      "sha256": "4b04d992f484917557493e20cac7f4857798c49613d4f27028392c1da558c453"
+      "sha256": "998ae956f8df9a8a9a6dd98b8e94fc893ad54076bee1ddae1c7f0802a823a643"
     },
     {
       "path": "apps/DevOpsConsole/src/ui/index.html",
-      "sha256": "a05af6070bc214122e7b84408c7c8288642a5071ddce1e393465a0f067db4620"
+      "sha256": "dcc1a2128c0b5d62322ec9519138172e5b632baab1bd6e7fc16398d7c9fdc1d9"
     },
     {
       "path": "apps/DevOpsConsole/test/helpers/stack.mjs",
-      "sha256": "f9c22e722343b02d9fbd42530a2d073895c0faf5217335e1859aa76c256c7ef2"
+      "sha256": "bbca8a9863bb056ecffd4bdc39e03f010f0ce0feef79c3546ba1d94b63ad30ab"
     },
     {
       "path": "ci/playwright/package-lock.json",
