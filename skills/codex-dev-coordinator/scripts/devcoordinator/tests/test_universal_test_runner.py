@@ -90,27 +90,21 @@ class UniversalTestRunnerTests(unittest.TestCase):
             )
         )
 
-    def result_chunks(self, result_path: Path) -> list[dict[str, object]]:
+    def result_package_content(self, result_path: Path) -> dict[str, object]:
         package = validate_result_package(result_path)
-        return [
-            {
-                "cases": list(iter_result_package_records(package, "cases")),
-                "failures": list(
-                    iter_result_package_records(package, "failures")
-                ),
-                "artifacts": list(package.manifest["artifacts"]),
-                "reporter_complete": package.manifest["outcome"][
-                    "reporter_complete"
-                ],
-            }
-        ]
+        return {
+            "cases": list(iter_result_package_records(package, "cases")),
+            "failures": list(
+                iter_result_package_records(package, "failures")
+            ),
+            "artifacts": list(package.manifest["artifacts"]),
+            "reporter_complete": package.manifest["outcome"][
+                "reporter_complete"
+            ],
+        }
 
     def result_failures(self, result_path: Path) -> list[dict[str, object]]:
-        return [
-            failure
-            for chunk in self.result_chunks(result_path)
-            for failure in chunk["failures"]
-        ]
+        return list(self.result_package_content(result_path)["failures"])
 
     def result_document(self, result_path: Path) -> dict[str, object]:
         package = validate_result_package(result_path)
@@ -996,7 +990,9 @@ raise SystemExit(1)
             {failure["case_id"] for failure in failures},
             {case["case_id"] for case in cases},
         )
-        self.assertEqual(len(self.result_chunks(result_path)), 1)
+        self.assertEqual(
+            self.result_package_content(result_path)["failures"], failures
+        )
         self.assertEqual(self.result_document(result_path)["counts"]["failures"], 130)
 
     def test_typed_drivers_receive_fixed_reporter_adapters(self) -> None:
@@ -1150,7 +1146,9 @@ raise SystemExit(1)
         self.assertFalse(result["incomplete_reporting"])
         self.assertEqual(result["terminal_outcome"], "succeeded")
         self.assertEqual(self.result_cases(result_path)[0]["status"], "passed")
-        self.assertTrue(self.result_chunks(result_path)[-1]["reporter_complete"])
+        self.assertTrue(
+            self.result_package_content(result_path)["reporter_complete"]
+        )
 
     def test_immutable_dotnet_restores_offline_before_no_restore_test(self) -> None:
         (self.root / "global.json").write_text(
@@ -1902,7 +1900,9 @@ raise SystemExit(1)
         self.assertEqual(failures[0]["classification"], "test_failure")
         self.assertEqual(failures[0]["case_id"], "real-failure")
         self.assertEqual(self.result_cases(result_path)[0]["status"], "failed")
-        self.assertTrue(self.result_chunks(result_path)[-1]["reporter_complete"])
+        self.assertTrue(
+            self.result_package_content(result_path)["reporter_complete"]
+        )
 
     def test_dotnet_solution_retains_every_trx_and_assertion_cause(self) -> None:
         executable = self.fake_dotnet(

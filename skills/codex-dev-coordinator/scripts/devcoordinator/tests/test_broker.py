@@ -3477,7 +3477,7 @@ class StoreBackedBrokerTests(unittest.TestCase):
                 repository_generation=0,
                 resource_id=PROJECT_ID,
                 operation=BrokerOperation.TEST_ATTEMPT_STATUS,
-                arguments={"runtime_id": "runtime-alpha", "result_chunk_index": 0},
+                arguments={"runtime_id": "runtime-alpha"},
             )
 
             acceptor = StoreBackedRequestAcceptor(
@@ -3503,16 +3503,33 @@ class StoreBackedBrokerTests(unittest.TestCase):
                         repository_id = PROJECT_ID
                         repository_generation = 0
                         attempt_id = PROJECT_ID
+                        generation = 1
 
                     return Descriptor()
 
-                def observe(
-                    self, _runtime_id: str, *, result_chunk_index: int
-                ) -> Mapping[str, object]:
-                    self.last_chunk_index = result_chunk_index
+                def observe(self, runtime_id: str) -> Mapping[str, object]:
                     if not self.available:
                         raise OSError(errno.EROFS, "read-only artifact store")
-                    return {"state": "running"}
+                    return {
+                        "execution_id": PROJECT_ID,
+                        "runtime_id": runtime_id,
+                        "attempt_id": PROJECT_ID,
+                        "generation": 1,
+                        "repository_id": PROJECT_ID,
+                        "repository_generation": 0,
+                        "systemd_unit": f"{runtime_id}.service",
+                        "invocation_id": "invocation-runtime-io",
+                        "state": "running",
+                        "unit_inactive": False,
+                        "cgroup_empty": False,
+                        "launch_confirmed": True,
+                        "started_at": 1.0,
+                        "finished_at": None,
+                        "result_package": None,
+                        "exit": None,
+                        "resource_usage": {"current_memory_bytes": 4096},
+                        "progress": None,
+                    }
 
             runtime = AttemptRuntime()
             backend._test_attempts = runtime
@@ -3527,10 +3544,7 @@ class StoreBackedBrokerTests(unittest.TestCase):
                 repository_generation=0,
                 resource_id=PROJECT_ID,
                 operation=BrokerOperation.TEST_ATTEMPT_STATUS,
-                arguments={
-                    "runtime_id": "devcoordinator-test-runtime-io",
-                    "result_chunk_index": 0,
-                },
+                arguments={"runtime_id": "devcoordinator-test-runtime-io"},
             )
 
             with self.assertNoLogs("devcoordinator.broker", level="ERROR"):
@@ -3547,8 +3561,29 @@ class StoreBackedBrokerTests(unittest.TestCase):
             recovered = service.reply_for_document(peer_for(), request.to_wire())
 
             self.assertTrue(recovered["ok"], recovered)
-            self.assertEqual(recovered["result"], {"state": "running"})
-            self.assertEqual(runtime.last_chunk_index, 0)
+            self.assertEqual(
+                recovered["result"],
+                {
+                    "execution_id": PROJECT_ID,
+                    "runtime_id": "devcoordinator-test-runtime-io",
+                    "attempt_id": PROJECT_ID,
+                    "generation": 1,
+                    "repository_id": PROJECT_ID,
+                    "repository_generation": 0,
+                    "systemd_unit": "devcoordinator-test-runtime-io.service",
+                    "invocation_id": "invocation-runtime-io",
+                    "state": "running",
+                    "unit_inactive": False,
+                    "cgroup_empty": False,
+                    "launch_confirmed": True,
+                    "started_at": 1.0,
+                    "finished_at": None,
+                    "result_package": None,
+                    "exit": None,
+                    "resource_usage": {"current_memory_bytes": 4096},
+                    "progress": None,
+                },
+            )
 
     def test_postgres_host_failure_is_durable_and_never_registers_backup(self) -> None:
         with CanonicalTemporaryDirectory() as root:
