@@ -355,6 +355,7 @@ Environment=ROOT_STATE=%h/.local/state/root-app
                 "image_blob": image_blob,
                 "sidecar_blob": sidecar_blob,
                 "detail": detail,
+                "head_tree": "current-head-tree",
             }
             check(
                 module.known_historical_source_drift(**exact),
@@ -367,6 +368,55 @@ Environment=ROOT_STATE=%h/.local/state/root-app
                     not module.known_historical_source_drift(**changed),
                     f"historical repair was not exact for {field}",
                 )
+            current = dict(exact)
+            current["head_tree"] = tree
+            check(
+                not module.known_historical_source_drift(**current),
+                "historical repair unexpectedly exempted current HEAD",
+            )
+
+        for (
+            image_path,
+            image_blob,
+            sidecar_blob,
+            source_path,
+            source_blob,
+            detail,
+        ) in module.KNOWN_HISTORICAL_SOURCE_BLOB_DRIFT:
+            exact = {
+                "tree": "historical-tree",
+                "image_path": image_path,
+                "image_blob": image_blob,
+                "sidecar_blob": sidecar_blob,
+                "source_path": source_path,
+                "source_blob": source_blob,
+                "detail": detail,
+                "head_tree": "current-head-tree",
+            }
+            check(
+                module.known_historical_source_drift(**exact),
+                "blob-bound historical repair did not accept its exact tuple",
+            )
+            for field in (
+                "image_path",
+                "image_blob",
+                "sidecar_blob",
+                "source_path",
+                "source_blob",
+                "detail",
+            ):
+                changed = dict(exact)
+                changed[field] = f"changed-{field}"
+                check(
+                    not module.known_historical_source_drift(**changed),
+                    f"blob-bound historical repair was not exact for {field}",
+                )
+            current = dict(exact)
+            current["head_tree"] = current["tree"]
+            check(
+                not module.known_historical_source_drift(**current),
+                "blob-bound historical repair unexpectedly exempted current HEAD",
+            )
 
         missing_contract_findings = module.scan_tip(repo)
         check(

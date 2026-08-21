@@ -244,6 +244,51 @@ KNOWN_HISTORICAL_SOURCE_DRIFT = frozenset(
     }
 )
 
+# Commit f649eab changed the Console Tests CSS while five canonical sidecars
+# still named the preceding stylesheet digest. The same immutable image,
+# sidecar, and source blobs then appeared in 22 otherwise unrelated commits
+# before a8fb086 regenerated every current pair. Bind this exception to those
+# exact blobs instead of enumerating whole repository trees; any changed path,
+# image, sidecar, source, or diagnostic remains a failure. Current HEAD is
+# never eligible even if it somehow recreates these bytes.
+KNOWN_HISTORICAL_SOURCE_BLOB_DRIFT = frozenset(
+    (
+        image_path,
+        image_blob,
+        sidecar_blob,
+        "apps/DevOpsConsole/src/ui/app.css",
+        "f2a20e61131aa5970f598dae0056d2ac5ca16e56",
+        "source hash mismatch: apps/DevOpsConsole/src/ui/app.css",
+    )
+    for image_path, image_blob, sidecar_blob in (
+        (
+            "apps/DevOpsConsole/Artifacts/Canonical/login-desktop.png",
+            "c923e6e0cd1db244774c982484d336d4cb7d1489",
+            "379dfb7cc77966a9e9140ecb5082fabb333bbc47",
+        ),
+        (
+            "apps/DevOpsConsole/Artifacts/Canonical/login-mobile.png",
+            "c94c0b78c7fe25d57589234a7f9731e449eefe97",
+            "2ee8a1c8d0973c52f0d6a2b61ba4bea1227c5e84",
+        ),
+        (
+            "apps/DevOpsConsole/Artifacts/Canonical/projects-desktop.png",
+            "5fefcb7009ef21deee13f4d319864171ee9b00b3",
+            "31b6b5dba64541fc7b656b3a3caea020b02cfa6d",
+        ),
+        (
+            "apps/DevOpsConsole/Artifacts/Canonical/projects-mobile.png",
+            "ffe502891dc31ffe13ff6f18af41812d1120082b",
+            "9082ca2c463c6771aa1ed56b16f505eaa547d68e",
+        ),
+        (
+            "apps/DevOpsConsole/Artifacts/Canonical/tests-detail-desktop.png",
+            "a6d6853a1f67c56aa01b0bd801bc8d85fb1c1dcc",
+            "8201cc99247c8fdc948582024a097f2615d0c888",
+        ),
+    )
+)
+
 
 @dataclass(frozen=True)
 class Finding:
@@ -357,14 +402,28 @@ def known_historical_source_drift(
     image_blob: str,
     sidecar_blob: str,
     detail: str,
+    source_path: str | None = None,
+    source_blob: str | None = None,
+    head_tree: str | None = None,
 ) -> bool:
-    return (
+    if head_tree is not None and tree == head_tree:
+        return False
+    if (
         tree,
         image_path,
         image_blob,
         sidecar_blob,
         detail,
-    ) in KNOWN_HISTORICAL_SOURCE_DRIFT
+    ) in KNOWN_HISTORICAL_SOURCE_DRIFT:
+        return True
+    return (
+        image_path,
+        image_blob,
+        sidecar_blob,
+        source_path,
+        source_blob,
+        detail,
+    ) in KNOWN_HISTORICAL_SOURCE_BLOB_DRIFT
 
 
 def production_dependency_paths(paths: list[str]) -> list[str]:
@@ -847,6 +906,9 @@ def scan_history(repo: Path) -> list[Finding]:
             )
 
     checked_trees: set[str] = set()
+    head_tree_raw = git(repo, "rev-parse", "HEAD^{tree}")
+    assert isinstance(head_tree_raw, str)
+    head_tree = head_tree_raw.strip()
     commits = git(repo, "rev-list", *history_revisions)
     assert isinstance(commits, str)
     for commit in commits.splitlines():
@@ -862,6 +924,8 @@ def scan_history(repo: Path) -> list[Finding]:
         for image_path in sorted(path for path in paths if CANONICAL_IMAGE.fullmatch(path)):
             sidecar_path = f"{image_path}.provenance.json"
             location = f"{commit}:{image_path}"
+            failed_source_path: str | None = None
+            failed_source_blob: str | None = None
             if sidecar_path not in paths:
                 findings.append(
                     Finding("historical-image-missing-provenance", location, "canonical image has no same-tree sidecar")
@@ -925,6 +989,14 @@ def scan_history(repo: Path) -> list[Finding]:
                             assert isinstance(source, bytes)
                             digest = hashlib.sha256(source).hexdigest()
                             if digest != recorded_hash:
+                                failed_source_path = source_path
+                                source_blob_raw = git(
+                                    repo,
+                                    "rev-parse",
+                                    f"{commit}:{source_path}",
+                                )
+                                assert isinstance(source_blob_raw, str)
+                                failed_source_blob = source_blob_raw.strip()
                                 raise ValueError(f"source hash mismatch: {source_path}")
                             current.append({"path": source_path, "sha256": digest})
                         aggregate = "".join(f"{item['path']}\0{item['sha256']}\n" for item in current)
@@ -943,6 +1015,9 @@ def scan_history(repo: Path) -> list[Finding]:
                     image_blob=image_blob.strip(),
                     sidecar_blob=sidecar_blob.strip(),
                     detail=detail,
+                    source_path=failed_source_path,
+                    source_blob=failed_source_blob,
+                    head_tree=head_tree,
                 ):
                     continue
                 findings.append(Finding("historical-image-provenance", location, detail))
