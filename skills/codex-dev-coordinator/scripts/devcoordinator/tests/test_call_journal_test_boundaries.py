@@ -144,9 +144,9 @@ class CallJournalTestBoundaryTests(unittest.TestCase):
                     "repository_id": "repo-globalfinance",
                     "run_id": "run-123",
                 },
-                "lease": {
+                "execution": {
                     "run_id": "run-123",
-                    "attempt_id": "attempt-456",
+                    "execution_id": "execution-456",
                 },
                 "plan": {"repository_id": "repo-globalfinance"},
             },
@@ -189,14 +189,14 @@ class CallJournalTestBoundaryTests(unittest.TestCase):
         self.assertEqual(terminal["request_id"], request_id)
         self.assertEqual(terminal["repository_id"], "repo-globalfinance")
         self.assertEqual(terminal["run_id"], "run-123")
-        self.assertEqual(terminal["attempt_id"], "attempt-456")
+        self.assertEqual(terminal["attempt_id"], "execution-456")
         self.assertEqual(terminal["peer_pid"], 4242)
         self.assertEqual(terminal["diagnostic"]["errno"], "EACCES")
         retained = self.journal_path.read_text(encoding="utf-8")
         self.assertNotIn("/home/private", retained)
         self.assertNotIn("must-not-leak", retained)
         self.assertNotIn('"candidate":', retained)
-        self.assertNotIn('"lease":', retained)
+        self.assertNotIn('"execution":', retained)
 
     def test_snapshot_success_records_native_identity_and_duration(self) -> None:
         server = UnixSnapshotServiceServer(
@@ -263,9 +263,9 @@ class CallJournalTestBoundaryTests(unittest.TestCase):
                             "repository_id": "repo-globalfinance",
                             "run_id": "run-123",
                         },
-                        "lease": {
+                        "execution": {
                             "run_id": "run-123",
-                            "attempt_id": "attempt-456",
+                            "execution_id": "execution-456",
                         },
                         "plan": {"repository_id": "repo-globalfinance"},
                     },
@@ -281,7 +281,7 @@ class CallJournalTestBoundaryTests(unittest.TestCase):
         self.assertEqual(records[-1]["boundary"], "snapshot_client")
         self.assertEqual(records[-1]["repository_id"], "repo-globalfinance")
         self.assertEqual(records[-1]["run_id"], "run-123")
-        self.assertEqual(records[-1]["attempt_id"], "attempt-456")
+        self.assertEqual(records[-1]["attempt_id"], "execution-456")
         self.assertEqual(records[-1]["code"], "snapshot_transport_unavailable")
         self.assertEqual(records[-1]["diagnostic"]["errno"], "ECONNREFUSED")
         retained = self.journal_path.read_text(encoding="utf-8")
@@ -358,7 +358,7 @@ class CallJournalTestBoundaryTests(unittest.TestCase):
                     {
                         "repository_id": "repo-globalfinance",
                         "run_id": "run-123",
-                        "attempt_id": "attempt-456",
+                        "execution_id": "execution-456",
                     },
                 )
 
@@ -373,7 +373,7 @@ class CallJournalTestBoundaryTests(unittest.TestCase):
         self.assertEqual(records[-1]["boundary"], "test_plane_client")
         self.assertEqual(records[-1]["repository_id"], "repo-globalfinance")
         self.assertEqual(records[-1]["run_id"], "run-123")
-        self.assertEqual(records[-1]["attempt_id"], "attempt-456")
+        self.assertEqual(records[-1]["attempt_id"], "execution-456")
         self.assertEqual(records[-1]["code"], "transport_unavailable")
         self.assertEqual(records[-1]["diagnostic"]["errno"], "ECONNREFUSED")
         retained = self.journal_path.read_text(encoding="utf-8")
@@ -399,7 +399,7 @@ class CallJournalTestBoundaryTests(unittest.TestCase):
                     "result": {
                         "repository_id": "repo-globalfinance",
                         "run_id": "run-123",
-                        "attempt_id": "attempt-456",
+                        "execution_id": "execution-456",
                     },
                 }
             ).encode("utf-8")
@@ -429,7 +429,7 @@ class CallJournalTestBoundaryTests(unittest.TestCase):
         self.assertEqual(records[-1]["peer_uid"], 0)
         self.assertEqual(records[-1]["repository_id"], "repo-globalfinance")
         self.assertEqual(records[-1]["run_id"], "run-123")
-        self.assertEqual(records[-1]["attempt_id"], "attempt-456")
+        self.assertEqual(records[-1]["attempt_id"], "execution-456")
 
     def test_test_plane_receive_abort_is_logged_and_does_not_escape(self) -> None:
         adapter = StoreTestPlaneAdapter(

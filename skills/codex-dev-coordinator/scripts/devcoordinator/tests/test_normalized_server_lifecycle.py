@@ -1235,12 +1235,14 @@ class NormalizedPortLifecycleTests(unittest.TestCase):
         )
         self.assertEqual(
             dev_coordinator.parse_test_evidence_query(
-                "repo_id=repo-a&after=failure-17&limit=3"
+                "repo_id=repo-a&after=failure-17&limit=3", cases=False
             ),
             {"repository_id": "repo-a", "after": "failure-17", "limit": 3},
         )
         with self.assertRaisesRegex(ValueError, "query parameters"):
-            dev_coordinator.parse_test_evidence_query("after=failure-17&limit=3")
+            dev_coordinator.parse_test_evidence_query(
+                "after=failure-17&limit=3", cases=False
+            )
         for query in (
             "repo_id=repo-a&limit=0",
             "repo_id=repo-a&state=invented",

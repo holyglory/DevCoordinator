@@ -136,7 +136,9 @@ class _InternalBrokerCalls:
             "repository_generation": repository_generation,
             "resource_id": resource_id,
             "run_id": arguments.get("run_id"),
-            "execution_id": arguments.get("execution_id"),
+            # The public v8 request carries execution_id.  The generic call
+            # journal keeps its historical diagnostic storage column name.
+            "attempt_id": arguments.get("execution_id"),
         }
         if self.call_journal is not None:
             self.call_journal.record(
