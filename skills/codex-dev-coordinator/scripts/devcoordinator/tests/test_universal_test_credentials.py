@@ -3,7 +3,6 @@ from __future__ import annotations
 import base64
 from contextlib import redirect_stdout
 from dataclasses import replace
-import hashlib
 import importlib.util
 import io
 import json
@@ -16,16 +15,22 @@ from unittest import mock
 
 from devcoordinator import universal_test_credentials as credentials_module
 from devcoordinator import universal_test_runtime as runtime_module
-from devcoordinator.universal_test_artifacts import package_directory
 from devcoordinator.universal_test_credentials import (
     AdministratorOperationalCredentialStore,
     BrokerOperationalCredentialProvider,
     public_binding_document,
 )
+from devcoordinator.universal_test_result_package import (
+    RESULT_PACKAGE_FILE_NAME,
+    copy_result_package_artifact,
+    iter_result_package_records,
+    validate_result_package,
+)
 from devcoordinator.universal_test_runner import run
 from devcoordinator.universal_test_runtime import (
     SystemdTestAttemptManager,
     TestAttemptDescriptor,
+    TestAttemptRuntimeNotFound,
 )
 from devcoordinator.universal_test_store import (
     TestStoreConflict,
@@ -70,7 +75,7 @@ class UniversalTestOperationalCredentialTests(unittest.TestCase):
     def descriptor(
         self,
         *,
-        attempt_id: str = "attempt-health-sweep",
+        execution_id: str = "execution-health-sweep",
         repository_id: str = "repo-skydive",
         repository_generation: int = 7,
         owner_uid: int | None = None,
@@ -79,7 +84,7 @@ class UniversalTestOperationalCredentialTests(unittest.TestCase):
         argv: tuple[str, ...] = ("/usr/bin/python3", "-c", "pass"),
     ) -> TestAttemptDescriptor:
         return TestAttemptDescriptor(
-            attempt_id=attempt_id,
+            execution_id=execution_id,
             target_id="target-health-sweep",
             run_id="run-health-sweep",
             repository_id=repository_id,
@@ -122,6 +127,44 @@ class UniversalTestOperationalCredentialTests(unittest.TestCase):
             source_key="ADMIN_TOKEN",
             source_uid=self.owner_uid,
         )
+
+    def secret_variants(self) -> tuple[bytes, ...]:
+        return tuple(
+            sorted(
+                {
+                    self.SECRET,
+                    base64.b64encode(self.SECRET),
+                    base64.urlsafe_b64encode(self.SECRET).rstrip(b"="),
+                    self.SECRET.hex().encode("ascii"),
+                }
+            )
+        )
+
+    def validated_secret_free_package(self, path: Path):
+        variants = self.secret_variants()
+        package = validate_result_package(
+            path,
+            prohibited_sequences=variants,
+        )
+        payload = path.read_bytes()
+        captures = json.dumps(
+            package.manifest["captures"],
+            sort_keys=True,
+        ).encode("utf-8")
+        for variant in variants:
+            self.assertNotIn(variant, payload)
+            self.assertNotIn(variant, captures)
+        for artifact in package.manifest["artifacts"]:
+            copied = io.BytesIO()
+            copy_result_package_artifact(
+                package,
+                str(artifact["artifact_id"]),
+                copied,
+            )
+            artifact_payload = copied.getvalue()
+            for variant in variants:
+                self.assertNotIn(variant, artifact_payload)
+        return package
 
     def test_registration_persists_only_sealed_metadata_and_opaque_alias(self) -> None:
         binding = self.register()
@@ -482,7 +525,7 @@ class UniversalTestOperationalCredentialTests(unittest.TestCase):
             self.provider._prepared_state_path(committed_runtime).exists()
         )
 
-    def test_not_found_terminal_state_cleans_recovered_credential_lease(
+    def test_absent_terminal_cleanup_requires_exact_launch_and_native_evidence(
         self,
     ) -> None:
         self.register()
@@ -506,6 +549,8 @@ class UniversalTestOperationalCredentialTests(unittest.TestCase):
         manager = SystemdTestAttemptManager(
             attempt_root=self.root / "attempts",
             artifact_root=self.root / "artifacts",
+            result_package_root=self.root / "result-packages",
+            cgroup_root=self.root / "cgroup",
             credential_provider=BrokerOperationalCredentialProvider(
                 registry_path=self.registry,
                 material_root=self.material_root,
@@ -514,8 +559,35 @@ class UniversalTestOperationalCredentialTests(unittest.TestCase):
             ),
             runner=unavailable_systemd,
         )
+        with self.assertRaisesRegex(
+            TestAttemptRuntimeNotFound,
+            "launch evidence is absent",
+        ):
+            manager.status(runtime_id)
+        self.assertTrue(lease_directory.is_dir())
+
+        state_root = manager._prepare_attempt_state(runtime_id)
+        manager._publish_runner_launch(
+            descriptor,
+            state=state_root,
+            execution_root=self.repository,
+            owner_gid=os.getegid(),
+        )
+        manager._publish_native_evidence(
+            runtime_id,
+            descriptor,
+            invocation_id="test-invocation-" + "1" * 32,
+            prepared_at=1_700_000_000.0,
+            started_at=1_700_000_001.0,
+            control_group=f"/system.slice/{runtime_id}.service",
+        )
         state = manager.status(runtime_id)
-        self.assertEqual(state.state, "not-found")
+        self.assertEqual(state.state, "absent")
+        self.assertFalse(state.active)
+        self.assertFalse(state.cgroup_populated)
+        self.assertTrue(lease_directory.is_dir())
+
+        manager.collect(runtime_id)
         self.assertFalse(lease_directory.exists())
 
     def test_lease_is_transient_replay_safe_and_systemd_only(self) -> None:
@@ -535,7 +607,7 @@ class UniversalTestOperationalCredentialTests(unittest.TestCase):
         self.assertNotIn(self.SECRET, state_payload)
         with self.assertRaisesRegex(TestStoreConflict, "already bound"):
             self.provider.provision(
-                replace(descriptor, attempt_id="attempt-replay"),
+                replace(descriptor, execution_id="execution-replay"),
                 runtime_id=runtime_id,
             )
 
@@ -701,11 +773,11 @@ class UniversalTestOperationalCredentialTests(unittest.TestCase):
         credential.chmod(0o400)
         output = self.root / "runner-output"
         output.mkdir(mode=0o700)
-        result_path = output / "result.json"
+        result_path = output / RESULT_PACKAGE_FILE_NAME
 
         inherited_probe = replace(
             self.descriptor(
-                attempt_id="attempt-inherited-env",
+                execution_id="execution-inherited-env",
                 argv=(
                     "/usr/bin/python3",
                     "-c",
@@ -721,7 +793,11 @@ class UniversalTestOperationalCredentialTests(unittest.TestCase):
             clear=False,
         ):
             self.assertEqual(run(inherited_probe, output, result_path), 0)
-        stdout = output / f"{inherited_probe.attempt_id}-stdout.log"
+        inherited_package = self.validated_secret_free_package(result_path)
+        self.assertFalse(
+            inherited_package.manifest["outcome"]["incomplete_reporting"]
+        )
+        stdout = output / f"{inherited_probe.execution_id}-stdout.log"
         self.assertEqual(stdout.read_text(encoding="utf-8").strip(), "missing")
 
         for index, expression in enumerate(
@@ -736,9 +812,9 @@ class UniversalTestOperationalCredentialTests(unittest.TestCase):
             with self.subTest(index=index):
                 attempt_output = self.root / f"secret-output-{index}"
                 attempt_output.mkdir(mode=0o700)
-                attempt_result = attempt_output / "result.json"
+                attempt_result = attempt_output / RESULT_PACKAGE_FILE_NAME
                 descriptor = self.descriptor(
-                    attempt_id=f"attempt-secret-output-{index}",
+                    execution_id=f"execution-secret-output-{index}",
                     argv=(
                         "/usr/bin/python3",
                         "-c",
@@ -754,28 +830,13 @@ class UniversalTestOperationalCredentialTests(unittest.TestCase):
                         run(descriptor, attempt_output, attempt_result),
                         1,
                     )
-                published = b"".join(
-                    path.read_bytes()
-                    for path in attempt_output.iterdir()
-                    if path.is_file()
+                package = self.validated_secret_free_package(attempt_result)
+                self.assertTrue(
+                    package.manifest["outcome"]["incomplete_reporting"]
                 )
-                self.assertNotIn(self.SECRET, published)
-                self.assertNotIn(base64.b64encode(self.SECRET), published)
-                result = json.loads(attempt_result.read_text(encoding="utf-8"))
-                self.assertTrue(result["incomplete_reporting"])
-                chunks = [
-                    json.loads(
-                        (attempt_output / item["file_name"]).read_text(
-                            encoding="utf-8"
-                        )
-                    )
-                    for item in result["chunk_manifest"]
-                ]
-                failures = [
-                    failure
-                    for chunk in chunks
-                    for failure in chunk["failures"]
-                ]
+                failures = list(
+                    iter_result_package_records(package, "failures")
+                )
                 self.assertTrue(
                     any(
                         failure["message"]
@@ -809,7 +870,7 @@ class UniversalTestOperationalCredentialTests(unittest.TestCase):
                     )
                 descriptor = replace(
                     self.descriptor(
-                        attempt_id=f"attempt-directory-{label}",
+                        execution_id=f"execution-directory-{label}",
                     ),
                     artifacts=(
                         {
@@ -823,43 +884,37 @@ class UniversalTestOperationalCredentialTests(unittest.TestCase):
                 )
                 output = self.root / f"directory-output-{label}"
                 output.mkdir(mode=0o700)
-                result_path = output / "result.json"
+                result_path = output / RESULT_PACKAGE_FILE_NAME
                 with mock.patch.dict(
                     os.environ,
                     {"CREDENTIALS_DIRECTORY": str(credential_directory)},
                     clear=False,
                 ):
                     self.assertEqual(run(descriptor, output, result_path), 1)
-                result = json.loads(result_path.read_text(encoding="utf-8"))
+                package = self.validated_secret_free_package(result_path)
                 self.assertFalse(
                     any(
                         item["kind"] == "directory"
-                        for item in result["artifact_sources"]
+                        for item in package.manifest["artifacts"]
                     )
                 )
-                failures = [
-                    failure
-                    for item in result["chunk_manifest"]
-                    for failure in json.loads(
-                        (output / item["file_name"]).read_text(encoding="utf-8")
-                    )["failures"]
-                ]
+                failures = list(
+                    iter_result_package_records(package, "failures")
+                )
                 self.assertTrue(
                     any("secret material" in failure["message"] for failure in failures)
                 )
 
-    def test_root_directory_repackaging_rechecks_exact_credential_sequences(
+    def test_atomic_directory_package_retention_ignores_mutated_source(
         self,
     ) -> None:
         self.register()
         reports = self.repository / "root-repackaged-reports"
         reports.mkdir()
-        split_at = 1024 * 1024 - 5
-        (reports / "payload.bin").write_bytes(
-            b"z" * split_at + self.SECRET + b"tail"
-        )
+        report = reports / "payload.bin"
+        report.write_bytes(b"safe directory evidence\n")
         descriptor = replace(
-            self.descriptor(attempt_id="attempt-root-directory-repackage"),
+            self.descriptor(execution_id="execution-root-directory-repackage"),
             artifacts=(
                 {
                     "name": "root-repackaged-reports",
@@ -876,40 +931,41 @@ class UniversalTestOperationalCredentialTests(unittest.TestCase):
         attempt_root = self.root / "root-repackage-attempts"
         output = attempt_root / runtime_id / "output"
         output.mkdir(mode=0o700, parents=True)
-        launch = attempt_root / runtime_id / "launch.json"
-        launch.write_text(
-            json.dumps({"descriptor": descriptor.to_document()}),
+        result_path = output / RESULT_PACKAGE_FILE_NAME
+        with mock.patch.dict(
+            os.environ,
+            {
+                "CREDENTIALS_DIRECTORY": str(
+                    Path(
+                        str(lease.credential_files[0]["source_path"])
+                    ).parent
+                )
+            },
+            clear=False,
+        ):
+            self.assertEqual(run(descriptor, output, result_path), 0)
+        package = self.validated_secret_free_package(result_path)
+        directory_artifact = next(
+            item
+            for item in package.manifest["artifacts"]
+            if item["kind"] == "directory"
+        )
+        packaged_before_mutation = io.BytesIO()
+        copy_result_package_artifact(
+            package,
+            str(directory_artifact["artifact_id"]),
+            packaged_before_mutation,
+        )
+
+        report.write_bytes(self.SECRET)
+        (reports / (self.SECRET.decode("ascii") + ".txt")).write_text(
+            "unsafe late source name",
             encoding="utf-8",
         )
-        archive = output / "untrusted-directory.tar"
-        with archive.open("wb") as destination:
-            evidence = package_directory(
-                reports,
-                destination,
-                expected_uid=self.owner_uid,
-                maximum_bytes=4 * 1024 * 1024,
-            )
-        artifact_id = "artifact-" + hashlib.sha256(
-            b"root-repackage-exact-secret"
-        ).hexdigest()[:32]
-        handle = f"test-artifact://{artifact_id}/{evidence.sha256}"
-        result = {
-            "artifact_sources": [
-                {
-                    "artifact_id": artifact_id,
-                    "storage_handle": handle,
-                    "kind": "directory",
-                    "scope": "output",
-                    "relative_path": archive.name,
-                    "packaged_from": reports.relative_to(self.repository).as_posix(),
-                    "sha256": evidence.sha256,
-                    "size_bytes": evidence.size_bytes,
-                }
-            ]
-        }
         manager = SystemdTestAttemptManager(
             attempt_root=attempt_root,
             artifact_root=self.root / "root-repackage-artifacts",
+            result_package_root=self.root / "root-repackage-results",
             credential_provider=BrokerOperationalCredentialProvider(
                 registry_path=self.registry,
                 material_root=self.material_root,
@@ -917,11 +973,15 @@ class UniversalTestOperationalCredentialTests(unittest.TestCase):
                 expected_authority_uid=self.owner_uid,
             ),
         )
-        with self.assertRaisesRegex(
-            TestStoreContractError,
-            "secret material",
-        ):
-            manager._collect_result_artifacts(runtime_id, result)
+        manager._collect_package_artifacts(package)
+        retained_path = manager.resolve_artifact(
+            str(directory_artifact["storage_handle"]),
+            expected_size=int(directory_artifact["size_bytes"]),
+        )
+        retained = retained_path.read_bytes()
+        self.assertEqual(retained, packaged_before_mutation.getvalue())
+        for variant in self.secret_variants():
+            self.assertNotIn(variant, retained)
         self.provider.cleanup(
             runtime_id=runtime_id,
             descriptor_fingerprint=lease.descriptor_fingerprint,
