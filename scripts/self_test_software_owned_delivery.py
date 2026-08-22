@@ -225,19 +225,25 @@ class DeliveryTests(unittest.TestCase):
             "digest": DIGEST,
             "path": f"/opt/devcoordinator/releases/{DIGEST}",
         }
-        results = subject.deploy_same_schema()
-        subject._rollback(reset_plan()["same_schema"]["rollback"])
+        results = subject.deploy_same_schema(finalize_delivery=False)
+        acceptance = subject.acceptance()
+        final = subject.finalize_delivery_fence(reset_test_history=False)
 
-        self.assertTrue(all(item.ok for item in results))
+        self.assertTrue(all(item.ok for item in [*results, *acceptance, final]))
         switch_calls = [
             call
             for call in executor.calls
             if any(Path(value).name == "devcoordinator-same-schema-switch" for value in call)
         ]
-        self.assertEqual(len(switch_calls), 4)
+        self.assertEqual(
+            [FakeExecutor.name(call) for call in switch_calls],
+            ["prepare", "apply", "verify", "finalize"],
+        )
         expected = str(self.root / "transaction" / DIGEST)
         for call in switch_calls:
             self.assertEqual(call[call.index("--transaction-root") + 1], expected)
+        names = [FakeExecutor.name(call) for call in executor.calls]
+        self.assertLess(names.index("acceptance-three"), names.index("finalize"))
 
     def test_browser_storage_handoff_requires_exact_caller_owned_private_json(self) -> None:
         storage = self.root / "storage-state.json"
@@ -345,6 +351,15 @@ class DeliveryTests(unittest.TestCase):
             all("--reset-test-history" not in call for call in executor.calls)
         )
         self.assertFalse(subject.state["deployment"]["test_history_reset"])
+        self.assertEqual(subject.state["deployment"]["fence_status"], "released")
+        failed = self.subject(
+            executor=FakeExecutor({"finalize": 1}), selected_plan=reset_plan()
+        )
+        failed.state["release"] = subject.state["release"]
+        failed.deploy_same_schema()
+        self.assertEqual(
+            failed.state["deployment"]["status"], "fence-release-incomplete"
+        )
 
     def test_opt_in_test_history_reset_reaches_every_switch_phase(self) -> None:
         executor = FakeExecutor()
@@ -357,7 +372,7 @@ class DeliveryTests(unittest.TestCase):
         self.assertTrue(all(result.ok for result in results))
         self.assertEqual(
             [FakeExecutor.name(call) for call in executor.calls],
-            ["prepare", "apply", "verify"],
+            ["prepare", "apply", "verify", "finalize"],
         )
         self.assertTrue(
             all(call.count("--reset-test-history") == 1 for call in executor.calls)
@@ -497,20 +512,36 @@ class DeliveryTests(unittest.TestCase):
     def test_acceptance_runs_all_checks_after_multiple_failures(self) -> None:
         executor = FakeExecutor({"acceptance-one": 1, "acceptance-three": 1})
         subject = self.subject(executor=executor)
+        subject.state["release"] = {
+            "digest": DIGEST,
+            "path": f"/opt/devcoordinator/releases/{DIGEST}",
+        }
+        subject.state["deployment"] = {
+            "status": "healthy",
+            "mode": "same-schema",
+            "test_history_reset": False,
+            "fence_status": "released",
+        }
+        begin = subject.begin_split_acceptance()
         results = subject.acceptance()
+        final = subject.finalize_delivery_fence(reset_test_history=False)
+        self.assertTrue(begin.ok and final.ok)
         self.assertEqual(
             [FakeExecutor.name(call) for call in executor.calls],
             [
+                "acceptance-begin",
                 "acceptance-session",
                 "acceptance-one",
                 "acceptance-two",
                 "acceptance-three",
+                "finalize",
             ],
         )
         self.assertEqual(sum(not result.ok for result in results), 2)
         report = subject.report()
         self.assertEqual(report["conclusion"], "failed")
         self.assertEqual(report["counts"]["acceptance_failures"], 2)
+        self.assertEqual(subject.state["deployment"]["fence_status"], "released")
 
     def test_plan_rejects_missing_rollback_or_health(self) -> None:
         value = plan()

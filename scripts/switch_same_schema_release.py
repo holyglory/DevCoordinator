@@ -44,6 +44,7 @@ if str(SCRIPT_ROOT) not in sys.path:
 
 import browser_lcp_acceptance as browser_lcp  # noqa: E402
 import install_availability_release as installer  # noqa: E402
+import server_wide_installer_fence as installer_fence  # noqa: E402
 from devcoordinator.schema import SCHEMA_VERSION as COORDINATOR_SCHEMA_VERSION  # noqa: E402
 from devcoordinator import retained_control  # noqa: E402
 from devcoordinator.server_credentials import (  # noqa: E402
@@ -71,6 +72,13 @@ from devcoordinator.worker_runner import observe_worker_process_identity  # noqa
 KIND = "devcoordinator-same-schema-release-switch"
 VERSION = 1
 RELEASE_RE = re.compile(r"^[0-9a-f]{64}$")
+DELIVERY_FENCE_OWNER_KIND = "devcoordinator-software-owned-delivery"
+DELIVERY_FENCE_IDENTITY_KIND = "devcoordinator-software-delivery-fence-identity"
+DELIVERY_FENCE_TERMINAL_KIND = "devcoordinator-software-delivery-fence-terminal"
+DELIVERY_FENCE_VERSION = 1
+DELIVERY_FENCE_IDENTITY_NAME = "installer-fence-identity.json"
+DELIVERY_FENCE_TERMINAL_NAME = "installer-fence-terminal.json"
+DELIVERY_FENCE_UUID_NAMESPACE = uuid.UUID("59f68121-c619-40e8-a85f-a22ab0ae890d")
 UNIT_ROOT = Path("/etc/systemd/system")
 SYSUSERS_ROOT = Path("/etc/sysusers.d")
 TMPFILES_ROOT = Path("/etc/tmpfiles.d")
@@ -858,6 +866,164 @@ def require_transaction_root(path: Path, *, release_digest: str) -> Path:
                 f"same-schema transaction directory is not root-owned and private: {directory}"
             )
     return absolute
+
+
+def _read_delivery_fence_document(
+    path: Path,
+    *,
+    expected_uid: int,
+    expected_gid: int,
+) -> dict[str, object]:
+    """Reuse the installer's no-follow file validator for private evidence."""
+
+    descriptor, before = installer_fence._claim_file(
+        path, expected_uid=expected_uid, expected_gid=expected_gid
+    )
+    try:
+        if not 1 <= before.st_size <= installer_fence.MAX_CLAIM_BYTES:
+            raise SwitchError("software delivery fence document size is invalid")
+        payload = os.read(descriptor, before.st_size)
+        after = os.fstat(descriptor)
+        if (
+            len(payload) != before.st_size
+            or (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+            != (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+        ):
+            raise SwitchError("software delivery fence document changed while reading")
+    finally:
+        os.close(descriptor)
+    try:
+        value = json.loads(payload)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise SwitchError("software delivery fence document is invalid JSON") from error
+    if not isinstance(value, dict):
+        raise SwitchError("software delivery fence document must be an object")
+    return value
+
+
+def delivery_fence_binding(
+    transaction_root: Path,
+    *,
+    release_digest: str,
+    expected_uid: int,
+    expected_gid: int,
+) -> tuple[Path, Path, dict[str, object]]:
+    """Publish or validate the reboot-stable identity for one delivery."""
+
+    identity = {
+        "schema_version": DELIVERY_FENCE_VERSION,
+        "kind": DELIVERY_FENCE_IDENTITY_KIND,
+        "operation_id": str(uuid.uuid5(
+            DELIVERY_FENCE_UUID_NAMESPACE, f"{release_digest}\0{transaction_root}"
+        )),
+        "release_digest": release_digest,
+    }
+    identity_path = transaction_root / DELIVERY_FENCE_IDENTITY_NAME
+    terminal_path = transaction_root / DELIVERY_FENCE_TERMINAL_NAME
+    if not identity_path.exists() and not identity_path.is_symlink():
+        atomic_json(identity_path, identity)
+    if _read_delivery_fence_document(
+        identity_path, expected_uid=expected_uid, expected_gid=expected_gid
+    ) != identity:
+        raise SwitchError("software delivery fence identity belongs to another release")
+    return identity_path, terminal_path, identity
+
+
+def delivery_fence_terminal(
+    transaction_root: Path,
+    identity: Mapping[str, object],
+    *,
+    expected_uid: int,
+    expected_gid: int,
+    publish_outcome: str | None = None,
+) -> dict[str, object] | None:
+    path = transaction_root / DELIVERY_FENCE_TERMINAL_NAME
+    published: dict[str, object] | None = None
+    if publish_outcome is not None:
+        if publish_outcome not in {"deployed", "rolled-back"}:
+            raise SwitchError("software delivery fence outcome is invalid")
+        published = {
+            "schema_version": DELIVERY_FENCE_VERSION,
+            "kind": DELIVERY_FENCE_TERMINAL_KIND,
+            "operation_id": identity["operation_id"],
+            "release_digest": identity["release_digest"],
+            "outcome": publish_outcome,
+            "completed_at": now(),
+        }
+        atomic_json(path, published)
+    if not path.exists() and not path.is_symlink():
+        return None
+    value = _read_delivery_fence_document(
+        path, expected_uid=expected_uid, expected_gid=expected_gid
+    )
+    if (
+        set(value)
+        != {
+            "schema_version",
+            "kind",
+            "operation_id",
+            "release_digest",
+            "outcome",
+            "completed_at",
+        }
+        or value.get("schema_version") != DELIVERY_FENCE_VERSION
+        or value.get("kind") != DELIVERY_FENCE_TERMINAL_KIND
+        or value.get("operation_id") != identity.get("operation_id")
+        or value.get("release_digest") != identity.get("release_digest")
+        or value.get("outcome") not in {"deployed", "rolled-back"}
+        or not isinstance(value.get("completed_at"), str)
+        or not value["completed_at"]
+        or len(value["completed_at"]) > 64
+    ):
+        raise SwitchError("software delivery fence terminal evidence is invalid")
+    if published is not None and value != published:
+        raise SwitchError("software delivery fence terminal did not publish exactly")
+    return value
+
+
+def remove_delivery_fence_document(
+    path: Path,
+    expected: Mapping[str, object],
+    *,
+    expected_uid: int,
+    expected_gid: int,
+) -> None:
+    if _read_delivery_fence_document(
+        path, expected_uid=expected_uid, expected_gid=expected_gid
+    ) != dict(expected):
+        raise SwitchError("software delivery fence document changed before cleanup")
+    path.unlink()
+    fsync_parent(path)
+
+
+def acquire_delivery_fence(
+    transaction_root: Path,
+    *,
+    release_digest: str,
+    action: str,
+    expected_uid: int = 0,
+    expected_gid: int = 0,
+    lock_path: Path = installer_fence.DEFAULT_INSTALLER_LOCK,
+    claim_path: Path = installer_fence.DEFAULT_INSTALLER_CLAIM,
+) -> tuple[installer_fence.InstallerFenceHandle, dict[str, object]]:
+    identity_path, terminal_path, identity = delivery_fence_binding(
+        transaction_root,
+        release_digest=release_digest,
+        expected_uid=expected_uid,
+        expected_gid=expected_gid,
+    )
+    handle = installer_fence.acquire_transaction_fence(
+        owner_kind=DELIVERY_FENCE_OWNER_KIND,
+        operation_id=str(identity["operation_id"]),
+        transaction=identity_path,
+        terminal=terminal_path,
+        action=action,
+        expected_uid=expected_uid,
+        expected_gid=expected_gid,
+        lock_path=lock_path,
+        claim_path=claim_path,
+    )
+    return handle, identity
 
 
 def testd_uid() -> int:
@@ -6151,7 +6317,14 @@ def rollback(
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description=__doc__)
     actions = result.add_subparsers(dest="action", required=True)
-    for name in ("prepare", "apply", "rollback", "verify"):
+    for name in (
+        "prepare",
+        "apply",
+        "rollback",
+        "verify",
+        "acceptance-begin",
+        "finalize",
+    ):
         action = actions.add_parser(name)
         action.add_argument("--release", type=Path, required=True)
         action.add_argument("--transaction-root", type=Path, required=True)
@@ -6172,13 +6345,24 @@ def parser() -> argparse.ArgumentParser:
 def public_switch_result(action: str, value: Mapping[str, object]) -> dict[str, object]:
     """Return a bounded path-, backup-, and credential-evidence-free CLI result."""
 
-    if action not in {"prepare", "apply", "rollback", "verify"}:
+    if action not in {
+        "prepare",
+        "apply",
+        "rollback",
+        "verify",
+        "acceptance-begin",
+        "finalize",
+    }:
         raise SwitchError("same-schema public result action is invalid")
     release_digest = value.get("release_digest")
     if not isinstance(release_digest, str) or RELEASE_RE.fullmatch(release_digest) is None:
         raise SwitchError("same-schema public result release identity is invalid")
     result: dict[str, object] = {
-        "ok": value.get("ok") is True if action == "verify" else True,
+        "ok": (
+            value.get("ok") is True
+            if action in {"verify", "acceptance-begin"}
+            else True
+        ),
         "action": action,
         "release_digest": release_digest,
         "phase": str(value.get("phase") or ("verified" if action == "verify" else action)),
@@ -6208,47 +6392,330 @@ def public_switch_result(action: str, value: Mapping[str, object]) -> dict[str, 
     return result
 
 
+def require_live_rollback_identity(
+    release: Path,
+    transaction_root: Path,
+    *,
+    reset_test_history: bool,
+) -> dict[str, object]:
+    """Prove the exact published release without requiring healthy services."""
+
+    document = load_journal(transaction_root / "journal.json")
+    if (
+        document is None
+        or document.get("release") != str(release)
+        or document.get("release_digest") != release.name
+        or document.get("phase") != "applied"
+    ):
+        raise SwitchError("late rollback lacks its exact applied journal")
+    require_test_history_reset_mode(document, requested=reset_test_history)
+    unit = f"devcoordinator-console@{release.name}.service"
+    slot = SLOT_ROOT / f"{release.name}.env"
+    recorded_slot = document.get("candidate_console_slot")
+    if (
+        document.get("candidate_console_unit") != unit
+        or (
+            document.get("already_active") is not True
+            and recorded_slot != str(slot)
+        )
+        or not slot.is_file()
+        or slot.is_symlink()
+    ):
+        raise SwitchError("late rollback Console slot identity changed")
+    values = parse_slot(slot.read_text(encoding="utf-8"))
+    try:
+        ports_match = (
+            int(values["HTTPS_PORT"]) == int(document["candidate_outer_port"])
+            and int(values["DEVCOORDINATOR_CONSOLE_INNER_PORT"])
+            == int(document["candidate_inner_port"])
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise SwitchError("late rollback Console slot evidence is invalid") from error
+    if (
+        values.get("DEVCOORDINATOR_RELEASE_DIGEST") != release.name
+        or values.get("DEVCOORDINATOR_CONSOLE_CONTROL_SOCKET")
+        != document.get("candidate_control_socket")
+        or not ports_match
+    ):
+        raise SwitchError("late rollback Console slot no longer names this release")
+    published = publication_snapshot()
+    if (
+        published.get("release_digest") != release.name
+        or published.get("port") != document.get("candidate_outer_port")
+    ):
+        raise SwitchError("late rollback release is no longer published")
+    rendered = Path(str(document.get("rendered_units") or ""))
+    template = "devcoordinator-console@.service"
+    source = rendered / template
+    installed = UNIT_ROOT / template
+    if any(not path.is_file() or path.is_symlink() for path in (source, installed)):
+        raise SwitchError("late rollback Console unit identity is unavailable")
+    if digest_file(source) != digest_file(installed):
+        raise SwitchError("late rollback Console unit belongs to another release")
+    return document
+
+
+def execute_fenced_switch_action(
+    action: str,
+    release: Path,
+    transaction_root: Path,
+    runner: Runner,
+    *,
+    public_url: str = "https://console.vr.ae/healthz",
+    api_url: str = "http://127.0.0.1:29876/healthz",
+    reset_test_history: bool = False,
+    expected_uid: int = 0,
+    expected_gid: int = 0,
+    lock_path: Path = installer_fence.DEFAULT_INSTALLER_LOCK,
+    claim_path: Path = installer_fence.DEFAULT_INSTALLER_CLAIM,
+) -> dict[str, object]:
+    """Run one switch phase beneath the exact durable software-delivery owner."""
+
+    release = release.expanduser().resolve(strict=True)
+    transaction_root = require_transaction_root(
+        transaction_root, release_digest=release.name
+    )
+    prior_terminal: dict[str, object] | None = None
+    if action == "acceptance-begin":
+        _identity_path, _terminal_path, prior_identity = delivery_fence_binding(
+            transaction_root,
+            release_digest=release.name,
+            expected_uid=expected_uid,
+            expected_gid=expected_gid,
+        )
+        prior_terminal = delivery_fence_terminal(
+            transaction_root,
+            prior_identity,
+            expected_uid=expected_uid,
+            expected_gid=expected_gid,
+        )
+        if prior_terminal is None or prior_terminal.get("outcome") != "deployed":
+            raise SwitchError(
+                "software delivery acceptance requires one completed exact deployment"
+            )
+    fence_action = {
+        "prepare": "prepare",
+        "apply": "prepare",
+        "verify": "recover",
+        "rollback": "abort",
+        "acceptance-begin": "recover",
+        "finalize": "finalize",
+    }.get(action)
+    if fence_action is None:
+        raise SwitchError("same-schema fenced action is invalid")
+    handle, identity = acquire_delivery_fence(
+        transaction_root,
+        release_digest=release.name,
+        action=fence_action,
+        expected_uid=expected_uid,
+        expected_gid=expected_gid,
+        lock_path=lock_path,
+        claim_path=claim_path,
+    )
+    command_succeeded = False
+    terminal_cleanup = False
+    try:
+        if action == "acceptance-begin":
+            locked_terminal = delivery_fence_terminal(
+                transaction_root,
+                identity,
+                expected_uid=expected_uid,
+                expected_gid=expected_gid,
+            )
+            if (
+                locked_terminal != prior_terminal
+                or locked_terminal is None
+                or locked_terminal.get("outcome") != "deployed"
+            ):
+                raise SwitchError(
+                    "software delivery acceptance terminal changed before claim"
+                )
+            prior_terminal = locked_terminal
+        elif prior_terminal is None:
+            prior_terminal = delivery_fence_terminal(
+                transaction_root,
+                identity,
+                expected_uid=expected_uid,
+                expected_gid=expected_gid,
+            )
+        if action in {"prepare", "apply"} and handle.created_claim:
+            if prior_terminal is not None:
+                remove_delivery_fence_document(
+                    transaction_root / DELIVERY_FENCE_TERMINAL_NAME,
+                    prior_terminal,
+                    expected_uid=expected_uid,
+                    expected_gid=expected_gid,
+                )
+        if action == "prepare":
+            value = prepare(
+                release,
+                transaction_root,
+                runner,
+                reset_test_history=reset_test_history,
+            )
+        elif action == "apply":
+            value = apply(
+                release,
+                transaction_root,
+                runner,
+                reset_test_history=reset_test_history,
+            )
+        elif action == "rollback":
+            if handle.created_claim and prior_terminal is not None:
+                if prior_terminal.get("outcome") == "rolled-back":
+                    value = load_journal(transaction_root / "journal.json")
+                    if (
+                        value is None
+                        or value.get("release") != str(release)
+                        or value.get("phase") != "rolled-back"
+                    ):
+                        raise SwitchError(
+                            "idempotent rollback lacks exact terminal journal evidence"
+                        )
+                    require_test_history_reset_mode(
+                        value, requested=reset_test_history
+                    )
+                    handle.mark_complete()
+                    command_succeeded = True
+                    return value
+                try:
+                    require_live_rollback_identity(
+                        release,
+                        transaction_root,
+                        reset_test_history=reset_test_history,
+                    )
+                except BaseException:
+                    handle.mark_complete()
+                    terminal_cleanup = True
+                    raise
+            value = rollback(
+                release,
+                transaction_root,
+                runner,
+                reset_test_history=reset_test_history,
+            )
+            if value.get("phase") != "rolled-back":
+                raise SwitchError("same-schema rollback lacks terminal journal evidence")
+            delivery_fence_terminal(
+                transaction_root,
+                identity,
+                expected_uid=expected_uid,
+                expected_gid=expected_gid,
+                publish_outcome="rolled-back",
+            )
+            handle.mark_complete()
+        elif action in {"verify", "acceptance-begin"}:
+            value = verify(
+                release,
+                transaction_root,
+                runner,
+                public_url=public_url,
+                api_url=api_url,
+                reset_test_history=reset_test_history,
+            )
+            if action == "verify" and handle.created_claim:
+                # A standalone read after a completed deployment borrows the
+                # exact claim only for the duration of this verification.
+                handle.mark_complete()
+            elif (
+                action == "acceptance-begin"
+                and handle.created_claim
+                and value.get("ok") is not True
+            ):
+                handle.mark_complete()
+        else:
+            document = load_journal(transaction_root / "journal.json")
+            if (
+                document is None
+                or document.get("release") != str(release)
+                or document.get("phase") != "applied"
+            ):
+                raise SwitchError(
+                    "software delivery cannot finalize before the release is applied"
+                )
+            require_test_history_reset_mode(
+                document, requested=reset_test_history
+            )
+            live = verify(
+                release,
+                transaction_root,
+                runner,
+                public_url=public_url,
+                api_url=api_url,
+                reset_test_history=reset_test_history,
+            )
+            if live.get("ok") is not True:
+                raise SwitchError(
+                    "software delivery cannot finalize a release that is no longer live"
+                )
+            delivery_fence_terminal(
+                transaction_root,
+                identity,
+                expected_uid=expected_uid,
+                expected_gid=expected_gid,
+                publish_outcome="deployed",
+            )
+            handle.mark_complete()
+            value = {**document, "phase": "finalized"}
+        command_succeeded = True
+        return value
+    except BaseException:
+        journal = transaction_root / "journal.json"
+        if (
+            action in {"prepare", "apply"}
+            and handle.created_claim
+            and not journal.exists()
+            and not journal.is_symlink()
+        ):
+            remove_delivery_fence_document(
+                transaction_root / DELIVERY_FENCE_IDENTITY_NAME,
+                identity,
+                expected_uid=expected_uid,
+                expected_gid=expected_gid,
+            )
+        elif (
+            action in {"verify", "acceptance-begin", "finalize"}
+            and handle.created_claim
+        ):
+            terminal = delivery_fence_terminal(
+                transaction_root,
+                identity,
+                expected_uid=expected_uid,
+                expected_gid=expected_gid,
+            )
+            if terminal is not None:
+                handle.mark_complete()
+                terminal_cleanup = True
+        raise
+    finally:
+        handle.close(command_succeeded=command_succeeded or terminal_cleanup)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     try:
         if os.geteuid() != 0:
             raise SwitchError("same-schema release switch must run as root")
-        runner = Runner()
-        if args.action == "prepare":
-            value = prepare(
-                args.release,
-                args.transaction_root,
-                runner,
-                reset_test_history=args.reset_test_history,
-            )
-        elif args.action == "apply":
-            value = apply(
-                args.release,
-                args.transaction_root,
-                runner,
-                reset_test_history=args.reset_test_history,
-            )
-        elif args.action == "rollback":
-            value = rollback(
-                args.release,
-                args.transaction_root,
-                runner,
-                reset_test_history=args.reset_test_history,
-            )
-        else:
-            value = verify(
-                args.release,
-                args.transaction_root,
-                runner,
-                public_url=args.public_url,
-                api_url=args.api_url,
-                reset_test_history=args.reset_test_history,
-            )
-    except (SwitchError, installer.ReleaseError, OSError, ValueError) as error:
+        value = execute_fenced_switch_action(
+            args.action,
+            args.release,
+            args.transaction_root,
+            Runner(),
+            public_url=getattr(args, "public_url", "https://console.vr.ae/healthz"),
+            api_url=getattr(args, "api_url", "http://127.0.0.1:29876/healthz"),
+            reset_test_history=args.reset_test_history,
+        )
+    except (
+        SwitchError,
+        installer.ReleaseError,
+        installer_fence.InstallerFenceError,
+        OSError,
+        ValueError,
+    ) as error:
         print(json.dumps({"ok": False, "error": str(error)}, sort_keys=True), file=sys.stderr)
         return 1
     print(json.dumps(public_switch_result(args.action, value), sort_keys=True))
-    if args.action == "verify" and value.get("ok") is not True:
+    if args.action in {"verify", "acceptance-begin"} and value.get("ok") is not True:
         return 1
     return 0
 

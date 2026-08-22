@@ -729,8 +729,77 @@ class Delivery:
             )
         return results
 
+    def _delivery_fence_step(
+        self,
+        action: str,
+        *,
+        phase: str,
+        name: str,
+        reset_test_history: bool,
+    ) -> CommandResult:
+        argv = [
+            "{release}/bin/devcoordinator-same-schema-switch",
+            action,
+            "--release",
+            "{release}",
+            "--transaction-root",
+            "{transaction_root}",
+        ]
+        if reset_test_history:
+            argv.append("--reset-test-history")
+        return self.run_step(
+            phase=phase,
+            name=name,
+            argv=argv,
+            blocking=True,
+            root=True,
+        )
+
+    def begin_split_acceptance(self) -> CommandResult:
+        deployment = self.state.get("deployment")
+        reset = (
+            deployment.get("test_history_reset") is True
+            if isinstance(deployment, Mapping)
+            else False
+        )
+        result = self._delivery_fence_step(
+            "acceptance-begin",
+            phase="acceptance-fence",
+            name="protect-production-acceptance",
+            reset_test_history=reset,
+        )
+        current = dict(deployment) if isinstance(deployment, Mapping) else {}
+        if result.ok:
+            current["fence_status"] = "held"
+        else:
+            current["status"] = "blocked-before-acceptance"
+        self.state["deployment"] = current
+        self._save_state()
+        return result
+
+    def finalize_delivery_fence(
+        self, *, reset_test_history: bool
+    ) -> CommandResult:
+        result = self._delivery_fence_step(
+            "finalize",
+            phase="deploy-finalize",
+            name="release-delivery-fence",
+            reset_test_history=reset_test_history,
+        )
+        deployment = self.state.get("deployment")
+        current = dict(deployment) if isinstance(deployment, Mapping) else {}
+        current["fence_status"] = "released" if result.ok else "release-incomplete"
+        if not result.ok:
+            current["status"] = "fence-release-incomplete"
+        self.state["deployment"] = current
+        self._save_state()
+        return result
+
     def deploy_same_schema(
-        self, *, reset_test_history: bool = False
+        self,
+        *,
+        reset_test_history: bool = False,
+        finalize_delivery: bool = True,
     ) -> list[CommandResult]:
         same = self.plan.get("same_schema")
         if not isinstance(same, Mapping):
@@ -809,8 +878,15 @@ class Delivery:
             "status": "healthy",
             "mode": "same-schema",
             "test_history_reset": reset_test_history,
+            "fence_status": "held",
         }
         self._save_state()
+        if finalize_delivery:
+            results.append(
+                self.finalize_delivery_fence(
+                    reset_test_history=reset_test_history
+                )
+            )
         return results
 
     def acceptance(self) -> list[CommandResult]:
@@ -850,9 +926,11 @@ class Delivery:
         )
         if deployment_status in {
             "blocked-before-mutation",
+            "blocked-before-acceptance",
             "rolled-back-after-apply-failure",
             "rolled-back-after-health-failure",
             "rollback-incomplete",
+            "fence-release-incomplete",
         }:
             conclusion = "blocked"
         elif health or blocking or acceptance:
@@ -1057,7 +1135,17 @@ def main(argv: list[str] | None = None) -> int:
             elif args.action == "package":
                 delivery.package()
             elif args.action == "acceptance":
-                delivery.acceptance()
+                begin = delivery.begin_split_acceptance()
+                if begin.ok:
+                    delivery.acceptance()
+                    deployment = delivery.state.get("deployment")
+                    delivery.finalize_delivery_fence(
+                        reset_test_history=(
+                            deployment.get("test_history_reset") is True
+                            if isinstance(deployment, Mapping)
+                            else False
+                        )
+                    )
             elif args.action == "deploy":
                 delivery.deploy_same_schema(
                     reset_test_history=args.reset_test_history
@@ -1068,7 +1156,8 @@ def main(argv: list[str] | None = None) -> int:
                     packaged = delivery.package()
                     if not delivery._blocking_failed(packaged):
                         delivery.deploy_same_schema(
-                            reset_test_history=args.reset_test_history
+                            reset_test_history=args.reset_test_history,
+                            finalize_delivery=False,
                         )
                         deployment = delivery.state.get("deployment")
                         if (
@@ -1076,6 +1165,9 @@ def main(argv: list[str] | None = None) -> int:
                             and deployment.get("status") == "healthy"
                         ):
                             delivery.acceptance()
+                            delivery.finalize_delivery_fence(
+                                reset_test_history=args.reset_test_history
+                            )
             report = delivery.report()
             print(concise(report))
             return (

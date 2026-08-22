@@ -1666,7 +1666,14 @@ def exercise_opt_in_test_history_reset_and_previous_release_rollback() -> None:
 
 
 def exercise_reset_cli_is_explicit() -> None:
-    for action in ("prepare", "apply", "rollback", "verify"):
+    for action in (
+        "prepare",
+        "apply",
+        "rollback",
+        "verify",
+        "acceptance-begin",
+        "finalize",
+    ):
         arguments = [
             action,
             "--release",
@@ -1677,6 +1684,374 @@ def exercise_reset_cli_is_explicit() -> None:
         ]
         parsed = switch.parser().parse_args(arguments)
         expect(parsed.reset_test_history is True, f"{action} lost explicit reset flag")
+
+
+def exercise_software_delivery_fence_lifecycle() -> None:
+    uid = os.geteuid()
+    gid = os.getegid()
+    with tempfile.TemporaryDirectory(prefix="same-schema-delivery-fence-") as raw:
+        root = Path(raw)
+        root.chmod(0o700)
+        release = root / "releases" / DIGEST
+        release.mkdir(parents=True)
+        release_b = root / "releases" / ("b" * 64)
+        release_b.mkdir()
+        lock = root / "installer.lock"
+        claim_root = root / "claims"
+        claim_root.mkdir(mode=0o700)
+        claim = claim_root / "installer-claim.json"
+        slot_root = root / "slots"
+        unit_root = root / "units"
+        slot_root.mkdir(mode=0o700)
+        unit_root.mkdir(mode=0o700)
+        publication_file = root / "routes.publication"
+        transaction_a = root / "run-a" / DIGEST
+        transaction_b = root / "run-b" / release_b.name
+        for transaction in (transaction_a, transaction_b):
+            transaction.mkdir(parents=True, mode=0o700)
+            transaction.parent.chmod(0o700)
+            transaction.chmod(0o700)
+
+        crashed, _identity = switch.acquire_delivery_fence(
+            transaction_a,
+            release_digest=DIGEST,
+            action="prepare",
+            expected_uid=uid,
+            expected_gid=gid,
+            lock_path=lock,
+            claim_path=claim,
+        )
+        crashed.close(command_succeeded=False)
+        recovered, _identity = switch.acquire_delivery_fence(
+            transaction_a,
+            release_digest=DIGEST,
+            action="recover",
+            expected_uid=uid,
+            expected_gid=gid,
+            lock_path=lock,
+            claim_path=claim,
+        )
+        recovered.close(command_succeeded=True)
+
+        prepare_calls: list[Path] = []
+        rollback_calls: list[Path] = []
+        active: dict[str, str | None] = {"release": None}
+        healthy = {"value": True}
+
+        def prepared(selected_release, transaction, _runner, **_kwargs):
+            prepare_calls.append(transaction)
+            return {
+                "phase": "prepared",
+                "release": str(selected_release),
+                "release_digest": selected_release.name,
+            }
+
+        def applied(selected_release, transaction, _runner, **_kwargs):
+            active["release"] = str(selected_release)
+            outer = 41001 if selected_release == release else 42001
+            inner = outer + 1
+            rendered = transaction / "rendered-units"
+            rendered.mkdir(mode=0o700, exist_ok=True)
+            unit_payload = f"release={selected_release.name}\n".encode("ascii")
+            switch.atomic_bytes(
+                rendered / "devcoordinator-console@.service", unit_payload, 0o644
+            )
+            switch.atomic_bytes(
+                unit_root / "devcoordinator-console@.service", unit_payload, 0o644
+            )
+            switch.atomic_bytes(
+                slot_root / f"{selected_release.name}.env",
+                switch.candidate_slot_payload(selected_release.name, outer, inner),
+                0o644,
+            )
+            switch.atomic_json(
+                publication_file,
+                {
+                    "payload_sha256": "f" * 64,
+                    "publication": {
+                        "release_digest": selected_release.name,
+                        "generation": 7,
+                        "console": {"upstream": {"port": outer}},
+                    },
+                },
+            )
+            value = {
+                "phase": "applied",
+                "release": str(selected_release),
+                "release_digest": selected_release.name,
+                "candidate_console_unit": (
+                    f"devcoordinator-console@{selected_release.name}.service"
+                ),
+                "candidate_console_slot": str(
+                    slot_root / f"{selected_release.name}.env"
+                ),
+                "candidate_outer_port": outer,
+                "candidate_inner_port": inner,
+                "candidate_control_socket": (
+                    f"/run/devcoordinator-console/{selected_release.name}.sock"
+                ),
+                "rendered_units": str(rendered),
+            }
+            switch.atomic_json(
+                transaction / "journal.json",
+                {"schema_version": switch.VERSION, "kind": switch.KIND, **value},
+            )
+            return value
+
+        def rolled_back(selected_release, transaction, _runner, **_kwargs):
+            rollback_calls.append(transaction)
+            active["release"] = None
+            value = {
+                "phase": "rolled-back",
+                "release": str(selected_release),
+                "release_digest": selected_release.name,
+            }
+            switch.atomic_json(
+                transaction / "journal.json",
+                {"schema_version": switch.VERSION, "kind": switch.KIND, **value},
+            )
+            return value
+
+        def verified(selected_release, _transaction, _runner, **_kwargs):
+            return {
+                "ok": (
+                    active["release"] == str(selected_release)
+                    and healthy["value"]
+                ),
+                "phase": "verified",
+                "release_digest": selected_release.name,
+            }
+
+        root_args = {
+            "expected_uid": uid,
+            "expected_gid": gid,
+            "lock_path": lock,
+            "claim_path": claim,
+        }
+        transaction_passthrough = mock.patch.object(
+            switch,
+            "require_transaction_root",
+            side_effect=lambda path, **_kwargs: path,
+        )
+        with transaction_passthrough, mock.patch.object(
+            switch, "prepare", side_effect=prepared
+        ), mock.patch.object(switch, "apply", side_effect=applied), mock.patch.object(
+            switch, "rollback", side_effect=rolled_back
+        ), mock.patch.object(
+            switch, "verify", side_effect=verified
+        ), mock.patch.object(
+            switch, "SLOT_ROOT", slot_root
+        ), mock.patch.object(
+            switch, "UNIT_ROOT", unit_root
+        ), mock.patch.object(
+            switch, "PUBLICATION_FILE", publication_file
+        ):
+            switch.execute_fenced_switch_action(
+                "prepare", release, transaction_a, FakeRunner(), **root_args
+            )
+            try:
+                switch.execute_fenced_switch_action(
+                    "prepare", release_b, transaction_b, FakeRunner(), **root_args
+                )
+            except switch.installer_fence.InstallerFenceError:
+                pass
+            else:
+                raise AssertionError("a distinct delivery entered prepare")
+            expect(
+                prepare_calls == [transaction_a],
+                "the second run reached prepare before obtaining the host claim",
+            )
+            switch.execute_fenced_switch_action(
+                "apply", release, transaction_a, FakeRunner(), **root_args
+            )
+            switch.execute_fenced_switch_action(
+                "rollback", release, transaction_a, FakeRunner(), **root_args
+            )
+
+            switch.execute_fenced_switch_action(
+                "prepare", release_b, transaction_b, FakeRunner(), **root_args
+            )
+            with mock.patch.object(
+                switch, "rollback", side_effect=switch.SwitchError("rollback failed")
+            ):
+                try:
+                    switch.execute_fenced_switch_action(
+                        "rollback", release_b, transaction_b, FakeRunner(), **root_args
+                    )
+                except switch.SwitchError:
+                    pass
+                else:
+                    raise AssertionError("failed rollback unexpectedly succeeded")
+            try:
+                switch.execute_fenced_switch_action(
+                    "prepare", release, transaction_a, FakeRunner(), **root_args
+                )
+            except switch.installer_fence.InstallerFenceError:
+                pass
+            else:
+                raise AssertionError("failed rollback released the host claim")
+            switch.execute_fenced_switch_action(
+                "rollback", release_b, transaction_b, FakeRunner(), **root_args
+            )
+
+            switch.execute_fenced_switch_action(
+                "prepare", release, transaction_a, FakeRunner(), **root_args
+            )
+            switch.execute_fenced_switch_action(
+                "apply", release, transaction_a, FakeRunner(), **root_args
+            )
+            switch.execute_fenced_switch_action(
+                "finalize", release, transaction_a, FakeRunner(), **root_args
+            )
+
+            real_acquire = switch.acquire_delivery_fence
+
+            def acquire_then_change_terminal(*args, **kwargs):
+                handle, identity = real_acquire(*args, **kwargs)
+                switch.delivery_fence_terminal(
+                    transaction_a,
+                    identity,
+                    expected_uid=uid,
+                    expected_gid=gid,
+                    publish_outcome="rolled-back",
+                )
+                return handle, identity
+
+            with mock.patch.object(
+                switch,
+                "acquire_delivery_fence",
+                side_effect=acquire_then_change_terminal,
+            ):
+                try:
+                    switch.execute_fenced_switch_action(
+                        "acceptance-begin",
+                        release,
+                        transaction_a,
+                        FakeRunner(),
+                        **root_args,
+                    )
+                except switch.SwitchError:
+                    pass
+                else:
+                    raise AssertionError("changed acceptance terminal was accepted")
+            probe, _identity = switch.acquire_delivery_fence(
+                transaction_b,
+                release_digest=release_b.name,
+                action="prepare",
+                expected_uid=uid,
+                expected_gid=gid,
+                lock_path=lock,
+                claim_path=claim,
+            )
+            probe.mark_complete()
+            probe.close(command_succeeded=True)
+            switch.execute_fenced_switch_action(
+                "finalize", release, transaction_a, FakeRunner(), **root_args
+            )
+
+            switch.execute_fenced_switch_action(
+                "prepare", release_b, transaction_b, FakeRunner(), **root_args
+            )
+            switch.execute_fenced_switch_action(
+                "apply", release_b, transaction_b, FakeRunner(), **root_args
+            )
+            switch.execute_fenced_switch_action(
+                "finalize", release_b, transaction_b, FakeRunner(), **root_args
+            )
+            stale_acceptance = switch.execute_fenced_switch_action(
+                "acceptance-begin",
+                release,
+                transaction_a,
+                FakeRunner(),
+                **root_args,
+            )
+            expect(
+                stale_acceptance.get("ok") is False,
+                "stale acceptance did not retain its failed verification",
+            )
+            try:
+                switch.execute_fenced_switch_action(
+                    "finalize", release, transaction_a, FakeRunner(), **root_args
+                )
+            except switch.SwitchError:
+                pass
+            else:
+                raise AssertionError("stale finalize unexpectedly succeeded")
+            rollback_count = len(rollback_calls)
+            try:
+                switch.execute_fenced_switch_action(
+                    "rollback", release, transaction_a, FakeRunner(), **root_args
+                )
+            except switch.SwitchError:
+                pass
+            else:
+                raise AssertionError("late stale rollback unexpectedly started")
+            expect(
+                len(rollback_calls) == rollback_count
+                and active["release"] == str(release_b),
+                "late stale rollback mutated the current release",
+            )
+            switch.execute_fenced_switch_action(
+                "finalize", release_b, transaction_b, FakeRunner(), **root_args
+            )
+
+            healthy["value"] = False
+            rollback_count = len(rollback_calls)
+            switch.execute_fenced_switch_action(
+                "rollback", release_b, transaction_b, FakeRunner(), **root_args
+            )
+            expect(
+                len(rollback_calls) == rollback_count + 1,
+                "unhealthy exact-live release did not enter late rollback",
+            )
+            switch.execute_fenced_switch_action(
+                "rollback", release_b, transaction_b, FakeRunner(), **root_args
+            )
+            expect(
+                len(rollback_calls) == rollback_count + 1,
+                "idempotent rollback repeated host mutation",
+            )
+            healthy["value"] = True
+            switch.execute_fenced_switch_action(
+                "prepare", release_b, transaction_b, FakeRunner(), **root_args
+            )
+            switch.execute_fenced_switch_action(
+                "apply", release_b, transaction_b, FakeRunner(), **root_args
+            )
+            switch.execute_fenced_switch_action(
+                "finalize", release_b, transaction_b, FakeRunner(), **root_args
+            )
+            healthy["value"] = False
+
+            def fail_after_rollback_mutation(
+                _release, transaction, _runner, **_kwargs
+            ):
+                rollback_calls.append(transaction)
+                active["release"] = None
+                raise switch.SwitchError("rollback failed after mutation")
+
+            with mock.patch.object(
+                switch, "rollback", side_effect=fail_after_rollback_mutation
+            ):
+                try:
+                    switch.execute_fenced_switch_action(
+                        "rollback", release_b, transaction_b, FakeRunner(), **root_args
+                    )
+                except switch.SwitchError:
+                    pass
+                else:
+                    raise AssertionError("post-mutation rollback unexpectedly succeeded")
+            try:
+                switch.execute_fenced_switch_action(
+                    "prepare", release, transaction_a, FakeRunner(), **root_args
+                )
+            except switch.installer_fence.InstallerFenceError:
+                pass
+            else:
+                raise AssertionError("post-mutation rollback failure released its claim")
+            switch.execute_fenced_switch_action(
+                "rollback", release_b, transaction_b, FakeRunner(), **root_args
+            )
 
 
 def exercise_retained_control_transaction_boundary() -> None:
@@ -3977,7 +4352,8 @@ def exercise_verification_requires_boot_enablement() -> None:
         "candidate or rollback can complete before retained workers restart",
     )
     expect(
-        'args.action == "verify" and value.get("ok") is not True' in main_source
+        'args.action in {"verify", "acceptance-begin"}' in main_source
+        and 'value.get("ok") is not True' in main_source
         and "public_switch_result(args.action, value)" in main_source
         and 'raise SwitchError("same-schema control-plane health failed")'
         not in source,
@@ -4013,6 +4389,13 @@ def exercise_cli_result_excludes_private_transaction_evidence() -> None:
     expect(public["ok"] is True and public["phase"] == "applied", "public result lost status")
     for forbidden in (credential_sha, "/private", "backups", "manifest", "sha256"):
         expect(forbidden not in encoded, f"public result disclosed private {forbidden}")
+    acceptance = switch.public_switch_result(
+        "acceptance-begin", {"ok": False, "release_digest": DIGEST}
+    )
+    expect(
+        acceptance["ok"] is False,
+        "acceptance-begin public result hid failed live verification",
+    )
 
 
 def main() -> int:
@@ -4040,6 +4423,7 @@ def main() -> int:
     exercise_codex_directory_transaction()
     exercise_opt_in_test_history_reset_and_previous_release_rollback()
     exercise_reset_cli_is_explicit()
+    exercise_software_delivery_fence_lifecycle()
     exercise_retained_control_transaction_boundary()
     exercise_retained_server_credential_transaction()
     exercise_rebaseline_quiesces_exact_managed_workers()
