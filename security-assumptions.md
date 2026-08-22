@@ -139,12 +139,16 @@ new gate.
   valid first-use adoption is not a new tenant grant and does not need separate
   case-by-case approval. Repeated deployments of this already-confirmed behavior
   likewise do not require another security-posture decision.
-- A sealed first-use Compose declaration that publishes only to numeric
-  loopback addresses (`127.0.0.0/8` or `::1`) does not need separate
-  administrator approval. Loopback publication is ordinary local development
-  reachability on this single-developer host. Missing, wildcard, malformed, or
-  non-loopback host addresses and other host-equivalent Compose features remain
-  behind the explicit approval boundary.
+- A sealed first-use Compose declaration needs no separate administrator
+  approval merely because it uses a service-level Compose bind mount classified
+  as `host_bind_mount`, `cap_add`, or numeric loopback publication
+  (`127.0.0.0/8` or `::1`). On this one-developer host, those are accepted
+  declared development capabilities, not a second semantic approval workflow.
+  The rendered model remains bounded, validated, pinned and fingerprinted for
+  identity/replay. Local volume-driver binds (`volume_driver_bind`), missing,
+  wildcard, malformed or non-loopback publication, devices, privileged mode,
+  host namespaces, Docker socket access, unconfined security and other distinct
+  host-equivalent risks retain their existing explicit approval boundary.
 - Per-account writable-home drop-ins are unnecessary for the authority. They
   made ordinary first use depend on installer inventory even though every
   local account belongs to the same developer.
@@ -193,6 +197,16 @@ new gate.
   added. Repository paths remain behind the local-host boundary; this does not
   authorize a public identity, remote worker, secret disclosure, disabled
   action, or disabled/retired repository.
+- The developer explicitly accepts that a repository-sealed service-level
+  Compose bind mount (`host_bind_mount`) and declared Linux capability can be
+  used without another fingerprint approval. A container can therefore read or
+  modify whatever that service bind source and mount mode expose, and an added
+  capability can expand that container's kernel authority. The server and all
+  local repositories belong to the same developer; model sealing, pinned
+  images, typed broker execution, exact replay identity and the remaining
+  volume-driver/public/device/namespace/privileged gates are retained. Revisit
+  this acceptance if repositories or local accounts become mutually
+  distrusting.
 - The developer explicitly authorizes the root-owned Coordinator
   administrative release to commission only an exact project
   `deploy/systemd/<unit>.service` non-root one-shot and its optional exact
@@ -218,6 +232,9 @@ new gate.
 
 ## Recorded confirmations
 
+- [DC-2026-08-22-COMPOSE-DECLARED-HOST-CAPABILITIES-01](DecisionDetails/DC-2026-08-22-COMPOSE-DECLARED-HOST-CAPABILITIES-01.md)
+  records the user-confirmed service-level bind-mount and added-capability
+  approval exemption, accepted risk, and unchanged remaining gates.
 - [Single-developer local trust](docs/architecture/single-developer-local-trust.md)
   records the confirmed local-account and public-boundary model.
 - [Universal test harness](docs/architecture/universal-test-harness.md) records
