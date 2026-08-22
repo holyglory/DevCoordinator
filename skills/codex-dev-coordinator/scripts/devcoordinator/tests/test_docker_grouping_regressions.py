@@ -5,14 +5,18 @@ import json
 import os
 from pathlib import Path
 import tempfile
+import threading
 import unittest
 from unittest import mock
 
 import dev_coordinator
+from devcoordinator.broker_configuration import (
+    reconcile_configured_runtime_container_declarations,
+)
 from devcoordinator.broker_host import EPHEMERAL_DOCKER_LABELS
 from devcoordinator.host_observation import commit_host_inventory_observation
 from devcoordinator.inventory_projection import envelope as inventory_envelope
-from devcoordinator.observer import SingleFlightObserver
+from devcoordinator.observer import ObservationOutcome, SingleFlightObserver
 from devcoordinator.store import AccountStore, deterministic_id, utc_timestamp
 
 
@@ -332,7 +336,8 @@ class NormalizedDockerGroupingTests(unittest.TestCase):
         containers: list[dict],
         *,
         docker_available: bool = True,
-    ) -> None:
+        observer_domain: str = "fixture-docker",
+    ) -> ObservationOutcome:
         sample = {
             "sampled_at": utc_timestamp(),
             "inventory": {
@@ -344,9 +349,9 @@ class NormalizedDockerGroupingTests(unittest.TestCase):
                 },
             },
         }
-        SingleFlightObserver(store).observe(
+        return SingleFlightObserver(store).observe(
             host_id=host_id,
-            observer_domain="fixture-docker",
+            observer_domain=observer_domain,
             sampler=lambda: sample,
             commit=lambda connection, snapshot_id, observed: commit_host_inventory_observation(
                 connection,
@@ -356,6 +361,109 @@ class NormalizedDockerGroupingTests(unittest.TestCase):
                 coordinator_home=str(self.home),
                 effective_uid=os.geteuid(),
             ),
+        )
+
+    def _write_runtime_container_declaration(
+        self, repository: Path, container_name: str
+    ) -> None:
+        runtime = repository / ".codex"
+        runtime.mkdir(exist_ok=True)
+        (runtime / "dev-runtime.json").write_text(
+            json.dumps(
+                {
+                    "dependencies": [
+                        {"type": "docker", "container": container_name}
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    def test_current_declared_container_reconciliation_is_read_only(self) -> None:
+        repository = self.root / "current-declaration"
+        repository.mkdir()
+        (repository / ".git").mkdir()
+        container_name = "current-declaration-api-1"
+        self._write_runtime_container_declaration(repository, container_name)
+        with AccountStore.open_default(self.home) as store:
+            host_id = store.ensure_local_host()
+            repo_id = self._insert_repository(store, host_id, repository)
+            outcome = self._observe(
+                store,
+                host_id,
+                [self._container("d" * 64, container_name, project=repository)],
+                observer_domain=dev_coordinator.OBSERVER_DOMAIN_FULL_DOCKER,
+            )
+            before = store.metadata.state_revision
+            result = reconcile_configured_runtime_container_declarations(
+                store, snapshot_id=outcome.snapshot_id
+            )
+            after = store.metadata.state_revision
+
+        self.assertEqual(before, after)
+        self.assertEqual(result["changed"], 0)
+        self.assertEqual(result["bindings"][0]["status"], "already_associated")
+        self.assertEqual(result["bindings"][0]["associated_repo_id"], repo_id)
+
+    def test_concurrent_first_declaration_associates_exactly_once(self) -> None:
+        repository = self.root / "concurrent-declaration"
+        repository.mkdir()
+        (repository / ".git").mkdir()
+        container_name = "concurrent-declaration-api-1"
+        self._write_runtime_container_declaration(repository, container_name)
+        with AccountStore.open_default(self.home) as store:
+            host_id = store.ensure_local_host()
+            repo_id = self._insert_repository(store, host_id, repository)
+            outcome = self._observe(
+                store,
+                host_id,
+                [self._container("e" * 64, container_name)],
+                observer_domain=dev_coordinator.OBSERVER_DOMAIN_FULL_DOCKER,
+            )
+            before = store.metadata.state_revision
+
+        barrier = threading.Barrier(8)
+        results: list[dict] = []
+        failures: list[BaseException] = []
+
+        def reconcile() -> None:
+            try:
+                with AccountStore.open_default(self.home) as worker_store:
+                    barrier.wait(timeout=2.0)
+                    results.append(
+                        reconcile_configured_runtime_container_declarations(
+                            worker_store, snapshot_id=outcome.snapshot_id
+                        )
+                    )
+            except BaseException as error:  # pragma: no cover - diagnostics
+                failures.append(error)
+
+        workers = [threading.Thread(target=reconcile) for _ in range(8)]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join(timeout=5.0)
+
+        with AccountStore.open_default(self.home) as store:
+            after = store.metadata.state_revision
+            with store.read_transaction() as connection:
+                associated_repo_id = connection.execute(
+                    """
+                    SELECT repo_id FROM docker_resources
+                    WHERE full_container_id = ?
+                    """,
+                    ("e" * 64,),
+                ).fetchone()[0]
+
+        self.assertFalse(any(worker.is_alive() for worker in workers), failures)
+        self.assertEqual(failures, [])
+        self.assertEqual(len(results), 8)
+        self.assertEqual(sum(int(result["changed"]) for result in results), 1)
+        self.assertEqual(after, before + 1)
+        self.assertEqual(associated_repo_id, repo_id)
+        self.assertEqual(
+            sorted(result["bindings"][0]["status"] for result in results),
+            ["already_associated"] * 7 + ["associated"],
         )
 
     def _observe_at(

@@ -2355,20 +2355,17 @@ class BrokerCLIContractTests(unittest.TestCase):
                 self._socket_mode = 0o660
 
             def start(self) -> None:
-                self.assert_startup_recovery_complete()
+                self.assert_startup_recovery_not_started()
                 events.append("server-started")
                 handlers[broker_cli_module.signal.SIGTERM](
                     broker_cli_module.signal.SIGTERM, None
                 )
 
             @staticmethod
-            def assert_startup_recovery_complete() -> None:
+            def assert_startup_recovery_not_started() -> None:
                 self.assertEqual(
-                    runtime.persistence.method_calls[:2],
-                    [
-                        mock.call.recover_interrupted_docker_operations(),
-                        mock.call.recover_interrupted_compose_operations(),
-                    ],
+                    runtime.persistence.method_calls,
+                    [],
                 )
 
         class FakeRuntime:
@@ -2437,21 +2434,16 @@ class BrokerCLIContractTests(unittest.TestCase):
         self.assertEqual(
             events,
             [
-                "workers-fenced",
                 "server-started",
                 "mutation-fenced",
                 "runtime-closed",
             ],
         )
         self.assertEqual(runtime.begin_shutdown_calls, 1)
-        (
-            runtime.persistence.recover_interrupted_compose_operations
-        ).assert_called_once_with()
-        (
-            runtime.persistence.recover_interrupted_docker_operations
-        ).assert_called_once_with()
-        runtime.backend.recover_ephemeral_runs.assert_called_once_with()
-        runtime.backend.start_ephemeral_reaper.assert_called_once_with()
+        runtime.persistence.recover_interrupted_compose_operations.assert_not_called()
+        runtime.persistence.recover_interrupted_docker_operations.assert_not_called()
+        runtime.backend.recover_ephemeral_runs.assert_not_called()
+        runtime.backend.start_ephemeral_reaper.assert_not_called()
 
     def test_repeated_signal_during_shutdown_does_not_reenter_fence(self) -> None:
         events: list[str] = []
@@ -2546,18 +2538,13 @@ class BrokerCLIContractTests(unittest.TestCase):
             serve_broker(args, host_mutations_factory=mock.Mock)
 
         self.assertEqual(runtime.begin_shutdown_calls, 1)
-        (
-            runtime.persistence.recover_interrupted_compose_operations
-        ).assert_called_once_with()
-        (
-            runtime.persistence.recover_interrupted_docker_operations
-        ).assert_called_once_with()
-        runtime.backend.recover_ephemeral_runs.assert_called_once_with()
-        runtime.backend.start_ephemeral_reaper.assert_called_once_with()
+        runtime.persistence.recover_interrupted_compose_operations.assert_not_called()
+        runtime.persistence.recover_interrupted_docker_operations.assert_not_called()
+        runtime.backend.recover_ephemeral_runs.assert_not_called()
+        runtime.backend.start_ephemeral_reaper.assert_not_called()
         self.assertEqual(
             events,
             [
-                "workers-fenced",
                 "server-started",
                 "mutation-fenced",
                 "drain-started",
@@ -2595,7 +2582,11 @@ class BrokerCLIContractTests(unittest.TestCase):
             def autostart_workers_after_admission(
                 *, fenced: object
             ) -> dict[str, object]:
-                if events != ["workers-fenced", "server-started"]:
+                if events != [
+                    "server-started",
+                    "workers-fenced",
+                    "mutation-admitted",
+                ]:
                     raise AssertionError("worker autostart ran before broker admission")
                 events.append("workers-autostarted")
                 handlers[broker_cli_module.signal.SIGTERM](
@@ -2605,6 +2596,10 @@ class BrokerCLIContractTests(unittest.TestCase):
                     **dict(fenced),
                     "started": [{"worker_id": "worker-old"}],
                 }
+
+            @staticmethod
+            def begin_mutation_admission() -> None:
+                events.append("mutation-admitted")
 
             @staticmethod
             def begin_shutdown() -> int:
@@ -2652,8 +2647,9 @@ class BrokerCLIContractTests(unittest.TestCase):
         self.assertEqual(
             events,
             [
-                "workers-fenced",
                 "server-started",
+                "workers-fenced",
+                "mutation-admitted",
                 "workers-autostarted",
                 "mutation-fenced",
                 "runtime-closed",
