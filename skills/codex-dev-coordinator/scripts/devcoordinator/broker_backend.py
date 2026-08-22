@@ -594,6 +594,12 @@ class StoreBackedMutationBackend:
         self._lifecycle_adapter = lifecycle_adapter or CoordinatorHostLifecycleAdapter()
         self._observe_before_lifecycle_plan = observe_before_lifecycle_plan
         self._host_observation_shutdown = threading.Event()
+        self._host_observation_fanout = threading.Condition(threading.RLock())
+        self._host_observation_active = False
+        self._host_observation_waiters = 0
+        self._host_observation_completion_generation = 0
+        self._host_observation_result: dict[str, Any] | None = None
+        self._host_observation_failure: BaseException | None = None
         self._runtime_session_mutation_lock = threading.RLock()
         self._runtime_reaper_stop = threading.Event()
         self._runtime_reaper_wake = threading.Event()
@@ -785,13 +791,18 @@ class StoreBackedMutationBackend:
                         or "The durable test-plan preview failed.",
                         operation_id=request.operation_id,
                     )
-                if disposition.state != "execute":
+                if disposition.state not in {"execute", "pending"}:
                     raise BrokerBackendError(
                         "operation_in_progress",
                         "The durable test-plan preview is still running; follow its exact operation handle.",
                         operation_id=request.operation_id,
                         retry_after_seconds=2,
                     )
+                # The serialized operation lock prevents an in-process replay
+                # from entering while the original preview still executes.
+                # Seeing a durable pending row here therefore proves a broker
+                # replacement left it behind; immutable preview is
+                # deterministic and safe to re-drive under the same identity.
                 preview_operation_reserved = True
                 execution_context = (
                     self._persistence.test_repository_execution_context(
@@ -900,7 +911,19 @@ class StoreBackedMutationBackend:
                         "repository_id": request.project_id,
                         "intent": preview_plan.intent,
                         "plan_id": preview_plan.plan_id,
+                        "plan_fingerprint": preview_plan.fingerprint,
                         "snapshot_id": preview_plan.source.snapshot_id,
+                        "source_mode": preview_plan.source.mode.value,
+                        "selected_target_count": len(
+                            preview_plan.selected_targets
+                        ),
+                        "selected_targets": list(
+                            preview_plan.selected_targets[:16]
+                        ),
+                        "selected_targets_truncated": len(
+                            preview_plan.selected_targets
+                        )
+                        > 16,
                         "registered": bool(registration.get("registered")),
                     },
                 )
@@ -914,6 +937,23 @@ class StoreBackedMutationBackend:
                 )
 
             if request.operation is BrokerOperation.TEST_RUN_SUBMIT:
+                disposition = self._persistence.reserve_operation(accepted)
+                if disposition.state == "completed":
+                    return dict(disposition.result or {})
+                if disposition.state == "failed":
+                    raise BrokerBackendError(
+                        disposition.error_code or "test_run_submit_failed",
+                        disposition.error_message
+                        or "The durable test-plan submission failed.",
+                        operation_id=request.operation_id,
+                    )
+                if disposition.state not in {"execute", "pending"}:
+                    raise BrokerBackendError(
+                        "operation_in_progress",
+                        "The durable test-plan submission is still running; follow its exact operation handle.",
+                        operation_id=request.operation_id,
+                        retry_after_seconds=2,
+                    )
                 expected_repository_id = request.arguments.get(
                     "expected_repository_id"
                 )
@@ -955,6 +995,9 @@ class StoreBackedMutationBackend:
                     )
                 )
                 self._require_test_repository(result, repository_id)
+                self._persistence.finish_operation(
+                    request.operation_id, result=result
+                )
                 return result
 
             if request.operation is BrokerOperation.TEST_QUEUE_STATUS:
@@ -1301,6 +1344,15 @@ class StoreBackedMutationBackend:
                     "no retry run was created.",
                     operation_id=request.operation_id,
                 ) from error
+            if (
+                request.operation is BrokerOperation.TEST_ARTIFACT_RESOLVE
+                and error.code == "artifact_unverified"
+            ):
+                raise BrokerBackendError(
+                    "test_artifact_unverified",
+                    "The exact test artifact is not integrity-verified and cannot be resolved.",
+                    operation_id=request.operation_id,
+                ) from error
             snapshot_transport_failure = error.code in {
                 "snapshot_transport_unavailable",
                 "snapshot_transport_timeout",
@@ -1401,6 +1453,15 @@ class StoreBackedMutationBackend:
                 operation_id=request.operation_id,
             ) from error
         except TestStoreConflict as error:
+            if (
+                request.operation is BrokerOperation.TEST_ARTIFACT_RESOLVE
+                and "has not been verified" in str(error)
+            ):
+                raise BrokerBackendError(
+                    "test_artifact_unverified",
+                    "The exact test artifact is not integrity-verified and cannot be resolved.",
+                    operation_id=request.operation_id,
+                ) from error
             finish_preview_failure(
                 "test_state_conflict",
                 "The test request conflicts with current scheduler state.",
@@ -2172,6 +2233,14 @@ class StoreBackedMutationBackend:
                 raise RepositoryContextError(
                     "Compose host-access approval requires the exact primary repository root"
                 )
+            # Approval is also the reviewed live path for a declared Compose
+            # project-name transition. Commit a fresh exhaustive observation
+            # before resealing so persistence can prove the old project name
+            # has no retained containers, networks, or volumes.
+            self._observe_fresh_full_docker(
+                request.operation_id,
+                project_id=request.project_id,
+            )
             reconciled = self._reconcile_repository_compose_contract(
                 request=request,
                 repo_id=request.project_id,
@@ -2473,7 +2542,11 @@ class StoreBackedMutationBackend:
                 raise BrokerBackendError(
                     code, message, operation_id=request.operation_id
                 )
-            if replay_database_result is None and not replay_database_retirement:
+            if (
+                replay_database_result is None
+                and not replay_database_retirement
+                and request.operation is not BrokerOperation.CLEANUP_PLAN
+            ):
                 raise BrokerBackendError(
                     "operation_in_progress",
                     "This durable operation is already running or requires reconciliation; it was not executed again.",
@@ -5842,6 +5915,68 @@ class StoreBackedMutationBackend:
         return report
 
     def _observe_committed_host(self, operation_id: str) -> dict[str, Any]:
+        """Join one complete in-process observation, including reconciliation."""
+
+        with self._host_observation_fanout:
+            observed_generation = self._host_observation_completion_generation
+            if self._host_observation_active:
+                self._host_observation_waiters += 1
+                try:
+                    while (
+                        self._host_observation_completion_generation
+                        == observed_generation
+                    ):
+                        if self._host_observation_shutdown.is_set():
+                            raise BrokerBackendError(
+                                "service_shutting_down",
+                                "The broker is shutting down and cannot finish a host observation.",
+                                operation_id=operation_id,
+                            )
+                        self._host_observation_fanout.wait(timeout=0.2)
+                finally:
+                    self._host_observation_waiters -= 1
+                failure = self._host_observation_failure
+                result = self._host_observation_result
+                if failure is not None:
+                    if isinstance(failure, BrokerError):
+                        raise BrokerBackendError(
+                            failure.code,
+                            failure.message,
+                            operation_id=operation_id,
+                        ) from failure
+                    raise RuntimeError(
+                        "joined host observation failed"
+                    ) from failure
+                if result is None:
+                    raise BrokerBackendError(
+                        "lifecycle_observation_incomplete",
+                        "Joined host observation omitted its committed result.",
+                        operation_id=operation_id,
+                    )
+                joined = dict(result)
+                joined["joined"] = True
+                return joined
+            self._host_observation_active = True
+
+        try:
+            result = self._observe_committed_host_once(operation_id)
+        except BaseException as error:
+            with self._host_observation_fanout:
+                self._host_observation_failure = error
+                self._host_observation_result = None
+                self._host_observation_completion_generation += 1
+                self._host_observation_active = False
+                self._host_observation_fanout.notify_all()
+            raise
+        with self._host_observation_fanout:
+            self._host_observation_failure = None
+            self._host_observation_result = dict(result)
+            self._host_observation_completion_generation += 1
+            self._host_observation_active = False
+            self._host_observation_fanout.notify_all()
+        return result
+
+    def _observe_committed_host_once(self, operation_id: str) -> dict[str, Any]:
         """Run or join an explicit host observation and verify its durable row."""
 
         if self._host_observation_shutdown.is_set():
@@ -7051,6 +7186,11 @@ class StoreBackedBrokerRuntime:
             # the one broker-wide shutdown deadline.
             self.backend.request_ephemeral_reaper_stop()
 
+    def begin_mutation_admission(self) -> None:
+        """Open mutations only after startup recovery and worker fencing."""
+
+        self.writer.begin_mutation_admission()
+
     def close(self) -> None:
         """Fence all mutations, drain accepted work, then clean observation ownership."""
 
@@ -7062,13 +7202,10 @@ class StoreBackedBrokerRuntime:
             failures.append(("mutation admission fence", error))
             _LOGGER.exception("broker mutation admission fence failed")
         try:
-            self.server.close(
-                timeout_seconds=max(0.0, deadline - time.monotonic())
-            )
-        except BaseException as error:
-            failures.append(("server drain", error))
-            _LOGGER.exception("broker server drain failed")
-        try:
+            # Keep the inherited listener serving compatible read-only calls
+            # while already-admitted mutations finish.  begin_shutdown()
+            # fences every later mutation, so retaining transport availability
+            # here cannot extend or add to the mutation drain.
             if not self.writer.wait_for_drain(
                 max(0.0, deadline - time.monotonic())
             ):
@@ -7080,10 +7217,16 @@ class StoreBackedBrokerRuntime:
             failures.append(("mutation drain", error))
             _LOGGER.exception("broker mutation drain failed")
         try:
-            # The reaper mutates the same durable lifecycle state directly;
-            # prove it has returned only after accepted request work has had a
-            # chance to drain, and charge the join to the broker's single
-            # published shutdown deadline.
+            self.server.close(
+                timeout_seconds=max(0.0, deadline - time.monotonic())
+            )
+        except BaseException as error:
+            failures.append(("server drain", error))
+            _LOGGER.exception("broker server drain failed")
+        try:
+            # The reaper mutates the same durable lifecycle state directly.
+            # Prove it has returned after both mutation and client drains, and
+            # charge the join to the broker's single published deadline.
             self.backend.wait_ephemeral_reaper_stopped(
                 max(0.0, deadline - time.monotonic())
             )
@@ -7130,6 +7273,7 @@ def build_store_backed_broker_runtime(
     service_uid: Optional[int] = None,
     socket_mode: int = 0o666,
     max_clients: int = 32,
+    initially_accepting_mutations: bool = True,
     shutdown_timeout_seconds: float = BROKER_SHUTDOWN_DRAIN_TIMEOUT_SECONDS,
     lifecycle_adapter: CoordinatorHostLifecycleAdapter | None = None,
     observe_before_lifecycle_plan: Callable[
@@ -7194,6 +7338,7 @@ def build_store_backed_broker_runtime(
     writer = SerializedMutationWriter(
         backend,
         max_concurrent_host_observations=max(0, min(4, max_clients - 1)),
+        initially_accepting_mutations=initially_accepting_mutations,
     )
     call_journal = (
         None

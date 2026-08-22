@@ -94,8 +94,11 @@ _INSTALLATION_MANIFEST_KINDS = frozenset(
         "dotnet-toolchain",
         "node-package-lock",
         "nuget-package-source",
+        "installed-skill",
     }
 )
+_INSTALLED_SKILL_ENVIRONMENT_SUFFIX = "_SKILL_DIR"
+_MAX_INSTALLED_SKILL_BINDINGS = 4
 _SNAPSHOT_PREVIEW_DEADLINE: contextvars.ContextVar[float | None] = (
     contextvars.ContextVar("devcoordinator_snapshot_preview_deadline", default=None)
 )
@@ -974,6 +977,14 @@ class RootSnapshotService:
                     original_root=plan.source.original_root,
                 )
             ]
+            launch["skill_bindings"] = (
+                [
+                    dict(binding)
+                    for binding in self._installed_skill_bindings(launch)
+                ]
+                if plan.source.mode.value == "immutable"
+                else []
+            )
             launch_catalog[target_name] = launch
         planned = {**dict(planned), "launch_catalog": launch_catalog}
         self._publish_catalog(
@@ -1405,6 +1416,30 @@ class RootSnapshotService:
             candidates.extend(source_root.glob("host/fxr/*/.version"))
         elif kind == "node-package-lock":
             candidates.append(source_root / ".package-lock.json")
+        elif kind == "installed-skill":
+            for candidate in sorted(source_root.rglob("*"), key=str):
+                relative = candidate.relative_to(source_root)
+                if any(
+                    part in {".git", "__pycache__", "node_modules", ".venv", "dist"}
+                    for part in relative.parts
+                ):
+                    continue
+                try:
+                    metadata = candidate.lstat()
+                except OSError as error:
+                    raise TestStoreConflict(
+                        "installed skill identity is unavailable"
+                    ) from error
+                if stat.S_ISLNK(metadata.st_mode):
+                    raise TestStoreConflict(
+                        "installed skill contains an unsafe symbolic link"
+                    )
+                if stat.S_ISREG(metadata.st_mode):
+                    candidates.append(candidate)
+                elif not stat.S_ISDIR(metadata.st_mode):
+                    raise TestStoreConflict(
+                        "installed skill contains an unsafe file type"
+                    )
         else:
             if not required_paths:
                 raise TestStoreConflict(
@@ -1461,6 +1496,93 @@ class RootSnapshotService:
             identity.update(file_digest.encode("ascii"))
             identity.update(b"\n")
         return identity.hexdigest(), len(unique), total_bytes
+
+    @staticmethod
+    def _installed_skill_destination(path: Path) -> bool:
+        parts = path.parts
+        if len(parts) == 5 and parts[:4] == ("/", "home", "holyskills", "skills"):
+            return bool(parts[4])
+        return (
+            len(parts) == 6
+            and parts[0:2] == ("/", "home")
+            and parts[3] in {".codex", ".claude"}
+            and parts[4] == "skills"
+            and bool(parts[2])
+            and bool(parts[5])
+        )
+
+    @classmethod
+    def _installed_skill_bindings(
+        cls, launch: Mapping[str, object]
+    ) -> tuple[Mapping[str, object], ...]:
+        """Pin declared reviewed skill roots without exposing an account home."""
+
+        environment = launch.get("environment")
+        if not isinstance(environment, Mapping):
+            raise TestStoreContractError("test launch environment is invalid")
+        selected = sorted(
+            (str(name), str(value))
+            for name, value in environment.items()
+            if isinstance(name, str)
+            and name.endswith(_INSTALLED_SKILL_ENVIRONMENT_SUFFIX)
+        )
+        if len(selected) > _MAX_INSTALLED_SKILL_BINDINGS:
+            raise TestStoreContractError("installed skill bindings exceed their bound")
+        bindings: list[Mapping[str, object]] = []
+        destinations: set[str] = set()
+        for name, raw_path in selected:
+            destination = Path(raw_path)
+            if (
+                not destination.is_absolute()
+                or ".." in destination.parts
+                or not cls._installed_skill_destination(destination)
+                or str(destination) in destinations
+            ):
+                raise TestStoreContractError(
+                    "installed skill destination is invalid"
+                )
+            try:
+                declared_metadata = destination.lstat()
+                source = destination.resolve(strict=True)
+                source_metadata = source.lstat()
+                skill_metadata = (source / "SKILL.md").lstat()
+            except OSError as error:
+                raise TestStoreConflict("installed skill is unavailable") from error
+            if (
+                not (
+                    stat.S_ISDIR(declared_metadata.st_mode)
+                    or stat.S_ISLNK(declared_metadata.st_mode)
+                )
+                or not stat.S_ISDIR(source_metadata.st_mode)
+                or stat.S_ISLNK(source_metadata.st_mode)
+                or not stat.S_ISREG(skill_metadata.st_mode)
+                or stat.S_ISLNK(skill_metadata.st_mode)
+                or source.name != destination.name
+            ):
+                raise TestStoreConflict("installed skill identity is unsafe")
+            installation_sha256, installation_files, installation_bytes = (
+                cls._installation_manifest_identity(
+                    source, kind="installed-skill"
+                )
+            )
+            destinations.add(str(destination))
+            bindings.append(
+                {
+                    "environment": name,
+                    "destination": str(destination),
+                    "declared_device": int(declared_metadata.st_dev),
+                    "declared_inode": int(declared_metadata.st_ino),
+                    "declared_symlink": stat.S_ISLNK(declared_metadata.st_mode),
+                    "source_root": str(source),
+                    "source_device": int(source_metadata.st_dev),
+                    "source_inode": int(source_metadata.st_ino),
+                    "installation_kind": "installed-skill",
+                    "installation_sha256": installation_sha256,
+                    "installation_files": installation_files,
+                    "installation_bytes": installation_bytes,
+                }
+            )
+        return tuple(bindings)
 
     @classmethod
     def _validated_dependency_locks(
@@ -2477,6 +2599,7 @@ class RootSnapshotService:
             source_provenance=source_provenance,
             dependency_bindings=dependency_bindings,
             state_bindings=tuple(launch.get("state_bindings", ())),  # type: ignore[arg-type]
+            skill_bindings=tuple(launch.get("skill_bindings", ())),  # type: ignore[arg-type]
             toolchain_bindings=toolchain_bindings,
             supplementary_gids=supplementary_gids,
         )

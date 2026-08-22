@@ -28,7 +28,9 @@ from .universal_test_contract import (
 from .universal_test_planner import DEFAULT_LAUNCH_TIMEOUT_SECONDS
 
 
-MAX_AGENT_ENVELOPE_BYTES = 8 * 1024
+# Every CLI document is newline-terminated. Reserve that final byte while
+# shrinking cursor pages so an accepted document cannot fail in the emitter.
+MAX_AGENT_ENVELOPE_BYTES = 8 * 1024 - 1
 _BROKER_PROFILE_ERROR = "protected broker profile is unavailable or invalid"
 _OPAQUE_ID_CHARS = frozenset(
     "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.:@-"

@@ -541,16 +541,13 @@ def serve_broker(
             host_mutations=host_mutations_factory(),
             socket_mode=0o666,
             max_clients=int(args.max_clients),
+            initially_accepting_mutations=False,
             observe_before_lifecycle_plan=observe_before_lifecycle_plan,
             test_plane=test_plane,
             call_journal_path=call_journal_path,
             call_journal_max_bytes=call_journal_max_bytes,
             call_journal_backups=call_journal_backups,
         )
-        runtime.persistence.recover_interrupted_docker_operations()
-        runtime.persistence.recover_interrupted_compose_operations()
-        runtime.backend.recover_ephemeral_runs()
-
         def reclaim_stale_socket_before_admission() -> None:
             """Reclaim only a proven-dead socket while this function holds flock.
 
@@ -648,7 +645,13 @@ def serve_broker(
                     "Broker stale socket could not be removed.",
                 ) from None
 
-        worker_fencing = runtime.fence_workers_on_startup()
+        worker_fencing: dict[str, Any] = {
+            "ok": True,
+            "supervisor_epoch": None,
+            "fenced_old_runners": [],
+            "started": [],
+            "errors": [],
+        }
         stop = threading.Event()
         previous: dict[int, Any] = {}
         shutdown_requested = False
@@ -743,7 +746,6 @@ def serve_broker(
             previous[signum] = signal.getsignal(signum)
             signal.signal(signum, request_stop)
         try:
-            runtime.backend.start_ephemeral_reaper()
             if isinstance(runtime.server, UnixBrokerServer) and inherited_listener is None:
                 reclaim_stale_socket_before_admission()
             if inherited_listener is None:
@@ -759,16 +761,35 @@ def serve_broker(
                     }
                 )
             else:
-                # Repository startup remains fenced until the release manager
-                # observes this broker as ready. Reconcile in the background so
-                # admission can become observable first, then converge every
-                # expected keep-alive worker once that temporary fence clears.
-                worker_autostart_thread = threading.Thread(
-                    target=reconcile_workers_after_admission,
-                    name="devcoordinator-worker-startup",
-                    daemon=True,
-                )
-                worker_autostart_thread.start()
+                # Accept the inherited socket before potentially long durable
+                # recovery and worker fencing. The writer starts mutation-
+                # fenced, so only compatible reads are served in this phase.
+                runtime.persistence.recover_interrupted_docker_operations()
+                runtime.persistence.recover_interrupted_compose_operations()
+                runtime.backend.recover_ephemeral_runs()
+                runtime.backend.start_ephemeral_reaper()
+                worker_fencing = runtime.fence_workers_on_startup()
+                if shutdown_requested:
+                    report_worker_reconciliation(
+                        {
+                            **worker_fencing,
+                            "ok": worker_fencing.get("ok") is True,
+                            "started": [],
+                        }
+                    )
+                    stop.set()
+                else:
+                    runtime.begin_mutation_admission()
+                    # Repository startup remains fenced until the release manager
+                    # observes this broker as ready. Reconcile in the background so
+                    # admission can become observable first, then converge every
+                    # expected keep-alive worker once that temporary fence clears.
+                    worker_autostart_thread = threading.Thread(
+                        target=reconcile_workers_after_admission,
+                        name="devcoordinator-worker-startup",
+                        daemon=True,
+                    )
+                    worker_autostart_thread.start()
             print(
                 json.dumps(
                     {

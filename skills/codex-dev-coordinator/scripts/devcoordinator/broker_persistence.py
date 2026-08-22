@@ -4802,11 +4802,107 @@ class BrokerPersistence:
                     fingerprint=request_fingerprint,
                 )
                 if existing is not None:
+                    if (
+                        existing.state == "pending"
+                        and request.operation is BrokerOperation.CLEANUP_PLAN
+                    ):
+                        connection.execute(
+                            """
+                            UPDATE operation_targets
+                            SET target_kind = ?, target_id = ?, action = ?,
+                                immutable_fingerprint = ?
+                            WHERE operation_id = ? AND ordinal = 0
+                              AND status = 'running'
+                            """,
+                            (
+                                str(request.arguments["target_kind"]),
+                                str(request.arguments["target_id"]),
+                                "cleanup." + str(request.arguments["action"]),
+                                request_fingerprint,
+                                request.operation_id,
+                            ),
+                        )
                     return existing
 
                 _validate_connection_request(connection, peer=accepted.peer, request=request)
                 compose_snapshot: sqlite3.Row | None = None
                 runtime_target: tuple[str, str, str, str] | None = None
+                if request.operation is BrokerOperation.CLEANUP_PLAN:
+                    runtime_target = (
+                        str(request.arguments["target_kind"]),
+                        str(request.arguments["target_id"]),
+                        "cleanup." + str(request.arguments["action"]),
+                        request_fingerprint,
+                    )
+                elif request.operation is BrokerOperation.LIFECYCLE_RESTORE:
+                    runtime_target = (
+                        str(request.arguments["target_kind"]),
+                        str(request.arguments["target_id"]),
+                        "lifecycle.restore",
+                        request_fingerprint,
+                    )
+                elif request.operation is BrokerOperation.CLEANUP_APPLY:
+                    cleanup_plan = connection.execute(
+                        """
+                        SELECT target_kind, target_id, target_fingerprint
+                        FROM cleanup_plans WHERE plan_id = ?
+                        """,
+                        (str(request.arguments["plan_id"]),),
+                    ).fetchone()
+                    if cleanup_plan is None:
+                        lifecycle_plan = connection.execute(
+                            """
+                            SELECT kind, repo_id, request_fingerprint
+                            FROM operations WHERE operation_id = ?
+                            """,
+                            (str(request.arguments["plan_id"]),),
+                        ).fetchone()
+                        if (
+                            lifecycle_plan is not None
+                            and lifecycle_plan["kind"] == "repository_decommission"
+                            and lifecycle_plan["repo_id"] is not None
+                        ):
+                            runtime_target = (
+                                "project",
+                                str(lifecycle_plan["repo_id"]),
+                                "cleanup.apply",
+                                str(lifecycle_plan["request_fingerprint"]),
+                            )
+                        elif (
+                            lifecycle_plan is not None
+                            and lifecycle_plan["kind"]
+                            == "standalone_resource_retirement"
+                        ):
+                            lifecycle_target = connection.execute(
+                                """
+                                SELECT target_kind, target_id,
+                                       immutable_fingerprint
+                                FROM operation_targets
+                                WHERE operation_id = ?
+                                ORDER BY ordinal LIMIT 1
+                                """,
+                                (str(request.arguments["plan_id"]),),
+                            ).fetchone()
+                            if lifecycle_target is not None:
+                                runtime_target = (
+                                    str(lifecycle_target["target_kind"]),
+                                    str(lifecycle_target["target_id"]),
+                                    "cleanup.apply",
+                                    str(lifecycle_target["immutable_fingerprint"]),
+                                )
+                        if runtime_target is None:
+                            raise BrokerError(
+                                "cleanup_plan_unavailable",
+                                "The exact cleanup plan does not exist.",
+                                operation_id=request.operation_id,
+                            )
+                    else:
+                        runtime_target = (
+                            str(cleanup_plan["target_kind"]),
+                            str(cleanup_plan["target_id"]),
+                            "cleanup.apply",
+                            str(cleanup_plan["target_fingerprint"]),
+                        )
                 if (
                     request.operation is BrokerOperation.RUNTIME_REQUEST
                     and request.arguments["action"] == "temporary_start"
@@ -15277,16 +15373,22 @@ def _operation_follow_correlations(
     if not isinstance(decoded, dict):
         return {}
     correlations: dict[str, str] = {}
-    for field in ("plan_id", "run_id"):
+    patterns = {
+        "plan_id": re.compile(r"^plan-[0-9a-f]{32}$"),
+        "run_id": re.compile(r"^run-[0-9a-f]{32}$"),
+    }
+    for field, pattern in patterns.items():
         value = decoded.get(field)
         if not isinstance(value, str):
             continue
+        if pattern.fullmatch(value) is not None:
+            correlations[field] = value
+            continue
         try:
-            canonical = str(uuid.UUID(value))
+            if str(uuid.UUID(value)) == value:
+                correlations[field] = value
         except (ValueError, AttributeError):
             continue
-        if value == canonical:
-            correlations[field] = canonical
     return correlations
 
 

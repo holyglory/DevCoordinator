@@ -16,6 +16,7 @@ from __future__ import annotations
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import fcntl
 import hashlib
 import json
 import os
@@ -1841,6 +1842,54 @@ def _ensure_artifact_root(path: Path, *, expected_uid: int) -> Path:
         raise ImagePublicationError("publication artifact root could not be created") from exc
     _require_real_directory(root)
     return root
+
+
+@contextmanager
+def publication_execution_lock(
+    *,
+    specification: PublicationSpec,
+    artifact_root: Path,
+    service_uid: int,
+) -> Iterator[None]:
+    """Exclude only a competing mutation of this exact project publication."""
+
+    root = _ensure_artifact_root(artifact_root, expected_uid=service_uid)
+    locks = root / ".locks"
+    created = not locks.exists()
+    locks.mkdir(mode=0o700, exist_ok=True)
+    if created:
+        os.chmod(locks, 0o700)
+    _require_real_directory(locks, field="publication lock directory")
+    identity = hashlib.sha256(
+        (str(specification.project) + "\0" + specification.name).encode("utf-8")
+    ).hexdigest()
+    path = locks / (identity + ".lock")
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0)
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(path, flags, 0o600)
+    try:
+        metadata = os.fstat(descriptor)
+        after = path.lstat()
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or stat.S_ISLNK(after.st_mode)
+            or (metadata.st_dev, metadata.st_ino)
+            != (after.st_dev, after.st_ino)
+        ):
+            raise ImagePublicationError("publication single-flight lock is unsafe")
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise ImagePublicationError(
+                "this project image publication is already running"
+            ) from error
+        yield
+    finally:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
 
 
 def _require_regular_file(path: Path) -> os.stat_result:

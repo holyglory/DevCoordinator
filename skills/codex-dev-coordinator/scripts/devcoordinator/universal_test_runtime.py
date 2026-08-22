@@ -124,6 +124,7 @@ _INSTALLATION_MANIFEST_KINDS = frozenset(
         "dotnet-toolchain",
         "node-package-lock",
         "nuget-package-source",
+        "installed-skill",
     }
 )
 
@@ -287,6 +288,20 @@ def _absolute_path(field: str, value: object) -> str:
     return str(path)
 
 
+def _installed_skill_destination(path: Path) -> bool:
+    parts = path.parts
+    if len(parts) == 5 and parts[:4] == ("/", "home", "holyskills", "skills"):
+        return bool(parts[4])
+    return (
+        len(parts) == 6
+        and parts[0:2] == ("/", "home")
+        and bool(parts[2])
+        and parts[3] in {".codex", ".claude"}
+        and parts[4] == "skills"
+        and bool(parts[5])
+    )
+
+
 def _relative_path(field: str, value: object) -> str:
     text = _single_line(field, value, maximum=4096)
     if text == ".":
@@ -439,6 +454,7 @@ class TestAttemptDescriptor:
     source_provenance: Mapping[str, object] = field(default_factory=dict)
     dependency_bindings: tuple[Mapping[str, object], ...] = ()
     state_bindings: tuple[Mapping[str, object], ...] = ()
+    skill_bindings: tuple[Mapping[str, object], ...] = ()
     toolchain_bindings: tuple[Mapping[str, object], ...] = ()
     supplementary_gids: tuple[int, ...] = ()
     fixture_bindings: tuple[Mapping[str, object], ...] = ()
@@ -1046,6 +1062,89 @@ class TestAttemptDescriptor:
         ):
             raise TestStoreContractError("test attempt state bindings are ambiguous")
         object.__setattr__(self, "state_bindings", tuple(normalized_state_bindings))
+        normalized_skill_bindings: list[Mapping[str, object]] = []
+        skill_fields = {
+            "environment",
+            "destination",
+            "declared_device",
+            "declared_inode",
+            "declared_symlink",
+            "source_root",
+            "source_device",
+            "source_inode",
+            "installation_kind",
+            "installation_sha256",
+            "installation_files",
+            "installation_bytes",
+        }
+        for raw in self.skill_bindings:
+            if not isinstance(raw, Mapping) or set(raw) != skill_fields:
+                raise TestStoreContractError(
+                    "test attempt installed skill binding fields are invalid"
+                )
+            environment = str(raw["environment"])
+            destination = _absolute_path(
+                "installed skill destination", raw["destination"]
+            )
+            source_root = _absolute_path(
+                "installed skill source", raw["source_root"]
+            )
+            if (
+                not environment.endswith("_SKILL_DIR")
+                or _ENVIRONMENT_NAME.fullmatch(environment) is None
+                or _SECRET_ENVIRONMENT_NAME.search(environment)
+                or not _installed_skill_destination(Path(destination))
+                or Path(source_root).name != Path(destination).name
+                or raw["installation_kind"] != "installed-skill"
+                or _SHA256.fullmatch(str(raw["installation_sha256"])) is None
+                or type(raw["declared_symlink"]) is not bool
+            ):
+                raise TestStoreContractError(
+                    "test attempt installed skill binding is invalid"
+                )
+            identities: dict[str, int] = {}
+            for field_name in (
+                "declared_device",
+                "declared_inode",
+                "source_device",
+                "source_inode",
+                "installation_files",
+                "installation_bytes",
+            ):
+                value = raw[field_name]
+                if type(value) is not int or value < 0:
+                    raise TestStoreContractError(
+                        "test attempt installed skill identity is invalid"
+                    )
+                identities[field_name] = int(value)
+            normalized_skill_bindings.append(
+                {
+                    "environment": environment,
+                    "destination": destination,
+                    "declared_symlink": bool(raw["declared_symlink"]),
+                    "source_root": source_root,
+                    **identities,
+                    "installation_kind": "installed-skill",
+                    "installation_sha256": str(raw["installation_sha256"]),
+                }
+            )
+        if (
+            len(normalized_skill_bindings) > 4
+            or len({item["environment"] for item in normalized_skill_bindings})
+            != len(normalized_skill_bindings)
+            or len({item["destination"] for item in normalized_skill_bindings})
+            != len(normalized_skill_bindings)
+        ):
+            raise TestStoreContractError(
+                "test attempt installed skill bindings are ambiguous"
+            )
+        if normalized_skill_bindings and self.source_mode != "immutable":
+            raise TestStoreContractError(
+                "live test attempts cannot bind installed skills"
+            )
+        object.__setattr__(
+            self, "skill_bindings", tuple(normalized_skill_bindings)
+        )
         normalized_standalone_toolchains: list[Mapping[str, object]] = []
         standalone_fields = {
             "resolved_executable",
@@ -1151,6 +1250,7 @@ class TestAttemptDescriptor:
         raw.setdefault("source_provenance", {})
         raw.setdefault("dependency_bindings", ())
         raw.setdefault("state_bindings", ())
+        raw.setdefault("skill_bindings", ())
         raw.setdefault("toolchain_bindings", ())
         raw.setdefault("supplementary_gids", ())
         raw.setdefault("fixture_bindings", ())
@@ -1199,6 +1299,7 @@ class TestAttemptDescriptor:
             "source_provenance": dict(self.source_provenance),
             "dependency_bindings": [dict(item) for item in self.dependency_bindings],
             "state_bindings": [dict(item) for item in self.state_bindings],
+            "skill_bindings": [dict(item) for item in self.skill_bindings],
             "toolchain_bindings": [dict(item) for item in self.toolchain_bindings],
             "supplementary_gids": list(self.supplementary_gids),
             "fixture_bindings": [dict(item) for item in self.fixture_bindings],
@@ -1941,6 +2042,30 @@ class SystemdTestAttemptManager:
                     "test .NET package identity has no locked packages"
                 )
             candidates.extend(source_root.joinpath(*path.parts) for path in required_paths)
+        elif kind == "installed-skill":
+            for candidate in sorted(source_root.rglob("*"), key=str):
+                relative = candidate.relative_to(source_root)
+                if any(
+                    part in {".git", "__pycache__", "node_modules", ".venv", "dist"}
+                    for part in relative.parts
+                ):
+                    continue
+                try:
+                    metadata = candidate.lstat()
+                except OSError as error:
+                    raise TestStoreConflict(
+                        "installed skill identity is unavailable"
+                    ) from error
+                if stat.S_ISLNK(metadata.st_mode):
+                    raise TestStoreConflict(
+                        "installed skill contains an unsafe symbolic link"
+                    )
+                if stat.S_ISREG(metadata.st_mode):
+                    candidates.append(candidate)
+                elif not stat.S_ISDIR(metadata.st_mode):
+                    raise TestStoreConflict(
+                        "installed skill contains an unsafe file type"
+                    )
         else:
             raise TestStoreConflict(
                 "test dependency installation manifest kind is invalid"
@@ -2340,6 +2465,54 @@ class SystemdTestAttemptManager:
             )
             environment[str(binding["environment"])] = str(database)
         return environment
+
+    @classmethod
+    def _validate_skill_binding(
+        cls,
+        binding: Mapping[str, object],
+    ) -> tuple[Path, Path]:
+        destination = Path(str(binding["destination"]))
+        source = Path(str(binding["source_root"]))
+        if not _installed_skill_destination(destination):
+            raise TestStoreConflict("installed skill destination is unsafe")
+        try:
+            declared_metadata = destination.lstat()
+            resolved = destination.resolve(strict=True)
+            skill_metadata = (source / "SKILL.md").lstat()
+        except OSError as error:
+            raise TestStoreConflict("installed skill is unavailable") from error
+        declared_symlink = bool(binding["declared_symlink"])
+        if (
+            resolved != source
+            or (declared_metadata.st_dev, declared_metadata.st_ino)
+            != (binding["declared_device"], binding["declared_inode"])
+            or stat.S_ISLNK(declared_metadata.st_mode) != declared_symlink
+            or not (
+                stat.S_ISLNK(declared_metadata.st_mode)
+                or stat.S_ISDIR(declared_metadata.st_mode)
+            )
+            or not stat.S_ISREG(skill_metadata.st_mode)
+            or stat.S_ISLNK(skill_metadata.st_mode)
+        ):
+            raise TestStoreConflict("installed skill declaration changed after planning")
+        source_metadata = cls._require_real_directory(
+            source, field="installed skill source"
+        )
+        if (
+            source_metadata.st_dev != binding["source_device"]
+            or source_metadata.st_ino != binding["source_inode"]
+        ):
+            raise TestStoreConflict("installed skill source changed after planning")
+        identity = cls._installation_manifest_identity(
+            source, kind="installed-skill"
+        )
+        if identity != (
+            binding["installation_sha256"],
+            binding["installation_files"],
+            binding["installation_bytes"],
+        ):
+            raise TestStoreConflict("installed skill content changed after planning")
+        return source, destination
 
     @classmethod
     def _prepare_dependency_mountpoints(
@@ -3911,6 +4084,14 @@ class SystemdTestAttemptManager:
                     _systemd_bind_path("test state", source)
                     if source == destination
                     else _systemd_bind_mapping("test state", source, destination)
+                )
+            )
+        for binding in descriptor.skill_bindings:
+            source, destination = cls._validate_skill_binding(binding)
+            properties.append(
+                "--property=BindReadOnlyPaths="
+                + _systemd_bind_mapping(
+                    "installed skill", source, destination
                 )
             )
         credential_files: list[Mapping[str, object]] = []

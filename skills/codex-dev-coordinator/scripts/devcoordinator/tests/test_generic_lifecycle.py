@@ -863,7 +863,13 @@ class GenericLifecycleHttpTests(unittest.TestCase):
         ) as broker_call:
             result = dev_coordinator.coordinated_list_archives()
         self.assertEqual(result["archives"][0]["target_id"], other.repo_id)
-        broker_call.assert_called_once()
+        broker_call.assert_called_once_with(
+            repository=repository,
+            resource_id=repository.repo_id,
+            operation=BrokerOperation.ARCHIVES_READ,
+            arguments={},
+            transport_timeout_seconds=60.0,
+        )
 
 
 if __name__ == "__main__":

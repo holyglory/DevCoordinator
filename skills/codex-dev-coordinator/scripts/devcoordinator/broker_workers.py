@@ -22,6 +22,7 @@ from .store import CoordinatorStore, canonical_json, utc_timestamp
 from .worker_native import WorkerNativeError, verify_systemd_worker_caller
 from .worker_artifacts import (
     WorkerArtifactError,
+    provision_worker_log_directory,
     verify_worker_log_artifact,
 )
 from .worker_supervision import (
@@ -261,6 +262,11 @@ class BrokerWorkerOperations:
                     )
                 candidate = self._prepared_candidate(accepted, prepared)
                 self._require_candidate_tokens(accepted, candidate)
+                # Repositories enrolled before the canonical worker-log root
+                # existed may have no per-UID directory. Provision it at the
+                # exact launch boundary before the user-owned runner starts;
+                # replay remains idempotent and validates existing identity.
+                provision_worker_log_directory(int(candidate["execution_uid"]))
                 actual = (
                     int(candidate["definition_generation"]),
                     int(candidate["policy_generation"]),

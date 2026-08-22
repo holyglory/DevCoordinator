@@ -519,7 +519,12 @@ class TestPlaneDispatcher:
             elif isinstance(error, TestStoreNotFound):
                 code, message = "not_found", str(error)
             elif isinstance(error, TestStoreConflict):
-                code, message = "conflict", str(error)
+                code, message = (
+                    ("artifact_unverified", str(error))
+                    if operation == TEST_ARTIFACT_RESOLVE
+                    and "has not been verified" in str(error)
+                    else ("conflict", str(error))
+                )
             elif isinstance(error, TestStoreContractError):
                 code, message = (
                     ("test_plan_source_invalid", str(error))

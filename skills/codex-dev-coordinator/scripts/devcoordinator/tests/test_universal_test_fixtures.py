@@ -7,7 +7,7 @@ from pathlib import Path
 import stat
 import unittest
 
-from devcoordinator.broker import BrokerError
+from devcoordinator.broker import BrokerBackendError, BrokerError
 from devcoordinator.ephemeral_secrets import (
     POSTGRES_INITDB_PASSWORD_FILE_V1,
     VolatileRunSecretManager,
@@ -201,6 +201,39 @@ class UniversalTestFixtureProviderTests(unittest.TestCase):
             provider.provision(
                 self.descriptor(), runtime_id="devcoordinator-test-" + "8" * 32
             )
+
+    def test_fixture_recovers_unknown_create_from_exact_labels(self) -> None:
+        class UnknownReplyHost(FixtureHost):
+            def __init__(self) -> None:
+                super().__init__()
+                self.create_calls = 0
+
+            def docker_create_ephemeral(self, target):
+                self.create_calls += 1
+                super().docker_create_ephemeral(target)
+                raise BrokerBackendError(
+                    "ephemeral_docker_create_outcome_unknown",
+                    "injected lost create reply",
+                )
+
+        self.host = UnknownReplyHost()
+        provider = self.provider()
+        runtime_id = "devcoordinator-test-" + "7" * 32
+
+        lease = provider.provision(self.descriptor(), runtime_id=runtime_id)
+
+        self.assertEqual(self.host.create_calls, 1)
+        self.assertEqual(lease.fixtures, ("postgres",))
+        journal = json.loads(
+            (self.state_root / f"{runtime_id}.json").read_text(encoding="utf-8")
+        )
+        self.assertRegex(journal["fixtures"][0]["full_container_id"], r"^[0-9a-f]{64}$")
+        provider.cleanup(
+            runtime_id=runtime_id,
+            descriptor_fingerprint=lease.descriptor_fingerprint,
+            reason="terminal",
+        )
+        self.assertEqual(self.host.containers, {})
 
     def test_sealed_fixture_template_is_available_to_another_repository(self) -> None:
         consumer_root = self.fixture.root / "consumer"

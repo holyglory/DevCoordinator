@@ -636,6 +636,7 @@ class SerializedMutationWriter:
         completed_cache_size: int = DEFAULT_COMPLETED_OPERATION_CACHE,
         max_result_bytes: int = DEFAULT_MAX_MESSAGE_BYTES // 2,
         max_concurrent_host_observations: int = 4,
+        initially_accepting_mutations: bool = True,
     ) -> None:
         if not _is_exact_int(completed_cache_size) or completed_cache_size <= 0:
             raise ValueError("completed_cache_size must be positive")
@@ -648,6 +649,8 @@ class SerializedMutationWriter:
             raise ValueError(
                 "max_concurrent_host_observations must be a non-negative integer"
             )
+        if type(initially_accepting_mutations) is not bool:
+            raise ValueError("initially_accepting_mutations must be a boolean")
         self._backend = backend
         self._completed_cache_size = completed_cache_size
         self._max_result_bytes = max_result_bytes
@@ -661,7 +664,8 @@ class SerializedMutationWriter:
         self._active_count = 0
         self._inflight_mutation_count = 0
         self._admitted_mutation_count = 0
-        self._accepting_mutations = True
+        self._accepting_mutations = initially_accepting_mutations
+        self._shutdown_requested = False
         self._host_observation_slots = (
             threading.BoundedSemaphore(max_concurrent_host_observations)
             if max_concurrent_host_observations > 0
@@ -706,10 +710,23 @@ class SerializedMutationWriter:
         """
 
         with self._metrics_condition:
+            self._shutdown_requested = True
             self._accepting_mutations = False
             admitted = self._admitted_mutation_count
             self._metrics_condition.notify_all()
             return admitted
+
+    def begin_mutation_admission(self) -> None:
+        """Open mutation admission after startup recovery and fencing."""
+
+        with self._metrics_condition:
+            if self._shutdown_requested:
+                raise BrokerError(
+                    "service_shutting_down",
+                    "The broker is shutting down and cannot open mutation admission.",
+                )
+            self._accepting_mutations = True
+            self._metrics_condition.notify_all()
 
     def wait_for_drain(self, timeout: float) -> bool:
         """Wait for admitted work to finish and pre-fence waiters to reject."""
@@ -772,9 +789,18 @@ class SerializedMutationWriter:
         operation = request.request.operation
         with self._metrics_condition:
             if not self._accepting_mutations:
+                code = (
+                    "service_shutting_down"
+                    if self._shutdown_requested
+                    else "service_starting"
+                )
                 raise BrokerError(
-                    "service_shutting_down",
-                    "The broker is shutting down; retry with its replacement.",
+                    code,
+                    (
+                        "The broker is shutting down; retry with its replacement."
+                        if self._shutdown_requested
+                        else "The broker is starting; retry this mutation after readiness."
+                    ),
                     operation_id=operation_id,
                 )
             self._inflight_mutation_count += 1

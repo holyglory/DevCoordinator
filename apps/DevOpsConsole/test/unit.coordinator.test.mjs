@@ -348,6 +348,11 @@ test('archive reads coalesce and lifecycle mutations invalidate their cache', as
 test('archive reads recover one coalesced cold-cutover 502', async (t) => {
   let archiveReads = 0;
   const responder = async ({ req, res }) => {
+    if (req.url === '/v1/observe') {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ ok: true }));
+      return true;
+    }
     if (req.url !== '/v1/archives') return false;
     archiveReads += 1;
     res.writeHead(archiveReads === 1 ? 502 : 200, { 'content-type': 'application/json' });
@@ -368,6 +373,38 @@ test('archive reads recover one coalesced cold-cutover 502', async (t) => {
   assert.deepEqual(first, { archives: [] });
   assert.deepEqual(second, first);
   assert.equal(archiveReads, 2);
+});
+
+test('archive reads retain the last validated value across a saturation burst', async (t) => {
+  let archiveReads = 0;
+  let failing = false;
+  const responder = async ({ req, res }) => {
+    if (req.url === '/v1/observe') {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ ok: true }));
+      return true;
+    }
+    if (req.url !== '/v1/archives') return false;
+    archiveReads += 1;
+    if (!failing) await new Promise((resolve) => setTimeout(resolve, 20));
+    res.writeHead(failing ? 502 : 200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify(
+      failing ? { error: 'authority saturated' } : { archives: [{ target_id: 'repo-1' }] },
+    ));
+    return true;
+  };
+  const { client } = await fixture(t, { responder });
+  const warming = client.lifecycleArchives();
+  await client.request('POST', '/v1/observe', {});
+  const retained = await warming;
+  failing = true;
+
+  await assert.rejects(client.lifecycleArchives({ maxAgeMs: -1 }), CoordError);
+  const beforeFallbackReads = archiveReads;
+  const fallback = client.retainedLifecycleArchives();
+
+  assert.deepEqual(fallback, retained);
+  assert.equal(archiveReads, beforeFallbackReads);
 });
 
 function recordingLog(entries) {

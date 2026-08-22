@@ -1340,6 +1340,42 @@ class SingleWriterConcurrencyTests(unittest.TestCase):
             rejected[0]["error"]["code"], "service_shutting_down"
         )
 
+    def test_startup_fence_serves_reads_before_mutation_admission(self) -> None:
+        backend = RecordingBackend()
+        writer = SerializedMutationWriter(
+            backend,
+            initially_accepting_mutations=False,
+        )
+        service = BrokerService(TrustedLocalRequestAcceptor(), writer)
+        peer = peer_for()
+
+        read = service.reply_for_document(
+            peer,
+            request_for(BrokerOperation.CAPABILITIES_READ).to_wire(),
+        )
+        blocked = service.reply_for_document(
+            peer,
+            request_for(BrokerOperation.DOCKER_START).to_wire(),
+        )
+
+        self.assertTrue(read["ok"], read)
+        self.assertFalse(blocked["ok"], blocked)
+        self.assertEqual(blocked["error"]["code"], "service_starting")
+        self.assertEqual(len(backend.calls), 1)
+
+        writer.begin_mutation_admission()
+        admitted = service.reply_for_document(
+            peer,
+            request_for(BrokerOperation.DOCKER_START).to_wire(),
+        )
+        self.assertTrue(admitted["ok"], admitted)
+        self.assertEqual(len(backend.calls), 2)
+
+        writer.begin_shutdown()
+        with self.assertRaises(BrokerError) as raised:
+            writer.begin_mutation_admission()
+        self.assertEqual(raised.exception.code, "service_shutting_down")
+
     def test_busy_host_observation_does_not_poison_operation_replay(self) -> None:
         entered = threading.Event()
         release = threading.Event()
@@ -2486,7 +2522,7 @@ class StoreBackedBrokerTests(unittest.TestCase):
             "a signal-turn stop request must not be cleared by a late start",
         )
 
-    def test_runtime_joins_reaper_after_transport_and_writer_drain(self) -> None:
+    def test_runtime_keeps_transport_until_writer_drain_then_joins_reaper(self) -> None:
         events: list[str] = []
         test_case = self
 
@@ -2497,7 +2533,7 @@ class StoreBackedBrokerTests(unittest.TestCase):
             def wait_ephemeral_reaper_stopped(self, timeout: float) -> None:
                 test_case.assertGreater(timeout, 0.5)
                 test_case.assertLessEqual(timeout, 1.0)
-                test_case.assertEqual(events[-1], "writer-drained")
+                test_case.assertEqual(events[-1], "server-drained")
                 events.append("reaper-stopped")
 
             def begin_shutdown_host_observations(self) -> int:
@@ -2536,8 +2572,8 @@ class StoreBackedBrokerTests(unittest.TestCase):
             [
                 "mutation-fenced",
                 "reaper-stop-requested",
-                "server-drained",
                 "writer-drained",
+                "server-drained",
                 "reaper-stopped",
                 "observations-cleaned",
                 "observations-cleaned",
@@ -2558,14 +2594,17 @@ class StoreBackedBrokerTests(unittest.TestCase):
                     release,
                     fail_after_release=fail_after_release,
                 )
+                runtime_directory = root / "runtime"
+                runtime_directory.mkdir(mode=0o750)
                 runtime = build_store_backed_broker_runtime(
                     database_path=persistence.database_path,
-                    socket_path=root / "runtime/broker.sock",
+                    socket_path=runtime_directory / "broker.sock",
                     host_mutations=actions,
                     service_uid=os.geteuid(),
                     shutdown_timeout_seconds=3.0,
                     observe_before_lifecycle_plan=_committed_available_observer,
                 )
+                runtime.server.start()
                 first_request = request_for(
                     BrokerOperation.DATABASE_BACKUP,
                     arguments={"database_name": DATABASE_NAME},
@@ -2620,6 +2659,12 @@ class StoreBackedBrokerTests(unittest.TestCase):
                 while runtime.writer.accepting_mutations and time.monotonic() < deadline:
                     time.sleep(0.01)
                 self.assertFalse(runtime.writer.accepting_mutations)
+
+                read_during_drain = BrokerClient(
+                    runtime.server.socket_path,
+                    timeout_seconds=1.0,
+                ).call(request_for(BrokerOperation.CAPABILITIES_READ))
+                self.assertTrue(read_during_drain["ok"], read_during_drain)
 
                 late = runtime.service.reply_for_document(
                     peer_for(), late_request.to_wire()
@@ -3078,16 +3123,14 @@ class StoreBackedBrokerTests(unittest.TestCase):
         sampler_entered = threading.Event()
         release_sampler = threading.Event()
         sampler_lock = threading.Lock()
-        observer_barrier = threading.Barrier(2)
-        joiner_entered = threading.Event()
+        observer_calls = 0
         sampler_calls = 0
 
-        class InstrumentedObserver(SingleFlightObserver):
-            def _join(self, ticket: Any) -> Any:
-                joiner_entered.set()
-                return super()._join(ticket)
-
         def observe(store: CoordinatorStore) -> Mapping[str, Any]:
+            nonlocal observer_calls
+            with sampler_lock:
+                observer_calls += 1
+
             def sample() -> Mapping[str, Any]:
                 nonlocal sampler_calls
                 with sampler_lock:
@@ -3107,7 +3150,6 @@ class StoreBackedBrokerTests(unittest.TestCase):
                     },
                 }
 
-            observer_barrier.wait(timeout=2.0)
             def commit(
                 connection: sqlite3.Connection,
                 snapshot_id: str,
@@ -3124,7 +3166,7 @@ class StoreBackedBrokerTests(unittest.TestCase):
                     (snapshot_id, "sha256:" + "4" * 64, committed_at),
                 )
 
-            outcome = InstrumentedObserver(store, join_timeout=3.0).observe(
+            outcome = SingleFlightObserver(store, join_timeout=3.0).observe(
                 host_id=HOST_ID,
                 observer_domain="host-runtime-v2:full-docker",
                 sampler=sample,
@@ -3153,14 +3195,16 @@ class StoreBackedBrokerTests(unittest.TestCase):
 
         with CanonicalTemporaryDirectory() as root:
             persistence, actions = seed_store_backed_broker(root)
+            backend = StoreBackedMutationBackend(
+                persistence,
+                actions,
+                observe_before_lifecycle_plan=observe,
+            )
             service = BrokerService(
                 StoreBackedRequestAcceptor(persistence),
                 SerializedMutationWriter(
-                    StoreBackedMutationBackend(
-                        persistence,
-                        actions,
-                        observe_before_lifecycle_plan=observe,
-                    )
+                    backend,
+                    max_concurrent_host_observations=8,
                 ),
             )
             with CoordinatorStore.open(
@@ -3184,14 +3228,22 @@ class StoreBackedBrokerTests(unittest.TestCase):
                 except BaseException as error:  # pragma: no cover - diagnostics
                     failures.append(error)
 
-            workers = [threading.Thread(target=invoke) for _ in range(2)]
+            workers = [threading.Thread(target=invoke) for _ in range(8)]
             for worker in workers:
                 worker.start()
             self.assertTrue(sampler_entered.wait(timeout=1.0))
-            self.assertTrue(
-                joiner_entered.wait(timeout=1.0),
-                "second request did not join the durable observation ticket",
-            )
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline:
+                with backend._host_observation_fanout:
+                    if backend._host_observation_waiters == 7:
+                        break
+                time.sleep(0.01)
+            with backend._host_observation_fanout:
+                self.assertEqual(
+                    backend._host_observation_waiters,
+                    7,
+                    "all later requests must join the complete backend observation",
+                )
             release_sampler.set()
             for worker in workers:
                 worker.join(timeout=3.0)
@@ -3202,8 +3254,9 @@ class StoreBackedBrokerTests(unittest.TestCase):
 
         self.assertFalse(any(worker.is_alive() for worker in workers), failures)
         self.assertEqual(failures, [])
+        self.assertEqual(observer_calls, 1)
         self.assertEqual(sampler_calls, 1)
-        self.assertEqual(len(replies), 2)
+        self.assertEqual(len(replies), 8)
         self.assertTrue(all(reply["ok"] for reply in replies), replies)
         self.assertEqual(
             {reply["result"]["snapshot_id"] for reply in replies},
@@ -3211,7 +3264,7 @@ class StoreBackedBrokerTests(unittest.TestCase):
         )
         self.assertEqual(
             sorted(reply["result"]["joined"] for reply in replies),
-            [False, True],
+            [False] + [True] * 7,
         )
         self.assertEqual(after, before + 1)
 

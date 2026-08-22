@@ -1690,7 +1690,29 @@ class StoreTestPlaneAdapter:
             self._store.get_run(run_id, repository_id=repository_id)
         )
         metrics = self._store.run_metrics(run_id)
-        document["sampled_at"] = self._store.current_time()
+        sampled_at = self._store.current_time()
+        document["sampled_at"] = sampled_at
+        for target in document.get("targets", []):
+            if not isinstance(target, dict):
+                continue
+            active = target.get("active_attempt")
+            if not isinstance(active, dict):
+                continue
+            lease_expires_at = active.get("lease_expires_at")
+            degraded = (
+                not isinstance(lease_expires_at, bool)
+                and isinstance(lease_expires_at, (int, float))
+                and float(lease_expires_at) < float(sampled_at)
+            )
+            active["supervision"] = {
+                "state": "degraded" if degraded else "current",
+                "code": (
+                    "lease_expired_without_terminal_evidence"
+                    if degraded
+                    else None
+                ),
+                "since": float(lease_expires_at) if degraded else None,
+            }
         document["failure_count"] = int(metrics["failure_record_count"])
         document["counts"] = {
             "executions": int(metrics["execution_count"]),

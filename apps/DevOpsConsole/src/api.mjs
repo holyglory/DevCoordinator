@@ -811,7 +811,10 @@ export function createConsoleApi({
       sendJson(res, 200, { archives: archiveRows(result) });
     } catch (error) {
       if (error?.status !== 502) throw error;
-      const result = await coordinator.lifecycleArchives({ maxAgeMs: -1 });
+      // Read retained validated data directly. Re-entering the generic loader
+      // can join the same failed in-flight refresh and repeat its 502.
+      const result = coordinator.retainedLifecycleArchives?.();
+      if (result === undefined) throw error;
       sendJson(res, 200, { archives: archiveRows(result) });
     }
   }

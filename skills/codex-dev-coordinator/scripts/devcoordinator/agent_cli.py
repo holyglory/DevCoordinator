@@ -1678,6 +1678,12 @@ def _operation(
             f"devcoordinator test follow {shlex.quote(run_handle)}"
             f" --project {shlex.quote(context.root.canonical_root)}"
         )
+    elif isinstance(plan_id, str):
+        plan_handle = continuation_handle("plan", plan_id)
+        document["next_command"] = (
+            f"devcoordinator test submit {shlex.quote(plan_handle)}"
+            f" --project {shlex.quote(context.root.canonical_root)}"
+        )
     return require_agent_result(
         document,
         surface="operation follow",

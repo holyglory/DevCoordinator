@@ -1463,7 +1463,20 @@ def reconcile_configured_runtime_container_declarations(
             if row["associated_repo_id"] is None
             else str(row["associated_repo_id"])
         )
-        if associated_repo_id not in {None, primary["repo_id"]}:
+        if associated_repo_id == primary["repo_id"]:
+            bindings.append(
+                {
+                    "container": name,
+                    "resource_id": str(row["docker_resource_id"]),
+                    "full_container_id": str(row["full_container_id"]),
+                    "status": "already_associated",
+                    "associated_repo_id": primary["repo_id"],
+                    "associated_root": primary["canonical_root"],
+                    "shared_references": declared_by[1:],
+                }
+            )
+            continue
+        if associated_repo_id is not None:
             bindings.append(
                 {
                     "container": name,
@@ -1475,23 +1488,58 @@ def reconcile_configured_runtime_container_declarations(
                 }
             )
             continue
-        with store.immediate_transaction() as connection:
+        with store.immediate_transaction(revision_kind=None) as connection:
             updated = connection.execute(
                 """
                 UPDATE docker_resources
                 SET repo_id = ?, updated_at = ?
                 WHERE docker_resource_id = ? AND full_container_id = ?
-                  AND (repo_id IS NULL OR repo_id = ?)
+                  AND repo_id IS NULL
                 """,
                 (
                     primary["repo_id"],
                     utc_timestamp(),
                     str(row["docker_resource_id"]),
                     str(row["full_container_id"]),
-                    primary["repo_id"],
                 ),
             ).rowcount
+            if updated == 1:
+                connection.execute(
+                    """
+                    UPDATE schema_metadata
+                    SET state_revision = state_revision + 1, updated_at = ?
+                    WHERE singleton = 1
+                    """,
+                    (utc_timestamp(),),
+                )
         if updated != 1:
+            with store.read_transaction() as connection:
+                current = connection.execute(
+                    """
+                    SELECT repo_id, full_container_id
+                    FROM docker_resources
+                    WHERE docker_resource_id = ?
+                    """,
+                    (str(row["docker_resource_id"]),),
+                ).fetchone()
+            if (
+                current is not None
+                and str(current["full_container_id"])
+                == str(row["full_container_id"])
+                and str(current["repo_id"] or "") == primary["repo_id"]
+            ):
+                bindings.append(
+                    {
+                        "container": name,
+                        "resource_id": str(row["docker_resource_id"]),
+                        "full_container_id": str(row["full_container_id"]),
+                        "status": "already_associated",
+                        "associated_repo_id": primary["repo_id"],
+                        "associated_root": primary["canonical_root"],
+                        "shared_references": declared_by[1:],
+                    }
+                )
+                continue
             bindings.append(
                 {
                     "container": name,
@@ -1502,13 +1550,13 @@ def reconcile_configured_runtime_container_declarations(
                 }
             )
             continue
-        changed += int(associated_repo_id is None)
+        changed += 1
         bindings.append(
             {
                 "container": name,
                 "resource_id": str(row["docker_resource_id"]),
                 "full_container_id": str(row["full_container_id"]),
-                "status": "associated" if associated_repo_id is None else "already_associated",
+                "status": "associated",
                 "associated_repo_id": primary["repo_id"],
                 "associated_root": primary["canonical_root"],
                 "shared_references": declared_by[1:],

@@ -4946,6 +4946,7 @@ class UniversalTestStore:
                     JOIN test_run_targets AS target
                       ON target.target_id = artifact.target_id
                     WHERE target.run_id = ? AND artifact.artifact_id > ?
+                      AND artifact.verified = 1
                     ORDER BY artifact.artifact_id LIMIT ?
                     """,
                     (run_id, after_value, limit),

@@ -4,6 +4,7 @@ import argparse
 import contextlib
 import hashlib
 import io
+import inspect
 import json
 import os
 import socket
@@ -2362,84 +2363,14 @@ class BrokerCLIContractTests(unittest.TestCase):
             help_text,
         )
 
-    def test_image_publication_requires_active_maintenance_marker(self) -> None:
-        with (
-            mock.patch.object(
-                dev_coordinator.grp,
-                "getgrnam",
-                return_value=mock.Mock(gr_gid=986),
-            ),
-            mock.patch.object(
-                dev_coordinator,
-                "load_maintenance_state",
-                return_value=None,
-            ),
-            mock.patch.object(dev_coordinator.subprocess, "run") as run,
-            self.assertRaisesRegex(RuntimeError, "requires active server-wide"),
-        ):
-            dev_coordinator._require_live_image_publication_maintenance_boundary()
-        run.assert_not_called()
-
-    def test_image_publication_keeps_loopback_api_available(self) -> None:
-        with (
-            mock.patch.object(
-                dev_coordinator.grp,
-                "getgrnam",
-                return_value=mock.Mock(gr_gid=986),
-            ),
-            mock.patch.object(
-                dev_coordinator,
-                "load_maintenance_state",
-                return_value=object(),
-            ),
-            mock.patch.object(
-                dev_coordinator.subprocess,
-                "run",
-                return_value=mock.Mock(returncode=3),
-            ) as run,
-            self.assertRaisesRegex(RuntimeError, "instead of ECONNREFUSED"),
-        ):
-            dev_coordinator._require_live_image_publication_maintenance_boundary()
-        run.assert_called_once_with(
-            [
-                "systemctl",
-                "is-active",
-                "--quiet",
-                "devcoordinator-authority.service",
-            ],
-            check=False,
-            stdin=dev_coordinator.subprocess.DEVNULL,
-            stdout=dev_coordinator.subprocess.DEVNULL,
-            stderr=dev_coordinator.subprocess.DEVNULL,
-            timeout=5.0,
+    def test_image_publication_is_project_scoped_not_global_maintenance(self) -> None:
+        source = inspect.getsource(
+            dev_coordinator.coordinated_broker_publish_image
         )
-
-    def test_image_publication_accepts_preserved_control_plane(self) -> None:
-        with (
-            mock.patch.object(
-                dev_coordinator.grp,
-                "getgrnam",
-                return_value=mock.Mock(gr_gid=986),
-            ),
-            mock.patch.object(
-                dev_coordinator,
-                "load_maintenance_state",
-                return_value=object(),
-            ),
-            mock.patch.object(
-                dev_coordinator.subprocess,
-                "run",
-                return_value=mock.Mock(returncode=0),
-            ) as run,
-        ):
-            dev_coordinator._require_live_image_publication_maintenance_boundary()
-        self.assertEqual(
-            [call.args[0][-1] for call in run.call_args_list],
-            [
-                "devcoordinator-authority.service",
-                "devcoordinator-api.service",
-            ],
-        )
+        self.assertIn("publication_execution_lock", source)
+        self.assertNotIn("_require_live_image_publication_maintenance_boundary", source)
+        self.assertNotIn("exclusive_broker_service_lock", source)
+        self.assertNotIn("systemctl", source)
 
     def test_sigterm_fences_mutations_before_serve_loop_poll(self) -> None:
         events: list[str] = []
@@ -2453,20 +2384,17 @@ class BrokerCLIContractTests(unittest.TestCase):
                 self._socket_mode = 0o660
 
             def start(self) -> None:
-                self.assert_startup_recovery_complete()
+                self.assert_startup_recovery_not_started()
                 events.append("server-started")
                 handlers[broker_cli_module.signal.SIGTERM](
                     broker_cli_module.signal.SIGTERM, None
                 )
 
             @staticmethod
-            def assert_startup_recovery_complete() -> None:
+            def assert_startup_recovery_not_started() -> None:
                 self.assertEqual(
-                    runtime.persistence.method_calls[:2],
-                    [
-                        mock.call.recover_interrupted_docker_operations(),
-                        mock.call.recover_interrupted_compose_operations(),
-                    ],
+                    runtime.persistence.method_calls,
+                    [],
                 )
 
         class FakeRuntime:
@@ -2535,21 +2463,16 @@ class BrokerCLIContractTests(unittest.TestCase):
         self.assertEqual(
             events,
             [
-                "workers-fenced",
                 "server-started",
                 "mutation-fenced",
                 "runtime-closed",
             ],
         )
         self.assertEqual(runtime.begin_shutdown_calls, 1)
-        (
-            runtime.persistence.recover_interrupted_compose_operations
-        ).assert_called_once_with()
-        (
-            runtime.persistence.recover_interrupted_docker_operations
-        ).assert_called_once_with()
-        runtime.backend.recover_ephemeral_runs.assert_called_once_with()
-        runtime.backend.start_ephemeral_reaper.assert_called_once_with()
+        runtime.persistence.recover_interrupted_compose_operations.assert_not_called()
+        runtime.persistence.recover_interrupted_docker_operations.assert_not_called()
+        runtime.backend.recover_ephemeral_runs.assert_not_called()
+        runtime.backend.start_ephemeral_reaper.assert_not_called()
 
     def test_repeated_signal_during_shutdown_does_not_reenter_fence(self) -> None:
         events: list[str] = []
@@ -2644,18 +2567,13 @@ class BrokerCLIContractTests(unittest.TestCase):
             serve_broker(args, host_mutations_factory=mock.Mock)
 
         self.assertEqual(runtime.begin_shutdown_calls, 1)
-        (
-            runtime.persistence.recover_interrupted_compose_operations
-        ).assert_called_once_with()
-        (
-            runtime.persistence.recover_interrupted_docker_operations
-        ).assert_called_once_with()
-        runtime.backend.recover_ephemeral_runs.assert_called_once_with()
-        runtime.backend.start_ephemeral_reaper.assert_called_once_with()
+        runtime.persistence.recover_interrupted_compose_operations.assert_not_called()
+        runtime.persistence.recover_interrupted_docker_operations.assert_not_called()
+        runtime.backend.recover_ephemeral_runs.assert_not_called()
+        runtime.backend.start_ephemeral_reaper.assert_not_called()
         self.assertEqual(
             events,
             [
-                "workers-fenced",
                 "server-started",
                 "mutation-fenced",
                 "drain-started",
@@ -2693,7 +2611,11 @@ class BrokerCLIContractTests(unittest.TestCase):
             def autostart_workers_after_admission(
                 *, fenced: object
             ) -> dict[str, object]:
-                if events != ["workers-fenced", "server-started"]:
+                if events != [
+                    "server-started",
+                    "workers-fenced",
+                    "mutation-admitted",
+                ]:
                     raise AssertionError("worker autostart ran before broker admission")
                 events.append("workers-autostarted")
                 handlers[broker_cli_module.signal.SIGTERM](
@@ -2703,6 +2625,10 @@ class BrokerCLIContractTests(unittest.TestCase):
                     **dict(fenced),
                     "started": [{"worker_id": "worker-old"}],
                 }
+
+            @staticmethod
+            def begin_mutation_admission() -> None:
+                events.append("mutation-admitted")
 
             @staticmethod
             def begin_shutdown() -> int:
@@ -2750,8 +2676,9 @@ class BrokerCLIContractTests(unittest.TestCase):
         self.assertEqual(
             events,
             [
-                "workers-fenced",
                 "server-started",
+                "workers-fenced",
+                "mutation-admitted",
                 "workers-autostarted",
                 "mutation-fenced",
                 "runtime-closed",

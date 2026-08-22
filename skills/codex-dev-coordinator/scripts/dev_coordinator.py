@@ -88,6 +88,7 @@ from devcoordinator.image_publication import (
     apply_publication,
     normalize_publication_spec,
     plan_publication,
+    publication_execution_lock,
     publication_status,
     rollback_publication,
 )
@@ -12613,15 +12614,7 @@ def coordinated_broker_approve_compose_host_access(
 
 
 def coordinated_broker_publish_image(args: argparse.Namespace) -> dict[str, Any]:
-    """Run the explicit root-only image publication lifecycle.
-
-    The broker process must be stopped for any mutation phase, but the loopback
-    API must remain available and maintenance mode must already be active.
-    Holding the broker lifetime lock prevents another coordinator lifecycle
-    action from racing the immutable snapshot, image tag, or sealed Compose
-    recreation without turning a planned maintenance window into an opaque
-    connection-refused outage for every Console and agent.
-    """
+    """Run one explicit root-only, project-scoped image publication lifecycle."""
 
     if os.geteuid() != 0:
         raise PermissionError(
@@ -12670,25 +12663,25 @@ def coordinated_broker_publish_image(args: argparse.Namespace) -> dict[str, Any]
         runtime_config=config,
         name=str(args.publication),
     )
-    if mode == "build":
-        if not args.confirm_plan_fingerprint:
-            raise ValueError(
-                "image publication build requires --confirm-plan-fingerprint"
+    with publication_execution_lock(
+        specification=specification,
+        artifact_root=artifact_root,
+        service_uid=0,
+    ):
+        if mode == "build":
+            if not args.confirm_plan_fingerprint:
+                raise ValueError(
+                    "image publication build requires --confirm-plan-fingerprint"
+                )
+            return apply_publication(
+                specification=specification,
+                artifact_root=artifact_root,
+                operation_id=str(args.operation_id),
+                confirmation_fingerprint=str(args.confirm_plan_fingerprint),
+                service_uid=0,
+                broker_database_path=database_path,
+                rollout=False,
             )
-        return apply_publication(
-            specification=specification,
-            artifact_root=artifact_root,
-            operation_id=str(args.operation_id),
-            confirmation_fingerprint=str(args.confirm_plan_fingerprint),
-            service_uid=0,
-            broker_database_path=database_path,
-            rollout=False,
-        )
-    _require_live_image_publication_maintenance_boundary()
-    # The broker service itself holds this same lock during normal operation.
-    # A failed acquisition is a deliberate stop condition, not an invitation to
-    # issue an uncoordinated raw Docker command.
-    with exclusive_broker_service_lock(database_path):
         if mode == "apply":
             if not args.confirm_plan_fingerprint:
                 raise ValueError(
@@ -12714,45 +12707,6 @@ def coordinated_broker_publish_image(args: argparse.Namespace) -> dict[str, Any]
             service_uid=0,
             broker_database_path=database_path,
         )
-
-
-def _require_live_image_publication_maintenance_boundary() -> None:
-    """Fail closed unless offline publication preserves the public control plane."""
-
-    try:
-        maintenance = load_maintenance_state()
-    except (MaintenanceMarkerError, OSError, ValueError) as exc:
-        raise RuntimeError(
-            "image publication could not verify server-wide maintenance mode"
-        ) from exc
-    if maintenance is None:
-        raise RuntimeError(
-            "image publication apply/rollback requires active server-wide "
-            "maintenance mode before the broker is stopped"
-        )
-    for unit, role in (
-        ("devcoordinator-authority.service", "Coordinator authority"),
-        ("devcoordinator-api.service", "loopback Coordinator API"),
-    ):
-        try:
-            state = subprocess.run(
-                ["systemctl", "is-active", "--quiet", unit],
-                check=False,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=5.0,
-            )
-        except (OSError, subprocess.SubprocessError) as exc:
-            raise RuntimeError(
-                f"image publication could not verify the {role}"
-            ) from exc
-        if state.returncode != 0:
-            raise RuntimeError(
-                f"image publication requires {unit} to remain active; stop only "
-                "devcoordinator-broker.service so Consoles and agents receive "
-                "the maintenance response instead of ECONNREFUSED"
-            )
 
 
 def coordinated_broker_compose_reconcile(
@@ -20640,6 +20594,7 @@ def coordinated_list_archives() -> dict[str, Any]:
             resource_id=repository.repo_id,
             operation=BrokerOperation.ARCHIVES_READ,
             arguments={},
+            transport_timeout_seconds=60.0,
         )
         rows = result.get("archives")
         if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):

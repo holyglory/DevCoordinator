@@ -14,7 +14,7 @@ import time
 from typing import Any, Mapping
 import uuid
 
-from .broker import BrokerError
+from .broker import BrokerBackendError, BrokerError
 from .broker_host import (
     EphemeralDockerContainerTarget,
     EphemeralDockerCreateTarget,
@@ -340,26 +340,41 @@ class BrokerSealedFixtureProvider:
                             "sealed fixture conflicts with broker secret delivery"
                         )
                     environment = (*environment, *secret_mount.environment)
-                created = self.host.docker_create_ephemeral(
-                    EphemeralDockerCreateTarget(
-                        identity=identity,
-                        owner_uid=int(raw["owner_uid"]),
-                        container_name=str(raw["container_name"]),
-                        image_ref=str(raw["image_ref"]),
-                        command=tuple(raw["command"]),
-                        environment=environment,
-                        memory_bytes=int(raw["memory_bytes"]),
-                        cpu_limit=(
-                            f"{int(raw['cpu_millis']) // 1000}"
-                            if int(raw["cpu_millis"]) % 1000 == 0
-                            else f"{int(raw['cpu_millis']) / 1000:.3f}".rstrip("0").rstrip(".")
-                        ),
-                        host_tcp_port=None,
-                        container_tcp_port=None,
-                        network_container_id=raw.get("network_container_id"),
-                        secret_mount=secret_mount,
-                    )
+                create_target = EphemeralDockerCreateTarget(
+                    identity=identity,
+                    owner_uid=int(raw["owner_uid"]),
+                    container_name=str(raw["container_name"]),
+                    image_ref=str(raw["image_ref"]),
+                    command=tuple(raw["command"]),
+                    environment=environment,
+                    memory_bytes=int(raw["memory_bytes"]),
+                    cpu_limit=(
+                        f"{int(raw['cpu_millis']) // 1000}"
+                        if int(raw["cpu_millis"]) % 1000 == 0
+                        else f"{int(raw['cpu_millis']) / 1000:.3f}".rstrip("0").rstrip(".")
+                    ),
+                    host_tcp_port=None,
+                    container_tcp_port=None,
+                    network_container_id=raw.get("network_container_id"),
+                    secret_mount=secret_mount,
                 )
+                try:
+                    created = self.host.docker_create_ephemeral(create_target)
+                except BrokerBackendError as error:
+                    if error.code != "ephemeral_docker_create_outcome_unknown":
+                        raise
+                    # Docker may have created the exact label-bound container
+                    # before its reply was lost. Reconcile once by immutable
+                    # identity and persist the full ID before any start/cleanup
+                    # path can proceed.
+                    recovered = self.host.docker_find_ephemeral(identity)
+                    if recovered.get("found") is False:
+                        raise
+                    if recovered.get("found") is not True:
+                        raise TestStoreConflict(
+                            "fixture create reconciliation is unobservable"
+                        ) from error
+                    created = recovered
                 full_id = created.get("full_container_id")
             if not isinstance(full_id, str) or _FULL_ID.fullmatch(full_id) is None:
                 raise TestStoreConflict("fixture create did not prove an immutable container")

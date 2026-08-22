@@ -534,8 +534,11 @@ export function createCoordinator({ config, log }) {
     }
   }
 
-  function invalidateCaches({ preserveInventory = false } = {}) {
+  function invalidateCaches({ preserveInventory = false, preserveArchives = false } = {}) {
     for (const cache of [invCache, srvCache, archiveCache]) {
+      if (preserveArchives && cache === archiveCache) {
+        continue;
+      }
       cache.generation += 1;
       if (preserveInventory && cache === invCache && cache.value !== undefined) {
         cache.dirty = true;
@@ -568,7 +571,10 @@ export function createCoordinator({ config, log }) {
       // screen every sampling interval. Keep that snapshot as stale while the
       // next read refreshes it. User-triggered mutations still invalidate
       // strictly so their completion cannot reveal pre-mutation state.
-      invalidateCaches({ preserveInventory: apiPath === '/v1/observe' });
+      invalidateCaches({
+        preserveInventory: apiPath === '/v1/observe',
+        preserveArchives: apiPath === '/v1/observe',
+      });
     }
     return result;
   }
@@ -872,6 +878,10 @@ export function createCoordinator({ config, log }) {
       null,
       readLifecycleArchives,
     );
+  }
+
+  function retainedLifecycleArchives() {
+    return archiveCache.value;
   }
 
   function events({ after = null, limit = 100 } = {}) {
@@ -1236,6 +1246,7 @@ export function createCoordinator({ config, log }) {
     runtimeAction,
     runtimeArtifact,
     lifecycleArchives,
+    retainedLifecycleArchives,
     lifecyclePlan: (b = {}) => request('POST', '/v1/lifecycle/plan', b),
     lifecycleApply: async (b = {}) => lifecycleResult(
       'apply', await request('POST', '/v1/lifecycle/apply', b),
