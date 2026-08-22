@@ -458,7 +458,8 @@ def _compose_effective_model(row: Mapping[str, Any], table: str) -> dict[str, An
         if (
             not isinstance(value, list)
             or any(not isinstance(item, str) or not item for item in value)
-            or value != sorted(set(value))
+            or len(value) != len(set(value))
+            or (field != "services_json" and value != sorted(value))
         ):
             raise RetainedControlError(f"{table} {field} is invalid")
         decoded_lists[field] = value
@@ -937,22 +938,24 @@ def _validate_compose_controls(connection: sqlite3.Connection) -> None:
             raise RetainedControlError(
                 f"Compose control {compose_id!r} has incomplete file evidence"
             )
-        lifecycle_services = tuple(
-            str(item[0])
+        lifecycle_service_rows = tuple(
+            (int(item[0]), str(item[1]))
             for item in connection.execute(
-                "SELECT service_name FROM broker_compose_services "
+                "SELECT ordinal,service_name FROM broker_compose_services "
                 "WHERE compose_definition_id=? ORDER BY ordinal",
                 (compose_id,),
             )
         )
-        profiles = tuple(
-            str(item[0])
+        lifecycle_services = tuple(name for _ordinal, name in lifecycle_service_rows)
+        profile_rows = tuple(
+            (int(item[0]), str(item[1]))
             for item in connection.execute(
-                "SELECT profile_name FROM broker_compose_profiles "
+                "SELECT ordinal,profile_name FROM broker_compose_profiles "
                 "WHERE compose_definition_id=? ORDER BY ordinal",
                 (compose_id,),
             )
         )
+        profiles = tuple(name for _ordinal, name in profile_rows)
         try:
             run_once_policies = _compose_run_once_policies_connection(
                 connection,
@@ -990,10 +993,11 @@ def _validate_compose_controls(connection: sqlite3.Connection) -> None:
         except (TypeError, ValueError, json.JSONDecodeError) as error:
             raise RetainedControlError("retained Compose control JSON is invalid") from error
         if (
-            recorded_lifecycle != sorted(lifecycle_services)
+            lifecycle_service_rows != tuple(enumerate(recorded_lifecycle))
+            or profile_rows != tuple(enumerate(profiles))
             or recorded_model
             != sorted((*lifecycle_services, *(policy.name for policy in run_once_policies)))
-            or recorded_profiles != sorted(profiles)
+            or not set(profiles) <= set(recorded_profiles)
             or not isinstance(model_replicas, dict)
             or int(row[19]) != sum(model_replicas.values())
         ):

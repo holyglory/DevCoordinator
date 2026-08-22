@@ -366,6 +366,201 @@ class RetainedControlTests(unittest.TestCase):
             timestamp=STAMP,
         )
 
+    def _seed_production_ordered_compose_evidence(
+        self,
+        *,
+        declared_profiles: tuple[str, ...] = (),
+        available_profiles: tuple[str, ...] = ("optional",),
+    ) -> tuple[str, str]:
+        run_once_policy = ComposeRunOncePolicy(
+            name="migrate",
+            max_timeout_seconds=900,
+            receipt=ComposeRunOnceReceiptContract(
+                required=(("migration", "string"),)
+            ),
+        )
+        services = ("web", "api")
+        fingerprint = retained_control._compose_definition_fingerprint(
+            repo_id="repo-1",
+            canonical_root="/srv/repo",
+            root_identity={"device": 1, "inode": 2},
+            cwd="/srv/repo",
+            cwd_identity={"device": 1, "inode": 3},
+            compose_files=("/srv/repo/compose.yml",),
+            compose_file_evidence=(
+                {"content_sha256": "a" * 64, "byte_size": 100},
+            ),
+            env_files=(),
+            env_file_evidence=(),
+            profiles=declared_profiles,
+            services=services,
+            run_once_services=(run_once_policy,),
+            project_name="repo",
+        )
+        services_json = json.dumps(list(services))
+        profiles_json = json.dumps(sorted(available_profiles))
+        connection = sqlite3.connect(self.database)
+        try:
+            connection.execute(
+                "DELETE FROM broker_compose_services "
+                "WHERE compose_definition_id='compose-1'"
+            )
+            connection.executemany(
+                "INSERT INTO broker_compose_services VALUES (?,?,?)",
+                (("compose-1", ordinal, name) for ordinal, name in enumerate(services)),
+            )
+            connection.execute(
+                "DELETE FROM broker_compose_profiles "
+                "WHERE compose_definition_id='compose-1'"
+            )
+            connection.executemany(
+                "INSERT INTO broker_compose_profiles VALUES (?,?,?)",
+                (
+                    ("compose-1", ordinal, name)
+                    for ordinal, name in enumerate(declared_profiles)
+                ),
+            )
+            connection.execute(
+                "UPDATE broker_compose_definitions "
+                "SET definition_fingerprint=? WHERE compose_definition_id='compose-1'",
+                (fingerprint,),
+            )
+            connection.execute(
+                """
+                UPDATE broker_compose_effective_model_evidence
+                SET definition_fingerprint=?, services_json=?,
+                    service_replicas_json=?, model_services_json=?,
+                    model_service_replicas_json=?, service_images_json=?,
+                    profiles_json=?, replica_budget=3
+                WHERE compose_definition_id='compose-1'
+                """,
+                (
+                    fingerprint,
+                    services_json,
+                    json.dumps({"web": 1, "api": 1}),
+                    json.dumps(["api", "migrate", "web"]),
+                    json.dumps({"api": 1, "migrate": 1, "web": 1}),
+                    json.dumps(
+                        {
+                            "api": "repo/api@sha256:" + "e" * 64,
+                            "migrate": "repo/migrate@sha256:" + "c" * 64,
+                            "web": "repo/web@sha256:" + "d" * 64,
+                        }
+                    ),
+                    profiles_json,
+                ),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        return services_json, profiles_json
+
+    def test_rebaseline_preserves_declared_service_order_and_available_profiles(
+        self,
+    ) -> None:
+        services_json, profiles_json = self._seed_production_ordered_compose_evidence()
+        result = self._prepare("ordered-compose-out")
+        target = sqlite3.connect(result["target"]["database"]["path"])
+        try:
+            retained = target.execute(
+                "SELECT services_json,profiles_json "
+                "FROM broker_compose_effective_model_evidence "
+                "WHERE compose_definition_id='compose-1'"
+            ).fetchone()
+            self.assertEqual(retained, (services_json, profiles_json))
+            self.assertEqual(
+                target.execute(
+                    "SELECT service_name FROM broker_compose_services "
+                    "WHERE compose_definition_id='compose-1' ORDER BY ordinal"
+                ).fetchall(),
+                [("web",), ("api",)],
+            )
+            self.assertEqual(
+                target.execute(
+                    "SELECT profile_name FROM broker_compose_profiles "
+                    "WHERE compose_definition_id='compose-1' ORDER BY ordinal"
+                ).fetchall(),
+                [],
+            )
+        finally:
+            target.close()
+
+    def test_rebaseline_rejects_duplicate_declared_service_evidence(self) -> None:
+        self._seed_production_ordered_compose_evidence()
+        connection = sqlite3.connect(self.database)
+        connection.execute(
+            "UPDATE broker_compose_effective_model_evidence "
+            "SET services_json='[\"web\",\"web\"]'"
+        )
+        connection.commit()
+        connection.close()
+        with self.assertRaisesRegex(
+            retained_control.RetainedControlError,
+            "services_json is invalid",
+        ):
+            self._prepare("duplicate-compose-services-out")
+
+    def test_rebaseline_rejects_declared_service_order_mismatch(self) -> None:
+        self._seed_production_ordered_compose_evidence()
+        connection = sqlite3.connect(self.database)
+        connection.execute(
+            "UPDATE broker_compose_effective_model_evidence "
+            "SET services_json='[\"api\",\"web\"]'"
+        )
+        connection.commit()
+        connection.close()
+        with self.assertRaisesRegex(
+            retained_control.RetainedControlError,
+            "contradicts its retained model",
+        ):
+            self._prepare("ordered-compose-mismatch-out")
+
+    def test_rebaseline_rejects_declared_service_ordinal_gap(self) -> None:
+        self._seed_production_ordered_compose_evidence()
+        connection = sqlite3.connect(self.database)
+        connection.execute(
+            "UPDATE broker_compose_services SET ordinal=2 "
+            "WHERE compose_definition_id='compose-1' AND ordinal=1"
+        )
+        connection.commit()
+        connection.close()
+        with self.assertRaisesRegex(
+            retained_control.RetainedControlError,
+            "contradicts its retained model",
+        ):
+            self._prepare("compose-service-ordinal-gap-out")
+
+    def test_rebaseline_rejects_selected_profile_absent_from_effective_model(
+        self,
+    ) -> None:
+        self._seed_production_ordered_compose_evidence(
+            declared_profiles=("selected",),
+            available_profiles=("optional",),
+        )
+        with self.assertRaisesRegex(
+            retained_control.RetainedControlError,
+            "contradicts its retained model",
+        ):
+            self._prepare("missing-compose-profile-out")
+
+    def test_rebaseline_rejects_selected_profile_nonzero_start(self) -> None:
+        self._seed_production_ordered_compose_evidence(
+            declared_profiles=("selected",),
+            available_profiles=("optional", "selected"),
+        )
+        connection = sqlite3.connect(self.database)
+        connection.execute(
+            "UPDATE broker_compose_profiles SET ordinal=1 "
+            "WHERE compose_definition_id='compose-1' AND ordinal=0"
+        )
+        connection.commit()
+        connection.close()
+        with self.assertRaisesRegex(
+            retained_control.RetainedControlError,
+            "contradicts its retained model",
+        ):
+            self._prepare("compose-profile-nonzero-start-out")
+
     def test_rebaseline_retains_only_controls_and_advances_generations(self) -> None:
         source_before = self.database.read_bytes()
         profile_before = self.profile.read_bytes()
