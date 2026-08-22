@@ -39,6 +39,7 @@ from .broker_host import (
 )
 from .compose_contract import (
     bounded_compose_environment,
+    compose_approval_required_risks,
     require_effective_compose_model,
     require_sealable_compose_payload,
 )
@@ -744,12 +745,13 @@ def require_configured_compose_approval(
     effective: Any,
     database_path: Path,
 ) -> dict[str, Any]:
-    """Bind publication to the live root-approved broker Compose configuration.
+    """Bind publication to the live sealed broker Compose configuration.
 
     A runtime JSON file is user-writable, so a root publisher must not accept a
-    host bind mount merely because that file labels it as intended. The service
-    store is the durable administrator approval record. This read-only lookup
-    also rejects a stale configuration after any Compose or environment drift.
+    model merely because that file labels it as intended. The service store is
+    the durable sealed-model record and, for the distinct risks that remain
+    gated, the administrator approval record. This read-only lookup also
+    rejects a stale configuration after any Compose or environment drift.
     """
 
     database = Path(database_path)
@@ -824,7 +826,14 @@ def require_configured_compose_approval(
     expected_risks = sorted(getattr(effective, "host_access_risks", ()))
     if configured_risks != expected_risks:
         raise ImagePublicationError("broker-configured host-access risks differ from the publication model")
-    if expected_risks and int(row["host_access_approved"]) != 1:
+    expected_approval_risks = tuple(
+        getattr(
+            effective,
+            "approval_required_risks",
+            compose_approval_required_risks(expected_risks),
+        )
+    )
+    if expected_approval_risks and int(row["host_access_approved"]) != 1:
         raise ImagePublicationError("effective Compose model requires an existing explicit host-access approval")
     file_rows = _configuration_file_rows(database, str(row["compose_definition_id"]), environment=False)
     env_rows = _configuration_file_rows(database, str(row["compose_definition_id"]), environment=True)

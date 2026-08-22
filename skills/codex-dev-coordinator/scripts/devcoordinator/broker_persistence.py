@@ -40,6 +40,7 @@ from .browser_lifecycle import (
 )
 from .compose_contract import (
     EffectiveComposeEvidence,
+    compose_approval_required_risks,
     compose_directory_identity,
     compose_relative_parts,
     open_anchored_compose_root,
@@ -1724,6 +1725,7 @@ class BrokerPersistence:
                         "ADD COLUMN prepared_json TEXT"
                     )
                 _migrate_legacy_compose_definition_fingerprints(connection)
+                _clear_obsolete_compose_approval_flags(connection)
                 _disable_legacy_unscoped_compose_definitions(connection)
                 _disable_unpinned_compose_definitions(connection)
                 _disable_unvalidated_effective_compose_definitions(connection)
@@ -2340,6 +2342,8 @@ class BrokerPersistence:
 
         previous_host_access_approved = False
         previous_host_access_risks: tuple[str, ...] = ()
+        previous_approved_by_uid: int | None = None
+        previous_approved_at: str | None = None
         with self._store() as store:
             with store.read_transaction() as connection:
                 repo = connection.execute(
@@ -2349,7 +2353,9 @@ class BrokerPersistence:
                 previous_evidence = connection.execute(
                     """
                     SELECT effective.host_access_approved,
-                           effective.host_access_risks_json
+                           effective.host_access_risks_json,
+                           effective.approved_by_uid,
+                           effective.approved_at
                     FROM broker_compose_effective_model_evidence effective
                     JOIN broker_compose_definitions definition
                       USING(compose_definition_id)
@@ -2361,6 +2367,16 @@ class BrokerPersistence:
         if previous_evidence is not None:
             previous_host_access_approved = bool(
                 previous_evidence["host_access_approved"]
+            )
+            previous_approved_by_uid = (
+                None
+                if previous_evidence["approved_by_uid"] is None
+                else int(previous_evidence["approved_by_uid"])
+            )
+            previous_approved_at = (
+                None
+                if previous_evidence["approved_at"] is None
+                else str(previous_evidence["approved_at"])
             )
             previous_risks_raw = json.loads(
                 str(previous_evidence["host_access_risks_json"])
@@ -2482,8 +2498,12 @@ class BrokerPersistence:
                 )
                 if host_access_approved is None and previous_host_access_approved:
                     added_risks = sorted(
-                        set(effective_evidence.host_access_risks)
-                        - set(previous_host_access_risks)
+                        set(effective_evidence.approval_required_risks)
+                        - set(
+                            compose_approval_required_risks(
+                                previous_host_access_risks
+                            )
+                        )
                     )
                     if added_risks:
                         raise PermissionError(
@@ -2715,8 +2735,13 @@ class BrokerPersistence:
                     )
                 else:
                     approved = bool(
-                        effective_evidence.host_access_risks
+                        effective_evidence.approval_required_risks
                         and effective_host_access_approved
+                    )
+                    retain_approval = bool(
+                        approved
+                        and host_access_approved is None
+                        and previous_host_access_approved
                     )
                     connection.execute(
                         """
@@ -2766,8 +2791,20 @@ class BrokerPersistence:
                             json.dumps(list(effective_evidence.profiles)),
                             json.dumps(list(effective_evidence.host_access_risks)),
                             int(approved),
-                            _service_administrator_uid() if approved else None,
-                            now if approved else None,
+                            (
+                                previous_approved_by_uid
+                                if retain_approval
+                                else _service_administrator_uid()
+                                if approved
+                                else None
+                            ),
+                            (
+                                previous_approved_at
+                                if retain_approval
+                                else now
+                                if approved
+                                else None
+                            ),
                             effective_evidence.replica_budget,
                             now,
                         ),
@@ -13332,6 +13369,48 @@ def _legacy_compose_definition_fingerprint(
         separators=(",", ":"),
     ).encode("utf-8")
     return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+
+def _clear_obsolete_compose_approval_flags(
+    connection: sqlite3.Connection,
+) -> None:
+    """Clear retained approvals whose evidence contains no still-gated risk."""
+
+    rows = list(
+        connection.execute(
+            """
+            SELECT compose_definition_id, host_access_risks_json
+            FROM broker_compose_effective_model_evidence
+            WHERE host_access_approved = 1
+            ORDER BY compose_definition_id
+            """
+        )
+    )
+    for row in rows:
+        try:
+            raw_risks = json.loads(str(row["host_access_risks_json"]))
+        except (json.JSONDecodeError, TypeError, ValueError) as error:
+            raise RuntimeError(
+                "retained Compose host-access risks are invalid"
+            ) from error
+        if (
+            not isinstance(raw_risks, list)
+            or any(not isinstance(item, str) or not item for item in raw_risks)
+            or raw_risks != sorted(set(raw_risks))
+        ):
+            raise RuntimeError("retained Compose host-access risks are invalid")
+        if compose_approval_required_risks(tuple(raw_risks)):
+            continue
+        connection.execute(
+            """
+            UPDATE broker_compose_effective_model_evidence
+            SET host_access_approved = 0,
+                approved_by_uid = NULL,
+                approved_at = NULL
+            WHERE compose_definition_id = ?
+            """,
+            (str(row["compose_definition_id"]),),
+        )
 
 
 def _migrate_legacy_compose_definition_fingerprints(

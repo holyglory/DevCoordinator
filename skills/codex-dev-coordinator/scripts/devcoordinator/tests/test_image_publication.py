@@ -230,20 +230,49 @@ class ImagePublicationTests(unittest.TestCase):
 
         self.assertEqual(observed["model_sha256"], observed["effective_model_sha256"])
 
-    def test_configuration_reader_accepts_the_canonical_capture_digest(self) -> None:
+    def test_configuration_reader_accepts_sealed_bind_and_capability_without_approval(
+        self,
+    ) -> None:
+        def exempt_model(**_arguments: object) -> bytes:
+            return json.dumps(
+                {
+                    "name": "demo",
+                    "services": {
+                        "migrate": {"image": "postgres:17-alpine"},
+                        "worker": {
+                            "image": "example/worker:local",
+                            "cap_add": ["SYS_PTRACE"],
+                            "volumes": [
+                                {
+                                    "type": "bind",
+                                    "source": "/srv/project-data",
+                                    "target": "/workspace/data",
+                                }
+                            ],
+                        },
+                        "helper": {"image": "example/worker:local"},
+                    },
+                }
+            ).encode("utf-8")
+
         material = publication.capture_compose_material(
             self.specification,
-            renderer=rendered_model,
+            renderer=exempt_model,
             broker_database_path=self.broker_database,
             configuration_verifier=self._configuration_verifier,
         )
         effective = require_effective_compose_model(
-            rendered_model(),
+            exempt_model(),
             declared_services=self.specification.compose_services,
             declared_profiles=self.specification.compose_profiles,
             project_name=self.specification.compose_project_name,
-            host_access_approved=True,
+            host_access_approved=False,
         )
+        self.assertEqual(
+            effective.host_access_risks,
+            ("added_capabilities", "host_bind_mount"),
+        )
+        self.assertEqual(effective.approval_required_risks, ())
         definition_id = "00000000-0000-4000-8000-000000000000"
         definition_fingerprint = "sha256:" + "c" * 64
         with sqlite3.connect(self.broker_database) as database:
@@ -297,7 +326,8 @@ class ImagePublicationTests(unittest.TestCase):
                 ),
             )
             database.execute(
-                "INSERT INTO broker_compose_effective_model_evidence VALUES (?, ?, ?, ?, ?, ?, ?, 1, 0, ?)",
+                "INSERT INTO broker_compose_effective_model_evidence "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, 0, NULL, NULL)",
                 (
                     definition_id,
                     definition_fingerprint,
@@ -306,7 +336,6 @@ class ImagePublicationTests(unittest.TestCase):
                     json.dumps(sorted(self.specification.compose_services)),
                     json.dumps(list(effective.profiles)),
                     json.dumps(list(effective.host_access_risks)),
-                    "2026-07-23T00:00:00Z",
                 ),
             )
             database.executemany(
@@ -333,6 +362,7 @@ class ImagePublicationTests(unittest.TestCase):
         )
 
         self.assertEqual(configuration["model_sha256"], effective.model_sha256)
+        self.assertFalse(configuration["host_access_approved"])
 
     def test_runtime_verification_requires_built_image_and_source_fingerprint(self) -> None:
         def runner(command: tuple[str, ...], _timeout: float, _environment: dict[str, str]) -> subprocess.CompletedProcess[str]:

@@ -1917,6 +1917,58 @@ volumes:
                 host_access_approved=False,
             )
 
+        volume_driver_bind = json.dumps(
+            {
+                "services": {
+                    "web": {
+                        "image": "example.invalid/web:test",
+                        "volumes": [
+                            {
+                                "type": "volume",
+                                "source": "host-data",
+                                "target": "/data",
+                            }
+                        ],
+                    }
+                },
+                "volumes": {
+                    "host-data": {
+                        "driver": "local",
+                        "driver_opts": {
+                            "type": "none",
+                            "o": "bind",
+                            "device": "/srv/project-data",
+                        },
+                    }
+                },
+            }
+        ).encode()
+        with self.assertRaisesRegex(
+            PermissionError, "volume_driver_bind"
+        ):
+            require_effective_compose_model(
+                volume_driver_bind,
+                declared_services=("web",),
+                declared_profiles=(),
+                project_name="alpha-stack",
+                host_access_approved=False,
+            )
+        volume_driver_evidence = require_effective_compose_model(
+            volume_driver_bind,
+            declared_services=("web",),
+            declared_profiles=(),
+            project_name="alpha-stack",
+            host_access_approved=True,
+        )
+        self.assertEqual(
+            volume_driver_evidence.host_access_risks,
+            ("volume_driver_bind",),
+        )
+        self.assertEqual(
+            volume_driver_evidence.approval_required_risks,
+            ("volume_driver_bind",),
+        )
+
         safe_internal = json.dumps(
             {
                 "name": "alpha-stack",
@@ -1965,7 +2017,283 @@ volumes:
                 host_access_approved=False,
             )
 
-    def test_effective_model_host_access_needs_fingerprint_bound_admin_approval(
+    def test_sealed_bind_mounts_and_capabilities_need_no_separate_approval(
+        self,
+    ) -> None:
+        feature_cases = {
+            "bind-only": (
+                {
+                    "volumes": [
+                        {
+                            "type": "bind",
+                            "source": "/srv/project-data",
+                            "target": "/workspace/data",
+                        }
+                    ]
+                },
+                ("host_bind_mount",),
+            ),
+            "capability-only": (
+                {"cap_add": ["SYS_PTRACE"]},
+                ("added_capabilities",),
+            ),
+            "combined": (
+                {
+                    "cap_add": ["NET_ADMIN", "SYS_PTRACE"],
+                    "volumes": ["./cache:/workspace/cache:rw"],
+                },
+                ("added_capabilities", "host_bind_mount"),
+            ),
+        }
+        for label, (service_fields, expected_evidence) in feature_cases.items():
+            with self.subTest(label=label):
+                payload = json.dumps(
+                    {
+                        "services": {
+                            "web": {
+                                "image": "example.invalid/web:test",
+                                **service_fields,
+                            }
+                        }
+                    }
+                ).encode()
+                evidence = require_effective_compose_model(
+                    payload,
+                    declared_services=("web",),
+                    declared_profiles=(),
+                    project_name="alpha-stack",
+                    host_access_approved=False,
+                )
+                self.assertEqual(evidence.host_access_risks, expected_evidence)
+                self.assertEqual(evidence.approval_required_risks, ())
+
+        def combined_model(**arguments: object) -> bytes:
+            services = tuple(str(item) for item in arguments["declared_services"])
+            return json.dumps(
+                {
+                    "services": {
+                        name: {
+                            "image": f"example.invalid/{name}:test",
+                            **(
+                                {
+                                    "cap_add": ["SYS_PTRACE"],
+                                    "volumes": [
+                                        {
+                                            "type": "bind",
+                                            "source": "/srv/project-data",
+                                            "target": "/workspace/data",
+                                        }
+                                    ],
+                                }
+                                if name == "web"
+                                else {}
+                            ),
+                        }
+                        for name in services
+                    }
+                }
+            ).encode()
+
+        self.fixture.persistence.compose_model_renderer = combined_model
+        self.fixture.persistence.provision_compose_definition(
+            repo_id=REPO_ALPHA,
+            compose_definition_id=COMPOSE_ALPHA,
+            cwd=self.fixture.alpha_root,
+            files=(self.fixture.compose_one, self.fixture.compose_two),
+            services=("db", "web"),
+            project_name="alpha-stack",
+        )
+        with mock.patch.object(
+            broker_persistence, "_service_administrator_uid", return_value=0
+        ):
+            self.fixture.persistence.provision_compose_definition(
+                repo_id=REPO_ALPHA,
+                compose_definition_id=COMPOSE_ALPHA,
+                cwd=self.fixture.alpha_root,
+                files=(self.fixture.compose_one, self.fixture.compose_two),
+                services=("db", "web"),
+                project_name="alpha-stack",
+                host_access_approved=True,
+            )
+        status = self.fixture.persistence.compose_host_access_status(
+            repo_id=REPO_ALPHA
+        )
+        self.assertEqual(
+            status["host_access_risks"],
+            ["added_capabilities", "host_bind_mount"],
+        )
+        self.assertFalse(status["host_access_approved"])
+        self.assertIsNone(status["approved_by_uid"])
+        self.assertIsNone(status["approved_at"])
+
+        with CoordinatorStore.open(
+            self.fixture.persistence.database_path,
+            expected_uid=os.geteuid(),
+        ) as store:
+            with store.immediate_transaction() as connection:
+                connection.execute(
+                    """
+                    UPDATE broker_compose_effective_model_evidence
+                    SET host_access_approved = 1,
+                        approved_by_uid = 0,
+                        approved_at = ?
+                    WHERE compose_definition_id = ?
+                    """,
+                    (utc_timestamp(), COMPOSE_ALPHA),
+                )
+        reopened = BrokerPersistence(
+            self.fixture.persistence.database_path,
+            expected_uid=os.geteuid(),
+            compose_model_renderer=combined_model,
+        )
+        normalized = reopened.compose_host_access_status(repo_id=REPO_ALPHA)
+        self.assertEqual(normalized["host_access_risks"], status["host_access_risks"])
+        self.assertFalse(normalized["host_access_approved"])
+        self.assertIsNone(normalized["approved_by_uid"])
+        self.assertIsNone(normalized["approved_at"])
+
+        calls = 0
+
+        def runner(
+            command: tuple[str, ...],
+            cwd: str,
+            timeout: float,
+            environment: Mapping[str, str],
+        ) -> subprocess.CompletedProcess[str]:
+            del cwd, timeout, environment
+            nonlocal calls
+            calls += 1
+            return subprocess.CompletedProcess(
+                command, 0, stdout="started\n", stderr=""
+            )
+
+        service, _ = service_for(
+            self.fixture,
+            compose_runner=runner,
+            compose_model_renderer=combined_model,
+        )
+        context = SimpleNamespace(
+            project_kind="primary",
+            temporary=None,
+            root=SimpleNamespace(canonical_root=str(self.fixture.alpha_root)),
+        )
+        declared = {
+            "declared": True,
+            "files": ["compose.yml", "compose.override.yml"],
+            "env_files": [],
+            "profiles": [],
+            "services": ["db", "web"],
+            "run_once_services": [],
+            "project_name": "alpha-stack",
+        }
+        approval_request = self.fixture.request(
+            BrokerOperation.REPOSITORY_APPROVE_COMPOSE_HOST_ACCESS,
+            resource_id=REPO_ALPHA,
+            arguments={
+                "agent": "admin-session",
+                "canonical_root": str(self.fixture.alpha_root),
+                "approve": True,
+            },
+        )
+        with (
+            mock.patch(
+                "devcoordinator.repository_context."
+                "resolve_effective_repository_context",
+                return_value=context,
+            ),
+            mock.patch.object(
+                broker_configuration,
+                "declared_compose_from_runtime_manifest",
+                return_value=declared,
+            ),
+            mock.patch.object(
+                broker_persistence,
+                "_service_administrator_uid",
+                return_value=0,
+            ),
+        ):
+            unnecessary = service.reply_for_document(
+                self.fixture.peer(), approval_request.to_wire()
+            )
+        self.assertFalse(unnecessary["ok"], unnecessary)
+        self.assertEqual(
+            unnecessary["error"]["code"],
+            "compose_host_access_approval_not_required",
+        )
+        after_unnecessary = self.fixture.persistence.compose_host_access_status(
+            repo_id=REPO_ALPHA
+        )
+        self.assertFalse(after_unnecessary["host_access_approved"])
+        self.assertIsNone(after_unnecessary["approved_by_uid"])
+        self.assertIsNone(after_unnecessary["approved_at"])
+
+        started = service.reply_for_document(
+            self.fixture.peer(),
+            self.fixture.request(
+                BrokerOperation.COMPOSE_UP,
+                resource_id=COMPOSE_ALPHA,
+            ).to_wire(),
+        )
+        self.assertTrue(started["ok"], started)
+        self.assertEqual(started["result"]["status"], "completed")
+        self.assertEqual(calls, 1)
+
+        self.fixture.compose_one.write_text(
+            "services: {}\n# changed after sealing\n", encoding="utf-8"
+        )
+        stale = service.reply_for_document(
+            self.fixture.peer(),
+            self.fixture.request(
+                BrokerOperation.COMPOSE_UP,
+                resource_id=COMPOSE_ALPHA,
+            ).to_wire(),
+        )
+        self.assertFalse(stale["ok"], stale)
+        self.assertEqual(stale["error"]["code"], "compose_definition_drift")
+        self.assertEqual(calls, 1)
+
+    def test_malformed_bind_mounts_and_capabilities_remain_rejected(self) -> None:
+        cases = (
+            ("capability scalar", {"cap_add": "SYS_PTRACE"}, "capabilities"),
+            ("capability item", {"cap_add": [7]}, "capability"),
+            (
+                "bind source",
+                {
+                    "volumes": [
+                        {"type": "bind", "source": 7, "target": "/workspace"}
+                    ]
+                },
+                "mount source",
+            ),
+            (
+                "bind target",
+                {"volumes": [{"type": "bind", "source": "/srv/data"}]},
+                "mount target",
+            ),
+            ("short bind", {"volumes": [":/workspace"]}, "mount source"),
+        )
+        for label, service_fields, message in cases:
+            with self.subTest(label=label):
+                payload = json.dumps(
+                    {
+                        "services": {
+                            "web": {
+                                "image": "example.invalid/web:test",
+                                **service_fields,
+                            }
+                        }
+                    }
+                ).encode()
+                with self.assertRaisesRegex(ValueError, message):
+                    require_effective_compose_model(
+                        payload,
+                        declared_services=("web",),
+                        declared_profiles=(),
+                        project_name="alpha-stack",
+                        host_access_approved=True,
+                    )
+
+    def test_effective_model_remaining_host_access_needs_fingerprint_approval(
         self,
     ) -> None:
         risky = json.dumps(
@@ -2011,6 +2339,10 @@ volumes:
                 "host_namespace",
                 "privileged",
             ),
+        )
+        self.assertEqual(
+            evidence.approval_required_risks,
+            ("docker_socket", "host_namespace", "privileged"),
         )
 
         self.fixture.persistence.compose_model_renderer = lambda **_arguments: risky
@@ -2072,18 +2404,15 @@ volumes:
         self.fixture.persistence.compose_model_renderer = (
             lambda **_arguments: expanded
         )
-        with self.assertRaisesRegex(
-            PermissionError, "adds administrator-approved host access: added_capabilities"
-        ):
-            self.fixture.persistence.provision_compose_definition(
-                repo_id=REPO_ALPHA,
-                compose_definition_id=COMPOSE_ALPHA,
-                cwd=self.fixture.alpha_root,
-                files=(self.fixture.compose_one,),
-                services=("web",),
-                project_name="alpha-stack",
-                host_access_approved=None,
-            )
+        expanded_definition = self.fixture.persistence.provision_compose_definition(
+            repo_id=REPO_ALPHA,
+            compose_definition_id=COMPOSE_ALPHA,
+            cwd=self.fixture.alpha_root,
+            files=(self.fixture.compose_one,),
+            services=("web",),
+            project_name="alpha-stack",
+            host_access_approved=None,
+        )
         with CoordinatorStore.open(
             self.fixture.persistence.database_path,
             expected_uid=os.geteuid(),
@@ -2103,10 +2432,16 @@ volumes:
                     """,
                     (COMPOSE_ALPHA,),
                 ).fetchone()
-        self.assertEqual(approved["definition_fingerprint"], row["current_fingerprint"])
+        self.assertEqual(
+            expanded_definition["definition_fingerprint"],
+            row["current_fingerprint"],
+        )
         self.assertEqual(row["definition_fingerprint"], row["current_fingerprint"])
         self.assertEqual(row["host_access_approved"], 1)
         self.assertEqual(row["approved_by_uid"], 0)
+        self.assertIn(
+            "added_capabilities", json.loads(row["host_access_risks_json"])
+        )
         self.assertIn("docker_socket", json.loads(row["host_access_risks_json"]))
 
     def test_effective_renderer_seals_inputs_and_overrides_compose_controls(

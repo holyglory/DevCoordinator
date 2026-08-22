@@ -193,6 +193,14 @@ DOCKER_FORWARD_ENV_NAMES = (
     "DOCKER_API_VERSION",
 )
 
+# ``security-assumptions.md`` records these repository-sealed capabilities as
+# ordinary development behavior on the confirmed single-developer host.  They
+# are still parsed and validated below, but they are deliberately absent from
+# the separate administrator-approval risk set.
+COMPOSE_APPROVAL_EXEMPT_RISKS = frozenset(
+    {"added_capabilities", "host_bind_mount"}
+)
+
 
 @dataclass(frozen=True)
 class ComposeDirectoryIdentity:
@@ -210,6 +218,7 @@ class EffectiveComposeEvidence:
     services: tuple[str, ...]
     profiles: tuple[str, ...]
     host_access_risks: tuple[str, ...]
+    approval_required_risks: tuple[str, ...]
     service_replicas: tuple[tuple[str, int], ...]
     service_images: tuple[tuple[str, str], ...]
     replica_budget: int
@@ -783,6 +792,107 @@ def _published_port_is_loopback_only(value: Any) -> bool:
         return False
 
 
+def _require_effective_capabilities(value: Any) -> tuple[str, ...]:
+    """Validate the bounded ``cap_add`` shape rendered by Compose."""
+
+    if value in (None, (), []):
+        return ()
+    if not isinstance(value, Sequence) or isinstance(
+        value, (str, bytes, bytearray)
+    ):
+        raise ValueError("effective Compose added capabilities are invalid")
+    if len(value) > 128:
+        raise ValueError("effective Compose added capabilities exceed 128 entries")
+    capabilities: list[str] = []
+    for capability in value:
+        if (
+            not isinstance(capability, str)
+            or not capability
+            or capability != capability.strip()
+            or "\x00" in capability
+            or len(capability.encode("utf-8")) > 128
+        ):
+            raise ValueError("effective Compose added capability is invalid")
+        capabilities.append(capability)
+    return tuple(capabilities)
+
+
+def _require_effective_mount_text(
+    value: Any,
+    *,
+    field: str,
+    required: bool,
+) -> str:
+    if value is None and not required:
+        return ""
+    if (
+        not isinstance(value, str)
+        or not value
+        or value != value.strip()
+        or "\x00" in value
+        or len(value.encode("utf-8")) > 8192
+    ):
+        raise ValueError(f"effective Compose service mount {field} is invalid")
+    return value
+
+
+def _classify_effective_mount(
+    value: Any,
+    *,
+    declared_volumes: Mapping[str, Any],
+    risks: set[str],
+) -> None:
+    """Validate one rendered mount and retain only still-gated risk classes."""
+
+    if isinstance(value, Mapping):
+        mount_type = _require_effective_mount_text(
+            value.get("type"), field="type", required=True
+        ).lower()
+        source = _require_effective_mount_text(
+            value.get("source"),
+            field="source",
+            required=mount_type == "bind",
+        )
+        target = _require_effective_mount_text(
+            value.get("target"), field="target", required=True
+        )
+        if "docker.sock" in source or "docker.sock" in target:
+            risks.add("docker_socket")
+        if mount_type == "volume" and source and source not in declared_volumes:
+            raise ValueError(
+                "effective Compose named volume escapes the declared model"
+            )
+        if mount_type == "bind":
+            risks.add("host_bind_mount")
+        return
+    if isinstance(value, str):
+        rendered = _require_effective_mount_text(
+            value, field="value", required=True
+        )
+        if rendered.startswith(":"):
+            raise ValueError("effective Compose service mount source is invalid")
+        source = rendered.split(":", 1)[0]
+        if source.startswith(("/", ".", "~")):
+            risks.add("host_bind_mount")
+        if "docker.sock" in rendered:
+            risks.add("docker_socket")
+        return
+    raise ValueError("effective Compose service mount is invalid")
+
+
+def compose_approval_required_risks(
+    host_access_risks: Sequence[str],
+    *,
+    published_ports_require_approval: bool = True,
+) -> tuple[str, ...]:
+    """Return the exact subset that still needs administrator approval."""
+
+    required = set(host_access_risks) - COMPOSE_APPROVAL_EXEMPT_RISKS
+    if not published_ports_require_approval:
+        required.discard("published_host_ports")
+    return tuple(sorted(required))
+
+
 def _classify_deploy(
     value: Any,
     *,
@@ -864,8 +974,10 @@ def require_effective_compose_model(
 
     The full rendered payload can contain interpolated secrets, so callers
     persist only this digest and bounded classifications.  Administrator
-    approval is required for host-equivalent capabilities; resource fan-out
-    remains bounded even when such access is approved.
+    approval is required for distinct host-equivalent capabilities outside the
+    repository-sealed development features accepted in
+    ``security-assumptions.md``; resource fan-out remains bounded even when
+    such access is approved.
     """
 
     if not isinstance(payload, bytes):
@@ -1041,7 +1153,7 @@ def require_effective_compose_model(
             risks.add("host_devices")
         if raw_service.get("gpus"):
             risks.add("gpu_access")
-        if raw_service.get("cap_add"):
+        if _require_effective_capabilities(raw_service.get("cap_add")):
             risks.add("added_capabilities")
         ports = raw_service.get("ports") or ()
         if isinstance(ports, (str, Mapping)):
@@ -1082,26 +1194,11 @@ def require_effective_compose_model(
         if not isinstance(mounts, Sequence):
             raise ValueError("effective Compose service volumes are invalid")
         for mount in mounts:
-            if isinstance(mount, Mapping):
-                mount_type = str(mount.get("type") or "").lower()
-                source = str(mount.get("source") or "")
-                target = str(mount.get("target") or "")
-                if mount_type == "bind":
-                    risks.add("host_bind_mount")
-                if "docker.sock" in source or "docker.sock" in target:
-                    risks.add("docker_socket")
-                if mount_type == "volume" and source and source not in volumes:
-                    raise ValueError(
-                        "effective Compose named volume escapes the declared model"
-                    )
-            elif isinstance(mount, str):
-                source = mount.split(":", 1)[0]
-                if source.startswith(("/", ".", "~")):
-                    risks.add("host_bind_mount")
-                if "docker.sock" in mount:
-                    risks.add("docker_socket")
-            else:
-                raise ValueError("effective Compose service mount is invalid")
+            _classify_effective_mount(
+                mount,
+                declared_volumes=volumes,
+                risks=risks,
+            )
 
     if replica_budget > 64:
         raise ValueError("effective Compose replica budget exceeds 64 containers")
@@ -1112,9 +1209,10 @@ def require_effective_compose_model(
         )
 
     ordered_risks = tuple(sorted(risks))
-    approval_required_risks = set(ordered_risks)
-    if not published_ports_require_approval:
-        approval_required_risks.discard("published_host_ports")
+    approval_required_risks = compose_approval_required_risks(
+        ordered_risks,
+        published_ports_require_approval=published_ports_require_approval,
+    )
     if approval_required_risks and not host_access_approved:
         raise PermissionError(
             "effective Compose model requests administrator-approved host access: "
@@ -1132,6 +1230,7 @@ def require_effective_compose_model(
         services=services,
         profiles=tuple(sorted(available_profiles)),
         host_access_risks=ordered_risks,
+        approval_required_risks=approval_required_risks,
         service_replicas=tuple(sorted(service_replicas.items())),
         service_images=tuple(sorted(service_images.items())),
         replica_budget=replica_budget,
