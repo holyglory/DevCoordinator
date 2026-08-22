@@ -993,16 +993,25 @@ def exercise_rollback_restores_control_plane_before_background_services() -> Non
     )
 
     rollback_source = inspect.getsource(switch.rollback)
+    completion_source = inspect.getsource(
+        switch.complete_rollback_after_control_plane
+    )
     ordering = [
         rollback_source.index("restore_destination_backups(backups)"),
         rollback_source.index("restore_rollback_control_plane(runner)"),
         rollback_source.index('"previous Console restore"'),
-        rollback_source.index('"rollback-control-plane-restored"'),
-        rollback_source.index("restore_rollback_background_services(runner)"),
+        rollback_source.rindex('"rollback-control-plane-restored"'),
+        rollback_source.rindex("complete_rollback_after_control_plane("),
     ]
     expect(
         ordering == sorted(ordering),
         "rollback does not checkpoint a coherent previous control plane before background restore",
+    )
+    expect(
+        completion_source.index("restore_rollback_background_services(runner)")
+        < completion_source.index('"rollback-background-restored"')
+        < completion_source.index("require_retained_worker_policy_convergence("),
+        "rollback completion does not checkpoint background restore before convergence",
     )
 
 
@@ -2553,6 +2562,115 @@ def exercise_source_worker_quiescence_is_exact_and_race_safe() -> None:
                 switch._valid_source_worker_quiescence(proof),
                 "source worker quiescence proof is not self-validating",
             )
+            advanced_revision = json.loads(json.dumps(proof))
+            advanced_revision["state_revision"] += 2
+            expect(
+                switch.source_worker_quiescence_matches(
+                    proof,
+                    advanced_revision,
+                    allow_state_revision_advance=True,
+                )
+                and not switch.source_worker_quiescence_matches(
+                    proof,
+                    advanced_revision,
+                    allow_state_revision_advance=False,
+                ),
+                "graceful writer shutdown revision advance was not isolated",
+            )
+            regressed_revision = json.loads(json.dumps(proof))
+            regressed_revision["state_revision"] -= 1
+            drifted_worker = json.loads(json.dumps(advanced_revision))
+            drifted_worker["worker_state_sha256"] = "f" * 64
+            drifted_policy = json.loads(json.dumps(advanced_revision))
+            drifted_policy["policy_expectations"][0]["policy_generation"] += 1
+            expect(
+                not switch.source_worker_quiescence_matches(
+                    proof,
+                    regressed_revision,
+                    allow_state_revision_advance=True,
+                )
+                and not switch.source_worker_quiescence_matches(
+                    proof,
+                    drifted_worker,
+                    allow_state_revision_advance=True,
+                )
+                and not switch.source_worker_quiescence_matches(
+                    proof,
+                    drifted_policy,
+                    allow_state_revision_advance=True,
+                ),
+                "revision regression or worker drift passed semantic comparison",
+            )
+            writer_stopped_journal = root / "writer-stopped-journal.json"
+            writer_stopped_document: dict[str, object] = {"phase": "applying"}
+            writer_stopped_intent: dict[str, object] = {
+                "status": "planned",
+                "source_worker_quiescence": proof
+            }
+            rebound = switch.bind_writer_stopped_worker_quiescence(
+                writer_stopped_document,
+                writer_stopped_intent,
+                writer_stopped_journal,
+                advanced_revision,
+            )
+            expect(
+                rebound["state_revision"] == proof["state_revision"] + 2
+                and json.loads(writer_stopped_journal.read_text(encoding="utf-8"))[
+                    "retained_control_rebaseline"
+                ]["source_worker_quiescence"]["state_revision"]
+                == proof["state_revision"] + 2,
+                "writer-stopped proof did not replace the pre-shutdown revision",
+            )
+            for bound_status in ("backed-up", "prepared"):
+                bound_intent: dict[str, object] = {
+                    "status": bound_status,
+                    "source_worker_quiescence": proof,
+                }
+                try:
+                    switch.bind_writer_stopped_worker_quiescence(
+                        {"phase": "applying"},
+                        bound_intent,
+                        root / f"{bound_status}.json",
+                        advanced_revision,
+                    )
+                except switch.SwitchError:
+                    pass
+                else:
+                    raise AssertionError(
+                        f"{bound_status} worker proof rebound away from its backup"
+                    )
+            connection = sqlite3.connect(database)
+            connection.execute(
+                "UPDATE schema_metadata SET state_revision=state_revision+2"
+            )
+            connection.commit()
+            connection.close()
+            for bound_status in ("backed-up", "prepared"):
+                try:
+                    switch.bind_source_worker_quiescence(
+                        {"phase": "applying"},
+                        {
+                            "status": bound_status,
+                            "source_worker_quiescence": proof,
+                        },
+                        root / f"bind-{bound_status}.json",
+                        runner,
+                    )
+                except switch.SwitchError:
+                    pass
+                else:
+                    raise AssertionError(
+                        f"{bound_status} replay accepted revision drift"
+                    )
+            intent["status"] = "planned"
+            replayed = switch.bind_source_worker_quiescence(
+                document, intent, journal, runner
+            )
+            expect(
+                replayed["state_revision"] == proof["state_revision"]
+                and intent["source_worker_quiescence"] is proof,
+                "pre-stop semantic replay rewrote the journal before writer shutdown",
+            )
             connection = sqlite3.connect(database)
             connection.execute(
                 "UPDATE worker_policies SET generation=generation+1 "
@@ -2718,6 +2836,34 @@ def exercise_credentialized_web_worker_convergence() -> None:
         def sleeper(seconds: float) -> None:
             clock_value[0] += seconds
 
+        refresh_calls: list[tuple[str, str, float]] = []
+
+        def status_refresher(
+            target: object, timeout_seconds: float
+        ) -> dict[str, object]:
+            expect(isinstance(target, dict), "status refresh target is not a row")
+            refresh_calls.append(
+                (
+                    str(target["server_definition_id"]),
+                    str(target["canonical_root"]),
+                    timeout_seconds,
+                )
+            )
+            return {
+                "server_definition_id": str(target["server_definition_id"]),
+                "repo_id": str(target["repo_id"]),
+                "name": str(target["name"]),
+                "current_attempt_id": target["current_attempt_id"],
+                "keep_alive": True,
+                "desired_state": "running",
+                "breaker_state": "armed",
+                "supervisor_state": "running",
+                "ready": True,
+                "supervision_ready": True,
+                "endpoint_ready": True,
+                "state": "running",
+            }
+
         with (
             mock.patch.object(switch, "AUTHORITY_DATABASE", target_database),
             mock.patch.object(
@@ -2747,6 +2893,50 @@ def exercise_credentialized_web_worker_convergence() -> None:
                 policy_blockers == (),
                 "candidate did not restart the retained desired-running policy",
             )
+            connection = sqlite3.connect(target_database)
+            connection.execute(
+                "UPDATE server_observations SET lifecycle='stopped',pid=NULL,"
+                "process_start_time=NULL,process_fingerprint=NULL,health_ok=NULL "
+                "WHERE server_definition_id=?",
+                (target_ids["worker_id"],),
+            )
+            connection.commit()
+            connection.close()
+            policy_blockers, _policy_fingerprint = (
+                switch._retained_worker_policy_blockers(
+                    runner,
+                    source_proof=source_proof,
+                    target_schema_version=16,
+                    generation_offset=1,
+                    cgroup_root=cgroup_root,
+                    process_observer=lambda _pid, _started: "alive",
+                )
+            )
+            credential_blockers, _credential_fingerprint = (
+                switch._credentialized_worker_blockers(
+                    manifest,
+                    transaction,
+                    runner,
+                    source_proof=source_proof,
+                    cgroup_root=cgroup_root,
+                    process_observer=lambda _pid, _started: "alive",
+                )
+            )
+            expect(
+                policy_blockers == ()
+                and credential_blockers == (),
+                "stale observation re-entered process-supervision proof",
+            )
+            connection = sqlite3.connect(target_database)
+            connection.execute(
+                "UPDATE server_observations SET lifecycle='running',pid=42424,"
+                "process_start_time='process-start',"
+                "process_fingerprint='process-fingerprint',health_ok=1 "
+                "WHERE server_definition_id=?",
+                (target_ids["worker_id"],),
+            )
+            connection.commit()
+            connection.close()
             switch.require_credentialized_worker_convergence(
                 manifest,
                 transaction,
@@ -2758,10 +2948,161 @@ def exercise_credentialized_web_worker_convergence() -> None:
                 sleeper=sleeper,
                 cgroup_root=cgroup_root,
                 process_observer=lambda _pid, _started: "alive",
+                status_refresher=status_refresher,
             )
             expect(
                 clock_value[0] >= 2.0,
                 "credentialized worker passed without a stable-running interval",
+            )
+            expect(
+                len(refresh_calls) == 3
+                and all(
+                    worker_id == str(target_ids["worker_id"])
+                    and root == "/srv/repository"
+                    for worker_id, root, _timeout in refresh_calls
+                )
+                and refresh_calls[0][2] == 5.0
+                and all(
+                    earlier[2] > later[2]
+                    for earlier, later in zip(refresh_calls, refresh_calls[1:])
+                ),
+                "credentialized convergence did not sample exact status through stability",
+            )
+
+            connection = sqlite3.connect(target_database)
+            connection.execute(
+                "UPDATE worker_attempts SET policy_generation=4 WHERE attempt_id=?",
+                (target_ids["attempt_id"],),
+            )
+            connection.commit()
+            connection.close()
+            clock_value[0] = 0.0
+            refresh_calls.clear()
+
+            def repairing_status_refresher(
+                target: object, timeout_seconds: float
+            ) -> dict[str, object]:
+                evidence = status_refresher(target, timeout_seconds)
+                connection = sqlite3.connect(target_database)
+                connection.execute(
+                    "UPDATE worker_attempts SET policy_generation=5 WHERE attempt_id=?",
+                    (target_ids["attempt_id"],),
+                )
+                connection.commit()
+                connection.close()
+                return evidence
+
+            switch.require_credentialized_worker_convergence(
+                manifest,
+                transaction,
+                runner,
+                source_proof=source_proof,
+                timeout_seconds=5.0,
+                stable_seconds=2.0,
+                clock=clock,
+                sleeper=sleeper,
+                cgroup_root=cgroup_root,
+                process_observer=lambda _pid, _started: "alive",
+                status_refresher=repairing_status_refresher,
+            )
+            expect(
+                len(refresh_calls) == 3,
+                "credentialized convergence did not re-read after exact refresh",
+            )
+
+            clock_value[0] = 0.0
+            refresh_calls.clear()
+
+            def non_ready_status_refresher(
+                target: object, timeout_seconds: float
+            ) -> dict[str, object]:
+                evidence = status_refresher(target, timeout_seconds)
+                evidence.update(
+                    {
+                        "ready": False,
+                        "endpoint_ready": False,
+                        "state": "starting",
+                    }
+                )
+                return evidence
+
+            try:
+                switch.require_credentialized_worker_convergence(
+                    manifest,
+                    transaction,
+                    runner,
+                    source_proof=source_proof,
+                    timeout_seconds=1.5,
+                    stable_seconds=0.2,
+                    clock=clock,
+                    sleeper=sleeper,
+                    cgroup_root=cgroup_root,
+                    process_observer=lambda _pid, _started: "alive",
+                    status_refresher=non_ready_status_refresher,
+                )
+            except switch.SwitchError as error:
+                expect(
+                    "did not converge" in str(error),
+                    "non-ready exact refresh returned an unrelated failure",
+                )
+            else:
+                raise AssertionError("non-ready refreshed worker passed health proof")
+            expect(
+                len(refresh_calls) >= 2,
+                "non-ready credentialized worker was not retried",
+            )
+
+            clock_value[0] = 0.0
+            refresh_calls.clear()
+            refresh_row = switch._credentialized_worker_rows()[0][
+                str(target_ids["worker_id"])
+            ]
+            second_row = dict(refresh_row)
+            second_row.update(
+                {
+                    "server_definition_id": "22222222-2222-4222-8222-222222222222",
+                    "name": "second-credentialized-worker",
+                }
+            )
+
+            def exhausted_status_refresher(
+                target: object, timeout_seconds: float
+            ) -> dict[str, object]:
+                evidence = status_refresher(target, timeout_seconds)
+                clock_value[0] += timeout_seconds
+                return evidence
+
+            with mock.patch.object(
+                switch,
+                "_credentialized_worker_refresh_targets",
+                return_value=(refresh_row, second_row),
+            ):
+                try:
+                    switch.require_credentialized_worker_convergence(
+                        manifest,
+                        transaction,
+                        runner,
+                        source_proof=source_proof,
+                        timeout_seconds=1.5,
+                        stable_seconds=0.2,
+                        clock=clock,
+                        sleeper=sleeper,
+                        cgroup_root=cgroup_root,
+                        process_observer=lambda _pid, _started: "alive",
+                        status_refresher=exhausted_status_refresher,
+                    )
+                except switch.SwitchError as error:
+                    expect(
+                        "deadline" in str(error),
+                        "multi-worker refresh returned an unrelated timeout",
+                    )
+                else:
+                    raise AssertionError(
+                        "multi-worker refresh exceeded the shared deadline"
+                    )
+            expect(
+                len(refresh_calls) == 1 and refresh_calls[0][2] == 1.5,
+                "credentialized refresh gave each worker a fresh deadline",
             )
 
             clock_value[0] = 0.0
@@ -2795,6 +3136,15 @@ def exercise_credentialized_web_worker_convergence() -> None:
         rollback_runner = ConvergenceRunner(
             str(rollback_ids["worker_id"]), worker_slice, rollback_control_group
         )
+        connection = sqlite3.connect(rollback_database)
+        connection.execute(
+            "UPDATE server_observations SET lifecycle='stopped',pid=NULL,"
+            "process_start_time=NULL,process_fingerprint=NULL,health_ok=NULL "
+            "WHERE server_definition_id=?",
+            (rollback_ids["worker_id"],),
+        )
+        connection.commit()
+        connection.close()
         with mock.patch.object(switch, "AUTHORITY_DATABASE", rollback_database):
             rollback_blockers, _rollback_fingerprint = (
                 switch._retained_worker_policy_blockers(
@@ -2806,9 +3156,20 @@ def exercise_credentialized_web_worker_convergence() -> None:
                     process_observer=lambda _pid, _started: "alive",
                 )
             )
+            mismatched_process, _mismatched_fingerprint = (
+                switch._retained_worker_policy_blockers(
+                    rollback_runner,
+                    source_proof=source_proof,
+                    target_schema_version=15,
+                    generation_offset=0,
+                    cgroup_root=rollback_cgroup_root,
+                    process_observer=lambda _pid, _started: "mismatch",
+                )
+            )
         expect(
-            rollback_blockers == (),
-            "rollback did not restart the original desired-running policy",
+            rollback_blockers == ()
+            and mismatched_process == (rollback_ids["worker_id"],),
+            "rollback restart proof used stale health or lost exact process identity",
         )
 
         with (
@@ -2854,9 +3215,21 @@ def exercise_credentialized_web_worker_convergence() -> None:
                 cgroup_root=cgroup_root,
                 process_observer=lambda _pid, _started: "alive",
             )
+            observed_rows = switch._credentialized_worker_rows()
+            target_row = observed_rows[0][str(target_ids["worker_id"])]
+            unavailable_endpoint = status_refresher(target_row, 5.0)
+            unavailable_endpoint["endpoint_ready"] = False
+            live_blockers, _live_fingerprint = (
+                switch._credentialized_live_status_blockers(
+                    observed_rows[0],
+                    {str(target_ids["worker_id"])},
+                    {str(target_ids["worker_id"]): unavailable_endpoint},
+                )
+            )
             expect(
-                blockers == (target_ids["worker_id"],),
-                "configured worker health contract accepted unknown health",
+                blockers == ()
+                and live_blockers == (target_ids["worker_id"],),
+                "fresh credentialized status accepted an unavailable endpoint",
             )
 
             connection = sqlite3.connect(target_database)
@@ -2880,9 +3253,20 @@ def exercise_credentialized_web_worker_convergence() -> None:
                 cgroup_root=cgroup_root,
                 process_observer=lambda _pid, _started: "alive",
             )
+            policy_blockers, _policy_fingerprint = (
+                switch._retained_worker_policy_blockers(
+                    runner,
+                    source_proof=source_proof,
+                    target_schema_version=16,
+                    generation_offset=1,
+                    cgroup_root=cgroup_root,
+                    process_observer=lambda _pid, _started: "alive",
+                )
+            )
             expect(
-                blockers == (target_ids["worker_id"],),
-                "stale credentialized worker attempt generation was accepted",
+                blockers == (target_ids["worker_id"],)
+                and policy_blockers == (target_ids["worker_id"],),
+                "stale worker attempt generation was accepted",
             )
 
             connection = sqlite3.connect(target_database)
@@ -2901,8 +3285,9 @@ def exercise_credentialized_web_worker_convergence() -> None:
                 (target_ids["worker_id"],),
             )
             connection.execute(
-                "UPDATE server_observations SET lifecycle='stopped',pid=NULL,"
-                "process_start_time=NULL,process_fingerprint=NULL,health_ok=NULL "
+                "UPDATE server_observations SET lifecycle='running',pid=99999,"
+                "process_start_time='stale-start',"
+                "process_fingerprint='stale-fingerprint',health_ok=1 "
                 "WHERE server_definition_id=?",
                 (target_ids["worker_id"],),
             )
@@ -3221,9 +3606,268 @@ def exercise_candidate_worker_rollback_cleanup() -> None:
                 pass
             else:
                 raise AssertionError("candidate rollback failure was ignored")
+    expect(
+        order == ["authority"],
+        "candidate cleanup failure allowed source restoration",
+    )
+
+
+def exercise_credentialized_status_refresh_is_exact_and_bounded() -> None:
+    worker_id = "11111111-1111-4111-8111-111111111111"
+    repo_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    target = {
+        "server_definition_id": worker_id,
+        "name": "credentialized-web",
+        "canonical_root": "/srv/repository",
+        "repo_id": repo_id,
+    }
+    payload = {
+        "action": "status",
+        "ok": True,
+        "outcome": "certain",
+        "mutation_performed": False,
+        "name": "credentialized-web",
+        "ready": False,
+        "supervision_ready": True,
+        "endpoint_ready": False,
+        "state": "starting",
+        "target": {"id": worker_id, "kind": "service"},
+        "resource": {
+            "id": worker_id,
+            "kind": "service",
+            "repo_id": repo_id,
+            "name": "credentialized-web",
+            "state": "starting",
+            "ready": False,
+        },
+        "supervision": {
+            "current_attempt_id": "attempt-one",
+            "keep_alive": True,
+            "desired_state": "running",
+            "breaker_state": "armed",
+            "supervisor_state": "running",
+        },
+    }
+
+    class BoundedRunner(FakeRunner):
+        def __init__(self, document: object, returncode: int = 0) -> None:
+            super().__init__()
+            self.document = document
+            self.returncode = returncode
+            self.timeouts: list[float] = []
+
+        def run_bounded(
+            self, argv: list[str], *, timeout_seconds: float
+        ) -> subprocess.CompletedProcess[str]:
+            self.commands.append(list(argv))
+            self.timeouts.append(timeout_seconds)
+            return subprocess.CompletedProcess(
+                argv,
+                self.returncode,
+                json.dumps(self.document, sort_keys=True),
+                "",
+            )
+
+    runner = BoundedRunner(payload)
+    evidence = switch._refresh_credentialized_worker_status(
+        runner, target, timeout_seconds=7.5
+    )
+    expect(
+        runner.commands
+        == [
+            [
+                str(switch.CLIENT_LAUNCHER),
+                "runtime",
+                "status",
+                worker_id,
+                "--kind",
+                "service",
+                "--project",
+                "/srv/repository",
+            ]
+        ]
+        and runner.timeouts == [7.5]
+        and evidence["ready"] is False
+        and evidence["current_attempt_id"] == "attempt-one",
+        "credentialized refresh was not exact and bounded",
+    )
+
+    wrong = json.loads(json.dumps(payload))
+    wrong["resource"]["id"] = "22222222-2222-4222-8222-222222222222"
+    try:
+        switch._refresh_credentialized_worker_status(
+            BoundedRunner(wrong), target, timeout_seconds=7.5
+        )
+    except switch.SwitchError:
+        pass
+    else:
+        raise AssertionError("credentialized refresh accepted another resource")
+
+    failed = json.loads(json.dumps(payload))
+    failed["ok"] = False
+    failed["ready"] = True
+    failed["resource"]["ready"] = True
+    try:
+        switch._refresh_credentialized_worker_status(
+            BoundedRunner(failed), target, timeout_seconds=7.5
+        )
+    except switch.SwitchError:
+        pass
+    else:
+        raise AssertionError("credentialized refresh accepted failed readiness")
+
+    excessive = BoundedRunner(payload)
+
+    def excessive_result(
+        argv: list[str], *, timeout_seconds: float
+    ) -> subprocess.CompletedProcess[str]:
+        excessive.commands.append(list(argv))
+        excessive.timeouts.append(timeout_seconds)
+        return subprocess.CompletedProcess(argv, 0, "x" * 8193, "")
+
+    excessive.run_bounded = excessive_result  # type: ignore[method-assign]
+    try:
+        switch._refresh_credentialized_worker_status(
+            excessive, target, timeout_seconds=7.5
+        )
+    except switch.SwitchError:
+        pass
+    else:
+        raise AssertionError("credentialized refresh accepted oversized output")
+    stable_client_source = (
+        ROOT
+        / "skills/codex-dev-coordinator/scripts/devcoordinator/agent_cli.py"
+    ).read_text(encoding="utf-8")
+    expect(
+        "if len(encoded) + 1 > MAX_AGENT_RESULT_BYTES:" in stable_client_source
+        and "final serialized output exceeds the 8192-byte agent contract"
+        in stable_client_source,
+        "stable status client no longer bounds output before emission",
+    )
+
+
+def exercise_rollback_resume_preserves_restored_control_plane() -> None:
+    source_proof = {
+        "schema_version": 15,
+        "database_generation": "rollback-source-generation",
+        "state_revision": 4,
+        "worker_units": [],
+        "active_supervisors": [],
+        "current_attempts": [],
+        "active_observations": [],
+        "policy_expectations": [],
+        "quiesced_workers": [],
+        "policy_count": 0,
+        "supervisor_count": 0,
+        "observation_count": 0,
+        "worker_state_sha256": "a" * 64,
+    }
+    intent = {
+        "required": True,
+        "source_schema_version": 15,
+        "target_schema_version": 16,
+        "status": "planned",
+        "source_worker_quiescence": source_proof,
+    }
+    with tempfile.TemporaryDirectory(prefix="rollback-resume-") as raw:
+        root = Path(raw)
+        journal = root / "journal.json"
+        document: dict[str, object] = {
+            "phase": "rollback-control-plane-restored",
+            "release_digest": DIGEST,
+            "retained_control_rebaseline": intent,
+        }
+        background_calls: list[str] = []
+        convergence_calls: list[str] = []
+
+        def converge(*_args: object, **_kwargs: object) -> None:
+            convergence_calls.append("converge")
+            if len(convergence_calls) == 1:
+                raise switch.SwitchError("injected late worker")
+
+        with (
+            mock.patch.object(switch, "SLOT_ROOT", root / "slots"),
+            mock.patch.object(
+                switch,
+                "restore_rollback_background_services",
+                side_effect=lambda _runner: background_calls.append("background"),
+            ),
+            mock.patch.object(
+                switch,
+                "require_retained_worker_policy_convergence",
+                side_effect=converge,
+            ),
+        ):
+            try:
+                switch.complete_rollback_after_control_plane(
+                    document, journal, FakeRunner()
+                )
+            except switch.SwitchError:
+                pass
+            else:
+                raise AssertionError("injected rollback convergence failure was ignored")
+            expect(
+                document["phase"] == "rollback-background-restored",
+                "rollback did not checkpoint background restoration before waiting",
+            )
+            switch.complete_rollback_after_control_plane(
+                document, journal, FakeRunner()
+            )
         expect(
-            order == ["authority"],
-            "candidate cleanup failure allowed source restoration",
+            background_calls == ["background"]
+            and convergence_calls == ["converge", "converge"]
+            and document["phase"] == "rolled-back",
+            "rollback replay restarted restored services or skipped convergence",
+        )
+
+        release = root / DIGEST
+        release.mkdir()
+        resumed_document: dict[str, object] = {
+            "phase": "rollback-background-restored",
+            "release": str(release),
+            "release_digest": DIGEST,
+            "previous_release_digest": "b" * 64,
+            "candidate_console_unit": f"devcoordinator-console@{DIGEST}.service",
+            "previous_console_unit": "devcoordinator-console@" + "b" * 64 + ".service",
+            "candidate_control_socket": "/run/candidate.sock",
+            "previous_control_socket": "/run/previous.sock",
+            "candidate_outer_port": 41001,
+            "previous_outer_port": 41002,
+            "backups": {"unit": {}},
+            "retained_control_rebaseline": intent,
+        }
+        marker = {"phase": "rolled-back"}
+        with (
+            mock.patch.object(
+                switch, "require_transaction_root", return_value=root
+            ),
+            mock.patch.object(switch, "load_journal", return_value=resumed_document),
+            mock.patch.object(
+                switch, "require_test_history_reset_mode", return_value=None
+            ),
+            mock.patch.object(
+                switch,
+                "publication_snapshot",
+                return_value={
+                    "release_digest": "b" * 64,
+                    "port": 41002,
+                },
+            ),
+            mock.patch.object(
+                switch,
+                "complete_rollback_after_control_plane",
+                return_value=marker,
+            ) as resumed,
+            mock.patch.object(
+                switch,
+                "restore_retained_control_rebaseline",
+                side_effect=AssertionError("resumed rollback restored control plane again"),
+            ),
+        ):
+            result = switch.rollback(release, root, FakeRunner())
+        expect(
+            result is marker and resumed.call_count == 1,
+            "rollback dispatcher did not resume after restored control plane",
         )
 
 
@@ -3235,6 +3879,9 @@ def exercise_verification_requires_boot_enablement() -> None:
     )
     retained_completion_source = inspect.getsource(
         switch.complete_retained_control_rebaseline
+    )
+    rollback_completion_source = inspect.getsource(
+        switch.complete_rollback_after_control_plane
     )
     main_source = inspect.getsource(switch.main)
     expect(
@@ -3301,10 +3948,10 @@ def exercise_verification_requires_boot_enablement() -> None:
         < retained_completion_source.index(
             "require_credentialized_worker_convergence("
         )
-        and rollback_source.rindex(
+        and rollback_completion_source.index(
             "restore_rollback_background_services(runner)"
         )
-        < rollback_source.rindex(
+        < rollback_completion_source.index(
             "require_retained_worker_policy_convergence("
         ),
         "candidate or rollback can complete before retained workers restart",
@@ -3378,7 +4025,9 @@ def main() -> int:
     exercise_rebaseline_quiesces_exact_managed_workers()
     exercise_source_worker_quiescence_is_exact_and_race_safe()
     exercise_credentialized_web_worker_convergence()
+    exercise_credentialized_status_refresh_is_exact_and_bounded()
     exercise_candidate_worker_rollback_cleanup()
+    exercise_rollback_resume_preserves_restored_control_plane()
     exercise_verification_requires_boot_enablement()
     exercise_cli_result_excludes_private_transaction_evidence()
     print("same-schema release switch self-test ok")
