@@ -244,6 +244,14 @@ class BrowserCleanupRunner(FakeRunner):
 
 
 class HistoryRunner(FakeRunner):
+    def __init__(
+        self,
+        *,
+        rollback_schema: int = switch.RETAINED_PREDECESSOR_TEST_STORE_SCHEMA_VERSION,
+    ) -> None:
+        super().__init__()
+        self.rollback_schema = rollback_schema
+
     def run(self, argv: list[str]) -> subprocess.CompletedProcess[str]:
         self.commands.append(list(argv))
         return subprocess.CompletedProcess(argv, 1, "", "")
@@ -259,7 +267,7 @@ class HistoryRunner(FakeRunner):
                 "attestation": attestation,
                 "attestation_fingerprint": "c" * 64,
                 "store_generation": "forward-generation",
-                "schema_version": 7,
+                "schema_version": switch.CURRENT_TEST_STORE_SCHEMA_VERSION,
                 "discarded_existing": True,
                 "replayed": False,
             }
@@ -269,7 +277,7 @@ class HistoryRunner(FakeRunner):
                 "ok": True,
                 "action": "create",
                 "test_database": database,
-                "schema_version": 5,
+                "schema_version": self.rollback_schema,
                 "store_generation": "rollback-generation",
             }
         raise AssertionError(f"unexpected history command: {argv}")
@@ -2118,9 +2126,69 @@ def exercise_opt_in_test_history_reset_and_previous_release_rollback() -> None:
                 "release": str(current),
                 "release_digest": DIGEST,
                 "previous_release_digest": "b" * 64,
+                "retained_control_rebaseline": {
+                    "required": True,
+                    "source_schema_version": 15,
+                    "target_schema_version": 16,
+                    "status": "planned",
+                },
             }
             document["test_history_reset"] = switch.test_history_reset_intent(
-                current, previous_release_digest="b" * 64
+                current,
+                previous_release_digest="b" * 64,
+                source_authority_schema_version=15,
+            )
+            expect(
+                document["test_history_reset"][
+                    "expected_previous_test_store_schema_version"
+                ]
+                == switch.RETAINED_PREDECESSOR_TEST_STORE_SCHEMA_VERSION
+                == 6,
+                "one-time rebaseline did not bind the schema-6 predecessor",
+            )
+            document["test_history_reset"][
+                "expected_previous_test_store_schema_version"
+            ] = 5
+            try:
+                switch.require_test_history_reset_mode(document, requested=True)
+            except switch.SwitchError:
+                pass
+            else:
+                raise AssertionError(
+                    "test-history reset accepted a stale journal-bound predecessor schema"
+                )
+            document["test_history_reset"][
+                "expected_previous_test_store_schema_version"
+            ] = switch.RETAINED_PREDECESSOR_TEST_STORE_SCHEMA_VERSION
+
+            current_format_document: dict[str, object] = {
+                "release": str(current),
+                "previous_release_digest": "b" * 64,
+                "retained_control_rebaseline": {
+                    "required": False,
+                    "source_schema_version": 16,
+                    "target_schema_version": 16,
+                    "status": "planned",
+                },
+            }
+            current_format_document["test_history_reset"] = (
+                switch.test_history_reset_intent(
+                    current,
+                    previous_release_digest="b" * 64,
+                    source_authority_schema_version=16,
+                )
+            )
+            current_format_reset = switch.require_test_history_reset_mode(
+                current_format_document, requested=True
+            )
+            expect(
+                current_format_reset is not None
+                and current_format_reset[
+                    "expected_previous_test_store_schema_version"
+                ]
+                == switch.CURRENT_TEST_STORE_SCHEMA_VERSION
+                == 8,
+                "current-format reset did not bind the merged schema-8 contract",
             )
             switch.atomic_json(journal, document)
             switch.reset_test_history_for_release(
@@ -2132,8 +2200,10 @@ def exercise_opt_in_test_history_reset_and_previous_release_rollback() -> None:
                 "forward test-history reset was not journaled",
             )
             expect(
-                reset["forward_evidence"]["schema_version"] == 7,
-                "forward reset did not attest schema 7",
+                reset["forward_evidence"]["schema_version"]
+                == switch.CURRENT_TEST_STORE_SCHEMA_VERSION
+                == 8,
+                "forward reset did not attest the merged schema-8 store",
             )
             expect(
                 reset["forward_evidence"]["spool"]["fresh"] is True,
@@ -2173,6 +2243,22 @@ def exercise_opt_in_test_history_reset_and_previous_release_rollback() -> None:
                 "also disposable", encoding="utf-8"
             )
             runner.commands.clear()
+            wrong_schema = HistoryRunner(rollback_schema=5)
+            try:
+                switch.reset_test_history_for_rollback(
+                    document, journal, wrong_schema
+                )
+            except switch.SwitchError:
+                pass
+            else:
+                raise AssertionError(
+                    "rollback accepted a Test Store schema outside the exact predecessor contract"
+                )
+            expect(
+                document["test_history_reset"]["status"]
+                == "rollback-resetting",
+                "wrong predecessor schema did not retain replayable rollback state",
+            )
             switch.reset_test_history_for_rollback(document, journal, runner)
             reset = document["test_history_reset"]
             expect(
@@ -2196,8 +2282,9 @@ def exercise_opt_in_test_history_reset_and_previous_release_rollback() -> None:
                 "rollback did not require the previous current-format test-store wrapper",
             )
             expect(
-                reset["rollback_evidence"]["schema_version"] == 5,
-                "rollback did not initialize an empty schema-5 store",
+                reset["rollback_evidence"]["schema_version"]
+                == switch.RETAINED_PREDECESSOR_TEST_STORE_SCHEMA_VERSION,
+                "rollback did not initialize the exact schema-6 predecessor store",
             )
 
 

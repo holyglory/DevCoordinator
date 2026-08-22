@@ -47,6 +47,9 @@ import install_availability_release as installer  # noqa: E402
 import server_wide_installer_fence as installer_fence  # noqa: E402
 from devcoordinator.schema import SCHEMA_VERSION as COORDINATOR_SCHEMA_VERSION  # noqa: E402
 from devcoordinator import retained_control  # noqa: E402
+from devcoordinator.universal_test_store import (  # noqa: E402
+    TEST_STORE_SCHEMA_VERSION as CURRENT_TEST_STORE_SCHEMA_VERSION,
+)
 from devcoordinator.server_credentials import (  # noqa: E402
     MAX_SERVER_CREDENTIAL_BYTES,
     SERVER_CREDENTIAL_FILE_SUFFIX,
@@ -181,6 +184,7 @@ TESTD_USER = "devcoordinator-testd"
 TESTD_SERVICE = "devcoordinator-testd.service"
 TESTD_SOCKET = "devcoordinator-testd.socket"
 TEST_DATABASE = Path("/var/lib/devcoordinator-testd/tests.sqlite3")
+RETAINED_PREDECESSOR_TEST_STORE_SCHEMA_VERSION = 6
 TEST_SPOOL = Path("/var/lib/devcoordinator-testd/spool")
 TEST_SPOOL_QUEUES = (
     "pending",
@@ -1403,10 +1407,26 @@ def testd_uid() -> int:
     return int(account.pw_uid)
 
 
+def reviewed_previous_test_store_schema(source_authority_schema_version: int) -> int:
+    if source_authority_schema_version == retained_control.REBASELINE_SOURCE_SCHEMA:
+        return RETAINED_PREDECESSOR_TEST_STORE_SCHEMA_VERSION
+    if source_authority_schema_version == COORDINATOR_SCHEMA_VERSION:
+        return CURRENT_TEST_STORE_SCHEMA_VERSION
+    raise SwitchError(
+        "test-history reset has no reviewed predecessor Test Store contract"
+    )
+
+
 def test_history_reset_intent(
-    release: Path, *, previous_release_digest: str
+    release: Path,
+    *,
+    previous_release_digest: str,
+    source_authority_schema_version: int,
 ) -> dict[str, object]:
     operation_id = str(uuid.uuid4())
+    expected_previous_schema = reviewed_previous_test_store_schema(
+        source_authority_schema_version
+    )
     return {
         "requested": True,
         "status": "planned",
@@ -1423,6 +1443,7 @@ def test_history_reset_intent(
             TEST_DATABASE.parent / f"schema-readiness-{operation_id}.json"
         ),
         "expected_test_uid": testd_uid(),
+        "expected_previous_test_store_schema_version": expected_previous_schema,
         "forward_release": str(release),
         "previous_release": str(release.parent / previous_release_digest),
     }
@@ -1471,6 +1492,7 @@ def require_test_history_reset_mode(
         or not isinstance(raw.get("rollback_discarded_spool"), str)
         or not isinstance(raw.get("attestation"), str)
         or type(raw.get("expected_test_uid")) is not int
+        or type(raw.get("expected_previous_test_store_schema_version")) is not int
         or not isinstance(raw.get("forward_release"), str)
         or not isinstance(raw.get("previous_release"), str)
     ):
@@ -1494,12 +1516,18 @@ def require_test_history_reset_mode(
     )
     release = Path(str(document.get("release")))
     previous_digest = document.get("previous_release_digest")
+    rebaseline = retained_rebaseline_intent(document)
+    expected_previous_schema = reviewed_previous_test_store_schema(
+        int(rebaseline["source_schema_version"])
+    )
     if (
         operation_id != raw["operation_id"]
         or raw["attestation"] != str(expected_attestation)
         or raw["forward_discarded_spool"] != str(expected_forward_discard)
         or raw["rollback_discarded_spool"] != str(expected_rollback_discard)
         or raw["expected_test_uid"] != testd_uid()
+        or raw["expected_previous_test_store_schema_version"]
+        != expected_previous_schema
         or raw["forward_release"] != str(release)
         or raw["previous_release"] != str(release.parent / str(previous_digest))
     ):
@@ -2282,7 +2310,9 @@ def prepare(
         }
         if reset_test_history:
             document["test_history_reset"] = test_history_reset_intent(
-                release, previous_release_digest=current_digest
+                release,
+                previous_release_digest=current_digest,
+                source_authority_schema_version=authority_schema,
             )
         if not reset_test_history and retained_rebaseline["required"] is not True:
             document["completed_at"] = now()
@@ -2334,7 +2364,9 @@ def prepare(
     }
     if reset_test_history:
         document["test_history_reset"] = test_history_reset_intent(
-            release, previous_release_digest=current_digest
+            release,
+            previous_release_digest=current_digest,
+            source_authority_schema_version=authority_schema,
         )
     atomic_json(transaction_root / "journal.json", document)
     return document
@@ -6167,7 +6199,8 @@ def reset_test_history_for_rollback(
     if (
         result.get("action") != "create"
         or result.get("test_database") != str(TEST_DATABASE)
-        or result.get("schema_version") != 5
+        or result.get("schema_version")
+        != reset["expected_previous_test_store_schema_version"]
         or not isinstance(result.get("store_generation"), str)
     ):
         raise SwitchError("previous release returned invalid empty-store evidence")
