@@ -954,6 +954,541 @@ def exercise_internal_socket_rebind_order() -> None:
     )
 
 
+def exercise_authority_writer_stop_is_bounded_and_exact() -> None:
+    control_group = "/system.slice/devcoordinator-authority.service"
+    with tempfile.TemporaryDirectory(prefix="authority-stop-") as raw:
+        cgroup_root = Path(raw) / "cgroup"
+        events = cgroup_root.joinpath(
+            *control_group.split("/")[1:]
+        ) / "cgroup.events"
+        events.parent.mkdir(parents=True)
+        events.write_text("populated 1\n", encoding="ascii")
+        class AuthorityRunner(FakeRunner):
+            def __init__(self) -> None:
+                super().__init__()
+                self.killed = False
+                self.timeouts: list[float] = []
+
+            def run_bounded(
+                self, argv: list[str], *, timeout_seconds: float
+            ) -> subprocess.CompletedProcess[str]:
+                self.commands.append(list(argv))
+                self.timeouts.append(timeout_seconds)
+                if "show" in argv:
+                    active = not self.killed
+                    return subprocess.CompletedProcess(
+                        argv,
+                        0,
+                        "\n".join(
+                            (
+                                "LoadState=loaded",
+                                f"ActiveState={'active' if active else 'inactive'}",
+                                f"SubState={'running' if active else 'dead'}",
+                                f"MainPID={4312 if active else 0}",
+                                f"ControlGroup={control_group}",
+                            )
+                        ),
+                        "",
+                    )
+                if "--signal=KILL" in argv:
+                    self.killed = True
+                    events.write_text("populated 0\n", encoding="ascii")
+                return subprocess.CompletedProcess(argv, 0, "", "")
+
+        clock_value = [0.0]
+
+        def clock() -> float:
+            return clock_value[0]
+
+        def sleeper(seconds: float) -> None:
+            clock_value[0] += seconds
+
+        runner = AuthorityRunner()
+        evidence = switch.stop_authority_service_bounded(
+            runner,
+            cgroup_root=cgroup_root,
+            process_start_reader=lambda pid: "process-start" if pid == 4312 else "",
+            process_observer=lambda pid, started: (
+                "absent" if runner.killed and pid == 4312 and started == "process-start" else "alive"
+            ),
+            clock=clock,
+            sleeper=sleeper,
+            grace_seconds=0.2,
+        )
+        expect(
+            evidence["status"] == "stopped"
+            and evidence["process"] == "absent"
+            and all(timeout == 5.0 for timeout in runner.timeouts),
+            "bounded authority stop lost terminal identity evidence",
+        )
+        expect(
+            [
+                command
+                for command in runner.commands
+                if "show" not in command
+            ]
+            == [
+                [
+                    "/usr/bin/systemctl",
+                    "--no-block",
+                    "stop",
+                    switch.AUTHORITY_SERVICE,
+                ],
+                [
+                    "/usr/bin/systemctl",
+                    "kill",
+                    "--kill-whom=all",
+                    "--signal=TERM",
+                    switch.AUTHORITY_SERVICE,
+                ],
+                [
+                    "/usr/bin/systemctl",
+                    "kill",
+                    "--kill-whom=all",
+                    "--signal=KILL",
+                    switch.AUTHORITY_SERVICE,
+                ],
+            ],
+            "authority stop did not use bounded stop then exact TERM/KILL",
+        )
+
+        class PidOneRunner(AuthorityRunner):
+            def run_bounded(
+                self, argv: list[str], *, timeout_seconds: float
+            ) -> subprocess.CompletedProcess[str]:
+                result = super().run_bounded(argv, timeout_seconds=timeout_seconds)
+                if "show" in argv:
+                    return subprocess.CompletedProcess(
+                        argv, result.returncode, result.stdout.replace("MainPID=4312", "MainPID=1"), result.stderr
+                    )
+                return result
+
+        events.write_text("populated 1\n", encoding="ascii")
+        try:
+            switch.stop_authority_service_bounded(
+                PidOneRunner(),
+                cgroup_root=cgroup_root,
+                process_start_reader=lambda _pid: "process-start",
+                process_observer=lambda _pid, _started: "absent",
+                clock=clock,
+                sleeper=sleeper,
+                grace_seconds=0.1,
+            )
+        except switch.SwitchError:
+            pass
+        else:
+            raise AssertionError("PID 1 was accepted as authority process identity")
+
+        events.write_text("populated 1\n", encoding="ascii")
+        unsafe = AuthorityRunner()
+        try:
+            switch.stop_authority_service_bounded(
+                unsafe,
+                cgroup_root=cgroup_root,
+                process_start_reader=lambda _pid: "process-start",
+                process_observer=lambda _pid, _started: "alive",
+                clock=clock,
+                sleeper=sleeper,
+                grace_seconds=0.1,
+            )
+        except switch.SwitchError:
+            pass
+        else:
+            raise AssertionError("authority stop accepted an unproved process exit")
+
+        class LostReplyRunner(AuthorityRunner):
+            def __init__(self, *, timeout: bool) -> None:
+                super().__init__()
+                self.timeout = timeout
+
+            def run_bounded(
+                self, argv: list[str], *, timeout_seconds: float
+            ) -> subprocess.CompletedProcess[str]:
+                if "--no-block" in argv:
+                    self.commands.append(list(argv))
+                    self.timeouts.append(timeout_seconds)
+                    self.killed = True
+                    events.write_text("populated 0\n", encoding="ascii")
+                    if self.timeout:
+                        raise switch.SwitchError("injected timeout")
+                    return subprocess.CompletedProcess(argv, 1, "", "lost reply")
+                return super().run_bounded(argv, timeout_seconds=timeout_seconds)
+
+        for timeout in (False, True):
+            events.write_text("populated 1\n", encoding="ascii")
+            lost = LostReplyRunner(timeout=timeout)
+            reconciled = switch.stop_authority_service_bounded(
+                lost,
+                cgroup_root=cgroup_root,
+                process_start_reader=lambda _pid: "process-start",
+                process_observer=lambda _pid, _started: "absent",
+                clock=clock,
+                sleeper=sleeper,
+                grace_seconds=0.1,
+            )
+            expect(
+                reconciled["status"] == "stopped",
+                "lost authority stop reply lacked exact terminal reconciliation",
+            )
+
+    source = inspect.getsource(switch.stop_authority_writers)
+    expect(
+        switch.AUTHORITY_WRITER_UNITS[-1] == switch.AUTHORITY_SERVICE
+        and "stop_authority_service_bounded(" in source,
+        "bounded authority stop changed writer ordering",
+    )
+
+
+def exercise_writer_stop_malformed_replay_and_race_guards() -> None:
+    class StatusRunner(FakeRunner):
+        def __init__(self, output: str, returncode: int = 0) -> None:
+            super().__init__()
+            self.output = output
+            self.returncode = returncode
+
+        def run_bounded(
+            self, argv: list[str], *, timeout_seconds: float
+        ) -> subprocess.CompletedProcess[str]:
+            self.commands.append(list(argv))
+            return subprocess.CompletedProcess(
+                argv, self.returncode, self.output, ""
+            )
+
+    valid = (
+        "LoadState=loaded\nActiveState=inactive\nSubState=dead\n"
+        "MainPID=0\nControlGroup=\n"
+    )
+    socket_output = (
+        "LoadState=loaded\nActiveState=active\nSubState=listening\n"
+    )
+    socket_state = switch._writer_unit_state(
+        StatusRunner(socket_output), switch.AUTHORITY_WRITER_UNITS[0]
+    )
+    expect(
+        socket_state["active"] is True
+        and socket_state["pid"] is None
+        and socket_state["control_group"] is None,
+        "real socket status required synthetic service properties",
+    )
+    for output in (
+        valid + "LoadState=loaded\n",
+        valid.replace("LoadState=loaded", "LoadState=not-found"),
+        valid.replace("ActiveState=inactive", "ActiveState=unknown"),
+    ):
+        try:
+            switch._writer_unit_state(
+                StatusRunner(output), switch.AUTHORITY_SERVICE
+            )
+        except switch.SwitchError:
+            pass
+        else:
+            raise AssertionError("malformed or missing writer status was accepted")
+    try:
+        switch._writer_unit_state(
+            StatusRunner(valid, returncode=1), switch.AUTHORITY_SERVICE
+        )
+    except switch.SwitchError:
+        pass
+    else:
+        raise AssertionError("failed writer status command was accepted")
+
+    with tempfile.TemporaryDirectory(prefix="writer-cgroup-guards-") as raw:
+        root = Path(raw)
+        group = "/system.slice/devcoordinator-authority.service"
+        events = root.joinpath(*group.split("/")[1:]) / "cgroup.events"
+        events.parent.mkdir(parents=True)
+        events.write_text("populated 0\npopulated 1\n", encoding="ascii")
+        try:
+            switch._writer_cgroup_populated(
+                group, cgroup_root=root, allow_missing=False
+            )
+        except switch.SwitchError:
+            pass
+        else:
+            raise AssertionError("duplicate cgroup populated evidence was accepted")
+        events.unlink()
+        target = root / "real-events"
+        target.write_text("populated 0\n", encoding="ascii")
+        events.symlink_to(target)
+        try:
+            switch._writer_cgroup_populated(
+                group, cgroup_root=root, allow_missing=False
+            )
+        except switch.SwitchError:
+            pass
+        else:
+            raise AssertionError("symlinked cgroup evidence bypassed O_NOFOLLOW")
+        events.unlink()
+        events.write_text("populated 0\n", encoding="ascii")
+        original_read = os.read
+        swapped = [False]
+
+        def swapping_read(descriptor: int, maximum: int) -> bytes:
+            if not swapped[0]:
+                swapped[0] = True
+                displaced = events.with_name("cgroup.events.displaced")
+                events.rename(displaced)
+                events.write_text("populated 0\n", encoding="ascii")
+            return original_read(descriptor, maximum)
+
+        with mock.patch.object(switch.os, "read", side_effect=swapping_read):
+            try:
+                switch._writer_cgroup_populated(
+                    group, cgroup_root=root, allow_missing=False
+                )
+            except switch.SwitchError:
+                pass
+            else:
+                raise AssertionError("replaced cgroup path retained stale fd authority")
+
+        unsafe_root = root / "unsafe-root"
+        real_slice = root / "real-slice"
+        real_unit = real_slice / "devcoordinator-authority.service"
+        real_unit.mkdir(parents=True)
+        (real_unit / "cgroup.events").write_text("populated 0\n", encoding="ascii")
+        unsafe_root.mkdir()
+        (unsafe_root / "system.slice").symlink_to(real_slice, target_is_directory=True)
+        try:
+            switch._writer_cgroup_populated(
+                group, cgroup_root=unsafe_root, allow_missing=False
+            )
+        except switch.SwitchError:
+            pass
+        else:
+            raise AssertionError("symlinked cgroup ancestry was accepted")
+
+    with tempfile.TemporaryDirectory(prefix="all-writer-stop-") as raw:
+        cgroup_root = Path(raw) / "cgroup"
+        authority_group = "/system.slice/devcoordinator-authority.service"
+        events = cgroup_root.joinpath(
+            *authority_group.split("/")[1:]
+        ) / "cgroup.events"
+        events.parent.mkdir(parents=True)
+        events.write_text("populated 1\n", encoding="ascii")
+        service_groups = {
+            unit: f"/system.slice/{unit}"
+            for unit in switch.AUTHORITY_WRITER_UNITS
+            if unit.endswith(".service")
+        }
+        for group in service_groups.values():
+            service_events = cgroup_root.joinpath(
+                *group.split("/")[1:]
+            ) / "cgroup.events"
+            service_events.parent.mkdir(parents=True, exist_ok=True)
+            service_events.write_text("populated 1\n", encoding="ascii")
+
+        class AllWriterRunner(FakeRunner):
+            def __init__(
+                self,
+                *,
+                restart_race: bool = False,
+                inactive_drift: bool = False,
+                failed_stop_unit: str | None = None,
+                terminal_on_failure: bool = True,
+            ) -> None:
+                super().__init__()
+                self.active = {unit: True for unit in switch.AUTHORITY_WRITER_UNITS}
+                self.show_counts = {unit: 0 for unit in switch.AUTHORITY_WRITER_UNITS}
+                self.stop_units: list[str] = []
+                self.restart_race = restart_race
+                self.inactive_drift = inactive_drift
+                self.failed_stop_unit = failed_stop_unit
+                self.terminal_on_failure = terminal_on_failure
+
+            def run_bounded(
+                self, argv: list[str], *, timeout_seconds: float
+            ) -> subprocess.CompletedProcess[str]:
+                self.commands.append(list(argv))
+                if "show" in argv:
+                    unit = argv[2]
+                    self.show_counts[unit] += 1
+                    active = self.active[unit]
+                    if (
+                        self.restart_race
+                        and unit == switch.AUTHORITY_WRITER_UNITS[0]
+                        and self.show_counts[unit] >= 3
+                    ):
+                        active = True
+                    service = unit.endswith(".service")
+                    pid = 4312 if active and service else 0
+                    substate = "running" if active else "dead"
+                    if (
+                        self.inactive_drift
+                        and unit == switch.AUTHORITY_WRITER_UNITS[0]
+                        and self.show_counts[unit] >= 3
+                    ):
+                        substate = "failed"
+                    properties = [
+                        "LoadState=loaded",
+                        f"ActiveState={'active' if active else 'inactive'}",
+                        f"SubState={substate}",
+                    ]
+                    if service:
+                        properties.extend(
+                            (
+                                f"MainPID={pid}",
+                                f"ControlGroup={service_groups[unit]}",
+                            )
+                        )
+                    return subprocess.CompletedProcess(
+                        argv,
+                        0,
+                        "\n".join(properties),
+                        "",
+                    )
+                if "stop" in argv:
+                    unit = argv[-1]
+                    self.stop_units.append(unit)
+                    failed = unit == self.failed_stop_unit
+                    if not failed or self.terminal_on_failure:
+                        self.active[unit] = False
+                    if unit in service_groups:
+                        service_events = cgroup_root.joinpath(
+                            *service_groups[unit].split("/")[1:]
+                        ) / "cgroup.events"
+                        if not failed or self.terminal_on_failure:
+                            service_events.write_text("populated 0\n", encoding="ascii")
+                    if failed:
+                        return subprocess.CompletedProcess(argv, 1, "", "lost reply")
+                return subprocess.CompletedProcess(argv, 0, "", "")
+
+        clock_value = [0.0]
+
+        def clock() -> float:
+            return clock_value[0]
+
+        def sleeper(seconds: float) -> None:
+            clock_value[0] += seconds
+
+        runner = AllWriterRunner()
+        switch.stop_authority_writers(
+            runner,
+            cgroup_root=cgroup_root,
+            process_start_reader=lambda _pid: "process-start",
+            process_observer=lambda _pid, _started: "absent",
+            clock=clock,
+            sleeper=sleeper,
+            settle_seconds=0.2,
+        )
+        expect(
+            runner.stop_units == list(switch.AUTHORITY_WRITER_UNITS),
+            "bounded writer stop changed socket/service ordering",
+        )
+        before_replay = list(runner.stop_units)
+        switch.stop_authority_writers(
+            runner,
+            cgroup_root=cgroup_root,
+            process_start_reader=lambda _pid: "process-start",
+            process_observer=lambda _pid, _started: "absent",
+            clock=clock,
+            sleeper=sleeper,
+            settle_seconds=0.2,
+        )
+        expect(
+            runner.stop_units == before_replay,
+            "inactive writer replay issued another stop",
+        )
+
+        lost_unit = switch.AUTHORITY_WRITER_UNITS[0]
+        events.write_text("populated 1\n", encoding="ascii")
+        reconciled = AllWriterRunner(failed_stop_unit=lost_unit)
+        switch.stop_authority_writers(
+            reconciled,
+            cgroup_root=cgroup_root,
+            process_start_reader=lambda _pid: "process-start",
+            process_observer=lambda _pid, _started: "absent",
+            clock=clock,
+            sleeper=sleeper,
+            settle_seconds=0.2,
+        )
+        expect(
+            lost_unit in reconciled.stop_units,
+            "nonzero writer stop reply was not terminally reconciled",
+        )
+
+        events.write_text("populated 1\n", encoding="ascii")
+        unresolved = AllWriterRunner(
+            failed_stop_unit=lost_unit, terminal_on_failure=False
+        )
+        try:
+            switch.stop_authority_writers(
+                unresolved,
+                cgroup_root=cgroup_root,
+                process_start_reader=lambda _pid: "process-start",
+                process_observer=lambda _pid, _started: "absent",
+                clock=clock,
+                sleeper=sleeper,
+                settle_seconds=0.2,
+            )
+        except switch.SwitchError:
+            pass
+        else:
+            raise AssertionError("nonterminal failed writer stop was reconciled")
+
+        events.write_text("populated 1\n", encoding="ascii")
+        racing = AllWriterRunner(restart_race=True)
+        try:
+            switch.stop_authority_writers(
+                racing,
+                cgroup_root=cgroup_root,
+                process_start_reader=lambda _pid: "process-start",
+                process_observer=lambda _pid, _started: "absent",
+                clock=clock,
+                sleeper=sleeper,
+                settle_seconds=0.2,
+            )
+        except switch.SwitchError:
+            pass
+        else:
+            raise AssertionError("writer restart race passed stable inactive proof")
+
+        drifted = AllWriterRunner(inactive_drift=True)
+        events.write_text("populated 1\n", encoding="ascii")
+        try:
+            switch.stop_authority_writers(
+                drifted,
+                cgroup_root=cgroup_root,
+                process_start_reader=lambda _pid: "process-start",
+                process_observer=lambda _pid, _started: "absent",
+                clock=clock,
+                sleeper=sleeper,
+                settle_seconds=0.2,
+            )
+        except switch.SwitchError:
+            pass
+        else:
+            raise AssertionError("inactive writer state drift passed stable proof")
+
+        class PopulatedRunner(AllWriterRunner):
+            def run_bounded(
+                self, argv: list[str], *, timeout_seconds: float
+            ) -> subprocess.CompletedProcess[str]:
+                result = super().run_bounded(argv, timeout_seconds=timeout_seconds)
+                retained_unit = "devcoordinator-api.service"
+                if "stop" in argv and argv[-1] == retained_unit:
+                    retained_events = cgroup_root.joinpath(
+                        *service_groups[retained_unit].split("/")[1:]
+                    ) / "cgroup.events"
+                    retained_events.write_text("populated 1\n", encoding="ascii")
+                return result
+
+        events.write_text("populated 1\n", encoding="ascii")
+        try:
+            switch.stop_authority_writers(
+                PopulatedRunner(),
+                cgroup_root=cgroup_root,
+                process_start_reader=lambda _pid: "process-start",
+                process_observer=lambda _pid, _started: "absent",
+                clock=clock,
+                sleeper=sleeper,
+                settle_seconds=0.2,
+            )
+        except switch.SwitchError:
+            pass
+        else:
+            raise AssertionError("populated non-authority service cgroup was accepted")
+
+
 def exercise_rollback_restores_control_plane_before_background_services() -> None:
     class BackgroundFailureRunner(FakeRunner):
         def require(self, argv: list[str], _label: str) -> str:
@@ -4415,6 +4950,8 @@ def main() -> int:
     exercise_current_transaction_durability()
     exercise_legacy_control_plane_is_durably_retired()
     exercise_internal_socket_rebind_order()
+    exercise_authority_writer_stop_is_bounded_and_exact()
+    exercise_writer_stop_malformed_replay_and_race_guards()
     exercise_rollback_restores_control_plane_before_background_services()
     exercise_slot_readiness_waits_for_supervisor_socket()
     exercise_release_packaging_contract()

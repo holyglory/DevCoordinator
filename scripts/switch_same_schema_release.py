@@ -66,7 +66,10 @@ from devcoordinator.worker_native import (  # noqa: E402
     native_worker_manager,
     project_repository_slice,
 )
-from devcoordinator.worker_runner import observe_worker_process_identity  # noqa: E402
+from devcoordinator.worker_runner import (  # noqa: E402
+    _process_start_time as read_process_start_time,
+    observe_worker_process_identity,
+)
 
 
 KIND = "devcoordinator-same-schema-release-switch"
@@ -192,6 +195,12 @@ AUTHORITY_WRITER_UNITS = (
     "devcoordinator-api.service",
     "devcoordinator-authority.service",
 )
+AUTHORITY_SERVICE = "devcoordinator-authority.service"
+AUTHORITY_STOP_COMMAND_TIMEOUT_SECONDS = 5.0
+AUTHORITY_STOP_GRACE_SECONDS = 5.0
+AUTHORITY_STOP_POLL_SECONDS = 0.1
+WRITER_STOP_SETTLE_SECONDS = 35.0
+WRITER_STABLE_INACTIVE_SECONDS = 0.1
 PUBLICATION_FILE = Path("/var/lib/devcoordinator-edge/routes.publication")
 MAINTENANCE_ROOT = Path("/run/devcoordinator-maintenance")
 MAINTENANCE_MARKER = MAINTENANCE_ROOT / "maintenance.json"
@@ -2179,14 +2188,500 @@ def validate_retained_rebaseline_paths(
         raise SwitchError("retained-control manifest escaped its transaction")
 
 
-def stop_authority_writers(runner: Runner) -> None:
+def _writer_cgroup_populated(
+    control_group: str,
+    *,
+    cgroup_root: Path,
+    allow_missing: bool,
+) -> bool:
+    if (
+        not isinstance(control_group, str)
+        or not control_group.startswith("/")
+        or "\x00" in control_group
+        or any(part in {"", ".", ".."} for part in control_group.split("/")[1:])
+    ):
+        raise SwitchError("writer control-group identity is invalid")
+    root = cgroup_root.expanduser().absolute()
+    try:
+        root_info = root.lstat()
+        if (
+            not stat.S_ISDIR(root_info.st_mode)
+            or stat.S_ISLNK(root_info.st_mode)
+            or root.resolve(strict=True) != root
+        ):
+            raise SwitchError("writer cgroup root is not canonical")
+        current = root
+        for part in control_group.split("/")[1:]:
+            current = current / part
+            info = current.lstat()
+            if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
+                raise SwitchError("writer cgroup ancestry is unsafe")
+    except FileNotFoundError:
+        if allow_missing:
+            return False
+        raise SwitchError("writer cgroup ancestry is unavailable")
+    except OSError as error:
+        raise SwitchError("writer cgroup ancestry is unavailable") from error
+    events = current / "cgroup.events"
+    descriptor = -1
+    try:
+        path_before = events.lstat()
+        if stat.S_ISLNK(path_before.st_mode) or not stat.S_ISREG(path_before.st_mode):
+            raise SwitchError("writer cgroup.events is not a real file")
+        descriptor = os.open(
+            events,
+            os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
+        )
+    except FileNotFoundError:
+        if allow_missing:
+            return False
+        raise SwitchError("writer cgroup.events is unavailable")
+    except OSError as error:
+        raise SwitchError("writer cgroup.events is unavailable") from error
+    try:
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or (path_before.st_dev, path_before.st_ino)
+            != (before.st_dev, before.st_ino)
+        ):
+            raise SwitchError("writer cgroup path and descriptor differ")
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            block = os.read(descriptor, min(1024, 4097 - total))
+            if not block:
+                break
+            chunks.append(block)
+            total += len(block)
+            if total > 4096:
+                raise SwitchError("writer cgroup evidence is excessive")
+        after = os.fstat(descriptor)
+        path_after = events.lstat()
+        if (
+            before.st_dev != after.st_dev
+            or before.st_ino != after.st_ino
+            or stat.S_IFMT(before.st_mode) != stat.S_IFMT(after.st_mode)
+            or (path_after.st_dev, path_after.st_ino)
+            != (after.st_dev, after.st_ino)
+        ):
+            raise SwitchError("writer cgroup identity changed while reading")
+    except OSError as error:
+        raise SwitchError("writer cgroup evidence is unavailable") from error
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    try:
+        lines = b"".join(chunks).decode("ascii").splitlines()
+    except UnicodeDecodeError as error:
+        raise SwitchError("writer cgroup evidence is invalid") from error
+    values: dict[str, str] = {}
+    for line in lines:
+        fields = line.split(" ", 1)
+        if len(fields) != 2 or fields[0] in values:
+            raise SwitchError("writer cgroup evidence is invalid")
+        values[fields[0]] = fields[1]
+    if list(key for key in values if key == "populated") != ["populated"] or values[
+        "populated"
+    ] not in {"0", "1"}:
+        raise SwitchError("writer cgroup evidence is invalid")
+    return values["populated"] == "1"
+
+
+def _writer_unit_state(runner: Runner, unit: str) -> dict[str, object]:
+    if unit not in AUTHORITY_WRITER_UNITS:
+        raise SwitchError("writer unit identity is invalid")
+    service = unit.endswith(".service")
+    properties = ["LoadState", "ActiveState", "SubState"]
+    if service:
+        properties.extend(("MainPID", "ControlGroup"))
+    completed = runner.run_bounded(
+        [
+            "/usr/bin/systemctl",
+            "show",
+            unit,
+            *(f"--property={name}" for name in properties),
+            "--no-pager",
+        ],
+        timeout_seconds=AUTHORITY_STOP_COMMAND_TIMEOUT_SECONDS,
+    )
+    if len((completed.stdout + completed.stderr).encode("utf-8")) > 64 * 1024:
+        raise SwitchError("authority native evidence is excessive")
+    values: dict[str, str] = {}
+    for line in completed.stdout.splitlines():
+        if "=" not in line:
+            raise SwitchError("writer native status is malformed")
+        key, value = line.split("=", 1)
+        if key in values:
+            raise SwitchError("writer native status duplicated a property")
+        values[key] = value
+    if completed.returncode != 0:
+        raise SwitchError("writer native status failed")
+    if set(values) != set(properties):
+        raise SwitchError("writer native status is incomplete")
+    if values["LoadState"] != "loaded":
+        raise SwitchError("required writer unit is not loaded: " + unit)
+    if values["ActiveState"] not in {
+        "active",
+        "activating",
+        "deactivating",
+        "reloading",
+        "inactive",
+        "failed",
+    } or re.fullmatch(r"[a-z][a-z0-9-]{0,63}", values["SubState"]) is None:
+        raise SwitchError("writer native state is invalid")
+    pid: int | None = None
+    control_group: str | None = None
+    if service:
+        if not values["MainPID"].isdigit() or int(values["MainPID"]) > 2**31 - 1:
+            raise SwitchError("writer native PID is invalid")
+        pid = int(values["MainPID"]) or None
+        control_group = values["ControlGroup"] or None
+    active = values["ActiveState"] in {
+        "active",
+        "activating",
+        "deactivating",
+        "reloading",
+    }
+    if not active and pid is not None:
+        raise SwitchError("inactive writer retained a main PID")
+    return {
+        "unit": unit,
+        "active": active,
+        "state": values["SubState"],
+        "pid": pid,
+        "control_group": control_group,
+    }
+
+
+def _bounded_systemctl(
+    runner: Runner,
+    argv: Sequence[str],
+    *,
+    label: str,
+) -> bool:
+    try:
+        completed = runner.run_bounded(
+            argv, timeout_seconds=AUTHORITY_STOP_COMMAND_TIMEOUT_SECONDS
+        )
+    except SwitchError:
+        return False
+    if len((completed.stdout + completed.stderr).encode("utf-8")) > 64 * 1024:
+        raise SwitchError(label + " returned excessive output")
+    return completed.returncode == 0
+
+
+def _wait_writers_inactive(
+    runner: Runner,
+    *,
+    units: Sequence[str],
+    timeout_seconds: float,
+    clock: Callable[[], float],
+    sleeper: Callable[[float], None],
+    raise_on_timeout: bool = True,
+) -> dict[str, dict[str, object]]:
+    selected = tuple(units)
+    if (
+        not selected
+        or len(set(selected)) != len(selected)
+        or any(unit not in AUTHORITY_WRITER_UNITS for unit in selected)
+    ):
+        raise SwitchError("writer wait identities are invalid")
+    deadline = float(clock()) + max(0.1, float(timeout_seconds))
+    while True:
+        states = {unit: _writer_unit_state(runner, unit) for unit in selected}
+        active = sorted(
+            unit for unit, state in states.items() if state["active"] is True
+        )
+        if not active:
+            return states
+        if float(clock()) >= deadline:
+            if raise_on_timeout:
+                raise SwitchError(
+                    "authority writers did not stop: " + ", ".join(active)
+                )
+            return states
+        sleeper(
+            min(
+                AUTHORITY_STOP_POLL_SECONDS,
+                max(0.0, deadline - float(clock())),
+            )
+        )
+
+
+def _authority_terminal_proof(
+    runner: Runner,
+    *,
+    pid: int,
+    process_start: str,
+    control_group: str,
+    cgroup_root: Path,
+    process_observer: Callable[[int, str], str],
+) -> dict[str, object] | None:
+    observed = _writer_unit_state(runner, AUTHORITY_SERVICE)
+    if observed["active"] is True or _writer_cgroup_populated(
+        control_group, cgroup_root=cgroup_root, allow_missing=True
+    ):
+        return None
+    try:
+        process_state = process_observer(pid, process_start)
+    except (OSError, RuntimeError, ValueError) as error:
+        raise SwitchError("authority process absence is unobservable") from error
+    if process_state not in {"absent", "mismatch"}:
+        return None
+    return {
+        "status": "stopped",
+        "pid": pid,
+        "process_start_time": process_start,
+        "process": "pid-reused" if process_state == "mismatch" else "absent",
+        "control_group": control_group,
+    }
+
+
+def stop_authority_service_bounded(
+    runner: Runner,
+    *,
+    cgroup_root: Path = CGROUP_ROOT,
+    process_start_reader: Callable[[int], str | None] = read_process_start_time,
+    process_observer: Callable[[int, str], str] = observe_worker_process_identity,
+    clock: Callable[[], float] = time.monotonic,
+    sleeper: Callable[[float], None] = time.sleep,
+    grace_seconds: float = AUTHORITY_STOP_GRACE_SECONDS,
+) -> dict[str, object]:
+    """Stop the fixed authority unit without inheriting its 65-minute wait."""
+
+    if (
+        not isinstance(grace_seconds, (int, float))
+        or isinstance(grace_seconds, bool)
+        or not 0.1 <= float(grace_seconds) <= 30.0
+    ):
+        raise SwitchError("authority stop grace must be from 0.1 through 30 seconds")
+    before = _writer_unit_state(runner, AUTHORITY_SERVICE)
+    if before["active"] is not True:
+        control_group = before.get("control_group")
+        if isinstance(control_group, str) and _writer_cgroup_populated(
+            control_group, cgroup_root=cgroup_root, allow_missing=True
+        ):
+            raise SwitchError("inactive authority retained a populated cgroup")
+        return {
+            "status": "inactive",
+            "process": "not-running",
+            "control_group": control_group,
+        }
+    pid = before.get("pid")
+    control_group = before.get("control_group")
+    if (
+        type(pid) is not int
+        or pid <= 1
+        or not isinstance(control_group, str)
+        or not _writer_cgroup_populated(
+            control_group, cgroup_root=cgroup_root, allow_missing=False
+        )
+    ):
+        raise SwitchError("active authority identity is incomplete")
+    try:
+        process_start = process_start_reader(pid)
+    except (OSError, RuntimeError, ValueError) as error:
+        raise SwitchError("authority process start identity is unavailable") from error
+    if not isinstance(process_start, str) or not process_start:
+        raise SwitchError("authority process start identity is unavailable")
+    confirmed = _writer_unit_state(runner, AUTHORITY_SERVICE)
+    if (
+        confirmed.get("active") is not True
+        or confirmed.get("pid") != pid
+        or confirmed.get("control_group") != control_group
+    ):
+        raise SwitchError("authority identity changed before bounded stop")
+
+    requested = _bounded_systemctl(
+        runner,
+        ["/usr/bin/systemctl", "--no-block", "stop", AUTHORITY_SERVICE],
+        label="request bounded authority stop",
+    )
+    if not requested:
+        terminal = _authority_terminal_proof(
+            runner,
+            pid=pid,
+            process_start=process_start,
+            control_group=control_group,
+            cgroup_root=cgroup_root,
+            process_observer=process_observer,
+        )
+        if terminal is not None:
+            return terminal
+        raise SwitchError("bounded authority stop reply failed before terminal proof")
+    observed = _wait_writers_inactive(
+        runner,
+        units=(AUTHORITY_SERVICE,),
+        timeout_seconds=grace_seconds,
+        clock=clock,
+        sleeper=sleeper,
+        raise_on_timeout=False,
+    )[AUTHORITY_SERVICE]
+    for signal_name in ("TERM", "KILL"):
+        if observed["active"] is not True:
+            break
+        signalled = _bounded_systemctl(
+            runner,
+            [
+                "/usr/bin/systemctl",
+                "kill",
+                "--kill-whom=all",
+                f"--signal={signal_name}",
+                AUTHORITY_SERVICE,
+            ],
+            label=f"bounded authority {signal_name}",
+        )
+        if not signalled:
+            terminal = _authority_terminal_proof(
+                runner,
+                pid=pid,
+                process_start=process_start,
+                control_group=control_group,
+                cgroup_root=cgroup_root,
+                process_observer=process_observer,
+            )
+            if terminal is not None:
+                return terminal
+            raise SwitchError(
+                f"bounded authority {signal_name} failed before terminal proof"
+            )
+        observed = _wait_writers_inactive(
+            runner,
+            units=(AUTHORITY_SERVICE,),
+            timeout_seconds=grace_seconds,
+            clock=clock,
+            sleeper=sleeper,
+            raise_on_timeout=False,
+        )[AUTHORITY_SERVICE]
+    if observed["active"] is True:
+        raise SwitchError("authority remained active after bounded KILL")
+    terminal = _authority_terminal_proof(
+        runner,
+        pid=pid,
+        process_start=process_start,
+        control_group=control_group,
+        cgroup_root=cgroup_root,
+        process_observer=process_observer,
+    )
+    if terminal is None:
+        raise SwitchError("authority process absence is unproven")
+    return terminal
+
+
+def _require_stable_authority_evidence(
+    runner: Runner,
+    evidence: Mapping[str, object],
+    *,
+    cgroup_root: Path,
+    process_observer: Callable[[int, str], str],
+) -> None:
+    control_group = evidence.get("control_group")
+    if isinstance(control_group, str) and _writer_cgroup_populated(
+        control_group, cgroup_root=cgroup_root, allow_missing=True
+    ):
+        raise SwitchError("authority cgroup repopulated after stop")
+    if evidence.get("pid") is not None and _authority_terminal_proof(
+        runner,
+        pid=int(evidence["pid"]),
+        process_start=str(evidence["process_start_time"]),
+        control_group=str(control_group),
+        cgroup_root=cgroup_root,
+        process_observer=process_observer,
+    ) is None:
+        raise SwitchError("authority terminal proof was not stable")
+
+
+def stop_authority_writers(
+    runner: Runner,
+    *,
+    cgroup_root: Path = CGROUP_ROOT,
+    process_start_reader: Callable[[int], str | None] = read_process_start_time,
+    process_observer: Callable[[int, str], str] = observe_worker_process_identity,
+    clock: Callable[[], float] = time.monotonic,
+    sleeper: Callable[[float], None] = time.sleep,
+    settle_seconds: float = WRITER_STOP_SETTLE_SECONDS,
+) -> None:
     """Quiesce authority writers plus testd/snapshotd direct-generation readers."""
 
+    if (
+        not isinstance(settle_seconds, (int, float))
+        or isinstance(settle_seconds, bool)
+        or not 0.1 <= float(settle_seconds) <= 60.0
+    ):
+        raise SwitchError("writer settle timeout must be from 0.1 through 60 seconds")
+    authority_evidence: dict[str, object] | None = None
+    retained_service_cgroups: dict[str, str] = {}
     for unit in AUTHORITY_WRITER_UNITS:
-        runner.require(["/usr/bin/systemctl", "stop", unit], f"stop authority writer {unit}")
-    active = [unit for unit in AUTHORITY_WRITER_UNITS if unit_active(runner, unit)]
-    if active:
-        raise SwitchError("authority writers did not stop: " + ", ".join(active))
+        if unit == AUTHORITY_SERVICE:
+            authority_evidence = stop_authority_service_bounded(
+                runner,
+                cgroup_root=cgroup_root,
+                process_start_reader=process_start_reader,
+                process_observer=process_observer,
+                clock=clock,
+                sleeper=sleeper,
+            )
+            continue
+        before = _writer_unit_state(runner, unit)
+        if unit.endswith(".service"):
+            control_group = before.get("control_group")
+            if before["active"] is True and not isinstance(control_group, str):
+                raise SwitchError("active writer service has no control group: " + unit)
+            if isinstance(control_group, str):
+                retained_service_cgroups[unit] = control_group
+        if before["active"] is not True:
+            continue
+        requested = _bounded_systemctl(
+            runner,
+            ["/usr/bin/systemctl", "--no-block", "stop", unit],
+            label="request bounded writer stop",
+        )
+        if not requested and _writer_unit_state(runner, unit)["active"] is True:
+            raise SwitchError("bounded writer stop failed before terminal proof: " + unit)
+
+    first = _wait_writers_inactive(
+        runner,
+        units=AUTHORITY_WRITER_UNITS,
+        timeout_seconds=settle_seconds,
+        clock=clock,
+        sleeper=sleeper,
+    )
+    if authority_evidence is not None:
+        _require_stable_authority_evidence(
+            runner,
+            authority_evidence,
+            cgroup_root=cgroup_root,
+            process_observer=process_observer,
+        )
+    for unit, control_group in retained_service_cgroups.items():
+        if unit != AUTHORITY_SERVICE and _writer_cgroup_populated(
+            control_group, cgroup_root=cgroup_root, allow_missing=True
+        ):
+            raise SwitchError("writer service cgroup remained populated: " + unit)
+    sleeper(WRITER_STABLE_INACTIVE_SECONDS)
+    second = {
+        unit: _writer_unit_state(runner, unit) for unit in AUTHORITY_WRITER_UNITS
+    }
+    restarted = sorted(
+        unit for unit, state in second.items() if state["active"] is True
+    )
+    if restarted:
+        raise SwitchError("authority writer restarted after stop: " + ", ".join(restarted))
+    if canonical(first) != canonical(second):
+        raise SwitchError("authority writer inactive state changed after stop")
+    if authority_evidence is not None:
+        _require_stable_authority_evidence(
+            runner,
+            authority_evidence,
+            cgroup_root=cgroup_root,
+            process_observer=process_observer,
+        )
+    for unit, control_group in retained_service_cgroups.items():
+        if unit != AUTHORITY_SERVICE and _writer_cgroup_populated(
+            control_group, cgroup_root=cgroup_root, allow_missing=True
+        ):
+            raise SwitchError("writer service cgroup repopulated after stop: " + unit)
 
 
 def loaded_managed_worker_ids(runner: Runner) -> tuple[str, ...]:
