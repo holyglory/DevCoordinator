@@ -141,13 +141,15 @@ new gate.
   likewise do not require another security-posture decision.
 - A sealed first-use Compose declaration needs no separate administrator
   approval merely because it uses a service-level Compose bind mount classified
-  as `host_bind_mount`, `cap_add`, or numeric loopback publication
+  as `host_bind_mount`, a local volume-driver bind classified as
+  `volume_driver_bind`, `cap_add`, or numeric loopback publication
   (`127.0.0.0/8` or `::1`). On this one-developer host, those are accepted
   declared development capabilities, not a second semantic approval workflow.
   The rendered model remains bounded, validated, pinned and fingerprinted for
-  identity/replay. Local volume-driver binds (`volume_driver_bind`), missing,
-  wildcard, malformed or non-loopback publication, devices, privileged mode,
-  host namespaces, Docker socket access, unconfined security and other distinct
+  identity/replay. The developer accepts that either bind representation can
+  expose the selected host path with its declared mount mode. Missing, wildcard,
+  malformed or non-loopback publication, devices, privileged mode, host
+  namespaces, Docker socket access, unconfined security and other distinct
   host-equivalent risks retain their existing explicit approval boundary.
 - Per-account writable-home drop-ins are unnecessary for the authority. They
   made ordinary first use depend on installer inventory even though every

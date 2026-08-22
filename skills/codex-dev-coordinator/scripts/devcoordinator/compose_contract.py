@@ -198,7 +198,7 @@ DOCKER_FORWARD_ENV_NAMES = (
 # are still parsed and validated below, but they are deliberately absent from
 # the separate administrator-approval risk set.
 COMPOSE_APPROVAL_EXEMPT_RISKS = frozenset(
-    {"added_capabilities", "host_bind_mount"}
+    {"added_capabilities", "host_bind_mount", "volume_driver_bind"}
 )
 
 

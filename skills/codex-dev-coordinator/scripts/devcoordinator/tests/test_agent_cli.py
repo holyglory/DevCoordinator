@@ -1364,7 +1364,7 @@ class AgentCliTests(unittest.TestCase):
         error = BrokerError(
             "repository_runtime_contract_invalid",
             "effective Compose model adds administrator-approved host access: "
-            "volume_driver_bind",
+            "docker_socket",
         )
 
         result = agent_cli._failure(

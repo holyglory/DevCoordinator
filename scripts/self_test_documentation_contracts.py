@@ -191,7 +191,7 @@ def test_compose_approval_documentation_is_precise() -> None:
             "`added_capabilities`",
             "complete effective-model risk evidence",
             "`volume_driver_bind`",
-            "still-gated category",
+            "equivalent local volume-driver",
             "non-loopback, wildcard, or malformed host publication",
             "devices or GPUs",
             "privileged mode",
@@ -202,7 +202,8 @@ def test_compose_approval_documentation_is_precise() -> None:
             "devcoordinator-compose-host-access",
             "devcoordinator-authority-repository-repair",
             "Any changed or added approval-required risk",
-            "adding only `host_bind_mount` or `added_capabilities` does not",
+            "adding only `host_bind_mount`",
+            "`volume_driver_bind`, or `added_capabilities` does not",
         ),
     )
     require_fragments(
@@ -210,8 +211,8 @@ def test_compose_approval_documentation_is_precise() -> None:
         text=broker_cli,
         fragments=(
             "still-gated host access",
-            "volume-driver binds",
-            "Service-level bind mounts and cap_add",
+            "local volume-driver binds",
+            "Service-level bind mounts, local volume-driver binds, and cap_add",
             "do not require this flag",
             "risk set that remains approval-required",
         ),
@@ -224,8 +225,8 @@ def test_compose_approval_documentation_is_precise() -> None:
             "`host_bind_mount`",
             "`added_capabilities`",
             "`volume_driver_bind`",
-            "every other approval boundary in this record remain unchanged",
-            "historical for those two exempt categories",
+            "Every other approval boundary in this record remains unchanged",
+            "historical for those three exempt categories",
         ),
     )
     for label, text in (

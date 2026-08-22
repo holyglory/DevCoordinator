@@ -2352,11 +2352,11 @@ class BrokerCLIContractTests(unittest.TestCase):
         help_text = " ".join(output.getvalue().split()).replace("- ", "-")
         for required in (
             "still-gated host access",
-            "volume-driver binds",
-            "Service-level bind mounts and cap_add remain sealed risk evidence",
+            "Service-level bind mounts, local volume-driver binds, and cap_add remain sealed risk evidence",
             "do not require this flag",
         ):
             self.assertIn(required, help_text)
+        self.assertNotIn("volume-driver binds, external resources", help_text)
         self.assertNotIn(
             "host-equivalent capabilities such as bind mounts",
             help_text,

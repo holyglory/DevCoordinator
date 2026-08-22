@@ -176,9 +176,10 @@ def add_broker_parser(subparsers: Any) -> None:
             "Explicitly approve the exact rendered Compose definition to use "
             "still-gated host access such as non-loopback publication, devices, "
             "privileged mode, host namespaces, Docker-socket access, "
-            "volume-driver binds, external resources, or unconfined security. "
-            "Service-level bind mounts and cap_add remain sealed risk evidence "
-            "but do not require this flag. Approval is fingerprint-bound."
+            "external resources, or unconfined security. "
+            "Service-level bind mounts, local volume-driver binds, and cap_add "
+            "remain sealed risk evidence but do not require this flag. "
+            "Approval is fingerprint-bound."
         ),
     )
 

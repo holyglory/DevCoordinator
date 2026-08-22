@@ -1943,22 +1943,12 @@ volumes:
                 },
             }
         ).encode()
-        with self.assertRaisesRegex(
-            PermissionError, "volume_driver_bind"
-        ):
-            require_effective_compose_model(
-                volume_driver_bind,
-                declared_services=("web",),
-                declared_profiles=(),
-                project_name="alpha-stack",
-                host_access_approved=False,
-            )
         volume_driver_evidence = require_effective_compose_model(
             volume_driver_bind,
             declared_services=("web",),
             declared_profiles=(),
             project_name="alpha-stack",
-            host_access_approved=True,
+            host_access_approved=False,
         )
         self.assertEqual(
             volume_driver_evidence.host_access_risks,
@@ -1966,7 +1956,33 @@ volumes:
         )
         self.assertEqual(
             volume_driver_evidence.approval_required_risks,
-            ("volume_driver_bind",),
+            (),
+        )
+        mixed_volume_driver = json.loads(volume_driver_bind)
+        mixed_volume_driver["services"]["web"]["privileged"] = True
+        mixed_volume_driver_payload = json.dumps(mixed_volume_driver).encode()
+        with self.assertRaisesRegex(PermissionError, "privileged"):
+            require_effective_compose_model(
+                mixed_volume_driver_payload,
+                declared_services=("web",),
+                declared_profiles=(),
+                project_name="alpha-stack",
+                host_access_approved=False,
+            )
+        mixed_volume_driver_evidence = require_effective_compose_model(
+            mixed_volume_driver_payload,
+            declared_services=("web",),
+            declared_profiles=(),
+            project_name="alpha-stack",
+            host_access_approved=True,
+        )
+        self.assertEqual(
+            mixed_volume_driver_evidence.host_access_risks,
+            ("privileged", "volume_driver_bind"),
+        )
+        self.assertEqual(
+            mixed_volume_driver_evidence.approval_required_risks,
+            ("privileged",),
         )
 
         safe_internal = json.dumps(
@@ -2082,7 +2098,12 @@ volumes:
                                             "type": "bind",
                                             "source": "/srv/project-data",
                                             "target": "/workspace/data",
-                                        }
+                                        },
+                                        {
+                                            "type": "volume",
+                                            "source": "host-data",
+                                            "target": "/workspace/host-data",
+                                        },
                                     ],
                                 }
                                 if name == "web"
@@ -2090,7 +2111,17 @@ volumes:
                             ),
                         }
                         for name in services
-                    }
+                    },
+                    "volumes": {
+                        "host-data": {
+                            "driver": "local",
+                            "driver_opts": {
+                                "type": "none",
+                                "o": "bind",
+                                "device": "/srv/project-volume-data",
+                            },
+                        }
+                    },
                 }
             ).encode()
 
@@ -2120,7 +2151,7 @@ volumes:
         )
         self.assertEqual(
             status["host_access_risks"],
-            ["added_capabilities", "host_bind_mount"],
+            ["added_capabilities", "host_bind_mount", "volume_driver_bind"],
         )
         self.assertFalse(status["host_access_approved"])
         self.assertIsNone(status["approved_by_uid"])
