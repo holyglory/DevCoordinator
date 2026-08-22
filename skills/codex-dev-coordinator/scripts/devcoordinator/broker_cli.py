@@ -174,8 +174,11 @@ def add_broker_parser(subparsers: Any) -> None:
         action="store_true",
         help=(
             "Explicitly approve the exact rendered Compose definition to use "
-            "host-equivalent capabilities such as bind mounts, devices, host "
-            "namespaces, or added capabilities. Approval is fingerprint-bound."
+            "still-gated host access such as non-loopback publication, devices, "
+            "privileged mode, host namespaces, Docker-socket access, "
+            "volume-driver binds, external resources, or unconfined security. "
+            "Service-level bind mounts and cap_add remain sealed risk evidence "
+            "but do not require this flag. Approval is fingerprint-bound."
         ),
     )
 
@@ -183,7 +186,7 @@ def add_broker_parser(subparsers: Any) -> None:
         "approve-compose-host-access",
         help=(
             "approve the exact current repository-declared Compose host-access "
-            "risk set through the live authority"
+            "risk set that remains approval-required through the live authority"
         ),
     )
     approve_compose.add_argument("--project", required=True)
@@ -193,7 +196,10 @@ def add_broker_parser(subparsers: Any) -> None:
         "--approve-compose-host-access",
         action="store_true",
         required=True,
-        help="explicitly approve the current fingerprinted effective risk set",
+        help=(
+            "explicitly approve the current fingerprinted approval-required "
+            "risk set"
+        ),
     )
 
     port_range = actions.add_parser(

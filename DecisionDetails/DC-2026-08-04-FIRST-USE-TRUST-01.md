@@ -26,6 +26,15 @@ host bind mounts, devices, added capabilities, the Docker socket, and other
 host-equivalent features. This keeps ordinary local previews fast without
 turning first use into implicit public exposure.
 
+Superseded in part by
+[DC-2026-08-22-COMPOSE-DECLARED-HOST-CAPABILITIES-01](DC-2026-08-22-COMPOSE-DECLARED-HOST-CAPABILITIES-01.md):
+service-level Compose bind mounts classified as `host_bind_mount` and
+`cap_add` classified as `added_capabilities` remain complete risk evidence but
+no longer require separate approval. Volume-driver binds classified as
+`volume_driver_bind` and every other approval boundary in this record remain
+unchanged. Later references below to requiring approval for every other
+host-equivalent feature are historical for those two exempt categories.
+
 A protected read-only control-plane client may use any one current installed
 repository as its transport anchor and dynamically merge the broker-issued
 route for a newer adopted repository. If that protected account has no row for

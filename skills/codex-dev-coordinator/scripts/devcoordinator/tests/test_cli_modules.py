@@ -2343,6 +2343,25 @@ class LifecycleParserContractTests(unittest.TestCase):
 
 
 class BrokerCLIContractTests(unittest.TestCase):
+    def test_compose_approval_help_separates_exempt_and_gated_risks(self) -> None:
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output), self.assertRaises(SystemExit) as raised:
+            parser().parse_args(["broker", "configure", "--help"])
+
+        self.assertEqual(raised.exception.code, 0)
+        help_text = " ".join(output.getvalue().split()).replace("- ", "-")
+        for required in (
+            "still-gated host access",
+            "volume-driver binds",
+            "Service-level bind mounts and cap_add remain sealed risk evidence",
+            "do not require this flag",
+        ):
+            self.assertIn(required, help_text)
+        self.assertNotIn(
+            "host-equivalent capabilities such as bind mounts",
+            help_text,
+        )
+
     def test_image_publication_requires_active_maintenance_marker(self) -> None:
         with (
             mock.patch.object(

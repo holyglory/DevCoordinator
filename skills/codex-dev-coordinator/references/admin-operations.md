@@ -123,11 +123,18 @@ python3 "$COORDINATOR" docker compose-run-once --help
 
 ## Compose host-access approval
 
-A declared Compose model that requests non-loopback ports, bind mounts,
-devices, host namespaces, added capabilities, or another host-equivalent risk
-requires one explicit approval of its current rendered fingerprint. Use the
-immutable live-authority wrapper; do not stop the authority or fall back to
-offline `broker configure`:
+A declared Compose model does not need separate approval for a service-level
+bind mount classified as `host_bind_mount` or for `cap_add`, classified as
+`added_capabilities`. Both remain visible in the complete effective-model risk
+evidence. A volume-driver bind classified as `volume_driver_bind` is a distinct
+still-gated category.
+
+Approval remains required for non-loopback, wildcard, or malformed host
+publication; devices or GPUs; privileged mode; host namespaces; Docker-socket
+access; unconfined security; external containers, networks, or volumes;
+volume-driver binds; and any other approval-required risk. Use the immutable
+live-authority wrapper; do not stop the authority or fall back to offline
+`broker configure`:
 
 ```bash
 devcoordinator-compose-host-access \
@@ -138,11 +145,12 @@ devcoordinator-compose-host-access \
 ```
 
 The result names the exact Compose definition, generation, fingerprint, and
-approved risk set. Replay only the same operation UUID after an uncertain
-reply. Any changed or added risk requires a new explicit approval operation.
-`devcoordinator-authority-repository-repair` is retained as a compatibility
-alias for this same live command; it no longer invokes historical cutover
-repair actions.
+complete effective risk evidence. Replay only the same operation UUID after an
+uncertain reply. Any changed or added approval-required risk requires a new
+explicit approval operation; adding only `host_bind_mount` or
+`added_capabilities` does not. `devcoordinator-authority-repository-repair` is
+retained as a compatibility alias for this same live command; it no longer
+invokes historical cutover repair actions.
 
 ## Exact Compose service recreation
 

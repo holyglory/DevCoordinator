@@ -18,6 +18,7 @@ RUNTIME_ROOT = ROOT / "skills" / "codex-dev-coordinator"
 RUNTIME_SKILL = RUNTIME_ROOT / "SKILL.md"
 RUNTIME_CLIENT = RUNTIME_ROOT / "references" / "agent-client.md"
 RUNTIME_API = RUNTIME_ROOT / "references" / "runtime-api.md"
+ADMIN_OPERATIONS = RUNTIME_ROOT / "references" / "admin-operations.md"
 RUNTIME_METADATA = RUNTIME_ROOT / "agents" / "openai.yaml"
 TEST_ROOT = ROOT / "skills" / "codex-governed-tests"
 TEST_SKILL = TEST_ROOT / "SKILL.md"
@@ -30,6 +31,12 @@ PRODUCTION_ACCEPTANCE = (
     ROOT / "apps" / "DevOpsConsole" / "Tools" / "production-console-acceptance.mjs"
 )
 POSTGRES_SKILL = ROOT / "skills" / "postgres-docker-backup" / "SKILL.md"
+BROKER_CLI = (
+    RUNTIME_ROOT / "scripts" / "devcoordinator" / "broker_cli.py"
+)
+FIRST_USE_TRUST_DECISION = (
+    ROOT / "DecisionDetails" / "DC-2026-08-04-FIRST-USE-TRUST-01.md"
+)
 
 
 def section(markdown: str, heading: str) -> str:
@@ -167,6 +174,68 @@ def test_first_use_runtime_journey_is_copyable_and_explanatory() -> None:
             "operation follow",
         ),
     )
+
+
+def test_compose_approval_documentation_is_precise() -> None:
+    administration = section(
+        ADMIN_OPERATIONS.read_text(encoding="utf-8"),
+        "Compose host-access approval",
+    )
+    broker_cli = BROKER_CLI.read_text(encoding="utf-8")
+    prior_decision = FIRST_USE_TRUST_DECISION.read_text(encoding="utf-8")
+    require_fragments(
+        label="Compose approval administration",
+        text=administration,
+        fragments=(
+            "`host_bind_mount`",
+            "`added_capabilities`",
+            "complete effective-model risk evidence",
+            "`volume_driver_bind`",
+            "still-gated category",
+            "non-loopback, wildcard, or malformed host publication",
+            "devices or GPUs",
+            "privileged mode",
+            "host namespaces",
+            "Docker-socket access",
+            "unconfined security",
+            "external containers, networks, or volumes",
+            "devcoordinator-compose-host-access",
+            "devcoordinator-authority-repository-repair",
+            "Any changed or added approval-required risk",
+            "adding only `host_bind_mount` or `added_capabilities` does not",
+        ),
+    )
+    require_fragments(
+        label="Compose approval CLI help",
+        text=broker_cli,
+        fragments=(
+            "still-gated host access",
+            "volume-driver binds",
+            "Service-level bind mounts and cap_add",
+            "do not require this flag",
+            "risk set that remains approval-required",
+        ),
+    )
+    require_fragments(
+        label="first-use Compose approval supersession",
+        text=prior_decision,
+        fragments=(
+            "DC-2026-08-22-COMPOSE-DECLARED-HOST-CAPABILITIES-01",
+            "`host_bind_mount`",
+            "`added_capabilities`",
+            "`volume_driver_bind`",
+            "every other approval boundary in this record remain unchanged",
+            "historical for those two exempt categories",
+        ),
+    )
+    for label, text in (
+        ("administration", administration),
+        ("broker CLI", broker_cli),
+    ):
+        if "bind mounts, devices, host namespaces, added capabilities" in text:
+            raise AssertionError(
+                f"{label} still says service bind mounts and cap_add require approval"
+            )
 
 
 def test_governed_routing_surface_and_evidence_are_complete() -> None:
@@ -391,6 +460,7 @@ def main() -> int:
         test_split_skills_have_distinct_triggers_and_generated_metadata,
         test_every_skill_reference_is_direct_and_resolves,
         test_first_use_runtime_journey_is_copyable_and_explanatory,
+        test_compose_approval_documentation_is_precise,
         test_governed_routing_surface_and_evidence_are_complete,
         test_failure_intake_fallback_task_routing_and_public_audit_are_explicit,
         test_broker_routing_example_remains_copyable,
