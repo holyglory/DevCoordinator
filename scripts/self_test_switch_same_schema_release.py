@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import inspect
 import io
 import json
@@ -2881,10 +2882,26 @@ def exercise_prepared_supersession_clears_only_exact_claim() -> None:
             0o644,
         )
         launchers = {
-            "client": (root / "bin" / "client", "devcoordinator"),
-            "test": (root / "bin" / "test", "devcoordinator-test"),
+            rendered_name: (root / "bin" / destination.name, immutable_name)
+            for rendered_name, (
+                destination,
+                immutable_name,
+            ) in switch.STABLE_LAUNCHERS.items()
         }
-        for _name, (destination, immutable_name) in launchers.items():
+        required_launchers = set(launchers) - set(
+            switch.RETAINED_PREDECESSOR_OPTIONAL_LAUNCHERS
+        )
+        expect(
+            switch.RETAINED_PREDECESSOR_OPTIONAL_LAUNCHERS
+            == {switch.EDGE_CERT_REFRESH_LAUNCHER_RENDERED}
+            and required_launchers
+            == set(switch.RETAINED_PREDECESSOR_REQUIRED_LAUNCHERS)
+            and len(required_launchers) == 7,
+            "retained predecessor launcher boundary is not exactly seven required and one optional",
+        )
+        for rendered_name, (destination, immutable_name) in launchers.items():
+            if rendered_name in switch.RETAINED_PREDECESSOR_OPTIONAL_LAUNCHERS:
+                continue
             destination.parent.mkdir(parents=True, exist_ok=True)
             switch.atomic_bytes(
                 destination,
@@ -2937,8 +2954,56 @@ def exercise_prepared_supersession_clears_only_exact_claim() -> None:
             expect(
                 evidence["release_digest"] == current_digest
                 and replayed_evidence == evidence
-                and schema_reads == [15, 15, 15, 15],
+                and schema_reads == [15, 15, 15, 15]
+                and evidence["launchers"][
+                    str(
+                        launchers[switch.EDGE_CERT_REFRESH_LAUNCHER_RENDERED][0]
+                    )
+                ]
+                is None,
                 "current live release evidence lost exact deterministic identity",
+            )
+            optional_destination, optional_name = launchers[
+                switch.EDGE_CERT_REFRESH_LAUNCHER_RENDERED
+            ]
+            expected_optional_launcher = (
+                "#!/bin/sh\nset -eu\n"
+                f"exec '{current / 'bin' / optional_name}' \"$@\"\n"
+            ).encode("utf-8")
+            switch.atomic_bytes(
+                optional_destination, expected_optional_launcher, 0o755
+            )
+            present_optional = switch.require_current_live_release_identity(
+                current,
+                schema_reader=lambda: 15,
+                release_verifier=lambda selected: {
+                    "release_digest": selected.name
+                },
+            )
+            expect(
+                present_optional["launchers"][str(optional_destination)]
+                == hashlib.sha256(expected_optional_launcher).hexdigest(),
+                "matching optional predecessor launcher was not evidence-bound",
+            )
+            switch.atomic_bytes(
+                optional_destination, b"wrong optional launcher\n", 0o755
+            )
+            try:
+                switch.require_current_live_release_identity(
+                    current,
+                    schema_reader=lambda: 15,
+                    release_verifier=lambda selected: {
+                        "release_digest": selected.name
+                    },
+                )
+            except switch.SwitchError:
+                pass
+            else:
+                raise AssertionError(
+                    "live release verifier accepted mismatched optional launcher"
+                )
+            switch.atomic_bytes(
+                optional_destination, expected_optional_launcher, 0o755
             )
             switch.atomic_bytes(
                 unit_root / "devcoordinator-api.service",
@@ -2984,11 +3049,29 @@ def exercise_prepared_supersession_clears_only_exact_claim() -> None:
                 f"ExecStart=/opt/devcoordinator/releases/{current_digest}/bin/tool\n".encode(),
                 0o644,
             )
-            launcher_destination, launcher_name = launchers["client"]
+            launcher_destination, launcher_name = launchers[
+                switch.CLIENT_LAUNCHER_RENDERED
+            ]
             expected_launcher = (
                 "#!/bin/sh\nset -eu\n"
                 f"exec '{current / 'bin' / launcher_name}' \"$@\"\n"
             ).encode("utf-8")
+            launcher_destination.unlink()
+            try:
+                switch.require_current_live_release_identity(
+                    current,
+                    schema_reader=lambda: 15,
+                    release_verifier=lambda selected: {
+                        "release_digest": selected.name
+                    },
+                )
+            except switch.SwitchError:
+                pass
+            else:
+                raise AssertionError(
+                    "live release verifier accepted missing required launcher"
+                )
+            switch.atomic_bytes(launcher_destination, expected_launcher, 0o755)
             switch.atomic_bytes(launcher_destination, b"wrong launcher\n", 0o755)
             try:
                 switch.require_current_live_release_identity(

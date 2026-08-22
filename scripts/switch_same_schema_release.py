@@ -162,6 +162,20 @@ STABLE_LAUNCHERS = {
         "devcoordinator-edge-cert-refresh",
     ),
 }
+RETAINED_PREDECESSOR_OPTIONAL_LAUNCHERS = frozenset(
+    {EDGE_CERT_REFRESH_LAUNCHER_RENDERED}
+)
+RETAINED_PREDECESSOR_REQUIRED_LAUNCHERS = frozenset(
+    {
+        CLIENT_LAUNCHER_RENDERED,
+        MCP_LAUNCHER_RENDERED,
+        BUG_LAUNCHER_RENDERED,
+        TEST_LAUNCHER_RENDERED,
+        CALL_LOG_LAUNCHER_RENDERED,
+        SYSTEMD_UNIT_LAUNCHER_RENDERED,
+        IMAGE_LAUNCHER_RENDERED,
+    }
+)
 TEST_HISTORY_WRAPPER = "devcoordinator-test-store"
 TESTD_USER = "devcoordinator-testd"
 TESTD_SERVICE = "devcoordinator-testd.service"
@@ -1191,6 +1205,23 @@ def _read_bounded_stable_file(
             os.close(descriptor)
 
 
+def _read_optional_bounded_stable_file(
+    path: Path,
+    *,
+    maximum_bytes: int,
+    description: str,
+) -> bytes | None:
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return None
+    return _read_bounded_stable_file(
+        path,
+        maximum_bytes=maximum_bytes,
+        description=description,
+    )
+
+
 def _current_live_release_snapshot(
     release: Path,
     *,
@@ -1238,18 +1269,33 @@ def _current_live_release_snapshot(
     ):
         raise SwitchError("current Console slot contradicts publication")
 
-    launcher_sha256: dict[str, str] = {}
-    for _rendered_name, (destination, immutable_name) in STABLE_LAUNCHERS.items():
+    if set(STABLE_LAUNCHERS) != (
+        RETAINED_PREDECESSOR_REQUIRED_LAUNCHERS
+        | RETAINED_PREDECESSOR_OPTIONAL_LAUNCHERS
+    ):
+        raise SwitchError("retained predecessor launcher contract changed")
+    launcher_sha256: dict[str, str | None] = {}
+    for rendered_name, (destination, immutable_name) in STABLE_LAUNCHERS.items():
         expected = (
             "#!/bin/sh\n"
             "set -eu\n"
             f"exec '{release / 'bin' / immutable_name}' \"$@\"\n"
         ).encode("utf-8")
-        actual = _read_bounded_stable_file(
-            destination,
-            maximum_bytes=64 * 1024,
-            description="stable launcher",
-        )
+        if rendered_name in RETAINED_PREDECESSOR_OPTIONAL_LAUNCHERS:
+            actual = _read_optional_bounded_stable_file(
+                destination,
+                maximum_bytes=64 * 1024,
+                description="optional retained predecessor launcher",
+            )
+            if actual is None:
+                launcher_sha256[str(destination)] = None
+                continue
+        else:
+            actual = _read_bounded_stable_file(
+                destination,
+                maximum_bytes=64 * 1024,
+                description="required retained predecessor launcher",
+            )
         if actual != expected:
             raise SwitchError("stable launcher names another current release")
         launcher_sha256[str(destination)] = hashlib.sha256(actual).hexdigest()
