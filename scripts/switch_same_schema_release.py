@@ -56,6 +56,7 @@ from devcoordinator.server_credentials import (  # noqa: E402
 )
 from devcoordinator.store import AccountStore  # noqa: E402
 from devcoordinator.worker_control import (  # noqa: E402
+    quiesce_worker_registration,
     WorkerControlError,
     WorkerController,
 )
@@ -2073,8 +2074,8 @@ def require_no_managed_worker_units(runner: Runner) -> None:
         )
 
 
-def source_worker_quiescence_proof(runner: Runner) -> dict[str, object]:
-    """Prove schema-15 has no live worker before retained-state mutation."""
+def _read_source_worker_state(runner: Runner) -> dict[str, object]:
+    """Read one bounded schema-15 worker snapshot without changing it."""
 
     unit_ids_before = loaded_managed_worker_ids(runner)
     try:
@@ -2216,7 +2217,61 @@ def source_worker_quiescence_proof(runner: Runner) -> dict[str, object]:
             )
         ):
             raise SwitchError("source worker attempt evidence is invalid")
+    attempt_by_id = {str(row["attempt_id"]): row for row in attempts}
+    if len(attempt_by_id) != len(attempts):
+        raise SwitchError("source worker attempt identity is duplicated")
+    attempt_by_worker = {
+        str(row["server_definition_id"]): row for row in attempts
+    }
+    if len(attempt_by_worker) != len(attempts):
+        raise SwitchError("source worker has multiple current attempts")
+    current_attempt_ids = {
+        str(row["current_attempt_id"])
+        for row in supervisors
+        if row["current_attempt_id"] is not None
+    }
+    if current_attempt_ids != set(attempt_by_id):
+        raise SwitchError("source worker current-attempt coverage is invalid")
+    for row in supervisors:
+        state = str(row["state"])
+        current_attempt_id = row["current_attempt_id"]
+        if (
+            state in {"launching", "running", "stopping"}
+            and current_attempt_id is None
+        ):
+            raise SwitchError("source worker active supervisor identity is incomplete")
+    for row in observations:
+        lifecycle = str(row["lifecycle"])
+        pid = row["pid"]
+        started = row["process_start_time"]
+        active_observation = (
+            pid is not None
+            or lifecycle in {"starting", "running", "unhealthy", "stopping"}
+        )
+        if active_observation and (
+            type(pid) is not int
+            or int(pid) <= 1
+            or not isinstance(started, str)
+            or not started
+        ):
+            raise SwitchError("source worker observation identity is incomplete")
+        if active_observation:
+            attempt = attempt_by_worker.get(str(row["server_definition_id"]))
+            if (
+                attempt is None
+                or attempt.get("state") != "running"
+                or attempt.get("pid") != pid
+                or attempt.get("process_start_time") != started
+                or attempt.get("process_fingerprint")
+                != row.get("process_fingerprint")
+            ):
+                raise SwitchError(
+                    "source worker observation is not bound to its current attempt"
+                )
+
     unit_ids_after = loaded_managed_worker_ids(runner)
+    if unit_ids_before != unit_ids_after:
+        raise SwitchError("source worker unit inventory changed while observed")
     active_supervisors = sorted(
         str(row["server_definition_id"])
         for row in supervisors
@@ -2233,25 +2288,182 @@ def source_worker_quiescence_proof(runner: Runner) -> dict[str, object]:
         or str(row["lifecycle"])
         in {"starting", "running", "unhealthy", "stopping"}
     )
-    blockers = sorted(
-        {
-            *unit_ids_before,
-            *unit_ids_after,
-            *active_supervisors,
-            *active_attempts,
-            *active_observations,
-        }
-    )
-    if blockers:
-        raise SwitchError(
-            "schema rebaseline requires these managed workers to stop first: "
-            + ", ".join(blockers)
-        )
-    state_document = {
+    return {
+        "metadata": dict(metadata),
         "policies": policies,
         "supervisors": supervisors,
-        "current_attempts": attempts,
-        "worker_observations": observations,
+        "attempts": attempts,
+        "observations": observations,
+        "worker_units": list(unit_ids_after),
+        "active_supervisors": active_supervisors,
+        "active_attempts": active_attempts,
+        "active_observations": active_observations,
+    }
+
+
+def _terminal_process_state(
+    observer: Callable[[int, str], str], pid: int, process_start_time: str
+) -> str:
+    try:
+        state = observer(pid, process_start_time)
+    except (OSError, RuntimeError, ValueError) as error:
+        raise SwitchError("source worker process identity is unobservable") from error
+    if state not in {"absent", "mismatch"}:
+        raise SwitchError("source worker process absence is unproven")
+    return state
+
+
+def _require_quiesced_cgroup_empty(
+    control_group: object, *, cgroup_root: Path
+) -> None:
+    if control_group is None:
+        return
+    if (
+        not isinstance(control_group, str)
+        or not control_group.startswith("/")
+        or "\x00" in control_group
+        or any(part in {"", ".", ".."} for part in control_group.split("/")[1:])
+    ):
+        raise SwitchError("source worker cgroup identity is invalid")
+    events = cgroup_root.joinpath(*control_group.split("/")[1:]) / "cgroup.events"
+    try:
+        info = events.lstat()
+    except FileNotFoundError:
+        return
+    except OSError as error:
+        raise SwitchError("source worker cgroup evidence is unavailable") from error
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        raise SwitchError("source worker cgroup evidence is unsafe")
+    try:
+        payload = events.read_bytes()
+    except OSError as error:
+        raise SwitchError("source worker cgroup evidence is unavailable") from error
+    if len(payload) > 4096:
+        raise SwitchError("source worker cgroup evidence is excessive")
+    try:
+        values = dict(
+            line.split(" ", 1)
+            for line in payload.decode("ascii").splitlines()
+            if " " in line
+        )
+    except UnicodeDecodeError as error:
+        raise SwitchError("source worker cgroup evidence is invalid") from error
+    if values.get("populated") not in {"0", "1"}:
+        raise SwitchError("source worker cgroup evidence is invalid")
+    if values["populated"] != "0":
+        raise SwitchError("source worker cgroup remained populated")
+
+
+def _absent_worker_receipt(policy: Mapping[str, object]) -> dict[str, object]:
+    worker_id = str(policy["server_definition_id"])
+    return {
+        "worker_id": worker_id,
+        "execution_uid": int(policy["execution_uid"]),
+        "repository_id": str(policy["repo_id"]),
+        "definition_generation": int(policy["definition_generation"]),
+        "policy_generation": int(policy["policy_generation"]),
+        "unit": f"devcoordinator-worker-{worker_id}.service",
+        "expected_slice": None,
+        "loaded_before": False,
+        "active_before": False,
+        "runner_pid_before": None,
+        "control_group": None,
+        "cgroup_populated_before": None,
+        "removal_reply": "complete",
+        "unit_unloaded": True,
+        "cgroup_empty": True,
+        "process_proofs": [],
+    }
+
+
+def source_worker_policy_expectations(runner: Runner) -> dict[str, object]:
+    """Capture the retained schema-15 policy set without requiring quiescence."""
+
+    state = _read_source_worker_state(runner)
+    policies = list(state["policies"])
+    return {
+        "policy_expectations": policies,
+        "policy_count": len(policies),
+    }
+
+
+def source_worker_quiescence_proof(
+    runner: Runner,
+    *,
+    quiesced_workers: object = None,
+    process_observer: Callable[[int, str], str] = observe_worker_process_identity,
+    cgroup_root: Path = CGROUP_ROOT,
+) -> dict[str, object]:
+    """Prove schema-15 workers are absent while retaining policy unchanged."""
+
+    state = _read_source_worker_state(runner)
+    policies = list(state["policies"])
+    if quiesced_workers is None:
+        if (
+            state["worker_units"]
+            or state["active_supervisors"]
+            or state["active_attempts"]
+            or state["active_observations"]
+        ):
+            blockers = sorted(
+                {
+                    *state["worker_units"],
+                    *state["active_supervisors"],
+                    *state["active_attempts"],
+                    *state["active_observations"],
+                }
+            )
+            raise SwitchError(
+                "schema rebaseline has unquiesced managed workers: "
+                + ", ".join(blockers)
+            )
+        receipts = [_absent_worker_receipt(policy) for policy in policies]
+    else:
+        receipts = [dict(value) for value in quiesced_workers] if isinstance(
+            quiesced_workers, list
+        ) and all(isinstance(value, Mapping) for value in quiesced_workers) else []
+        if not _valid_quiesced_workers(receipts, expected_policies=policies):
+            raise SwitchError("source worker quiescence receipt is invalid")
+
+    policy_ids = {str(row["server_definition_id"]) for row in policies}
+    loaded = set(state["worker_units"])
+    if loaded:
+        raise SwitchError(
+            "schema rebaseline retained managed worker registrations: "
+            + ", ".join(sorted(loaded))
+        )
+    receipt_by_id = {str(row["worker_id"]): row for row in receipts}
+    if set(receipt_by_id) != policy_ids:
+        raise SwitchError("source worker quiescence coverage changed")
+    for receipt in receipts:
+        _require_quiesced_cgroup_empty(
+            receipt.get("control_group"), cgroup_root=cgroup_root
+        )
+
+    proof_identities = {
+        str(receipt["worker_id"]): {
+            (int(item["pid"]), str(item["process_start_time"]))
+            for item in receipt["process_proofs"]
+        }
+        for receipt in receipts
+    }
+    for row in [*state["attempts"], *state["observations"]]:
+        worker_id = str(row["server_definition_id"])
+        pid = row.get("pid")
+        started = row.get("process_start_time")
+        if pid is None:
+            continue
+        exact = (int(pid), str(started))
+        if exact not in proof_identities.get(worker_id, set()):
+            raise SwitchError("source worker process proof coverage is incomplete")
+        _terminal_process_state(process_observer, exact[0], exact[1])
+
+    metadata = state["metadata"]
+    state_document = {
+        "policies": policies,
+        "supervisors": state["supervisors"],
+        "current_attempts": state["attempts"],
+        "worker_observations": state["observations"],
     }
     return {
         "schema_version": int(metadata["schema_version"]),
@@ -2262,9 +2474,10 @@ def source_worker_quiescence_proof(runner: Runner) -> dict[str, object]:
         "current_attempts": [],
         "active_observations": [],
         "policy_expectations": policies,
+        "quiesced_workers": receipts,
         "policy_count": len(policies),
-        "supervisor_count": len(supervisors),
-        "observation_count": len(observations),
+        "supervisor_count": len(state["supervisors"]),
+        "observation_count": len(state["observations"]),
         "worker_state_sha256": hashlib.sha256(
             canonical(state_document)
         ).hexdigest(),
@@ -2319,6 +2532,130 @@ def _valid_policy_expectations(value: object, *, expected_count: object) -> bool
     return True
 
 
+def _valid_quiesced_workers(
+    value: object, *, expected_policies: object
+) -> bool:
+    if (
+        not isinstance(value, list)
+        or not isinstance(expected_policies, list)
+        or len(value) != len(expected_policies)
+        or len(value) > WORKER_CUTOVER_LIMIT
+    ):
+        return False
+    policies = {
+        str(row.get("server_definition_id")): row
+        for row in expected_policies
+        if isinstance(row, Mapping)
+    }
+    if len(policies) != len(expected_policies):
+        return False
+    expected_fields = {
+        "worker_id",
+        "execution_uid",
+        "repository_id",
+        "definition_generation",
+        "policy_generation",
+        "unit",
+        "expected_slice",
+        "loaded_before",
+        "active_before",
+        "runner_pid_before",
+        "control_group",
+        "cgroup_populated_before",
+        "removal_reply",
+        "unit_unloaded",
+        "cgroup_empty",
+        "process_proofs",
+    }
+    seen: set[str] = set()
+    for receipt in value:
+        if not isinstance(receipt, Mapping) or set(receipt) != expected_fields:
+            return False
+        worker_id = receipt.get("worker_id")
+        policy = policies.get(str(worker_id))
+        try:
+            canonical_id = str(uuid.UUID(str(worker_id)))
+        except (ValueError, TypeError, AttributeError):
+            return False
+        if (
+            canonical_id != worker_id
+            or worker_id in seen
+            or policy is None
+            or receipt.get("execution_uid") != policy.get("execution_uid")
+            or receipt.get("repository_id") != policy.get("repo_id")
+            or receipt.get("definition_generation")
+            != policy.get("definition_generation")
+            or receipt.get("policy_generation") != policy.get("policy_generation")
+            or receipt.get("unit")
+            != f"devcoordinator-worker-{worker_id}.service"
+            or type(receipt.get("loaded_before")) is not bool
+            or type(receipt.get("active_before")) is not bool
+            or receipt.get("active_before") is True
+            and receipt.get("loaded_before") is not True
+            or receipt.get("unit_unloaded") is not True
+            or receipt.get("cgroup_empty") is not True
+            or receipt.get("removal_reply") not in {"complete", "reconciled"}
+        ):
+            return False
+        expected_slice = receipt.get("expected_slice")
+        if expected_slice is not None and (
+            not isinstance(expected_slice, str)
+            or not expected_slice
+            or len(expected_slice.encode("utf-8")) > 512
+            or any(character in expected_slice for character in "\x00\r\n")
+        ):
+            return False
+        if receipt.get("loaded_before") is True:
+            if expected_slice != project_repository_slice(
+                uid=int(receipt["execution_uid"]),
+                repository_id=str(receipt["repository_id"]),
+            ):
+                return False
+        elif expected_slice is not None:
+            return False
+        runner_pid = receipt.get("runner_pid_before")
+        if runner_pid is not None and (type(runner_pid) is not int or runner_pid <= 1):
+            return False
+        control_group = receipt.get("control_group")
+        if control_group is not None and (
+            not isinstance(control_group, str)
+            or not control_group.startswith("/")
+            or "\x00" in control_group
+            or any(part in {"", ".", ".."} for part in control_group.split("/")[1:])
+        ):
+            return False
+        populated_before = receipt.get("cgroup_populated_before")
+        if populated_before is not None and type(populated_before) is not bool:
+            return False
+        processes = receipt.get("process_proofs")
+        if not isinstance(processes, list) or len(processes) > 8:
+            return False
+        identities: set[tuple[int, str]] = set()
+        for process in processes:
+            if not isinstance(process, Mapping) or set(process) != {
+                "pid",
+                "process_start_time",
+                "state",
+            }:
+                return False
+            pid = process.get("pid")
+            started = process.get("process_start_time")
+            if (
+                type(pid) is not int
+                or pid <= 1
+                or not isinstance(started, str)
+                or not started
+                or len(started.encode("utf-8")) > 256
+                or any(character in started for character in "\x00\r\n")
+                or process.get("state") not in {"absent", "pid_reused"}
+                or (pid, started) in identities
+            ):
+                return False
+            identities.add((pid, started))
+        seen.add(str(worker_id))
+    return seen == set(policies)
+
+
 def _valid_source_worker_quiescence(value: object) -> bool:
     return bool(
         isinstance(value, Mapping)
@@ -2332,6 +2669,7 @@ def _valid_source_worker_quiescence(value: object) -> bool:
             "current_attempts",
             "active_observations",
             "policy_expectations",
+            "quiesced_workers",
             "policy_count",
             "supervisor_count",
             "observation_count",
@@ -2351,6 +2689,10 @@ def _valid_source_worker_quiescence(value: object) -> bool:
             value.get("policy_expectations"),
             expected_count=value.get("policy_count"),
         )
+        and _valid_quiesced_workers(
+            value.get("quiesced_workers"),
+            expected_policies=value.get("policy_expectations"),
+        )
         and all(
             type(value.get(field)) is int and int(value[field]) >= 0
             for field in (
@@ -2369,21 +2711,147 @@ def _valid_source_worker_quiescence(value: object) -> bool:
     )
 
 
+def quiesce_source_workers(
+    document: Mapping[str, object],
+    runner: Runner,
+    *,
+    process_observer: Callable[[int, str], str] = observe_worker_process_identity,
+    cgroup_root: Path = CGROUP_ROOT,
+) -> dict[str, object]:
+    """Stop exact schema-15 runners while leaving retained policy untouched."""
+
+    before = _read_source_worker_state(runner)
+    policies = list(before["policies"])
+    policy_ids = {str(row["server_definition_id"]) for row in policies}
+    loaded = set(before["worker_units"])
+    unattributed = sorted(loaded - policy_ids)
+    if unattributed:
+        raise SwitchError(
+            "schema rebaseline found managed units without retained policy: "
+            + ", ".join(unattributed)
+        )
+    attempts_by_worker: dict[str, list[dict[str, object]]] = {}
+    for row in before["attempts"]:
+        attempts_by_worker.setdefault(
+            str(row["server_definition_id"]), []
+        ).append(dict(row))
+    script = _candidate_coordinator_script(document)
+    manager_factory = _worker_native_factory(runner)
+    receipts: list[dict[str, object]] = []
+    for policy in policies:
+        worker_id = str(policy["server_definition_id"])
+        identities: list[dict[str, object]] = []
+        for row in attempts_by_worker.get(worker_id, []):
+            if row.get("pid") is not None:
+                identities.append(
+                    {
+                        "pid": int(row["pid"]),
+                        "process_start_time": str(row["process_start_time"]),
+                    }
+                )
+        manager = manager_factory(coordinator_script=script, state_root=None)
+        try:
+            receipt = quiesce_worker_registration(
+                manager=manager,
+                worker_id=worker_id,
+                execution_uid=int(policy["execution_uid"]),
+                repository_id=str(policy["repo_id"]),
+                process_identities=identities,
+                timeout_seconds=45.0,
+                observer=process_observer,
+            )
+        except (WorkerControlError, WorkerNativeError, OSError) as error:
+            raise SwitchError(
+                "schema rebaseline could not quiesce managed worker " + worker_id
+            ) from error
+        receipt.update(
+            {
+                "definition_generation": int(policy["definition_generation"]),
+                "policy_generation": int(policy["policy_generation"]),
+            }
+        )
+        receipts.append(receipt)
+
+    proof = source_worker_quiescence_proof(
+        runner,
+        quiesced_workers=receipts,
+        process_observer=process_observer,
+        cgroup_root=cgroup_root,
+    )
+    if proof["policy_expectations"] != policies:
+        raise SwitchError("source worker policy changed during release quiescence")
+    return proof
+
+
 def bind_source_worker_quiescence(
     document: dict[str, object],
     intent: dict[str, object],
     journal_path: Path,
     runner: Runner,
+    *,
+    process_observer: Callable[[int, str], str] = observe_worker_process_identity,
+    cgroup_root: Path = CGROUP_ROOT,
 ) -> dict[str, object]:
-    observed = source_worker_quiescence_proof(runner)
     retained = intent.get("source_worker_quiescence")
     if retained is None:
+        observed = quiesce_source_workers(
+            document,
+            runner,
+            process_observer=process_observer,
+            cgroup_root=cgroup_root,
+        )
         intent["source_worker_quiescence"] = observed
         document["retained_control_rebaseline"] = intent
         save_phase(journal_path, document, str(document["phase"]))
         return observed
-    if not _valid_source_worker_quiescence(retained) or dict(retained) != observed:
-        raise SwitchError("source worker quiescence changed before schema rebaseline")
+    if not _valid_source_worker_quiescence(retained):
+        raise SwitchError("source worker quiescence journal proof is invalid")
+
+    def refresh_planned_quiescence() -> dict[str, object]:
+        if intent.get("status") != "planned":
+            raise SwitchError(
+                "source worker quiescence changed before schema rebaseline"
+            )
+        current = source_worker_policy_expectations(runner)
+        if (
+            current["policy_expectations"]
+            != retained["policy_expectations"]
+        ):
+            raise SwitchError(
+                "source worker policy changed before schema rebaseline"
+            )
+        refreshed = quiesce_source_workers(
+            document,
+            runner,
+            process_observer=process_observer,
+            cgroup_root=cgroup_root,
+        )
+        if (
+            refreshed["policy_expectations"]
+            != retained["policy_expectations"]
+        ):
+            raise SwitchError(
+                "source worker policy changed during replayed quiescence"
+            )
+        intent["source_worker_quiescence"] = refreshed
+        document["retained_control_rebaseline"] = intent
+        save_phase(journal_path, document, str(document["phase"]))
+        return refreshed
+
+    try:
+        observed = source_worker_quiescence_proof(
+            runner,
+            quiesced_workers=retained["quiesced_workers"],
+            process_observer=process_observer,
+            cgroup_root=cgroup_root,
+        )
+    except SwitchError as error:
+        try:
+            return refresh_planned_quiescence()
+        except SwitchError as replay_error:
+            raise replay_error from error
+    if dict(retained) != observed:
+        return refresh_planned_quiescence()
     return observed
 
 
@@ -2773,6 +3241,275 @@ def require_credentialized_worker_convergence(
         sleeper(min(0.1, max(0.0, deadline - float(clock()))))
 
 
+def _retained_worker_rows() -> tuple[int, dict[str, dict[str, object]]]:
+    """Read all retained worker policies and their current runtime evidence."""
+
+    try:
+        connection = sqlite3.connect(
+            f"{AUTHORITY_DATABASE.as_uri()}?mode=ro", uri=True, timeout=10.0
+        )
+        connection.row_factory = sqlite3.Row
+        try:
+            connection.execute("PRAGMA query_only=ON")
+            metadata = connection.execute(
+                "SELECT schema_version FROM schema_metadata WHERE singleton=1"
+            ).fetchone()
+            rows = [
+                dict(row)
+                for row in connection.execute(
+                    """
+                    SELECT definition.server_definition_id,definition.repo_id,
+                           definition.generation AS definition_generation,
+                           definition.health_url_template,
+                           policy.execution_uid,policy.keep_alive,
+                           policy.desired_state,policy.breaker_state,
+                           policy.generation AS policy_generation,
+                           supervisor.state AS supervisor_state,
+                           supervisor.supervisor_epoch,
+                           supervisor.supervisor_generation,
+                           supervisor.current_attempt_id,
+                           attempt.state AS attempt_state,attempt.pid AS attempt_pid,
+                           attempt.process_start_time AS attempt_process_start_time,
+                           attempt.process_fingerprint AS attempt_process_fingerprint,
+                           attempt.definition_generation AS attempt_definition_generation,
+                           attempt.policy_generation AS attempt_policy_generation,
+                           attempt.supervisor_generation AS attempt_supervisor_generation,
+                           attempt.supervisor_epoch AS attempt_supervisor_epoch,
+                           observation.lifecycle AS observation_lifecycle,
+                           observation.pid AS observation_pid,
+                           observation.process_start_time AS observation_process_start_time,
+                           observation.process_fingerprint AS observation_process_fingerprint,
+                           observation.listener_observable,
+                           observation.health_ok
+                    FROM worker_policies policy
+                    JOIN server_definitions definition USING(server_definition_id)
+                    JOIN worker_supervisor_states supervisor USING(server_definition_id)
+                    LEFT JOIN worker_attempts attempt
+                      ON attempt.attempt_id=supervisor.current_attempt_id
+                    LEFT JOIN server_observations observation USING(server_definition_id)
+                    ORDER BY definition.server_definition_id
+                    """
+                )
+            ]
+        finally:
+            connection.close()
+    except sqlite3.Error as error:
+        raise SwitchError("retained worker convergence cannot be read") from error
+    if (
+        metadata is None
+        or type(metadata["schema_version"]) is not int
+        or len(rows) > WORKER_CUTOVER_LIMIT
+    ):
+        raise SwitchError("retained worker convergence metadata is invalid")
+    by_id = {str(row["server_definition_id"]): row for row in rows}
+    if len(by_id) != len(rows):
+        raise SwitchError("retained worker convergence is duplicated")
+    return int(metadata["schema_version"]), by_id
+
+
+def _retained_worker_policy_blockers(
+    runner: Runner,
+    *,
+    source_proof: Mapping[str, object],
+    target_schema_version: int,
+    generation_offset: int,
+    cgroup_root: Path = CGROUP_ROOT,
+    process_observer: Callable[[int, str], str] = observe_worker_process_identity,
+) -> tuple[tuple[str, ...], str]:
+    raw_expectations = source_proof.get("policy_expectations")
+    if not _valid_policy_expectations(
+        raw_expectations, expected_count=source_proof.get("policy_count")
+    ):
+        raise SwitchError("retained worker source expectations are invalid")
+    if generation_offset not in {0, 1}:
+        raise SwitchError("retained worker generation offset is invalid")
+    expected = {
+        str(value["server_definition_id"]): value
+        for value in raw_expectations
+    }
+    schema_version, rows = _retained_worker_rows()
+    if schema_version != target_schema_version:
+        raise SwitchError("retained worker authority schema is incompatible")
+    loaded = set(loaded_managed_worker_ids(runner))
+    blockers: set[str] = (set(rows) ^ set(expected)) | (loaded - set(expected))
+    stability: list[dict[str, object]] = []
+    for worker_id, source in expected.items():
+        row = rows.get(worker_id)
+        if row is None:
+            blockers.add(worker_id)
+            continue
+        desired_state = (
+            "stopped"
+            if source["breaker_state"] == "tripped" and generation_offset == 1
+            else source["desired_state"]
+        )
+        if (
+            row.get("repo_id") != source["repo_id"]
+            or row.get("execution_uid") != source["execution_uid"]
+            or row.get("keep_alive") != source["keep_alive"]
+            or row.get("desired_state") != desired_state
+            or row.get("breaker_state") != source["breaker_state"]
+            or row.get("definition_generation")
+            != int(source["definition_generation"]) + generation_offset
+            or row.get("policy_generation")
+            != int(source["policy_generation"]) + generation_offset
+        ):
+            blockers.add(worker_id)
+            continue
+        expected_running = bool(
+            row["keep_alive"] == 1
+            and row["desired_state"] == "running"
+            and row["breaker_state"] == "armed"
+        )
+        active_observation = bool(
+            row.get("observation_pid") is not None
+            or str(row.get("observation_lifecycle") or "")
+            in {"starting", "running", "unhealthy", "stopping"}
+        )
+        if not expected_running:
+            if (
+                worker_id in loaded
+                or row.get("current_attempt_id") is not None
+                or row.get("attempt_state") in {"reserved", "running"}
+                or active_observation
+            ):
+                blockers.add(worker_id)
+            else:
+                stability.append(
+                    {
+                        "worker_id": worker_id,
+                        "state": "absent",
+                        "definition_generation": row["definition_generation"],
+                        "policy_generation": row["policy_generation"],
+                    }
+                )
+            continue
+        try:
+            native = _managed_worker_native_state(
+                runner, worker_id, cgroup_root=cgroup_root
+            )
+        except SwitchError:
+            blockers.add(worker_id)
+            continue
+        attempt_pid = row.get("attempt_pid")
+        attempt_start = row.get("attempt_process_start_time")
+        try:
+            process_alive = bool(
+                type(attempt_pid) is int
+                and isinstance(attempt_start, str)
+                and attempt_start
+                and process_observer(attempt_pid, attempt_start) == "alive"
+            )
+        except (OSError, RuntimeError, ValueError):
+            process_alive = False
+        expected_slice = project_repository_slice(
+            uid=int(row["execution_uid"]), repository_id=str(row["repo_id"])
+        )
+        health_contract = bool(
+            row.get("health_url_template")
+            or row.get("listener_observable") is not None
+        )
+        if (
+            row.get("supervisor_state") != "running"
+            or row.get("current_attempt_id") is None
+            or row.get("attempt_state") != "running"
+            or row.get("attempt_definition_generation")
+            != row.get("definition_generation")
+            or row.get("attempt_policy_generation") != row.get("policy_generation")
+            or row.get("attempt_supervisor_generation")
+            != row.get("supervisor_generation")
+            or row.get("attempt_supervisor_epoch") != row.get("supervisor_epoch")
+            or worker_id not in loaded
+            or native.get("loaded") is not True
+            or native.get("active") is not True
+            or native.get("main_pid") is None
+            or native.get("cgroup_populated") is not True
+            or native.get("slice") != expected_slice
+            or not process_alive
+            or row.get("observation_lifecycle") != "running"
+            or row.get("observation_pid") != attempt_pid
+            or row.get("observation_process_start_time") != attempt_start
+            or row.get("observation_process_fingerprint")
+            != row.get("attempt_process_fingerprint")
+            or (health_contract and row.get("health_ok") != 1)
+        ):
+            blockers.add(worker_id)
+            continue
+        stability.append(
+            {
+                "worker_id": worker_id,
+                "state": "running",
+                "definition_generation": row["definition_generation"],
+                "policy_generation": row["policy_generation"],
+                "supervisor_generation": row["supervisor_generation"],
+                "supervisor_epoch": row["supervisor_epoch"],
+                "attempt_id": row["current_attempt_id"],
+                "attempt_pid": attempt_pid,
+                "attempt_process_start_time": attempt_start,
+                "native_main_pid": native["main_pid"],
+                "native_control_group": native["control_group"],
+                "native_slice": native["slice"],
+                "health_contract": health_contract,
+                "health_ok": row["health_ok"] if health_contract else None,
+            }
+        )
+    return (
+        tuple(sorted(blockers)),
+        hashlib.sha256(
+            canonical(sorted(stability, key=lambda item: str(item["worker_id"])))
+        ).hexdigest(),
+    )
+
+
+def require_retained_worker_policy_convergence(
+    runner: Runner,
+    *,
+    source_proof: Mapping[str, object],
+    target_schema_version: int,
+    generation_offset: int,
+    timeout_seconds: float = 60.0,
+    stable_seconds: float = 2.0,
+    clock: Callable[[], float] = time.monotonic,
+    sleeper: Callable[[float], None] = time.sleep,
+    cgroup_root: Path = CGROUP_ROOT,
+    process_observer: Callable[[int, str], str] = observe_worker_process_identity,
+) -> None:
+    """Prove retained policy and the exact desired keep-alive set converged."""
+
+    deadline = float(clock()) + max(0.1, float(timeout_seconds))
+    stable_fingerprint: str | None = None
+    stable_since: float | None = None
+    blockers: tuple[str, ...] = ()
+    while True:
+        blockers, fingerprint = _retained_worker_policy_blockers(
+            runner,
+            source_proof=source_proof,
+            target_schema_version=target_schema_version,
+            generation_offset=generation_offset,
+            cgroup_root=cgroup_root,
+            process_observer=process_observer,
+        )
+        if not blockers:
+            observed_at = float(clock())
+            if (
+                stable_fingerprint == fingerprint
+                and stable_since is not None
+                and observed_at - stable_since >= max(0.1, float(stable_seconds))
+            ):
+                return
+            if stable_fingerprint != fingerprint:
+                stable_fingerprint = fingerprint
+                stable_since = observed_at
+        else:
+            stable_fingerprint = None
+            stable_since = None
+        if float(clock()) >= deadline:
+            raise SwitchError(
+                "retained workers did not converge: " + ", ".join(blockers)
+            )
+        sleeper(min(0.1, max(0.0, deadline - float(clock()))))
+
+
 def _candidate_coordinator_script(document: Mapping[str, object]) -> Path:
     release = Path(str(document.get("release") or ""))
     script = release / "skills/codex-dev-coordinator/scripts/dev_coordinator.py"
@@ -2866,11 +3603,11 @@ def stop_candidate_workers_for_rollback(
     intent: Mapping[str, object],
     runner: Runner,
 ) -> tuple[str, ...]:
-    """Stop only post-rebaseline workers, proven by the empty source receipt."""
+    """Stop only post-rebaseline workers, proven by source quiescence."""
 
     source_proof = intent.get("source_worker_quiescence")
     if not _valid_source_worker_quiescence(source_proof):
-        raise SwitchError("candidate worker cleanup lacks empty source proof")
+        raise SwitchError("candidate worker cleanup lacks source quiescence proof")
     loaded = set(loaded_managed_worker_ids(runner))
     rows, nonterminal = _candidate_worker_cleanup_rows()
     candidates = tuple(sorted(loaded | set(nonterminal)))
@@ -3557,12 +4294,13 @@ def apply_retained_control_rebaseline(
         require_no_managed_worker_units(runner)
     stop_authority_writers(runner)
     if source_status:
-        post_stop_proof = source_worker_quiescence_proof(runner)
         retained_proof = intent.get("source_worker_quiescence")
-        if (
-            not _valid_source_worker_quiescence(retained_proof)
-            or dict(retained_proof) != post_stop_proof
-        ):
+        if not _valid_source_worker_quiescence(retained_proof):
+            raise SwitchError("source worker quiescence journal proof is invalid")
+        post_stop_proof = source_worker_quiescence_proof(
+            runner, quiesced_workers=retained_proof["quiesced_workers"]
+        )
+        if dict(retained_proof) != post_stop_proof:
             raise SwitchError(
                 "source worker quiescence changed while authority writers stopped"
             )
@@ -3644,11 +4382,12 @@ def apply_retained_control_rebaseline(
         # immediately after one os.replace never reached disk.
         _restore_retained_files(backups, credentials)
         retained_proof = intent.get("source_worker_quiescence")
-        restored_proof = source_worker_quiescence_proof(runner)
-        if (
-            not _valid_source_worker_quiescence(retained_proof)
-            or dict(retained_proof) != restored_proof
-        ):
+        if not _valid_source_worker_quiescence(retained_proof):
+            raise SwitchError("source worker quiescence journal proof is invalid")
+        restored_proof = source_worker_quiescence_proof(
+            runner, quiesced_workers=retained_proof["quiesced_workers"]
+        )
+        if dict(retained_proof) != restored_proof:
             raise SwitchError(
                 "restored source worker quiescence differs from its journal proof"
             )
@@ -3720,6 +4459,12 @@ def complete_retained_control_rebaseline(
     manifest = _load_bound_retained_manifest(intent, transaction_root, backups)
     _require_exact_live_retained_target(manifest, backups, transaction_root)
     _require_live_retained_generation(manifest)
+    require_retained_worker_policy_convergence(
+        runner,
+        source_proof=intent["source_worker_quiescence"],
+        target_schema_version=COORDINATOR_SCHEMA_VERSION,
+        generation_offset=1,
+    )
     require_credentialized_worker_convergence(
         manifest,
         transaction_root,
@@ -3748,15 +4493,18 @@ def restore_retained_control_rebaseline(
         raise SwitchError("retained-control rollback backups are unavailable")
     status = str(intent["status"])
     retained_proof = intent.get("source_worker_quiescence")
+    if not _valid_source_worker_quiescence(retained_proof):
+        raise SwitchError("source worker quiescence journal proof is invalid")
     if status in {"backed-up", "prepared"}:
-        observed = source_worker_quiescence_proof(runner)
-        if (
-            not _valid_source_worker_quiescence(retained_proof)
-            or dict(retained_proof) != observed
-        ):
+        observed = source_worker_quiescence_proof(
+            runner, quiesced_workers=retained_proof["quiesced_workers"]
+        )
+        if dict(retained_proof) != observed:
             raise SwitchError("source worker quiescence changed before rollback")
         stop_authority_writers(runner)
-        observed = source_worker_quiescence_proof(runner)
+        observed = source_worker_quiescence_proof(
+            runner, quiesced_workers=retained_proof["quiesced_workers"]
+        )
         if dict(retained_proof) != observed:
             raise SwitchError("source worker quiescence changed while stopping writers")
     elif status == "publishing":
@@ -3764,8 +4512,9 @@ def restore_retained_control_rebaseline(
         stop_authority_writers(runner)
         require_no_managed_worker_units(runner)
     elif status in {"published", "applied"}:
-        # The journal proves the predecessor contained no worker. Every exact
-        # current attempt/unit was therefore created by this candidate.
+        # The journal proves the predecessor had no live worker at publication.
+        # Every exact current attempt/unit was therefore created by candidate
+        # startup and remains candidate-only rollback cleanup.
         stop_authority_writers(runner)
         stop_candidate_workers_for_rollback(document, intent, runner)
     else:
@@ -3781,11 +4530,10 @@ def restore_retained_control_rebaseline(
         credentials = _server_credentials_from_manifest(manifest, transaction_root)
         _cleanup_server_credential_temporaries(credentials, transaction_root)
     _restore_retained_files(backups, credentials)
-    restored_proof = source_worker_quiescence_proof(runner)
-    if (
-        not _valid_source_worker_quiescence(retained_proof)
-        or dict(retained_proof) != restored_proof
-    ):
+    restored_proof = source_worker_quiescence_proof(
+        runner, quiesced_workers=retained_proof["quiesced_workers"]
+    )
+    if dict(retained_proof) != restored_proof:
         raise SwitchError("restored source worker quiescence differs from its journal proof")
     intent.update({"status": "rolled-back", "rolled_back_at": now()})
     document["retained_control_rebaseline"] = intent
@@ -5077,11 +5825,24 @@ def rollback(
             restart_test_plane(runner)
         rebaseline = retained_rebaseline_intent(document)
         if rebaseline["required"] is True:
+            rollback_worker_expectations = (
+                rebaseline["source_worker_quiescence"]
+                if _valid_source_worker_quiescence(
+                    rebaseline.get("source_worker_quiescence")
+                )
+                else source_worker_policy_expectations(runner)
+            )
             if rebaseline["status"] not in {"planned", "rolled-back"}:
                 restore_retained_control_rebaseline(
                     document, journal_path, transaction_root, runner
                 )
             restart_services(runner)
+            require_retained_worker_policy_convergence(
+                runner,
+                source_proof=rollback_worker_expectations,
+                target_schema_version=retained_control.REBASELINE_SOURCE_SCHEMA,
+                generation_offset=0,
+            )
             restart_previous_console(release, document, runner)
         save_phase(journal_path, document, "rolled-back", completed_at=now())
         return document
@@ -5178,6 +5939,17 @@ def rollback(
         rollback_control_plane_restored_at=now(),
     )
     restore_rollback_background_services(runner)
+    rebaseline = retained_rebaseline_intent(document)
+    if rebaseline["required"] is True:
+        source_proof = rebaseline.get("source_worker_quiescence")
+        if not _valid_source_worker_quiescence(source_proof):
+            raise SwitchError("rollback worker restart proof is unavailable")
+        require_retained_worker_policy_convergence(
+            runner,
+            source_proof=source_proof,
+            target_schema_version=retained_control.REBASELINE_SOURCE_SCHEMA,
+            generation_offset=0,
+        )
     candidate_slot = SLOT_ROOT / f"{document['release_digest']}.env"
     candidate_slot.unlink(missing_ok=True)
     save_phase(journal_path, document, "rolled-back", completed_at=now())

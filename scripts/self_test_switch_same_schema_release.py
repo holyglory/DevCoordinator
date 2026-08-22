@@ -25,6 +25,8 @@ sys.path.insert(0, str(ROOT / "scripts"))
 import switch_same_schema_release as switch  # noqa: E402
 from devcoordinator.server_credentials import server_credential_id  # noqa: E402
 from devcoordinator.schema import initialize_schema  # noqa: E402
+from devcoordinator.worker_control import quiesce_worker_registration  # noqa: E402
+from devcoordinator.worker_native import NativeWorkerState  # noqa: E402
 
 
 DIGEST = "a" * 64
@@ -153,8 +155,8 @@ def worker_cutover_database(
                     "begin-worker-cutover",
                     worker_id,
                     repo_id,
-                    8,
-                    5,
+                    8 if schema_version == 16 else 7,
+                    5 if schema_version == 16 else 4,
                     3,
                     "worker-cutover-epoch",
                     "running",
@@ -2176,7 +2178,7 @@ def exercise_retained_server_credential_transaction() -> None:
         )
 
 
-def exercise_rebaseline_refuses_managed_worker_interruption() -> None:
+def exercise_rebaseline_quiesces_exact_managed_workers() -> None:
     worker_a = "11111111-1111-4111-8111-111111111111"
     worker_b = "22222222-2222-4222-8222-222222222222"
 
@@ -2206,19 +2208,6 @@ def exercise_rebaseline_refuses_managed_worker_interruption() -> None:
         switch.loaded_managed_worker_ids(active) == (worker_a, worker_b),
         "managed-worker inventory lost exact canonical identities",
     )
-    try:
-        switch.require_no_managed_worker_units(active)
-    except switch.SwitchError as error:
-        detail = str(error)
-        expect(worker_a in detail and worker_b in detail, "worker blocker omitted exact IDs")
-        expect(".service" not in detail, "worker blocker exposed native unit detail")
-    else:
-        raise AssertionError("active managed workers did not block schema rebaseline")
-    expect(
-        all("stop" not in command and "reset-failed" not in command for command in active.commands),
-        "rebaseline worker precondition interrupted a managed workload",
-    )
-
     malformed = InventoryRunner(
         "devcoordinator-worker-not-a-uuid.service loaded active running worker\n"
     )
@@ -2228,6 +2217,314 @@ def exercise_rebaseline_refuses_managed_worker_interruption() -> None:
         pass
     else:
         raise AssertionError("malformed managed-worker identity was ignored")
+
+    class CutoverManager:
+        def __init__(self, worker_id: str, cgroup_root: Path) -> None:
+            self.worker_id = worker_id
+            self.loaded = True
+            self.active = True
+            self.control_group = f"/workers/{worker_id}"
+            self.cgroup_root = cgroup_root
+            self.remove_timeouts: list[float] = []
+            events = cgroup_root.joinpath(
+                *self.control_group.split("/")[1:]
+            ) / "cgroup.events"
+            events.parent.mkdir(parents=True)
+            events.write_text("populated 1\n", encoding="ascii")
+
+        def status(
+            self, *, worker_id: str, allow_missing: bool = False
+        ) -> NativeWorkerState:
+            del allow_missing
+            expect(worker_id == self.worker_id, "cutover manager targeted another worker")
+            return NativeWorkerState(
+                worker_id=worker_id,
+                manager="systemd",
+                unit=f"devcoordinator-worker-{worker_id}.service",
+                loaded=self.loaded,
+                active=self.active,
+                state="running" if self.loaded else "not-found",
+                pid=31313 if self.loaded else None,
+                exit_status=None,
+                control_group=self.control_group if self.loaded else None,
+                cgroup_populated=True if self.loaded else None,
+            )
+
+        def require_project_isolation(
+            self, *, worker_id: str, uid: int, repository_id: str
+        ) -> str:
+            expect(worker_id == self.worker_id, "isolation used another worker")
+            expect(uid > 0 and bool(repository_id), "isolation omitted attribution")
+            return switch.project_repository_slice(
+                uid=uid, repository_id=repository_id
+            )
+
+        def remove(
+            self, *, worker_id: str, timeout_seconds: float
+        ) -> NativeWorkerState:
+            expect(worker_id == self.worker_id, "removal targeted another worker")
+            self.remove_timeouts.append(timeout_seconds)
+            self.loaded = False
+            self.active = False
+            events = self.cgroup_root.joinpath(
+                *self.control_group.split("/")[1:]
+            ) / "cgroup.events"
+            events.write_text("populated 0\n", encoding="ascii")
+            return self.status(worker_id=worker_id, allow_missing=True)
+
+        def require_control_group_empty(self, control_group: str) -> bool:
+            expect(control_group == self.control_group, "cgroup proof changed identity")
+            events = self.cgroup_root.joinpath(
+                *control_group.split("/")[1:]
+            ) / "cgroup.events"
+            expect(
+                events.read_text(encoding="ascii") == "populated 0\n",
+                "cutover accepted a populated cgroup",
+            )
+            return True
+
+    class ManagedRunner(FakeRunner):
+        def __init__(self, manager: CutoverManager) -> None:
+            super().__init__()
+            self.manager = manager
+
+        def require(self, argv: list[str], _label: str) -> str:
+            self.commands.append(list(argv))
+            if "list-units" in argv and self.manager.loaded:
+                return (
+                    f"devcoordinator-worker-{self.manager.worker_id}.service "
+                    "loaded active running worker\n"
+                )
+            return ""
+
+    with tempfile.TemporaryDirectory(prefix="active-worker-cutover-") as raw:
+        root = Path(raw)
+        database = root / "authority.sqlite3"
+        identities = worker_cutover_database(
+            database, schema_version=15, running=True
+        )
+        manager = CutoverManager(str(identities["worker_id"]), root / "cgroup")
+        runner = ManagedRunner(manager)
+        journal = root / "journal.json"
+        document: dict[str, object] = {
+            "phase": "prepared",
+            "release": str(ROOT),
+        }
+        intent: dict[str, object] = {}
+        with (
+            mock.patch.object(switch, "AUTHORITY_DATABASE", database),
+            mock.patch.object(
+                switch,
+                "_candidate_coordinator_script",
+                return_value=ROOT / "skills/codex-dev-coordinator/scripts/dev_coordinator.py",
+            ),
+            mock.patch.object(
+                switch,
+                "_worker_native_factory",
+                return_value=lambda **_values: manager,
+            ),
+        ):
+            proof = switch.bind_source_worker_quiescence(
+                document,
+                intent,
+                journal,
+                runner,
+                process_observer=lambda _pid, _started: "absent",
+                cgroup_root=root / "cgroup",
+            )
+            expect(
+                switch._valid_source_worker_quiescence(proof),
+                "active source worker did not produce a valid quiescence proof",
+            )
+            replay = switch.bind_source_worker_quiescence(
+                document,
+                intent,
+                journal,
+                runner,
+                process_observer=lambda _pid, _started: "absent",
+                cgroup_root=root / "cgroup",
+            )
+            expect(replay == proof, "source worker quiescence was not replayable")
+            intent["status"] = "planned"
+            manager.loaded = True
+            manager.active = True
+            manager.cgroup_root.joinpath(
+                *manager.control_group.split("/")[1:]
+            ).joinpath("cgroup.events").write_text(
+                "populated 1\n", encoding="ascii"
+            )
+            recovered = switch.bind_source_worker_quiescence(
+                document,
+                intent,
+                journal,
+                runner,
+                process_observer=lambda _pid, _started: "absent",
+                cgroup_root=root / "cgroup",
+            )
+            expect(
+                recovered["policy_expectations"] == proof["policy_expectations"],
+                "replayed quiescence changed retained policy",
+            )
+        expect(
+            manager.remove_timeouts == [45.0, 45.0],
+            "cutover stop/replay was not bounded above 30s",
+        )
+        connection = sqlite3.connect(database)
+        policy = connection.execute(
+            "SELECT keep_alive,desired_state,breaker_state,generation "
+            "FROM worker_policies WHERE server_definition_id=?",
+            (identities["worker_id"],),
+        ).fetchone()
+        connection.close()
+        expect(
+            policy == (1, "running", "armed", 4),
+            "worker quiescence changed retained desired policy",
+        )
+
+        race_database = root / "race-authority.sqlite3"
+        race_ids = worker_cutover_database(
+            race_database, schema_version=15, running=True
+        )
+        race_manager = CutoverManager(
+            str(race_ids["worker_id"]), root / "race-cgroup"
+        )
+
+        class RacingRunner(ManagedRunner):
+            def __init__(self, manager: CutoverManager) -> None:
+                super().__init__(manager)
+                self.inventory_reads = 0
+
+            def require(self, argv: list[str], _label: str) -> str:
+                self.commands.append(list(argv))
+                if "list-units" not in argv:
+                    return ""
+                self.inventory_reads += 1
+                if self.inventory_reads <= 2 or not self.manager.loaded:
+                    return (
+                        f"devcoordinator-worker-{self.manager.worker_id}.service "
+                        "loaded active running worker\n"
+                    )
+                return ""
+
+        race_runner = RacingRunner(race_manager)
+        race_document: dict[str, object] = {
+            "phase": "prepared",
+            "release": str(ROOT),
+        }
+        with (
+            mock.patch.object(switch, "AUTHORITY_DATABASE", race_database),
+            mock.patch.object(
+                switch,
+                "_candidate_coordinator_script",
+                return_value=ROOT / "skills/codex-dev-coordinator/scripts/dev_coordinator.py",
+            ),
+            mock.patch.object(
+                switch,
+                "_worker_native_factory",
+                return_value=lambda **_values: race_manager,
+            ),
+        ):
+            try:
+                switch.bind_source_worker_quiescence(
+                    race_document,
+                    {},
+                    root / "race-journal.json",
+                    race_runner,
+                    process_observer=lambda _pid, _started: "absent",
+                    cgroup_root=root / "race-cgroup",
+                )
+            except switch.SwitchError:
+                pass
+            else:
+                raise AssertionError("worker unit restart race passed quiescence")
+
+        missing = CutoverManager(str(identities["worker_id"]), root / "missing-cgroup")
+        missing.loaded = False
+        missing.active = False
+        termination_calls: list[tuple[int, str, float]] = []
+        fallback = quiesce_worker_registration(
+            manager=missing,
+            worker_id=str(identities["worker_id"]),
+            execution_uid=os.geteuid() or 1000,
+            repository_id=str(identities["repo_id"]),
+            process_identities=[
+                {"pid": 42424, "process_start_time": "process-start"}
+            ],
+            timeout_seconds=45.0,
+            observer=lambda _pid, _started: "alive",
+            terminator=lambda **values: (
+                termination_calls.append(
+                    (
+                        int(values["pid"]),
+                        str(values["process_start_time"]),
+                        float(values["timeout_seconds"]),
+                    )
+                )
+                or "absent"
+            ),
+        )
+        expect(
+            fallback["process_proofs"][0]["state"] == "absent"
+            and termination_calls == [(42424, "process-start", 45.0)],
+            "missing-runner fallback did not terminate the exact attempt identity",
+        )
+        receipt = quiesce_worker_registration(
+            manager=missing,
+            worker_id=str(identities["worker_id"]),
+            execution_uid=os.geteuid() or 1000,
+            repository_id=str(identities["repo_id"]),
+            process_identities=[
+                {"pid": 42424, "process_start_time": "process-start"}
+            ],
+            timeout_seconds=45.0,
+            observer=lambda _pid, _started: "mismatch",
+        )
+        expect(
+            receipt["process_proofs"] == [
+                {
+                    "pid": 42424,
+                    "process_start_time": "process-start",
+                    "state": "pid_reused",
+                }
+            ],
+            "missing-runner PID reuse was not terminal absence",
+        )
+        unobservable = CutoverManager(
+            str(identities["worker_id"]), root / "unobservable-cgroup"
+        )
+        unobservable.loaded = False
+        unobservable.active = False
+        try:
+            quiesce_worker_registration(
+                manager=unobservable,
+                worker_id=str(identities["worker_id"]),
+                execution_uid=os.geteuid() or 1000,
+                repository_id=str(identities["repo_id"]),
+                process_identities=[
+                    {"pid": 42424, "process_start_time": "process-start"}
+                ],
+                timeout_seconds=45.0,
+                observer=lambda _pid, _started: "unknown",
+            )
+        except switch.WorkerControlError:
+            pass
+        else:
+            raise AssertionError("unobservable process identity passed cutover")
+
+    one_policy = InventoryRunner(
+        f"devcoordinator-worker-{worker_a}.service loaded active running worker\n"
+        f"devcoordinator-worker-{worker_b}.service loaded active running worker\n"
+    )
+    with tempfile.TemporaryDirectory(prefix="unknown-worker-cutover-") as raw:
+        database = Path(raw) / "authority.sqlite3"
+        worker_cutover_database(database, schema_version=15, running=False)
+        with mock.patch.object(switch, "AUTHORITY_DATABASE", database):
+            try:
+                switch.quiesce_source_workers({"release": str(ROOT)}, one_policy)
+            except switch.SwitchError as error:
+                expect(worker_b in str(error), "unknown worker blocker omitted exact identity")
+            else:
+                raise AssertionError("unattributed managed unit was stopped or ignored")
 
 
 def exercise_source_worker_quiescence_is_exact_and_race_safe() -> None:
@@ -2249,9 +2546,9 @@ def exercise_source_worker_quiescence_is_exact_and_race_safe() -> None:
         document: dict[str, object] = {"phase": "prepared"}
         intent: dict[str, object] = {}
         with mock.patch.object(switch, "AUTHORITY_DATABASE", database):
-            proof = switch.bind_source_worker_quiescence(
-                document, intent, journal, runner
-            )
+            proof = switch.source_worker_quiescence_proof(runner)
+            intent["source_worker_quiescence"] = proof
+            document["retained_control_rebaseline"] = intent
             expect(
                 switch._valid_source_worker_quiescence(proof),
                 "source worker quiescence proof is not self-validating",
@@ -2436,6 +2733,20 @@ def exercise_credentialized_web_worker_convergence() -> None:
                 process_observer=lambda _pid, _started: "alive",
             )
             expect(blockers == (), "credentialized web worker did not converge")
+            policy_blockers, _policy_fingerprint = (
+                switch._retained_worker_policy_blockers(
+                    runner,
+                    source_proof=source_proof,
+                    target_schema_version=16,
+                    generation_offset=1,
+                    cgroup_root=cgroup_root,
+                    process_observer=lambda _pid, _started: "alive",
+                )
+            )
+            expect(
+                policy_blockers == (),
+                "candidate did not restart the retained desired-running policy",
+            )
             switch.require_credentialized_worker_convergence(
                 manifest,
                 transaction,
@@ -2453,6 +2764,59 @@ def exercise_credentialized_web_worker_convergence() -> None:
                 "credentialized worker passed without a stable-running interval",
             )
 
+            clock_value[0] = 0.0
+            switch.require_retained_worker_policy_convergence(
+                runner,
+                source_proof=source_proof,
+                target_schema_version=16,
+                generation_offset=1,
+                timeout_seconds=5.0,
+                stable_seconds=2.0,
+                clock=clock,
+                sleeper=sleeper,
+                cgroup_root=cgroup_root,
+                process_observer=lambda _pid, _started: "alive",
+            )
+
+        rollback_database = root / "rollback.sqlite3"
+        rollback_ids = worker_cutover_database(
+            rollback_database, schema_version=15, running=True, role="web"
+        )
+        rollback_control_group = (
+            "/devcoordinator.slice/"
+            f"devcoordinator-worker-{rollback_ids['worker_id']}.service"
+        )
+        rollback_cgroup_root = root / "rollback-cgroup"
+        rollback_events = rollback_cgroup_root.joinpath(
+            *rollback_control_group.split("/")[1:]
+        ) / "cgroup.events"
+        rollback_events.parent.mkdir(parents=True, mode=0o700)
+        rollback_events.write_text("populated 1\n", encoding="ascii")
+        rollback_runner = ConvergenceRunner(
+            str(rollback_ids["worker_id"]), worker_slice, rollback_control_group
+        )
+        with mock.patch.object(switch, "AUTHORITY_DATABASE", rollback_database):
+            rollback_blockers, _rollback_fingerprint = (
+                switch._retained_worker_policy_blockers(
+                    rollback_runner,
+                    source_proof=source_proof,
+                    target_schema_version=15,
+                    generation_offset=0,
+                    cgroup_root=rollback_cgroup_root,
+                    process_observer=lambda _pid, _started: "alive",
+                )
+            )
+        expect(
+            rollback_blockers == (),
+            "rollback did not restart the original desired-running policy",
+        )
+
+        with (
+            mock.patch.object(switch, "AUTHORITY_DATABASE", target_database),
+            mock.patch.object(
+                switch, "SERVER_CREDENTIAL_MATERIAL_ROOT", live_root
+            ),
+        ):
             connection = sqlite3.connect(target_database)
             connection.execute(
                 "UPDATE server_observations SET health_ok=NULL "
@@ -2598,6 +2962,7 @@ def exercise_candidate_worker_rollback_cleanup() -> None:
         "current_attempts": [],
         "active_observations": [],
         "policy_expectations": [],
+        "quiesced_workers": [],
         "policy_count": 0,
         "supervisor_count": 0,
         "observation_count": 0,
@@ -2868,6 +3233,9 @@ def exercise_verification_requires_boot_enablement() -> None:
     retained_rollback_source = inspect.getsource(
         switch.restore_retained_control_rebaseline
     )
+    retained_completion_source = inspect.getsource(
+        switch.complete_retained_control_rebaseline
+    )
     main_source = inspect.getsource(switch.main)
     expect(
         "enabled_states = {unit: unit_enabled" in source
@@ -2925,6 +3293,21 @@ def exercise_verification_requires_boot_enablement() -> None:
         < retained_rollback_source.index("_restore_retained_files(")
         and '["/usr/bin/systemctl", "disable", candidate]' in rollback_source,
         "post-promotion rollback starts a Console before stopping writers and restoring retained data",
+    )
+    expect(
+        retained_completion_source.index(
+            "require_retained_worker_policy_convergence("
+        )
+        < retained_completion_source.index(
+            "require_credentialized_worker_convergence("
+        )
+        and rollback_source.rindex(
+            "restore_rollback_background_services(runner)"
+        )
+        < rollback_source.rindex(
+            "require_retained_worker_policy_convergence("
+        ),
+        "candidate or rollback can complete before retained workers restart",
     )
     expect(
         'args.action == "verify" and value.get("ok") is not True' in main_source
@@ -2992,7 +3375,7 @@ def main() -> int:
     exercise_reset_cli_is_explicit()
     exercise_retained_control_transaction_boundary()
     exercise_retained_server_credential_transaction()
-    exercise_rebaseline_refuses_managed_worker_interruption()
+    exercise_rebaseline_quiesces_exact_managed_workers()
     exercise_source_worker_quiescence_is_exact_and_race_safe()
     exercise_credentialized_web_worker_convergence()
     exercise_candidate_worker_rollback_cleanup()

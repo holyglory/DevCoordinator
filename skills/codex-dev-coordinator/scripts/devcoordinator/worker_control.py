@@ -13,7 +13,7 @@ from pathlib import Path
 import pwd
 import signal
 import time
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, Sequence
 import uuid
 
 from .server_credentials import (
@@ -65,6 +65,209 @@ STARTUP_AUTOSTART_ATTEMPTS = 3
 STARTUP_AUTOSTART_RETRY_SECONDS = 0.25
 STARTUP_CONVERGENCE_SECONDS = 60.0
 STARTUP_CONVERGENCE_POLL_SECONDS = 0.1
+
+
+def quiesce_worker_registration(
+    *,
+    manager: Any,
+    worker_id: str,
+    execution_uid: int,
+    repository_id: str,
+    process_identities: Sequence[Mapping[str, Any]],
+    timeout_seconds: float,
+    observer: ProcessObserver = observe_worker_process_identity,
+    terminator: ProcessTerminator | None = None,
+    clock: Callable[[], float] = time.monotonic,
+    sleeper: Callable[[float], None] = time.sleep,
+) -> dict[str, Any]:
+    """Quiesce one exact systemd worker without changing durable policy.
+
+    This is the release-cutover primitive for the approved retained-control
+    rebaseline.  It accepts only broker-derived worker, execution and
+    repository identities; proves any loaded transient unit belongs to the
+    deterministic repository slice; removes that exact registration; proves
+    its original cgroup empty; and finally proves every retained attempt or
+    observation PID absent (PID reuse is terminal absence).  The caller owns
+    the surrounding database-generation fence and writer shutdown.
+    """
+
+    try:
+        canonical_worker_id = str(uuid.UUID(str(worker_id)))
+    except (ValueError, TypeError, AttributeError) as error:
+        raise WorkerControlError("release-cutover worker identity is invalid") from error
+    if canonical_worker_id != worker_id:
+        raise WorkerControlError("release-cutover worker identity is not canonical")
+    if type(execution_uid) is not int or execution_uid <= 0:
+        raise WorkerControlError("release-cutover execution UID is invalid")
+    if (
+        not isinstance(repository_id, str)
+        or not repository_id
+        or len(repository_id.encode("utf-8")) > 512
+        or any(character in repository_id for character in "\x00\r\n")
+    ):
+        raise WorkerControlError("release-cutover repository identity is invalid")
+    if (
+        not isinstance(timeout_seconds, (int, float))
+        or isinstance(timeout_seconds, bool)
+        or not 0.1 <= float(timeout_seconds) <= 60.0
+    ):
+        raise WorkerControlError(
+            "release-cutover worker timeout must be from 0.1 through 60 seconds"
+        )
+    if len(process_identities) > 8:
+        raise WorkerControlError("release-cutover process identity set is excessive")
+
+    expected_unit = f"devcoordinator-worker-{worker_id}.service"
+    try:
+        before = manager.status(worker_id=worker_id, allow_missing=True)
+    except (WorkerNativeError, OSError) as error:
+        raise WorkerControlError(
+            "release-cutover native worker identity is unobservable"
+        ) from error
+    if (
+        not isinstance(before, NativeWorkerState)
+        or before.worker_id != worker_id
+        or before.manager != "systemd"
+        or before.unit != expected_unit
+    ):
+        raise WorkerControlError("release-cutover native worker identity is invalid")
+
+    expected_slice: str | None = None
+    if before.loaded:
+        try:
+            expected_slice = manager.require_project_isolation(
+                worker_id=worker_id,
+                uid=execution_uid,
+                repository_id=repository_id,
+            )
+        except (WorkerNativeError, OSError, AttributeError) as error:
+            raise WorkerControlError(
+                "release-cutover worker attribution is unproven"
+            ) from error
+        if before.active and (before.pid is None or before.control_group is None):
+            raise WorkerControlError(
+                "release-cutover active worker PID or cgroup identity is unavailable"
+            )
+
+    removal_reply = "complete"
+    try:
+        removed = manager.remove(
+            worker_id=worker_id, timeout_seconds=float(timeout_seconds)
+        )
+    except (WorkerNativeError, OSError, RuntimeError):
+        removal_reply = "reconciled"
+        try:
+            removed = manager.status(worker_id=worker_id, allow_missing=True)
+        except (WorkerNativeError, OSError) as error:
+            raise WorkerControlError(
+                "release-cutover worker removal is unobservable"
+            ) from error
+    if (
+        not isinstance(removed, NativeWorkerState)
+        or removed.worker_id != worker_id
+        or removed.manager != "systemd"
+        or removed.unit != expected_unit
+        or removed.loaded
+        or removed.active
+    ):
+        raise WorkerControlError(
+            "release-cutover worker registration remained after removal"
+        )
+    if before.control_group is not None:
+        try:
+            manager.require_control_group_empty(before.control_group)
+        except (WorkerNativeError, OSError, AttributeError) as error:
+            raise WorkerControlError(
+                "release-cutover worker cgroup absence is unproven"
+            ) from error
+
+    try:
+        after = manager.status(worker_id=worker_id, allow_missing=True)
+    except (WorkerNativeError, OSError) as error:
+        raise WorkerControlError(
+            "release-cutover final worker identity is unobservable"
+        ) from error
+    if (
+        not isinstance(after, NativeWorkerState)
+        or after.worker_id != worker_id
+        or after.manager != "systemd"
+        or after.unit != expected_unit
+        or after.loaded
+        or after.active
+    ):
+        raise WorkerControlError(
+            "release-cutover worker registration raced with removal"
+        )
+
+    proofs: list[dict[str, Any]] = []
+    seen: set[tuple[int, str]] = set()
+    for identity in process_identities:
+        if not isinstance(identity, Mapping) or set(identity) != {
+            "pid",
+            "process_start_time",
+        }:
+            raise WorkerControlError("release-cutover process identity is invalid")
+        pid = identity.get("pid")
+        started = identity.get("process_start_time")
+        if (
+            type(pid) is not int
+            or int(pid) <= 1
+            or not isinstance(started, str)
+            or not started
+            or len(started.encode("utf-8")) > 256
+            or any(character in started for character in "\x00\r\n")
+        ):
+            raise WorkerControlError("release-cutover process identity is invalid")
+        exact = (int(pid), started)
+        if exact in seen:
+            continue
+        seen.add(exact)
+        try:
+            state = observer(exact[0], exact[1])
+        except (OSError, RuntimeError, ValueError) as error:
+            raise WorkerControlError(
+                "release-cutover process identity is unobservable"
+            ) from error
+        if state == "alive":
+            effective_terminator = (
+                terminate_worker_process_group if terminator is None else terminator
+            )
+            state = effective_terminator(
+                pid=exact[0],
+                process_start_time=exact[1],
+                timeout_seconds=float(timeout_seconds),
+                observer=observer,
+                clock=clock,
+                sleeper=sleeper,
+            )
+        if state not in {"absent", "mismatch"}:
+            raise WorkerControlError(
+                "release-cutover process absence is unproven"
+            )
+        proofs.append(
+            {
+                "pid": exact[0],
+                "process_start_time": exact[1],
+                "state": "pid_reused" if state == "mismatch" else "absent",
+            }
+        )
+
+    return {
+        "worker_id": worker_id,
+        "execution_uid": execution_uid,
+        "repository_id": repository_id,
+        "unit": expected_unit,
+        "expected_slice": expected_slice,
+        "loaded_before": before.loaded,
+        "active_before": before.active,
+        "runner_pid_before": before.pid,
+        "control_group": before.control_group,
+        "cgroup_populated_before": before.cgroup_populated,
+        "removal_reply": removal_reply,
+        "unit_unloaded": True,
+        "cgroup_empty": True,
+        "process_proofs": proofs,
+    }
 
 
 def terminate_worker_process_group(

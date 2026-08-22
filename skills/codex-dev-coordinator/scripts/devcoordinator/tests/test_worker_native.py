@@ -504,7 +504,9 @@ class WorkerNativeTests(unittest.TestCase):
                 side_effect=[True, False, False],
             ),
         ):
-            state = manager.remove(worker_id=self.worker_id)
+            state = manager.remove(
+                worker_id=self.worker_id, timeout_seconds=45.0
+            )
 
         unit = f"devcoordinator-worker-{self.worker_id}.service"
         self.assertFalse(state.loaded)
@@ -553,6 +555,8 @@ class WorkerNativeTests(unittest.TestCase):
         )
         self.assertEqual(state.termination_method, "systemd-control-group")
         self.assertFalse(state.cgroup_populated)
+        self.assertEqual(runner.kwargs[1]["timeout"], 45.0)
+        self.assertEqual(runner.kwargs[3]["timeout"], 45.0)
 
     def test_systemd_stop_escalates_only_the_exact_transitional_unit(self) -> None:
         unit = f"devcoordinator-worker-{self.worker_id}.service"

@@ -396,8 +396,19 @@ class SystemdWorkerManager:
             )
         return expected
 
-    def stop(self, *, worker_id: str) -> NativeWorkerState:
+    def stop(
+        self, *, worker_id: str, timeout_seconds: float = 20.0
+    ) -> NativeWorkerState:
         worker_id = _worker_id(worker_id)
+        if (
+            not isinstance(timeout_seconds, (int, float))
+            or isinstance(timeout_seconds, bool)
+            or not 0.1 <= float(timeout_seconds) <= 60.0
+        ):
+            raise WorkerNativeError(
+                "systemd worker stop timeout must be from 0.1 through 60 seconds"
+            )
+        command_timeout = float(timeout_seconds)
         unit = self.unit(worker_id)
         current = self.status(worker_id=worker_id, allow_missing=True)
         if not current.loaded:
@@ -409,7 +420,11 @@ class SystemdWorkerManager:
                     "systemd did not expose the worker control group before termination"
                 )
             terminated_control_group = current.control_group
-        _run(self.runner, [self.systemctl_executable, "stop", unit])
+        _run(
+            self.runner,
+            [self.systemctl_executable, "stop", unit],
+            timeout=command_timeout,
+        )
         stopped = self.status(worker_id=worker_id, allow_missing=True)
         if stopped.active:
             _run(
@@ -421,8 +436,13 @@ class SystemdWorkerManager:
                     "--signal=KILL",
                     unit,
                 ],
+                timeout=command_timeout,
             )
-            _run(self.runner, [self.systemctl_executable, "stop", unit])
+            _run(
+                self.runner,
+                [self.systemctl_executable, "stop", unit],
+                timeout=command_timeout,
+            )
             stopped = self.status(worker_id=worker_id, allow_missing=True)
         if stopped.active:
             raise WorkerNativeError(
@@ -444,19 +464,27 @@ class SystemdWorkerManager:
             )
         return stopped
 
-    def remove(self, *, worker_id: str) -> NativeWorkerState:
+    def remove(
+        self, *, worker_id: str, timeout_seconds: float = 20.0
+    ) -> NativeWorkerState:
         """Stop and collect the exact transient runner registration."""
 
         worker_id = _worker_id(worker_id)
         unit = self.unit(worker_id)
-        stopped = self.stop(worker_id=worker_id)
+        stopped = self.stop(
+            worker_id=worker_id, timeout_seconds=timeout_seconds
+        )
         if not stopped.loaded:
             return stopped
         if stopped.active:
             raise WorkerNativeError(
                 "systemd did not prove the worker runner stopped before removal"
             )
-        _run(self.runner, [self.systemctl_executable, "reset-failed", unit])
+        _run(
+            self.runner,
+            [self.systemctl_executable, "reset-failed", unit],
+            timeout=float(timeout_seconds),
+        )
         removed = self.status(worker_id=worker_id, allow_missing=True)
         if removed.loaded:
             raise WorkerNativeError(
@@ -501,6 +529,21 @@ class SystemdWorkerManager:
         if values.get("populated") not in {"0", "1"}:
             raise WorkerNativeError("worker cgroup.events has invalid populated evidence")
         return values["populated"] == "1"
+
+    def require_control_group_empty(self, control_group: str) -> bool:
+        """Prove an exact previously observed worker cgroup is unpopulated.
+
+        A collected transient unit can disappear before a lost stop reply is
+        reconciled.  Keeping this narrow proof on the native manager lets
+        release cutover recheck the original cgroup identity without writing
+        cgroupfs or inferring completion from unit disappearance alone.
+        """
+
+        if self._control_group_populated(control_group, allow_missing=True):
+            raise WorkerNativeError(
+                "worker control group remained populated after systemd stop"
+            )
+        return True
 
     def status(
         self, *, worker_id: str, allow_missing: bool = False
