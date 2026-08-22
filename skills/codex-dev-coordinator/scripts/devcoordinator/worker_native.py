@@ -19,6 +19,7 @@ import re
 import stat
 import subprocess
 import sys
+import time
 from typing import Any, Callable, Mapping, Sequence
 import uuid
 
@@ -222,6 +223,23 @@ def _run(
     return completed
 
 
+def _command_deadline(timeout_seconds: float, *, label: str) -> float:
+    if (
+        not isinstance(timeout_seconds, (int, float))
+        or isinstance(timeout_seconds, bool)
+        or not 0.1 <= float(timeout_seconds) <= 60.0
+    ):
+        raise WorkerNativeError(f"{label} timeout must be from 0.1 through 60 seconds")
+    return time.monotonic() + float(timeout_seconds)
+
+
+def _remaining_command_timeout(deadline: float, *, label: str) -> float:
+    remaining = float(deadline) - time.monotonic()
+    if remaining < 0.1:
+        raise WorkerNativeError(f"{label} timed out")
+    return remaining
+
+
 def _is_missing(error: _NativeCommandError) -> bool:
     detail = f"{error.stderr}\n{error.stdout}".lower()
     return error.returncode in {3, 4, 113} and any(
@@ -278,8 +296,12 @@ class SystemdWorkerManager:
         gid: int,
         repository_id: str,
         credential_bindings: object = (),
+        timeout_seconds: float = 20.0,
     ) -> NativeWorkerState:
         worker_id = _worker_id(worker_id)
+        deadline = _command_deadline(
+            timeout_seconds, label="systemd worker start"
+        )
         if os.geteuid() != 0:
             raise WorkerNativeError(
                 "systemd cross-account worker supervision requires root authority"
@@ -342,8 +364,19 @@ class SystemdWorkerManager:
             "--worker-id",
             worker_id,
         ]
-        _run(self.runner, argv)
-        state = self.status(worker_id=worker_id)
+        _run(
+            self.runner,
+            argv,
+            timeout=_remaining_command_timeout(
+                deadline, label="systemd worker start"
+            ),
+        )
+        state = self.status(
+            worker_id=worker_id,
+            timeout_seconds=_remaining_command_timeout(
+                deadline, label="systemd worker start"
+            ),
+        )
         if (
             not state.loaded
             or state.control_group is None
@@ -357,21 +390,35 @@ class SystemdWorkerManager:
                 worker_id=worker_id,
                 uid=identity.uid,
                 repository_id=repository_id,
+                timeout_seconds=_remaining_command_timeout(
+                    deadline, label="systemd worker start"
+                ),
             )
         except BaseException:
             # A successfully launched but mis-scoped worker is more dangerous
             # than a failed launch. Remove the exact transient registration
             # before returning the contract failure.
-            self.remove(worker_id=worker_id)
+            self.remove(
+                worker_id=worker_id,
+                timeout_seconds=max(0.1, deadline - time.monotonic()),
+            )
             raise
         return state
 
     def require_project_isolation(
-        self, *, worker_id: str, uid: int, repository_id: str
+        self,
+        *,
+        worker_id: str,
+        uid: int,
+        repository_id: str,
+        timeout_seconds: float = 20.0,
     ) -> str:
         """Prove the loaded unit belongs to its deterministic repository slice."""
 
         worker_id = _worker_id(worker_id)
+        deadline = _command_deadline(
+            timeout_seconds, label="systemd worker isolation proof"
+        )
         expected = project_repository_slice(uid=uid, repository_id=repository_id)
         unit = self.unit(worker_id)
         completed = _run(
@@ -384,6 +431,9 @@ class SystemdWorkerManager:
                 "--property=Slice",
                 "--no-pager",
             ],
+            timeout=_remaining_command_timeout(
+                deadline, label="systemd worker isolation proof"
+            ),
         )
         values: dict[str, str] = {}
         for line in completed.stdout.splitlines():
@@ -400,17 +450,17 @@ class SystemdWorkerManager:
         self, *, worker_id: str, timeout_seconds: float = 20.0
     ) -> NativeWorkerState:
         worker_id = _worker_id(worker_id)
-        if (
-            not isinstance(timeout_seconds, (int, float))
-            or isinstance(timeout_seconds, bool)
-            or not 0.1 <= float(timeout_seconds) <= 60.0
-        ):
-            raise WorkerNativeError(
-                "systemd worker stop timeout must be from 0.1 through 60 seconds"
-            )
-        command_timeout = float(timeout_seconds)
+        deadline = _command_deadline(
+            timeout_seconds, label="systemd worker stop"
+        )
         unit = self.unit(worker_id)
-        current = self.status(worker_id=worker_id, allow_missing=True)
+        current = self.status(
+            worker_id=worker_id,
+            allow_missing=True,
+            timeout_seconds=_remaining_command_timeout(
+                deadline, label="systemd worker stop"
+            ),
+        )
         if not current.loaded:
             return current
         terminated_control_group: str | None = None
@@ -423,9 +473,17 @@ class SystemdWorkerManager:
         _run(
             self.runner,
             [self.systemctl_executable, "stop", unit],
-            timeout=command_timeout,
+            timeout=_remaining_command_timeout(
+                deadline, label="systemd worker stop"
+            ),
         )
-        stopped = self.status(worker_id=worker_id, allow_missing=True)
+        stopped = self.status(
+            worker_id=worker_id,
+            allow_missing=True,
+            timeout_seconds=_remaining_command_timeout(
+                deadline, label="systemd worker stop"
+            ),
+        )
         if stopped.active:
             _run(
                 self.runner,
@@ -436,14 +494,24 @@ class SystemdWorkerManager:
                     "--signal=KILL",
                     unit,
                 ],
-                timeout=command_timeout,
+                timeout=_remaining_command_timeout(
+                    deadline, label="systemd worker stop"
+                ),
             )
             _run(
                 self.runner,
                 [self.systemctl_executable, "stop", unit],
-                timeout=command_timeout,
+                timeout=_remaining_command_timeout(
+                    deadline, label="systemd worker stop"
+                ),
             )
-            stopped = self.status(worker_id=worker_id, allow_missing=True)
+            stopped = self.status(
+                worker_id=worker_id,
+                allow_missing=True,
+                timeout_seconds=_remaining_command_timeout(
+                    deadline, label="systemd worker stop"
+                ),
+            )
         if stopped.active:
             raise WorkerNativeError(
                 "systemd did not prove the worker runner stopped"
@@ -470,9 +538,15 @@ class SystemdWorkerManager:
         """Stop and collect the exact transient runner registration."""
 
         worker_id = _worker_id(worker_id)
+        deadline = _command_deadline(
+            timeout_seconds, label="systemd worker removal"
+        )
         unit = self.unit(worker_id)
         stopped = self.stop(
-            worker_id=worker_id, timeout_seconds=timeout_seconds
+            worker_id=worker_id,
+            timeout_seconds=_remaining_command_timeout(
+                deadline, label="systemd worker removal"
+            ),
         )
         if not stopped.loaded:
             return stopped
@@ -483,9 +557,17 @@ class SystemdWorkerManager:
         _run(
             self.runner,
             [self.systemctl_executable, "reset-failed", unit],
-            timeout=float(timeout_seconds),
+            timeout=_remaining_command_timeout(
+                deadline, label="systemd worker removal"
+            ),
         )
-        removed = self.status(worker_id=worker_id, allow_missing=True)
+        removed = self.status(
+            worker_id=worker_id,
+            allow_missing=True,
+            timeout_seconds=_remaining_command_timeout(
+                deadline, label="systemd worker removal"
+            ),
+        )
         if removed.loaded:
             raise WorkerNativeError(
                 "systemd did not collect the exact transient worker runner"
@@ -546,9 +628,16 @@ class SystemdWorkerManager:
         return True
 
     def status(
-        self, *, worker_id: str, allow_missing: bool = False
+        self,
+        *,
+        worker_id: str,
+        allow_missing: bool = False,
+        timeout_seconds: float = 20.0,
     ) -> NativeWorkerState:
         worker_id = _worker_id(worker_id)
+        deadline = _command_deadline(
+            timeout_seconds, label="systemd worker status"
+        )
         unit = self.unit(worker_id)
         try:
             completed = _run(
@@ -565,6 +654,9 @@ class SystemdWorkerManager:
                     "--property=ControlGroup",
                     "--no-pager",
                 ],
+                timeout=_remaining_command_timeout(
+                    deadline, label="systemd worker status"
+                ),
             )
         except _NativeCommandError as error:
             if not allow_missing or not _is_missing(error):

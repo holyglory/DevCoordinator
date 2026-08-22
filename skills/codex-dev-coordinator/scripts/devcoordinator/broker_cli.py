@@ -656,6 +656,7 @@ def serve_broker(
         previous: dict[int, Any] = {}
         shutdown_requested = False
         worker_autostart_thread: threading.Thread | None = None
+        worker_autostart_started = False
 
         def report_worker_reconciliation(
             worker_reconciliation: dict[str, Any],
@@ -789,7 +790,6 @@ def serve_broker(
                         name="devcoordinator-worker-startup",
                         daemon=True,
                     )
-                    worker_autostart_thread.start()
             print(
                 json.dumps(
                     {
@@ -804,11 +804,14 @@ def serve_broker(
                 ),
                 flush=True,
             )
+            if worker_autostart_thread is not None and not shutdown_requested:
+                worker_autostart_thread.start()
+                worker_autostart_started = True
             while not stop.wait(0.5):
                 pass
         finally:
             try:
-                if worker_autostart_thread is not None:
+                if worker_autostart_thread is not None and worker_autostart_started:
                     worker_autostart_thread.join(timeout=1.0)
                 runtime.close()
             finally:

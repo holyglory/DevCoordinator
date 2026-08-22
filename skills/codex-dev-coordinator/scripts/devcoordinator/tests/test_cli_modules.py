@@ -2615,8 +2615,11 @@ class BrokerCLIContractTests(unittest.TestCase):
                     "server-started",
                     "workers-fenced",
                     "mutation-admitted",
+                    "ready-reported",
                 ]:
-                    raise AssertionError("worker autostart ran before broker admission")
+                    raise AssertionError(
+                        "worker autostart ran before broker readiness was reported"
+                    )
                 events.append("workers-autostarted")
                 handlers[broker_cli_module.signal.SIGTERM](
                     broker_cli_module.signal.SIGTERM, None
@@ -2653,6 +2656,17 @@ class BrokerCLIContractTests(unittest.TestCase):
             max_clients=4,
         )
         runtime = FakeRuntime()
+
+        def capture_print(*values: object, **_kwargs: object) -> None:
+            if not values or not isinstance(values[0], str):
+                return
+            try:
+                payload = json.loads(values[0])
+            except json.JSONDecodeError:
+                return
+            if payload.get("status") == "ready":
+                events.append("ready-reported")
+
         with (
             mock.patch.object(
                 broker_cli_module,
@@ -2669,7 +2683,7 @@ class BrokerCLIContractTests(unittest.TestCase):
                 "signal",
                 side_effect=install_handler,
             ),
-            mock.patch("builtins.print"),
+            mock.patch("builtins.print", side_effect=capture_print),
         ):
             serve_broker(args, host_mutations_factory=mock.Mock)
 
@@ -2679,7 +2693,113 @@ class BrokerCLIContractTests(unittest.TestCase):
                 "server-started",
                 "workers-fenced",
                 "mutation-admitted",
+                "ready-reported",
                 "workers-autostarted",
+                "mutation-fenced",
+                "runtime-closed",
+            ],
+        )
+
+    def test_shutdown_after_ready_does_not_join_unstarted_autostart(self) -> None:
+        events: list[str] = []
+        handlers: dict[int, object] = {}
+
+        class FakeServer:
+            @staticmethod
+            def start() -> None:
+                events.append("server-started")
+
+        class FakeRuntime:
+            def __init__(self) -> None:
+                self.server = FakeServer()
+                self.persistence = mock.Mock()
+                self.backend = mock.Mock()
+
+            @staticmethod
+            def fence_workers_on_startup() -> dict[str, object]:
+                events.append("workers-fenced")
+                return {
+                    "ok": True,
+                    "supervisor_epoch": "shutdown-before-autostart",
+                    "fenced_old_runners": [],
+                    "started": [],
+                    "errors": [],
+                }
+
+            @staticmethod
+            def autostart_workers_after_admission(
+                *, fenced: object
+            ) -> dict[str, object]:
+                raise AssertionError(
+                    f"autostart began after shutdown: {dict(fenced)}"
+                )
+
+            @staticmethod
+            def begin_mutation_admission() -> None:
+                events.append("mutation-admitted")
+
+            @staticmethod
+            def begin_shutdown() -> int:
+                events.append("mutation-fenced")
+                return 1
+
+            @staticmethod
+            def close() -> None:
+                events.append("runtime-closed")
+
+        def install_handler(signum: int, handler: object) -> None:
+            handlers[signum] = handler
+
+        def capture_print(*values: object, **_kwargs: object) -> None:
+            if not values or not isinstance(values[0], str):
+                return
+            try:
+                payload = json.loads(values[0])
+            except json.JSONDecodeError:
+                return
+            if payload.get("status") == "ready":
+                events.append("ready-reported")
+                handlers[broker_cli_module.signal.SIGTERM](
+                    broker_cli_module.signal.SIGTERM, None
+                )
+
+        temporary = tempfile.TemporaryDirectory(
+            prefix="devcoordinator-broker-ready-shutdown-"
+        )
+        self.addCleanup(temporary.cleanup)
+        args = argparse.Namespace(
+            access_group=None,
+            database=str(Path(temporary.name) / "coordinator.sqlite3"),
+            socket="/run/devcoordinator-authority.sock",
+            max_clients=4,
+        )
+        with (
+            mock.patch.object(
+                broker_cli_module,
+                "build_store_backed_broker_runtime",
+                return_value=FakeRuntime(),
+            ),
+            mock.patch.object(
+                broker_cli_module.signal,
+                "getsignal",
+                return_value=broker_cli_module.signal.SIG_DFL,
+            ),
+            mock.patch.object(
+                broker_cli_module.signal,
+                "signal",
+                side_effect=install_handler,
+            ),
+            mock.patch("builtins.print", side_effect=capture_print),
+        ):
+            serve_broker(args, host_mutations_factory=mock.Mock)
+
+        self.assertEqual(
+            events,
+            [
+                "server-started",
+                "workers-fenced",
+                "mutation-admitted",
+                "ready-reported",
                 "mutation-fenced",
                 "runtime-closed",
             ],

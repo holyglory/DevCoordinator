@@ -60,6 +60,8 @@ from devcoordinator.server_credentials import (  # noqa: E402
 )
 from devcoordinator.store import AccountStore  # noqa: E402
 from devcoordinator.worker_control import (  # noqa: E402
+    STARTUP_CONVERGENCE_SECONDS as WORKER_STARTUP_CONVERGENCE_SECONDS,
+    STARTUP_NATIVE_COMMAND_MAX_SECONDS as WORKER_STARTUP_NATIVE_COMMAND_MAX_SECONDS,
     quiesce_worker_registration,
     WorkerControlError,
     WorkerController,
@@ -203,6 +205,17 @@ WORKER_UNIT = re.compile(
 )
 CGROUP_ROOT = Path("/sys/fs/cgroup")
 WORKER_CUTOVER_LIMIT = 4096
+RETAINED_WORKER_STABILITY_SECONDS = 2.0
+RETAINED_WORKER_OBSERVATION_MARGIN_SECONDS = 5.0
+RETAINED_WORKER_CONVERGENCE_MARGIN_SECONDS = (
+    WORKER_STARTUP_NATIVE_COMMAND_MAX_SECONDS
+    + RETAINED_WORKER_STABILITY_SECONDS
+    + RETAINED_WORKER_OBSERVATION_MARGIN_SECONDS
+)
+RETAINED_WORKER_CONVERGENCE_SECONDS = (
+    WORKER_STARTUP_CONVERGENCE_SECONDS
+    + RETAINED_WORKER_CONVERGENCE_MARGIN_SECONDS
+)
 AUTHORITY_WRITER_UNITS = (
     "devcoordinator-testd.socket",
     "devcoordinator-test-snapshotd.socket",
@@ -214,9 +227,14 @@ AUTHORITY_WRITER_UNITS = (
     "devcoordinator-authority.service",
 )
 AUTHORITY_SERVICE = "devcoordinator-authority.service"
+AUTHORITY_SOCKET_PATH = "/run/devcoordinator-authority.sock"
 AUTHORITY_STOP_COMMAND_TIMEOUT_SECONDS = 5.0
 AUTHORITY_STOP_GRACE_SECONDS = 5.0
 AUTHORITY_STOP_POLL_SECONDS = 0.1
+AUTHORITY_READY_TIMEOUT_SECONDS = 90.0
+AUTHORITY_READY_COMMAND_TIMEOUT_SECONDS = 5.0
+AUTHORITY_READY_POLL_SECONDS = 0.1
+AUTHORITY_READY_OUTPUT_MAX_BYTES = 64 * 1024
 WRITER_STOP_SETTLE_SECONDS = 35.0
 WRITER_STABLE_INACTIVE_SECONDS = 0.1
 PUBLICATION_FILE = Path("/var/lib/devcoordinator-edge/routes.publication")
@@ -241,6 +259,17 @@ ROLLBACK_CRITICAL_SERVICES = (
 )
 ROLLBACK_BACKGROUND_SERVICES = tuple(
     unit for unit in SERVICE_ORDER if unit not in ROLLBACK_CRITICAL_SERVICES
+)
+ROLLBACK_CRITICAL_SOCKETS = (
+    "devcoordinator-edge-http.socket",
+    "devcoordinator-edge-https.socket",
+    "devcoordinator-edge-publication.socket",
+    "devcoordinator-api.socket",
+    "devcoordinator-authority.socket",
+)
+ROLLBACK_BACKGROUND_SOCKETS = (
+    "devcoordinator-test-snapshotd.socket",
+    "devcoordinator-testd.socket",
 )
 RUNTIME_SOCKET_REBIND_ORDER = (
     "devcoordinator-test-snapshotd.socket",
@@ -4674,8 +4703,8 @@ def require_retained_worker_policy_convergence(
     source_proof: Mapping[str, object],
     target_schema_version: int,
     generation_offset: int,
-    timeout_seconds: float = 60.0,
-    stable_seconds: float = 2.0,
+    timeout_seconds: float = RETAINED_WORKER_CONVERGENCE_SECONDS,
+    stable_seconds: float = RETAINED_WORKER_STABILITY_SECONDS,
     clock: Callable[[], float] = time.monotonic,
     sleeper: Callable[[float], None] = time.sleep,
     cgroup_root: Path = CGROUP_ROOT,
@@ -5935,28 +5964,185 @@ def restart_previous_console(
     )
 
 
-def restart_services(runner: Runner) -> None:
+def _authority_invocation_state(runner: Runner) -> dict[str, object]:
+    completed = runner.run_bounded(
+        [
+            "/usr/bin/systemctl",
+            "show",
+            AUTHORITY_SERVICE,
+            "--property=InvocationID",
+            "--property=MainPID",
+            "--property=ActiveState",
+            "--property=SubState",
+            "--no-pager",
+        ],
+        timeout_seconds=AUTHORITY_READY_COMMAND_TIMEOUT_SECONDS,
+    )
+    if completed.returncode != 0 or completed.stderr:
+        raise SwitchError("authority readiness status failed")
+    if (
+        len(completed.stdout.encode("utf-8"))
+        + len(completed.stderr.encode("utf-8"))
+        > AUTHORITY_READY_OUTPUT_MAX_BYTES
+    ):
+        raise SwitchError("authority readiness status is excessive")
+    values: dict[str, str] = {}
+    for line in completed.stdout.splitlines():
+        key, separator, value = line.partition("=")
+        if not separator or key in values:
+            raise SwitchError("authority readiness status is malformed")
+        values[key] = value
+    if set(values) != {"InvocationID", "MainPID", "ActiveState", "SubState"}:
+        raise SwitchError("authority readiness status is incomplete")
+    invocation_id = values["InvocationID"]
+    pid_text = values["MainPID"]
+    if (
+        re.fullmatch(r"[0-9a-f]{32}", invocation_id) is None
+        or not pid_text.isdigit()
+        or int(pid_text) <= 1
+        or values["ActiveState"] != "active"
+        or values["SubState"] != "running"
+    ):
+        raise SwitchError("authority readiness identity is not active")
+    return {
+        "invocation_id": invocation_id,
+        "main_pid": int(pid_text),
+        "active_state": values["ActiveState"],
+        "sub_state": values["SubState"],
+    }
+
+
+def wait_authority_ready(
+    runner: Runner,
+    *,
+    timeout_seconds: float = AUTHORITY_READY_TIMEOUT_SECONDS,
+    clock: Callable[[], float] = time.monotonic,
+    sleeper: Callable[[float], None] = time.sleep,
+) -> dict[str, object]:
+    if (
+        not isinstance(timeout_seconds, (int, float))
+        or isinstance(timeout_seconds, bool)
+        or not 0.1 <= float(timeout_seconds) <= AUTHORITY_READY_TIMEOUT_SECONDS
+    ):
+        raise SwitchError("authority readiness timeout is invalid")
+    deadline = float(clock()) + float(timeout_seconds)
+    expected = _authority_invocation_state(runner)
+
+    def filtered_records(pattern: str, remaining: float) -> list[dict[str, object]]:
+        completed = runner.run_bounded(
+            [
+                "/usr/bin/journalctl",
+                "--unit",
+                AUTHORITY_SERVICE,
+                "_SYSTEMD_INVOCATION_ID=" + str(expected["invocation_id"]),
+                "--grep=" + pattern,
+                "--output=cat",
+                "--no-pager",
+                "--lines=2",
+            ],
+            timeout_seconds=min(
+                AUTHORITY_READY_COMMAND_TIMEOUT_SECONDS,
+                max(0.1, remaining),
+            ),
+        )
+        if completed.returncode != 0 or completed.stderr:
+            raise SwitchError("authority readiness journal failed")
+        if (
+            len(completed.stdout.encode("utf-8"))
+            + len(completed.stderr.encode("utf-8"))
+            > AUTHORITY_READY_OUTPUT_MAX_BYTES
+        ):
+            raise SwitchError("authority readiness journal is excessive")
+        result: list[dict[str, object]] = []
+        for line in completed.stdout.splitlines():
+            if not line:
+                continue
+            try:
+                value = json.loads(line)
+            except json.JSONDecodeError as error:
+                raise SwitchError("authority readiness journal is malformed") from error
+            if not isinstance(value, Mapping):
+                raise SwitchError("authority readiness journal is malformed")
+            result.append(dict(value))
+        if len(result) > 1:
+            raise SwitchError("authority readiness record is duplicated")
+        return result
+
+    while True:
+        remaining = deadline - float(clock())
+        if remaining <= 0:
+            raise SwitchError("authority readiness record timed out")
+        schema_checks = filtered_records('"kind": "schema"', remaining)
+        ready = filtered_records('"status": "ready"', remaining)
+        observed = _authority_invocation_state(runner)
+        if observed != expected:
+            raise SwitchError("authority invocation changed before readiness")
+        if ready:
+            if len(schema_checks) != 1:
+                raise SwitchError("authority schema readiness record is missing")
+            schema = schema_checks[0]
+            if (
+                set(schema)
+                != {"ok", "kind", "database", "schema_version", "read_only"}
+                or schema.get("ok") is not True
+                or schema.get("kind") != "schema"
+                or schema.get("database") != str(AUTHORITY_DATABASE)
+                or schema.get("schema_version") != COORDINATOR_SCHEMA_VERSION
+                or schema.get("read_only") is not True
+            ):
+                raise SwitchError("authority schema readiness record is invalid")
+            document = ready[0]
+            if (
+                set(document)
+                != {
+                    "status",
+                    "service_uid",
+                    "socket",
+                    "socket_activated",
+                    "database",
+                    "wire_identity",
+                }
+                or document.get("service_uid") != 0
+                or document.get("socket") != AUTHORITY_SOCKET_PATH
+                or document.get("socket_activated") is not True
+                or document.get("database") != str(AUTHORITY_DATABASE)
+                or document.get("wire_identity") != "opaque_normalized_ids_only"
+            ):
+                raise SwitchError("authority readiness record is invalid")
+            return {**expected, "ready": True}
+        sleeper(min(AUTHORITY_READY_POLL_SECONDS, max(0.0, remaining)))
+
+
+def restart_services(
+    runner: Runner,
+    *,
+    ready_waiter: Callable[[Runner], object] = wait_authority_ready,
+) -> None:
     # Routine replacement is also the repair path for a host whose required
-    # unit was disabled out of band.  Starting a disabled unit is not durable:
-    # it looks healthy until the next reboot.  Reassert both activation and the
-    # boot contract before replacing processes.
+    # unit was disabled out of band. Reassert the boot contract first, then
+    # start each service exactly once through the ordered restart below.
     for unit in (*REQUIRED_SOCKETS, *SERVICE_ORDER):
         runner.require(
-            ["/usr/bin/systemctl", "enable", "--now", unit],
+            ["/usr/bin/systemctl", "enable", unit],
             f"enable required unit {unit}",
         )
-    # These socket units own their /run directory and pathname. Older service
-    # templates lifecycle-managed the same directories, so an already-active
-    # socket may retain only an unreachable, unlinked listener after a service
-    # restart. Rebinding before service replacement repairs that state and
-    # ensures the new process inherits the reachable listener.
-    for unit in RUNTIME_SOCKET_REBIND_ORDER:
-        runner.require(["/usr/bin/systemctl", "restart", unit], f"rebind {unit}")
-    for unit in SERVICE_ORDER:
-        runner.require(["/usr/bin/systemctl", "restart", unit], f"restart {unit}")
+    runner.require(
+        [
+            "/usr/bin/systemctl",
+            "restart",
+            *REQUIRED_SOCKETS,
+            *SERVICE_ORDER,
+        ],
+        "restart required service graph",
+    )
+    ready_waiter(runner)
 
 
-def restore_rollback_control_plane(runner: Runner) -> None:
+def restore_rollback_control_plane(
+    runner: Runner,
+    *,
+    ready_waiter: Callable[[Runner], object] = wait_authority_ready,
+) -> None:
     """Restore stable authority before any background unit can block rollback.
 
     A background service may legitimately take its full start deadline.  The
@@ -5965,39 +6151,41 @@ def restore_rollback_control_plane(runner: Runner) -> None:
     leaves every agent behind a release-handshake failure.
     """
 
-    for unit in REQUIRED_SOCKETS:
+    for unit in (*ROLLBACK_CRITICAL_SOCKETS, *ROLLBACK_CRITICAL_SERVICES):
         runner.require(
-            ["/usr/bin/systemctl", "enable", "--now", unit],
-            f"rollback enable required socket {unit}",
+            ["/usr/bin/systemctl", "enable", unit],
+            f"rollback enable critical graph unit {unit}",
         )
-    for unit in ROLLBACK_CRITICAL_SERVICES:
-        runner.require(
-            ["/usr/bin/systemctl", "enable", "--now", unit],
-            f"rollback enable critical unit {unit}",
-        )
-        runner.require(
-            ["/usr/bin/systemctl", "restart", unit],
-            f"rollback restart critical unit {unit}",
-        )
+    runner.require(
+        [
+            "/usr/bin/systemctl",
+            "--job-mode=ignore-requirements",
+            "restart",
+            *ROLLBACK_CRITICAL_SOCKETS,
+            *ROLLBACK_CRITICAL_SERVICES,
+        ],
+        "rollback restart critical graph",
+    )
+    ready_waiter(runner)
 
 
 def restore_rollback_background_services(runner: Runner) -> None:
     """Restore non-critical units only after stable authority is coherent."""
 
-    for unit in RUNTIME_SOCKET_REBIND_ORDER:
+    for unit in (*ROLLBACK_BACKGROUND_SOCKETS, *ROLLBACK_BACKGROUND_SERVICES):
         runner.require(
-            ["/usr/bin/systemctl", "restart", unit],
-            f"rollback rebind {unit}",
+            ["/usr/bin/systemctl", "enable", unit],
+            f"rollback enable background graph unit {unit}",
         )
-    for unit in ROLLBACK_BACKGROUND_SERVICES:
-        runner.require(
-            ["/usr/bin/systemctl", "enable", "--now", unit],
-            f"rollback enable background unit {unit}",
-        )
-        runner.require(
-            ["/usr/bin/systemctl", "restart", unit],
-            f"rollback restart background unit {unit}",
-        )
+    runner.require(
+        [
+            "/usr/bin/systemctl",
+            "restart",
+            *ROLLBACK_BACKGROUND_SOCKETS,
+            *ROLLBACK_BACKGROUND_SERVICES,
+        ],
+        "rollback restart background graph",
+    )
 
 
 def complete_rollback_after_control_plane(

@@ -198,6 +198,7 @@ class WorkerNativeTests(unittest.TestCase):
                 uid=501,
                 gid=20,
                 repository_id="repo-one",
+                timeout_seconds=7.0,
             )
 
         self.assertEqual(
@@ -250,6 +251,8 @@ class WorkerNativeTests(unittest.TestCase):
             ],
         )
         self.assertNotIn("shell", runner.kwargs[0])
+        self.assertGreater(runner.kwargs[0]["timeout"], 0.0)
+        self.assertLessEqual(runner.kwargs[0]["timeout"], 7.0)
         self.assertEqual(runner.kwargs[0]["stdin"], subprocess.DEVNULL)
         self.assertEqual(
             runner.kwargs[0]["env"],
@@ -555,8 +558,11 @@ class WorkerNativeTests(unittest.TestCase):
         )
         self.assertEqual(state.termination_method, "systemd-control-group")
         self.assertFalse(state.cgroup_populated)
-        self.assertEqual(runner.kwargs[1]["timeout"], 45.0)
-        self.assertEqual(runner.kwargs[3]["timeout"], 45.0)
+        self.assertGreater(runner.kwargs[3]["timeout"], 0.0)
+        self.assertLessEqual(
+            runner.kwargs[3]["timeout"], runner.kwargs[1]["timeout"]
+        )
+        self.assertLessEqual(runner.kwargs[1]["timeout"], 45.0)
 
     def test_systemd_stop_escalates_only_the_exact_transitional_unit(self) -> None:
         unit = f"devcoordinator-worker-{self.worker_id}.service"

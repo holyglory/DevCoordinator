@@ -938,29 +938,302 @@ def exercise_legacy_control_plane_is_durably_retired() -> None:
 
 
 def exercise_internal_socket_rebind_order() -> None:
-    runner = FakeRunner()
+    class ActivationRaceRunner(FakeRunner):
+        def __init__(self) -> None:
+            super().__init__()
+            self.coalesced_retry = False
 
-    switch.restart_services(runner)
+        def require(self, argv: list[str], _label: str) -> str:
+            self.commands.append(list(argv))
+            if argv[1] == "enable":
+                expect(
+                    "--now" not in argv,
+                    "socket activation became visible before the service graph job",
+                )
+            elif argv[1] == "restart":
+                expected = [*switch.REQUIRED_SOCKETS, *switch.SERVICE_ORDER]
+                expect(
+                    argv[2:] == expected
+                    and switch.AUTHORITY_SERVICE in argv
+                    and switch.API_SOCKET in argv,
+                    "retrying client was not coalesced with the exact service graph",
+                )
+                self.coalesced_retry = True
+            return ""
+
+    runner = ActivationRaceRunner()
+
+    ready_after_graph: list[bool] = []
+    switch.restart_services(
+        runner,
+        ready_waiter=lambda _runner: ready_after_graph.append(
+            runner.coalesced_retry
+        ),
+    )
 
     enable_count = len(switch.REQUIRED_SOCKETS) + len(switch.SERVICE_ORDER)
     enable_commands = runner.commands[:enable_count]
     restart_commands = runner.commands[enable_count:]
     enabled_units = [command[-1] for command in enable_commands]
-    units = [command[-1] for command in restart_commands]
     expect(
         enabled_units == [*switch.REQUIRED_SOCKETS, *switch.SERVICE_ORDER],
         "required sockets and services were not repaired for boot",
     )
     expect(
-        all(command[1:3] == ["enable", "--now"] for command in enable_commands),
-        "required unit repair did not make activation durable",
+        all(command[1] == "enable" and "--now" not in command for command in enable_commands),
+        "required sockets/services did not preserve durable single-start ordering",
     )
-    expected = [*switch.RUNTIME_SOCKET_REBIND_ORDER, *switch.SERVICE_ORDER]
-    expect(units == expected, "internal sockets were not rebound before services")
     expect(
-        all(command[1] == "restart" for command in restart_commands),
-        "socket/service replacement did not use one deterministic restart path",
+        restart_commands
+        == [[
+            "/usr/bin/systemctl",
+            "restart",
+            *switch.REQUIRED_SOCKETS,
+            *switch.SERVICE_ORDER,
+        ]]
+        and runner.coalesced_retry
+        and ready_after_graph == [True],
+        "socket/service replacement did not use one coalesced restart transaction",
     )
+    authority_commands = [
+        command
+        for command in runner.commands
+        if switch.AUTHORITY_SERVICE in command
+    ]
+    expect(
+        authority_commands
+        == [
+            ["/usr/bin/systemctl", "enable", switch.AUTHORITY_SERVICE],
+            restart_commands[0],
+        ],
+        "authority replacement created more than one startup epoch",
+    )
+
+
+def exercise_retained_worker_deadlines_are_nested() -> None:
+    expect(
+        switch.RETAINED_WORKER_CONVERGENCE_SECONDS
+        == switch.WORKER_STARTUP_CONVERGENCE_SECONDS
+        + switch.RETAINED_WORKER_CONVERGENCE_MARGIN_SECONDS
+        and switch.RETAINED_WORKER_CONVERGENCE_MARGIN_SECONDS
+        == switch.WORKER_STARTUP_NATIVE_COMMAND_MAX_SECONDS
+        + switch.RETAINED_WORKER_STABILITY_SECONDS
+        + switch.RETAINED_WORKER_OBSERVATION_MARGIN_SECONDS
+        and switch.RETAINED_WORKER_OBSERVATION_MARGIN_SECONDS >= 5.0,
+        "retained worker proof deadline does not contain startup plus stability",
+    )
+    clock_value = 0.0
+
+    def clock() -> float:
+        return clock_value
+
+    def sleeper(seconds: float) -> None:
+        nonlocal clock_value
+        clock_value += seconds
+
+    def delayed_blockers(*_args, **_kwargs):
+        if clock_value < switch.WORKER_STARTUP_CONVERGENCE_SECONDS:
+            return (("worker-still-starting",), "starting")
+        return ((), "exact-running")
+
+    with mock.patch.object(
+        switch,
+        "_retained_worker_policy_blockers",
+        side_effect=delayed_blockers,
+    ):
+        switch.require_retained_worker_policy_convergence(
+            FakeRunner(),
+            source_proof={},
+            target_schema_version=16,
+            generation_offset=1,
+            clock=clock,
+            sleeper=sleeper,
+        )
+    expect(
+        clock_value
+        >= switch.WORKER_STARTUP_CONVERGENCE_SECONDS
+        + switch.RETAINED_WORKER_STABILITY_SECONDS
+        and clock_value < switch.RETAINED_WORKER_CONVERGENCE_SECONDS,
+        "outer retained worker proof expired before legal inner convergence stabilized",
+    )
+
+
+def exercise_authority_ready_is_invocation_bound() -> None:
+    invocation_a = "a" * 32
+    invocation_b = "b" * 32
+
+    def state(invocation: str, *, active: bool = True) -> str:
+        return "\n".join(
+            (
+                f"InvocationID={invocation}",
+                "MainPID=4312",
+                f"ActiveState={'active' if active else 'inactive'}",
+                f"SubState={'running' if active else 'dead'}",
+            )
+        )
+
+    ready = json.dumps(
+        {
+            "status": "ready",
+            "service_uid": 0,
+            "socket": switch.AUTHORITY_SOCKET_PATH,
+            "socket_activated": True,
+            "database": str(switch.AUTHORITY_DATABASE),
+            "wire_identity": "opaque_normalized_ids_only",
+        },
+        sort_keys=True,
+    )
+    schema_ready = json.dumps(
+        {
+            "ok": True,
+            "kind": "schema",
+            "database": str(switch.AUTHORITY_DATABASE),
+            "schema_version": switch.COORDINATOR_SCHEMA_VERSION,
+            "read_only": True,
+        },
+        sort_keys=True,
+    )
+    ready_journal = schema_ready + "\n" + ready
+
+    class ReadyRunner(FakeRunner):
+        def __init__(self, states: list[str], journals: list[str]) -> None:
+            super().__init__()
+            self.states = list(states)
+            self.journals = list(journals)
+            self.timeouts: list[float] = []
+
+        def run_bounded(
+            self, argv: list[str], *, timeout_seconds: float
+        ) -> subprocess.CompletedProcess[str]:
+            self.commands.append(list(argv))
+            self.timeouts.append(timeout_seconds)
+            if "systemctl" in argv[0]:
+                output = self.states.pop(0) if len(self.states) > 1 else self.states[0]
+            else:
+                raw_output = (
+                    self.journals.pop(0)
+                    if len(self.journals) > 1
+                    else self.journals[0]
+                )
+                grep = next(
+                    (
+                        argument.removeprefix("--grep=")
+                        for argument in argv
+                        if argument.startswith("--grep=")
+                    ),
+                    None,
+                )
+                output = "\n".join(
+                    line
+                    for line in raw_output.splitlines()
+                    if grep is None or grep in line
+                )
+            return subprocess.CompletedProcess(argv, 0, output, "")
+
+    noisy_ready_journal = "\n".join(
+        [
+            schema_ready,
+            ready,
+            *(
+                json.dumps({"event": "worker.startup_reconciled", "index": index})
+                for index in range(100)
+            ),
+        ]
+    )
+    runner = ReadyRunner(
+        [state(invocation_a), state(invocation_a)], [noisy_ready_journal]
+    )
+    evidence = switch.wait_authority_ready(runner, timeout_seconds=1.0)
+    expect(
+        evidence["ready"] is True
+        and evidence["invocation_id"] == invocation_a
+        and all(0 < timeout <= switch.AUTHORITY_READY_COMMAND_TIMEOUT_SECONDS for timeout in runner.timeouts)
+        and any(
+            argument == "_SYSTEMD_INVOCATION_ID=" + invocation_a
+            for argument in runner.commands[1]
+        )
+        and all("--lines=2" in command for command in runner.commands[1:3])
+        and any(
+            argument == '--grep="status": "ready"'
+            for argument in runner.commands[2]
+        ),
+        "authority readiness was not bound to its exact invocation",
+    )
+
+    for states, journals, label in (
+        (
+            [state(invocation_a), state(invocation_b)],
+            [ready_journal],
+            "invocation change",
+        ),
+        (
+            [state(invocation_a)],
+            ['{"status": "ready"'],
+            "malformed journal",
+        ),
+        (
+            [state(invocation_a)],
+            [
+                json.dumps(
+                    {
+                        **json.loads(schema_ready),
+                        "schema_version": 15,
+                    },
+                    sort_keys=True,
+                )
+                + "\n"
+                + ready
+            ],
+            "wrong schema preflight",
+        ),
+        (
+            [state(invocation_a)],
+            [schema_ready + "\n" + ready + "\n" + ready],
+            "duplicate ready record",
+        ),
+        (
+            [state(invocation_a)],
+            [
+                '"status": "ready"'
+                + "x" * switch.AUTHORITY_READY_OUTPUT_MAX_BYTES
+            ],
+            "excessive journal",
+        ),
+        (
+            [state(invocation_a), state(invocation_a, active=False)],
+            [""],
+            "shutdown before ready",
+        ),
+    ):
+        try:
+            switch.wait_authority_ready(
+                ReadyRunner(states, journals), timeout_seconds=1.0
+            )
+        except switch.SwitchError:
+            pass
+        else:
+            raise AssertionError(f"authority readiness accepted {label}")
+
+    clock_value = 0.0
+
+    def clock() -> float:
+        return clock_value
+
+    def sleeper(seconds: float) -> None:
+        nonlocal clock_value
+        clock_value += seconds
+
+    try:
+        switch.wait_authority_ready(
+            ReadyRunner([state(invocation_a)], [""]),
+            timeout_seconds=0.3,
+            clock=clock,
+            sleeper=sleeper,
+        )
+    except switch.SwitchError as error:
+        expect("timed out" in str(error), "ready timeout returned another error")
+    else:
+        raise AssertionError("authority readiness exceeded its bounded timeout")
 
 
 def exercise_authority_writer_stop_is_bounded_and_exact() -> None:
@@ -1507,7 +1780,9 @@ def exercise_rollback_restores_control_plane_before_background_services() -> Non
             return ""
 
     runner = BackgroundFailureRunner()
-    switch.restore_rollback_control_plane(runner)
+    switch.restore_rollback_control_plane(
+        runner, ready_waiter=lambda _runner: None
+    )
     try:
         switch.restore_rollback_background_services(runner)
     except switch.SwitchError:
@@ -1515,15 +1790,12 @@ def exercise_rollback_restores_control_plane_before_background_services() -> Non
     else:
         raise AssertionError("background rollback failure was not injected")
 
-    authority_restart = [
+    critical_restart = [
         "/usr/bin/systemctl",
+        "--job-mode=ignore-requirements",
         "restart",
-        "devcoordinator-authority.service",
-    ]
-    api_restart = [
-        "/usr/bin/systemctl",
-        "restart",
-        "devcoordinator-api.service",
+        *switch.ROLLBACK_CRITICAL_SOCKETS,
+        *switch.ROLLBACK_CRITICAL_SERVICES,
     ]
     observer_failure = next(
         index
@@ -1531,9 +1803,51 @@ def exercise_rollback_restores_control_plane_before_background_services() -> Non
         if command[-1] == "devcoordinator-observer.service"
     )
     expect(
-        runner.commands.index(authority_restart) < observer_failure
-        and runner.commands.index(api_restart) < observer_failure,
+        runner.commands.index(critical_restart) < observer_failure,
         "background rollback failure occurred before stable authority/API recovery",
+    )
+
+    order_runner = FakeRunner()
+    switch.restore_rollback_control_plane(
+        order_runner, ready_waiter=lambda _runner: None
+    )
+    switch.restore_rollback_background_services(order_runner)
+    critical_enable = [
+        ["/usr/bin/systemctl", "enable", unit]
+        for unit in (
+            *switch.ROLLBACK_CRITICAL_SOCKETS,
+            *switch.ROLLBACK_CRITICAL_SERVICES,
+        )
+    ]
+    background_enable = [
+        ["/usr/bin/systemctl", "enable", unit]
+        for unit in (
+            *switch.ROLLBACK_BACKGROUND_SOCKETS,
+            *switch.ROLLBACK_BACKGROUND_SERVICES,
+        )
+    ]
+    background_restart = [
+        "/usr/bin/systemctl",
+        "restart",
+        *switch.ROLLBACK_BACKGROUND_SOCKETS,
+        *switch.ROLLBACK_BACKGROUND_SERVICES,
+    ]
+    expect(
+        order_runner.commands
+        == [
+            *critical_enable,
+            critical_restart,
+            *background_enable,
+            background_restart,
+        ]
+        and set(switch.ROLLBACK_CRITICAL_SOCKETS)
+        .isdisjoint(switch.ROLLBACK_BACKGROUND_SOCKETS)
+        and set(switch.ROLLBACK_CRITICAL_SOCKETS)
+        | set(switch.ROLLBACK_BACKGROUND_SOCKETS)
+        == set(switch.REQUIRED_SOCKETS)
+        and "--job-mode=ignore-requirements" in critical_restart
+        and "--job-mode=ignore-dependencies" not in critical_restart,
+        "rollback did not use disjoint critical/background service transactions",
     )
 
     rollback_source = inspect.getsource(switch.rollback)
@@ -6022,6 +6336,8 @@ def main() -> int:
     exercise_current_transaction_durability()
     exercise_legacy_control_plane_is_durably_retired()
     exercise_internal_socket_rebind_order()
+    exercise_retained_worker_deadlines_are_nested()
+    exercise_authority_ready_is_invocation_bound()
     exercise_authority_writer_stop_is_bounded_and_exact()
     exercise_writer_stop_malformed_replay_and_race_guards()
     exercise_rollback_restores_control_plane_before_background_services()

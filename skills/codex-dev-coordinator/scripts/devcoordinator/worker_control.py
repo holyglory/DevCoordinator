@@ -65,6 +65,7 @@ STARTUP_AUTOSTART_ATTEMPTS = 3
 STARTUP_AUTOSTART_RETRY_SECONDS = 0.25
 STARTUP_CONVERGENCE_SECONDS = 60.0
 STARTUP_CONVERGENCE_POLL_SECONDS = 0.1
+STARTUP_NATIVE_COMMAND_MAX_SECONDS = 20.0
 
 
 def quiesce_worker_registration(
@@ -1045,145 +1046,272 @@ class WorkerController:
         """Start fenced keep-alive candidates after broker admission is live."""
 
         remaining = (
-            None
+            {
+                str(candidate["server_definition_id"])
+                for candidate in self.supervision.startup_candidates(
+                    supervisor_epoch=supervisor_epoch
+                )
+            }
             if expected_worker_ids is None
             else {str(worker_id) for worker_id in expected_worker_ids}
         )
         started: list[dict[str, Any]] = []
         errors: list[dict[str, str]] = []
         convergence_errors: dict[str, str] = {}
+        pending: dict[str, int] = {}
+        launch_attempts: dict[str, int] = {}
+        terminal_workers: set[str] = set()
         deadline = self.clock() + STARTUP_CONVERGENCE_SECONDS
-        while remaining is None or remaining:
-            if remaining is not None:
-                for worker_id in sorted(remaining):
-                    try:
-                        policy = self._require_policy(worker_id)
-                        uid = int(policy["execution_uid"])
-                        native = self._native_status(worker_id=worker_id, uid=uid)
-                        current_attempt_id = policy.get("current_attempt_id")
-                        current_attempt = (
-                            None
-                            if current_attempt_id is None
-                            else self.supervision.attempt(str(current_attempt_id))
-                        )
-                        if (
-                            native.active
-                            and current_attempt is not None
-                            and str(current_attempt.get("state") or "") == "running"
-                            and str(current_attempt.get("supervisor_epoch") or "")
-                            == supervisor_epoch
-                        ):
-                            started.append(
-                                {
-                                    **native.to_dict(),
-                                    "startup_attempts": 0,
-                                    "recovered_existing": True,
-                                }
-                            )
-                            remaining.discard(worker_id)
-                            convergence_errors.pop(worker_id, None)
-                            continue
-                        if native.loaded or native.active:
-                            removed = self._native_remove(
-                                worker_id=worker_id, uid=uid
-                            )
-                            if removed.loaded or removed.active:
-                                raise WorkerControlError(
-                                    "old native worker registration remained during startup convergence"
-                                )
-                        if current_attempt_id is not None:
-                            self._settle_stopped_runner(
-                                worker_id=worker_id,
-                                evidence_key=f"{supervisor_epoch}-convergence",
-                            )
-                        self.supervision.normalize_startup_absence(
-                            server_definition_id=worker_id,
-                            supervisor_epoch=supervisor_epoch,
-                        )
-                        convergence_errors.pop(worker_id, None)
-                    except BaseException as error:
-                        convergence_errors[worker_id] = (
-                            f"{type(error).__name__}: {error}"
-                        )[:4096]
-            candidates = self.supervision.startup_candidates(
-                supervisor_epoch=supervisor_epoch
+
+        def remaining_native_timeout() -> float:
+            remaining = deadline - self.clock()
+            if remaining < 0.1:
+                raise WorkerControlError(
+                    "worker startup convergence deadline expired"
+                )
+            return min(STARTUP_NATIVE_COMMAND_MAX_SECONDS, remaining)
+
+        def cleanup_native_timeout() -> float:
+            return max(
+                0.1,
+                min(STARTUP_NATIVE_COMMAND_MAX_SECONDS, deadline - self.clock()),
             )
-            if remaining is not None:
-                candidates = [
-                    candidate
-                    for candidate in candidates
-                    if str(candidate["server_definition_id"]) in remaining
-                ]
-            if remaining is None and not candidates:
-                break
-            for candidate in candidates:
-                worker_id = str(candidate["server_definition_id"])
-                uid = int(candidate["execution_uid"])
-                user = pwd.getpwuid(uid)
-                attempt_errors: list[str] = []
-                for attempt_number in range(1, STARTUP_AUTOSTART_ATTEMPTS + 1):
-                    try:
-                        native = self._native_start(
-                            worker_id=worker_id,
-                            uid=uid,
-                            gid=int(user.pw_gid),
-                            repository_id=str(candidate["repo_id"]),
-                        )
+
+        def claim_cleanup_boundary(
+            worker_id: str,
+            *,
+            expected_attempt_id: object,
+            allow_current_epoch_cleanup: bool,
+        ) -> bool:
+            timestamp = utc_timestamp()
+            with self.store.immediate_transaction() as connection:
+                state = connection.execute(
+                    "SELECT current_attempt_id,supervisor_epoch,"
+                    "supervisor_generation FROM worker_supervisor_states "
+                    "WHERE server_definition_id=?",
+                    (worker_id,),
+                ).fetchone()
+                if (
+                    state is None
+                    or str(state["supervisor_epoch"] or "") != supervisor_epoch
+                    or state["current_attempt_id"] != expected_attempt_id
+                ):
+                    return False
+                if expected_attempt_id is not None:
+                    attempt = connection.execute(
+                        "SELECT state,supervisor_epoch FROM worker_attempts "
+                        "WHERE attempt_id=?",
+                        (str(expected_attempt_id),),
+                    ).fetchone()
+                    if attempt is None:
+                        return False
+                    if str(attempt["supervisor_epoch"] or "") == supervisor_epoch:
+                        if str(attempt["state"]) == "running":
+                            return False
+                        if (
+                            str(attempt["state"]) == "reserved"
+                            and not allow_current_epoch_cleanup
+                        ):
+                            return False
+                changed = connection.execute(
+                    "UPDATE worker_supervisor_states SET state='fenced',"
+                    "supervisor_generation=supervisor_generation+1,updated_at=? "
+                    "WHERE server_definition_id=? AND supervisor_epoch=? "
+                    "AND supervisor_generation=? AND current_attempt_id IS ?",
+                    (
+                        timestamp,
+                        worker_id,
+                        supervisor_epoch,
+                        int(state["supervisor_generation"]),
+                        expected_attempt_id,
+                    ),
+                ).rowcount
+                return changed == 1
+
+        def cleanup_registration(
+            worker_id: str,
+            *,
+            uid: int,
+            evidence_key: str,
+            force_remove: bool = False,
+            allow_current_epoch_cleanup: bool = False,
+        ) -> bool:
+            native = self._native_status(
+                worker_id=worker_id,
+                uid=uid,
+                timeout_seconds=cleanup_native_timeout(),
+            )
+            policy_before = self._require_policy(worker_id)
+            attempt_id_before = policy_before.get("current_attempt_id")
+            attempt_before = (
+                None
+                if attempt_id_before is None
+                else self.supervision.attempt(str(attempt_id_before))
+            )
+            current_epoch_active = bool(
+                native.loaded
+                and native.active
+                and attempt_before is not None
+                and str(attempt_before.get("state") or "")
+                in {"reserved", "running"}
+                and str(attempt_before.get("supervisor_epoch") or "")
+                == supervisor_epoch
+            )
+            if current_epoch_active and not allow_current_epoch_cleanup:
+                return False
+            if not claim_cleanup_boundary(
+                worker_id,
+                expected_attempt_id=attempt_id_before,
+                allow_current_epoch_cleanup=allow_current_epoch_cleanup,
+            ):
+                return False
+            if force_remove or native.loaded or native.active:
+                removed = self._native_remove(
+                    worker_id=worker_id,
+                    uid=uid,
+                    timeout_seconds=cleanup_native_timeout(),
+                )
+                if removed.loaded or removed.active:
+                    raise WorkerControlError(
+                        "native worker registration remained during startup convergence"
+                    )
+            policy_after = self._require_policy(worker_id)
+            attempt_id_after = policy_after.get("current_attempt_id")
+            native_after = self._native_status(
+                worker_id=worker_id,
+                uid=uid,
+                timeout_seconds=cleanup_native_timeout(),
+            )
+            if attempt_id_after != attempt_id_before:
+                if attempt_id_after is not None:
+                    changed = self.supervision.attempt(str(attempt_id_after))
+                    if (
+                        str(changed.get("state") or "") in {"reserved", "running"}
+                        and str(changed.get("supervisor_epoch") or "")
+                        == supervisor_epoch
+                    ):
+                        return False
+                raise WorkerControlError(
+                    "worker attempt changed during startup cleanup"
+                )
+            if native_after.loaded or native_after.active:
+                raise WorkerControlError(
+                    "native worker registration reappeared during startup cleanup"
+                )
+            if attempt_id_before is not None:
+                self._settle_stopped_runner(
+                    worker_id=worker_id,
+                    evidence_key=evidence_key,
+                    expected_attempt_id=str(attempt_id_before),
+                )
+            self.supervision.normalize_startup_absence(
+                server_definition_id=worker_id,
+                supervisor_epoch=supervisor_epoch,
+            )
+            return True
+
+        while remaining:
+            for worker_id in sorted(remaining):
+                try:
+                    policy = self._require_policy(worker_id)
+                    uid = int(policy["execution_uid"])
+                    native = self._native_status(
+                        worker_id=worker_id,
+                        uid=uid,
+                        timeout_seconds=(
+                            cleanup_native_timeout()
+                            if worker_id in pending and self.clock() >= deadline
+                            else remaining_native_timeout()
+                        ),
+                    )
+                    current_attempt_id = policy.get("current_attempt_id")
+                    current_attempt = (
+                        None
+                        if current_attempt_id is None
+                        else self.supervision.attempt(str(current_attempt_id))
+                    )
+                    if (
+                        native.loaded
+                        and native.active
+                        and current_attempt is not None
+                        and str(current_attempt.get("state") or "") == "running"
+                        and str(current_attempt.get("supervisor_epoch") or "")
+                        == supervisor_epoch
+                    ):
+                        attempts = pending.get(worker_id, 0)
                         started.append(
                             {
                                 **native.to_dict(),
-                                "startup_attempts": attempt_number,
+                                "startup_attempts": attempts,
+                                "recovered_existing": attempts == 0,
                             }
                         )
-                        break
-                    except BaseException as error:
-                        attempt_errors.append(f"{type(error).__name__}: {error}")
-                        if attempt_number >= STARTUP_AUTOSTART_ATTEMPTS:
-                            errors.append(
-                                {
-                                    "worker_id": worker_id,
-                                    "phase": "autostart",
-                                    "error": (
-                                        f"failed after {attempt_number} bounded attempts; "
-                                        + attempt_errors[-1]
-                                    )[:4096],
-                                }
-                            )
-                            break
-                        try:
-                            removed = self._native_remove(worker_id=worker_id, uid=uid)
-                            if removed.loaded or removed.active:
-                                raise WorkerControlError(
-                                    "native worker registration remained after failed autostart"
-                                )
-                            policy = self._policy_or_none(worker_id)
-                            if (
-                                policy is not None
-                                and policy.get("current_attempt_id") is not None
-                            ):
-                                self._settle_stopped_runner(
-                                    worker_id=worker_id,
-                                    evidence_key=(
-                                        f"{supervisor_epoch}-autostart-{attempt_number}"
-                                    ),
-                                )
-                        except BaseException as cleanup_error:
-                            errors.append(
-                                {
-                                    "worker_id": worker_id,
-                                    "phase": "autostart_cleanup",
-                                    "error": (
-                                        f"{type(cleanup_error).__name__}: {cleanup_error}"
-                                    )[:4096],
-                                }
-                            )
-                            break
-                        self.sleeper(
-                            STARTUP_AUTOSTART_RETRY_SECONDS * attempt_number
+                        remaining.discard(worker_id)
+                        pending.pop(worker_id, None)
+                        convergence_errors.pop(worker_id, None)
+                        continue
+                    launched = pending.get(worker_id)
+                    attempt_is_registering = bool(
+                        current_attempt is None
+                        or (
+                            str(current_attempt.get("state") or "") == "reserved"
+                            and str(current_attempt.get("supervisor_epoch") or "")
+                            == supervisor_epoch
                         )
-                if remaining is not None:
-                    remaining.discard(worker_id)
-            if remaining is None or not remaining:
+                    )
+                    if (
+                        launched is not None
+                        and native.loaded
+                        and native.active
+                        and attempt_is_registering
+                        and self.clock() < deadline
+                    ):
+                        convergence_errors[worker_id] = (
+                            "new native worker is awaiting exact current-epoch "
+                            "attempt registration"
+                        )
+                        continue
+                    cleaned = cleanup_registration(
+                        worker_id,
+                        uid=uid,
+                        evidence_key=f"{supervisor_epoch}-convergence",
+                        force_remove=launched is not None,
+                        allow_current_epoch_cleanup=self.clock() >= deadline,
+                    )
+                    if not cleaned:
+                        pending.setdefault(
+                            worker_id,
+                            launch_attempts.get(worker_id, 0),
+                        )
+                        convergence_errors[worker_id] = (
+                            "exact current-epoch registration won startup cleanup"
+                        )
+                        continue
+                    pending.pop(worker_id, None)
+                    if (
+                        launched is not None
+                        and launch_attempts.get(worker_id, 0)
+                        >= STARTUP_AUTOSTART_ATTEMPTS
+                    ):
+                        terminal_workers.add(worker_id)
+                        errors.append(
+                            {
+                                "worker_id": worker_id,
+                                "phase": "autostart_registration",
+                                "error": (
+                                    "native worker did not register one exact "
+                                    "current-epoch running attempt after "
+                                    f"{STARTUP_AUTOSTART_ATTEMPTS} bounded attempts"
+                                ),
+                            }
+                        )
+                        remaining.discard(worker_id)
+                    convergence_errors.pop(worker_id, None)
+                except BaseException as error:
+                    convergence_errors[worker_id] = (
+                        f"{type(error).__name__}: {error}"
+                    )[:4096]
+            if not remaining:
                 break
             if self.clock() >= deadline:
                 for worker_id in sorted(remaining):
@@ -1199,6 +1327,144 @@ class WorkerController:
                             )[:4096],
                         }
                     )
+                break
+            candidates = self.supervision.startup_candidates(
+                supervisor_epoch=supervisor_epoch
+            )
+            candidates = [
+                candidate
+                for candidate in candidates
+                if str(candidate["server_definition_id"]) in remaining
+            ]
+            candidates = [
+                candidate
+                for candidate in candidates
+                if str(candidate["server_definition_id"])
+                not in set(pending) | terminal_workers
+            ]
+            for candidate in candidates:
+                if self.clock() >= deadline:
+                    break
+                worker_id = str(candidate["server_definition_id"])
+                uid = int(candidate["execution_uid"])
+                user = pwd.getpwuid(uid)
+                attempt_number = launch_attempts.get(worker_id, 0) + 1
+                launch_attempts[worker_id] = attempt_number
+                try:
+                    self._native_start(
+                        worker_id=worker_id,
+                        uid=uid,
+                        gid=int(user.pw_gid),
+                        repository_id=str(candidate["repo_id"]),
+                        timeout_seconds=remaining_native_timeout(),
+                    )
+                    pending[worker_id] = attempt_number
+                    convergence_errors[worker_id] = (
+                        "native worker launched; exact attempt registration pending"
+                    )
+                except BaseException as error:
+                    detail = f"{type(error).__name__}: {error}"[:4096]
+                    convergence_errors[worker_id] = detail
+                    policy: dict[str, Any] | None = None
+                    current_attempt_id: object = None
+                    native: NativeWorkerState | None = None
+                    current_epoch_registration = False
+                    try:
+                        policy = self._policy_or_none(worker_id)
+                        native = self._native_status(
+                            worker_id=worker_id,
+                            uid=uid,
+                            timeout_seconds=remaining_native_timeout(),
+                        )
+                        current_attempt_id = (
+                            None
+                            if policy is None
+                            else policy.get("current_attempt_id")
+                        )
+                        current_attempt = (
+                            None
+                            if current_attempt_id is None
+                            else self.supervision.attempt(str(current_attempt_id))
+                        )
+                        current_epoch_registration = bool(
+                            current_attempt is None
+                            or (
+                                str(current_attempt.get("state") or "")
+                                in {"reserved", "running"}
+                                and str(
+                                    current_attempt.get("supervisor_epoch") or ""
+                                )
+                                == supervisor_epoch
+                            )
+                        )
+                    except BaseException as observation_error:
+                        convergence_errors[worker_id] = (
+                            detail
+                            + "; reobservation failed: "
+                            + f"{type(observation_error).__name__}: {observation_error}"
+                        )[:4096]
+                    if (
+                        native is not None
+                        and native.loaded
+                        and native.active
+                        and current_epoch_registration
+                    ):
+                        pending[worker_id] = attempt_number
+                        convergence_errors[worker_id] = (
+                            "native start reply was uncertain; exact current-epoch "
+                            "registration is being reobserved"
+                        )
+                        continue
+                    try:
+                        cleaned = cleanup_registration(
+                            worker_id=worker_id,
+                            uid=uid,
+                            evidence_key=(
+                                f"{supervisor_epoch}-autostart-{attempt_number}"
+                            ),
+                            force_remove=True,
+                        )
+                        if not cleaned:
+                            pending[worker_id] = attempt_number
+                            convergence_errors[worker_id] = (
+                                "exact current-epoch registration won uncertain "
+                                "start cleanup"
+                            )
+                            continue
+                    except BaseException as cleanup_error:
+                        terminal_workers.add(worker_id)
+                        errors.append(
+                            {
+                                "worker_id": worker_id,
+                                "phase": "autostart_cleanup",
+                                "error": (
+                                    f"{type(cleanup_error).__name__}: {cleanup_error}"
+                                )[:4096],
+                            }
+                        )
+                        remaining.discard(worker_id)
+                        continue
+                    if attempt_number >= STARTUP_AUTOSTART_ATTEMPTS:
+                        terminal_workers.add(worker_id)
+                        errors.append(
+                            {
+                                "worker_id": worker_id,
+                                "phase": "autostart",
+                                "error": (
+                                    f"failed after {attempt_number} bounded attempts; "
+                                    + detail
+                                )[:4096],
+                            }
+                        )
+                        remaining.discard(worker_id)
+                    else:
+                        retry_delay = min(
+                            STARTUP_AUTOSTART_RETRY_SECONDS * attempt_number,
+                            max(0.0, deadline - self.clock()),
+                        )
+                        if retry_delay > 0:
+                            self.sleeper(retry_delay)
+            if not remaining:
                 break
             self.sleeper(STARTUP_CONVERGENCE_POLL_SECONDS)
         return {
@@ -1838,20 +2104,35 @@ class WorkerController:
                 ),
             )
 
-    def _settle_stopped_runner(self, *, worker_id: str, evidence_key: str) -> None:
+    def _settle_stopped_runner(
+        self,
+        *,
+        worker_id: str,
+        evidence_key: str,
+        expected_attempt_id: str | None = None,
+    ) -> None:
         """Close an attempt when the native manager proves its runner absent.
 
         Normally the runner reports its own final child evidence first. This
         fallback is reserved for a manager-level stop/fence where no runner is
-        left to acknowledge; it is still an immutable, non-inferred
-        ``supervisor_lost`` trace rather than silent state repair.
+        left to acknowledge. A reserved attempt records ``launch_failure``;
+        only a launched attempt records ``supervisor_lost``.
         """
 
         policy = self._require_policy(worker_id)
         attempt_id = policy.get("current_attempt_id")
         if attempt_id is None:
             return
+        if expected_attempt_id is not None and str(attempt_id) != expected_attempt_id:
+            raise WorkerControlError(
+                "worker attempt changed before exact stopped-runner settlement"
+            )
         attempt = self.supervision.attempt(str(attempt_id))
+        exit_kind = (
+            "launch_failure"
+            if str(attempt.get("state") or "") == "reserved"
+            else "supervisor_lost"
+        )
         try:
             self.supervision.record_attempt_exit(
                 attempt_id=str(attempt["attempt_id"]),
@@ -1860,7 +2141,7 @@ class WorkerController:
                 ),
                 supervisor_epoch=str(attempt["supervisor_epoch"]),
                 supervisor_generation=int(attempt["supervisor_generation"]),
-                exit_kind="supervisor_lost",
+                exit_kind=exit_kind,
             )
         except WorkerSupervisionConflict:
             # A concurrent real runner report may have won the same atomic
@@ -1912,6 +2193,7 @@ class WorkerController:
         uid: int,
         gid: int,
         repository_id: str,
+        timeout_seconds: float | None = None,
     ) -> NativeWorkerState:
         arguments: dict[str, object] = {
             "worker_id": worker_id,
@@ -1924,12 +2206,27 @@ class WorkerController:
         # a real credential-bearing launch always receives the exact refs.
         if bindings:
             arguments["credential_bindings"] = bindings
-        return self._manager_instance().start(**arguments)
+        manager = self._manager_instance()
+        if timeout_seconds is not None and isinstance(manager, SystemdWorkerManager):
+            arguments["timeout_seconds"] = float(timeout_seconds)
+        return manager.start(**arguments)
 
-    def _native_status(self, *, worker_id: str, uid: int) -> NativeWorkerState:
+    def _native_status(
+        self,
+        *,
+        worker_id: str,
+        uid: int,
+        timeout_seconds: float | None = None,
+    ) -> NativeWorkerState:
         manager = self._manager_instance()
         if isinstance(manager, LaunchdWorkerManager):
             return manager.status(worker_id=worker_id, uid=uid)
+        if timeout_seconds is not None and isinstance(manager, SystemdWorkerManager):
+            return manager.status(
+                worker_id=worker_id,
+                allow_missing=True,
+                timeout_seconds=float(timeout_seconds),
+            )
         return manager.status(worker_id=worker_id, allow_missing=True)
 
     def _require_native_isolation(
@@ -1956,10 +2253,21 @@ class WorkerController:
             return manager.stop(worker_id=worker_id, uid=uid)
         return manager.stop(worker_id=worker_id)
 
-    def _native_remove(self, *, worker_id: str, uid: int) -> NativeWorkerState:
+    def _native_remove(
+        self,
+        *,
+        worker_id: str,
+        uid: int,
+        timeout_seconds: float | None = None,
+    ) -> NativeWorkerState:
         manager = self._manager_instance()
         if isinstance(manager, LaunchdWorkerManager):
             return manager.remove(worker_id=worker_id, uid=uid)
+        if timeout_seconds is not None and isinstance(manager, SystemdWorkerManager):
+            return manager.remove(
+                worker_id=worker_id,
+                timeout_seconds=float(timeout_seconds),
+            )
         return manager.remove(worker_id=worker_id)
 
     def _configure(

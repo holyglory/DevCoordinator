@@ -137,6 +137,69 @@ class FakeNativeManager:
         return result
 
 
+class AsynchronousNativeManager(FakeNativeManager):
+    """Return native start before the runner registers its exact attempt."""
+
+    def start(
+        self,
+        *,
+        worker_id: str,
+        uid: int,
+        gid: int,
+        repository_id: str,
+        credential_bindings: object = (),
+    ) -> NativeWorkerState:
+        del uid, gid
+        if not repository_id:
+            raise AssertionError("worker start omitted repository isolation identity")
+        self.credential_start_calls.append(
+            [dict(item) for item in credential_bindings]  # type: ignore[arg-type]
+        )
+        self.start_calls += 1
+        self.active = True
+        return self.status(worker_id=worker_id)
+
+    def remove(self, *, worker_id: str) -> NativeWorkerState:
+        self.remove_calls += 1
+        self.active = False
+        return self.status(worker_id=worker_id)
+
+    def reserve(self, *, worker_id: str) -> dict[str, object]:
+        policy = self.supervision.policy(worker_id)
+        candidate = self.supervision.launch_candidate(
+            server_definition_id=worker_id,
+            supervisor_epoch=str(policy["supervisor_epoch"]),
+        )
+        attempt = self.supervision.begin_attempt(
+            server_definition_id=worker_id,
+            begin_request_id=f"async-begin-{self.start_calls}",
+            supervisor_epoch=str(candidate["supervisor_epoch"]),
+            expected_definition_generation=int(candidate["definition_generation"]),
+            expected_policy_generation=int(candidate["policy_generation"]),
+            expected_supervisor_generation=int(candidate["supervisor_generation"]),
+        )
+        self.attempt = attempt
+        return attempt
+
+    def register(self, *, worker_id: str) -> None:
+        self.reserve(worker_id=worker_id)
+        self.mark_reserved()
+
+    def mark_reserved(self) -> None:
+        if self.attempt is None:
+            raise AssertionError("async worker has no reserved attempt")
+        attempt = self.attempt
+        self.attempt = self.supervision.mark_attempt_launched(
+            attempt_id=str(attempt["attempt_id"]),
+            launch_report_id=f"async-launch-{self.start_calls}",
+            supervisor_epoch=str(attempt["supervisor_epoch"]),
+            supervisor_generation=int(attempt["supervisor_generation"]),
+            pid=32_000 + self.start_calls,
+            process_start_time=f"async-start-{self.start_calls}",
+            process_fingerprint=f"async-fingerprint-{self.start_calls}",
+        )
+
+
 class WorkerControllerTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
@@ -360,7 +423,7 @@ class WorkerControllerTests(unittest.TestCase):
             supervisor_epoch="replacement-epoch"
         )
 
-        self.assertTrue(reconciled["ok"])
+        self.assertTrue(reconciled["ok"], reconciled)
         self.assertEqual(reconciled["errors"], [])
         self.assertEqual(len(reconciled["started"]), 1)
         self.assertEqual(reconciled["started"][0]["startup_attempts"], 2)
@@ -417,12 +480,21 @@ class WorkerControllerTests(unittest.TestCase):
         real_remove = self.controller._native_remove
         first_remove = True
 
-        def delayed_remove(*, worker_id: str, uid: int) -> NativeWorkerState:
+        def delayed_remove(
+            *,
+            worker_id: str,
+            uid: int,
+            timeout_seconds: float | None = None,
+        ) -> NativeWorkerState:
             nonlocal first_remove
             if first_remove:
                 first_remove = False
                 raise RuntimeError("native runner is still exiting")
-            return real_remove(worker_id=worker_id, uid=uid)
+            return real_remove(
+                worker_id=worker_id,
+                uid=uid,
+                timeout_seconds=timeout_seconds,
+            )
 
         with mock.patch.object(
             self.controller, "_native_remove", side_effect=delayed_remove
@@ -517,6 +589,354 @@ class WorkerControllerTests(unittest.TestCase):
             self.supervision.policy(self.worker_id)["supervisor_state"],
             "running",
         )
+
+    def test_startup_waits_for_async_current_epoch_registration(self) -> None:
+        self._start()
+        epoch = "replacement-async-registration"
+        fenced = self.controller.fence_startup(supervisor_epoch=epoch)
+        manager = AsynchronousNativeManager(self.supervision)
+        registration_phase = 0
+
+        def register_after_native_start(_seconds: float) -> None:
+            nonlocal registration_phase
+            if not manager.active:
+                return
+            if registration_phase == 0:
+                manager.reserve(worker_id=self.worker_id)
+                registration_phase = 1
+            elif registration_phase == 1:
+                manager.mark_reserved()
+                registration_phase = 2
+
+        controller = WorkerController(
+            self.store,
+            coordinator_script=Path(__file__).parents[2] / "dev_coordinator.py",
+            manager_factory=lambda **_kwargs: manager,
+            process_observer=lambda _pid, _started: "alive",
+            sleeper=register_after_native_start,
+        )
+        reconciled = controller.autostart_fenced(
+            supervisor_epoch=epoch,
+            expected_worker_ids=fenced["autostart_expected"],
+        )
+
+        self.assertTrue(reconciled["ok"])
+        self.assertEqual(registration_phase, 2)
+        self.assertEqual(manager.start_calls, 1)
+        self.assertEqual(manager.remove_calls, 0)
+        self.assertEqual(len(reconciled["started"]), 1)
+        self.assertEqual(reconciled["started"][0]["startup_attempts"], 1)
+        self.assertFalse(reconciled["started"][0]["recovered_existing"])
+        policy = self.supervision.policy(self.worker_id)
+        self.assertEqual(policy["supervisor_state"], "running")
+        attempt = self.supervision.attempt(str(policy["current_attempt_id"]))
+        self.assertEqual(attempt["supervisor_epoch"], epoch)
+
+    def test_startup_accepts_exact_running_attempt_after_lost_start_reply(self) -> None:
+        self._start()
+        epoch = "replacement-lost-start-reply"
+        fenced = self.controller.fence_startup(supervisor_epoch=epoch)
+        real_start = self.controller._native_start
+
+        def start_then_lose_reply(**arguments: object) -> NativeWorkerState:
+            real_start(**arguments)  # type: ignore[arg-type]
+            raise RuntimeError("injected lost native start reply")
+
+        with mock.patch.object(
+            self.controller,
+            "_native_start",
+            side_effect=start_then_lose_reply,
+        ):
+            reconciled = self.controller.autostart_fenced(
+                supervisor_epoch=epoch,
+                expected_worker_ids=fenced["autostart_expected"],
+            )
+
+        self.assertTrue(reconciled["ok"])
+        self.assertEqual(self.manager.remove_calls, 1)
+        self.assertEqual(len(reconciled["started"]), 1)
+        policy = self.supervision.policy(self.worker_id)
+        attempt = self.supervision.attempt(str(policy["current_attempt_id"]))
+        self.assertEqual(attempt["supervisor_epoch"], epoch)
+        self.assertEqual(attempt["state"], "running")
+
+    def test_startup_cleanup_preserves_concurrent_current_epoch_winner(self) -> None:
+        self._start()
+        epoch = "replacement-concurrent-winner"
+        fenced = self.controller.fence_startup(supervisor_epoch=epoch)
+        real_status = self.controller._native_status
+        status_calls = 0
+
+        def race_status(
+            *, worker_id: str, uid: int, timeout_seconds: float | None = None
+        ) -> NativeWorkerState:
+            del timeout_seconds
+            nonlocal status_calls
+            status_calls += 1
+            if status_calls == 2:
+                self.manager.start(
+                    worker_id=worker_id,
+                    uid=uid,
+                    gid=os.getegid(),
+                    repository_id=self.repo_id,
+                )
+            return real_status(worker_id=worker_id, uid=uid)
+
+        with (
+            mock.patch.object(
+                self.controller,
+                "_native_start",
+                side_effect=RuntimeError("injected pre-start failure"),
+            ),
+            mock.patch.object(
+                self.controller,
+                "_native_status",
+                side_effect=race_status,
+            ),
+        ):
+            reconciled = self.controller.autostart_fenced(
+                supervisor_epoch=epoch,
+                expected_worker_ids=fenced["autostart_expected"],
+            )
+
+        self.assertTrue(reconciled["ok"], reconciled)
+        self.assertEqual(self.manager.remove_calls, 1)
+        policy = self.supervision.policy(self.worker_id)
+        attempt = self.supervision.attempt(str(policy["current_attempt_id"]))
+        self.assertEqual(attempt["supervisor_epoch"], epoch)
+        self.assertEqual(attempt["state"], "running")
+
+    def test_startup_cleanup_never_fences_current_epoch_running_attempt(self) -> None:
+        self._start()
+        epoch = "replacement-running-wins-cleanup"
+        fenced = self.controller.fence_startup(supervisor_epoch=epoch)
+        policy = self.supervision.policy(self.worker_id)
+        self.manager.start(
+            worker_id=self.worker_id,
+            uid=int(policy["execution_uid"]),
+            gid=os.getegid(),
+            repository_id=self.repo_id,
+        )
+        stale = NativeWorkerState(
+            worker_id=self.worker_id,
+            manager="fake",
+            unit=f"fake-{self.worker_id}",
+            loaded=False,
+            active=False,
+            state="not-found",
+            pid=None,
+            exit_status=None,
+        )
+        real_status = self.controller._native_status
+        status_calls = 0
+
+        def stale_then_current(
+            *, worker_id: str, uid: int, timeout_seconds: float | None = None
+        ) -> NativeWorkerState:
+            nonlocal status_calls
+            del timeout_seconds
+            status_calls += 1
+            if status_calls <= 2:
+                return stale
+            return real_status(worker_id=worker_id, uid=uid)
+
+        with mock.patch.object(
+            self.controller,
+            "_native_status",
+            side_effect=stale_then_current,
+        ):
+            reconciled = self.controller.autostart_fenced(
+                supervisor_epoch=epoch,
+                expected_worker_ids=fenced["autostart_expected"],
+            )
+
+        self.assertTrue(reconciled["ok"])
+        self.assertEqual(self.manager.remove_calls, 1)
+        current = self.supervision.policy(self.worker_id)
+        attempt = self.supervision.attempt(str(current["current_attempt_id"]))
+        self.assertEqual(attempt["state"], "running")
+        self.assertEqual(attempt["supervisor_epoch"], epoch)
+
+    def test_startup_retries_async_runner_that_exits_before_registration(self) -> None:
+        self._start()
+        epoch = "replacement-async-exit"
+        fenced = self.controller.fence_startup(supervisor_epoch=epoch)
+        manager = AsynchronousNativeManager(self.supervision)
+        clock_value = 0.0
+
+        def clock() -> float:
+            return clock_value
+
+        def exit_unregistered_runner(seconds: float) -> None:
+            nonlocal clock_value
+            clock_value += seconds
+            if manager.active:
+                manager.active = False
+
+        controller = WorkerController(
+            self.store,
+            coordinator_script=Path(__file__).parents[2] / "dev_coordinator.py",
+            manager_factory=lambda **_kwargs: manager,
+            process_observer=lambda _pid, _started: "alive",
+            clock=clock,
+            sleeper=exit_unregistered_runner,
+        )
+        reconciled = controller.autostart_fenced(
+            supervisor_epoch=epoch,
+            expected_worker_ids=fenced["autostart_expected"],
+        )
+
+        self.assertFalse(reconciled["ok"])
+        self.assertEqual(manager.start_calls, 3)
+        self.assertEqual(manager.remove_calls, 3)
+        self.assertFalse(manager.active)
+        self.assertEqual(reconciled["started"], [])
+        self.assertEqual(reconciled["errors"][0]["phase"], "autostart_registration")
+        self.assertLess(clock_value, 60.0)
+
+    def test_startup_preserves_active_unregistered_runner_until_deadline(self) -> None:
+        self._start()
+        epoch = "replacement-active-unregistered"
+        fenced = self.controller.fence_startup(supervisor_epoch=epoch)
+        manager = AsynchronousNativeManager(self.supervision)
+        clock_value = 0.0
+        reserved = False
+
+        def clock() -> float:
+            return clock_value
+
+        def advance(seconds: float) -> None:
+            nonlocal clock_value, reserved
+            clock_value += seconds
+            if manager.active and not reserved:
+                manager.reserve(worker_id=self.worker_id)
+                reserved = True
+
+        controller = WorkerController(
+            self.store,
+            coordinator_script=Path(__file__).parents[2] / "dev_coordinator.py",
+            manager_factory=lambda **_kwargs: manager,
+            process_observer=lambda _pid, _started: "alive",
+            clock=clock,
+            sleeper=advance,
+        )
+        reconciled = controller.autostart_fenced(
+            supervisor_epoch=epoch,
+            expected_worker_ids=fenced["autostart_expected"],
+        )
+
+        self.assertFalse(reconciled["ok"])
+        self.assertEqual(manager.start_calls, 1)
+        self.assertEqual(manager.remove_calls, 1)
+        self.assertFalse(manager.active)
+        self.assertTrue(reserved)
+        self.assertGreaterEqual(clock_value, 60.0)
+        self.assertEqual(reconciled["errors"][0]["phase"], "autostart_convergence")
+        self.assertIsNotNone(manager.attempt)
+        settled = self.supervision.attempt(str(manager.attempt["attempt_id"]))
+        self.assertEqual(settled["state"], "exited")
+        self.assertEqual(settled["exit_kind"], "launch_failure")
+
+    def test_startup_does_not_relaunch_after_native_call_uses_deadline(self) -> None:
+        self._start()
+        epoch = "replacement-native-deadline"
+        fenced = self.controller.fence_startup(supervisor_epoch=epoch)
+        manager = AsynchronousNativeManager(self.supervision)
+        clock_value = 0.0
+
+        def clock() -> float:
+            return clock_value
+
+        def advance(seconds: float) -> None:
+            nonlocal clock_value
+            clock_value += seconds
+
+        controller = WorkerController(
+            self.store,
+            coordinator_script=Path(__file__).parents[2] / "dev_coordinator.py",
+            manager_factory=lambda **_kwargs: manager,
+            process_observer=lambda _pid, _started: "alive",
+            clock=clock,
+            sleeper=advance,
+        )
+
+        def slow_native_start(**_kwargs: object) -> NativeWorkerState:
+            nonlocal clock_value
+            manager.start_calls += 1
+            manager.active = True
+            clock_value = 61.0
+            return manager.status(worker_id=self.worker_id)
+
+        with mock.patch.object(
+            controller, "_native_start", side_effect=slow_native_start
+        ) as native_start:
+            reconciled = controller.autostart_fenced(
+                supervisor_epoch=epoch,
+                expected_worker_ids=fenced["autostart_expected"],
+            )
+
+        self.assertFalse(reconciled["ok"])
+        self.assertEqual(native_start.call_count, 1)
+        self.assertEqual(manager.start_calls, 1)
+        self.assertEqual(manager.remove_calls, 1)
+        self.assertLessEqual(
+            float(native_start.call_args.kwargs["timeout_seconds"]), 20.0
+        )
+
+    def test_startup_does_not_launch_when_candidate_setup_uses_deadline(self) -> None:
+        self._start()
+        epoch = "replacement-candidate-deadline"
+        fenced = self.controller.fence_startup(supervisor_epoch=epoch)
+        clock_value = 0.0
+
+        def clock() -> float:
+            return clock_value
+
+        controller = WorkerController(
+            self.store,
+            coordinator_script=Path(__file__).parents[2] / "dev_coordinator.py",
+            manager_factory=lambda **_kwargs: self.manager,
+            process_observer=lambda _pid, _started: "alive",
+            clock=clock,
+            sleeper=lambda _seconds: None,
+        )
+
+        def exhaust_candidate_budget(_uid: int) -> object:
+            nonlocal clock_value
+            clock_value = 61.0
+            return mock.Mock(pw_gid=os.getegid())
+
+        with (
+            mock.patch(
+                "devcoordinator.worker_control.pwd.getpwuid",
+                side_effect=exhaust_candidate_budget,
+            ),
+            mock.patch.object(controller, "_native_start") as native_start,
+        ):
+            reconciled = controller.autostart_fenced(
+                supervisor_epoch=epoch,
+                expected_worker_ids=fenced["autostart_expected"],
+            )
+
+        self.assertFalse(reconciled["ok"])
+        native_start.assert_not_called()
+
+    def test_startup_cleans_wrong_epoch_attempt_before_relaunch(self) -> None:
+        self._start()
+        epoch = "replacement-wrong-epoch"
+        self.supervision.fence_startup(supervisor_epoch=epoch)
+
+        reconciled = self.controller.autostart_fenced(
+            supervisor_epoch=epoch,
+            expected_worker_ids=[self.worker_id],
+        )
+
+        self.assertTrue(reconciled["ok"])
+        self.assertEqual(self.manager.remove_calls, 1)
+        policy = self.supervision.policy(self.worker_id)
+        attempt = self.supervision.attempt(str(policy["current_attempt_id"]))
+        self.assertEqual(attempt["supervisor_epoch"], epoch)
+        self.assertEqual(attempt["state"], "running")
 
     def test_status_uses_fixed_runner_and_exact_process_when_attempt_pointer_lags(self) -> None:
         self._start()
