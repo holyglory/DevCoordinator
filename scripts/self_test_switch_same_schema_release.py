@@ -3402,6 +3402,12 @@ def exercise_prepared_supersession_clears_only_exact_claim() -> None:
 
 def exercise_retained_control_transaction_boundary() -> None:
     apply_source = inspect.getsource(switch.apply_retained_control_rebaseline)
+    completion_source = inspect.getsource(
+        switch.complete_retained_control_rebaseline
+    )
+    post_start_source = inspect.getsource(
+        switch._require_post_start_retained_target
+    )
     rollback_source = inspect.getsource(switch.restore_retained_control_rebaseline)
     switch_source = inspect.getsource(switch.apply)
     verify_source = inspect.getsource(switch.verify)
@@ -3426,6 +3432,17 @@ def exercise_retained_control_transaction_boundary() -> None:
         and switch_source.index("apply_retained_control_rebaseline(")
         < switch_source.index("restart_services(runner)"),
         "retained-control publication is not inside the stopped-writer switch window",
+    )
+    expect(
+        apply_source.count("_require_exact_live_retained_target(") == 1
+        and apply_source.index("_require_exact_live_retained_target(")
+        < apply_source.index('intent.update({"status": "published"')
+        and "_require_post_start_retained_target(" in apply_source
+        and "_require_exact_live_retained_target(" not in completion_source
+        and "_require_post_start_retained_target(" in completion_source
+        and switch_source.index("restart_services(runner)")
+        < switch_source.index("complete_retained_control_rebaseline("),
+        "stopped-writer bytes and post-start semantics are checked in the wrong phases",
     )
     expect(
         apply_source.index("stop_authority_writers(runner)")
@@ -3480,7 +3497,8 @@ def exercise_retained_control_transaction_boundary() -> None:
         and "_cleanup_server_credential_temporaries("
         in rollback_source
         and "_cleanup_server_credential_temporaries("
-        in inspect.getsource(switch._require_exact_live_retained_target),
+        in inspect.getsource(switch._require_exact_live_retained_target)
+        and "_require_exact_live_server_credentials(" in post_start_source,
         "credential atomic remnants are not cleaned on replay, rollback, and verify",
     )
     expect(
@@ -3492,7 +3510,7 @@ def exercise_retained_control_transaction_boundary() -> None:
     expect(
         'document.get("phase") != "applied"' in verify_source
         and "_load_bound_retained_manifest(" in verify_source
-        and "_require_live_retained_generation(manifest)" in verify_source,
+        and "_require_post_start_retained_target(" in verify_source,
         "verification can accept an applying or generation-unbound rebaseline",
     )
 
@@ -3547,6 +3565,249 @@ def exercise_retained_control_transaction_boundary() -> None:
             stat.S_IMODE(source.stat().st_mode) == 0o640,
             "exact rollback changed file mode",
         )
+
+
+def exercise_post_start_retained_target_semantics() -> None:
+    generation = "post-start-generation"
+
+    def must_reject(callback, label: str) -> None:
+        try:
+            callback()
+        except switch.SwitchError:
+            pass
+        else:
+            raise AssertionError(label)
+
+    with tempfile.TemporaryDirectory(prefix="retained-post-start-") as raw:
+        root = Path(raw)
+        authority_root = root / "authority"
+        profile_root = root / "profile"
+        console_root = root / "console"
+        transaction = root / "transaction"
+        for directory in (
+            authority_root,
+            profile_root,
+            console_root,
+            transaction,
+        ):
+            directory.mkdir(mode=0o700)
+        authority = authority_root / "authority.sqlite3"
+        profile = profile_root / "client-profiles.json"
+        connection = sqlite3.connect(authority)
+        try:
+            connection.execute(
+                "CREATE TABLE schema_metadata("
+                "singleton INTEGER PRIMARY KEY,schema_version INTEGER NOT NULL,"
+                "database_generation TEXT NOT NULL,state_revision INTEGER NOT NULL)"
+            )
+            connection.execute(
+                "INSERT INTO schema_metadata VALUES(1,16,?,0)",
+                (generation,),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        authority.chmod(0o600)
+        profile_document = {
+            "version": 2,
+            "service": {
+                "socket": "/run/devcoordinator-authority/authority.sock",
+                "database_generation": generation,
+            },
+        }
+        console_documents = {
+            "routes.json": {"version": 1, "routes": {}},
+            "access-control.json": {
+                "version": 3,
+                "users": {},
+                "requests": {},
+            },
+            "ui-prefs.json": {
+                "version": 1,
+                "hidden": {"servers": [], "docker": [], "projects": []},
+            },
+        }
+        switch.atomic_json(profile, profile_document)
+        console_paths: dict[str, Path] = {}
+        for name, document in console_documents.items():
+            path = console_root / name
+            switch.atomic_json(path, document)
+            console_paths[name] = path
+
+        def backup(path: Path) -> dict[str, object]:
+            return {
+                "existed": True,
+                "source": switch.exact_file_identity(path),
+            }
+
+        backups = {
+            str(authority): backup(authority),
+            str(profile): backup(profile),
+            **{str(path): backup(path) for path in console_paths.values()},
+        }
+        manifest = {
+            "target": {
+                "database": switch.exact_file_identity(authority),
+                "profile": switch.exact_file_identity(profile),
+                "database_generation": generation,
+            },
+            "console_files": {
+                name: switch.exact_file_identity(path)
+                for name, path in console_paths.items()
+            },
+            "server_credentials": [],
+        }
+
+        def prove() -> None:
+            switch._require_post_start_retained_target(
+                manifest, backups, transaction
+            )
+
+        def update_authority(
+            *, schema: int = 16, current_generation: str = generation
+        ) -> None:
+            connection = sqlite3.connect(authority)
+            try:
+                connection.execute(
+                    "UPDATE schema_metadata SET schema_version=?,"
+                    "database_generation=?,state_revision=state_revision+1 "
+                    "WHERE singleton=1",
+                    (schema, current_generation),
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+        with (
+            mock.patch.object(switch, "AUTHORITY_DATABASE", authority),
+            mock.patch.object(switch, "CLIENT_PROFILE", profile),
+            mock.patch.object(switch, "CONSOLE_STATE_ROOT", console_root),
+        ):
+            prove()
+            staged_sha256 = manifest["target"]["database"]["sha256"]
+            update_authority()
+            expect(
+                switch.digest_file(authority) != staged_sha256,
+                "startup mutation fixture did not change authority bytes",
+            )
+            prove()
+            must_reject(
+                lambda: switch._require_exact_live_retained_target(
+                    manifest, backups, transaction
+                ),
+                "stopped-writer byte proof accepted a post-start database mutation",
+            )
+
+            update_authority(schema=17)
+            must_reject(prove, "post-start proof accepted another authority schema")
+            update_authority()
+            update_authority(current_generation="another-generation")
+            must_reject(prove, "post-start proof accepted another authority generation")
+            update_authority()
+
+            saved_authority = authority.with_name("authority.saved.sqlite3")
+            replacement_authority = authority.with_name(
+                "authority.replacement.sqlite3"
+            )
+            shutil.copy2(authority, saved_authority)
+            shutil.copy2(authority, replacement_authority)
+            real_connect = sqlite3.connect
+            swapped = False
+
+            def swap_authority_after_sqlite_open(*args, **kwargs):
+                nonlocal swapped
+                connection = real_connect(*args, **kwargs)
+                if not swapped:
+                    os.replace(replacement_authority, authority)
+                    swapped = True
+                return connection
+
+            try:
+                with mock.patch.object(
+                    switch.sqlite3,
+                    "connect",
+                    side_effect=swap_authority_after_sqlite_open,
+                ):
+                    must_reject(
+                        prove,
+                        "post-start proof combined identity and generation from different authority files",
+                    )
+                expect(swapped, "authority path-swap fixture did not execute")
+            finally:
+                os.replace(saved_authority, authority)
+                replacement_authority.unlink(missing_ok=True)
+
+            authority.chmod(0o640)
+            must_reject(prove, "post-start proof accepted another authority mode")
+            authority.chmod(0o600)
+            moved_authority = authority.with_name("authority.real")
+            authority.rename(moved_authority)
+            os.mkfifo(authority, 0o600)
+            try:
+                must_reject(
+                    prove,
+                    "post-start proof accepted a FIFO authority target",
+                )
+            finally:
+                authority.unlink()
+                moved_authority.rename(authority)
+            moved_authority = authority.with_name("authority.real")
+            authority.rename(moved_authority)
+            authority.symlink_to(moved_authority)
+            try:
+                must_reject(
+                    prove,
+                    "post-start proof accepted a symlinked authority target",
+                )
+            finally:
+                authority.unlink()
+                moved_authority.rename(authority)
+            live_contract = switch._live_regular_file_contract(authority)
+            with mock.patch.object(
+                switch,
+                "_live_regular_file_contract",
+                return_value={
+                    **live_contract,
+                    "uid": int(live_contract["uid"]) + 1,
+                },
+            ):
+                must_reject(prove, "post-start proof accepted another authority owner")
+
+            switch.atomic_json(
+                profile,
+                {
+                    **profile_document,
+                    "service": {
+                        **profile_document["service"],
+                        "database_generation": "another-generation",
+                    },
+                },
+            )
+            must_reject(prove, "post-start proof accepted changed exact profile")
+            switch.atomic_json(profile, profile_document)
+
+            preferences = console_paths["ui-prefs.json"]
+            switch.atomic_json(
+                preferences,
+                {
+                    "version": 1,
+                    "hidden": {
+                        "servers": ["changed"],
+                        "docker": [],
+                        "projects": [],
+                    },
+                },
+            )
+            must_reject(prove, "post-start proof accepted changed exact Console state")
+            switch.atomic_json(preferences, console_documents["ui-prefs.json"])
+
+            with mock.patch.object(
+                switch,
+                "_require_exact_live_server_credentials",
+                side_effect=switch.SwitchError("credential drift"),
+            ):
+                must_reject(prove, "post-start proof accepted changed credentials")
+            prove()
 
 
 def exercise_retained_server_credential_transaction() -> None:
@@ -5774,6 +6035,7 @@ def main() -> int:
     exercise_software_delivery_fence_lifecycle()
     exercise_prepared_supersession_clears_only_exact_claim()
     exercise_retained_control_transaction_boundary()
+    exercise_post_start_retained_target_semantics()
     exercise_retained_server_credential_transaction()
     exercise_rebaseline_quiesces_exact_managed_workers()
     exercise_source_worker_quiescence_is_exact_and_race_safe()

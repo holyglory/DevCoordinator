@@ -5379,6 +5379,94 @@ def _require_exact_live_server_credentials(
             raise SwitchError("retained server credential live target changed")
 
 
+def _retained_destination_owner(
+    backup: Mapping[str, object],
+) -> tuple[object, object, object]:
+    source = backup.get("source")
+    if not isinstance(source, Mapping):
+        raise SwitchError("retained-control source ownership is unavailable")
+    if backup.get("existed") is True:
+        return source.get("uid"), source.get("gid"), source.get("mode")
+    if backup.get("existed") is False:
+        parent = source.get("parent")
+        if not isinstance(parent, Mapping):
+            raise SwitchError("retained-control source parent is unavailable")
+        return parent.get("uid"), parent.get("gid"), 0o600
+    raise SwitchError("retained-control destination existence evidence is invalid")
+
+
+def _live_regular_file_contract(path: Path) -> dict[str, object]:
+    parent = path_parent_identity(path)
+    try:
+        path_before = path.lstat()
+    except OSError as error:
+        raise SwitchError(f"retained-control live file is unavailable: {path}") from error
+    if stat.S_ISLNK(path_before.st_mode) or not stat.S_ISREG(path_before.st_mode):
+        raise SwitchError(f"retained-control live file is not regular: {path}")
+    try:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NONBLOCK", 0),
+        )
+    except OSError as error:
+        raise SwitchError(f"retained-control live file is unavailable: {path}") from error
+    try:
+        opened = os.fstat(descriptor)
+        path_info = path.lstat()
+        opened_after = os.fstat(descriptor)
+    except OSError as error:
+        raise SwitchError(f"retained-control live file is unavailable: {path}") from error
+    finally:
+        os.close(descriptor)
+    identity = (
+        opened.st_dev,
+        opened.st_ino,
+        opened.st_uid,
+        opened.st_gid,
+        stat.S_IMODE(opened.st_mode),
+    )
+    if (
+        not stat.S_ISREG(opened.st_mode)
+        or identity
+        != (
+            path_before.st_dev,
+            path_before.st_ino,
+            path_before.st_uid,
+            path_before.st_gid,
+            stat.S_IMODE(path_before.st_mode),
+        )
+        or identity
+        != (
+            path_info.st_dev,
+            path_info.st_ino,
+            path_info.st_uid,
+            path_info.st_gid,
+            stat.S_IMODE(path_info.st_mode),
+        )
+        or identity
+        != (
+            opened_after.st_dev,
+            opened_after.st_ino,
+            opened_after.st_uid,
+            opened_after.st_gid,
+            stat.S_IMODE(opened_after.st_mode),
+        )
+    ):
+        raise SwitchError(f"retained-control live file identity changed: {path}")
+    return {
+        "path": str(path),
+        "uid": opened.st_uid,
+        "gid": opened.st_gid,
+        "mode": stat.S_IMODE(opened.st_mode),
+        "device": opened.st_dev,
+        "inode": opened.st_ino,
+        "parent": parent,
+    }
+
+
 def _require_exact_live_retained_target(
     manifest: Mapping[str, object],
     backups: Mapping[str, object],
@@ -5401,18 +5489,7 @@ def _require_exact_live_retained_target(
         if not isinstance(staged, Mapping) or not isinstance(backup, Mapping):
             raise SwitchError("retained-control live target evidence is incomplete")
         current = exact_file_identity(destination)
-        source = backup.get("source")
-        if not isinstance(source, Mapping):
-            raise SwitchError("retained-control source ownership is unavailable")
-        desired_owner = (
-            (source.get("uid"), source.get("gid"), source.get("mode"))
-            if backup.get("existed") is True
-            else (
-                source["parent"]["uid"],
-                source["parent"]["gid"],
-                0o600,
-            )
-        )
+        desired_owner = _retained_destination_owner(backup)
         if (
             current.get("sha256") != staged.get("sha256")
             or current.get("bytes") != staged.get("bytes")
@@ -5426,13 +5503,81 @@ def _require_exact_live_retained_target(
     require_current_authority_schema()
 
 
-def _require_live_retained_generation(manifest: Mapping[str, object]) -> None:
+def _require_post_start_retained_target(
+    manifest: Mapping[str, object],
+    backups: Mapping[str, object],
+    transaction_root: Path,
+) -> None:
+    target = manifest.get("target")
+    console_files = manifest.get("console_files")
+    if not isinstance(target, Mapping) or not isinstance(console_files, Mapping):
+        raise SwitchError("retained-control target evidence is unavailable")
+    database_backup = backups.get(str(AUTHORITY_DATABASE))
+    if not isinstance(database_backup, Mapping):
+        raise SwitchError("retained-control live authority evidence is incomplete")
+    database_source = database_backup.get("source")
+    if not isinstance(database_source, Mapping):
+        raise SwitchError("retained-control source ownership is unavailable")
+    require_parent_identity(AUTHORITY_DATABASE, database_source.get("parent"))
+    authority = _live_regular_file_contract(AUTHORITY_DATABASE)
+    if (
+        authority.get("uid"),
+        authority.get("gid"),
+        authority.get("mode"),
+    ) != _retained_destination_owner(database_backup):
+        raise SwitchError("retained-control live authority ownership changed")
+
+    exact_targets: tuple[tuple[Path, object], ...] = (
+        (CLIENT_PROFILE, target.get("profile")),
+        *tuple(
+            (CONSOLE_STATE_ROOT / name, console_files.get(name))
+            for name in retained_control.CONSOLE_FILES
+        ),
+    )
+    for destination, staged in exact_targets:
+        backup = backups.get(str(destination))
+        if not isinstance(staged, Mapping) or not isinstance(backup, Mapping):
+            raise SwitchError("retained-control live target evidence is incomplete")
+        current = exact_file_identity(destination)
+        if (
+            current.get("sha256") != staged.get("sha256")
+            or current.get("bytes") != staged.get("bytes")
+            or (current.get("uid"), current.get("gid"), current.get("mode"))
+            != _retained_destination_owner(backup)
+        ):
+            raise SwitchError(f"retained-control live target changed: {destination}")
+    credentials = _server_credentials_from_manifest(manifest, transaction_root)
+    _cleanup_server_credential_temporaries(credentials, transaction_root)
+    _require_exact_live_server_credentials(credentials)
+    _require_live_retained_generation(
+        manifest, expected_authority_identity=authority
+    )
+
+
+def _require_live_retained_generation(
+    manifest: Mapping[str, object],
+    *,
+    expected_authority_identity: Mapping[str, object],
+) -> None:
     target = manifest.get("target")
     if not isinstance(target, Mapping):
         raise SwitchError("retained-control target generation is unavailable")
     generation = target.get("database_generation")
     if not isinstance(generation, str) or not generation:
         raise SwitchError("retained-control target generation is invalid")
+
+    def require_bound_authority_path() -> None:
+        observed = _live_regular_file_contract(AUTHORITY_DATABASE)
+        fields = ("device", "inode", "uid", "gid", "mode")
+        if any(
+            observed.get(field) != expected_authority_identity.get(field)
+            for field in fields
+        ):
+            raise SwitchError(
+                "retained-control live authority changed during semantic proof"
+            )
+
+    require_bound_authority_path()
     try:
         connection = sqlite3.connect(f"{AUTHORITY_DATABASE.as_uri()}?mode=ro", uri=True)
         try:
@@ -5444,6 +5589,7 @@ def _require_live_retained_generation(manifest: Mapping[str, object]) -> None:
             connection.close()
     except sqlite3.Error as error:
         raise SwitchError(f"published retained authority is unreadable: {error}") from error
+    require_bound_authority_path()
     if row != (COORDINATOR_SCHEMA_VERSION, generation):
         raise SwitchError("published retained authority has another schema or generation")
     raw_profile, _profile_identity = retained_control._read_console(CLIENT_PROFILE, {})
@@ -5488,10 +5634,9 @@ def apply_retained_control_rebaseline(
         if not isinstance(backups, Mapping):
             raise SwitchError("applied retained-control transaction lost its backups")
         manifest = _load_bound_retained_manifest(intent, transaction_root, backups)
-        _require_exact_live_retained_target(
+        _require_post_start_retained_target(
             manifest, backups, transaction_root
         )
-        _require_live_retained_generation(manifest)
         return intent
 
     source_status = intent["status"] in {"planned", "backed-up", "prepared"}
@@ -5664,8 +5809,7 @@ def complete_retained_control_rebaseline(
     if not isinstance(backups, Mapping):
         raise SwitchError("retained-control completion lost its exact backups")
     manifest = _load_bound_retained_manifest(intent, transaction_root, backups)
-    _require_exact_live_retained_target(manifest, backups, transaction_root)
-    _require_live_retained_generation(manifest)
+    _require_post_start_retained_target(manifest, backups, transaction_root)
     require_retained_worker_policy_convergence(
         runner,
         source_proof=intent["source_worker_quiescence"],
@@ -6837,10 +6981,9 @@ def verify(
             raise SwitchError("retained-control verification lost its exact backups")
         validate_retained_rebaseline_paths(rebaseline, transaction_root)
         manifest = _load_bound_retained_manifest(rebaseline, transaction_root, backups)
-        _require_exact_live_retained_target(
+        _require_post_start_retained_target(
             manifest, backups, transaction_root
         )
-        _require_live_retained_generation(manifest)
     authority_schema = require_current_authority_schema()
     units = [*SERVICE_ORDER, *REQUIRED_SOCKETS, str(document["candidate_console_unit"])]
     states = {unit: unit_active(runner, unit) for unit in units}
