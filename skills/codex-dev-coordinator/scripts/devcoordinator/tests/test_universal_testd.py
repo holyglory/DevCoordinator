@@ -536,6 +536,64 @@ class TestdEngineTests(EngineFixture):
             initial_expiry,
         )
 
+    def test_successful_native_observation_recovers_a_downtime_expired_lease(self) -> None:
+        self.submit_live()
+        self.engine.schedule(launch_batch=1)
+        attempt_id = self.launcher.requests[0].ticket.attempt_id
+        self.clock.advance(31)
+
+        heartbeat = self.engine.heartbeat()
+
+        self.assertEqual(heartbeat["running_attempt_ids"], [attempt_id])
+        self.assertEqual(heartbeat["failures"], [])
+        recovered = self.store.get_attempt(attempt_id)
+        self.assertEqual(recovered["heartbeat_at"], self.clock())
+        self.assertEqual(
+            recovered["lease_expires_at"], self.clock() + 30
+        )
+
+    def test_expired_waiting_fanout_lease_does_not_abort_exact_observation(self) -> None:
+        self.submit_live()
+        self.engine.schedule(launch_batch=1)
+        second_plan = plan(
+            mode=SourceMode.LIVE,
+            fingerprint=uuid.uuid4().hex * 2,
+            temporary_root="/home/example/fanout-worktree",
+        )
+        self.store.submit_plan(
+            second_plan,
+            operation_id=operation_id(),
+            actor="codex:testd",
+            owner_uid=1001,
+            target_resources={
+                name: TargetResources(
+                    worktree_key="/home/example/fanout-worktree"
+                )
+                for name in second_plan.selected_targets
+            },
+        )
+        self.engine.schedule(launch_batch=1)
+        first_id = self.launcher.requests[0].ticket.attempt_id
+        second_id = self.launcher.requests[1].ticket.attempt_id
+        self.clock.advance(25)
+        self.store.heartbeat_attempt(
+            first_id,
+            generation=1,
+            lease_seconds=30,
+            operation_id=operation_id(),
+        )
+        self.clock.advance(6)
+
+        heartbeat = self.engine.heartbeat()
+
+        self.assertEqual(heartbeat["failures"], [])
+        self.assertEqual(
+            set(heartbeat["running_attempt_ids"]), {first_id, second_id}
+        )
+        second = self.store.get_attempt(second_id)
+        self.assertEqual(second["heartbeat_at"], self.clock())
+        self.assertEqual(second["lease_expires_at"], self.clock() + 30)
+
     def test_ticket_has_no_declared_resource_quota_fields(self) -> None:
         submitted = self.submit_live()
 

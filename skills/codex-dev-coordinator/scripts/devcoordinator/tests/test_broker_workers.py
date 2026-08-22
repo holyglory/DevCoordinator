@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import os
 from pathlib import Path
+import stat
 import sys
 import time
 import unittest
@@ -634,6 +635,21 @@ class WorkerBrokerBackendTests(unittest.TestCase):
                     ).fetchone()[0],
                     1,
                 )
+
+    def test_launch_ticket_bootstraps_a_missing_execution_uid_log_directory(self) -> None:
+        self.log_directory.rmdir()
+        self.log_directory.parent.rmdir()
+        service = self._service()
+        peer = PeerCredentials(uid=os.geteuid(), gid=os.getegid(), pid=os.getpid())
+        operation_id = str(uuid.uuid4())
+
+        first = self._reply(service, peer, self._ticket_request(operation_id))
+        replay = self._reply(service, peer, self._ticket_request(operation_id))
+
+        self.assertTrue(first["ok"], first)
+        self.assertEqual(replay, first)
+        self.assertTrue(self.log_directory.is_dir())
+        self.assertEqual(stat.S_IMODE(self.log_directory.stat().st_mode), 0o700)
 
     def test_exit_recovers_without_reopening_log_after_state_commit(self) -> None:
         peer = PeerCredentials(uid=os.geteuid(), gid=os.getegid(), pid=os.getpid())

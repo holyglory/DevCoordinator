@@ -15,7 +15,7 @@ import unittest
 from unittest import mock
 import zipfile
 
-from devcoordinator import universal_test_snapshot
+from devcoordinator import universal_test_runtime, universal_test_snapshot
 from devcoordinator.universal_test_contract import parse_test_manifest
 from devcoordinator.universal_test_runner import _immutable_python_launch_executable
 from devcoordinator.universal_test_runtime import (
@@ -254,6 +254,74 @@ class ImmutableDependencyBindingTests(unittest.TestCase):
         database.write_bytes(b"substituted state")
         with self.assertRaisesRegex(TestStoreConflict, "changed after planning"):
             SystemdTestAttemptManager._state_environment(round_trip)
+
+    def test_declared_installed_skill_is_pinned_and_bound_without_exposing_home(self) -> None:
+        source = self.base / "source" / "formal-web-ui-verification"
+        scripts = source / "scripts"
+        scripts.mkdir(parents=True)
+        (source / "SKILL.md").write_text("# Formal verifier\n", encoding="utf-8")
+        verifier = scripts / "formal_web_ui_verify.mjs"
+        verifier.write_text("export const version = 1;\n", encoding="utf-8")
+        verifier.chmod(0o755)
+        destination = self.base / "installed" / "formal-web-ui-verification"
+        destination.parent.mkdir()
+        destination.symlink_to(source, target_is_directory=True)
+        launch = {
+            "environment": {"FORMAL_WEB_UI_SKILL_DIR": str(destination)}
+        }
+        with mock.patch.object(
+            RootSnapshotService,
+            "_installed_skill_destination",
+            return_value=True,
+        ):
+            bindings = RootSnapshotService._installed_skill_bindings(launch)
+        with mock.patch.object(
+            universal_test_runtime,
+            "_installed_skill_destination",
+            return_value=True,
+        ):
+            descriptor = replace(
+                self.descriptor(),
+                environment=dict(launch["environment"]),
+                skill_bindings=bindings,
+            )
+            round_trip = TestAttemptDescriptor.from_document(
+                descriptor.to_document()
+            )
+        output = self.base / "skill-output"
+        output.mkdir()
+
+        with mock.patch.object(
+            universal_test_runtime,
+            "_installed_skill_destination",
+            return_value=True,
+        ):
+            properties = SystemdTestAttemptManager._systemd_properties(
+                round_trip,
+                execution_root=self.materialized,
+                output_root=output,
+            )
+
+        self.assertIn(
+            "--property=BindReadOnlyPaths="
+            + f"{source}:{destination}",
+            properties,
+        )
+        self.assertEqual(len(round_trip.skill_bindings), 1)
+        verifier.write_text("export const version = 2;\n", encoding="utf-8")
+        with (
+            mock.patch.object(
+                universal_test_runtime,
+                "_installed_skill_destination",
+                return_value=True,
+            ),
+            self.assertRaisesRegex(TestStoreConflict, "content changed"),
+        ):
+            SystemdTestAttemptManager._systemd_properties(
+                round_trip,
+                execution_root=self.materialized,
+                output_root=output,
+            )
 
     def test_preferred_python_environment_wins_over_retained_legacy_environment(self) -> None:
         legacy_python = self.original / ".venv" / "bin" / "python"

@@ -54,7 +54,9 @@ MAX_DISCOVERED_FILES = 100_000
 MAX_FINGERPRINT_FILE_BYTES = 256 * 1024 * 1024
 MAX_FINGERPRINT_TOTAL_BYTES = 2 * 1024 * 1024 * 1024
 MAX_GIT_DELTA_BYTES = 256 * 1024 * 1024
-MAX_AGENT_ENVELOPE_BYTES = 8 * 1024
+# Every CLI document is newline-terminated. Reserve that final byte while
+# shrinking cursor pages so an accepted document cannot fail in the emitter.
+MAX_AGENT_ENVELOPE_BYTES = 8 * 1024 - 1
 _BROKER_PROFILE_ERROR = "protected broker profile is unavailable or invalid"
 _LOCK_NAMES = frozenset(
     {

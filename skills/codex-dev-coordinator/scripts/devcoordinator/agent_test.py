@@ -165,10 +165,27 @@ def enqueue_test(
             )
         plan_projection = _compact_plan(plan)
     elif preview.get("classification") == "test_plan_preview_completed":
+        fingerprint = preview.get("plan_fingerprint")
+        source_mode = preview.get("source_mode")
+        selected_count = preview.get("selected_target_count")
+        selected_targets = preview.get("selected_targets")
+        selected_truncated = preview.get("selected_targets_truncated")
         if (
             preview.get("repository_id") != repository.repo_id
             or preview.get("intent") != intent
             or preview.get("operation_id") != operation_id
+            or not isinstance(fingerprint, str)
+            or len(fingerprint) != 64
+            or any(character not in "0123456789abcdef" for character in fingerprint)
+            or source_mode not in {"live", "immutable"}
+            or (intent in {"handoff", "release"} and source_mode != "immutable")
+            or type(selected_count) is not int
+            or selected_count < 0
+            or not isinstance(selected_targets, list)
+            or not all(isinstance(item, str) and item for item in selected_targets)
+            or len(selected_targets) > 16
+            or type(selected_truncated) is not bool
+            or selected_truncated != (selected_count > len(selected_targets))
         ):
             raise AgentTestError(
                 "test_reply_invalid", "durable test preview replay is contradictory"
@@ -176,7 +193,16 @@ def enqueue_test(
         plan_projection = {
             "id": plan_id,
             "intent": intent,
-            "source": {"snapshot_id": preview.get("snapshot_id")},
+            "fingerprint": fingerprint,
+            "source": {
+                "mode": source_mode,
+                "snapshot_id": preview.get("snapshot_id"),
+            },
+            "selection": {
+                "count": selected_count,
+                "targets": list(selected_targets),
+                "truncated": selected_truncated,
+            },
             "replayed": True,
         }
     else:
@@ -484,6 +510,17 @@ def project_test_follow(
                 "state": bounded_text(attempt_state, maximum_bytes=64),
                 "phase": "executing",
             }
+            raw_supervision = raw_attempt.get("supervision")
+            if isinstance(raw_supervision, Mapping):
+                supervision_state = raw_supervision.get("state")
+                supervision_code = raw_supervision.get("code")
+                if supervision_state == "degraded" and isinstance(
+                    supervision_code, str
+                ):
+                    active["phase"] = "supervision_degraded"
+                    active["supervision_code"] = bounded_text(
+                        supervision_code, maximum_bytes=96
+                    )
             for key in ("started_at", "heartbeat_at", "lease_expires_at"):
                 value = raw_attempt.get(key)
                 if (

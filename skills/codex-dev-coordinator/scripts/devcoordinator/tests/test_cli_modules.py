@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import inspect
 import json
 import os
 import socket
@@ -2333,84 +2334,14 @@ class LifecycleParserContractTests(unittest.TestCase):
 
 
 class BrokerCLIContractTests(unittest.TestCase):
-    def test_image_publication_requires_active_maintenance_marker(self) -> None:
-        with (
-            mock.patch.object(
-                dev_coordinator.grp,
-                "getgrnam",
-                return_value=mock.Mock(gr_gid=986),
-            ),
-            mock.patch.object(
-                dev_coordinator,
-                "load_maintenance_state",
-                return_value=None,
-            ),
-            mock.patch.object(dev_coordinator.subprocess, "run") as run,
-            self.assertRaisesRegex(RuntimeError, "requires active server-wide"),
-        ):
-            dev_coordinator._require_live_image_publication_maintenance_boundary()
-        run.assert_not_called()
-
-    def test_image_publication_keeps_loopback_api_available(self) -> None:
-        with (
-            mock.patch.object(
-                dev_coordinator.grp,
-                "getgrnam",
-                return_value=mock.Mock(gr_gid=986),
-            ),
-            mock.patch.object(
-                dev_coordinator,
-                "load_maintenance_state",
-                return_value=object(),
-            ),
-            mock.patch.object(
-                dev_coordinator.subprocess,
-                "run",
-                return_value=mock.Mock(returncode=3),
-            ) as run,
-            self.assertRaisesRegex(RuntimeError, "instead of ECONNREFUSED"),
-        ):
-            dev_coordinator._require_live_image_publication_maintenance_boundary()
-        run.assert_called_once_with(
-            [
-                "systemctl",
-                "is-active",
-                "--quiet",
-                "devcoordinator-authority.service",
-            ],
-            check=False,
-            stdin=dev_coordinator.subprocess.DEVNULL,
-            stdout=dev_coordinator.subprocess.DEVNULL,
-            stderr=dev_coordinator.subprocess.DEVNULL,
-            timeout=5.0,
+    def test_image_publication_is_project_scoped_not_global_maintenance(self) -> None:
+        source = inspect.getsource(
+            dev_coordinator.coordinated_broker_publish_image
         )
-
-    def test_image_publication_accepts_preserved_control_plane(self) -> None:
-        with (
-            mock.patch.object(
-                dev_coordinator.grp,
-                "getgrnam",
-                return_value=mock.Mock(gr_gid=986),
-            ),
-            mock.patch.object(
-                dev_coordinator,
-                "load_maintenance_state",
-                return_value=object(),
-            ),
-            mock.patch.object(
-                dev_coordinator.subprocess,
-                "run",
-                return_value=mock.Mock(returncode=0),
-            ) as run,
-        ):
-            dev_coordinator._require_live_image_publication_maintenance_boundary()
-        self.assertEqual(
-            [call.args[0][-1] for call in run.call_args_list],
-            [
-                "devcoordinator-authority.service",
-                "devcoordinator-api.service",
-            ],
-        )
+        self.assertIn("publication_execution_lock", source)
+        self.assertNotIn("_require_live_image_publication_maintenance_boundary", source)
+        self.assertNotIn("exclusive_broker_service_lock", source)
+        self.assertNotIn("systemctl", source)
 
     def test_sigterm_fences_mutations_before_serve_loop_poll(self) -> None:
         events: list[str] = []

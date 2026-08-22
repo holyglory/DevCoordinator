@@ -1059,7 +1059,7 @@ class AgentCliTests(unittest.TestCase):
             bounded["next_cursor"], bounded["failures"][-1]["failure_id"]
         )
         self.assertLessEqual(
-            len(agent_cli.canonical_json_bytes(bounded)), 8 * 1024
+            len(agent_cli.canonical_json_bytes(bounded)) + 1, 8 * 1024
         )
         self.assertEqual(result["next_cursor"], None)
         self.assertEqual(len(result["failures"]), 10)
@@ -1088,7 +1088,7 @@ class AgentCliTests(unittest.TestCase):
         self.assertLess(len(bounded["cases"]), 10)
         self.assertEqual(bounded["next_cursor"], bounded["cases"][-1]["cursor"])
         self.assertLessEqual(
-            len(agent_cli.canonical_json_bytes(bounded)), 8 * 1024
+            len(agent_cli.canonical_json_bytes(bounded)) + 1, 8 * 1024
         )
 
     def test_successful_retry_without_broker_ok_still_exits_successfully(self) -> None:
@@ -1435,6 +1435,42 @@ class AgentCliTests(unittest.TestCase):
         profile.operation_follow.assert_called_once_with(
             repository=profile.resolve_repository.return_value,
             operation_id=operation_id,
+        )
+
+    def test_terminal_plan_follow_returns_the_exact_submit_command(self) -> None:
+        operation_id = "00000000-0000-4000-8000-000000000001"
+        profile = mock.Mock()
+        profile.resolve_repository.return_value = mock.Mock(repo_id="repo-1")
+        profile.operation_follow.return_value = {
+            "operation_id": operation_id,
+            "status": "succeeded",
+            "phase": "completed",
+            "kind": "broker.test.plan_preview",
+            "target_ids": [],
+            "target_count": 0,
+            "target_ids_truncated": False,
+            "error_classification": None,
+            "outcome_certainty": "certain",
+            "next_transition": None,
+            "plan_id": "plan-" + "a" * 32,
+        }
+        namespace = agent_cli._parser().parse_args(
+            ["operation", "follow", f"dc1:operation:{operation_id}"]
+        )
+
+        result = agent_cli._operation(
+            namespace,
+            profile=profile,
+            capabilities={"continuations": {"operation_follow": True}},
+            context=_Context(),
+        )
+
+        self.assertEqual(result["plan_handle"], "dc1:plan:plan-" + "a" * 32)
+        self.assertEqual(
+            result["next_command"],
+            "devcoordinator test submit dc1:plan:plan-"
+            + "a" * 32
+            + " --project /repo",
         )
 
     def test_scoped_continuations_are_shell_safe_and_cwd_independent(self) -> None:

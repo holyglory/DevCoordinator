@@ -1018,6 +1018,41 @@ class TestdEngine:
             ),
         )
 
+    def _heartbeat_observed_active(
+        self, active: _ActiveAttempt, *, lease_seconds: int
+    ) -> None:
+        """Renew exact observed work, recovering only a downtime-expired lease."""
+
+        operation_id = str(uuid.uuid4())
+        try:
+            self.store.heartbeat_attempt(
+                active.lease.attempt_id,
+                generation=active.lease.generation,
+                lease_seconds=lease_seconds,
+                operation_id=operation_id,
+            )
+            return
+        except TestStoreConflict:
+            attempt = self.store.get_attempt(active.lease.attempt_id)
+            now = float(self.clock())
+            if (
+                int(attempt["generation"]) != active.lease.generation
+                or str(attempt["lease_owner"]) != active.lease.lease_owner
+                or str(attempt["state"]) not in {"leased", "running"}
+                or float(attempt["lease_expires_at"]) >= now
+            ):
+                raise
+        # The exact native observation preceding this call proves the attempt
+        # survived a control-plane gap. Recovery cannot extend an unobserved
+        # attempt and cannot resurrect a reaped/terminal generation.
+        self.store.recover_attempt_lease(
+            active.lease.attempt_id,
+            generation=active.lease.generation,
+            lease_owner=active.lease.lease_owner,
+            lease_seconds=lease_seconds,
+            operation_id=str(uuid.uuid4()),
+        )
+
     def _pending_launch_lease_seconds(self, active: _ActiveAttempt) -> int:
         deadline = (
             active.launched_at
@@ -1520,12 +1555,19 @@ class TestdEngine:
             # renewed if that observation fails. Only attempts waiting behind
             # earlier serial calls receive fanout protection.
             for _attempt_id, waiting in active_items[1:]:
-                self.store.heartbeat_attempt(
-                    waiting.lease.attempt_id,
-                    generation=waiting.lease.generation,
-                    lease_seconds=fanout_lease_seconds,
-                    operation_id=str(uuid.uuid4()),
-                )
+                try:
+                    self.store.heartbeat_attempt(
+                        waiting.lease.attempt_id,
+                        generation=waiting.lease.generation,
+                        lease_seconds=fanout_lease_seconds,
+                        operation_id=str(uuid.uuid4()),
+                    )
+                except TestStoreConflict:
+                    # Pre-renewal has no native observation and therefore may
+                    # not recover an expired lease. Let the per-attempt pass
+                    # observe it exactly; a successful observation can then
+                    # use the fenced recovery transition below.
+                    continue
         for attempt_id, active in active_items:
             try:
                 self._acknowledge_active(active)
@@ -1689,11 +1731,8 @@ class TestdEngine:
                                 observation.output_progress["observed_at"]
                             ),
                         )
-                    self.store.heartbeat_attempt(
-                        attempt_id,
-                        generation=active.lease.generation,
-                        lease_seconds=self.lease_seconds,
-                        operation_id=str(uuid.uuid4()),
+                    self._heartbeat_observed_active(
+                        active, lease_seconds=self.lease_seconds
                     )
                     running.append(attempt_id)
                 elif observation.state == "exited" and observation.exit_envelope is not None:

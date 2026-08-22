@@ -716,6 +716,19 @@ class UniversalTestStoreTests(StoreFixture):
         )
         with self.assertRaises(TestStoreNotFound):
             self.store.artifact(run_id="run-foreign", artifact_id="artifact-1")
+        with self.store._transaction() as connection:
+            connection.execute(
+                "UPDATE test_artifacts SET verified = 0 WHERE artifact_id = 'artifact-1'"
+            )
+        self.assertEqual(self.store.artifacts(run_id=submitted.run_id), ())
+        with self.assertRaisesRegex(TestStoreConflict, "not been verified"):
+            self.store.artifact(
+                run_id=submitted.run_id, artifact_id="artifact-1"
+            )
+        with self.store._transaction() as connection:
+            connection.execute(
+                "UPDATE test_artifacts SET verified = 1 WHERE artifact_id = 'artifact-1'"
+            )
 
         conflicting = AttemptResultChunk(
             chunk_id="chunk-1",
@@ -896,6 +909,21 @@ class UniversalTestStoreTests(StoreFixture):
             8 * 1024 * 1024,
         )
         self.assertGreater(after["sampled_at"], before["sampled_at"])
+        self.assertEqual(after_active["supervision"]["state"], "current")
+        self.clock.advance(31)
+        degraded = adapter.status(
+            run_id=submitted.run_id, repository_id="repo-tests"
+        )
+        degraded_active = next(
+            item["active_attempt"]
+            for item in degraded["targets"]
+            if item["target_name"] == "lint"
+        )
+        self.assertEqual(degraded_active["supervision"]["state"], "degraded")
+        self.assertEqual(
+            degraded_active["supervision"]["code"],
+            "lease_expired_without_terminal_evidence",
+        )
 
     def test_incomplete_reporting_is_not_published_as_success(self) -> None:
         submitted = self.submit()

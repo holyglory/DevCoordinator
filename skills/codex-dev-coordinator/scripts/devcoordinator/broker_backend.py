@@ -832,13 +832,18 @@ class StoreBackedMutationBackend:
                         or "The durable test-plan preview failed.",
                         operation_id=request.operation_id,
                     )
-                if disposition.state != "execute":
+                if disposition.state not in {"execute", "pending"}:
                     raise BrokerBackendError(
                         "operation_in_progress",
                         "The durable test-plan preview is still running; follow its exact operation handle.",
                         operation_id=request.operation_id,
                         retry_after_seconds=2,
                     )
+                # The serialized operation lock prevents an in-process replay
+                # from entering while the original preview still executes.
+                # Seeing a durable pending row here therefore proves a broker
+                # replacement left it behind; immutable preview is
+                # deterministic and safe to re-drive under the same identity.
                 preview_operation_reserved = True
                 execution_context = (
                     self._persistence.test_repository_execution_context(
@@ -947,7 +952,19 @@ class StoreBackedMutationBackend:
                         "repository_id": request.project_id,
                         "intent": preview_plan.intent,
                         "plan_id": preview_plan.plan_id,
+                        "plan_fingerprint": preview_plan.fingerprint,
                         "snapshot_id": preview_plan.source.snapshot_id,
+                        "source_mode": preview_plan.source.mode.value,
+                        "selected_target_count": len(
+                            preview_plan.selected_targets
+                        ),
+                        "selected_targets": list(
+                            preview_plan.selected_targets[:16]
+                        ),
+                        "selected_targets_truncated": len(
+                            preview_plan.selected_targets
+                        )
+                        > 16,
                         "registered": bool(registration.get("registered")),
                     },
                 )
@@ -1014,6 +1031,23 @@ class StoreBackedMutationBackend:
                 return result
 
             if request.operation is BrokerOperation.TEST_RUN_SUBMIT:
+                disposition = self._persistence.reserve_operation(accepted)
+                if disposition.state == "completed":
+                    return dict(disposition.result or {})
+                if disposition.state == "failed":
+                    raise BrokerBackendError(
+                        disposition.error_code or "test_run_submit_failed",
+                        disposition.error_message
+                        or "The durable test-plan submission failed.",
+                        operation_id=request.operation_id,
+                    )
+                if disposition.state not in {"execute", "pending"}:
+                    raise BrokerBackendError(
+                        "operation_in_progress",
+                        "The durable test-plan submission is still running; follow its exact operation handle.",
+                        operation_id=request.operation_id,
+                        retry_after_seconds=2,
+                    )
                 expected_repository_id = request.arguments.get(
                     "expected_repository_id"
                 )
@@ -1055,6 +1089,9 @@ class StoreBackedMutationBackend:
                     )
                 )
                 self._require_test_repository(result, repository_id)
+                self._persistence.finish_operation(
+                    request.operation_id, result=result
+                )
                 return result
 
             if request.operation is BrokerOperation.TEST_RUN_LIST:
@@ -1462,6 +1499,15 @@ class StoreBackedMutationBackend:
                     "no retry run was created.",
                     operation_id=request.operation_id,
                 ) from error
+            if (
+                request.operation is BrokerOperation.TEST_ARTIFACT_RESOLVE
+                and error.code == "artifact_unverified"
+            ):
+                raise BrokerBackendError(
+                    "test_artifact_unverified",
+                    "The exact test artifact is not integrity-verified and cannot be resolved.",
+                    operation_id=request.operation_id,
+                ) from error
             snapshot_transport_failure = error.code in {
                 "snapshot_transport_unavailable",
                 "snapshot_transport_timeout",
@@ -1562,6 +1608,15 @@ class StoreBackedMutationBackend:
                 operation_id=request.operation_id,
             ) from error
         except TestStoreConflict as error:
+            if (
+                request.operation is BrokerOperation.TEST_ARTIFACT_RESOLVE
+                and "has not been verified" in str(error)
+            ):
+                raise BrokerBackendError(
+                    "test_artifact_unverified",
+                    "The exact test artifact is not integrity-verified and cannot be resolved.",
+                    operation_id=request.operation_id,
+                ) from error
             finish_preview_failure(
                 "test_state_conflict",
                 "The test request conflicts with current scheduler state.",
@@ -2168,6 +2223,14 @@ class StoreBackedMutationBackend:
                 raise RepositoryContextError(
                     "Compose host-access approval requires the exact primary repository root"
                 )
+            # Approval is also the reviewed live path for a declared Compose
+            # project-name transition. Commit a fresh exhaustive observation
+            # before resealing so persistence can prove the old project name
+            # has no retained containers, networks, or volumes.
+            self._observe_fresh_full_docker(
+                request.operation_id,
+                project_id=request.project_id,
+            )
             reconciled = self._reconcile_repository_compose_contract(
                 request=request,
                 repo_id=request.project_id,
@@ -2469,7 +2532,11 @@ class StoreBackedMutationBackend:
                 raise BrokerBackendError(
                     code, message, operation_id=request.operation_id
                 )
-            if replay_database_result is None and not replay_database_retirement:
+            if (
+                replay_database_result is None
+                and not replay_database_retirement
+                and request.operation is not BrokerOperation.CLEANUP_PLAN
+            ):
                 raise BrokerBackendError(
                     "operation_in_progress",
                     "This durable operation is already running or requires reconciliation; it was not executed again.",

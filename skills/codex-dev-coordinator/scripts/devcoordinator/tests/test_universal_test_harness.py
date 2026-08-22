@@ -40,6 +40,7 @@ class PreviewTestPlane:
         self.registered: list[dict[str, object]] = []
         self.preview_calls: list[dict[str, object]] = []
         self.preview_error: Exception | None = None
+        self.submit_calls: list[dict[str, object]] = []
 
     def health(self):
         return {
@@ -86,6 +87,21 @@ class PreviewTestPlane:
             "repository_id": self.selected_plan.repository_id,
             "plan_id": self.selected_plan.plan_id,
             "registered": True,
+        }
+
+    def plan_repository(self, *, plan_id, repository_id):
+        if plan_id != self.selected_plan.plan_id:
+            raise TestStoreContractError("plan is unavailable")
+        return repository_id
+
+    def submit(self, **values):
+        self.submit_calls.append(dict(values))
+        return {
+            "schema_version": 1,
+            "repository_id": self.selected_plan.repository_id,
+            "operation_id": values["operation_id"],
+            "run_id": "run-" + "d" * 32,
+            "state": "queued",
         }
 
     def dashboard_fleet(self, *, repository_ids, hours):
@@ -557,7 +573,29 @@ class UniversalTestHarnessTests(unittest.TestCase):
         )
         self.assertEqual(replay["classification"], "test_plan_preview_completed")
         self.assertEqual(replay["plan_id"], valid_plane.selected_plan.plan_id)
+        self.assertEqual(
+            replay["plan_fingerprint"], valid_plane.selected_plan.fingerprint
+        )
+        self.assertEqual(
+            replay["selected_targets"],
+            list(valid_plane.selected_plan.selected_targets[:16]),
+        )
         self.assertEqual(len(valid_plane.preview_calls), 1)
+        recovered_preview = self.request(
+            BrokerOperation.TEST_PLAN_PREVIEW,
+            self.preview_arguments("release"),
+            operation_id=str(uuid.uuid4()),
+        )
+        recovered_accepted = self.persistence.accept(
+            recovered_preview.peer, recovered_preview.request
+        )
+        self.assertEqual(
+            self.persistence.reserve_operation(recovered_accepted).state,
+            "execute",
+        )
+        recovered = backend.execute(recovered_accepted)
+        self.assertEqual(recovered["plan_id"], valid_plane.selected_plan.plan_id)
+        self.assertEqual(len(valid_plane.preview_calls), 2)
 
         invalid_plane = PreviewTestPlane(selected(self.root / "not-authorized"))
         invalid_backend = StoreBackedMutationBackend(
@@ -626,6 +664,56 @@ class UniversalTestHarnessTests(unittest.TestCase):
                 arguments={"hours": 169},
                 authority_generation=self.generation,
             )
+
+    def test_crash_left_submit_reservation_replays_to_one_durable_run(self) -> None:
+        manifest = parse_test_manifest(universal_manifest_document())
+        plan = create_test_plan(
+            manifest,
+            intent="release",
+            source=SourceIdentity(
+                mode=SourceMode.IMMUTABLE,
+                repository_id=self.repo_id,
+                content_fingerprint="a" * 64,
+                original_root=str(self.root),
+                temporary_root=None,
+                snapshot_id="snapshot-" + "b" * 32,
+            ),
+        )
+        plane = PreviewTestPlane(plan)
+        backend = StoreBackedMutationBackend(
+            self.persistence,
+            object(),  # type: ignore[arg-type]
+            test_plane=plane,  # type: ignore[arg-type]
+        )
+        preview = self.request(
+            BrokerOperation.TEST_PLAN_PREVIEW,
+            self.preview_arguments("release"),
+        )
+        backend.execute(self.persistence.accept(preview.peer, preview.request))
+        operation_id = str(uuid.uuid4())
+        submit = self.request(
+            BrokerOperation.TEST_RUN_SUBMIT,
+            {
+                "plan_id": plan.plan_id,
+                "expected_repository_id": self.repo_id,
+                "actor": "codex:test",
+            },
+            operation_id=operation_id,
+        )
+        accepted = self.persistence.accept(submit.peer, submit.request)
+        self.assertEqual(
+            self.persistence.reserve_operation(accepted).state, "execute"
+        )
+
+        recovered = backend.execute(accepted)
+        replay = backend.execute(accepted)
+
+        self.assertEqual(recovered["run_id"], "run-" + "d" * 32)
+        self.assertEqual(replay, recovered)
+        self.assertEqual(len(plane.submit_calls), 1)
+        retained = self.persistence.existing_operation_disposition(accepted)
+        self.assertIsNotNone(retained)
+        self.assertEqual(retained.state, "completed")
 
     def test_fleet_projection_is_server_wide_for_every_trusted_local_peer(self) -> None:
 

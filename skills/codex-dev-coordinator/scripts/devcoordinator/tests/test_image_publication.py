@@ -129,6 +129,37 @@ class ImagePublicationTests(unittest.TestCase):
             ),
         )
 
+    def test_publication_lock_excludes_only_the_same_project_publication(self) -> None:
+        other_project = self.root / "other-project"
+        other_project.mkdir()
+        other = publication.PublicationSpec(
+            **{
+                **self.specification.__dict__,
+                "project": other_project,
+            }
+        )
+
+        with publication.publication_execution_lock(
+            specification=self.specification,
+            artifact_root=self.artifacts,
+            service_uid=os.geteuid(),
+        ):
+            with self.assertRaisesRegex(
+                publication.ImagePublicationError, "already running"
+            ):
+                with publication.publication_execution_lock(
+                    specification=self.specification,
+                    artifact_root=self.artifacts,
+                    service_uid=os.geteuid(),
+                ):
+                    self.fail("competing publication acquired the same lock")
+            with publication.publication_execution_lock(
+                specification=other,
+                artifact_root=self.artifacts,
+                service_uid=os.geteuid(),
+            ):
+                pass
+
     def test_plan_rejects_symlinked_context_input(self) -> None:
         target = self.project / "outside.cs"
         target.write_text("outside\n", encoding="utf-8")

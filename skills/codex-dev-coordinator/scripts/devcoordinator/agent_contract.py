@@ -17,6 +17,7 @@ import uuid
 
 AGENT_RESULT_SCHEMA_VERSION = 1
 MAX_AGENT_RESULT_BYTES = 8 * 1024
+MAX_AGENT_DOCUMENT_BYTES = MAX_AGENT_RESULT_BYTES - 1
 MAX_AGENT_MESSAGE_BYTES = 512
 MAX_NEXT_COMMAND_BYTES = 512
 MAX_NEXT_ACTION_BYTES = 512
@@ -111,9 +112,9 @@ def require_agent_result(
     value: Mapping[str, Any],
     *,
     surface: str,
-    maximum_bytes: int = MAX_AGENT_RESULT_BYTES,
+    maximum_bytes: int = MAX_AGENT_DOCUMENT_BYTES,
 ) -> dict[str, Any]:
-    """Return a copied result only when its final compact encoding is bounded."""
+    """Return a copied result only when encoding plus its newline is bounded."""
 
     if not isinstance(value, Mapping):
         raise AgentContractError(f"{surface} result must be an object")

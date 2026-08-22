@@ -18,6 +18,7 @@ if str(SCRIPTS_ROOT) not in sys.path:
 from devcoordinator.broker import BrokerError, BrokerOperation  # noqa: E402
 from devcoordinator.broker_persistence import (  # noqa: E402
     OPERATION_FOLLOW_MAX_BYTES,
+    _operation_follow_correlations,
 )
 from devcoordinator.broker_profile import (  # noqa: E402
     BrokerClientProfile,
@@ -170,6 +171,61 @@ class OperationFollowPersistenceTests(unittest.TestCase):
         self.assertNotIn(b"/private", encoded)
         self.assertNotIn(b"sensitive", encoded)
         self.assertNotIn(b"payload", encoded)
+
+    def test_current_test_plan_and_run_ids_survive_follow_projection(self) -> None:
+        self.assertEqual(
+            _operation_follow_correlations(
+                status="succeeded",
+                result_json=json.dumps(
+                    {
+                        "plan_id": "plan-" + "a" * 32,
+                        "run_id": "run-" + "b" * 32,
+                    }
+                ),
+            ),
+            {
+                "plan_id": "plan-" + "a" * 32,
+                "run_id": "run-" + "b" * 32,
+            },
+        )
+
+    def test_cleanup_plan_follow_preserves_exact_volume_target_kind(self) -> None:
+        plan = request_for(
+            BrokerOperation.CLEANUP_PLAN,
+            resource_id=PROJECT_ID,
+            operation_id=FOLLOWED_OPERATION_ID,
+            arguments={
+                "action": "purge",
+                "target_kind": "volume",
+                "target_id": "gf-v2-dev_capture_wal",
+                "reason": "retire superseded disposable volume",
+            },
+        )
+        disposition = self.persistence.reserve_operation(
+            self.persistence.accept(peer_for(), plan)
+        )
+
+        self.assertEqual(disposition.state, "execute")
+        with CoordinatorStore.open(
+            self.persistence.database_path, expected_uid=os.geteuid()
+        ) as store:
+            with store.immediate_transaction() as connection:
+                connection.execute(
+                    """
+                    UPDATE operation_targets SET target_kind = 'container'
+                    WHERE operation_id = ? AND ordinal = 0
+                    """,
+                    (FOLLOWED_OPERATION_ID,),
+                )
+        replay = self.persistence.reserve_operation(
+            self.persistence.accept(peer_for(), plan)
+        )
+        self.assertEqual(replay.state, "pending")
+        followed = self.follow()["result"]
+        self.assertEqual(
+            followed["target_ids"],
+            [{"kind": "volume", "id": "gf-v2-dev_capture_wal"}],
+        )
 
     def test_running_and_uncertain_states_expose_only_next_decision(self) -> None:
         self.reserve_operation()

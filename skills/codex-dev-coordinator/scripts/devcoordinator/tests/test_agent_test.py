@@ -139,7 +139,12 @@ class AgentTestTests(unittest.TestCase):
                 "repository_id": "repo-1",
                 "intent": "change",
                 "plan_id": "plan-1",
-                "snapshot_id": "snapshot-1",
+                "plan_fingerprint": "a" * 64,
+                "snapshot_id": None,
+                "source_mode": "live",
+                "selected_target_count": 2,
+                "selected_targets": ["lint", "unit"],
+                "selected_targets_truncated": False,
                 "registered": True,
             }
         )
@@ -156,6 +161,7 @@ class AgentTestTests(unittest.TestCase):
         )
         self.assertEqual(result["plan"]["id"], "plan-1")
         self.assertTrue(result["plan"]["replayed"])
+        self.assertEqual(result["plan"]["selection"]["targets"], ["lint", "unit"])
         self.assertEqual(len(profile.submit_calls), 1)
 
     def _enqueue(
