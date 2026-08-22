@@ -1707,24 +1707,20 @@ def exercise_retained_control_transaction_boundary() -> None:
         "retained-control publication is not inside the stopped-writer switch window",
     )
     expect(
-        apply_source.index("require_no_managed_worker_units(runner)")
-        < apply_source.index("stop_authority_writers(runner)")
-        < apply_source.index("prepare_rebaseline("),
-        "schema rebaseline does not fail closed before interrupting control-plane writers",
-    )
-    expect(
-        apply_source.index("bind_source_worker_quiescence(")
-        < apply_source.index("stop_authority_writers(runner)")
+        apply_source.index("stop_authority_writers(runner)")
+        < apply_source.index("bind_source_worker_quiescence(")
         < apply_source.index("post_stop_proof = source_worker_quiescence_proof(")
         < apply_source.index("_checkpoint_authority_database()"),
-        "source worker proof is not frozen on both sides of writer shutdown",
+        "source worker proof is not frozen after writer shutdown",
     )
     expect(
-        switch_source.index("require_no_managed_worker_units(runner)")
+        switch_source.index("stop_authority_writers(runner)")
+        < switch_source.index("bind_source_worker_quiescence(")
         < switch_source.index("install_rendered_destinations(rendered)")
-        and switch_source.index("require_no_managed_worker_units(runner)")
+        and switch_source.index("stop_authority_writers(runner)")
+        < switch_source.index("install_rendered_destinations(rendered)")
         < switch_source.index("perform_headless_browser_cleanup("),
-        "managed-worker precondition runs after apply-time destination mutation",
+        "writer freeze and worker proof run after apply-time destination mutation",
     )
     expect(
         "_server_credential_backup_destinations(" in apply_source
@@ -2362,21 +2358,22 @@ def exercise_rebaseline_quiesces_exact_managed_workers() -> None:
             ).joinpath("cgroup.events").write_text(
                 "populated 1\n", encoding="ascii"
             )
-            recovered = switch.bind_source_worker_quiescence(
-                document,
-                intent,
-                journal,
-                runner,
-                process_observer=lambda _pid, _started: "absent",
-                cgroup_root=root / "cgroup",
-            )
-            expect(
-                recovered["policy_expectations"] == proof["policy_expectations"],
-                "replayed quiescence changed retained policy",
-            )
+            try:
+                switch.bind_source_worker_quiescence(
+                    document,
+                    intent,
+                    journal,
+                    runner,
+                    process_observer=lambda _pid, _started: "absent",
+                    cgroup_root=root / "cgroup",
+                )
+            except switch.SwitchError:
+                pass
+            else:
+                raise AssertionError("frozen worker proof was refreshed on replay")
         expect(
-            manager.remove_timeouts == [45.0, 45.0],
-            "cutover stop/replay was not bounded above 30s",
+            manager.remove_timeouts == [45.0],
+            "cutover stop was not bounded above 30s",
         )
         connection = sqlite3.connect(database)
         policy = connection.execute(
@@ -2384,10 +2381,16 @@ def exercise_rebaseline_quiesces_exact_managed_workers() -> None:
             "FROM worker_policies WHERE server_definition_id=?",
             (identities["worker_id"],),
         ).fetchone()
+        attempt = connection.execute(
+            "SELECT state,exit_report_id,crash_event_id FROM worker_attempts "
+            "WHERE attempt_id=?",
+            (identities["attempt_id"],),
+        ).fetchone()
         connection.close()
         expect(
-            policy == (1, "running", "armed", 4),
-            "worker quiescence changed retained desired policy",
+            policy == (1, "running", "armed", 4)
+            and attempt == ("running", None, None),
+            "writer-frozen quiescence changed policy or recorded a false crash",
         )
 
         race_database = root / "race-authority.sqlite3"
@@ -2562,90 +2565,17 @@ def exercise_source_worker_quiescence_is_exact_and_race_safe() -> None:
                 switch._valid_source_worker_quiescence(proof),
                 "source worker quiescence proof is not self-validating",
             )
-            advanced_revision = json.loads(json.dumps(proof))
-            advanced_revision["state_revision"] += 2
-            expect(
-                switch.source_worker_quiescence_matches(
-                    proof,
-                    advanced_revision,
-                    allow_state_revision_advance=True,
-                )
-                and not switch.source_worker_quiescence_matches(
-                    proof,
-                    advanced_revision,
-                    allow_state_revision_advance=False,
-                ),
-                "graceful writer shutdown revision advance was not isolated",
+            replayed = switch.bind_source_worker_quiescence(
+                document, intent, journal, runner
             )
-            regressed_revision = json.loads(json.dumps(proof))
-            regressed_revision["state_revision"] -= 1
-            drifted_worker = json.loads(json.dumps(advanced_revision))
-            drifted_worker["worker_state_sha256"] = "f" * 64
-            drifted_policy = json.loads(json.dumps(advanced_revision))
-            drifted_policy["policy_expectations"][0]["policy_generation"] += 1
-            expect(
-                not switch.source_worker_quiescence_matches(
-                    proof,
-                    regressed_revision,
-                    allow_state_revision_advance=True,
-                )
-                and not switch.source_worker_quiescence_matches(
-                    proof,
-                    drifted_worker,
-                    allow_state_revision_advance=True,
-                )
-                and not switch.source_worker_quiescence_matches(
-                    proof,
-                    drifted_policy,
-                    allow_state_revision_advance=True,
-                ),
-                "revision regression or worker drift passed semantic comparison",
-            )
-            writer_stopped_journal = root / "writer-stopped-journal.json"
-            writer_stopped_document: dict[str, object] = {"phase": "applying"}
-            writer_stopped_intent: dict[str, object] = {
-                "status": "planned",
-                "source_worker_quiescence": proof
-            }
-            rebound = switch.bind_writer_stopped_worker_quiescence(
-                writer_stopped_document,
-                writer_stopped_intent,
-                writer_stopped_journal,
-                advanced_revision,
-            )
-            expect(
-                rebound["state_revision"] == proof["state_revision"] + 2
-                and json.loads(writer_stopped_journal.read_text(encoding="utf-8"))[
-                    "retained_control_rebaseline"
-                ]["source_worker_quiescence"]["state_revision"]
-                == proof["state_revision"] + 2,
-                "writer-stopped proof did not replace the pre-shutdown revision",
-            )
-            for bound_status in ("backed-up", "prepared"):
-                bound_intent: dict[str, object] = {
-                    "status": bound_status,
-                    "source_worker_quiescence": proof,
-                }
-                try:
-                    switch.bind_writer_stopped_worker_quiescence(
-                        {"phase": "applying"},
-                        bound_intent,
-                        root / f"{bound_status}.json",
-                        advanced_revision,
-                    )
-                except switch.SwitchError:
-                    pass
-                else:
-                    raise AssertionError(
-                        f"{bound_status} worker proof rebound away from its backup"
-                    )
+            expect(replayed == proof, "exact frozen worker proof did not replay")
             connection = sqlite3.connect(database)
             connection.execute(
                 "UPDATE schema_metadata SET state_revision=state_revision+2"
             )
             connection.commit()
             connection.close()
-            for bound_status in ("backed-up", "prepared"):
+            for bound_status in ("planned", "backed-up", "prepared"):
                 try:
                     switch.bind_source_worker_quiescence(
                         {"phase": "applying"},
@@ -2660,18 +2590,12 @@ def exercise_source_worker_quiescence_is_exact_and_race_safe() -> None:
                     pass
                 else:
                     raise AssertionError(
-                        f"{bound_status} replay accepted revision drift"
+                        f"{bound_status} replay accepted frozen-proof drift"
                     )
-            intent["status"] = "planned"
-            replayed = switch.bind_source_worker_quiescence(
-                document, intent, journal, runner
-            )
-            expect(
-                replayed["state_revision"] == proof["state_revision"]
-                and intent["source_worker_quiescence"] is proof,
-                "pre-stop semantic replay rewrote the journal before writer shutdown",
-            )
             connection = sqlite3.connect(database)
+            connection.execute(
+                "UPDATE schema_metadata SET state_revision=state_revision-2"
+            )
             connection.execute(
                 "UPDATE worker_policies SET generation=generation+1 "
                 "WHERE server_definition_id=?",
@@ -3133,6 +3057,33 @@ def exercise_credentialized_web_worker_convergence() -> None:
         ) / "cgroup.events"
         rollback_events.parent.mkdir(parents=True, mode=0o700)
         rollback_events.write_text("populated 1\n", encoding="ascii")
+        stale_receipt = switch._absent_worker_receipt(
+            source_proof["policy_expectations"][0]
+        )
+        stale_receipt["process_proofs"] = [
+            {
+                "pid": 42424,
+                "process_start_time": "process-start",
+                "state": "absent",
+            }
+        ]
+
+        class AbsentRollbackRunner(FakeRunner):
+            def require(self, argv: list[str], _label: str) -> str:
+                self.commands.append(list(argv))
+                return ""
+
+        with mock.patch.object(switch, "AUTHORITY_DATABASE", rollback_database):
+            stale_backup_proof = switch.source_worker_quiescence_proof(
+                AbsentRollbackRunner(),
+                quiesced_workers=[stale_receipt],
+                process_observer=lambda _pid, _started: "absent",
+                cgroup_root=rollback_cgroup_root,
+            )
+        expect(
+            switch._valid_source_worker_quiescence(stale_backup_proof),
+            "writer-frozen stale attempt was not safe to back up",
+        )
         rollback_runner = ConvergenceRunner(
             str(rollback_ids["worker_id"]), worker_slice, rollback_control_group
         )
@@ -3868,6 +3819,75 @@ def exercise_rollback_resume_preserves_restored_control_plane() -> None:
         expect(
             result is marker and resumed.call_count == 1,
             "rollback dispatcher did not resume after restored control plane",
+        )
+
+        partial_intent = dict(intent)
+        partial_intent.pop("source_worker_quiescence")
+        partial_document: dict[str, object] = {
+            "phase": "applying",
+            "release": str(release),
+            "release_digest": DIGEST,
+            "retained_control_rebaseline": partial_intent,
+        }
+        partial_order: list[str] = []
+        stale_expectations = {
+            "policy_expectations": [],
+            "policy_count": 0,
+        }
+
+        def verify_partial_convergence(
+            _runner: object, *, source_proof: object, **_values: object
+        ) -> None:
+            expect(
+                source_proof is stale_expectations,
+                "partial rollback lost source policy expectations",
+            )
+            partial_order.append("converge")
+
+        def finish_partial(
+            _path: object, value: dict[str, object], phase: str, **_values: object
+        ) -> None:
+            value["phase"] = phase
+
+        with (
+            mock.patch.object(
+                switch, "require_transaction_root", return_value=root
+            ),
+            mock.patch.object(switch, "load_journal", return_value=partial_document),
+            mock.patch.object(
+                switch, "require_test_history_reset_mode", return_value=None
+            ),
+            mock.patch.object(
+                switch,
+                "source_worker_policy_expectations",
+                side_effect=lambda _runner: (
+                    partial_order.append("expectations") or stale_expectations
+                ),
+            ),
+            mock.patch.object(
+                switch,
+                "restart_services",
+                side_effect=lambda _runner: partial_order.append("restart"),
+            ),
+            mock.patch.object(
+                switch,
+                "require_retained_worker_policy_convergence",
+                side_effect=verify_partial_convergence,
+            ),
+            mock.patch.object(
+                switch,
+                "restart_previous_console",
+                side_effect=lambda *_args: partial_order.append("console"),
+            ),
+            mock.patch.object(switch, "save_phase", side_effect=finish_partial),
+        ):
+            partial_result = switch.rollback(release, root, FakeRunner())
+        expect(
+            partial_result is partial_document
+            and partial_document["phase"] == "rolled-back"
+            and partial_order
+            == ["expectations", "restart", "converge", "console"],
+            "partial quiescence failure did not restart and settle stale policy",
         )
 
 

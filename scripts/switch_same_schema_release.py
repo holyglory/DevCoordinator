@@ -2711,66 +2711,6 @@ def _valid_source_worker_quiescence(value: object) -> bool:
     )
 
 
-def source_worker_quiescence_matches(
-    expected: object,
-    observed: object,
-    *,
-    allow_state_revision_advance: bool,
-) -> bool:
-    """Compare exact worker semantics without freezing unrelated mutations.
-
-    Graceful broker shutdown performs two bounded host-observation cleanup
-    transactions.  Those transactions intentionally advance the authority's
-    global ``state_revision`` even when they change no worker row.  Database
-    generation and every policy, supervisor, attempt, observation, unit,
-    process and cgroup proof remain exact; only a monotonic global revision
-    advance may be ignored at the writer-stop boundary.
-    """
-
-    if (
-        type(allow_state_revision_advance) is not bool
-        or not _valid_source_worker_quiescence(expected)
-        or not _valid_source_worker_quiescence(observed)
-    ):
-        return False
-    expected_document = dict(expected)
-    observed_document = dict(observed)
-    expected_revision = int(expected_document.pop("state_revision"))
-    observed_revision = int(observed_document.pop("state_revision"))
-    if expected_document != observed_document:
-        return False
-    return (
-        observed_revision >= expected_revision
-        if allow_state_revision_advance
-        else observed_revision == expected_revision
-    )
-
-
-def bind_writer_stopped_worker_quiescence(
-    document: dict[str, object],
-    intent: dict[str, object],
-    journal_path: Path,
-    observed: Mapping[str, object],
-) -> dict[str, object]:
-    retained = intent.get("source_worker_quiescence")
-    planned = intent.get("status") == "planned"
-    if not source_worker_quiescence_matches(
-        retained,
-        observed,
-        allow_state_revision_advance=planned,
-    ):
-        raise SwitchError(
-            "source worker quiescence changed while authority writers stopped"
-        )
-    if not planned:
-        return dict(retained)
-    final_proof = dict(observed)
-    intent["source_worker_quiescence"] = final_proof
-    document["retained_control_rebaseline"] = intent
-    save_phase(journal_path, document, str(document["phase"]))
-    return final_proof
-
-
 def quiesce_source_workers(
     document: Mapping[str, object],
     runner: Runner,
@@ -2866,38 +2806,6 @@ def bind_source_worker_quiescence(
         return observed
     if not _valid_source_worker_quiescence(retained):
         raise SwitchError("source worker quiescence journal proof is invalid")
-
-    def refresh_planned_quiescence() -> dict[str, object]:
-        if intent.get("status") != "planned":
-            raise SwitchError(
-                "source worker quiescence changed before schema rebaseline"
-            )
-        current = source_worker_policy_expectations(runner)
-        if (
-            current["policy_expectations"]
-            != retained["policy_expectations"]
-        ):
-            raise SwitchError(
-                "source worker policy changed before schema rebaseline"
-            )
-        refreshed = quiesce_source_workers(
-            document,
-            runner,
-            process_observer=process_observer,
-            cgroup_root=cgroup_root,
-        )
-        if (
-            refreshed["policy_expectations"]
-            != retained["policy_expectations"]
-        ):
-            raise SwitchError(
-                "source worker policy changed during replayed quiescence"
-            )
-        intent["source_worker_quiescence"] = refreshed
-        document["retained_control_rebaseline"] = intent
-        save_phase(journal_path, document, str(document["phase"]))
-        return refreshed
-
     try:
         observed = source_worker_quiescence_proof(
             runner,
@@ -2906,16 +2814,13 @@ def bind_source_worker_quiescence(
             cgroup_root=cgroup_root,
         )
     except SwitchError as error:
-        try:
-            return refresh_planned_quiescence()
-        except SwitchError as replay_error:
-            raise replay_error from error
-    if not source_worker_quiescence_matches(
-        retained,
-        observed,
-        allow_state_revision_advance=intent.get("status") == "planned",
-    ):
-        return refresh_planned_quiescence()
+        raise SwitchError(
+            "source worker quiescence changed before schema rebaseline"
+        ) from error
+    if dict(retained) != observed:
+        raise SwitchError(
+            "source worker quiescence changed before schema rebaseline"
+        )
     return dict(retained)
 
 
@@ -4539,11 +4444,11 @@ def apply_retained_control_rebaseline(
         return intent
 
     source_status = intent["status"] in {"planned", "backed-up", "prepared"}
+    stop_authority_writers(runner)
     if source_status:
         bind_source_worker_quiescence(document, intent, journal_path, runner)
     else:
         require_no_managed_worker_units(runner)
-    stop_authority_writers(runner)
     if source_status:
         retained_proof = intent.get("source_worker_quiescence")
         if not _valid_source_worker_quiescence(retained_proof):
@@ -4551,16 +4456,10 @@ def apply_retained_control_rebaseline(
         post_stop_proof = source_worker_quiescence_proof(
             runner, quiesced_workers=retained_proof["quiesced_workers"]
         )
-        # Bind the transaction to the final writer-stopped revision before
-        # checkpoint and backup. Later exact predecessor restoration must
-        # reproduce this proof byte-for-byte, not the earlier live-writer
-        # revision that was allowed to advance during graceful shutdown.
-        bind_writer_stopped_worker_quiescence(
-            document,
-            intent,
-            journal_path,
-            post_stop_proof,
-        )
+        if dict(retained_proof) != post_stop_proof:
+            raise SwitchError(
+                "source worker quiescence changed while authority writers stopped"
+            )
     else:
         # Close the unit-start TOCTOU even when replay begins from a partially
         # published database whose schema cannot yet be read as schema 15.
@@ -4644,11 +4543,7 @@ def apply_retained_control_rebaseline(
         restored_proof = source_worker_quiescence_proof(
             runner, quiesced_workers=retained_proof["quiesced_workers"]
         )
-        if not source_worker_quiescence_matches(
-            retained_proof,
-            restored_proof,
-            allow_state_revision_advance=False,
-        ):
+        if dict(retained_proof) != restored_proof:
             raise SwitchError(
                 "restored source worker quiescence differs from its journal proof"
             )
@@ -4760,21 +4655,13 @@ def restore_retained_control_rebaseline(
         observed = source_worker_quiescence_proof(
             runner, quiesced_workers=retained_proof["quiesced_workers"]
         )
-        if not source_worker_quiescence_matches(
-            retained_proof,
-            observed,
-            allow_state_revision_advance=False,
-        ):
+        if dict(retained_proof) != observed:
             raise SwitchError("source worker quiescence changed before rollback")
         stop_authority_writers(runner)
         observed = source_worker_quiescence_proof(
             runner, quiesced_workers=retained_proof["quiesced_workers"]
         )
-        if not source_worker_quiescence_matches(
-            retained_proof,
-            observed,
-            allow_state_revision_advance=False,
-        ):
+        if dict(retained_proof) != observed:
             raise SwitchError("source worker quiescence changed while stopping writers")
     elif status == "publishing":
         require_no_managed_worker_units(runner)
@@ -4802,11 +4689,7 @@ def restore_retained_control_rebaseline(
     restored_proof = source_worker_quiescence_proof(
         runner, quiesced_workers=retained_proof["quiesced_workers"]
     )
-    if not source_worker_quiescence_matches(
-        retained_proof,
-        restored_proof,
-        allow_state_revision_advance=False,
-    ):
+    if dict(retained_proof) != restored_proof:
         raise SwitchError("restored source worker quiescence differs from its journal proof")
     intent.update({"status": "rolled-back", "rolled_back_at": now()})
     document["retained_control_rebaseline"] = intent
@@ -5701,7 +5584,10 @@ def apply(
         raise SwitchError("same-schema journal cannot be applied from this phase")
     if rebaseline["required"] is True and rebaseline["status"] != "applied":
         if rebaseline["status"] in {"planned", "backed-up", "prepared"}:
-            # The proof is computed before this first journal mutation.
+            # Freeze every authority writer before the first worker unit or
+            # process is removed. The resulting proof is therefore terminal
+            # and exact before any candidate file reaches the live graph.
+            stop_authority_writers(runner)
             bind_source_worker_quiescence(
                 document, rebaseline, journal_path, runner
             )
