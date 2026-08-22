@@ -2589,6 +2589,647 @@ def exercise_software_delivery_fence_lifecycle() -> None:
             )
 
 
+def exercise_prepared_supersession_clears_only_exact_claim() -> None:
+    candidate_digest = "a" * 64
+    previous_digest = "b" * 64
+    current_digest = "c" * 64
+    uid, gid = os.geteuid(), os.getegid()
+
+    def prepared_document(candidate: Path) -> dict[str, object]:
+        return {
+            "schema_version": switch.VERSION,
+            "kind": switch.KIND,
+            "phase": "prepared",
+            "release": str(candidate),
+            "release_digest": candidate.name,
+            "previous_release_digest": previous_digest,
+            "backups": {},
+            "candidate_started": False,
+            "promoted": False,
+            "publication_switched": False,
+            "completed_at": None,
+            "retained_control_rebaseline": {
+                "required": True,
+                "source_schema_version": 15,
+                "target_schema_version": 16,
+                "status": "planned",
+            },
+        }
+
+    with tempfile.TemporaryDirectory(prefix="prepared-supersession-") as raw:
+        root = Path(raw)
+        releases = root / "releases"
+        candidate = releases / candidate_digest
+        current = releases / current_digest
+        candidate.mkdir(parents=True)
+        current.mkdir()
+        transaction = root / "run" / candidate_digest
+        transaction.mkdir(parents=True, mode=0o700)
+        transaction.parent.chmod(0o700)
+        journal = transaction / "journal.json"
+        document = prepared_document(candidate)
+        switch.atomic_json(journal, document)
+        journal_before = switch.exact_file_identity(journal)
+        lock = root / "installer.lock"
+        claim_root = root / "claims"
+        claim_root.mkdir(mode=0o700)
+        claim = claim_root / "claim.json"
+        held, identity = switch.acquire_delivery_fence(
+            transaction,
+            release_digest=candidate_digest,
+            action="prepare",
+            expected_uid=uid,
+            expected_gid=gid,
+            lock_path=lock,
+            claim_path=claim,
+        )
+        held.close(command_succeeded=False)
+        runner = FakeRunner()
+        root_args = {
+            "expected_uid": uid,
+            "expected_gid": gid,
+            "lock_path": lock,
+            "claim_path": claim,
+            "expected_current_release_digest": current_digest,
+        }
+        with (
+            mock.patch.object(
+                switch, "require_transaction_root", return_value=transaction
+            ),
+            mock.patch.object(
+                switch,
+                "require_current_live_release_identity",
+                return_value={"evidence_sha256": "d" * 64},
+            ),
+        ):
+            result = switch.execute_fenced_switch_action(
+                "supersede-prepared",
+                candidate,
+                transaction,
+                runner,
+                **root_args,
+            )
+            replay = switch.execute_fenced_switch_action(
+                "supersede-prepared",
+                candidate,
+                transaction,
+                runner,
+                **root_args,
+            )
+        expect(
+            result["phase"] == "superseded-before-mutation"
+            and replay["successor_release_digest"] == current_digest
+            and not claim.exists()
+            and runner.commands == []
+            and switch.exact_file_identity(journal) == journal_before,
+            "prepared supersession mutated product state or was not replayable",
+        )
+        parsed = switch.parser().parse_args(
+            [
+                "supersede-prepared",
+                "--release",
+                str(candidate),
+                "--transaction-root",
+                str(transaction),
+                "--expected-current-release-digest",
+                current_digest,
+            ]
+        )
+        expect(
+            parsed.expected_current_release_digest == current_digest,
+            "prepared supersession CLI lost explicit successor identity",
+        )
+        with (
+            mock.patch.object(
+                switch, "require_transaction_root", return_value=transaction
+            ),
+            mock.patch.object(
+                switch,
+                "require_current_live_release_identity",
+                return_value={"evidence_sha256": "d" * 64},
+            ),
+        ):
+            try:
+                switch.execute_fenced_switch_action(
+                    "supersede-prepared",
+                    candidate,
+                    transaction,
+                    FakeRunner(),
+                    **{
+                        **root_args,
+                        "expected_current_release_digest": previous_digest,
+                    },
+                )
+            except switch.SwitchError:
+                pass
+            else:
+                raise AssertionError("prepared supersession accepted previous release")
+        expect(not claim.exists(), "failed replay left a borrowed claim")
+        terminal = switch.delivery_fence_terminal(
+            transaction,
+            identity,
+            expected_uid=uid,
+            expected_gid=gid,
+        )
+        expect(
+            terminal is not None
+            and terminal["outcome"] == "superseded-before-mutation"
+            and terminal["successor_release_digest"] == current_digest,
+            "prepared supersession terminal lost successor evidence",
+        )
+        terminal_path = transaction / switch.DELIVERY_FENCE_TERMINAL_NAME
+        terminal_before = terminal_path.read_bytes()
+        journal_payload_before = journal.read_bytes()
+        for stale_action in ("prepare", "apply"):
+            stale_runner = FakeRunner()
+            with (
+                mock.patch.object(
+                    switch, "require_transaction_root", return_value=transaction
+                ),
+                mock.patch.object(
+                    switch,
+                    stale_action,
+                    side_effect=AssertionError(
+                        f"stale {stale_action} reached product mutation"
+                    ),
+                ) as forbidden,
+            ):
+                try:
+                    switch.execute_fenced_switch_action(
+                        stale_action,
+                        candidate,
+                        transaction,
+                        stale_runner,
+                        **root_args,
+                    )
+                except switch.SwitchError:
+                    pass
+                else:
+                    raise AssertionError(
+                        f"stale {stale_action} resumed a superseded transaction"
+                    )
+            expect(
+                not forbidden.called
+                and not claim.exists()
+                and stale_runner.commands == []
+                and journal.read_bytes() == journal_payload_before
+                and terminal_path.read_bytes() == terminal_before,
+                f"stale {stale_action} changed supersession evidence or product state",
+            )
+
+        for field, value in (
+            ("phase", "applying"),
+            ("backups", {"changed": {}}),
+            ("candidate_started", True),
+            ("promoted", True),
+            ("publication_switched", True),
+        ):
+            changed = prepared_document(candidate)
+            changed[field] = value
+            switch.atomic_json(journal, changed)
+            try:
+                switch.require_supersedable_prepared_journal(
+                    journal,
+                    candidate_release=candidate,
+                    successor_release_digest=current_digest,
+                )
+            except switch.SwitchError:
+                pass
+            else:
+                raise AssertionError(f"prepared supersession accepted {field} drift")
+        changed = prepared_document(candidate)
+        changed["retained_control_rebaseline"] = {
+            **changed["retained_control_rebaseline"],
+            "source_worker_quiescence": {},
+        }
+        switch.atomic_json(journal, changed)
+        try:
+            switch.require_supersedable_prepared_journal(
+                journal,
+                candidate_release=candidate,
+                successor_release_digest=current_digest,
+            )
+        except switch.SwitchError:
+            pass
+        else:
+            raise AssertionError("prepared supersession accepted worker proof mutation")
+        switch.atomic_json(journal, document)
+
+        live_failure_transaction = root / "failed" / candidate_digest
+        live_failure_transaction.mkdir(parents=True, mode=0o700)
+        live_failure_transaction.parent.chmod(0o700)
+        switch.atomic_json(
+            live_failure_transaction / "journal.json", prepared_document(candidate)
+        )
+        failed_handle, _failed_identity = switch.acquire_delivery_fence(
+            live_failure_transaction,
+            release_digest=candidate_digest,
+            action="prepare",
+            expected_uid=uid,
+            expected_gid=gid,
+            lock_path=lock,
+            claim_path=claim,
+        )
+        failed_handle.close(command_succeeded=False)
+        with (
+            mock.patch.object(
+                switch,
+                "require_transaction_root",
+                return_value=live_failure_transaction,
+            ),
+            mock.patch.object(
+                switch,
+                "require_current_live_release_identity",
+                side_effect=switch.SwitchError("live release mismatch"),
+            ),
+        ):
+            try:
+                switch.execute_fenced_switch_action(
+                    "supersede-prepared",
+                    candidate,
+                    live_failure_transaction,
+                    FakeRunner(),
+                    **root_args,
+                )
+            except switch.SwitchError:
+                pass
+            else:
+                raise AssertionError("live mismatch cleared prepared claim")
+        expect(claim.exists(), "failed supersession released durable owner")
+
+        unit_root = root / "units"
+        slot_root = root / "slots"
+        unit_root.mkdir()
+        slot_root.mkdir()
+        publication = root / "publication.json"
+        outer, inner = 41001, 41002
+        switch.atomic_json(
+            publication,
+            {
+                "schema_version": 1,
+                "payload_sha256": "e" * 64,
+                "publication": {
+                    "release_digest": current_digest,
+                    "generation": 9,
+                    "console": {"upstream": {"port": outer}},
+                },
+            },
+        )
+        switch.atomic_bytes(
+            slot_root / f"{current_digest}.env",
+            switch.candidate_slot_payload(current_digest, outer, inner),
+            0o644,
+        )
+        launchers = {
+            "client": (root / "bin" / "client", "devcoordinator"),
+            "test": (root / "bin" / "test", "devcoordinator-test"),
+        }
+        for _name, (destination, immutable_name) in launchers.items():
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            switch.atomic_bytes(
+                destination,
+                (
+                    "#!/bin/sh\nset -eu\n"
+                    f"exec '{current / 'bin' / immutable_name}' \"$@\"\n"
+                ).encode("utf-8"),
+                0o755,
+            )
+        for name in (
+            "devcoordinator-api.service",
+            "devcoordinator-authority.service",
+            "devcoordinator-edge.service",
+            "devcoordinator-notifications.service",
+            "devcoordinator-observer.service",
+            "devcoordinator-test-snapshotd.service",
+            "devcoordinator-testd.service",
+        ):
+            switch.atomic_bytes(
+                unit_root / name,
+                f"ExecStart=/opt/devcoordinator/releases/{current_digest}/bin/tool\n".encode(),
+                0o644,
+            )
+        with (
+            mock.patch.object(switch, "UNIT_ROOT", unit_root),
+            mock.patch.object(switch, "SLOT_ROOT", slot_root),
+            mock.patch.object(switch, "PUBLICATION_FILE", publication),
+            mock.patch.object(switch, "STABLE_LAUNCHERS", launchers),
+        ):
+            schema_reads: list[int] = []
+
+            def stable_schema() -> int:
+                schema_reads.append(15)
+                return 15
+
+            evidence = switch.require_current_live_release_identity(
+                current,
+                schema_reader=stable_schema,
+                release_verifier=lambda selected: {
+                    "release_digest": selected.name
+                },
+            )
+            replayed_evidence = switch.require_current_live_release_identity(
+                current,
+                schema_reader=stable_schema,
+                release_verifier=lambda selected: {
+                    "release_digest": selected.name
+                },
+            )
+            expect(
+                evidence["release_digest"] == current_digest
+                and replayed_evidence == evidence
+                and schema_reads == [15, 15, 15, 15],
+                "current live release evidence lost exact deterministic identity",
+            )
+            switch.atomic_bytes(
+                unit_root / "devcoordinator-api.service",
+                f"ExecStart=/opt/devcoordinator/releases/{previous_digest}/bin/tool\n".encode(),
+                0o644,
+            )
+            try:
+                switch.require_current_live_release_identity(
+                    current,
+                    schema_reader=lambda: 15,
+                    release_verifier=lambda selected: {
+                        "release_digest": selected.name
+                    },
+                )
+            except switch.SwitchError:
+                pass
+            else:
+                raise AssertionError("live release verifier accepted mixed units")
+            switch.atomic_bytes(
+                unit_root / "devcoordinator-api.service",
+                f"ExecStart=/opt/devcoordinator/releases/{current_digest}/bin/tool\n".encode(),
+                0o644,
+            )
+            switch.atomic_bytes(
+                unit_root / "devcoordinator-edge.service",
+                f"ExecStart=/opt/devcoordinator/releases/{previous_digest}/bin/tool\n".encode(),
+                0o644,
+            )
+            try:
+                switch.require_current_live_release_identity(
+                    current,
+                    schema_reader=lambda: 15,
+                    release_verifier=lambda selected: {
+                        "release_digest": selected.name
+                    },
+                )
+            except switch.SwitchError:
+                pass
+            else:
+                raise AssertionError("live release verifier accepted mixed edge unit")
+            switch.atomic_bytes(
+                unit_root / "devcoordinator-edge.service",
+                f"ExecStart=/opt/devcoordinator/releases/{current_digest}/bin/tool\n".encode(),
+                0o644,
+            )
+            launcher_destination, launcher_name = launchers["client"]
+            expected_launcher = (
+                "#!/bin/sh\nset -eu\n"
+                f"exec '{current / 'bin' / launcher_name}' \"$@\"\n"
+            ).encode("utf-8")
+            switch.atomic_bytes(launcher_destination, b"wrong launcher\n", 0o755)
+            try:
+                switch.require_current_live_release_identity(
+                    current,
+                    schema_reader=lambda: 15,
+                    release_verifier=lambda selected: {
+                        "release_digest": selected.name
+                    },
+                )
+            except switch.SwitchError:
+                pass
+            else:
+                raise AssertionError("live release verifier accepted mixed launcher")
+            switch.atomic_bytes(launcher_destination, expected_launcher, 0o755)
+
+            switch.atomic_json(
+                publication,
+                {
+                    "schema_version": 1,
+                    "payload_sha256": "e" * 64,
+                    "publication": {
+                        "release_digest": previous_digest,
+                        "generation": 9,
+                        "console": {"upstream": {"port": outer}},
+                    },
+                },
+            )
+            try:
+                switch.require_current_live_release_identity(
+                    current,
+                    schema_reader=lambda: 15,
+                    release_verifier=lambda selected: {
+                        "release_digest": selected.name
+                    },
+                )
+            except switch.SwitchError:
+                pass
+            else:
+                raise AssertionError("live release verifier accepted mixed publication")
+            switch.atomic_json(
+                publication,
+                {
+                    "schema_version": 1,
+                    "payload_sha256": "e" * 64,
+                    "publication": {
+                        "release_digest": current_digest,
+                        "generation": 9,
+                        "console": {"upstream": {"port": outer}},
+                    },
+                },
+            )
+
+            switch.atomic_bytes(
+                slot_root / f"{current_digest}.env",
+                switch.candidate_slot_payload(previous_digest, outer, inner),
+                0o644,
+            )
+            try:
+                switch.require_current_live_release_identity(
+                    current,
+                    schema_reader=lambda: 15,
+                    release_verifier=lambda selected: {
+                        "release_digest": selected.name
+                    },
+                )
+            except switch.SwitchError:
+                pass
+            else:
+                raise AssertionError("live release verifier accepted mixed Console slot")
+            switch.atomic_bytes(
+                slot_root / f"{current_digest}.env",
+                switch.candidate_slot_payload(current_digest, outer, inner),
+                0o644,
+            )
+
+            race_cases = (
+                (
+                    "publication",
+                    lambda: switch.atomic_json(
+                        publication,
+                        {
+                            "schema_version": 1,
+                            "payload_sha256": "e" * 64,
+                            "publication": {
+                                "release_digest": current_digest,
+                                "generation": 10,
+                                "console": {"upstream": {"port": outer}},
+                            },
+                        },
+                    ),
+                    lambda: switch.atomic_json(
+                        publication,
+                        {
+                            "schema_version": 1,
+                            "payload_sha256": "e" * 64,
+                            "publication": {
+                                "release_digest": current_digest,
+                                "generation": 9,
+                                "console": {"upstream": {"port": outer}},
+                            },
+                        },
+                    ),
+                ),
+                (
+                    "Console slot",
+                    lambda: switch.atomic_bytes(
+                        slot_root / f"{current_digest}.env",
+                        switch.candidate_slot_payload(
+                            current_digest, outer, inner + 1
+                        ),
+                        0o644,
+                    ),
+                    lambda: switch.atomic_bytes(
+                        slot_root / f"{current_digest}.env",
+                        switch.candidate_slot_payload(current_digest, outer, inner),
+                        0o644,
+                    ),
+                ),
+                (
+                    "launcher",
+                    lambda: switch.atomic_bytes(
+                        launcher_destination, b"changed between snapshots\n", 0o755
+                    ),
+                    lambda: switch.atomic_bytes(
+                        launcher_destination, expected_launcher, 0o755
+                    ),
+                ),
+                (
+                    "unit",
+                    lambda: switch.atomic_bytes(
+                        unit_root / "devcoordinator-edge.service",
+                        (
+                            "# changed between snapshots\n"
+                            f"ExecStart=/opt/devcoordinator/releases/{current_digest}/bin/tool\n"
+                        ).encode(),
+                        0o644,
+                    ),
+                    lambda: switch.atomic_bytes(
+                        unit_root / "devcoordinator-edge.service",
+                        f"ExecStart=/opt/devcoordinator/releases/{current_digest}/bin/tool\n".encode(),
+                        0o644,
+                    ),
+                ),
+            )
+            for label, mutate, restore in race_cases:
+                reads = 0
+
+                def mutate_after_first_snapshot() -> int:
+                    nonlocal reads
+                    reads += 1
+                    if reads == 1:
+                        mutate()
+                    return 15
+
+                try:
+                    switch.require_current_live_release_identity(
+                        current,
+                        schema_reader=mutate_after_first_snapshot,
+                        release_verifier=lambda selected: {
+                            "release_digest": selected.name
+                        },
+                    )
+                except switch.SwitchError:
+                    pass
+                else:
+                    raise AssertionError(
+                        f"live release verifier accepted {label} snapshot race"
+                    )
+                finally:
+                    restore()
+
+            for label, target in (
+                ("publication", publication),
+                ("Console slot", slot_root / f"{current_digest}.env"),
+                ("launcher", launcher_destination),
+                ("unit", unit_root / "devcoordinator-edge.service"),
+            ):
+                original = target.read_bytes()
+                target_info = target.lstat()
+                original_read = os.read
+                swapped = False
+
+                def swap_path_after_read(descriptor: int, size: int) -> bytes:
+                    nonlocal swapped
+                    payload = original_read(descriptor, size)
+                    opened = os.fstat(descriptor)
+                    if not swapped and (opened.st_dev, opened.st_ino) == (
+                        target_info.st_dev,
+                        target_info.st_ino,
+                    ):
+                        switch.atomic_bytes(
+                            target, original, stat.S_IMODE(target_info.st_mode)
+                        )
+                        swapped = True
+                    return payload
+
+                with mock.patch.object(
+                    switch.os, "read", side_effect=swap_path_after_read
+                ):
+                    try:
+                        switch.require_current_live_release_identity(
+                            current,
+                            schema_reader=lambda: 15,
+                            release_verifier=lambda selected: {
+                                "release_digest": selected.name
+                            },
+                        )
+                    except switch.SwitchError:
+                        pass
+                    else:
+                        raise AssertionError(
+                            f"live release verifier accepted {label} path swap"
+                        )
+                expect(swapped, f"{label} path-swap fixture did not execute")
+
+            for schema_reader, release_verifier, label in (
+                (
+                    lambda: 16,
+                    lambda selected: {"release_digest": selected.name},
+                    "schema",
+                ),
+                (
+                    lambda: 15,
+                    lambda _selected: {"release_digest": previous_digest},
+                    "immutable release",
+                ),
+            ):
+                try:
+                    switch.require_current_live_release_identity(
+                        current,
+                        schema_reader=schema_reader,
+                        release_verifier=release_verifier,
+                    )
+                except switch.SwitchError:
+                    pass
+                else:
+                    raise AssertionError(
+                        f"live release verifier accepted mixed {label}"
+                    )
+
+
 def exercise_retained_control_transaction_boundary() -> None:
     apply_source = inspect.getsource(switch.apply_retained_control_rebaseline)
     rollback_source = inspect.getsource(switch.restore_retained_control_rebaseline)
@@ -4961,6 +5602,7 @@ def main() -> int:
     exercise_opt_in_test_history_reset_and_previous_release_rollback()
     exercise_reset_cli_is_explicit()
     exercise_software_delivery_fence_lifecycle()
+    exercise_prepared_supersession_clears_only_exact_claim()
     exercise_retained_control_transaction_boundary()
     exercise_retained_server_credential_transaction()
     exercise_rebaseline_quiesces_exact_managed_workers()

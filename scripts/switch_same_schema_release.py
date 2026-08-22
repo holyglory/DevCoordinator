@@ -945,11 +945,18 @@ def delivery_fence_terminal(
     expected_uid: int,
     expected_gid: int,
     publish_outcome: str | None = None,
+    successor_release_digest: str | None = None,
+    journal_sha256: str | None = None,
+    live_evidence_sha256: str | None = None,
 ) -> dict[str, object] | None:
     path = transaction_root / DELIVERY_FENCE_TERMINAL_NAME
     published: dict[str, object] | None = None
     if publish_outcome is not None:
-        if publish_outcome not in {"deployed", "rolled-back"}:
+        if publish_outcome not in {
+            "deployed",
+            "rolled-back",
+            "superseded-before-mutation",
+        }:
             raise SwitchError("software delivery fence outcome is invalid")
         published = {
             "schema_version": DELIVERY_FENCE_VERSION,
@@ -959,30 +966,82 @@ def delivery_fence_terminal(
             "outcome": publish_outcome,
             "completed_at": now(),
         }
+        if publish_outcome == "superseded-before-mutation":
+            if (
+                not isinstance(successor_release_digest, str)
+                or RELEASE_RE.fullmatch(successor_release_digest) is None
+                or successor_release_digest == identity.get("release_digest")
+                or not isinstance(journal_sha256, str)
+                or re.fullmatch(r"[0-9a-f]{64}", journal_sha256) is None
+                or not isinstance(live_evidence_sha256, str)
+                or re.fullmatch(r"[0-9a-f]{64}", live_evidence_sha256) is None
+            ):
+                raise SwitchError("software delivery supersession evidence is invalid")
+            published.update(
+                {
+                    "successor_release_digest": successor_release_digest,
+                    "journal_sha256": journal_sha256,
+                    "live_evidence_sha256": live_evidence_sha256,
+                }
+            )
+        elif any(
+            value is not None
+            for value in (
+                successor_release_digest,
+                journal_sha256,
+                live_evidence_sha256,
+            )
+        ):
+            raise SwitchError("ordinary fence terminal has supersession evidence")
         atomic_json(path, published)
     if not path.exists() and not path.is_symlink():
         return None
     value = _read_delivery_fence_document(
         path, expected_uid=expected_uid, expected_gid=expected_gid
     )
+    ordinary_fields = {
+        "schema_version",
+        "kind",
+        "operation_id",
+        "release_digest",
+        "outcome",
+        "completed_at",
+    }
+    superseded_fields = ordinary_fields | {
+        "successor_release_digest",
+        "journal_sha256",
+        "live_evidence_sha256",
+    }
+    outcome = value.get("outcome")
     if (
         set(value)
-        != {
-            "schema_version",
-            "kind",
-            "operation_id",
-            "release_digest",
-            "outcome",
-            "completed_at",
-        }
+        != (
+            superseded_fields
+            if outcome == "superseded-before-mutation"
+            else ordinary_fields
+        )
         or value.get("schema_version") != DELIVERY_FENCE_VERSION
         or value.get("kind") != DELIVERY_FENCE_TERMINAL_KIND
         or value.get("operation_id") != identity.get("operation_id")
         or value.get("release_digest") != identity.get("release_digest")
-        or value.get("outcome") not in {"deployed", "rolled-back"}
+        or outcome
+        not in {"deployed", "rolled-back", "superseded-before-mutation"}
         or not isinstance(value.get("completed_at"), str)
         or not value["completed_at"]
         or len(value["completed_at"]) > 64
+        or outcome == "superseded-before-mutation"
+        and (
+            RELEASE_RE.fullmatch(str(value.get("successor_release_digest") or ""))
+            is None
+            or value.get("successor_release_digest")
+            == identity.get("release_digest")
+            or re.fullmatch(r"[0-9a-f]{64}", str(value.get("journal_sha256") or ""))
+            is None
+            or re.fullmatch(
+                r"[0-9a-f]{64}", str(value.get("live_evidence_sha256") or "")
+            )
+            is None
+        )
     ):
         raise SwitchError("software delivery fence terminal evidence is invalid")
     if published is not None and value != published:
@@ -1003,6 +1062,259 @@ def remove_delivery_fence_document(
         raise SwitchError("software delivery fence document changed before cleanup")
     path.unlink()
     fsync_parent(path)
+
+
+def require_supersedable_prepared_journal(
+    journal_path: Path,
+    *,
+    candidate_release: Path,
+    successor_release_digest: str,
+) -> tuple[dict[str, object], str]:
+    before = exact_file_identity(journal_path)
+    document = load_journal(journal_path)
+    if document is None:
+        raise SwitchError("prepared supersession journal is unavailable")
+    rebaseline = document.get("retained_control_rebaseline")
+    candidate_digest = candidate_release.name
+    previous = document.get("previous_release_digest")
+    if (
+        RELEASE_RE.fullmatch(successor_release_digest) is None
+        or successor_release_digest in {candidate_digest, previous}
+        or document.get("phase") != "prepared"
+        or document.get("release") != str(candidate_release)
+        or document.get("release_digest") != candidate_digest
+        or not isinstance(previous, str)
+        or RELEASE_RE.fullmatch(previous) is None
+        or document.get("backups") != {}
+        or document.get("candidate_started") is not False
+        or document.get("promoted") is not False
+        or document.get("publication_switched") is not False
+        or document.get("completed_at") is not None
+        or document.get("test_history_reset") is not None
+        or not isinstance(rebaseline, Mapping)
+        or set(rebaseline)
+        != {
+            "required",
+            "source_schema_version",
+            "target_schema_version",
+            "status",
+        }
+        or rebaseline.get("required") is not True
+        or rebaseline.get("source_schema_version")
+        != retained_control.REBASELINE_SOURCE_SCHEMA
+        or rebaseline.get("target_schema_version") != COORDINATOR_SCHEMA_VERSION
+        or rebaseline.get("status") != "planned"
+    ):
+        raise SwitchError("prepared supersession journal shows possible mutation")
+    after = exact_file_identity(journal_path)
+    if before != after:
+        raise SwitchError("prepared supersession journal changed while reading")
+    return document, str(before["sha256"])
+
+
+def _read_bounded_stable_file(
+    path: Path,
+    *,
+    maximum_bytes: int,
+    description: str,
+) -> bytes:
+    if (
+        not path.is_absolute()
+        or type(maximum_bytes) is not int
+        or maximum_bytes <= 0
+    ):
+        raise SwitchError(description + " read contract is invalid")
+    descriptor = -1
+    try:
+        path_before = path.lstat()
+        if (
+            stat.S_ISLNK(path_before.st_mode)
+            or not stat.S_ISREG(path_before.st_mode)
+            or path_before.st_size <= 0
+            or path_before.st_size > maximum_bytes
+        ):
+            raise SwitchError(description + " is not one bounded real file")
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+        )
+        opened = os.fstat(descriptor)
+        before_identity = (
+            path_before.st_dev,
+            path_before.st_ino,
+            path_before.st_size,
+            path_before.st_mtime_ns,
+            path_before.st_ctime_ns,
+        )
+        opened_identity = (
+            opened.st_dev,
+            opened.st_ino,
+            opened.st_size,
+            opened.st_mtime_ns,
+            opened.st_ctime_ns,
+        )
+        if opened_identity != before_identity:
+            raise SwitchError(description + " path changed before open")
+        payload = bytearray()
+        while len(payload) <= maximum_bytes:
+            block = os.read(descriptor, min(65536, maximum_bytes + 1 - len(payload)))
+            if not block:
+                break
+            payload.extend(block)
+        opened_after = os.fstat(descriptor)
+        path_after = path.lstat()
+        if (
+            len(payload) != opened.st_size
+            or opened_identity
+            != (
+                opened_after.st_dev,
+                opened_after.st_ino,
+                opened_after.st_size,
+                opened_after.st_mtime_ns,
+                opened_after.st_ctime_ns,
+            )
+            or opened_identity
+            != (
+                path_after.st_dev,
+                path_after.st_ino,
+                path_after.st_size,
+                path_after.st_mtime_ns,
+                path_after.st_ctime_ns,
+            )
+        ):
+            raise SwitchError(description + " changed while reading")
+        return bytes(payload)
+    except OSError as error:
+        raise SwitchError(description + " is unavailable") from error
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _current_live_release_snapshot(
+    release: Path,
+    *,
+    schema_reader: Callable[[], int],
+) -> dict[str, object]:
+    digest = release.name
+    publication_payload = _read_bounded_stable_file(
+        PUBLICATION_FILE,
+        maximum_bytes=2 * 1024 * 1024,
+        description="edge publication",
+    )
+    try:
+        envelope = json.loads(publication_payload)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise SwitchError("edge publication is invalid JSON") from error
+    publication = envelope.get("publication") if isinstance(envelope, Mapping) else None
+    console = publication.get("console") if isinstance(publication, Mapping) else None
+    upstream = console.get("upstream") if isinstance(console, Mapping) else None
+    if (
+        not isinstance(envelope, Mapping)
+        or not isinstance(publication, Mapping)
+        or not isinstance(upstream, Mapping)
+        or envelope.get("schema_version") != 1
+        or re.fullmatch(r"[0-9a-f]{64}", str(envelope.get("payload_sha256") or ""))
+        is None
+        or publication.get("release_digest") != digest
+        or type(publication.get("generation")) is not int
+        or type(upstream.get("port")) is not int
+    ):
+        raise SwitchError("edge publication names another current release")
+    port = int(upstream["port"])
+    slot = SLOT_ROOT / f"{digest}.env"
+    try:
+        slot_payload = _read_bounded_stable_file(
+            slot,
+            maximum_bytes=64 * 1024,
+            description="current Console slot",
+        )
+        slot_values = parse_slot(slot_payload.decode("utf-8"))
+    except UnicodeDecodeError as error:
+        raise SwitchError("current Console slot is not UTF-8") from error
+    if (
+        slot_values["DEVCOORDINATOR_RELEASE_DIGEST"] != digest
+        or int(slot_values["HTTPS_PORT"]) != port
+    ):
+        raise SwitchError("current Console slot contradicts publication")
+
+    launcher_sha256: dict[str, str] = {}
+    for _rendered_name, (destination, immutable_name) in STABLE_LAUNCHERS.items():
+        expected = (
+            "#!/bin/sh\n"
+            "set -eu\n"
+            f"exec '{release / 'bin' / immutable_name}' \"$@\"\n"
+        ).encode("utf-8")
+        actual = _read_bounded_stable_file(
+            destination,
+            maximum_bytes=64 * 1024,
+            description="stable launcher",
+        )
+        if actual != expected:
+            raise SwitchError("stable launcher names another current release")
+        launcher_sha256[str(destination)] = hashlib.sha256(actual).hexdigest()
+
+    release_bound_units = {
+        "devcoordinator-api.service",
+        "devcoordinator-authority.service",
+        "devcoordinator-edge.service",
+        "devcoordinator-notifications.service",
+        "devcoordinator-observer.service",
+        "devcoordinator-test-snapshotd.service",
+        "devcoordinator-testd.service",
+    }
+    unit_sha256: dict[str, str] = {}
+    reference = re.compile(r"/opt/devcoordinator/releases/([0-9a-f]{64})(?:/|\b)")
+    for name in sorted(release_bound_units):
+        payload = _read_bounded_stable_file(
+            UNIT_ROOT / name,
+            maximum_bytes=1024 * 1024,
+            description="current release unit",
+        )
+        try:
+            references = set(reference.findall(payload.decode("utf-8")))
+        except UnicodeDecodeError as error:
+            raise SwitchError("current release unit is not UTF-8") from error
+        if references != {digest}:
+            raise SwitchError("current unit names another release: " + name)
+        unit_sha256[name] = hashlib.sha256(payload).hexdigest()
+    schema_version = schema_reader()
+    if schema_version != retained_control.REBASELINE_SOURCE_SCHEMA:
+        raise SwitchError("current live authority schema is not the retained predecessor")
+    return {
+        "release_digest": digest,
+        "publication_file_sha256": hashlib.sha256(publication_payload).hexdigest(),
+        "publication_payload_sha256": envelope["payload_sha256"],
+        "publication_generation": publication["generation"],
+        "console_slot_sha256": hashlib.sha256(slot_payload).hexdigest(),
+        "authority_schema_version": schema_version,
+        "launchers": launcher_sha256,
+        "units": unit_sha256,
+    }
+
+
+def require_current_live_release_identity(
+    release: Path,
+    *,
+    schema_reader: Callable[[], int] | None = None,
+    release_verifier: Callable[[Path], Mapping[str, object]] = installer.verify_release,
+) -> dict[str, object]:
+    release = release.expanduser().resolve(strict=True)
+    digest = release.name
+    if RELEASE_RE.fullmatch(digest) is None:
+        raise SwitchError("current live release identity is invalid")
+    verified = release_verifier(release)
+    if verified.get("release_digest") != digest:
+        raise SwitchError("current immutable release verification changed identity")
+    read_schema = _authority_schema_version if schema_reader is None else schema_reader
+    evidence = _current_live_release_snapshot(release, schema_reader=read_schema)
+    second = _current_live_release_snapshot(release, schema_reader=read_schema)
+    if evidence != second:
+        raise SwitchError("current live release changed between proof snapshots")
+    return {
+        **evidence,
+        "evidence_sha256": hashlib.sha256(canonical(evidence)).hexdigest(),
+    }
 
 
 def acquire_delivery_fence(
@@ -6819,18 +7131,22 @@ def parser() -> argparse.ArgumentParser:
         "verify",
         "acceptance-begin",
         "finalize",
+        "supersede-prepared",
     ):
         action = actions.add_parser(name)
         action.add_argument("--release", type=Path, required=True)
         action.add_argument("--transaction-root", type=Path, required=True)
-        action.add_argument(
-            "--reset-test-history",
-            action="store_true",
-            help=(
-                "discard only the isolated test-history store and attempt spool, "
-                "then initialize an empty current-schema test plane while testd is stopped"
-            ),
-        )
+        if name == "supersede-prepared":
+            action.add_argument("--expected-current-release-digest", required=True)
+        else:
+            action.add_argument(
+                "--reset-test-history",
+                action="store_true",
+                help=(
+                    "discard only the isolated test-history store and attempt spool, "
+                    "then initialize an empty current-schema test plane while testd is stopped"
+                ),
+            )
         if name == "verify":
             action.add_argument("--public-url", default="https://console.vr.ae/healthz")
             action.add_argument("--api-url", default="http://127.0.0.1:29876/healthz")
@@ -6847,6 +7163,7 @@ def public_switch_result(action: str, value: Mapping[str, object]) -> dict[str, 
         "verify",
         "acceptance-begin",
         "finalize",
+        "supersede-prepared",
     }:
         raise SwitchError("same-schema public result action is invalid")
     release_digest = value.get("release_digest")
@@ -6884,6 +7201,9 @@ def public_switch_result(action: str, value: Mapping[str, object]) -> dict[str, 
     authority_schema = value.get("authority_schema_version")
     if type(authority_schema) is int:
         result["authority_schema_version"] = authority_schema
+    successor = value.get("successor_release_digest")
+    if isinstance(successor, str) and RELEASE_RE.fullmatch(successor) is not None:
+        result["successor_release_digest"] = successor
     return result
 
 
@@ -6959,6 +7279,7 @@ def execute_fenced_switch_action(
     public_url: str = "https://console.vr.ae/healthz",
     api_url: str = "http://127.0.0.1:29876/healthz",
     reset_test_history: bool = False,
+    expected_current_release_digest: str | None = None,
     expected_uid: int = 0,
     expected_gid: int = 0,
     lock_path: Path = installer_fence.DEFAULT_INSTALLER_LOCK,
@@ -6995,6 +7316,7 @@ def execute_fenced_switch_action(
         "rollback": "abort",
         "acceptance-begin": "recover",
         "finalize": "finalize",
+        "supersede-prepared": "recover",
     }.get(action)
     if fence_action is None:
         raise SwitchError("same-schema fenced action is invalid")
@@ -7033,6 +7355,17 @@ def execute_fenced_switch_action(
                 expected_uid=expected_uid,
                 expected_gid=expected_gid,
             )
+        if (
+            action in {"prepare", "apply"}
+            and prior_terminal is not None
+            and prior_terminal.get("outcome") == "superseded-before-mutation"
+        ):
+            if handle.created_claim:
+                handle.mark_complete()
+                terminal_cleanup = True
+            raise SwitchError(
+                "superseded prepared transaction cannot prepare or apply again"
+            )
         if action in {"prepare", "apply"} and handle.created_claim:
             if prior_terminal is not None:
                 remove_delivery_fence_document(
@@ -7041,7 +7374,55 @@ def execute_fenced_switch_action(
                     expected_uid=expected_uid,
                     expected_gid=expected_gid,
                 )
-        if action == "prepare":
+        if action == "supersede-prepared":
+            if (
+                not isinstance(expected_current_release_digest, str)
+                or RELEASE_RE.fullmatch(expected_current_release_digest) is None
+            ):
+                raise SwitchError("prepared supersession requires current release digest")
+            document, journal_sha256 = require_supersedable_prepared_journal(
+                transaction_root / "journal.json",
+                candidate_release=release,
+                successor_release_digest=expected_current_release_digest,
+            )
+            live = require_current_live_release_identity(
+                release.parent / expected_current_release_digest
+            )
+            live_sha256 = str(live["evidence_sha256"])
+            expected_terminal = {
+                "operation_id": identity["operation_id"],
+                "release_digest": identity["release_digest"],
+                "outcome": "superseded-before-mutation",
+                "successor_release_digest": expected_current_release_digest,
+                "journal_sha256": journal_sha256,
+                "live_evidence_sha256": live_sha256,
+            }
+            if prior_terminal is None:
+                prior_terminal = delivery_fence_terminal(
+                    transaction_root,
+                    identity,
+                    expected_uid=expected_uid,
+                    expected_gid=expected_gid,
+                    publish_outcome="superseded-before-mutation",
+                    successor_release_digest=expected_current_release_digest,
+                    journal_sha256=journal_sha256,
+                    live_evidence_sha256=live_sha256,
+                )
+            if (
+                prior_terminal is None
+                or any(
+                    prior_terminal.get(key) != expected
+                    for key, expected in expected_terminal.items()
+                )
+            ):
+                raise SwitchError("prepared supersession terminal changed identity")
+            handle.mark_complete()
+            value = {
+                **document,
+                "phase": "superseded-before-mutation",
+                "successor_release_digest": expected_current_release_digest,
+            }
+        elif action == "prepare":
             value = prepare(
                 release,
                 transaction_root,
@@ -7169,7 +7550,8 @@ def execute_fenced_switch_action(
                 expected_gid=expected_gid,
             )
         elif (
-            action in {"verify", "acceptance-begin", "finalize"}
+            action
+            in {"verify", "acceptance-begin", "finalize", "supersede-prepared"}
             and handle.created_claim
         ):
             terminal = delivery_fence_terminal(
@@ -7198,7 +7580,10 @@ def main(argv: list[str] | None = None) -> int:
             Runner(),
             public_url=getattr(args, "public_url", "https://console.vr.ae/healthz"),
             api_url=getattr(args, "api_url", "http://127.0.0.1:29876/healthz"),
-            reset_test_history=args.reset_test_history,
+            reset_test_history=getattr(args, "reset_test_history", False),
+            expected_current_release_digest=getattr(
+                args, "expected_current_release_digest", None
+            ),
         )
     except (
         SwitchError,
